@@ -58,11 +58,26 @@ test('docks a rightmost Transform preview above the toolbar at 1280x720', async 
   try {
     await expect(panel).toHaveAttribute('data-presentation', 'docked')
     const panelBox = await panel.boundingBox()
+    const transformBox = await page.locator('.react-flow__node[data-id="transform"]').boundingBox()
     const toolbarBox = await page.getByTestId('toolbar').boundingBox()
+    const chromeBoxes = await page.locator('[data-layout-region="canvas-top-chrome"]').evaluateAll((elements) => (
+      elements.map((element) => {
+        const rect = element.getBoundingClientRect()
+        return { top: rect.top, bottom: rect.bottom }
+      })
+    ))
+    const chromeBottom = Math.max(...chromeBoxes.map((box) => box.bottom))
     expect(panelBox).not.toBeNull()
+    expect(transformBox).not.toBeNull()
     expect(toolbarBox).not.toBeNull()
-    expect(panelBox!.height).toBeGreaterThanOrEqual(400)
+    expect(panelBox!.height).toBeGreaterThanOrEqual(401)
+    expect(panelBox!.x).toBeLessThan(transformBox!.x)
+    expect(panelBox!.y).toBeGreaterThanOrEqual(chromeBottom)
     expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(toolbarBox!.y + 0.5)
+    const badge = page.getByTestId('kernel-badge')
+    await badge.click()
+    await expect(page.getByText('Execution kernel', { exact: true })).toBeVisible()
+    await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Fit view', exact: true }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
   } finally {

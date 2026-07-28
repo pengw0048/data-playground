@@ -108,7 +108,8 @@ export function TopBar() {
 
   return (
     <>
-      <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div data-layout-region="canvas-top-chrome"
+        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
         {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
         <span className="text-[13.5px] text-muted-foreground">/</span>
@@ -120,11 +121,13 @@ export function TopBar() {
           <ThemeToggle />
         </span>
       </div>
-      <div style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
+      <div data-layout-region="canvas-top-chrome"
+        style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
         <CanvasWorkspaceLocation onReturnDestination={setWorkspaceReturnDestination} onNavigate={navigateToWorkspace} />
       </div>
 
-      <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div data-layout-region="canvas-top-chrome"
+        style={{ position: 'absolute', top: kernelUp ? 16 : 48, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
         <PeerAvatars />
         <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
         <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">

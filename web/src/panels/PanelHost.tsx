@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useState, type ReactNode } from 'react'
 import { useViewport } from '@xyflow/react'
 import { useStore, type PanelKind } from '../store/graph'
 import { color, radius, shadow } from '../theme/tokens'
@@ -37,7 +37,12 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   const rect = el?.getBoundingClientRect()
   const title = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.title ?? '')
   const close = useStore((s) => s.closePanel)
+  const kernelUp = useStore((s) => s.kernelUp)
   const [max, setMax] = useState(false)
+  const [, refreshPlacement] = useState(0)
+  // Offline chrome moves down after the hub status changes. Re-measure after that DOM commit so an
+  // already-open panel keeps the full TopBar interactive instead of retaining its warm-state top.
+  useLayoutEffect(() => { refreshPlacement((value) => value + 1) }, [kernelUp])
 
   const content = (
     <>
@@ -76,9 +81,13 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
     ?? window.innerWidth
   if (kind === 'data') {
     const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
+    const canvasTop = Math.max(0, ...Array.from(
+      document.querySelectorAll<HTMLElement>('[data-layout-region="canvas-top-chrome"]'),
+      (element) => element.getBoundingClientRect().bottom,
+    ))
     const placement = dataPanelPlacement({
       anchor: rect, width, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
-      rightEdge, toolbarTop,
+      rightEdge, toolbarTop, canvasTop,
     })
     return (
       <div className="dp-float dp-panel" data-testid={`panel-${kind}`} data-presentation={placement.presentation}

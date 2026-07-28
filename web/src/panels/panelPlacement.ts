@@ -21,7 +21,7 @@ export interface DataPanelPlacement {
 }
 
 export function dataPanelPlacement({
-  anchor, width, viewportWidth, viewportHeight, rightEdge, toolbarTop,
+  anchor, width, viewportWidth, viewportHeight, rightEdge, toolbarTop, canvasTop,
 }: {
   anchor: Rect
   width: number
@@ -29,9 +29,11 @@ export function dataPanelPlacement({
   viewportHeight: number
   rightEdge: number
   toolbarTop?: number
+  canvasTop?: number
 }): DataPanelPlacement {
-  // The docked panel must leave the product toolbar clickable. Its coordinate is a real DOM
-  // measurement when available; the viewport edge keeps first paint bounded before that settles.
+  // Leave both measured Canvas chrome and the product toolbar clickable. Viewport edges keep first
+  // paint bounded before either DOM measurement settles.
+  const safeTop = Math.max(EDGE, (canvasTop ?? 0) + EDGE)
   const safeBottom = Math.min(viewportHeight - 16, (toolbarTop ?? viewportHeight) - EDGE)
   const availableRightWidth = rightEdge - anchor.right - EDGE * 2
   const rightPlacementFits = availableRightWidth >= MIN_DATA_PANEL_WIDTH
@@ -39,7 +41,7 @@ export function dataPanelPlacement({
   const left = rightPlacementFits
     ? anchor.right + EDGE
     : Math.max(EDGE, Math.min(anchor.left, rightEdge - width - EDGE))
-  const top = Math.max(EDGE, rightPlacementFits ? anchor.top : anchor.bottom + EDGE)
+  const top = Math.max(safeTop, rightPlacementFits ? anchor.top : anchor.bottom + EDGE)
   const anchoredMaxHeight = Math.max(0, Math.min(MAX_PANEL_HEIGHT, safeBottom - top))
 
   if (anchoredMaxHeight - PANEL_TITLE_HEIGHT >= DATA_PANEL_USEFUL_CONTENT_HEIGHT) {
@@ -47,12 +49,14 @@ export function dataPanelPlacement({
   }
 
   // Keep a useful viewer inside the same canvas/Inspector boundary rather than opening a one-row
-  // sliver below a node. At the supported viewport this gives DataPanel up to 579px of content.
+  // sliver below a node. Dock opposite the selected node so the remaining graph stays operable.
+  const rightDockLeft = Math.max(EDGE, Math.min(rightEdge - width - EDGE, viewportWidth - width - EDGE))
+  const dockLeft = (anchor.left + anchor.right) / 2 >= rightEdge / 2 ? EDGE : rightDockLeft
   return {
     presentation: 'docked',
-    left: Math.max(EDGE, Math.min(rightEdge - width - EDGE, viewportWidth - width - EDGE)),
-    top: EDGE,
+    left: dockLeft,
+    top: safeTop,
     width,
-    maxHeight: Math.max(0, Math.min(MAX_PANEL_HEIGHT, safeBottom - EDGE)),
+    maxHeight: Math.max(0, Math.min(MAX_PANEL_HEIGHT, safeBottom - safeTop)),
   }
 }
