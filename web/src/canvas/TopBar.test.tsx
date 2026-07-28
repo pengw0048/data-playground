@@ -8,6 +8,15 @@ const state = vi.hoisted(() => ({
   inboxQuery: '',
   newFile: vi.fn(),
   kernelInfo: { capabilities: [] as string[] },
+  doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' },
+  files: [],
+  openFile: vi.fn(),
+  newFromExample: vi.fn(),
+  renameFile: vi.fn(),
+  deleteFile: vi.fn(),
+  discardLocalDraft: vi.fn(),
+  currentDraftId: null,
+  canvasRole: 'owner',
 }))
 
 vi.mock('../store/graph', () => ({
@@ -18,7 +27,7 @@ vi.mock('../store/graph', () => ({
   ),
 }))
 
-import { AppMenu } from './TopBar'
+import { AppMenu, FileMenu } from './TopBar'
 
 describe('AppMenu', () => {
   it('describes work destinations in researcher language', async () => {
@@ -44,5 +53,16 @@ describe('AppMenu', () => {
     expect(screen.getByText('runs from this Canvas')).toBeInTheDocument()
     expect(screen.queryByText(/terminal outcomes/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/audit trail/i)).not.toBeInTheDocument()
+  })
+})
+
+describe('FileMenu', () => {
+  it('keeps the complete Canvas name directly discoverable when the visible label truncates', () => {
+    render(<FileMenu onCanvasSettings={vi.fn()} />)
+
+    const trigger = screen.getByTestId('file-menu')
+    expect(trigger).toHaveAttribute('title', state.doc.name)
+    expect(trigger).toHaveTextContent(state.doc.name)
+    expect(trigger.querySelector('.truncate')).not.toBeNull()
   })
 })

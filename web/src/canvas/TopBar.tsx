@@ -109,35 +109,33 @@ export function TopBar() {
   return (
     <>
       <div data-layout-region="canvas-top-chrome"
-        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
-        {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
-        <span className="text-[13.5px] text-muted-foreground">/</span>
-        <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
-        <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
-        <span className="ml-1.5 inline-flex gap-0.5">
-          <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
-          <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
-          <ThemeToggle />
-        </span>
+        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
+        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+          <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
+          {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
+          <span className="shrink-0 text-[13.5px] text-muted-foreground">/</span>
+          <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
+          <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
+          <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
+            <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
+            <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
+            <ThemeToggle />
+          </span>
+        </div>
+        <div data-testid="canvas-run-controls" className="flex items-center gap-2.5">
+          <PeerAvatars />
+          <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
+          <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
+            <Icon name="refresh" size={13} /> Rerun all
+          </Button>
+          <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
+            <Icon name="link" size={13} /> Share
+          </Button>
+        </div>
       </div>
       <div data-layout-region="canvas-top-chrome"
         style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
         <CanvasWorkspaceLocation onReturnDestination={setWorkspaceReturnDestination} onNavigate={navigateToWorkspace} />
-      </div>
-
-      <div data-layout-region="canvas-top-chrome"
-        style={{ position: 'absolute', top: kernelUp ? 16 : 48, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
-        <PeerAvatars />
-        <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
-        <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
-          <Icon name="refresh" size={13} /> Rerun all
-        </Button>
-        <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
-          <Icon name="link" size={13} /> Share
-        </Button>
-        {/* Settings lives in the app menu (top-left); identity + log out live on the files shell —
-            no redundant Settings button / account avatar here. */}
       </div>
       {settingsOpen && <SettingsModal onClose={closeSettings} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
@@ -223,7 +221,7 @@ function CanvasInboxIndicator({ count }: { count: number }) {
   </button>
 }
 
-function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
+export function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const [open, setOpen] = useState(false)
   const doc = useStore((s) => s.doc)
   const files = useStore((s) => s.files)
@@ -244,9 +242,11 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
       <DropdownMenuTrigger asChild>
         <button
           data-testid="file-menu"
-          className="inline-flex cursor-pointer items-center gap-1 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-semibold text-foreground"
+          title={doc.name ?? 'untitled'}
+          className="inline-flex min-w-0 cursor-pointer items-center gap-1 overflow-hidden rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-semibold text-foreground"
         >
-          {doc.name ?? 'untitled'} <span className="text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
+          <span className="min-w-0 truncate">{doc.name ?? 'untitled'}</span>
+          <span className="shrink-0 text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[240px]">
