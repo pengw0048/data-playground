@@ -85,6 +85,18 @@ function jobPhase(item: WorkspaceJobDto): string | null {
   return null
 }
 
+function managedWriteRevisionReceipt(
+  item: WorkspaceJobDto,
+  committed: WorkspaceJobDto['outputs'],
+): WriteReceipt | null {
+  const receipt = item.outputReceipt
+    ?? committed.find((output) => output.writeReceipt)?.writeReceipt
+  return receipt && (
+    receipt.publication.provider === 'managed-local-file'
+    || receipt.publication.provider === 'managed-local-lance'
+  ) ? receipt : null
+}
+
 export function JobsView() {
   const jobsQuery = useStore((state) => state.jobsQuery)
   const setJobsQuery = useStore((state) => state.setJobsQuery)
@@ -446,6 +458,7 @@ function Filter({ label, name, value, onChange, placeholder }: { label: string; 
 function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
+  const publishedRevision = managedWriteRevisionReceipt(item, committed)
   const rows = item.rows ?? item.profile?.rowCount ?? null
   const phase = jobPhase(item)
   const report = item.distributionReport
@@ -461,11 +474,12 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
     : item.status === 'failed' ? 'Failed'
       : item.status === 'cancelled' ? 'Cancelled'
         : item.cancelRequested ? 'Cancellation requested'
-          : committed.length ? `${committed.length} output${committed.length === 1 ? '' : 's'} published`
-            : item.status === 'done' ? 'Completed'
-              : item.externalWait ? 'Waiting for external work'
-                : item.status === 'queued' ? 'Queued'
-                  : 'In progress'
+          : publishedRevision ? 'Dataset revision published'
+            : committed.length ? `${committed.length} output${committed.length === 1 ? '' : 's'} retained`
+              : item.status === 'done' ? 'Completed'
+                : item.externalWait ? 'Waiting for external work'
+                  : item.status === 'queued' ? 'Queued'
+                    : 'In progress'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
@@ -501,9 +515,9 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
             {item.mergeColumns && <div><strong>Column merge:</strong> {readable(item.mergeColumns.phase)} · candidate {item.mergeColumns.candidate}{item.mergeColumns.reused ? ' (reused)' : ''}{item.mergeColumns.candidateRows != null ? ` · ${item.mergeColumns.candidateRows.toLocaleString()} rows` : ''}{item.mergeColumns.diagnosticCode ? ` · ${item.mergeColumns.diagnosticCode}` : ''}</div>}
             <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
             {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
-            {item.outputReceipt && <ExactRevisionReceipt receipt={item.outputReceipt} />}
             {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="w-fit rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
           </>}
+          {publishedRevision && <ExactRevisionReceipt receipt={publishedRevision} />}
         </div>
       </details>
     </div>}
