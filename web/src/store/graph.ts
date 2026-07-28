@@ -1835,6 +1835,9 @@ export const useStore = create<Store>((set, get) => ({
 
   updateConfig: (id, patch) => {
     if (!roleCanEdit(get().canvasRole)) return
+    // A metadata request launched for the previous configuration must not repopulate the size or
+    // schema we clear below while the debounced refresh for this edit is still waiting to start.
+    _schemaSeq += 1
     // coalesced undo checkpoint: one per editing burst (new node, or >700ms idle) so a param
     // edit is its own undo step instead of discarding an unrelated earlier change.
     const now = performance.now()
@@ -1874,6 +1877,9 @@ export const useStore = create<Store>((set, get) => ({
       const runs = invalidateWriteAdmissions(
         s.doc, s.runs, [id, ...stale],
       )
+      const sizes = Object.fromEntries(
+        Object.entries(s.sizes).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
+      )
       // A Source picker registration changes the durable catalog identity even when its URI stays
       // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
       // the next Run re-estimates against the new registration instead of caching the old refusal.
@@ -1889,7 +1895,7 @@ export const useStore = create<Store>((set, get) => ({
           }
         }
       }
-      return { doc: { ...s.doc, nodes, edges }, runs }
+      return { doc: { ...s.doc, nodes, edges }, runs, sizes }
     })
   },
 
