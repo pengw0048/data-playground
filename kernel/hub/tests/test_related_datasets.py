@@ -176,6 +176,32 @@ def test_confirm_is_one_canvas_cas_and_stale_canvas_or_dataset_changes_nothing(t
         "how": "left",
     }
 
+    parameter_canvas_id = f"related-parameter-{token}"
+    parameter_canvas = {
+        **original,
+        "id": parameter_canvas_id,
+        "parameters": [{"name": "runtime_dataset", "type": "dataset", "required": True}],
+        "nodes": [{
+            **original["nodes"][0],
+            "data": {
+                **original["nodes"][0]["data"],
+                "config": {
+                    **original["nodes"][0]["data"]["config"],
+                    "datasetRef": {"parameterRef": "runtime_dataset"},
+                },
+            },
+        }],
+    }
+    assert client.post("/api/canvas", json=parameter_canvas).status_code == 200
+    parameter_attempt = client.post(
+        f"/api/canvas/{parameter_canvas_id}/join-with-related", json=body)
+    assert parameter_attempt.status_code == 409
+    assert "parameter-bound Source" in parameter_attempt.text
+    persisted_parameter = client.get(f"/api/canvas/{parameter_canvas_id}").json()
+    assert persisted_parameter["version"] == 1
+    assert len(persisted_parameter["nodes"]) == 1
+    assert persisted_parameter["edges"] == []
+
     confirmed = client.post(f"/api/canvas/{canvas_id}/join-with-related", json=body)
     assert confirmed.status_code == 200, confirmed.text
     result = confirmed.json()
@@ -428,10 +454,15 @@ def test_source_admission_and_typed_targets_never_fall_back_to_display_identity(
         "datasetRef": {"kind": "as_of", "resolved": {"revisionId": "provider-as-of"}},
     })
     assert (provider_as_of.revision_mode, provider_as_of.revision_id) == ("exact", "provider-as-of")
-    assert source_identity_from_config(catalog, {
+    for parameter_config in ({
+        "registrationId": table.registration_id,
+        "datasetRef": {"parameterRef": "runtime_dataset"},
+    }, {
         "providerMountId": "mount-a", "providerSourceBindingId": "a" * 32,
-        "datasetRef": {"parameterRef": "revision"},
-    }).revision_mode == "current"
+        "datasetRef": {"parameterRef": "runtime_dataset"},
+    }):
+        with pytest.raises(ValueError, match="parameter-bound Source"):
+            source_identity_from_config(catalog, parameter_config)
 
     with pytest.raises(ValueError):
         from hub.models import RelatedDatasetIdentity

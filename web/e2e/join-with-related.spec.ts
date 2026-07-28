@@ -94,6 +94,30 @@ async function unregisterTable(request: APIRequestContext, table: { id: string, 
 }
 
 test.describe('Join with related data', () => {
+  test('an open related-data dialog blocks the Canvas Delete shortcut', async ({ page }) => {
+    const source = await catalogTable(page.request, 'events')
+    const canvasId = `join-related-modal-${Date.now()}`
+    try {
+      await seedSourceCanvas(page, canvasId, source)
+      await page.locator('.react-flow__node[data-id="selected-source"]').click()
+      await expect(page.getByTestId('join-with-related-selected-source')).toBeVisible()
+      await page.getByTestId('join-with-related-canvas-selected-source').click()
+      const dialog = page.getByRole('dialog', { name: 'Join with related data' })
+      await expect(dialog).toBeVisible()
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).focus()
+      await page.keyboard.press('Delete')
+
+      await expect(dialog).toBeVisible()
+      await expect(page.locator('.react-flow__node[data-id="selected-source"]')).toBeVisible()
+      const unchanged = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
+      expect(unchanged.version).toBe(1)
+      expect(unchanged.nodes).toHaveLength(1)
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
   test('declared review cancellation leaves the Canvas untouched', async ({ page }) => {
     test.setTimeout(45_000)
     const left = await catalogTable(page.request, 'events')
@@ -181,7 +205,7 @@ test.describe('Join with related data', () => {
       leftColumns: ['user_id'],
       rightUri: '',
       rightColumns: ['id'],
-      cardinality: '1:1',
+      cardinality: '1:N',
       confidence: 'declared',
     }
     writeFileSync(sourcePath, 'user_id,value\n1,source\n2,source-2\n')
@@ -208,7 +232,16 @@ test.describe('Join with related data', () => {
       await expect(page.getByTestId('join-with-related-empty-join')).toHaveCount(0)
       await page.getByPlaceholder('Dataset, column, tag…').fill(target.name)
       await page.getByRole('button', { name: new RegExp(target.name, 'i') }).click()
-      await expect(page.getByText('user_id = id')).toBeVisible()
+      const review = page.getByRole('dialog', { name: 'Join with related data' })
+      await expect(review.getByText('a.id = b.user_id')).toBeVisible()
+      await expect(review.getByText('N:1', { exact: true })).toBeVisible()
+      await review.getByLabel('Join type').selectOption('left')
+      await expect(review.getByTestId('related-join-behavior'))
+        .toHaveText(`Keeps every row from left input (a): ${target.name}.`)
+      await review.getByLabel('Join type').selectOption('right')
+      await expect(review.getByTestId('related-join-behavior'))
+        .toHaveText(`Keeps every row from right input (b): ${source.name}.`)
+      await review.getByLabel('Join type').selectOption('inner')
       await page.getByTestId('confirm-related-join').click()
 
       await expect(page.locator('.react-flow__node')).toHaveCount(3)

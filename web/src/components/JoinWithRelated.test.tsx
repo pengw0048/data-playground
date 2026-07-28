@@ -247,6 +247,20 @@ describe('JoinWithRelated', () => {
     await waitFor(() => expect(opener).toHaveFocus())
   })
 
+  it('uses the Canvas modal shortcut-isolation contract and ignores Delete', async () => {
+    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Join with related data' }))
+    await screen.findByText('Declared and proven references')
+    const dialog = screen.getByRole('dialog', { name: 'Join with related data' })
+    expect(dialog.parentElement).toHaveClass('dp-modal-overlay')
+    const cancel = screen.getByRole('button', { name: 'Cancel', exact: true })
+    cancel.focus()
+    fireEvent.keyDown(cancel, { key: 'Delete' })
+    expect(dialog).toBeVisible()
+    expect(mocks.confirm).not.toHaveBeenCalled()
+    expect(mocks.loadDoc).not.toHaveBeenCalled()
+  })
+
   it('preserves an existing local exact Source identity for review', async () => {
     mocks.state.doc.nodes[0].data.config.datasetRef = {
       kind: 'exact', datasetId: 'reg-events', revisionId: 'source-v4',
@@ -271,6 +285,17 @@ describe('JoinWithRelated', () => {
     expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
   })
 
+  it('hides both Canvas and Inspector actions for a parameter-bound Source', () => {
+    mocks.state.doc.nodes[0].data.config.datasetRef = { parameterRef: 'runtime_dataset' }
+    const { unmount } = render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
+    unmount()
+
+    render(<JoinWithRelated nodeId="source-1" />)
+    expect(screen.queryByTestId('join-with-related-source-1')).toBeNull()
+    expect(mocks.related).not.toHaveBeenCalled()
+  })
+
   it('labels the empty side of a one-input Join without guessing a missing port', () => {
     mocks.state.doc.nodes.push({
       id: 'join-1', type: 'join', position: { x: 200, y: 0 },
@@ -288,5 +313,50 @@ describe('JoinWithRelated', () => {
     mocks.state.doc.edges[0].targetHandle = null
     render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
     expect(screen.queryByTestId('join-with-related-canvas-join-1')).toBeNull()
+  })
+
+  it('orients datasets, keys, cardinality, and join behavior to the actual a/b ports', async () => {
+    const swappedPage = {
+      ...page,
+      candidates: [{
+        ...page.candidates[0],
+        cardinality: '1:N',
+        cardinalityState: 'available',
+        warning: 'This join may multiply rows; inspect the resulting Join analysis before running.',
+      }],
+      truncated: false,
+      refinementRequired: false,
+    }
+    mocks.related.mockResolvedValueOnce(swappedPage)
+    mocks.state.doc.nodes.push({
+      id: 'join-1', type: 'join', position: { x: 200, y: 0 },
+      data: { title: 'join', status: 'draft', config: {} },
+    })
+    mocks.state.doc.edges = [{
+      id: 'source-to-right', source: 'source-1', target: 'join-1',
+      sourceHandle: 'out', targetHandle: 'b',
+    }]
+
+    render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Join with related data on left input' }))
+    await screen.findByText('Declared and proven references')
+    expect(screen.getByText('a.id = b.user_id')).toBeVisible()
+    expect(screen.getByText('N:1')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: /users/ }))
+
+    expect(screen.getByText('Left input (a)').parentElement).toHaveTextContent('users')
+    expect(screen.getByText('Left input (a)').parentElement).toHaveTextContent('Related dataset')
+    expect(screen.getByText('Right input (b)').parentElement).toHaveTextContent('events')
+    expect(screen.getByText('Right input (b)').parentElement).toHaveTextContent('Selected dataset')
+    expect(screen.getByText('a.id = b.user_id')).toBeVisible()
+    expect(screen.getByText('N:1')).toBeVisible()
+    expect(screen.getByText(/left input \(a\) fans out/)).toBeVisible()
+
+    fireEvent.change(screen.getByLabelText('Join type'), { target: { value: 'left' } })
+    expect(screen.getByTestId('related-join-behavior'))
+      .toHaveTextContent('Keeps every row from left input (a): users.')
+    fireEvent.change(screen.getByLabelText('Join type'), { target: { value: 'right' } })
+    expect(screen.getByTestId('related-join-behavior'))
+      .toHaveTextContent('Keeps every row from right input (b): events.')
   })
 })

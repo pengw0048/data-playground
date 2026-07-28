@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
 import type { DatasetRevisionPage, RelatedDatasetCandidate, RelatedDatasetPage } from '../types/api'
-import { datasetRefIdentity, type DatasetRef } from '../types/graph'
+import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -23,8 +23,49 @@ const CARDINALITY_TONE: Record<string, string> = {
   unknown: 'bg-muted text-muted-foreground',
 }
 
+function orientedJoinFacts(candidate: RelatedDatasetCandidate, swapInputs: boolean) {
+  const cardinality = swapInputs
+    ? candidate.cardinality === '1:N' ? 'N:1'
+      : candidate.cardinality === 'N:1' ? '1:N'
+        : candidate.cardinality
+    : candidate.cardinality
+  return {
+    leftColumns: swapInputs ? candidate.rightColumns : candidate.leftColumns,
+    rightColumns: swapInputs ? candidate.leftColumns : candidate.rightColumns,
+    cardinality,
+  }
+}
+
+function qualifiedColumns(side: 'a' | 'b', columns: string[]) {
+  return columns.map((column) => `${side}.${column}`).join(' + ')
+}
+
+function fanoutWarning(cardinality: RelatedDatasetCandidate['cardinality']): string | null {
+  if (cardinality === '1:N') {
+    return 'This join is 1:N: right input (b) fans out, so joined rows may multiply.'
+  }
+  if (cardinality === 'N:1') {
+    return 'This join is N:1: left input (a) fans out, so joined rows may multiply.'
+  }
+  if (cardinality === 'N:M') {
+    return 'This join is N:M: both inputs fan out, so joined rows may multiply.'
+  }
+  return null
+}
+
+function joinTypeMeaning(
+  how: 'inner' | 'left' | 'right' | 'outer',
+  leftName: string,
+  rightName: string,
+) {
+  if (how === 'left') return `Keeps every row from left input (a): ${leftName}.`
+  if (how === 'right') return `Keeps every row from right input (b): ${rightName}.`
+  if (how === 'outer') return 'Keeps rows from both inputs, including unmatched rows.'
+  return 'Keeps only rows that match across left input (a) and right input (b).'
+}
+
 function exactLabel(ref: DatasetRef | undefined, fallback: string) {
-  if (!ref || 'parameterRef' in ref) return fallback
+  if (!ref) return fallback
   const exact = ref.kind === 'as_of' ? ref.resolved : ref
   return `${exact.datasetId}@${exact.revisionId}`
 }
@@ -59,9 +100,10 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const sourceIdentity = useMemo(() => {
     const config = context?.source.data.config
     if (!config) return null
+    const ref = config.datasetRef as DatasetRef | { parameterRef: string } | undefined
+    if (isParameterRef(ref)) return null
     if (typeof config.registrationId === 'string' && config.registrationId) {
-      const ref = config.datasetRef as DatasetRef | undefined
-      const exact = ref && !('parameterRef' in ref) ? datasetRefIdentity(ref) : null
+      const exact = ref ? datasetRefIdentity(ref) : null
       return {
         kind: 'local' as const, registrationId: config.registrationId,
         revisionMode: exact ? 'exact' as const : 'current' as const,
@@ -70,8 +112,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     }
     if (typeof config.providerMountId === 'string' && config.providerMountId
         && typeof config.providerSourceBindingId === 'string' && config.providerSourceBindingId) {
-      const ref = config.datasetRef as DatasetRef | undefined
-      const exact = ref && !('parameterRef' in ref) ? datasetRefIdentity(ref) : null
+      const exact = ref ? datasetRefIdentity(ref) : null
       return {
         kind: 'provider' as const, mountId: config.providerMountId,
         sourceBindingId: config.providerSourceBindingId,
@@ -317,6 +358,23 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const exactRevisionPending = Boolean(requestedRevisionId && requestedRevisionId !== reviewedRevisionId)
   const declared = page?.candidates.filter((item) => item.evidence !== 'schema_match') ?? []
   const inferred = page?.candidates.filter((item) => item.evidence === 'schema_match') ?? []
+  const sourceOnRight = context.emptyPort === 'a'
+  const oriented = candidate ? orientedJoinFacts(candidate, sourceOnRight) : null
+  const sourceReview = {
+    name: page?.sourceName ?? context.source.data.title,
+    identity: exactLabel(selectedRef, sourceFallback),
+    role: 'Selected dataset',
+  }
+  const relatedReview = candidate ? {
+    name: candidate.name,
+    identity: candidateIdentity,
+    role: 'Related dataset',
+  } : null
+  const leftReview = sourceOnRight ? relatedReview : sourceReview
+  const rightReview = sourceOnRight ? sourceReview : relatedReview
+  const reviewWarning = oriented
+    ? fanoutWarning(oriented.cardinality) ?? candidate?.warning ?? candidate?.cardinalityReason
+    : null
   const triggerLabel = surface === 'canvas'
     ? context.joinNodeId
       ? `Join with related data on ${context.emptyPort === 'a' ? 'left' : 'right'} input`
@@ -336,7 +394,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
         }}>
         {triggerLabel}
       </Button>
-      {open && createPortal(<div className="fixed inset-0 z-[80] grid place-items-center bg-black/40 p-4"
+      {open && createPortal(<div className="dp-modal-overlay fixed inset-0 z-[80] grid place-items-center bg-black/40 p-4"
         onMouseDown={(event) => { if (event.target === event.currentTarget && !confirming) close() }}>
         <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Join with related data"
           className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
@@ -371,12 +429,12 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                 No related datasets in this search/folder scope.
               </div>}
               {!loading && declared.length > 0 && <CandidateGroup title="Declared and proven references"
-                candidates={declared} onSelect={(item) => {
+                candidates={declared} swapInputs={sourceOnRight} onSelect={(item) => {
                   setCandidate(item); setCandidateBase(item)
                   setRequestedRevisionId(item.identity.revisionMode === 'exact' ? item.identity.revisionId ?? '' : '')
                 }} />}
               {!loading && inferred.length > 0 && <CandidateGroup title="Inferred candidates"
-                candidates={inferred} onSelect={(item) => {
+                candidates={inferred} swapInputs={sourceOnRight} onSelect={(item) => {
                   setCandidate(item); setCandidateBase(item)
                   setRequestedRevisionId(item.identity.revisionMode === 'exact' ? item.identity.revisionId ?? '' : '')
                 }} />}
@@ -393,18 +451,19 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                 ref={reviewFocusRef}
                 onClick={() => { setCandidate(null); setCandidateBase(null); setRequestedRevisionId(''); setError('') }}>← Back to candidates</button>
               <div className="grid gap-2 rounded-md border border-border bg-muted/20 p-3 text-[11px]">
-                <ReviewIdentity label="Selected dataset" name={page?.sourceName ?? context.source.data.title}
-                  identity={exactLabel(selectedRef, sourceFallback)} />
-                <ReviewIdentity label="Related dataset" name={candidate.name} identity={candidateIdentity} />
+                {leftReview && <ReviewIdentity label="Left input (a)" {...leftReview} />}
+                {rightReview && <ReviewIdentity label="Right input (b)" {...rightReview} />}
                 <div className="grid grid-cols-[120px_1fr] gap-2">
                   <span className="text-muted-foreground">Evidence</span>
                   <span>{EVIDENCE_LABEL[candidate.evidence]} · {candidate.reason}</span>
                   <span className="text-muted-foreground">Keys</span>
-                  <span className="font-mono">{candidate.leftColumns.join(' + ')} = {candidate.rightColumns.join(' + ')}</span>
+                  <span className="font-mono">
+                    {qualifiedColumns('a', oriented!.leftColumns)} = {qualifiedColumns('b', oriented!.rightColumns)}
+                  </span>
                   <span className="text-muted-foreground">Cardinality</span>
-                  <span><span className={cn('rounded px-1.5 py-0.5 font-semibold', CARDINALITY_TONE[candidate.cardinality])}>
-                    {candidate.cardinality}
-                  </span>{candidate.cardinality === 'unknown' && ' — not verified; selectable with caution'}</span>
+                  <span><span className={cn('rounded px-1.5 py-0.5 font-semibold', CARDINALITY_TONE[oriented!.cardinality])}>
+                    {oriented!.cardinality}
+                  </span>{oriented!.cardinality === 'unknown' && ' — not verified; selectable with caution'}</span>
                   <span className="text-muted-foreground">Version</span>
                   <span>
                     <select aria-label="Related dataset version"
@@ -436,10 +495,14 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                     className="h-7 rounded border border-border bg-background px-2">
                     {['inner', 'left', 'right', 'outer'].map((item) => <option key={item}>{item}</option>)}
                   </select>
+                  <span className="text-muted-foreground">Join behavior</span>
+                  <span data-testid="related-join-behavior">
+                    {joinTypeMeaning(how, leftReview!.name, rightReview!.name)}
+                  </span>
                 </div>
               </div>
-              {(candidate.warning || candidate.cardinalityReason) && <div className="mt-3 rounded border border-amber-300/60 bg-amber-50 p-2 text-[11px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                ⚠ {candidate.warning ?? candidate.cardinalityReason}
+              {reviewWarning && <div className="mt-3 rounded border border-amber-300/60 bg-amber-50 p-2 text-[11px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                ⚠ {reviewWarning}
               </div>}
               {error && <div role="alert" className="mt-3 rounded border border-destructive/30 p-2 text-[11px] text-destructive">
                 {error}
@@ -465,35 +528,48 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   )
 }
 
-function CandidateGroup({ title, candidates, onSelect }: {
+function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
   title: string
   candidates: RelatedDatasetCandidate[]
+  swapInputs: boolean
   onSelect: (candidate: RelatedDatasetCandidate) => void
 }) {
   return <section className="mt-4">
     <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
     <div className="grid gap-1.5">
-      {candidates.map((candidate) => <button type="button"
-        key={candidate.identity.registrationId ?? candidate.identity.sourceBindingId}
-        onClick={() => onSelect(candidate)}
-        className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent">
-        <span className="min-w-0">
-          <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
-          <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
-          <span className="block truncate font-mono text-[10px] text-muted-foreground">
-            {candidate.leftColumns.join('+')} = {candidate.rightColumns.join('+')}
+      {candidates.map((candidate) => {
+        const oriented = orientedJoinFacts(candidate, swapInputs)
+        return <button type="button"
+          key={candidate.identity.registrationId ?? candidate.identity.sourceBindingId}
+          onClick={() => onSelect(candidate)}
+          className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent">
+          <span className="min-w-0">
+            <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
+            <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
+            <span className="block truncate font-mono text-[10px] text-muted-foreground">
+              {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
+            </span>
           </span>
-        </span>
-        <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
-          CARDINALITY_TONE[candidate.cardinality])}>{candidate.cardinality}</span>
-      </button>)}
+          <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
+            CARDINALITY_TONE[oriented.cardinality])}>{oriented.cardinality}</span>
+        </button>
+      })}
     </div>
   </section>
 }
 
-function ReviewIdentity({ label, name, identity }: { label: string; name: string; identity: string }) {
+function ReviewIdentity({ label, name, identity, role }: {
+  label: string
+  name: string
+  identity: string
+  role: string
+}) {
   return <div className="grid grid-cols-[120px_1fr] gap-2">
     <span className="text-muted-foreground">{label}</span>
-    <span><strong>{name}</strong><span className="mt-0.5 block break-all font-mono text-[10px] text-muted-foreground">{identity}</span></span>
+    <span>
+      <strong>{name}</strong>
+      <span className="ml-1.5 text-[9.5px] text-muted-foreground">{role}</span>
+      <span className="mt-0.5 block break-all font-mono text-[10px] text-muted-foreground">{identity}</span>
+    </span>
   </div>
 }
