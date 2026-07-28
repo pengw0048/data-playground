@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { PreviewDetails, PreviewProvenance, PreviewSummary } from './PreviewPresentation'
+import {
+  editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary,
+} from './PreviewPresentation'
 import type { SampleResult } from '../types/api'
 
 const preview = (overrides: Partial<SampleResult> = {}): SampleResult => ({
@@ -37,6 +39,48 @@ describe('Preview presentation', () => {
 
     expect(screen.getByText('Random sample · 50 rows · seed 42')).toBeInTheDocument()
     expect(screen.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toBeInTheDocument()
+  })
+
+  it('removes the input-cap warning only for a complete retained editor input within the cap', () => {
+    const data = preview({
+      limitScope: 'each-source', limitReason: 'preview-scan', rowLimit: 2_000,
+      editorTestInput: { runId: 'run-1', nodeId: 'sample', portId: 'out', label: 'Editor sample', rows: 1_000 },
+    })
+    render(<PreviewSummary data={data} suppressSourceCapWarning={editorInputFitsPreviewCap(data)} />)
+
+    expect(editorInputFitsPreviewCap(data)).toBe(true)
+    expect(screen.queryByText(/Preview uses up to 2,000 rows from each input/)).not.toBeInTheDocument()
+  })
+
+  it('keeps limitations for unknown or capped retained editor inputs and for output windows', () => {
+    const unknownInput = preview({
+      limitScope: 'each-source', limitReason: 'preview-scan', rowLimit: 2_000,
+      editorTestInput: { runId: 'run-1', nodeId: 'sample', portId: 'out', label: 'Editor sample' },
+    })
+    const cappedInput = {
+      ...unknownInput,
+      editorTestInput: { ...unknownInput.editorTestInput!, rows: 2_001 },
+    }
+    const outputWindow = {
+      ...unknownInput,
+      completeness: 'capped' as const,
+      limitScope: 'result-window' as const,
+      limitReason: 'interactive-row-budget' as const,
+      editorTestInput: { ...unknownInput.editorTestInput!, rows: 1_000 },
+    }
+    const { rerender } = render(
+      <PreviewSummary data={unknownInput} suppressSourceCapWarning={editorInputFitsPreviewCap(unknownInput)} />,
+    )
+
+    expect(editorInputFitsPreviewCap(unknownInput)).toBe(false)
+    expect(screen.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toBeInTheDocument()
+
+    rerender(<PreviewSummary data={cappedInput} suppressSourceCapWarning={editorInputFitsPreviewCap(cappedInput)} />)
+    expect(editorInputFitsPreviewCap(cappedInput)).toBe(false)
+    expect(screen.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toBeInTheDocument()
+
+    rerender(<PreviewSummary data={outputWindow} suppressSourceCapWarning={editorInputFitsPreviewCap(outputWindow)} />)
+    expect(screen.getByText('Showing up to 2,000 rows; run the node to inspect the full result.')).toBeInTheDocument()
   })
 
   it('can keep a plain Source to the range while retaining provenance on demand', () => {

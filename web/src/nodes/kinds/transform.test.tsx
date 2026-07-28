@@ -147,6 +147,7 @@ describe('Transform exact processor labels', () => {
     expect(await screen.findByRole('button', { name: 'Upstream result' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Example rows' }))
     expect(screen.getByText('Test only')).toBeInTheDocument()
+    expect(screen.getByText('These rows are used only for this test and are not saved to the Canvas. Edit them, then choose Test code.')).toBeInTheDocument()
     const fixture = screen.getByRole('textbox', { name: 'Example rows JSON' })
     expect(fixture).toHaveValue('[\n  {\n    "value": 1\n  }\n]')
 
@@ -297,7 +298,7 @@ describe('Transform exact processor labels', () => {
         },
       } } } as any)
     })
-    expect(screen.getByRole('status', { name: 'Upstream result ready' })).toHaveTextContent('Test code is available')
+    expect(screen.queryByRole('status', { name: 'Upstream result ready' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
     useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
