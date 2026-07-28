@@ -1085,7 +1085,7 @@ function cancelDetachedProfileJob(job: ProfileJobState | undefined): void {
 
 export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
 
-export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string }
+export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string; nodeIds?: string[] }
 export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
 export interface ToastAction { label: string; onClick: () => void | Promise<unknown> }
 export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string }
@@ -1161,7 +1161,7 @@ interface Store {
   reconnectEdge: (id: string, edge: CanvasEdge) => void
   removeEdge: (id: string) => void
   select: (id: string | null) => void
-  requestNodeReveal: (canvasId: string, nodeId: string) => void
+  requestNodeReveal: (canvasId: string, nodeId: string | string[]) => void
   acknowledgeNodeReveal: (requestId: number) => void
   clearNodeReveal: () => void
   requestViewportFit: (doc?: CanvasDoc) => void
@@ -2047,7 +2047,12 @@ export const useStore = create<Store>((set, get) => ({
   select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
 
   requestNodeReveal: (canvasId, nodeId) => set({
-    nodeRevealRequest: { id: ++_nodeRevealGeneration, canvasId, nodeId },
+    nodeRevealRequest: {
+      id: ++_nodeRevealGeneration,
+      canvasId,
+      nodeId: Array.isArray(nodeId) ? nodeId[0] : nodeId,
+      ...(Array.isArray(nodeId) && nodeId.length > 1 ? { nodeIds: nodeId } : {}),
+    },
   }),
 
   // Acknowledge only the request that actually moved the viewport. If a newer route arrived while

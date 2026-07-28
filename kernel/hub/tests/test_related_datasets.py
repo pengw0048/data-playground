@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub import graph as graph_mod
+from hub import metadb
 from hub.deps import get_deps
 from hub.main import app
 from hub.models import (
@@ -23,6 +24,56 @@ from hub.models import (
 from hub.related_datasets import related_datasets, source_identity_from_config
 
 client = TestClient(app)
+
+
+def _related_footprints_overlap(first: dict, second: dict) -> bool:
+    """Match the conservative related-Join placement footprint and its practical gap."""
+    first_position, second_position = first["position"], second["position"]
+    return (
+        first_position["x"] + 280 > second_position["x"]
+        and second_position["x"] + 280 > first_position["x"]
+        and first_position["y"] + 275 > second_position["y"]
+        and second_position["y"] + 275 > first_position["y"]
+    )
+
+
+def test_related_join_placement_skips_reproduced_and_dense_slots_deterministically():
+    selected = {"id": "selected", "type": "source", "position": {"x": 32, "y": 272}}
+    # This is the reported reproduction: the old fixed Join position covered this Transform.
+    transform = {"id": "transform", "type": "transform", "position": {"x": 384, "y": 272}}
+    dense = {"id": "dense", "type": "write", "position": {"x": 792, "y": 382}}
+    first_source = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    first_join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+    metadb._workspace_related_join_positions([selected, transform], selected, first_source, first_join)
+
+    second_source = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    second_join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+    metadb._workspace_related_join_positions(
+        [selected, transform, dense], selected, second_source, second_join)
+
+    assert first_source["position"] == {"x": 432.0, "y": 572.0}
+    assert first_join["position"] == {"x": 792.0, "y": 382.0}
+    assert second_source["position"] == {"x": 1232.0, "y": 572.0}
+    assert second_join["position"] == {"x": 1592.0, "y": 382.0}
+    for node in (selected, transform):
+        assert not _related_footprints_overlap(first_source, node)
+        assert not _related_footprints_overlap(first_join, node)
+    for node in (selected, transform, dense):
+        assert not _related_footprints_overlap(second_source, node)
+        assert not _related_footprints_overlap(second_join, node)
+
+
+def test_related_join_fill_placement_uses_the_next_free_slot():
+    selected = {"id": "selected", "type": "source", "position": {"x": 80, "y": 180}}
+    join = {"id": "join", "type": "join", "position": {"x": 420, "y": 180}}
+    blocker = {"id": "blocker", "type": "write", "position": {"x": 120, "y": 390}}
+    added = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+
+    metadb._workspace_related_join_positions([selected, join, blocker], join, added, None)
+
+    assert added["position"] == {"x": 720.0, "y": 390.0}
+    for node in (selected, join, blocker):
+        assert not _related_footprints_overlap(added, node)
 
 
 class _UnavailableAdapter:

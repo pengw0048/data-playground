@@ -106,6 +106,36 @@ async function seedOneSidedJoinCanvas(page: Page, canvasId: string, table: Table
     .toHaveAccessibleName(leftInputTrigger)
 }
 
+async function seedPlacementReproductionCanvas(page: Page, canvasId: string, table: Table) {
+  const config = { uri: table.uri, tableId: table.id, registrationId: table.registrationId }
+  const response = await page.request.post('/api/canvas', { data: {
+    id: canvasId,
+    name: 'Related Join placement reproduction',
+    version: 1,
+    nodes: [
+      { id: 'selected-source', type: 'source', position: { x: 32, y: 272 }, data: {
+        title: table.name, status: 'draft', history: [], config,
+      } },
+      { id: 'existing-transform', type: 'transform', position: { x: 384, y: 272 }, data: {
+        title: 'Existing transform', status: 'draft', history: [], config: {},
+      } },
+      { id: 'existing-write', type: 'write', position: { x: 700, y: 272 }, data: {
+        title: 'Existing write', status: 'draft', history: [], config: {},
+      } },
+    ],
+    edges: [],
+  } })
+  expect(response.ok()).toBeTruthy()
+  await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+  await expect(page.locator('.react-flow__node')).toHaveCount(3)
+  await expect(page.getByTestId('join-with-related-canvas-selected-source')).toBeVisible()
+}
+
+function disjoint(first: { x: number, y: number, width: number, height: number }, second: { x: number, y: number, width: number, height: number }) {
+  return first.x + first.width <= second.x || second.x + second.width <= first.x
+    || first.y + first.height <= second.y || second.y + second.height <= first.y
+}
+
 async function unregisterTable(request: APIRequestContext, table: { id: string, registrationId?: string, metadataRevision?: string }) {
   if (!table.registrationId || !table.metadataRevision) return
   await request.delete(`/api/catalog/tables/${encodeURIComponent(table.id)}`, { params: {
@@ -115,6 +145,59 @@ async function unregisterTable(request: APIRequestContext, table: { id: string, 
 }
 
 test.describe('Related data and possible key matches', () => {
+  test('places and reveals a confirmed related Source and Join in the safe desktop Canvas region', async ({ page }) => {
+    test.setTimeout(60_000)
+    const left = await catalogTable(page.request, 'events')
+    const right = await catalogTable(page.request, 'movies')
+    const relation = {
+      leftUri: left.uri,
+      leftColumns: [left.columns[0]?.name ?? 'id'],
+      rightUri: right.uri,
+      rightColumns: [right.columns[0]?.name ?? 'id'],
+      cardinality: '1:1',
+      confidence: 'declared',
+    }
+    expect((await page.request.post('/api/catalog/relationships', { data: relation })).ok()).toBeTruthy()
+    try {
+      for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+        await page.setViewportSize(viewport)
+        const canvasId = `join-related-placement-${viewport.width}-${Date.now()}`
+        try {
+          await seedPlacementReproductionCanvas(page, canvasId, left)
+          await page.getByTestId('join-with-related-canvas-selected-source').click()
+          await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
+          await page.getByTestId('confirm-related-join').click()
+          const inserted = page.locator('.react-flow__node[data-id^="source_related_"], .react-flow__node[data-id^="join_related_"]')
+          await expect(inserted).toHaveCount(2)
+          await expect(async () => {
+            const surface = await page.locator('.react-flow').boundingBox()
+            const boxes = await inserted.evaluateAll((elements) => elements.map((element) => {
+              const box = element.getBoundingClientRect()
+              return { x: box.x, y: box.y, width: box.width, height: box.height }
+            }))
+            const existing = await page.locator('.react-flow__node[data-id="selected-source"], .react-flow__node[data-id="existing-transform"], .react-flow__node[data-id="existing-write"]').evaluateAll((elements) => elements.map((element) => {
+              const box = element.getBoundingClientRect()
+              return { x: box.x, y: box.y, width: box.width, height: box.height }
+            }))
+            expect(surface).not.toBeNull()
+            expect(boxes).toHaveLength(2)
+            for (const box of boxes) {
+              expect(box.x).toBeGreaterThanOrEqual(surface!.x + 196)
+              expect(box.y).toBeGreaterThanOrEqual(surface!.y + 96)
+              expect(box.x + box.width).toBeLessThanOrEqual(surface!.x + surface!.width - 16)
+              expect(box.y + box.height).toBeLessThanOrEqual(surface!.y + surface!.height - 208)
+              for (const other of existing) expect(disjoint(box, other)).toBeTruthy()
+            }
+          }).toPass({ timeout: 5_000 })
+        } finally {
+          await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+        }
+      }
+    } finally {
+      await page.request.post('/api/catalog/relationships/delete', { data: relation })
+    }
+  })
+
   test('an open related-data dialog blocks the Canvas Delete shortcut', async ({ page }) => {
     const source = await catalogTable(page.request, 'events')
     const canvasId = `join-related-modal-${Date.now()}`

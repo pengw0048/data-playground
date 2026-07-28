@@ -304,6 +304,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
       })
       useStore.getState().loadDoc(result.canvas)
       useStore.getState().select(result.joinNodeId)
+      useStore.getState().requestNodeReveal(result.canvas.id, [result.sourceNodeId, result.joinNodeId])
       useStore.getState().pushToast('Added the reviewed Source and Join as one Canvas edit', 'success')
       close()
     } catch (reason) {
