@@ -283,7 +283,8 @@ try:
     def connect(ctx: RunContext[_Ctx], source_id: str, target_id: str,
                 target_handle: str | None = None,
                 source_handle: str | None = None) -> dict:
-        """Connect ports. source_handle is required for a multi-output source; target_handle selects a named input."""
+        """Connect ports. source_handle is required for a multi-output source; target_handle is
+        required for a Join and selects its named `a` or `b` input."""
         try:
             out = graph_ops.connect(ctx.deps.wg, ctx.deps.kdeps.node_specs, _new_id(ctx.deps, "e"),
                                     source_id, target_id, target_handle, source_handle)

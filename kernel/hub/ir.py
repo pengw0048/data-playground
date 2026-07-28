@@ -94,7 +94,7 @@ class IRStep:
     id: str                                  # the node id
     op: str                                  # normalized operator (see _NODE_OP / CLEAN_OPS)
     config: dict                             # RESOLVED, portable config — no DuckDB objects
-    inputs: list[tuple[str, str | None]]     # [(source_node_id, source_handle)] in incoming-edge order
+    inputs: list[tuple[str, str | None]]     # semantic input order (Join a/b), then serialized order
 
 
 @dataclass
@@ -264,7 +264,12 @@ def lower_to_ir(graph: Graph, target_node_id: str | None = None, node_specs: dic
     steps: list[IRStep] = []
     for node in chain:
         op, cfg = _op_and_config(node, node_ir)
-        inputs = [(e.source, e.source_handle) for e in g.incoming(graph, node.id)]
+        edges = (
+            g.join_input_edges(graph, node.id)
+            if node.type == "join"
+            else g.incoming(graph, node.id)
+        )
+        inputs = [(e.source, e.source_handle) for e in edges]
         steps.append(IRStep(id=node.id, op=op, config=cfg, inputs=inputs))
     return CompiledIR(target=target_node_id, steps=steps)
 

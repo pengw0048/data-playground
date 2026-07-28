@@ -66,7 +66,8 @@ class NodeBuilder(Protocol):
 
     `engine` is the `hub.executors.engine.BuildEngine` driving the pass (typed `Any` to avoid a
     runtime import cycle; use `engine.full`, `engine.node_specs`, `engine._view(rel)` etc.). `inputs`
-    are the already-built upstream relations, in incoming-edge order. Return a single `Relation`
+    are the already-built upstream relations, in semantic input order (Join ``a``/``b``; serialized
+    edge order for ordinary multi-input nodes). Return a single `Relation`
     for a single-output node, or `{port_id: Relation}` for a multi-output node — the engine routes by
     the wired `source_handle` (default port id is "out"). Building is LAZY: return relations, don't
     force execution; the runner materializes at the end.

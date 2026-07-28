@@ -214,6 +214,53 @@ def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:
     return [e for e in graph.edges if e.target == node_id]
 
 
+_JOIN_INPUT_PORTS = ("a", "b")
+
+
+def _join_input_errors(graph: Graph, node_id: str) -> list[str]:
+    """Validate the two semantic Join inputs without consulting edge-array order."""
+    by_port: dict[str, list[GraphEdge]] = {port: [] for port in _JOIN_INPUT_PORTS}
+    errors: list[str] = []
+    for edge in incoming(graph, node_id):
+        if edge.target_handle is None:
+            errors.append(
+                f"edge '{edge.id}' must identify Join input 'a' or 'b' on node '{node_id}'"
+            )
+        elif edge.target_handle not in by_port:
+            errors.append(
+                f"edge '{edge.id}' uses unknown target handle '{edge.target_handle}' "
+                f"on node '{node_id}'"
+            )
+        else:
+            by_port[edge.target_handle].append(edge)
+    for port in _JOIN_INPUT_PORTS:
+        edges = by_port[port]
+        if not edges:
+            errors.append(
+                f"Join node '{node_id}' requires exactly one incoming edge on input '{port}'"
+            )
+        elif len(edges) > 1:
+            edge_ids = "', '".join(edge.id for edge in edges)
+            errors.append(
+                f"Join input '{port}' on node '{node_id}' has multiple incoming edges "
+                f"('{edge_ids}')"
+            )
+    return errors
+
+
+def join_input_edges(graph: Graph, node_id: str) -> tuple[GraphEdge, GraphEdge]:
+    """Return a Join's left (``a``) and right (``b``) edges in semantic port order.
+
+    Join operands are named ports, not positions in the serialized edge array. Callers must fail
+    closed when either binding is absent or ambiguous rather than guessing from edge or node IDs.
+    """
+    errors = _join_input_errors(graph, node_id)
+    if errors:
+        raise ValueError("invalid Join inputs: " + "; ".join(errors))
+    by_port = {edge.target_handle: edge for edge in incoming(graph, node_id)}
+    return by_port["a"], by_port["b"]
+
+
 def outgoing(graph: Graph, node_id: str) -> list[GraphEdge]:
     return [e for e in graph.edges if e.source == node_id]
 
@@ -447,9 +494,10 @@ def _port(node: GraphNode, spec, handle: str | None, side: str) -> tuple[str, st
 def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None = None) -> list[str]:
     """Return deterministic errors for graph structure that must never be guessed by an executor.
 
-    A missing target handle selects its conventional primary input; a missing source handle is valid
-    only for a single-output node. An explicit handle must exist. Unknown kinds are left to the
-    unknown-kind gate; registered plugin kinds use the ports from their required NodeSpec.
+    A missing target handle selects its conventional primary input except on Join, whose semantic
+    ``a``/``b`` operands must always be explicit. A missing source handle is valid only for a
+    single-output node. An explicit handle must exist. Unknown kinds are left to the unknown-kind
+    gate; registered plugin kinds use the ports from their required NodeSpec.
     """
     errors: list[str] = []
     nodes: dict[str, GraphNode] = {}
@@ -511,6 +559,10 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
         target_spec = node_specs.get(target.type)
         if target_spec is None:
             continue
+        if target.type == "join":
+            # Join's complete, named two-input contract is checked once below. Do not let the generic
+            # primary-port fallback reinterpret an omitted handle as input ``a``.
+            continue
         input_port = _port(target, target_spec, edge.target_handle, "target")
         if input_port is None:
             if edge.target_handle is None:
@@ -529,6 +581,9 @@ def structural_errors(graph: Graph, node_specs: dict, target_node_id: str | None
             )
         else:
             occupied[key] = edge.id
+    for node in nodes.values():
+        if node.type == "join" and node.type in node_specs:
+            errors.extend(_join_input_errors(graph, node.id))
     return errors
 
 

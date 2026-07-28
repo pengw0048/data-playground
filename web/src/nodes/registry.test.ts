@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { nodeOutputs, portAccepts, portMulti, portWire, register } from './registry'
+import {
+  firstCompatibleInput, nodeOutputs, portAccepts, portMulti, portWire, register,
+} from './registry'
 import type { CanvasNode } from '../types/graph'
+import './kinds/join'
 
 const DummyNode = () => null
 
@@ -41,6 +44,10 @@ describe('nodeOutputs', () => {
 })
 
 describe('port lookup', () => {
+  it('selects the explicit a port when a dataset wire creates a Join', () => {
+    expect(firstCompatibleInput('join', 'dataset')?.id).toBe('a')
+  })
+
   it('requires an exact source handle for multi-output nodes', () => {
     register({
       kind: 'multi-output-port-test', title: 'multi output', category: 'compute', inputs: [],

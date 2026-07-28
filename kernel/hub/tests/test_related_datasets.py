@@ -10,12 +10,14 @@ import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 
+from hub import graph as graph_mod
 from hub.deps import get_deps
 from hub.main import app
 from hub.models import (
     CatalogPage,
     CatalogTable,
     ColumnSchema,
+    Graph,
     Relationship,
 )
 from hub.related_datasets import related_datasets, source_identity_from_config
@@ -210,11 +212,11 @@ def test_confirm_is_one_canvas_cas_and_stale_canvas_or_dataset_changes_nothing(t
             },
         ],
         "edges": [{
-            "id": "left-to-empty-join",
+            "id": "selected-source-to-b",
             "source": "left-source",
             "target": "empty-join",
             "sourceHandle": "out",
-            "targetHandle": "a",
+            "targetHandle": "b",
         }],
     }
     assert client.post("/api/canvas", json=existing_join).status_code == 200
@@ -231,6 +233,17 @@ def test_confirm_is_one_canvas_cas_and_stale_canvas_or_dataset_changes_nothing(t
         node for node in filled_result["canvas"]["nodes"] if node["id"] == "empty-join"
     )
     assert filled_join["data"]["config"]["how"] == "right"
+    persisted_filled = client.get(f"/api/canvas/{existing_join_id}").json()
+    assert persisted_filled == filled_result["canvas"]
+    left_edge, right_edge = graph_mod.join_input_edges(
+        Graph.model_validate(persisted_filled), "empty-join")
+    assert left_edge.source == filled_result["sourceNodeId"]
+    assert right_edge.source == "left-source"
+    analysis = client.post("/api/graph/join-analysis", json={
+        "graph": persisted_filled, "targetNodeId": "empty-join",
+    })
+    assert analysis.status_code == 200, analysis.text
+    assert analysis.json()["suggestions"]
 
     # A current/latest review is deliberately re-evaluated at confirmation; it must not pretend to
     # be an exact revision conflict merely because current catalog metadata advanced.

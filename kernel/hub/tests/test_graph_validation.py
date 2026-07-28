@@ -53,6 +53,48 @@ def test_default_handles_are_normalized_before_single_input_fan_in_check():
     assert errors == ["input 'in' on node 'f' has multiple incoming edges ('ea' and 'eb')"]
 
 
+@pytest.mark.parametrize(("edges", "messages"), [
+    (
+        [_edge("missing", "left", "join")],
+        ("must identify Join input 'a' or 'b'", "requires exactly one incoming edge on input 'a'",
+         "requires exactly one incoming edge on input 'b'"),
+    ),
+    (
+        [_edge("unknown", "left", "join", target_handle="left")],
+        ("unknown target handle 'left'", "requires exactly one incoming edge on input 'a'",
+         "requires exactly one incoming edge on input 'b'"),
+    ),
+    (
+        [_edge("a1", "left", "join", target_handle="a"),
+         _edge("a2", "right", "join", target_handle="a")],
+        ("Join input 'a'", "multiple incoming edges", "requires exactly one incoming edge on input 'b'"),
+    ),
+])
+def test_join_requires_one_explicit_edge_per_semantic_input(
+    edges: list[GraphEdge], messages: tuple[str, ...],
+):
+    graph = _graph(
+        [_node("left", "source"), _node("right", "source"), _node("join", "join")],
+        edges,
+    )
+    errors = graph_mod.structural_errors(graph, SPECS)
+    for message in messages:
+        assert any(message in error for error in errors)
+    with pytest.raises(ValueError, match="invalid Join inputs"):
+        graph_mod.join_input_edges(graph, "join")
+
+
+def test_join_input_edges_use_named_ports_not_serialized_edge_order():
+    left = _edge("left", "left", "join", target_handle="a")
+    right = _edge("right", "right", "join", target_handle="b")
+    graph = _graph(
+        [_node("left", "source"), _node("right", "source"), _node("join", "join")],
+        [right, left],
+    )
+    assert graph_mod.structural_errors(graph, SPECS) == []
+    assert graph_mod.join_input_edges(graph, "join") == (left, right)
+
+
 @pytest.mark.parametrize(("config", "message"), [
     ({"count": "12abc"}, "complete safe integer"),
     ({"count": True}, "complete safe integer"),

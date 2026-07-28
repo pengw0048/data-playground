@@ -78,9 +78,9 @@ def _joined_source_graph(left_uri: str, right_uri: str) -> Graph:
         ],
         "edges": [
             {"id": "left-join", "source": "left", "target": "join",
-             "targetHandle": "left"},
+             "targetHandle": "a"},
             {"id": "right-join", "source": "right", "target": "join",
-             "targetHandle": "right"},
+             "targetHandle": "b"},
         ],
     })
 

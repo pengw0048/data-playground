@@ -76,6 +76,8 @@ def connect(graph: dict, node_specs, edge_id: str, source_id: str, target_id: st
     src, tgt = find_node(graph, source_id), find_node(graph, target_id)
     if not src or not tgt:
         raise GraphOpError("source_id or target_id not found")
+    if tgt.get("type") == "join" and target_handle is None:
+        raise GraphOpError("target_handle 'a' or 'b' is required when connecting a Join")
     port = _target_port(node_specs, tgt.get("type"), target_handle)
     if port is None:
         raise GraphOpError(f"'{tgt.get('type')}' has no input port")
