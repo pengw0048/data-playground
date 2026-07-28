@@ -36,21 +36,27 @@ function haystack(spec: NodeSpec): string[] {
  * context may restrict the same effective registry to specs with an accepting input port. */
 export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType, compatibleOnly = false): FinderResult[] {
   const q = normalized(query)
-  return specs.flatMap((spec) => {
+  const matches = specs.flatMap((spec) => {
     const title = normalized(spec.title)
     const kind = normalized(spec.kind)
-    const match = !q ? 3
+    const match = !q ? 4
       : title === q || kind === q ? 0
-        : title.startsWith(q) || kind.startsWith(q) ? 1
-          : title.includes(q) || kind.includes(q) ? 2
-            : haystack(spec).some((field) => field.includes(q)) ? 3 : -1
+        : title.startsWith(q) ? 1
+          : kind.startsWith(q) ? 2
+            : title.includes(q) || kind.includes(q) ? 3
+              : haystack(spec).some((field) => field.includes(q)) ? 4 : -1
     if (match < 0) return []
     const compatible = !wire || spec.inputs.some((port) => (port.accepts ?? [port.wire]).includes(wire))
     if (compatibleOnly && !compatible) return []
     return [{ spec, compatible, match }]
-  }).sort((a, b) => (
-    Number(b.compatible) - Number(a.compatible)
-    || a.match - b.match
+  })
+  // Once the user has typed a title or kind fragment, registry metadata should not turn the
+  // command palette back into a long browse list. Purpose/category search remains available when
+  // no operation name matches the query.
+  const strongMatches = q ? matches.filter((result) => result.match < 4) : []
+  return (strongMatches.length > 0 ? strongMatches : matches).sort((a, b) => (
+    a.match - b.match
+    || Number(b.compatible) - Number(a.compatible)
     || codePointCompare(normalized(a.spec.title), normalized(b.spec.title))
     || codePointCompare(normalized(a.spec.kind), normalized(b.spec.kind))
   ))
