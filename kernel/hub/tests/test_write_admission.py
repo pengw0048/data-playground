@@ -201,6 +201,29 @@ def _dynamic_transform_schemas():
     }
 
 
+def _execute_managed_write(deps, graph: Graph, admission: WriteAdmission, submission: str):
+    from hub.compiler import compile_plan
+    from hub.plugins.runner import LocalRunner
+
+    assert admission.intent is not None
+    node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    _inject_write_intent(graph, "write", admission.intent)
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, deps.catalog, deps.workspace,
+        node_specs=node_specs, storage=deps.storage)
+    run_id = metadb.local_run_submission_id("researcher", graph.id, submission)
+    status = runner.run(
+        compile_plan(graph, "write", deps.registry, node_specs),
+        graph, "write", "local", run_id=run_id)
+    deadline = time.monotonic() + 3
+    while status.status not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline, status
+        time.sleep(0.01)
+        status = runner.status(run_id)
+    assert runner.wait_for_worker(run_id, timeout=2)
+    return status
+
+
 def test_dynamic_adhoc_transform_admits_runtime_schema_and_publishes_full_schema(
         contract, monkeypatch):
     deps, graph = contract
@@ -317,6 +340,50 @@ def test_runtime_schema_does_not_bypass_resolution_error(contract, monkeypatch):
 
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", "runtime-resolution-error")
+
+    assert admission.intent is None
+    assert admission.blocker is not None and "bounded output schema" in admission.blocker
+
+
+@pytest.mark.parametrize("intermediate", ["library-transform", "select"])
+def test_runtime_schema_requires_a_direct_source_input(
+        contract, monkeypatch, intermediate):
+    deps, base = contract
+    source, write = base.nodes
+    middle = (
+        {"id": "middle", "type": "transform", "data": {"config": {
+            "source": "library", "processor": "missing", "version": "v1",
+        }}}
+        if intermediate == "library-transform"
+        else {"id": "middle", "type": "select", "data": {"config": {"select": "value"}}}
+    )
+    graph = Graph.model_validate({
+        **base.model_dump(by_alias=True),
+        "nodes": [
+            source.model_dump(by_alias=True),
+            middle,
+            {"id": "transform", "type": "transform", "data": {"config": {
+                "source": "adhoc",
+                "code": "def fn(row):\n    return row",
+            }}},
+            write.model_dump(by_alias=True),
+        ],
+        "edges": [
+            {"id": "source-middle", "source": "source", "target": "middle"},
+            {"id": "middle-transform", "source": "middle", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+    known = [ColumnSchema(name="value", type="int")]
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {
+        "source": known,
+        "middle": known if intermediate == "select" else None,
+        "transform": None,
+        "write": None,
+    })
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", f"runtime-indirect-{intermediate}")
 
     assert admission.intent is None
     assert admission.blocker is not None and "bounded output schema" in admission.blocker
@@ -1703,6 +1770,106 @@ def test_runtime_transform_batch_schema_drift_fails_before_publication(contract,
     assert "schema drifted" in (status.error or "")
     assert _managed_publication_counts() == before_publications
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+@pytest.mark.parametrize("case", ["empty-input", "all-skipped"])
+def test_runtime_transform_without_materialized_schema_publishes_nothing(
+        contract, case):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    source = next(node for node in graph.nodes if node.id == "source")
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    if case == "empty-input":
+        pq.write_table(
+            pa.table({"value": pa.array([], type=pa.int64())}),
+            source.data["config"]["uri"],
+        )
+        transform.data["config"]["code"] = (
+            "def fn(row):\n"
+            "    return {'stable_added': str(row['value'])}"
+        )
+    else:
+        transform.data["config"].update({
+            "code": (
+                "def fn(row):\n"
+                "    return {'stable_added': 1 // (row['value'] - row['value'])}"
+            ),
+            "onError": "skip",
+        })
+    submission = f"runtime-no-schema-{case}"
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+    assert admission.intent is not None and admission.intent.schema_mode == "runtime"
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    status = _execute_managed_write(deps, graph, admission, submission)
+
+    assert status.status == "failed"
+    assert "produced no output rows" in (status.error or "")
+    assert "declare an explicit output schema" in (status.error or "")
+    assert metadb.catalog_managed_local_write_head(admission.destination) is None
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_runtime_transform_accepts_an_explicit_typed_zero_row_batch(contract):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"].update({
+        "mode": "map_batches",
+        "batchFormat": "arrow",
+        "code": (
+            "def fn(batch):\n"
+            "    import pyarrow as pa\n"
+            "    return pa.table({'stable_added': pa.array([], type=pa.string())})"
+        ),
+    })
+    submission = "runtime-typed-empty-batch"
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+    assert admission.intent is not None and admission.intent.schema_mode == "runtime"
+
+    status = _execute_managed_write(deps, graph, admission, submission)
+
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None and receipt.rows == 0
+    assert [(column.name, column.type) for column in receipt.schema] == [
+        ("stable_added", "string"),
+    ]
+
+
+def test_declared_transform_schema_can_publish_an_empty_result(contract):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    source = next(node for node in graph.nodes if node.id == "source")
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    pq.write_table(
+        pa.table({"value": pa.array([], type=pa.int64())}),
+        source.data["config"]["uri"],
+    )
+    transform.data["config"].update({
+        "code": (
+            "def fn(row):\n"
+            "    return {'stable_added': str(row['value'])}"
+        ),
+        "outputSchema": [{"name": "stable_added", "type": "string"}],
+    })
+    submission = "declared-empty-transform"
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+    assert admission.intent is not None and admission.intent.schema_mode == "declared"
+
+    status = _execute_managed_write(deps, graph, admission, submission)
+
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None and receipt.rows == 0
+    assert [(column.name, column.type) for column in receipt.schema] == [
+        ("stable_added", "string"),
+    ]
 
 
 def test_precise_library_integer_schema_matches_managed_write_runtime(contract):

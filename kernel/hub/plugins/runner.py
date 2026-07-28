@@ -1696,8 +1696,15 @@ class LocalRunner:
                 if intent.schema_mode == "declared" and intent.expected_schema != actual_schema:
                     raise RuntimeError(
                         "managed local write output schema does not match its declared admission")
-                if intent.schema_mode == "runtime" and not actual_schema:
-                    raise RuntimeError("managed local write full output schema is empty")
+                if intent.schema_mode == "runtime":
+                    transform_id = inc[0].source
+                    if not engine.materialized_transform_schema(transform_id):
+                        raise RuntimeError(
+                            "the Transform produced no output rows, so its output schema could not "
+                            "be determined; declare an explicit output schema to publish an empty "
+                            "result")
+                    if not actual_schema:
+                        raise RuntimeError("managed local write full output schema is empty")
             if admitted is None:
                 actual_schema = relation_columns(parent_rel)
             def write_candidate(candidate_uri: str) -> None:

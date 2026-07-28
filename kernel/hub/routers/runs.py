@@ -774,9 +774,15 @@ def _runtime_schema_write_eligible(graph: Graph, node_id: str, schemas: dict[str
     config = transform.data.get("config", {}) if isinstance(transform.data, dict) else {}
     if not isinstance(config, dict) or config.get("source", "adhoc") != "adhoc":
         return False
-    sources = [node for node in graph_mod.upstream_chain(graph, transform.id)
-               if node.type == "source"]
-    return bool(sources) and all(schemas.get(node.id) is not None for node in sources)
+    transform_inputs = graph_mod.incoming(graph, transform.id)
+    if len(transform_inputs) != 1:
+        return False
+    source = nodes.get(transform_inputs[0].source)
+    return (
+        source is not None
+        and source.type == "source"
+        and schemas.get(source.id) is not None
+    )
 
 
 def _managed_file_schema_drift(
