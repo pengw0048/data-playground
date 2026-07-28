@@ -467,7 +467,11 @@ function DataScopeBanner({ data, offset, unit, scope, showDetails = true, showWa
       <>
         <PreviewSummary data={data} offset={offset} unit={unit} showRange={false}
           showWarning={showWarning} />
-        {showDetails && <PreviewDetails provenance={provenance} />}
+        {showDetails && provenance && (
+          <div className="px-[11px]">
+            <PreviewDetails provenance={provenance} />
+          </div>
+        )}
       </>
     )
   }
