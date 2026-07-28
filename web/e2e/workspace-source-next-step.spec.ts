@@ -1,8 +1,25 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
+async function expectToolbarInsideCanvas(page: Page, viewportWidth: number) {
+  const toolbar = page.getByTestId('toolbar')
+  const canvas = page.locator('.react-flow')
+  const nextStep = page.getByRole('button', { name: 'Add next step', exact: true })
+  const [toolbarBox, canvasBox, nextStepBox] = await Promise.all([
+    toolbar.boundingBox(), canvas.boundingBox(), nextStep.boundingBox(),
+  ])
+  expect(toolbarBox).not.toBeNull()
+  expect(canvasBox).not.toBeNull()
+  expect(nextStepBox).not.toBeNull()
+  expect(toolbarBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
+  expect(toolbarBox!.x + toolbarBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
+  expect(nextStepBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
+  expect(nextStepBox!.x + nextStepBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
+  expect(canvasBox!.x + canvasBox!.width).toBeLessThan(viewportWidth)
+}
+
 test.describe('Workspace Source next-step flow @ux-smoke', () => {
-  test('creates one selected Source and connects Transform at 1280x720', async ({ page }) => {
+  test('keeps the selected Source next-step flow responsive and connects Transform', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await goToWorkspace(page)
 
@@ -16,14 +33,20 @@ test.describe('Workspace Source next-step flow @ux-smoke', () => {
 
     const toolbar = page.getByTestId('toolbar')
     const nextStep = page.getByRole('button', { name: 'Add next step', exact: true })
+    await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
     await expect(nextStep).toBeVisible()
     await expect(nextStep).toContainText('Add next step')
-    const [toolbarBox, nextStepBox] = await Promise.all([toolbar.boundingBox(), nextStep.boundingBox()])
-    expect(toolbarBox).not.toBeNull()
-    expect(nextStepBox).not.toBeNull()
-    expect(toolbarBox!.x).toBeGreaterThanOrEqual(0)
-    expect(toolbarBox!.x + toolbarBox!.width).toBeLessThanOrEqual(1280)
-    expect(nextStepBox!.x + nextStepBox!.width).toBeLessThanOrEqual(1280)
+    await expect(toolbar).toHaveAttribute('data-density', 'compact')
+    await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
+    await expect(toolbar.getByRole('button', { name: 'Fit view' })).toContainText('Fit view')
+    await expectToolbarInsideCanvas(page, 1280)
+
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
+    await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
+    await expect(toolbar.getByRole('button', { name: 'Fit view' })).toContainText('Fit view')
+    await expect(nextStep).toContainText('Add next step')
+    await expectToolbarInsideCanvas(page, 1440)
 
     await nextStep.click()
     const finder = page.getByRole('dialog', { name: 'Add an operation' })
