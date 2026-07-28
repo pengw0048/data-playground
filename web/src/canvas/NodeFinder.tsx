@@ -56,14 +56,14 @@ export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType,
   ))
 }
 
-export function portSummary(spec: NodeSpec): string {
-  const inputs = spec.inputs.map((port) => (port.accepts ?? [port.wire]).join('/')).join(', ') || 'none'
-  const outputs = spec.outputs.map((port) => port.wire).join(', ') || 'none'
-  return `in ${inputs} · out ${outputs}`
-}
-
-function sourceLabel(source?: string): string {
-  return source?.startsWith('plugin:') ? `Plugin · ${source.slice('plugin:'.length)}` : 'Built-in'
+function secondaryCue(result: FinderResult, results: FinderResult[]): string | null {
+  // Registry provenance only earns space when two operations would otherwise look alike.
+  const sameTitle = results.filter((candidate) => normalized(candidate.spec.title) === normalized(result.spec.title))
+  if (sameTitle.length < 2) return null
+  const source = result.spec.source?.startsWith('plugin:')
+    ? `Plugin · ${result.spec.source.slice('plugin:'.length)}`
+    : null
+  return source ?? result.spec.category
 }
 
 export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClose }: {
@@ -96,22 +96,24 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClos
           <input ref={input} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown}
             aria-label="Search operations" placeholder="Search operations, ports, categories…"
             className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground" />
-          {wire && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">accepts {wire}</span>}
+          {compatibleOnly && wire && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">For {wire} output</span>}
           <kbd className="text-[10px] text-muted-foreground">Esc</kbd>
         </div>
         <div role="listbox" aria-label="Matching nodes" className="max-h-[min(480px,66vh)] overflow-y-auto p-1.5">
-          {shownResults.map((result, index) => (
+          {shownResults.map((result, index) => {
+            const cue = secondaryCue(result, shownResults)
+            return (
             <button key={result.spec.kind} role="option" aria-selected={index === active} onMouseEnter={() => setActive(index)} onClick={() => choose(result)}
               className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${index === active ? 'bg-accent' : 'hover:bg-accent/60'}`}>
               <span className="mt-0.5 h-8 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[result.spec.kind] ?? color.text3 }} />
               <span className="min-w-0 flex-1">
-                <span className="flex items-center gap-2"><span className="text-[13px] font-semibold text-foreground">{result.spec.title}</span><span className="text-[10px] text-muted-foreground">{result.spec.kind}</span></span>
+                <span className="text-[13px] font-semibold text-foreground">{result.spec.title}</span>
                 <span className="mt-0.5 block text-[11px] text-muted-foreground">{result.spec.blurb || 'No description.'}</span>
-                <span className="mt-1 block text-[10px] text-muted-foreground">{result.spec.category} · {sourceLabel(result.spec.source)} · {portSummary(result.spec)}</span>
+                {cue && <span className="mt-1 block text-[10px] text-muted-foreground">{cue}</span>}
               </span>
-              {wire && result.compatible && <span className="mt-1 rounded bg-primary/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-primary">compatible</span>}
             </button>
-          ))}
+            )
+          })}
           {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching node.</div>}
           {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
         </div>
