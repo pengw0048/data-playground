@@ -31,7 +31,7 @@ register(
     kind: 'vector-search', title: 'vector-search', category: 'query', tag: 'vector',
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset'] }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false,
-    blurb: 'top-K nearest by cosine similarity',
+    blurb: 'Find the nearest rows to a query vector',
     defaultData: () => ({ title: 'vector-search', status: 'draft', config: { column: 'embedding', k: 10 }, meta: 'top-K nearest' }),
   },
   VectorSearch,

@@ -8462,9 +8462,11 @@ def test_nodespec_frontend_backend_parity():
         kind = re.search(r"\bkind:\s*'([^']+)'", body)
         if not kind:
             continue
+        blurb = re.search(r"\bblurb:\s*'([^']+)'", body)
         fe[kind.group(1)] = {"file": f.name,
                              "inputs": array_ports(body, "inputs"),
-                             "outputs": array_ports(body, "outputs")}
+                             "outputs": array_ports(body, "outputs"),
+                             "blurb": blurb.group(1) if blurb else None}
 
     mismatches = []
     checked = 0
@@ -8479,8 +8481,44 @@ def test_nodespec_frontend_backend_parity():
             mismatches.append(f"{spec.kind} ({card['file']}) inputs: backend {be_in} != frontend {card['inputs']}")
         if be_out != card["outputs"]:
             mismatches.append(f"{spec.kind} ({card['file']}) outputs: backend {be_out} != frontend {card['outputs']}")
+        if spec.blurb != card["blurb"]:
+            mismatches.append(f"{spec.kind} ({card['file']}) blurb: backend {spec.blurb!r} != frontend {card['blurb']!r}")
     assert checked >= 8, f"parser matched too few kinds ({checked}) — frontend format may have changed"
     assert not mismatches, "backend/frontend node-spec drift:\n" + "\n".join(mismatches)
+
+
+def test_builtin_node_blurbs_are_task_first_copy_contract():
+    """Common Add-menu operations lead with the research task, not their implementation."""
+    from hub.nodespecs import BUILTIN_NODE_SPECS
+
+    expected = {
+        "source": "Choose a registered dataset",
+        "sample": "Take a repeatable sample of rows",
+        "filter": "Keep rows that match a condition",
+        "select": "Choose, rename, or derive columns",
+        "transform": "Apply a Python transform to rows",
+        "sql": "Query input datasets with SQL",
+        "join": "Combine two datasets by matching rows",
+        "union": "Stack datasets into one table",
+        "aggregate": "Group rows and calculate summaries — scans all rows",
+        "sort": "Sort rows by selected columns",
+        "dedup": "Remove duplicate rows",
+        "window": "Add rankings, running totals, or comparisons within groups",
+        "fill": "Fill missing values with a chosen value or summary",
+        "unnest": "Expand each list item into its own row — can expand rows",
+        "unpivot": "Turn selected columns into name/value rows — can expand rows",
+        "pivot": "Turn values into columns with summaries — scans all rows",
+        "write": "Save data to a file or managed dataset — scans all rows",
+        "metric": "Calculate one summary value",
+        "assert": "Check every row against a rule — error severity blocks downstream writes",
+        "chart": "Create a chart from selected columns",
+        "vector-search": "Find the nearest rows to a query vector",
+        "section": "Run a workflow with loops or branches",
+    }
+    blurbs = {spec.kind: spec.blurb for spec in BUILTIN_NODE_SPECS}
+    assert blurbs == expected
+    jargon = ("DuckDB", "COALESCE", "UNPIVOT", "hash", "spill", "out-of-core", "ad-hoc cell", "library preset")
+    assert not {kind: blurb for kind, blurb in blurbs.items() if any(word.lower() in blurb.lower() for word in jargon)}
 
 
 def test_password_change_revokes_outstanding_sessions(monkeypatch):

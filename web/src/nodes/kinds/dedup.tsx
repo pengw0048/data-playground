@@ -22,7 +22,7 @@ register(
     kind: 'dedup', title: 'dedup', category: 'shape', tag: 'dedup',
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: true,
-    blurb: 'distinct rows (hash-based, spillable)',
+    blurb: 'Remove duplicate rows',
     defaultData: () => ({ title: 'dedup', status: 'draft', config: { on: '' }, meta: 'distinct rows' }),
   },
   Dedup,

@@ -31,7 +31,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'], multi: true }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'SQL over a table → a queryable view',
+    blurb: 'Query input datasets with SQL',
     defaultData: () => ({ title: 'sql', status: 'draft', config: { sql: DEFAULT_SQL }, meta: 'SQL → view' }),
   },
   Sql,

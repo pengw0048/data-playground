@@ -28,7 +28,7 @@ register(
     kind: 'aggregate', title: 'aggregate', category: 'compute', tag: 'aggregate',
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset'] }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false,
-    blurb: 'group-by aggregation (out-of-core)',
+    blurb: 'Group rows and calculate summaries — scans all rows',
     defaultData: () => ({ title: 'aggregate', status: 'draft', config: { aggs: 'count(*) AS n' }, meta: 'group-by · needs full pass', needsFullPass: true }),
   },
   Aggregate,

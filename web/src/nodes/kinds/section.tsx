@@ -102,7 +102,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'driver script over contained nodes (loops / branches)',
+    blurb: 'Run a workflow with loops or branches',
     defaultData: () => ({ title: 'section', status: 'draft', meta: 'driver script',
       config: { script: DEFAULT_SCRIPT, params: {}, maxRuns: 200, outputs: ['out'] } }),
   },

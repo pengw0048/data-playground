@@ -19,7 +19,7 @@ register(
     kind: 'sort', title: 'sort', category: 'shape', tag: 'sort',
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: true,
-    blurb: 'streaming sort (spills)',
+    blurb: 'Sort rows by selected columns',
     defaultData: () => ({ title: 'sort', status: 'draft', config: { by: '' }, meta: 'streaming sort' }),
   },
   Sort,

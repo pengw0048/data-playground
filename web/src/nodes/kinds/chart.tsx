@@ -50,7 +50,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'visualize a column pair — grouped bar/line, or raw scatter',
+    blurb: 'Create a chart from selected columns',
     defaultData: () => ({ title: 'chart', status: 'draft', config: { chartType: 'bar', agg: 'count' }, meta: 'bar · —' }),
   },
   Chart,

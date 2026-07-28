@@ -2226,6 +2226,33 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
   })
 
+  test('Add menus describe built-in operations by their research task at 1280x720 @ux-smoke', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await fresh(page)
+    const expectedByCategory: Array<[string, string[]]> = [
+      ['Sources & sinks', ['Choose a registered dataset', 'Save data to a file or managed dataset — scans all rows']],
+      ['Shape', [
+        'Take a repeatable sample of rows', 'Keep rows that match a condition', 'Choose, rename, or derive columns',
+        'Sort rows by selected columns', 'Remove duplicate rows', 'Fill missing values with a chosen value or summary',
+        'Expand each list item into its own row — can expand rows', 'Turn selected columns into name/value rows — can expand rows',
+      ]],
+      ['Compute', [
+        'Apply a Python transform to rows', 'Combine two datasets by matching rows', 'Stack datasets into one table',
+        'Group rows and calculate summaries — scans all rows',
+        'Add rankings, running totals, or comparisons within groups',
+        'Turn values into columns with summaries — scans all rows', 'Run a workflow with loops or branches',
+      ]],
+      ['Query', ['Query input datasets with SQL', 'Find the nearest rows to a query vector']],
+      ['Inspect', ['Calculate one summary value', 'Check every row against a rule — error severity blocks downstream writes', 'Create a chart from selected columns']],
+    ]
+
+    for (const [category, blurbs] of expectedByCategory) {
+      await page.getByRole('button', { name: category, exact: true }).click()
+      for (const blurb of blurbs) await expect(page.getByText(blurb, { exact: true })).toBeVisible()
+      await page.keyboard.press('Escape')
+    }
+  })
+
   test('a post-startup local input registers and retries its formal run without restart @ux-smoke', async ({ page }) => {
     const filename = `issue-956-${Date.now()}.parquet`
     const uri = resolve('.e2e-workspace/outputs', filename)
