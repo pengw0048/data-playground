@@ -25,9 +25,12 @@ async function openHistory(page: import('@playwright/test').Page) {
   expect(dataset).toBeTruthy()
   await page.route('**/api/catalog/tables/*/revisions*', (route) =>
     route.fulfill({ json: { items: [REVISION('rev-head'), REVISION('rev-old')], nextCursor: null, hasMore: false } }))
-  await page.route('**/api/catalog/revisions/**', (route) => {
-    const parts = new URL(route.request().url()).pathname.split('/')
-    const revisionId = decodeURIComponent(parts[parts.length - 1])
+  await page.route('**/api/catalog/revision-details', (route) => {
+    expect(route.request().method()).toBe('POST')
+    const body = route.request().postDataJSON() as { datasetId: string; revisionId: string }
+    expect(body.datasetId).toBe('stable-dataset')
+    const revisionId = body.revisionId
+    expect(['rev-head', 'rev-old', 'rev-new']).toContain(revisionId)
     route.fulfill({ json: DETAIL(revisionId, revisionId === 'rev-head' ? 3 : revisionId === 'rev-new' ? 2 : 2) })
   })
   await page.goto('/#/workspace')
@@ -39,7 +42,6 @@ async function openHistory(page: import('@playwright/test').Page) {
 
 test('restores an old revision as a new head and reopens the exact result', async ({ page }) => {
   await openHistory(page)
-  // Registered last so it wins over the detail route for the restore POST url.
   await page.route('**/api/catalog/revisions/*/*/restore', (route) =>
     route.fulfill({ json: {
       taskId: 'restore-task', status: 'done', sourceDatasetId: 'stable-dataset',

@@ -321,3 +321,40 @@ def test_route_sanitizes_dynamic_lookup_schema_and_descriptor_failures(
     assert response.status_code == status
     assert response.json() == body
     assert "super-secret" not in response.text
+
+
+def test_media_body_route_preserves_slash_bearing_opaque_identity(monkeypatch):
+    from hub.plugins import adapters as plugin_adapters
+    from hub.routers import catalog as catalog_routes
+
+    dataset_id = "luma-data-api://table/1530"
+    revision_id = "luma-data-exact://table/1530/revision/2/identity/73cb"
+    physical = _Adapter()
+    logical_uri = "workspace-provider://canonical"
+    bound = _BoundProviderDatasetAdapter(logical_uri, "provider://physical", physical)
+    monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
+    monkeypatch.setattr(
+        catalog_routes, "_revision_binding_for_dataset_id",
+        lambda value: {"dataset_id": value, "uri": logical_uri},
+    )
+    monkeypatch.setattr(
+        plugin_adapters, "managed_local_file_revision_adapter", lambda _uri: None)
+    monkeypatch.setattr(catalog_routes, "_revision_adapter", lambda _uri: bound)
+    monkeypatch.setattr(
+        catalog_routes, "get_deps", lambda: SimpleNamespace(storage=None))
+
+    response = TestClient(app).post(
+        "/api/catalog/revision-media-cell",
+        headers={"X-DP-User": "media-adapter-contract"},
+        json={
+            "datasetId": dataset_id, "revisionId": revision_id,
+            "identity": [{"name": "id", "arrowType": "int32", "value": "7"}],
+            "column": "media",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == PNG
+    assert physical.calls[0] == ("supports", ("provider://physical", revision_id))
+    assert physical.calls[1][0] == "read"
+    assert physical.calls[1][1][1].revision_id == revision_id

@@ -138,8 +138,12 @@ test('browses and opens one exact retained dataset revision without drifting to 
       : { items: [{ datasetId: 'stable-dataset', revisionId: 'rev-2', committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' }], nextCursor: 'opaque-page-2', hasMore: true },
     })
   })
-  await page.route('**/api/catalog/revisions/**', async (route) => {
-    const revisionId = decodeURIComponent(new URL(route.request().url()).pathname.split('/').pop()!)
+  await page.route('**/api/catalog/revision-details', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    const body = route.request().postDataJSON() as { datasetId: string; revisionId: string }
+    expect(body.datasetId).toBe('stable-dataset')
+    const revisionId = body.revisionId
+    expect(['rev-2', 'rev-1']).toContain(revisionId)
     await route.fulfill({ json: revisionId === 'rev-2' ? {
       datasetId: 'stable-dataset', revisionId: 'rev-2', committedAt: '2026-07-16T12:00:00Z',
       retentionOwner: 'provider', parentRevisionId: 'rev-1', producerOperation: 'append',
@@ -213,7 +217,9 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
   await page.route('**/api/catalog/tables/pin-table/revisions/capabilities', async (route) => {
     await route.fulfill({ json: { selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null } })
   })
-  await page.route('**/api/catalog/revisions/opaque-dataset/1', async (route) => {
+  await page.route('**/api/catalog/revision-details', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().postDataJSON()).toEqual({ datasetId: 'opaque-dataset', revisionId: '1' })
     await route.fulfill({ json: {
       datasetId: 'opaque-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z',
       retentionOwner: 'provider', parentRevisionId: null, producerOperation: 'create',
@@ -287,7 +293,9 @@ test('keeps an exact Source binding through provider outage and retries at the s
     ], nextCursor: null, hasMore: false } })
   })
   let providerAvailable = false
-  await page.route('**/api/catalog/revisions/recovery-dataset/1', async (route) => {
+  await page.route('**/api/catalog/revision-details', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().postDataJSON()).toEqual({ datasetId: 'recovery-dataset', revisionId: '1' })
     if (!providerAvailable) {
       await route.fulfill({ status: 503, json: {
         detail: 'revision provider unavailable', code: 'service_unavailable', retryable: true,

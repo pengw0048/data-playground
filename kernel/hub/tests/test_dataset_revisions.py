@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub.main import app
-from hub.models import CatalogTable, Graph
+from hub.models import CatalogTable, ColumnSchema, Graph
 from hub.plugins.adapters import (
     LanceAdapter, ManagedLocalFileRevisionAdapter, RevisionPermissionLost,
     RevisionProviderOffline, RevisionUnavailable,
@@ -466,6 +466,50 @@ def test_exact_revision_normalizes_recoverable_provider_failures(
     response = client.get("/api/catalog/revisions/dataset/revision")
     assert response.status_code == status
     assert response.json() == {"detail": detail, "code": code, "retryable": retryable}
+
+
+def test_revision_detail_body_route_preserves_slash_bearing_opaque_identity(monkeypatch):
+    dataset_id = "luma-data-api://table/1530"
+    revision_id = "luma-data-exact://table/1530/revision/2/identity/73cb"
+
+    class OpaqueAdapter:
+        retention_owner = "provider"
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def revision_detail(self, uri, revision, *, preview_limit):
+            self.calls.append((uri, revision))
+            assert preview_limit == 100
+            assert revision == revision_id
+            return {
+                "revision_id": revision, "name": "opaque source",
+                "committed_at": None, "parent_revision_id": None,
+                "producer_operation": None, "row_count": 1,
+                "data_file_count": None, "total_bytes": None, "fragment_count": None,
+                "columns": [ColumnSchema(name="value", type="int64")],
+                "preview_table": pa.table({"value": [7]}),
+            }
+
+    adapter = OpaqueAdapter()
+    monkeypatch.setattr(catalog_router, "_revision_binding_for_dataset_id", lambda value: {
+        "dataset_id": value, "uri": "workspace-provider://canonical-source",
+    })
+    monkeypatch.setattr(catalog_router, "_revision_adapter", lambda _uri: adapter)
+    monkeypatch.setattr(catalog_router.metadb, "managed_local_lance_row_identity_binding",
+                        lambda _dataset_id: None)
+    monkeypatch.setattr(catalog_router.metadb, "catalog_managed_local_revision_certification_facts",
+                        lambda _exact: None)
+
+    response = client.post("/api/catalog/revision-details", json={
+        "datasetId": dataset_id, "revisionId": revision_id,
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["datasetId"] == dataset_id
+    assert response.json()["revisionId"] == revision_id
+    assert response.json()["preview"]["rows"] == [{"value": 7}]
+    assert adapter.calls == [("workspace-provider://canonical-source", revision_id)]
 
 
 @pytest.mark.parametrize(("failure", "status", "detail", "code", "retryable"), [

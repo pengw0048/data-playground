@@ -136,10 +136,14 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.route('**/api/canvas', async (route) => route.fulfill({ json: [{ id: 'canvas-merge', name: 'Column enrichment', version: 1, role: 'editor' }] }))
   await page.route('**/api/jobs?*', async (route) => route.fulfill({ json: { items: [mergeJob], nextCursor: null, hasMore: false } }))
   await page.route('**/api/canvas/canvas-merge/runs/merge-task-1/manifest', async (route) => route.fulfill({ json: { availability: 'not_recorded' } }))
-  await page.route('**/api/catalog/revisions/dataset-1/rev-published', async (route) => route.fulfill({ json: {
-    datasetId: 'dataset-1', revisionId: 'rev-published', committedAt: '2026-07-19T12:01:00Z', retentionOwner: 'core', parentRevisionId: 'rev-base', producerOperation: 'merge-columns',
-    summary: { rowCount: 2, dataFileCount: 1, totalBytes: 120, fragmentCount: 1 }, preview: { columns: [{ name: 'id', type: 'BIGINT' }, { name: 'score', type: 'DOUBLE' }], rows: [{ id: 1, score: 0.8 }], hasMore: true, rowLimit: 100 },
-  } }))
+  await page.route('**/api/catalog/revision-details', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    expect(route.request().postDataJSON()).toEqual({ datasetId: 'dataset-1', revisionId: 'rev-published' })
+    await route.fulfill({ json: {
+      datasetId: 'dataset-1', revisionId: 'rev-published', committedAt: '2026-07-19T12:01:00Z', retentionOwner: 'core', parentRevisionId: 'rev-base', producerOperation: 'merge-columns',
+      summary: { rowCount: 2, dataFileCount: 1, totalBytes: 120, fragmentCount: 1 }, preview: { columns: [{ name: 'id', type: 'BIGINT' }, { name: 'score', type: 'DOUBLE' }], rows: [{ id: 1, score: 0.8 }], hasMore: true, rowLimit: 100 },
+    } })
+  })
 
   await page.goto('/#/jobs')
   await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
