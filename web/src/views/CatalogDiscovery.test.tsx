@@ -370,7 +370,7 @@ describe('Catalog discovery request and mutation truth', () => {
 
     expect(await screen.findByText(/Couldn't load lineage: HTTP 503/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-lineage-retry'))
-    expect(await screen.findByText('no upstream datasets')).toBeInTheDocument()
+    expect(await screen.findByText('No related datasets yet.')).toBeInTheDocument()
 
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
@@ -411,7 +411,14 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
-    expect(screen.getByText('Dataset location & identity').parentElement).toHaveTextContent(TABLE.uri)
+    const details = screen.getByTestId('detail-dataset-details')
+    expect(details).not.toHaveAttribute('open')
+    expect(details).toHaveTextContent('Dataset details')
+    expect(screen.getByTestId('dataset-location')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Dataset details'))
+    expect(details).toHaveAttribute('open')
+    expect(screen.getByTestId('dataset-location')).toHaveTextContent(TABLE.uri)
+    expect(screen.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     expect(screen.getByText('Catalog maintenance').parentElement).not.toHaveAttribute('open')
     expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
@@ -523,7 +530,7 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByText(/not bound to latest head orders-dataset@3/i)).toBeInTheDocument()
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Catalog snapshot catalog-v3')
+    expect(screen.queryByTestId('dataset-facts-source')).not.toBeInTheDocument()
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
     expect(await screen.findByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()

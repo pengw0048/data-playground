@@ -1140,7 +1140,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const displayColumns = exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
   const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
-  const catalogSnapshotLabel = table.version ?? 'identity unavailable'
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1163,33 +1162,30 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
         <div tabIndex={0} aria-label="Dataset detail content" data-testid="dataset-detail-content"
           className="min-h-0 flex-1 overflow-y-auto p-4 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
-        <div className="flex flex-col gap-4 text-[12.5px]">
-          <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
-            <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
-            <span>· {displayColumns.length} cols</span>
-            <span data-testid="dataset-facts-source">· {exactFacts
-              ? `Exact revision ${revisionLabel(exactFacts)}`
-              : `Catalog snapshot ${catalogSnapshotLabel}`}</span>
-            {factsVerifiedLatest ? <span>· verified latest head</span> : null}
-            {table.usage ? <span>· used {table.usage}×</span> : null}
-          </div>
-
-          <details className="rounded-lg border border-border px-3 py-2 text-[11px]">
-            <summary className="grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] items-center gap-2 font-semibold text-foreground">
-              <span>Dataset location &amp; identity</span>
-              <code className="truncate text-right text-[10.5px] font-normal text-muted-foreground" title={table.uri}>{table.uri}</code>
-            </summary>
-            <div className="mt-2 grid gap-2">
-              <div className="flex items-start gap-2">
-                <code className="min-w-0 flex-1 break-all text-[10.5px] text-muted-foreground">{table.uri}</code>
-                <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
-              </div>
-              {table.registrationId ? <div>
-                <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
-                <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
-              </div> : null}
+          <div className="flex flex-col gap-4 text-[12.5px]">
+            <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
+              <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
+              <span>· {displayColumns.length} cols</span>
+              {exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
+              {factsVerifiedLatest ? <span>· verified latest head</span> : null}
+              {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
-          </details>
+
+            <details data-testid="detail-dataset-details" className="rounded-lg border border-border px-3 py-2 text-[11px]">
+              <summary className="cursor-pointer font-semibold text-foreground">
+                Dataset details
+              </summary>
+              <div className="mt-2 grid gap-2">
+                <div className="flex items-start gap-2">
+                  <code data-testid="dataset-location" className="min-w-0 flex-1 break-all text-[10.5px] text-muted-foreground">{table.uri}</code>
+                  <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
+                </div>
+                {table.registrationId ? <div>
+                  <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
+                  <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
+                </div> : null}
+              </div>
+            </details>
 
           {headChecking && !latestHead ? (
             <div role="status" className="text-[11px] text-muted-foreground">Checking latest dataset head…</div>
@@ -1207,7 +1203,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 <div className="font-semibold">Dataset facts need refresh</div>
                 <div className="break-words">{exactFacts
                   ? `Header and Columns are bound to exact revision ${revisionLabel(exactFacts)}; latest head is ${revisionLabel(latestHead)}.`
-                  : `Header and Columns are from catalog snapshot ${catalogSnapshotLabel}, which is not bound to latest head ${revisionLabel(latestHead)}.`}</div>
+                  : `Header and Columns are not bound to latest head ${revisionLabel(latestHead)}.`}</div>
               </div>
               {factsError ? <div role="alert">Couldn't refresh exact head facts: {factsError}</div> : null}
               <button type="button" onClick={() => void refreshHeadFacts()} disabled={factsLoading}
@@ -1314,17 +1310,18 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 <button onClick={() => void loadLineage()} data-testid="detail-lineage-retry" className="shrink-0 font-semibold underline">Retry</button>
               </div>
             ) : null}
-            {lin ? <>
-              <LineageMini label="Parents" empty="no upstream datasets" onOpen={openLinked}
+            {lin && parents.length === 0 && children.length === 0 ? <div className="py-0.5 text-[11px] text-muted-foreground">No related datasets yet.</div> : null}
+            {lin && (parents.length > 0 || children.length > 0) ? <>
+              {parents.length > 0 ? <LineageMini label="Parents" onOpen={openLinked}
                 rows={parents.map((e) => ({
                   name: nameOf(e.parent), factCount: e.factCount,
                   uri: e.parent, catalogId: lineageNode(e.parent)?.id,
-                }))} />
-              <LineageMini label="Children" empty="no downstream datasets" onOpen={openLinked}
+                }))} /> : null}
+              {children.length > 0 ? <LineageMini label="Children" onOpen={openLinked}
                 rows={children.map((e) => ({
                   name: nameOf(e.child), factCount: e.factCount,
                   uri: e.child, catalogId: lineageNode(e.child)?.id,
-                }))} />
+                }))} /> : null}
             </> : null}
           </section>
 
@@ -1538,8 +1535,8 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
   )
 }
 
-function LineageMini({ label, empty, rows, onOpen }: {
-  label: string; empty: string
+function LineageMini({ label, rows, onOpen }: {
+  label: string
   rows: { name: string; factCount: number; uri: string; catalogId?: string }[]
   onOpen: (catalogId: string | undefined) => void
 }) {
@@ -1553,7 +1550,7 @@ function LineageMini({ label, empty, rows, onOpen }: {
               <Icon name="arrow" size={11} /> {r.name}<span className="text-[10px] text-muted-foreground">· {r.factCount} {r.factCount === 1 ? 'fact' : 'facts'}</span>
             </button>
           ))
-        : <div className="py-0.5 text-[11px] text-muted-foreground">{empty}</div>}
+        : null}
     </div>
   )
 }
