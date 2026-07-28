@@ -29,14 +29,14 @@ describe('API error recovery contract', () => {
       }], edges: [],
     }
 
-    await api.retainedResult(doc, 'transform', 'out', [])
+    await api.retainedResult(doc, 'transform', 'out')
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/run/retained-result',
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({
-          graph: toGraph(doc), nodeId: 'transform', portId: 'out', parameterBindings: [],
+          graph: toGraph(doc), nodeId: 'transform', portId: 'out',
         }),
       }),
     )

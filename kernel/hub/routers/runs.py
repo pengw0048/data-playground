@@ -4292,6 +4292,10 @@ def retained_canvas_result(
     deps = get_deps()
     graph = _resolve_parameters(
         req.graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
+    if "parameter_bindings" not in req.model_fields_set and graph._parameter_bindings:
+        raise _retained_editor_error(
+            409, "current result parameter bindings are unavailable",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
     _reject_invalid(graph, deps, req.node_id)
     target = graph_mod.node_map(graph).get(req.node_id)

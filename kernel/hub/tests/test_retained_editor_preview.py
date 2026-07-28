@@ -225,6 +225,46 @@ def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_pat
         assert response.json()["runId"] == run_id
 
 
+def test_canvas_does_not_treat_missing_bindings_as_defaults_or_fall_back(tmp_path):
+    def configure(graph):
+        graph["parameters"] = [{
+            "name": "sample_size",
+            "type": "integer",
+            "default": 3,
+        }]
+        graph["nodes"][1]["data"]["config"]["n"] = {
+            "parameterRef": "sample_size",
+        }
+
+    with _retained_sample(tmp_path, configure) as (graph, default_run_id, _output):
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "targetNodeId": "sample",
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+            "parameterBindings": [{"name": "sample_size", "value": 2}],
+        })
+        assert started.status_code == 200, started.text
+        bound = _wait(started.json()["runId"])
+        assert bound["status"] == "done", bound
+        _wait_for_history_projection(bound["runId"])
+        assert bound["runId"] != default_run_id
+
+        unknown = _retained_result(graph)
+        assert unknown.status_code == 409, unknown.text
+        assert unknown.json()["code"] == "retained_upstream_stale"
+        assert "parameter bindings" in unknown.json()["detail"]
+
+        exact = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "sample",
+            "portId": "out",
+            "parameterBindings": [{"name": "sample_size", "value": 2}],
+        })
+        assert exact.status_code == 200, exact.text
+        assert exact.json()["runId"] == bound["runId"]
+
+
 def test_retained_editor_preview_reuses_current_upstream_without_freezing_transform(
         retained_sample):
     graph, run_id, output = retained_sample

@@ -182,4 +182,99 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await page.request.delete(`/api/canvas/${doc.id}`)
     }
   })
+
+  test('never falls back to an older default-binding result in a fresh browser', async ({ page, browser, baseURL }) => {
+    const doc = goldenCanvas(
+      'ux-golden-retained-parameters',
+      'UX retained parameter canvas',
+      'UX retained parameter source',
+    )
+    doc.parameters = [{
+      name: 'predicate', type: 'string', default: "event = 'purchase'",
+    }]
+    doc.nodes[1].data.config.predicate = { parameterRef: 'predicate' }
+    await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      parameters: doc.parameters,
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const startRun = async (parameterBindings?: Array<{ name: string; value: unknown }>) => {
+      const response = await page.request.post('/api/run', {
+        data: {
+          graph, targetNodeId: 'filter', confirmed: true,
+          ...(parameterBindings ? { parameterBindings } : {}),
+        },
+      })
+      const failure = response.ok() ? '' : await response.text()
+      expect(response.ok(), failure).toBe(true)
+      const runId = (await response.json()).runId as string
+      await expect.poll(async () => {
+        const status = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+        return (await status.json()).status
+      }, { timeout: 30_000 }).toBe('done')
+      return runId
+    }
+    const defaultRunId = await startRun()
+    const boundRunId = await startRun([{
+      name: 'predicate', value: "event = 'signup'",
+    }])
+    expect(boundRunId).not.toBe(defaultRunId)
+    const exact = await page.request.post('/api/run/retained-result', {
+      data: {
+        graph, nodeId: 'filter', portId: 'out',
+        parameterBindings: [{ name: 'predicate', value: "event = 'signup'" }],
+      },
+    })
+    expect(exact.ok(), exact.ok() ? '' : await exact.text()).toBe(true)
+    expect((await exact.json()).runId).toBe(boundRunId)
+    const unknown = await page.request.post('/api/run/retained-result', {
+      data: { graph, nodeId: 'filter', portId: 'out' },
+    })
+    expect(unknown.status()).toBe(409)
+
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${doc.id}/runs`)
+      const runs = await response.json() as Array<{ runId?: string }>
+      return runs.map((run) => run.runId)
+    }, { timeout: 30_000 }).toEqual(expect.arrayContaining([defaultRunId, boundRunId]))
+    const historyBefore = await page.request.get(`/api/canvas/${doc.id}/runs`)
+    const runsBefore = await historyBefore.json() as Array<{ runId?: string }>
+    const freshContext = await browser.newContext({ baseURL })
+    const freshPage = await freshContext.newPage()
+    try {
+      await freshPage.goto(`/#/canvas/${doc.id}`)
+      const filter = freshPage.locator('.react-flow__node', { hasText: 'UX golden filter' })
+      await expect(filter.getByTitle('latest')).toBeVisible()
+      await filter.click()
+      await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+
+      const panel = freshPage.getByTestId('panel-data')
+      await expect(panel.getByRole('status', {
+        name: 'Retained result parameters unavailable',
+      })).toBeVisible()
+      await expect(panel.getByRole('button', { name: 'Run this step' })).toBeVisible()
+      await expect(panel.getByText('Full result artifact')).toHaveCount(0)
+      const historyAfter = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
+      expect(await historyAfter.json()).toEqual(runsBefore)
+    } finally {
+      await freshContext.close()
+      await page.request.delete(`/api/canvas/${doc.id}`)
+    }
+  })
 })

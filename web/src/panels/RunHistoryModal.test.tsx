@@ -863,13 +863,45 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
 
     await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledWith(
-      doc, 'target', 'out', [],
+      doc, 'target', 'out', undefined,
     ))
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
       'persisted-run', 'target', 'out', 50, 0,
     ))
     expect(screen.getByText('Full result artifact')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+  })
+
+  it('does not use default bindings when a fresh session cannot prove run parameters', async () => {
+    const requestRun = vi.fn()
+    const doc = {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [],
+      parameters: [{ name: 'predicate', type: 'string' as const, default: "event = 'purchase'" }],
+      edges: [], nodes: [{
+        id: 'target', type: 'filter', position: { x: 0, y: 0 },
+        data: {
+          title: 'target', status: 'latest' as const,
+          config: { predicate: { parameterRef: 'predicate' } }, history: [],
+        },
+      }],
+    }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {},
+      canvasRole: 'owner',
+      requestRun,
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('status', { name: 'Retained result parameters unavailable' }))
+      .toBeInTheDocument()
+    expect(apiMock.retainedResult).not.toHaveBeenCalled()
+    expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run this step' }))
+    expect(requestRun).toHaveBeenCalledWith('target')
   })
 
   it('does not recover an old retained result after the node becomes stale', async () => {

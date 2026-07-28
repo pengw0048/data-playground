@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   parameterBindingsIdentity, previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey,
-  roleCanEdit, useStore,
+  roleCanEdit, targetParameterDeclarations, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
@@ -64,7 +64,8 @@ export function DataPanel({ nodeId, editorPreview }: {
   // the visible tab selection is carried on every preview and sampled-profile request.
   const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
   const run = useStore((s) => s.runs[nodeId])
-  const parameterBindings = run?.parameterBindings ?? []
+  const parameterBindings = run?.parameterBindings
+  const parameterBindingsKnown = parameterBindings !== undefined
   const runOutputs = run?.status?.outputs.filter((output) => output.nodeId === nodeId) ?? []
   const selectedRunOutput = runOutputs.find((output) => (
     output.nodeId === nodeId && (selectedPortId === undefined || output.portId === selectedPortId)
@@ -72,6 +73,9 @@ export function DataPanel({ nodeId, editorPreview }: {
   const committedRunOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
     ? selectedRunOutput
     : undefined
+  const retainedBindingsUnavailable = !editorPreview && node?.data.status === 'latest'
+    && !committedRunOutput && !parameterBindingsKnown
+    && targetParameterDeclarations(doc, nodeId).length > 0
   const retainedRequestGeneration = useRef(0)
   const [retainedResult, setRetainedResult] = useState<{
     nodeId: string
@@ -110,6 +114,7 @@ export function DataPanel({ nodeId, editorPreview }: {
     const requestGeneration = ++retainedRequestGeneration.current
     setRetainedResult(null)
     if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
+        || retainedBindingsUnavailable
         || retainedPortId === undefined) return
     const requestDoc = doc
     const requestPlanIdentity = planIdentity
@@ -118,10 +123,11 @@ export function DataPanel({ nodeId, editorPreview }: {
       .then((identity) => {
         const current = useStore.getState()
         const currentNode = current.doc.nodes.find((candidate) => candidate.id === nodeId)
-        const currentBindings = current.runs[nodeId]?.parameterBindings ?? []
+        const currentBindings = current.runs[nodeId]?.parameterBindings
         if (
           retainedRequestGeneration.current !== requestGeneration
           || currentNode?.data.status !== 'latest'
+          || (currentBindings !== undefined) !== parameterBindingsKnown
           || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
           || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
         ) return
@@ -139,7 +145,7 @@ export function DataPanel({ nodeId, editorPreview }: {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     editorPreview, nodeId, retainedPortId, node?.data.status, committedRunOutput?.uri,
-    planIdentity, bindingsIdentity,
+    retainedBindingsUnavailable, parameterBindingsKnown, planIdentity, bindingsIdentity,
   ])
   useEffect(() => {
     if (editorPreview?.autoLoad !== false
@@ -183,6 +189,20 @@ export function DataPanel({ nodeId, editorPreview }: {
         selectedPortId={selectedPortId} onSelect={choosePort} />
       {!editorPreview && (
         <SelectedOutputOutcome runStatus={run?.status?.status} output={displayedSelectedOutput} />
+      )}
+      {retainedBindingsUnavailable && (
+        <div role="status" aria-label="Retained result parameters unavailable"
+          className="flex items-center gap-3 border-b border-border bg-amber-500/5 px-3 py-2 text-[11px] text-muted-foreground">
+          <span className="flex-1">
+            The parameters used by the saved result are not available in this session. Run this step
+            to create a result with verified parameters.
+          </span>
+          {canEdit && (
+            <Button variant="outline" size="sm" onClick={() => requestRun(nodeId)}>
+              Run this step
+            </Button>
+          )}
+        </div>
       )}
       {editorPreview && preview?.result?.editorTestInput && (
         <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
