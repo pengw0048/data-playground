@@ -1371,6 +1371,66 @@ test.describe('Data Playground canvas', () => {
     await expect(entities.filter({ hasText: expandedTable }).first()).toBeVisible({ timeout: 10_000 })
   })
 
+  test('relationship fitting keeps show-all entities clear of controls at compact and reference viewports', async ({ page }) => {
+    test.skip(process.env.DP_E2E_FIXTURE_PROFILE === 'full', 'the full profile intentionally exceeds this four-entity geometry fixture')
+    const longName = `events_with_a_deliberately_long_relationship_entity_name_${Date.now()}`
+    const uploaded = await page.request.post('/api/catalog/upload', {
+      data: Buffer.from('id,owner_id,metric_a,metric_b,metric_c,metric_d,metric_e,metric_f,metric_g,metric_h\n1,1,1,1,1,1,1,1,1,1\n'),
+      headers: { 'X-Upload-Filename': `${longName}.csv` },
+    })
+    const uploadText = await uploaded.text()
+    expect(uploaded.ok(), uploadText).toBe(true)
+    const extra = JSON.parse(uploadText) as { id: string; registrationId: string; metadataRevision: string }
+    const canvasId = `er-fit-${Date.now()}`
+    const canvas = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'ER fit geometry', version: 1, requirements: [], nodes: [], edges: [],
+    } })
+    expect(canvas.ok()).toBe(true)
+
+    try {
+      await page.setViewportSize({ width: 1280, height: 720 })
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      await expect(page.getByTestId('toolbar')).toBeVisible()
+      await backToWorkspace(page)
+      await openWorkspaceDataset(page, 'events')
+      await page.getByTestId('detail-relationships').click()
+      await expect(page.getByTestId('er-clear-focus')).toBeVisible({ timeout: 10_000 })
+      await page.getByTestId('er-clear-focus').click()
+
+      const entities = page.locator('.react-flow__node')
+      const expectedEntities = ['events', 'movies', 'images', longName].map((name) =>
+        entities.filter({ hasText: name }).first())
+      for (const entity of expectedEntities) await expect(entity).toBeVisible({ timeout: 10_000 })
+
+      const staysInSafeViewport = async () => {
+        const flow = await boxOf(page.locator('.react-flow'))
+        const panel = await boxOf(page.getByTestId('er-controls-panel'))
+        const controls = await boxOf(page.locator('.react-flow__controls'))
+        const boxes = await Promise.all(expectedEntities.map(boxOf))
+        return boxes.every((box) =>
+          box.x >= flow.x && box.y >= flow.y
+          && box.x + box.width <= flow.x + flow.width
+          && box.y + box.height <= flow.y + flow.height
+          && !overlaps(box, panel) && !overlaps(box, controls))
+      }
+
+      // `show all` must fit its replacement node set without requiring a manual pan or fit.
+      await expect.poll(staysInSafeViewport).toBe(true)
+      await page.getByTestId('er-suggestions-toggle').check()
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+      await expect.poll(staysInSafeViewport).toBe(true)
+
+      // Resize uses the same insets, rather than reverting to React Flow's pane-only fit.
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await expect.poll(staysInSafeViewport).toBe(true)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      await page.request.delete(`/api/catalog/tables/${encodeURIComponent(extra.id)}`, {
+        params: { expected_registration_id: extra.registrationId, expected_revision: extra.metadataRevision },
+      })
+    }
+  })
+
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector

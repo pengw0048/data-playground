@@ -1,11 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ReactNode } from 'react'
+import type { ButtonHTMLAttributes, ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), relationships: vi.fn(), facets: vi.fn(), joinSuggestions: vi.fn(),
   declareKey: vi.fn(), deleteRelationship: vi.fn(), addRelationship: vi.fn(), lineage: vi.fn(),
+  fitView: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
@@ -15,7 +16,7 @@ const store = vi.hoisted(() => ({
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 vi.mock('../theme/mode', () => ({ resolvedTheme: () => 'light' }))
 
-// React Flow's canvas geometry is irrelevant here; expose connection as a deterministic button.
+// React Flow's canvas geometry is irrelevant here; expose connection and Fit View deterministically.
 vi.mock('@xyflow/react', () => ({
   ReactFlow: ({ nodes, onConnect, children }: {
     nodes: { id: string; data: {
@@ -30,7 +31,9 @@ vi.mock('@xyflow/react', () => ({
     {children}
   </div>,
   Background: () => null,
-  Controls: () => null,
+  Controls: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props}>{children}</button>,
+  useReactFlow: () => ({ fitView: mocks.fitView }),
   Handle: () => null,
   Position: { Left: 'left', Right: 'right' },
   MarkerType: { ArrowClosed: 'arrow-closed' },
@@ -59,6 +62,7 @@ describe('ERDiagram request truth', () => {
     mocks.deleteRelationship.mockResolvedValue([])
     mocks.addRelationship.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: ORDERS.uri, nodes: [], edges: [] })
+    mocks.fitView.mockReset()
   })
   afterEach(() => cleanup())
 
@@ -110,6 +114,17 @@ describe('ERDiagram request truth', () => {
 
     expect(await screen.findByText(/Open a dataset from Workspace, then declare a primary key in its detail drawer/)).toBeVisible()
     expect(screen.queryByText(/Tables.*detail drawer/i)).toBeNull()
+  })
+
+  it('uses the same safe insets for the React Flow Fit View control', async () => {
+    render(<ERDiagram />)
+
+    await screen.findByText('orders')
+    fireEvent.click(screen.getByRole('button', { name: 'Fit view' }))
+
+    expect(mocks.fitView).toHaveBeenCalledWith({
+      padding: { top: 164, right: 16, bottom: 16, left: 344 }, maxZoom: 1,
+    })
   })
 
   it('uses the canonical lineage root when a focused physical generation advances', async () => {
