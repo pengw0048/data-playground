@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import { previewIsCurrent, useStore, nodeRunnable, roleCanEdit } from '../store/graph'
 import { useInputColumns } from '../nodes/fields'
 import { Icon } from '../ui/Icon'
@@ -24,12 +24,18 @@ export function CodeFullscreen() {
   const runnable = fs ? nodeRunnable(doc, fs.nodeId) : false
   const previews = useStore((s) => s.previews)
   const editorPreviews = useStore((s) => s.editorPreviews)
+  const runs = useStore((s) => s.runs)
   const processors = useStore((s) => s.processors)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const inputCols = useInputColumns(fs?.nodeId ?? '')  // THIS node's input schema — the precise completions
   const [testInput, setTestInput] = useState<'upstream' | 'example'>('upstream')
   const [exampleRowsJson, setExampleRowsJson] = useState('')
   const [testedExampleRowsJson, setTestedExampleRowsJson] = useState<string | null>(null)
+  // This is deliberately request-local. The authoritative run lifecycle stays in the graph store;
+  // the editor only remembers that this surface initiated it so an unrelated Canvas run is not
+  // presented as its test input.
+  const [upstreamRunRequested, setUpstreamRunRequested] = useState(false)
+  const refreshedUpstreamRunId = useRef<string | null>(null)
   const exampleValidation = useMemo(
     () => validateEditorExampleRows(exampleRowsJson),
     [exampleRowsJson],
@@ -47,7 +53,25 @@ export function CodeFullscreen() {
     setTestInput('upstream')
     setExampleRowsJson('')
     setTestedExampleRowsJson(null)
+    setUpstreamRunRequested(false)
+    refreshedUpstreamRunId.current = null
   }, [fs?.nodeId])
+  const editorUpstreamNodeId = fs
+    ? (() => {
+        const upstreamEdges = doc.edges.filter((edge) => edge.target === fs.nodeId)
+        return upstreamEdges.length === 1 ? upstreamEdges[0]?.source : undefined
+      })()
+    : undefined
+  const upstreamRun = editorUpstreamNodeId ? runs[editorUpstreamNodeId] : undefined
+  const upstreamRunId = upstreamRun?.status?.runId
+  useEffect(() => {
+    // Re-select through the server-owned retained-result contract after the exact upstream run
+    // succeeds. This neither runs nor persists the downstream Transform as a full Canvas run.
+    if (!fs || testInput !== 'upstream' || !editorUpstreamNodeId || !upstreamRunRequested || upstreamRun?.phase !== 'done'
+        || !upstreamRunId || refreshedUpstreamRunId.current === upstreamRunId) return
+    refreshedUpstreamRunId.current = upstreamRunId
+    void runEditorPreview(fs.nodeId)
+  }, [editorUpstreamNodeId, fs, runEditorPreview, testInput, upstreamRun?.phase, upstreamRunId, upstreamRunRequested])
   if (!fs || !node) return null
 
   const cfg = node.data.config as Record<string, unknown>
@@ -69,8 +93,6 @@ export function CodeFullscreen() {
   const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
   const own = preview && previewIsCurrent(preview, doc, fs.nodeId) ? (preview.result?.columns ?? []).map((c) => c.name) : []
   const completions = [...new Set(inputNames.length ? inputNames : own)]
-  const upstreamEdges = isTransform ? doc.edges.filter((edge) => edge.target === fs.nodeId) : []
-  const editorUpstreamNodeId = upstreamEdges.length === 1 ? upstreamEdges[0]?.source : undefined
   const usingExampleRows = canUseExampleRows && testInput === 'example'
   const chooseTestInput = (input: 'upstream' | 'example') => {
     clearEditorPreview(fs.nodeId)
@@ -90,7 +112,12 @@ export function CodeFullscreen() {
     setTestedExampleRowsJson(exampleRowsJson)
     void runEditorExamplePreview(fs.nodeId, exampleRowsJson, offset, portId)
   }
-
+  const runUpstream = () => {
+    if (!editorUpstreamNodeId) return
+    setUpstreamRunRequested(true)
+    refreshedUpstreamRunId.current = null
+    void requestRun(editorUpstreamNodeId)
+  }
   return (
     <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>
       <div onClick={(e) => e.stopPropagation()}
@@ -171,7 +198,14 @@ export function CodeFullscreen() {
                     Edit this request-local fixture, then choose Test code. It is never saved to the Canvas.
                   </div>
                 ) : (
-                  <DataPanel key={testInput} nodeId={fs.nodeId} editorPreview={isTransform ? (
+                  <>
+                    {isTransform && testInput === 'upstream' && upstreamRunRequested && editorUpstreamNodeId && (
+                      <EditorUpstreamRunStatus nodeId={editorUpstreamNodeId} run={upstreamRun}
+                        onConfirm={() => void useStore.getState().run(editorUpstreamNodeId, true)}
+                        onCancelConfirmation={() => useStore.getState().clearRun(editorUpstreamNodeId)}
+                        onCancelRun={() => void useStore.getState().cancelRun(editorUpstreamNodeId)} />
+                    )}
+                    <DataPanel key={testInput} nodeId={fs.nodeId} editorPreview={isTransform ? (
                     usingExampleRows
                       ? {
                           autoLoad: false,
@@ -180,12 +214,10 @@ export function CodeFullscreen() {
                           onPreview: (offset, portId) => testExampleRows(offset, portId),
                         }
                       : {
-                          onRunUpstream: editorUpstreamNodeId ? () => {
-                            close()
-                            void requestRun(editorUpstreamNodeId)
-                          } : undefined,
+                          onRunUpstream: editorUpstreamNodeId ? runUpstream : undefined,
                         }
-                  ) : undefined} />
+                    ) : undefined} />
+                  </>
                 )}
               </div>
             </div>
@@ -231,5 +263,82 @@ export function CodeFullscreen() {
         ) : null}
       </div>
     </div>
+  )
+}
+
+function EditorUpstreamRunStatus({ nodeId, run, onConfirm, onCancelConfirmation, onCancelRun }: {
+  nodeId: string
+  run?: {
+    phase?: string
+    error?: string
+    estimate?: { rows?: number | null; bytes?: number | null; confirmationReasons?: string[] }
+    status?: { runId?: string; progress?: number | null; rowsProcessed?: number; totalRows?: number | null }
+  }
+  onConfirm: () => void
+  onCancelConfirmation: () => void
+  onCancelRun: () => void
+}) {
+  const phase = run?.phase
+  const estimate = run?.estimate
+  const status = run?.status
+  const upstreamLabel = useStore((s) => s.doc.nodes.find((node) => node.id === nodeId)?.data.title ?? nodeId)
+  const rows = estimate?.rows == null ? 'an unknown number of rows' : `${estimate.rows.toLocaleString()} rows`
+
+  if (phase === 'confirm') return (
+    <section aria-label="Confirm upstream run" className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px]">
+      <div className="font-semibold text-foreground">Confirm upstream run</div>
+      <p className="mt-1 text-muted-foreground">{upstreamLabel} will process {rows}. This upstream run needs your explicit confirmation.</p>
+      <div className="mt-2 flex gap-2">
+        <button type="button" onClick={onConfirm}
+          className="rounded bg-[#d99a2b] px-2.5 py-1.5 font-semibold text-white hover:bg-[#c98d24]">
+          Run upstream
+        </button>
+        <button type="button" onClick={onCancelConfirmation}
+          className="rounded border border-border bg-background px-2.5 py-1.5 font-semibold text-foreground hover:bg-accent">
+          Cancel
+        </button>
+      </div>
+    </section>
+  )
+
+  if (phase === 'failed') return (
+    <section aria-label="Upstream run failed" role="alert" className="border-b border-destructive/30 bg-destructive/10 px-3 py-2.5 text-[11px]">
+      <div className="font-semibold text-destructive">Upstream run failed</div>
+      <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{run?.error ?? 'The upstream result could not be produced.'}</p>
+    </section>
+  )
+
+  if (phase === 'done') return (
+    <section aria-label="Upstream result ready" role="status" className="border-b border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5 text-[11px]">
+      <div className="font-semibold text-foreground">Upstream result ready</div>
+      <p className="mt-1 text-muted-foreground">A fresh retained {upstreamLabel} result is selected for this editor. Test code is available.</p>
+    </section>
+  )
+
+  if (phase === 'running' || phase === 'estimating') return (
+    <section aria-label="Upstream run progress" role="status" className="border-b border-primary/20 bg-primary/5 px-3 py-2.5 text-[11px]">
+      <div className="flex items-center gap-2 font-semibold text-foreground">
+        <span className="dp-running-glyph text-primary">●</span>
+        {phase === 'estimating' ? 'Preparing upstream run…' : 'Running upstream…'}
+      </div>
+      {phase === 'running' && status && <p className="mt-1 text-muted-foreground">
+        {(status.rowsProcessed ?? 0).toLocaleString()}{status.totalRows != null ? ` / ${status.totalRows.toLocaleString()} rows` : ' rows processed'}
+        {status.progress != null ? ` · ${Math.round(status.progress * 100)}%` : ''}
+      </p>}
+      {phase === 'running' && status?.runId && <button type="button" onClick={onCancelRun}
+        className="mt-2 rounded border border-border bg-background px-2.5 py-1.5 font-semibold text-foreground hover:bg-accent">Stop</button>}
+    </section>
+  )
+
+  if (phase === 'parameters' || phase === 'drift' || phase === 'estimated') return (
+    <section aria-label="Upstream run needs attention" role="alert" className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px] text-muted-foreground">
+      This upstream run needs attention before it can start. Its existing run controls remain authoritative.
+    </section>
+  )
+
+  return (
+    <section aria-label="Upstream run cancelled" role="status" className="border-b border-border bg-muted/40 px-3 py-2.5 text-[11px] text-muted-foreground">
+      Upstream run cancelled. Choose Run upstream to try again.
+    </section>
   )
 }

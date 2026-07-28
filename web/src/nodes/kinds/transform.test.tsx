@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -14,7 +14,13 @@ vi.mock('../../ui/CodeEditor', () => ({
 vi.mock('../../ui/CodeSnippet', () => ({
   CodeSnippet: () => <div data-testid="code-snippet" />,
 }))
-vi.mock('../../panels/DataPanel', () => ({ DataPanel: () => null }))
+vi.mock('../../panels/DataPanel', () => ({
+  DataPanel: ({ editorPreview }: { editorPreview?: { onRunUpstream?: () => void } }) => (
+    editorPreview?.onRunUpstream
+      ? <button type="button" onClick={editorPreview.onRunUpstream}>Run upstream</button>
+      : null
+  ),
+}))
 
 import './transform'
 import { getComponent } from '../registry'
@@ -196,5 +202,61 @@ describe('Transform exact processor labels', () => {
     const row = JSON.parse((fixture as HTMLTextAreaElement).value)[0]
     expect(row).toEqual({ id: 1, user_id: 1 })
     expect(row.id + 1).toBe(2)
+  })
+
+  it('keeps upstream run confirmation, progress, success, and failure in the fullscreen editor', async () => {
+    const upstream = {
+      id: 'sample', type: 'sample', position: { x: 0, y: 0 },
+      data: { title: 'Sample input', status: 'draft' as const, config: { n: 8, seed: 42 } },
+    }
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, status: 'draft' as const, config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      } },
+    }
+    const requestRun = vi.fn()
+    const run = vi.fn()
+    const runEditorPreview = vi.fn()
+    useStore.setState({
+      doc: {
+        id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [upstream, adhocNode],
+        edges: [{ id: 'sample-transform', source: 'sample', sourceHandle: 'out', target: 'transform', targetHandle: 'in', data: { wire: 'sample' } }],
+      },
+      kernelUp: true,
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+      requestRun, run, runEditorPreview, runs: {},
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Run upstream' }))
+    expect(requestRun).toHaveBeenCalledWith('sample')
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument()
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } } } as any)
+    })
+    const confirmation = screen.getByRole('region', { name: 'Confirm upstream run' })
+    expect(confirmation).toHaveTextContent('2,001 rows')
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Run upstream' }))
+    expect(run).toHaveBeenCalledWith('sample', true)
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'running', status: { runId: 'upstream-run', rowsProcessed: 4, totalRows: 8, progress: 0.5 } } } } as any)
+    })
+    expect(screen.getByRole('status', { name: 'Upstream run progress' })).toHaveTextContent('4 / 8 rows')
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'done', status: { runId: 'upstream-run' } } } } as any)
+    })
+    expect(screen.getByRole('status', { name: 'Upstream result ready' })).toHaveTextContent('Test code is available')
+    await waitFor(() => expect(runEditorPreview).toHaveBeenCalledWith('transform'))
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'failed', error: 'upstream fixture failed' } } } as any)
+    })
+    expect(screen.getByRole('alert', { name: 'Upstream run failed' })).toHaveTextContent('upstream fixture failed')
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument()
   })
 })
