@@ -172,6 +172,59 @@ def _preview(graph: dict, port_id: str = "out"):
     })
 
 
+def _retained_result(graph: dict, node_id: str = "sample", port_id: str = "out"):
+    return client.post("/api/run/retained-result", json={
+        "graph": graph,
+        "nodeId": node_id,
+        "portId": port_id,
+    })
+
+
+def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_sample):
+    graph, run_id, output = retained_sample
+    history_before = metadb.list_runs(graph["id"])
+
+    response = _retained_result(graph)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "runId": run_id,
+        "executionManifestSha256": history_before[0]["executionManifestSha256"],
+        "output": output,
+    }
+    page = client.post(f"/api/run/{run_id}/sample", json={
+        "nodeId": "sample", "portId": "out", "k": 2, "offset": 0,
+    })
+    assert page.status_code == 200, page.text
+    assert len(page.json()["rows"]) == 2
+    assert metadb.list_runs(graph["id"]) == history_before
+
+    changed = copy.deepcopy(graph)
+    changed["nodes"][1]["data"]["config"]["seed"] = 99
+    stale = _retained_result(changed)
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["code"] == "retained_upstream_stale"
+
+    os.unlink(output["uri"])
+    retained_identity = _retained_result(graph)
+    assert retained_identity.status_code == 200, retained_identity.text
+    expired = client.post(f"/api/run/{run_id}/sample", json={
+        "nodeId": "sample", "portId": "out", "k": 2, "offset": 0,
+    })
+    assert expired.status_code == 410, expired.text
+    assert expired.json()["code"] == "resource_gone"
+
+
+def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_path):
+    with _retained_sample(tmp_path) as (graph, run_id, _output):
+        graph["nodes"][0]["data"]["config"].pop("datasetRef")
+
+        response = _retained_result(graph)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["runId"] == run_id
+
+
 def test_retained_editor_preview_reuses_current_upstream_without_freezing_transform(
         retained_sample):
     graph, run_id, output = retained_sample

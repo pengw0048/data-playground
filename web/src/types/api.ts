@@ -781,6 +781,12 @@ export interface RunOutput {
   writeReceipt?: WriteReceipt | null
 }
 
+export interface RetainedResultIdentity {
+  runId: string
+  executionManifestSha256: string
+  output: RunOutput
+}
+
 export interface WriteIntent {
   destination: { logicalUri: string; name: string; datasetId?: string | null; provider: 'managed-local-file' | 'managed-local-lance' }
   mode: 'create' | 'replace' | 'append'

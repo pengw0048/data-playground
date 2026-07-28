@@ -11844,7 +11844,7 @@ def get_run_record_outputs(run_id: str) -> list[dict] | None:
     return [dict(output) for output in outputs]
 
 
-def retained_run_editor_candidates(
+def retained_run_output_candidates(
         canvas_id: str, target_node_id: str, port_id: str) -> list[dict]:
     """Return newest retained results for one exact Canvas target/output.
 

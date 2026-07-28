@@ -17,7 +17,9 @@ import {
   editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
 } from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
-import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
+import type {
+  ProfileResult, RetainedResultIdentity, RunOutput, RunState, SampleProvenance, SampleResult,
+} from '../types/api'
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
@@ -56,20 +58,47 @@ export function DataPanel({ nodeId, editorPreview }: {
   const selectedPortId = outputPorts.some((port) => port.id === selectedPort)
     ? selectedPort
     : outputPorts.find((port) => port.id === 'out')?.id ?? outputPorts[0]?.id
+  const retainedPortId = selectedPortId
+    ?? (node && node.type !== 'section' && outputPorts.length === 0 ? 'out' : undefined)
   // Single-output requests may omit the port. Multi-output requests never rely on backend ordering:
   // the visible tab selection is carried on every preview and sampled-profile request.
   const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
   const run = useStore((s) => s.runs[nodeId])
+  const parameterBindings = run?.parameterBindings ?? []
   const runOutputs = run?.status?.outputs.filter((output) => output.nodeId === nodeId) ?? []
   const selectedRunOutput = runOutputs.find((output) => (
     output.nodeId === nodeId && (selectedPortId === undefined || output.portId === selectedPortId)
   )) ?? (outputPorts.length <= 1 && runOutputs.length === 1 ? runOutputs[0] : undefined)
+  const committedRunOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
+    ? selectedRunOutput
+    : undefined
+  const retainedRequestGeneration = useRef(0)
+  const [retainedResult, setRetainedResult] = useState<{
+    nodeId: string
+    portId?: string
+    planIdentity: string
+    bindingsIdentity: string
+    identity: RetainedResultIdentity
+  } | null>(null)
+  const planIdentity = previewPlanIdentity(doc, nodeId, selectedPortId)
+  const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
+  const recoveredResult = !editorPreview && node?.data.status === 'latest'
+    && retainedResult?.nodeId === nodeId
+    && retainedResult.portId === retainedPortId
+    && retainedResult.planIdentity === planIdentity
+    && retainedResult.bindingsIdentity === bindingsIdentity
+    ? retainedResult.identity
+    : undefined
   // A terminal run can fail or be cancelled after another named output was durably committed.
   // Keep that artifact readable without implying that non-committed sibling ports succeeded.
   const selectedOutput = !editorPreview
-    && selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
-    ? selectedRunOutput
+    ? committedRunOutput ?? recoveredResult?.output
     : undefined
+  const selectedRunId = committedRunOutput ? run?.status?.runId : recoveredResult?.runId
+  const displayedRunOutputs = runOutputs.length > 0
+    ? runOutputs
+    : recoveredResult ? [recoveredResult.output] : []
+  const displayedSelectedOutput = selectedRunOutput ?? recoveredResult?.output
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
   const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
@@ -77,6 +106,41 @@ export function DataPanel({ nodeId, editorPreview }: {
   const previousOffsets = useRef<number[]>([])
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
+  useEffect(() => {
+    const requestGeneration = ++retainedRequestGeneration.current
+    setRetainedResult(null)
+    if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
+        || retainedPortId === undefined) return
+    const requestDoc = doc
+    const requestPlanIdentity = planIdentity
+    const requestBindingsIdentity = bindingsIdentity
+    void api.retainedResult(requestDoc, nodeId, retainedPortId, parameterBindings)
+      .then((identity) => {
+        const current = useStore.getState()
+        const currentNode = current.doc.nodes.find((candidate) => candidate.id === nodeId)
+        const currentBindings = current.runs[nodeId]?.parameterBindings ?? []
+        if (
+          retainedRequestGeneration.current !== requestGeneration
+          || currentNode?.data.status !== 'latest'
+          || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
+          || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
+        ) return
+        setRetainedResult({
+          nodeId, portId: retainedPortId, planIdentity: requestPlanIdentity,
+          bindingsIdentity: requestBindingsIdentity, identity,
+        })
+      })
+      .catch(() => {
+        // No exact retained result is a normal state. The bounded preview remains available and the
+        // user can run this step; never substitute a merely newer or older artifact client-side.
+      })
+  // `doc` and bindings are represented by their canonical identities so position-only edits and
+  // equivalent binding order do not issue another durable lookup.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    editorPreview, nodeId, retainedPortId, node?.data.status, committedRunOutput?.uri,
+    planIdentity, bindingsIdentity,
+  ])
   useEffect(() => {
     if (editorPreview?.autoLoad !== false
         && (!preview || preview.portId !== requestPortId)) {
@@ -95,6 +159,9 @@ export function DataPanel({ nodeId, editorPreview }: {
     // durable run finishes. A later explicit click on Sample remains sticky until the artifact changes.
     if (preview?.result?.notPreviewable && selectedOutput?.uri) setResultMode('full')
   }, [nodeId, requestPortId, selectedOutput?.uri, preview?.result?.notPreviewable])
+  useEffect(() => {
+    if (recoveredResult?.output.uri) setResultMode('full')
+  }, [recoveredResult?.runId, recoveredResult?.output.uri])
   const nextPage = (rowsRead: number) => {
     previousOffsets.current.push(offset)
     setDetail(null)
@@ -112,10 +179,10 @@ export function DataPanel({ nodeId, editorPreview }: {
   }
   const withOutputPorts = (content: ReactNode) => (
     <>
-      <OutputPortSelector ports={outputPorts} outputs={runOutputs}
+      <OutputPortSelector ports={outputPorts} outputs={displayedRunOutputs}
         selectedPortId={selectedPortId} onSelect={choosePort} />
       {!editorPreview && (
-        <SelectedOutputOutcome runStatus={run?.status?.status} output={selectedRunOutput} />
+        <SelectedOutputOutcome runStatus={run?.status?.status} output={displayedSelectedOutput} />
       )}
       {editorPreview && preview?.result?.editorTestInput && (
         <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
@@ -182,10 +249,11 @@ export function DataPanel({ nodeId, editorPreview }: {
     if (selectedOutput?.uri && resultMode === 'full') {
       return withOutputPorts(<FullResult uri={selectedOutput.uri}
         total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
-        runId={run?.status?.runId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+        runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
         publicationKind={selectedOutput.publicationKind}
         name={String(node?.data.title || node?.id || 'result')}
-        modeToggle={resultModeToggle} presentation={artifactPresentation} />)
+        modeToggle={resultModeToggle} presentation={artifactPresentation}
+        onRunUnavailable={() => requestRun(nodeId)} />)
     }
     if (editorPreview) {
       return withOutputPorts(<NotPreviewable
@@ -211,10 +279,11 @@ export function DataPanel({ nodeId, editorPreview }: {
   if (selectedOutput?.uri && resultMode === 'full') {
     return withOutputPorts(<FullResult uri={selectedOutput.uri}
       total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
-      runId={run?.status?.runId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+      runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
       publicationKind={selectedOutput.publicationKind}
       name={String(node?.data.title || node?.id || 'result')}
-      modeToggle={resultModeToggle} presentation={artifactPresentation} />)
+      modeToggle={resultModeToggle} presentation={artifactPresentation}
+      onRunUnavailable={() => requestRun(nodeId)} />)
   }
 
   const columns = res.columns
@@ -1174,6 +1243,7 @@ type ArtifactPresentation =
 
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
+  onRunUnavailable,
 }: {
   uri: string
   total: number | null
@@ -1184,6 +1254,7 @@ export function FullResult({
   name?: string
   modeToggle?: ReactNode
   presentation?: ArtifactPresentation
+  onRunUnavailable?: () => void
 }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
@@ -1251,8 +1322,13 @@ export function FullResult({
       reason="This history entry has no durable run identity, so the kernel cannot verify which output to read. Run the node again to create a verifiable result."
       modeToggle={modeToggle} />
   )
+  const runAction = onRunUnavailable ? (
+    <Button variant="outline" size="sm" onClick={onRunUnavailable}>Run this step</Button>
+  ) : undefined
+
   if (err) return <ArtifactUnavailable error={err} modeToggle={modeToggle}
-    label={viewLabel} action={exportAction} onRetry={() => setRetry((n) => n + 1)} />
+    label={viewLabel} action={exportAction} missingAction={runAction}
+    onRetry={() => setRetry((n) => n + 1)} />
   if (!data) return <div className="dp-dark text-foreground">
     <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
       <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
@@ -1348,11 +1424,12 @@ function FullResultMessage({ title, reason, onRetry, modeToggle, action }: {
   )
 }
 
-function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
+function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction, label }: {
   error: Error & { status?: number }
   onRetry: () => void
   modeToggle?: ReactNode
   action?: ReactNode
+  missingAction?: ReactNode
   label: string
 }) {
   const status = error.status
@@ -1375,7 +1452,7 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
       <div title={error.message} className="dp-mono mx-auto mt-2 max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground/70">{error.message}</div>
       <div className="mt-3.5 flex items-center justify-center gap-2">
         <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>
-        {action}
+        {missing && missingAction ? missingAction : action}
       </div>
     </div>
   )
