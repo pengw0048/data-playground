@@ -1,5 +1,31 @@
 import { expect, test } from '@playwright/test'
 
+test('bare entry stays neutral until a first-run Workspace destination is known', async ({ page }) => {
+  let releaseCanvasList!: () => void
+  const canvasListBlocked = new Promise<void>((resolve) => { releaseCanvasList = resolve })
+  await page.route('**/api/canvas', async (route) => {
+    const request = route.request()
+    if (request.method() !== 'GET' || new URL(request.url()).pathname !== '/api/canvas') {
+      await route.continue()
+      return
+    }
+    await canvasListBlocked
+    await route.fulfill({ contentType: 'application/json', body: '[]' })
+  })
+
+  await page.goto('/')
+
+  await expect(page.getByTestId('app-destination-bootstrap')).toBeVisible()
+  await expect(page.getByTestId('toolbar')).toHaveCount(0)
+  await expect(page.getByText('You have view-only access')).toHaveCount(0)
+  await expect(page.getByText('Checking canvas access…')).toHaveCount(0)
+
+  releaseCanvasList()
+  await expect(page.getByTestId('workspace-rail')).toBeVisible()
+  await expect(page.getByTestId('app-destination-bootstrap')).toHaveCount(0)
+  await expect(page).toHaveURL(/#\/workspace$/)
+})
+
 test('auth bootstrap stays fenced while unavailable and recovers on Retry without reloading', async ({ page }) => {
   let authRequests = 0
   let bootstrapRequests = 0

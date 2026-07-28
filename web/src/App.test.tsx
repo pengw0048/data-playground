@@ -22,7 +22,10 @@ vi.mock('./views/Shell', () => ({ Shell: () => <div>Shell</div> }))
 vi.mock('./views/Login', () => ({ Login: () => <div data-testid="login">Login</div> }))
 vi.mock('./ui/Toaster', () => ({ Toaster: () => null }))
 vi.mock('./HubLiveness', () => ({ HubLiveness: () => null }))
-vi.mock('./router', () => ({ initRouter: mocks.initRouter }))
+vi.mock('./router', async () => {
+  const actual = await vi.importActual<typeof import('./router')>('./router')
+  return { ...actual, initRouter: mocks.initRouter }
+})
 vi.mock('./nodes/capabilities', () => ({ syncPluginCapabilities: mocks.syncPluginCapabilities }))
 
 import App from './App'
@@ -47,6 +50,7 @@ describe('App auth bootstrap', () => {
     mocks.settleBootstrap.mockReset()
     useStore.setState({ bootstrap: mocks.bootstrap, view: 'canvas', authEnabled: false } as never)
     localStorage.clear()
+    history.replaceState(null, '', '/')
   })
 
   afterEach(() => { vi.unstubAllGlobals() })
@@ -79,6 +83,65 @@ describe('App auth bootstrap', () => {
     expect(screen.getByTestId('canvas')).toBeVisible()
     expect(useStore.getState().authEnabled).toBe(false)
   })
+
+  it('keeps a bare entry neutral until bootstrap determines the destination', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    let release!: () => void
+    mocks.bootstrap.mockImplementation(async ({ navigationToken }) => {
+      await new Promise<void>((resolve) => { release = resolve })
+      useStore.setState({ view: 'workspace' })
+      return navigationToken
+    })
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('app-destination-bootstrap')).toBeVisible()
+    expect(screen.queryByTestId('canvas')).not.toBeInTheDocument()
+    expect(screen.queryByText('Shell')).not.toBeInTheDocument()
+
+    release()
+    expect(await screen.findByText('Shell')).toBeVisible()
+  })
+
+  it('keeps an explicit Canvas deep link on its Canvas loading surface', async () => {
+    history.replaceState(null, '', '#/canvas/canvas-loading')
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    let release!: () => void
+    mocks.bootstrap.mockImplementation(async ({ navigationToken }) => {
+      await new Promise<void>((resolve) => { release = resolve })
+      return navigationToken
+    })
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(screen.queryByTestId('app-destination-bootstrap')).not.toBeInTheDocument()
+    release()
+    await waitFor(() => expect(mocks.settleBootstrap).toHaveBeenCalled())
+  })
+
+  it.each(['#/workspace', '#/jobs', '#/inbox', '#/transforms', '#/settings', '#/not-a-route'])(
+    'does not flash Canvas UI while bootstrapping %s',
+    async (hash) => {
+      history.replaceState(null, '', hash)
+      vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+      let release!: () => void
+      mocks.bootstrap.mockImplementation(async ({ navigationToken }) => {
+        await new Promise<void>((resolve) => { release = resolve })
+        return navigationToken
+      })
+
+      render(<App />)
+
+      await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+      expect(screen.getByTestId('app-destination-bootstrap')).toBeVisible()
+      expect(screen.queryByTestId('canvas')).not.toBeInTheDocument()
+      release()
+      await waitFor(() => expect(mocks.settleBootstrap).toHaveBeenCalled())
+    },
+  )
 
   it('shows login for an authenticated deployment without a session', async () => {
     vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: true, userId: null })

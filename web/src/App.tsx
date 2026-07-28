@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { api } from './api/client'
 import { useStore } from './store/graph'
-import { initRouter } from './router'
+import { initRouter, parseHash } from './router'
 import { startNavigation } from './navigationOwnership'
 import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
@@ -66,6 +66,7 @@ export default function App() {
   // Gate on an explicit auth outcome. An unavailable request is not evidence that this is local mode.
   const [auth, setAuth] = useState<AuthState>({ kind: 'checking' })
   const [booted, setBooted] = useState(false)
+  const [destinationReady, setDestinationReady] = useState(false)
   const [inspectorCollapsed, setInspectorCollapsed] = useCollapsibleRegion('inspector')
   const requestGeneration = useRef(0)
 
@@ -113,6 +114,7 @@ export default function App() {
         router.settleBootstrap(settledToken)
         // register generic viewer tabs for plugin capabilities that declare one (§5.6, no per-plugin FE code)
         syncPluginCapabilities(useStore.getState().kernelInfo?.capabilityViews ?? [])
+        setDestinationReady(true)
       })
     }
   }, [auth, booted, bootstrap])
@@ -120,6 +122,13 @@ export default function App() {
   if (auth.kind === 'checking') return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
   if (auth.kind === 'unavailable') return <AuthBootstrapUnavailable state={auth} onRetry={() => void checkAuth()} />
   if (auth.kind === 'login') return <Login onLoggedIn={(userId) => setAuth({ kind: 'authenticated', userId })} />
+  const route = parseHash()
+  if (!destinationReady && !(route.view === 'canvas' && route.canvasId)) {
+    // A bare or shell URL has no Canvas identity to render while bootstrap decides its destination.
+    // Keep this frame visually neutral; otherwise the empty initial document looks like real work
+    // with failed access before Workspace or another shell route replaces it.
+    return <div data-testid="app-destination-bootstrap" className="absolute inset-0 bg-background" />
+  }
 
   return (
     <TooltipProvider delayDuration={300}>
