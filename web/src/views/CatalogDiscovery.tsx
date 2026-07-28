@@ -1161,7 +1161,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <button ref={closeRef} onClick={requestClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        <div tabIndex={0} aria-label="Dataset detail content" data-testid="dataset-detail-content"
+          className="min-h-0 flex-1 overflow-y-auto p-4 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
         <div className="flex flex-col gap-4 text-[12.5px]">
           <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
             <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
@@ -1214,13 +1215,13 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span className="text-[10.5px] text-muted-foreground">{displayColumns.length} columns</span>
             </div>
             {displayColumns.length ? <div className="grid grid-cols-2 gap-x-3 gap-y-1 rounded-lg border border-border px-3 py-2 text-[11px]">
-              {displayColumns.slice(0, 10).map((column) => <div key={column.name} className="flex min-w-0 gap-1"><span className="min-w-0 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span></div>)}
+              {displayColumns.slice(0, 10).map((column) => <div key={column.name} className="flex min-w-0 items-center gap-1"><span className="min-w-0 flex-1 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span><FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" /></div>)}
               {displayColumns.length > 10 && <div className="col-span-2 text-muted-foreground">{displayColumns.length - 10} more columns in Catalog maintenance.</div>}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
           </section>
 
           <section>
-            <button onClick={togglePreview} data-testid="detail-preview"
+            <button onClick={togglePreview} data-testid="detail-preview" aria-expanded={previewOpen}
               className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground hover:text-foreground">
               <Icon name={previewOpen ? 'chevronDown' : 'chevronRight'} size={11} /> Row preview
             </button>
@@ -1236,7 +1237,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 {!preview.error && !preview.notPreviewable && <CatalogPreviewScope preview={preview} stale={Boolean(previewError)} />}
                 {preview.error || preview.notPreviewable || !preview.rows.length
                   ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">{preview.reason || emptyCatalogPreviewMessage(preview)}</div>
-                  : <><div className="overflow-x-auto rounded-lg border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.columns.map((c) => (
+                  : <><div tabIndex={0} aria-label="Row preview table" data-testid="detail-preview-scroll"
+                    className="overflow-x-auto rounded-lg border border-border focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.columns.map((c) => (
                     <th key={c.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
                   ))}</tr></thead><tbody>{preview.rows.slice(0, 4).map((r, i) => (
                     <tr key={i}>{preview.columns.map((c) => <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{cell(r[c.name])}</td>)}</tr>
@@ -1282,7 +1284,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                     <button type="button" onClick={() => togglePk(c.name)} disabled={!atomicMetadataEditable} data-testid={`detail-pk-${c.name}`} aria-label={action} title={`${action}. This is saved only when you select Save.`} className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">{selected ? 'Remove key' : 'Mark as key'}</button>
                     <button onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`} className="flex min-w-0 flex-1 items-center gap-2 text-left"><span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span><span className="text-[10px] text-muted-foreground">{c.type}</span></button>
                     {role ? <span data-testid={`detail-key-state-${c.name}`} className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${persisted && !pendingRemoval ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>{role}</span> : null}
-                    <FieldEvidenceButton column={c} label="ⓘ" marker className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
                   </div>
                 })}
               </div>

@@ -406,6 +406,17 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByText('Showing the first 4 of 50 preview rows.')).toBeInTheDocument()
   })
 
+  it('keeps default schema evidence and scrollable preview inspection keyboard reachable', async () => {
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
+    expect(screen.getByText('Catalog maintenance').parentElement).not.toHaveAttribute('open')
+    expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
+    expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
+  })
+
   it('labels a catalog prefix preview as non-random and exposes its input revision', async () => {
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,

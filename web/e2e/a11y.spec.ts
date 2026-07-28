@@ -86,6 +86,12 @@ test.describe('accessibility gate @ux-smoke', () => {
     await backToWorkspace(page)
     await (await workspaceResource(page, 'dataset', 'images')).click()
     await expect(page.getByRole('dialog', { name: 'images' })).toBeVisible()
+    const detailContent = page.getByTestId('dataset-detail-content')
+    await detailContent.focus()
+    await expect(detailContent).toBeFocused()
+    const previewScroll = page.getByTestId('detail-preview-scroll')
+    await previewScroll.focus()
+    await expect(previewScroll).toBeFocused()
     await expectNoSeriousAxe(page, 'Workspace dataset detail', { keepOverlay: true })
   })
 
