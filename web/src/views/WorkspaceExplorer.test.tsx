@@ -15,7 +15,7 @@ const store = vi.hoisted(() => ({
   workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
   workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
   workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
-  setWorkspaceResource: vi.fn(), openFile: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
+  setWorkspaceResource: vi.fn(), openFile: vi.fn(), select: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
   doc: { id: '', version: 0 },
@@ -690,7 +690,7 @@ describe('WorkspaceExplorer', () => {
   it('explores a stable dataset in a new canvas at its visible container', async () => {
     store.workspaceResourceId = DATASET.id
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'explore-1', created: true, resource: CANVAS })
+    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'explore-1', created: true, nodeId: 'created-source', resource: CANVAS })
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
@@ -701,6 +701,7 @@ describe('WorkspaceExplorer', () => {
       name: 'observations exploration', datasetIds: ['dataset-1'],
     }))
     expect(store.openFile).toHaveBeenCalledWith('explore-1')
+    await waitFor(() => expect(store.select).toHaveBeenCalledWith('created-source'))
   })
 
   it('adds a stable dataset only to the explicitly selected editable canvas', async () => {
@@ -1050,6 +1051,7 @@ describe('WorkspaceExplorer', () => {
       name: '2 datasets exploration', datasetIds: ['dataset-1', 'dataset-2'],
     }))
     expect(store.openFile).toHaveBeenCalledWith('batch-canvas')
+    expect(store.select).not.toHaveBeenCalled()
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', { limit: 1 })
   })
 

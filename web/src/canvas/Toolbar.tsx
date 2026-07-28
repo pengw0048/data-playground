@@ -142,7 +142,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 
               <div className="mx-1 h-[22px] w-px bg-border" />
 
-              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
+              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" showLabel={!!nextStepSource} onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
