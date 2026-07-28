@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { NodeFinder, findNodeSpecs, portSummary } from './NodeFinder'
+import { NodeFinder, findNodeSpecs } from './NodeFinder'
 import type { NodeSpec } from '../nodes/registry'
 
 const node = (overrides: Partial<NodeSpec>): NodeSpec => ({
@@ -17,7 +17,6 @@ describe('node finder', () => {
     ]
     expect(findNodeSpecs(specs, 'filter', 'dataset').map((result) => result.spec.kind)).toEqual(['filter', 'profile', 'same-plugin'])
     expect(findNodeSpecs(specs, 'metric').map((result) => result.spec.kind)).toEqual(['same-plugin'])
-    expect(portSummary(specs[0])).toBe('in metric · out dataset')
   })
 
   it('uses case-normalized code-point ordering for title and kind ties', () => {
@@ -30,17 +29,36 @@ describe('node finder', () => {
     expect(findNodeSpecs(specs, '').map((result) => result.spec.kind)).toEqual(['alpha', 'beta', 'zeta', 'umlaut'])
   })
 
-  it('adds the highlighted result with Enter and closes with Escape', () => {
+  it('keeps a single operation title and hides registry metadata for an unambiguous result', () => {
     const onPick = vi.fn()
     const onClose = vi.fn()
     render(<NodeFinder specs={[node({ source: 'plugin:quality-pack' })]} onPick={onPick} onClose={onClose} />)
     const search = screen.getByRole('textbox', { name: 'Search operations' })
     expect(search).toHaveFocus()
-    expect(screen.getByRole('option').textContent).toContain('Plugin · quality-pack')
+    const option = screen.getByRole('option')
+    expect(option).toHaveTextContent('filter')
+    expect(option).toHaveTextContent('row predicate')
+    expect(option).not.toHaveTextContent('Built-in')
+    expect(option).not.toHaveTextContent('Plugin · quality-pack')
+    expect(option).not.toHaveTextContent('in dataset')
+    expect(option).not.toHaveTextContent('out dataset')
     fireEvent.keyDown(search, { key: 'Enter' })
     expect(onPick).toHaveBeenCalledWith('filter')
     fireEvent.keyDown(search, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a concise cue only when duplicate human titles need distinction', () => {
+    render(<NodeFinder specs={[
+      node({ kind: 'filter', title: 'Filter', category: 'shape' }),
+      node({ kind: 'quality-filter', title: 'Filter', category: 'inspect', source: 'plugin:quality-pack' }),
+    ]} onPick={vi.fn()} onClose={vi.fn()} />)
+
+    const options = screen.getAllByRole('option')
+    expect(options[0]).toHaveTextContent('shape')
+    expect(options[0]).not.toHaveTextContent('filter filter')
+    expect(options[1]).toHaveTextContent('Plugin · quality-pack')
+    expect(options[1]).not.toHaveTextContent('quality-filter')
   })
 
   it('uses the same keyboard-first picker for compatible port connections', () => {
@@ -56,7 +74,9 @@ describe('node finder', () => {
     expect(screen.getByRole('dialog', { name: 'Connect to an operation' })).toBeVisible()
     expect(search).toHaveFocus()
     expect(screen.getAllByRole('option')).toHaveLength(1)
-    expect(screen.getByRole('option')).toHaveTextContent('Plugin · quality-pack')
+    expect(screen.getByText('For dataset output')).toBeVisible()
+    expect(screen.getByRole('option')).not.toHaveTextContent('compatible')
+    expect(screen.getByRole('option')).not.toHaveTextContent('in dataset')
     fireEvent.change(search, { target: { value: 't' } })
     fireEvent.keyDown(search, { key: 'ArrowDown' })
     fireEvent.keyDown(search, { key: 'ArrowUp' })
