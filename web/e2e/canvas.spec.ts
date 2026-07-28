@@ -1953,8 +1953,12 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('the app menu opens canvas version history with a restore action', async ({ page }) => {
-    await fresh(page)               // creating the file autosaves it → a first snapshot is captured
-    await page.waitForTimeout(700)  // let the autosave (~400ms) persist server-side
+    await fresh(page)
+    // A server-created blank Canvas is already saved and must not be echoed back as a second
+    // version. Make one real user edit so Version history has an honest snapshot to restore.
+    await addNode(page, 'Shape', 'filter')
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+    await expect.poll(async () => (await canvasFor(page, canvasId)).nodes.length).toBe(1)
     await page.getByTestId('app-menu').click()
     await page.getByText('Version history').click()
     await expect(page.getByRole('heading', { name: 'Version history' })).toBeVisible()

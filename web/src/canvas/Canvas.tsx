@@ -17,12 +17,13 @@ import { api } from '../api/client'
 import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
+import type { CanvasNode } from '../types/graph'
 import { NodeFinder } from './NodeFinder'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
-import { locateNode } from './locateNode'
+import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 
@@ -32,6 +33,47 @@ function viewportNodeGeometryIdentity(nodes: readonly Node[]): string {
   return JSON.stringify(nodes.map((node) => [
     node.id, node.type ?? null, node.parentId ?? null, node.position.x, node.position.y,
   ]))
+}
+
+function revealNodeGroup(
+  doc: CanvasNode[],
+  rfNodes: readonly Node[],
+  nodeIds: readonly string[],
+  surface: DOMRect,
+  viewport: { setCenter: (x: number, y: number, options: { zoom: number, duration: number }) => void },
+): boolean {
+  const measured = new Map(rfNodes.map((node) => [node.id, node]))
+  const nodes = nodeIds.map((id) => doc.find((node) => node.id === id))
+  if (nodes.some((node) => !node)) return false
+  const bounds = (nodes as CanvasNode[]).map((node) => {
+    const measuredNode = measured.get(node.id)
+    const width = measuredNode?.measured?.width ?? measuredNode?.width
+    const height = measuredNode?.measured?.height ?? measuredNode?.height
+    if (!width || !height) return null
+    const position = absoluteNodePosition(doc, node)
+    return { x: position.x, y: position.y, width, height }
+  })
+  if (bounds.some((bound) => bound === null)) return false
+  const boxes = bounds as Array<{ x: number, y: number, width: number, height: number }>
+  const left = Math.min(...boxes.map((box) => box.x))
+  const top = Math.min(...boxes.map((box) => box.y))
+  const right = Math.max(...boxes.map((box) => box.x + box.width))
+  const bottom = Math.max(...boxes.map((box) => box.y + box.height))
+  // Keep a newly confirmed pair clear of the fixed top bar, bottom toolbar and bottom-left minimap.
+  // The Canvas surface already excludes the Inspector, so this remains responsive when it is collapsed.
+  const safe = { left: 196, top: 96, right: surface.width - 16, bottom: surface.height - 208 }
+  const width = safe.right - safe.left
+  const height = safe.bottom - safe.top
+  if (width <= 0 || height <= 0) return false
+  const zoom = Math.max(0.2, Math.min(1, width / (right - left + 64), height / (bottom - top + 64)))
+  const safeCenterX = (safe.left + safe.right) / 2
+  const safeCenterY = (safe.top + safe.bottom) / 2
+  viewport.setCenter(
+    (left + right) / 2 + (surface.width / 2 - safeCenterX) / zoom,
+    (top + bottom) / 2 + (surface.height / 2 - safeCenterY) / zoom,
+    { zoom, duration: 350 },
+  )
+  return true
 }
 
 // Directional arrowheads for the wires (open chevrons). Defined once; referenced by id from
@@ -125,6 +167,7 @@ export function Canvas() {
   const bypass = useStore((s) => s.bypass)
   const disable = useStore((s) => s.disable)
   const { screenToFlowPosition, setCenter, getZoom, fitView, viewportInitialized } = useReactFlow()
+  const canvasRef = useRef<HTMLDivElement>(null)
   const internalNodeGeometryIdentity = useReactFlowStore(
     (state) => viewportNodeGeometryIdentity(state.nodes),
   )
@@ -260,14 +303,23 @@ export function Canvas() {
   useEffect(() => {
     if (!nodeRevealRequest || nodeRevealRequest.canvasId !== doc.id
         || revealedRequestId.current === nodeRevealRequest.id) return
+    const nodeIds = nodeRevealRequest.nodeIds ?? [nodeRevealRequest.nodeId]
     const mounted = Array.from(document.querySelectorAll<HTMLElement>('.react-flow__node'))
-      .some((element) => element.dataset.id === nodeRevealRequest.nodeId)
-    if (!mounted) return
+    if (!nodeIds.every((nodeId) => mounted.some((element) => element.dataset.id === nodeId))) return
+    if (nodeIds.length > 1) {
+      const surface = canvasRef.current?.getBoundingClientRect()
+      if (!surface || !viewportInitialized) return
+      if (revealNodeGroup(doc.nodes, rfNodes, nodeIds, surface, { setCenter })) {
+        revealedRequestId.current = nodeRevealRequest.id
+        acknowledgeNodeReveal(nodeRevealRequest.id)
+      }
+      return
+    }
     if (locateNode(doc.nodes, nodeRevealRequest.nodeId, { setCenter, getZoom })) {
       revealedRequestId.current = nodeRevealRequest.id
       acknowledgeNodeReveal(nodeRevealRequest.id)
     }
-  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, setCenter, getZoom, acknowledgeNodeReveal])
+  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, viewportInitialized, setCenter, getZoom, acknowledgeNodeReveal])
 
   // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes
@@ -474,7 +526,7 @@ export function Canvas() {
   }, [removeSelected, bypass, disable])
 
   return (
-    <div style={{ position: 'absolute', inset: 0 }}
+    <div ref={canvasRef} style={{ position: 'absolute', inset: 0 }}
       onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
       onDragOver={onDragOverFiles} onDragLeave={onDragLeaveFiles} onDrop={onDropFiles}>
       <ArrowDefs />

@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub import graph as graph_mod
+from hub import metadb
 from hub.deps import get_deps
 from hub.main import app
 from hub.models import (
@@ -23,6 +24,97 @@ from hub.models import (
 from hub.related_datasets import related_datasets, source_identity_from_config
 
 client = TestClient(app)
+
+
+def _related_footprints_overlap(first: dict, second: dict) -> bool:
+    """Match the deterministic related-Join card envelopes and practical gap."""
+    first_position, second_position = first["position"], second["position"]
+    first_width, first_height = metadb._workspace_related_join_footprint(first)
+    second_width, second_height = metadb._workspace_related_join_footprint(second)
+    return (
+        first_position["x"] + first_width + 48 > second_position["x"]
+        and second_position["x"] + second_width + 48 > first_position["x"]
+        and first_position["y"] + first_height + 32 > second_position["y"]
+        and second_position["y"] + second_height + 32 > first_position["y"]
+    )
+
+
+def test_related_join_placement_skips_reproduced_and_dense_slots_deterministically():
+    selected = {"id": "selected", "type": "source", "position": {"x": 32, "y": 272}}
+    # This is the reported reproduction: the old fixed Join position covered this Transform.
+    transform = {"id": "transform", "type": "transform", "position": {"x": 384, "y": 272}}
+    dense = {"id": "dense", "type": "write", "position": {"x": 792, "y": 382}}
+    first_source = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    first_join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+    metadb._workspace_related_join_positions([selected, transform], selected, first_source, first_join)
+
+    second_source = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    second_join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+    metadb._workspace_related_join_positions(
+        [selected, transform, dense], selected, second_source, second_join)
+
+    assert first_source["position"] == {"x": 832.0, "y": 572.0}
+    assert first_join["position"] == {"x": 1192.0, "y": 382.0}
+    assert second_source["position"] == {"x": 1232.0, "y": 572.0}
+    assert second_join["position"] == {"x": 1592.0, "y": 382.0}
+    for node in (selected, transform):
+        assert not _related_footprints_overlap(first_source, node)
+        assert not _related_footprints_overlap(first_join, node)
+    for node in (selected, transform, dense):
+        assert not _related_footprints_overlap(second_source, node)
+        assert not _related_footprints_overlap(second_join, node)
+
+
+def test_related_join_fill_placement_uses_the_next_free_slot():
+    selected = {"id": "selected", "type": "source", "position": {"x": 80, "y": 180}}
+    join = {"id": "join", "type": "join", "position": {"x": 420, "y": 180}}
+    blocker = {"id": "blocker", "type": "write", "position": {"x": 120, "y": 390}}
+    added = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+
+    metadb._workspace_related_join_positions([selected, join, blocker], join, added, None)
+
+    assert added["position"] == {"x": 720.0, "y": 390.0}
+    for node in (selected, join, blocker):
+        assert not _related_footprints_overlap(added, node)
+
+
+def test_related_join_placement_reserves_the_full_code_annotation_envelope():
+    selected = {"id": "selected", "type": "source", "position": {"x": 32, "y": 272}}
+    # CodeBlock is a legitimate 320x275 top-level annotation.  It is wider than a NodeCard, so
+    # treating it as 232px creates a real DOM overlap even when the generic-node fixture passes.
+    code = {"id": "code", "type": "code", "position": {"x": 384, "y": 272}}
+    related = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+
+    assert metadb._workspace_related_join_footprint(code) == (320, 275)
+    metadb._workspace_related_join_positions([selected, code], selected, related, join)
+
+    assert not _related_footprints_overlap(related, code)
+    assert not _related_footprints_overlap(join, code)
+
+
+def test_related_join_placement_reserves_a_persisted_ten_key_join_builder():
+    # A persisted structured Join with ten pairs mounts to 654.25px in Chromium. The old fixed
+    # 400px obstacle accepted the source candidate at (400, 300), where it visibly overlapped.
+    # This must use the same server-visible config persisted by the Canvas, not browser geometry.
+    selected = {"id": "selected", "type": "source", "position": {"x": 0, "y": 0}}
+    ten_keys = ", ".join(f"key_{index}" for index in range(10))
+    tall_join = {
+        "id": "tall-join",
+        "type": "join",
+        "position": {"x": 450, "y": -150},
+        "data": {"config": {"how": "inner", "on": ten_keys}},
+    }
+    related = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+
+    assert metadb._workspace_related_join_footprint(tall_join) == (232, 655)
+    metadb._workspace_related_join_positions([selected, tall_join], selected, related, join)
+
+    assert related["position"] == {"x": 800.0, "y": 300.0}
+    assert join["position"] == {"x": 1160.0, "y": 110.0}
+    assert not _related_footprints_overlap(related, tall_join)
+    assert not _related_footprints_overlap(join, tall_join)
 
 
 class _UnavailableAdapter:

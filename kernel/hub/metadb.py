@@ -3866,6 +3866,148 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
         nodes.append(source)
 
 
+_RELATED_JOIN_CARD_FOOTPRINTS: dict[str, tuple[float, float]] = {
+    # These are the mounted top-level card envelopes, not a graph layout.  Keep them in lockstep
+    # with the product's fixed card contracts: CodeBlock is w-80 with a 240px clipped body; Note
+    # is w-[268px] with its 400px clipped body; Section is explicitly 360x240. Ordinary NodeCard
+    # forms are all 232px wide and use a 400px vertical envelope. Join's repeated key builder is
+    # sized from its persisted config below, so it cannot be placed beneath an adjacent card just
+    # because its current fields happen to be short.
+    "code": (320, 275),
+    "note": (268, 424),
+    "section": (360, 240),
+    "source": (232, 400),
+}
+_RELATED_JOIN_DEFAULT_FOOTPRINT = (232, 400)
+_RELATED_JOIN_CARD_MIN_HEIGHT = 400
+# Match the mounted key-builder geometry in web/src/nodes/kinds/join.tsx: its one-key card is
+# 195.25px high, then each additional persisted key pair contributes a 45px Field row and 6px
+# flex gap.  Round upward at the server boundary so the deterministic placement envelope never
+# falls short of the actual fractional-pixel DOM box.
+_RELATED_JOIN_KEY_BUILDER_BASE_HEIGHT = 196
+_RELATED_JOIN_KEY_BUILDER_ADDITIONAL_PAIR_HEIGHT = 51
+
+
+def _workspace_related_join_key_pair_count(config: object) -> int | None:
+    """Count only the key-builder shapes the Join card will render as repeated rows.
+
+    The persisted engine accepts broader predicates, but the Canvas uses its one-row advanced
+    editor for those.  A malformed/advanced expression must therefore not be guessed as many
+    key rows; only the UI's exact same-name ``on`` and equality ``condition`` contracts count.
+    """
+    if not isinstance(config, dict):
+        return None
+    condition = config.get("condition")
+    if isinstance(condition, str) and condition.strip():
+        terms = re.split(r"\s+AND\s+", condition.strip(), flags=re.IGNORECASE)
+        equality = re.compile(
+            r'a\.(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+            r'b\.(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)$',
+            re.IGNORECASE,
+        )
+        return len(terms) if terms and all(equality.fullmatch(term.strip()) for term in terms) else None
+    on = config.get("on")
+    if not isinstance(on, str):
+        return None
+    value = on.strip()
+    if not value:
+        return 1
+    identifier = re.compile(r'^(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)$')
+    columns = [column.strip() for column in value.split(",")]
+    return len(columns) if columns and all(identifier.fullmatch(column) for column in columns) else None
+
+
+def _workspace_related_join_footprint(node: dict) -> tuple[float, float]:
+    """Return the deterministic mounted-card envelope used by related-Join placement.
+
+    The server deliberately does not measure a browser.  Product cards with a distinct fixed
+    contract have an explicit entry; ordinary NodeCard implementations share the conservative
+    bounded envelope above.  Children of Sections are positioned in their parent coordinate space
+    and are not top-level obstacles.
+    """
+    kind = str(node.get("type") or "")
+    if kind == "join":
+        data = node.get("data")
+        config = data.get("config") if isinstance(data, dict) else None
+        pairs = _workspace_related_join_key_pair_count(config)
+        height = _RELATED_JOIN_CARD_MIN_HEIGHT
+        if pairs is not None:
+            height = max(height, _RELATED_JOIN_KEY_BUILDER_BASE_HEIGHT
+                         + _RELATED_JOIN_KEY_BUILDER_ADDITIONAL_PAIR_HEIGHT * (pairs - 1))
+        return 232, height
+    return _RELATED_JOIN_CARD_FOOTPRINTS.get(kind, _RELATED_JOIN_DEFAULT_FOOTPRINT)
+
+
+def _workspace_related_join_positions(
+        nodes: list[dict], source: dict, new_source: dict, new_join: dict | None) -> None:
+    """Place the related-data addition without disturbing the existing Canvas.
+
+    The fixed candidate order keeps a retry or another client on the same Canvas deterministic
+    while the transaction lock makes the occupied set authoritative.
+    """
+    source_width, source_height = _workspace_related_join_footprint(new_source)
+    join_width, join_height = _workspace_related_join_footprint(new_join or new_source)
+    horizontal_gap, vertical_gap = 48, 32
+
+    def footprint(node: dict) -> tuple[float, float, float, float] | None:
+        if node.get("parentId") is not None:
+            return None
+        position = node.get("position")
+        if not isinstance(position, dict):
+            return None
+        x, y = position.get("x"), position.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        width, height = _workspace_related_join_footprint(node)
+        return float(x), float(y), width, height
+
+    occupied = [box for node in nodes if isinstance(node, dict)
+                if (box := footprint(node)) is not None]
+
+    def available(candidate: list[tuple[float, float, float, float]]) -> bool:
+        boxes = [*occupied]
+        for x, y, width, height in candidate:
+            if any(
+                x + width + horizontal_gap > other_x
+                and other_x + other_width + horizontal_gap > x
+                and y + height + vertical_gap > other_y
+                and other_y + other_height + vertical_gap > y
+                for other_x, other_y, other_width, other_height in boxes
+            ):
+                return False
+            boxes.append((x, y, width, height))
+        return True
+
+    sx = float((source.get("position") or {}).get("x", 0))
+    sy = float((source.get("position") or {}).get("y", 0))
+    if new_join is None:
+        # Fill the one empty Join input near that Join, then move through deterministic free slots.
+        sx = sx - 300
+        sy = sy + 210
+        for row in range(32):
+            for column in range(32):
+                x, y = sx + column * 300, sy + row * 275
+                if available([(x, y, source_width, source_height)]):
+                    new_source["position"] = {"x": x, "y": y}
+                    return
+    else:
+        # Keep the reviewed two-input topology recognizable: the related Source sits below the
+        # selected Source and both wires lead right into the inserted Join.
+        for row in range(32):
+            for column in range(32):
+                base_x, base_y = sx + column * 400, sy + row * 320
+                source_position = (base_x, base_y + 300)
+                join_position = (base_x + 360, base_y + 110)
+                if available([
+                    (*source_position, source_width, source_height),
+                    (*join_position, join_width, join_height),
+                ]):
+                    new_source["position"] = {"x": source_position[0], "y": source_position[1]}
+                    new_join["position"] = {"x": join_position[0], "y": join_position[1]}
+                    return
+    raise WorkspaceVersionConflict("no free position is available for the related-data Join")
+
+
 def _workspace_canvas_create_intent_sha256(intent: dict) -> str:
     """Hash the client-visible semantic request, never generated node IDs or provider handles."""
     payload = json.dumps(intent, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -4260,17 +4402,15 @@ def workspace_apply_related_join_action(
         fence(candidate_identity, candidate_source)
         suffix = uuid.uuid4().hex[:12]
         source_id = f"source_related_{suffix}"
-        sx = float((source.get("position") or {}).get("x", 0))
-        sy = float((source.get("position") or {}).get("y", 0))
         new_source = {
-            "id": source_id, "type": "source", "position": {"x": sx, "y": sy + 220},
+            "id": source_id, "type": "source", "position": {"x": 0, "y": 0},
             "data": {"title": candidate_name, "status": "draft", "config": candidate_source,
                      "history": []},
         }
         if join_node_id is None:
             join_id = f"join_related_{suffix}"
             new_join = {
-                "id": join_id, "type": "join", "position": {"x": sx + 360, "y": sy + 110},
+                "id": join_id, "type": "join", "position": {"x": 0, "y": 0},
                 "data": {"title": f"Join {((source.get('data') or {}).get('title') or 'source')} with {candidate_name}",
                          "status": "draft", "config": {"how": how, **join_config}, "history": []},
             }
@@ -4280,6 +4420,7 @@ def workspace_apply_related_join_action(
                 {"id": f"edge_related_right_{suffix}", "source": source_id, "target": join_id,
                  "sourceHandle": "out", "targetHandle": "b", "data": {"wire": "dataset"}},
             ]
+            _workspace_related_join_positions(nodes, source, new_source, new_join)
             nodes.extend([new_source, new_join])
         else:
             join = next((node for node in nodes if isinstance(node, dict)
@@ -4291,8 +4432,7 @@ def workspace_apply_related_join_action(
             join_id = join_node_id
             occupied = incoming[0]["targetHandle"]
             empty = "a" if occupied == "b" else "b"
-            new_source["position"] = {"x": float((join.get("position") or {}).get("x", 0)) - 300,
-                                      "y": float((join.get("position") or {}).get("y", 0)) + 210}
+            _workspace_related_join_positions(nodes, join, new_source, None)
             join_data = join.setdefault("data", {})
             old_config = join_data.get("config") if isinstance(join_data.get("config"), dict) else {}
             join_data["config"] = {**old_config, "how": how, **join_config}
