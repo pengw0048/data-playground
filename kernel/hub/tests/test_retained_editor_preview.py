@@ -94,7 +94,7 @@ def _wait(run_id: str) -> dict:
 
 
 @contextmanager
-def _retained_sample(tmp_path, configure_graph=None):
+def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     lance = pytest.importorskip("lance")
     canvas_id = f"retained-editor-{uuid.uuid4().hex}"
     source_uri = str(tmp_path / f"{canvas_id}.lance")
@@ -107,14 +107,17 @@ def _retained_sample(tmp_path, configure_graph=None):
     })
     assert registered.status_code == 200, registered.text
     graph = _graph(canvas_id)
-    graph["nodes"][0]["data"]["config"] = {
-        "uri": source_uri,
-        "datasetRef": {
-            "kind": "exact",
-            "datasetId": registered.json()["registrationId"],
-            "revisionId": "1",
-        },
-    }
+    graph["nodes"][0]["data"]["config"] = (
+        {"uri": source_uri, "registrationId": registered.json()["registrationId"]}
+        if logical_source else {
+            "uri": source_uri,
+            "datasetRef": {
+                "kind": "exact",
+                "datasetId": registered.json()["registrationId"],
+                "revisionId": "1",
+            },
+        }
+    )
     if configure_graph is not None:
         configure_graph(graph)
     with metadb.session() as session:
@@ -443,6 +446,86 @@ def test_exact_source_reuses_retained_rows_without_reopening_provider(
     response = _preview(graph)
     assert response.status_code == 200, response.text
     assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_logical_workspace_source_reuses_retained_rows_after_head_advances(
+        tmp_path, monkeypatch):
+    """Workspace Use Sources carry registrationId, while the run owns its exact revision."""
+    lance = pytest.importorskip("lance")
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        source_uri = graph["nodes"][0]["data"]["config"]["uri"]
+        lance.write_dataset(pa.table({
+            "event": ["new-head"], "amount": [999],
+        }), source_uri, mode="append")
+
+        def forbidden_revision_read(*_args, **_kwargs):
+            raise AssertionError("editor reuse must read only the retained upstream result")
+
+        monkeypatch.setattr(LanceAdapter, "open_revision", forbidden_revision_read)
+        monkeypatch.setattr(LanceAdapter, "preview_revision", forbidden_revision_read)
+        response = _preview(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_retained_editor_preview_uses_terminal_state_before_history_projection(tmp_path):
+    """The editor can open immediately after a local run reaches terminal state."""
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        # Model the narrow real ordering window: RunState has committed first, but the asynchronous
+        # history projection has not yet run.  The terminal state remains Canvas- and manifest-bound.
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            assert state is not None
+            assert state.canvas_id == graph["id"]
+            assert state.status == "done"
+            assert json.loads(state.doc)["target_node_id"] == "sample"
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            assert record is not None
+            session.delete(record)
+
+        response = _preview(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_terminal_state_does_not_outlive_history_retention_for_editor_reuse(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        # Normal history pruning removes the admission together with the RunRecord. A still-retained
+        # operational RunState must not resurrect that older result as editor history.
+        with metadb.session() as session:
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            admission = session.get(metadb.RunInputAdmission, run_id)
+            assert record is not None and admission is not None
+            session.delete(record)
+            session.delete(admission)
+
+        response = _preview(graph)
+        assert response.status_code == 404, response.text
+        assert response.json()["code"] == "retained_upstream_unavailable"
+
+
+def test_projected_history_is_never_overridden_by_live_state(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        with metadb.session() as session:
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            assert record is not None
+            record.outputs = "[]"
+
+        response = _preview(graph)
+        assert response.status_code == 404, response.text
+        assert response.json()["code"] == "retained_upstream_unavailable"
+
+
+def test_logical_workspace_source_registration_change_invalidates_reuse(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, _run_id, _output):
+        changed = copy.deepcopy(graph)
+        changed["nodes"][0]["data"]["config"]["registrationId"] = "replaced-registration"
+        response = _preview(changed)
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "retained_upstream_stale"
 
 
 def test_official_transform_run_does_not_depend_on_editor_retained_input(retained_sample):

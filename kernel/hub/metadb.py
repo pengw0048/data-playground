@@ -12521,10 +12521,39 @@ def retained_run_editor_candidates(
             )
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
         ).all()
+        # A local runner publishes its durable terminal RunState before its best-effort history
+        # projection.  The fullscreen editor is reached directly from that terminal UI, so it must
+        # be able to use the same committed output during this short projection window.  Restrict
+        # the fallback to the same Canvas, target, terminal state, and manifest identity; it is not
+        # a substitute for historical records after RunState retention expires.
+        live_rows = s.execute(
+            select(
+                RunState.run_id,
+                RunState.execution_manifest_sha256,
+                RunState.doc,
+            )
+            .join(
+                RunInputAdmission,
+                RunInputAdmission.run_id == RunState.run_id,
+            )
+            .where(
+                RunState.canvas_id == str(canvas_id),
+                RunState.status == "done",
+                RunState.job_type == "run",
+                RunInputAdmission.canvas_id == str(canvas_id),
+                RunInputAdmission.target_node_id == str(target_node_id),
+                RunInputAdmission.dispatched_at.is_not(None),
+                RunInputAdmission.execution_manifest_sha256
+                == RunState.execution_manifest_sha256,
+            )
+            .order_by(RunState.updated_at.desc(), RunState.run_id.desc())
+        ).all()
     candidates: list[dict] = []
+    seen_run_ids: set[str] = set()
     for row in rows:
         if row.run_id is None:
             continue
+        seen_run_ids.add(str(row.run_id))
         try:
             outputs = json.loads(row.outputs)
         except (TypeError, ValueError):
@@ -12543,6 +12572,38 @@ def retained_run_editor_candidates(
         if output is not None:
             candidates.append({
                 "run_id": str(row.run_id),
+                "execution_manifest_sha256": row.execution_manifest_sha256,
+                "output": dict(output),
+            })
+    for row in live_rows:
+        run_id = str(row.run_id)
+        if run_id in seen_run_ids:
+            continue
+        try:
+            status = json.loads(row.doc)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not isinstance(status, dict)
+            or status.get("status") != "done"
+            or status.get("target_node_id") != target_node_id
+        ):
+            continue
+        outputs = status.get("outputs")
+        if not isinstance(outputs, list):
+            continue
+        output = next((
+            item for item in outputs
+            if isinstance(item, dict)
+            and item.get("node_id") == target_node_id
+            and item.get("port_id") == port_id
+            and item.get("outcome") == "committed"
+            and item.get("publication_kind") == "result"
+            and item.get("uri")
+        ), None)
+        if output is not None:
+            candidates.append({
+                "run_id": run_id,
                 "execution_manifest_sha256": row.execution_manifest_sha256,
                 "output": dict(output),
             })
