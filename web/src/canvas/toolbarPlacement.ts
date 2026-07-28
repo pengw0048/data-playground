@@ -7,23 +7,52 @@ export const TOOLBAR_NODE_HEIGHT = 200
 export const TOOLBAR_ACTION_SHELF_HEIGHT = 38
 const SAFE_GUTTER = 12
 const FREE_WIDTH = 280
-const FREE_HEIGHT = 180
+const LEGACY_FREE_HEIGHT = 180
+const SAFE_FOOTPRINT_HEIGHT = TOOLBAR_NODE_HEIGHT + 5 + TOOLBAR_ACTION_SHELF_HEIGHT
 
 export type ToolbarSafeBounds = { left: number; top: number; right: number; bottom: number }
 
-function clashes(nodes: readonly CanvasNode[], x: number, y: number) {
+function clashes(nodes: readonly CanvasNode[], x: number, y: number, height = SAFE_FOOTPRINT_HEIGHT) {
   return nodes.some((node) => (
-    Math.abs(node.position.x - x) < FREE_WIDTH && Math.abs(node.position.y - y) < FREE_HEIGHT
+    Math.abs(node.position.x - x) < FREE_WIDTH && Math.abs(node.position.y - y) < height
   ))
 }
 
-function candidates(base: { x: number; y: number }) {
+function legacyCandidates(base: { x: number; y: number }) {
   const positions = [base]
   const directions = [[1, 0], [0, 1], [1, 1], [-1, 0], [-1, 1], [0, -1], [1, -1], [-1, -1]]
   for (let radius = 1; radius < 50; radius++) {
     for (const [dx, dy] of directions) {
-      positions.push({ x: base.x + dx * FREE_WIDTH * radius * 0.75, y: base.y + dy * FREE_HEIGHT * radius * 0.9 })
+      positions.push({ x: base.x + dx * FREE_WIDTH * radius * 0.75, y: base.y + dy * LEGACY_FREE_HEIGHT * radius * 0.9 })
     }
+  }
+  return positions
+}
+
+function safeCandidates(base: { x: number; y: number }, bounds: ToolbarSafeBounds) {
+  const minX = bounds.left + SAFE_GUTTER
+  const maxX = bounds.right - SAFE_GUTTER - TOOLBAR_NODE_WIDTH
+  if (minX > maxX) return []
+
+  // Fill the current row before moving vertically. Projecting the regular horizontal steps onto
+  // the real edges prevents a narrowed or panned viewport from skipping a usable side strip.
+  const xs: number[] = []
+  const seen = new Set<number>()
+  const addX = (x: number) => {
+    const bounded = Math.max(minX, Math.min(x, maxX))
+    if (!seen.has(bounded)) { seen.add(bounded); xs.push(bounded) }
+  }
+  addX(base.x)
+  for (let radius = 1; radius < 50; radius++) {
+    addX(base.x + FREE_WIDTH * radius * 0.75)
+    addX(base.x - FREE_WIDTH * radius * 0.75)
+  }
+
+  const positions = xs.map((x) => ({ x, y: base.y }))
+  for (let radius = 1; radius < 50; radius++) {
+    const up = base.y - SAFE_FOOTPRINT_HEIGHT * radius
+    const down = base.y + SAFE_FOOTPRINT_HEIGHT * radius
+    positions.push(...xs.map((x) => ({ x, y: up })), ...xs.map((x) => ({ x, y: down })))
   }
   return positions
 }
@@ -42,10 +71,10 @@ function isInsideSafeBounds(position: { x: number; y: number }, bounds: ToolbarS
 export function toolbarSafePosition(
   nodes: readonly CanvasNode[], base: { x: number; y: number }, bounds: ToolbarSafeBounds,
 ): { x: number; y: number } {
-  const positions = candidates(base)
+  const positions = safeCandidates(base, bounds)
   const safe = positions.find((position) => !clashes(nodes, position.x, position.y) && isInsideSafeBounds(position, bounds))
   if (safe) return safe
 
   // Keep the pre-existing free-position behavior when the visible region is genuinely full.
-  return positions.find((position) => !clashes(nodes, position.x, position.y)) ?? base
+  return legacyCandidates(base).find((position) => !clashes(nodes, position.x, position.y, LEGACY_FREE_HEIGHT)) ?? base
 }

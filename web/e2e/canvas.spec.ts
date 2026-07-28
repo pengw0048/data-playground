@@ -18,6 +18,12 @@ function overlaps(a: { x: number; y: number; width: number; height: number }, b:
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
+function contains(outer: { x: number; y: number; width: number; height: number }, inner: typeof outer) {
+  return inner.x >= outer.x && inner.y >= outer.y
+    && inner.x + inner.width <= outer.x + outer.width
+    && inner.y + inner.height <= outer.y + outer.height
+}
+
 async function confirmRun(page: Page, action: 'managed' | 'ordinary' = 'managed') {
   const runPanel = page.getByTestId('panel-run')
   await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
@@ -817,7 +823,9 @@ test.describe('Data Playground canvas', () => {
       await addNode(page, category, title)
       const shelf = page.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'History' }).locator('..')
       await expect(shelf).toBeVisible()
-      expect(overlaps(await boxOf(shelf), await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
+      const shelfBox = await boxOf(shelf)
+      expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the visible Canvas`).toBe(true)
+      expect(overlaps(shelfBox, await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
     }
 
     const nodes = page.locator('.react-flow__node')
@@ -838,8 +846,18 @@ test.describe('Data Playground canvas', () => {
 
     await page.keyboard.press('Escape')
     await page.setViewportSize({ width: 1440, height: 900 })
-    await expect(page.getByTestId('toolbar')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Edit code' })).toBeVisible()
+    await fresh(page)
+    for (const [category, title] of [
+      ['Sources & sinks', 'source'],
+      ['Shape', 'filter'],
+      ['Compute', 'transform'],
+    ] as const) {
+      await addNode(page, category, title)
+      const shelf = page.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'History' }).locator('..')
+      const shelfBox = await boxOf(shelf)
+      expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the reference Canvas`).toBe(true)
+      expect(overlaps(shelfBox, await boxOf(page.getByTestId('toolbar'))), `${title} action shelf overlaps the reference toolbar`).toBe(false)
+    }
   })
 
   test('the file menu opens a fresh (empty) canvas as a new file', async ({ page }) => {
