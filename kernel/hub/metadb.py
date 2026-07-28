@@ -11857,6 +11857,18 @@ def retained_run_output_candidates(
                 RunRecord.run_id,
                 RunRecord.execution_manifest_sha256,
                 RunRecord.outputs,
+                RunState.updated_at.label("terminal_at"),
+            )
+            .outerjoin(
+                RunState,
+                and_(
+                    RunState.run_id == RunRecord.run_id,
+                    RunState.canvas_id == RunRecord.canvas_id,
+                    RunState.status == "done",
+                    RunState.job_type == "run",
+                    RunState.execution_manifest_sha256
+                    == RunRecord.execution_manifest_sha256,
+                ),
             )
             .where(
                 RunRecord.canvas_id == str(canvas_id),
@@ -11876,6 +11888,7 @@ def retained_run_output_candidates(
                 RunState.run_id,
                 RunState.execution_manifest_sha256,
                 RunState.doc,
+                RunState.updated_at.label("terminal_at"),
             )
             .join(
                 RunInputAdmission,
@@ -11893,7 +11906,7 @@ def retained_run_output_candidates(
             )
             .order_by(RunState.updated_at.desc(), RunState.run_id.desc())
         ).all()
-    candidates: list[dict] = []
+    projected_candidates: list[dict] = []
     seen_run_ids: set[str] = set()
     for row in rows:
         if row.run_id is None:
@@ -11915,11 +11928,13 @@ def retained_run_output_candidates(
             and item.get("uri")
         ), None)
         if output is not None:
-            candidates.append({
+            projected_candidates.append({
                 "run_id": str(row.run_id),
                 "execution_manifest_sha256": row.execution_manifest_sha256,
                 "output": dict(output),
+                "_terminal_at": row.terminal_at,
             })
+    live_candidates: list[dict] = []
     for row in live_rows:
         run_id = str(row.run_id)
         if run_id in seen_run_ids:
@@ -11947,12 +11962,30 @@ def retained_run_output_candidates(
             and item.get("uri")
         ), None)
         if output is not None:
-            candidates.append({
+            live_candidates.append({
                 "run_id": run_id,
                 "execution_manifest_sha256": row.execution_manifest_sha256,
                 "output": dict(output),
+                "_terminal_at": row.terminal_at,
             })
-    return candidates
+
+    def public(items: list[dict]) -> list[dict]:
+        return [{key: value for key, value in item.items() if key != "_terminal_at"}
+                for item in items]
+
+    if not live_candidates:
+        return public(projected_candidates)
+    candidates = [*projected_candidates, *live_candidates]
+    terminal_times = [item["_terminal_at"] for item in candidates]
+    # RunRecord.created_at is projection time, not completion time, so it cannot order a projected
+    # result against an unprojected terminal state. Compare only the same manifest-bound RunState
+    # evidence across both sources. Missing or tied evidence is ambiguous and must fail closed rather
+    # than make an older artifact appear current.
+    if any(value is None for value in terminal_times) \
+            or len(set(terminal_times)) != len(terminal_times):
+        return []
+    candidates.sort(key=lambda item: item["_terminal_at"], reverse=True)
+    return public(candidates)
 
 
 def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:
