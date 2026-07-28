@@ -60,7 +60,9 @@ test('Run upstream stays in the fullscreen Transform editor and selects its fres
     await page.getByRole('button', { name: 'Run upstream' }).click()
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
     await expect(page.getByRole('status', { name: 'Upstream run cancelled' })).toHaveCount(0)
-    await expect(page.getByRole('status', { name: 'Upstream result ready' })).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByText('Using Editor sample · 8 rows', { exact: true })).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByRole('status', { name: 'Upstream result ready' })).toHaveCount(0)
+    await expect(page.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Test code' })).toBeEnabled()
     await expect(page.getByText('true', { exact: true }).first()).toBeVisible({ timeout: 20_000 })
   } finally {
@@ -103,11 +105,29 @@ test('fullscreen Transform confirms an upstream run without leaving the code-tes
     await expect(retriedConfirmation).toBeVisible()
     await retriedConfirmation.getByRole('button', { name: 'Run upstream' }).click()
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
-    await expect(page.getByRole('status', { name: 'Upstream result ready' })).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByText('Using Editor sample · 8 rows', { exact: true })).toBeVisible({ timeout: 20_000 })
     await expect(page.getByRole('button', { name: 'Test code' })).toBeEnabled()
     await expect(editor).toContainText('tested_in_editor')
     await page.getByRole('button', { name: 'Example rows', exact: true }).click()
     await expect(fixture).toHaveValue('[{"event":"confirmation-sentinel"}]')
+  } finally {
+    await removeCanvas(page, canvasId)
+  }
+})
+
+test('fullscreen Transform keeps the input-cap warning when retained input metadata exceeds the cap', async ({ page }) => {
+  test.setTimeout(45_000)
+  const canvasId = await openUnprimedEditor(page, 'capped-input')
+  try {
+    await page.route('**/api/run/editor-preview', async (route) => {
+      const response = await route.fetch()
+      const body = await response.json()
+      body.editorTestInput.rows = 2_001
+      await route.fulfill({ response, json: body })
+    })
+    await page.getByRole('button', { name: 'Run upstream' }).click()
+    await expect(page.getByText('Using Editor sample · 2,001 rows', { exact: true })).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toBeVisible()
   } finally {
     await removeCanvas(page, canvasId)
   }

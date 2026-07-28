@@ -295,7 +295,7 @@ export function CodeFullscreen() {
               <div className="min-h-0 flex-1 overflow-auto">
                 {usingExampleRows && testedExampleRowsJson !== exampleRowsJson ? (
                   <div className="grid h-full min-h-40 place-items-center px-6 text-center text-xs leading-relaxed text-muted-foreground">
-                    Edit this request-local fixture, then choose Test code. It is never saved to the Canvas.
+                    These rows are used only for this test and are not saved to the Canvas. Edit them, then choose Test code.
                   </div>
                 ) : (
                   <>
@@ -421,10 +421,7 @@ function EditorUpstreamRunStatus({
   )
 
   if (phase === 'done' && resultReady) return (
-    <section aria-label="Upstream result ready" role="status" className="border-b border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5 text-[11px]">
-      <div className="font-semibold text-foreground">Upstream result ready</div>
-      <p className="mt-1 text-muted-foreground">A fresh retained {upstreamLabel} result is selected for this editor. Test code is available.</p>
-    </section>
+    null
   )
 
   if (phase === 'done' && selectionFailed) return (

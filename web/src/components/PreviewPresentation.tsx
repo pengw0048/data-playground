@@ -3,6 +3,13 @@ import type { SampleProvenance, SampleResult } from '../types/api'
 type PreviewUnit = 'rows' | 'points' | 'groups'
 type PreviewSurface = 'canvas' | 'catalog'
 
+export function editorInputFitsPreviewCap(data: SampleResult): boolean {
+  const input = data.editorTestInput
+  // `rows` is server-proved only when the retained output has an exact materialized count.
+  // An absent count is uncertainty, not evidence that the source cap did not apply.
+  return input?.rows != null && data.rowLimit != null && input.rows <= data.rowLimit
+}
+
 export function previewRangeLabel(unit: PreviewUnit, offset: number, count: number) {
   if (count === 0) return offset === 0 ? `No ${unit} returned` : `No ${unit} at offset ${offset.toLocaleString()}`
   return `${unit} ${(offset + 1).toLocaleString()}–${(offset + count).toLocaleString()}`
@@ -12,10 +19,11 @@ export function previewWarning(
   data: SampleResult,
   unit: PreviewUnit,
   surface: PreviewSurface = 'canvas',
+  suppressSourceCapWarning = false,
 ): string | null {
   const end = data.rows.length
   const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
-  if (sourceCapped) {
+  if (sourceCapped && !suppressSourceCapWarning) {
     return `Preview uses up to ${(data.rowLimit ?? end).toLocaleString()} ${unit} from each input; output may differ from a full run.`
   }
   const resultCapped = data.limitScope === 'result-window'
@@ -40,6 +48,7 @@ export function PreviewSummary({
   showRange = true,
   showWarning = true,
   surface = 'canvas',
+  suppressSourceCapWarning = false,
 }: {
   data: SampleResult
   offset?: number
@@ -47,9 +56,10 @@ export function PreviewSummary({
   showRange?: boolean
   showWarning?: boolean
   surface?: PreviewSurface
+  suppressSourceCapWarning?: boolean
 }) {
   const summary = data.sampleProvenance ? samplingSummary(data.sampleProvenance) : null
-  const warning = showWarning ? previewWarning(data, unit, surface) : null
+  const warning = showWarning ? previewWarning(data, unit, surface, suppressSourceCapWarning) : null
   if (!showRange && !summary && !warning) return null
   return (
     <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">

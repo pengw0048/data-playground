@@ -14,7 +14,7 @@ import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCellRenderer'
 import {
-  PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
+  editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
 } from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
@@ -119,7 +119,7 @@ export function DataPanel({ nodeId, editorPreview }: {
       )}
       {editorPreview && preview?.result?.editorTestInput && (
         <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
-          Testing with {preview.result.editorTestInput.label} result
+          Using {preview.result.editorTestInput.label}
           {preview.result.editorTestInput.rows != null
             ? ` · ${preview.result.editorTestInput.rows.toLocaleString()} rows`
             : ''}
@@ -296,7 +296,8 @@ export function DataPanel({ nodeId, editorPreview }: {
         <ExampleRowsResultBanner data={res} offset={offset} />
       ) : (
         <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
-          showDetails={activeTab !== 'stats'} showWarning={node?.type !== 'source'} />
+          showDetails={activeTab !== 'stats'} showWarning={node?.type !== 'source'}
+          suppressSourceCapWarning={editorInputFitsPreviewCap(res)} />
       )}
 
       {isChart ? (
@@ -457,13 +458,16 @@ function ExampleRowsResultBanner({ data, offset }: { data: SampleResult; offset:
   )
 }
 
-function DataScopeBanner({ data, offset, unit, scope, showDetails = true, showWarning = true }: {
+function DataScopeBanner({
+  data, offset, unit, scope, showDetails = true, showWarning = true, suppressSourceCapWarning = false,
+}: {
   data: SampleResult
   offset: number
   unit: 'rows' | 'points' | 'groups'
   scope: 'preview' | 'full-result' | 'published-dataset'
   showDetails?: boolean
   showWarning?: boolean
+  suppressSourceCapWarning?: boolean
 }) {
   const end = offset + data.rows.length
   const total = data.rowCount ?? null
@@ -476,7 +480,7 @@ function DataScopeBanner({ data, offset, unit, scope, showDetails = true, showWa
     return (
       <>
         <PreviewSummary data={data} offset={offset} unit={unit} showRange={false}
-          showWarning={showWarning} />
+          showWarning={showWarning} suppressSourceCapWarning={suppressSourceCapWarning} />
         {showDetails && provenance && (
           <div className="px-[11px]">
             <PreviewDetails provenance={provenance} />
