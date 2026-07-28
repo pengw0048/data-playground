@@ -416,6 +416,7 @@ export function CatalogDiscovery({
       {selectedIds.size > 0 && (
         <div className="flex items-center gap-2 px-7 pb-2 text-[12px]" data-testid="catalog-selection-bar">
           <span className="font-semibold text-foreground">{selectedIds.size} selected</span>
+          {selectedIds.size > 1 && <span className="text-muted-foreground">Up to {CATALOG_BATCH_LIMIT} datasets</span>}
           <button onClick={useSelected} className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-primary hover:bg-accent">
             <Icon name="plus" size={11} /> Use
           </button>

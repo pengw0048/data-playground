@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { api, type CanvasFile } from '../api/client'
+import { api, KernelError, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
   CatalogTable, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
@@ -862,9 +862,11 @@ function WorkspaceMixedExplorer() {
         onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
         files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
+        onRefreshCanvases={refreshFiles}
         onOpened={(canvasId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openFile(canvasId) }} />}
       {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
         container={container} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setProviderDatasetAction(null)}
+        onRefreshCanvases={refreshFiles}
         onOpened={(canvasId) => {
           setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
         }} />}
@@ -1113,7 +1115,7 @@ function WorkspaceDatasets() {
     </div>
     {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
       destinationError={destinationError} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
-      onRetryDestination={() => setDestinationRevision((current) => current + 1)}
+      onRetryDestination={() => setDestinationRevision((current) => current + 1)} onRefreshCanvases={refreshFiles}
       onOpened={(canvasId) => { setDatasetAction(null); void openFile(canvasId) }} />}
   </div>
 }
@@ -1512,10 +1514,10 @@ function CanvasDeleteDialog({ resource, onClose, onDeleted }: {
 
 type CanvasTargetState = 'loading' | 'ready' | 'unavailable'
 
-function DatasetActionDialog({ action, container, destinationError, files, currentCanvasId, targetState, onClose, onOpened, onRetryDestination }: {
+function DatasetActionDialog({ action, container, destinationError, files, currentCanvasId, targetState, onClose, onOpened, onRetryDestination, onRefreshCanvases }: {
   action: { tables: CatalogTable[] }; container: WorkspaceResource | null; destinationError?: string | null
   files: CanvasFile[]; currentCanvasId: string; targetState: CanvasTargetState; onClose: () => void; onOpened: (canvasId: string) => void
-  onRetryDestination?: () => void
+  onRetryDestination?: () => void; onRefreshCanvases: () => Promise<boolean>
 }) {
   const editable = targetState === 'ready'
     ? files.filter((file) => file.role === 'owner' || file.role === 'editor') : []
@@ -1526,6 +1528,7 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [conflict, setConflict] = useState(false)
   const pushToast = useStore((state) => state.pushToast)
   const addReplay = useRef<{ intent: string; requestId: string } | null>(null)
   const currentCanvas = editable.find((file) => file.id === currentCanvasId)
@@ -1534,7 +1537,7 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
   }, [canvasId, files, targetState])
   const submit = async () => {
     if (busy) return
-    setBusy(true); setError(null)
+    setBusy(true); setError(null); setConflict(false)
     try {
       if (datasetIds.length !== action.tables.length || !datasetIds.length) {
         setError('Reload the selection before using it; a stable dataset identity is missing')
@@ -1559,36 +1562,48 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
         if (result.alreadyPresent) pushToast('This dataset is already present in the selected Canvas.', 'info')
         onOpened(target.id)
       }
-    } catch (caught) { setError(errorMessage(caught)) }
+    } catch (caught) {
+      if (caught instanceof KernelError && caught.status === 409 && mode !== 'explore') {
+        setConflict(true)
+        setError('That Canvas changed. Refresh the Canvas list, then try adding the Source again.')
+      } else setError(errorMessage(caught))
+    }
     finally { setBusy(false) }
+  }
+  const refreshAfterConflict = async () => {
+    if (busy) return
+    setBusy(true)
+    const refreshed = await onRefreshCanvases()
+    setBusy(false)
+    if (refreshed) { setConflict(false); setError('Canvases refreshed. Try adding the Source again.') }
   }
   return <Modal label={`Use ${label}`} onClose={onClose}>
     <div className="max-h-24 overflow-y-auto rounded-md border border-border bg-muted/25 px-2 py-1 text-[10.5px] text-muted-foreground">
       {action.tables.map((table) => <div key={table.id} className="truncate">{table.name}</div>)}
     </div>
-    <p className="text-[11px] text-muted-foreground">Bounded to {CATALOG_BATCH_LIMIT} datasets. The selected sources are applied atomically under one Canvas version precondition.</p>
     <div className="grid gap-2 sm:grid-cols-3">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}>
         <span className="block text-[12px] font-semibold">Explore in a new Canvas</span><span className="text-[10.5px] text-muted-foreground">{container ? `Create in ${container.name}` : 'Loading exact destination…'}</span>
       </button>
       <button onClick={() => setMode('current')} disabled={targetState !== 'ready' || !currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}>
-        <span className="block text-[12px] font-semibold">Add to this Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable current Canvas'}</span>
+        <span className="block text-[12px] font-semibold">Add to a recent Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable recent Canvas'}</span>
       </button>
       <button onClick={() => setMode('choose')} disabled={targetState !== 'ready'} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}>
         <span className="block text-[12px] font-semibold">Choose a Canvas</span><span className="text-[10.5px] text-muted-foreground">Select an editable destination</span>
       </button>
     </div>
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name
-      <input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input aria-label="New canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label> : targetState !== 'ready' ? <div role="status" className="text-[12px] text-muted-foreground">{targetState === 'loading' ? 'Refreshing editable Canvases…' : 'Editable Canvases could not be refreshed. Close and try again.'}</div>
-      : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong></div>
+      : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong>. Source nodes will be added; your data is not copied or modified.</div>
       : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas
       <select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">
         {editable.map((file) => <option key={file.id} value={file.id}>{file.name} · {file.id}</option>)}
       </select>
+      <span className="text-[11px] text-muted-foreground">Source nodes will be added; your data is not copied or modified.</span>
     </label> : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available. Explore in a new canvas instead.</div>}
     {destinationError && mode === 'explore' && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>Couldn't load the Workspace destination: {destinationError}</span>{onRetryDestination && <button onClick={onRetryDestination} className="font-semibold underline">Retry</button>}</div>}
-    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    {error && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>{error}</span>{conflict && <button onClick={() => void refreshAfterConflict()} disabled={busy} className="font-semibold underline">Refresh Canvases</button>}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : targetState !== 'ready' || (mode === 'current' ? !currentCanvas : !canvasId))} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
   </Modal>
@@ -1829,9 +1844,9 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   </div>
 }
 
-function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, targetState, onClose, onOpened }: {
+function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, targetState, onClose, onOpened, onRefreshCanvases }: {
   resource: WorkspaceResource; container: WorkspaceResource | null; files: CanvasFile[]; currentCanvasId: string; targetState: CanvasTargetState
-  onClose: () => void; onOpened: (canvasId: string) => void
+  onClose: () => void; onOpened: (canvasId: string) => void; onRefreshCanvases: () => Promise<boolean>
 }) {
   const editable = targetState === 'ready'
     ? files.filter((file) => file.role === 'owner' || file.role === 'editor') : []
@@ -1840,6 +1855,7 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [conflict, setConflict] = useState(false)
   const pushToast = useStore((state) => state.pushToast)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
   const addReplay = useRef<{ intent: string; requestId: string } | null>(null)
@@ -1850,7 +1866,7 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
   }, [canvasId, files, targetState])
   const submit = async () => {
     if (busy) return
-    setBusy(true); setError(null)
+    setBusy(true); setError(null); setConflict(false)
     try {
       if (mode === 'explore') {
         if (!destination) throw new Error('Load an exact writable local Canvas destination first')
@@ -1879,23 +1895,35 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
         if (result.alreadyPresent) pushToast('This provider dataset is already present in the selected Canvas.', 'info')
         onOpened(target.id)
       }
-    } catch (caught) { setError(errorMessage(caught)) }
+    } catch (caught) {
+      if (caught instanceof KernelError && caught.status === 409 && mode !== 'explore') {
+        setConflict(true)
+        setError('That Canvas changed. Refresh the Canvas list, then try adding the Source again.')
+      } else setError(errorMessage(caught))
+    }
     finally { setBusy(false) }
+  }
+  const refreshAfterConflict = async () => {
+    if (busy) return
+    setBusy(true)
+    const refreshed = await onRefreshCanvases()
+    setBusy(false)
+    if (refreshed) { setConflict(false); setError('Canvases refreshed. Try adding the Source again.') }
   }
   return <Modal label={`Use ${resource.name}`} onClose={onClose}>
     <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated. {isExternal(container) && destination && 'The new Canvas is a locally owned overlay beside this source-only provider resource.'}</p>
     <div className="grid gap-2 sm:grid-cols-3">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in a new Canvas</span></button>
-      <button onClick={() => setMode('current')} disabled={targetState !== 'ready' || !currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to this Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable current Canvas'}</span></button>
+      <button onClick={() => setMode('current')} disabled={targetState !== 'ready' || !currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to a recent Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable recent Canvas'}</span></button>
       <button onClick={() => setMode('choose')} disabled={targetState !== 'ready'} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Choose a Canvas</span></button>
     </div>
-    {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
+    {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input aria-label="New canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
       : targetState !== 'ready' ? <div role="status" className="text-[12px] text-muted-foreground">{targetState === 'loading' ? 'Refreshing editable Canvases…' : 'Editable Canvases could not be refreshed. Close and try again.'}</div>
-      : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong></div>
-      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
+      : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong>. Source nodes will be added; your data is not copied or modified.</div>
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select><span className="text-[11px] text-muted-foreground">Source nodes will be added; your data is not copied or modified.</span></label>
         : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available.</div>}
     {mode === 'explore' && !destination && <div role="status" className="text-[12px] text-muted-foreground">{canvasDestinationTitle(container, 'create')}</div>}
-    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    {error && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>{error}</span>{conflict && <button onClick={() => void refreshAfterConflict()} disabled={busy} className="font-semibold underline">Refresh Canvases</button>}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !destination : targetState !== 'ready' || (mode === 'current' ? !currentCanvas : !canvasId))}
       title={mode === 'explore' && !destination ? canvasDestinationTitle(container, 'create') : undefined}
       className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
