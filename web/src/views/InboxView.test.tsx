@@ -50,7 +50,7 @@ describe('InboxView', () => {
     mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
     render(<InboxView />)
     expect(await screen.findByText(
-      'No completed background work yet. When a durable task finishes, its outcome will appear here.',
+      'No completed background work yet. Completed background tasks will appear here.',
     )).toBeInTheDocument()
     expect(screen.queryByText(/finished runs/i)).toBeNull()
   })
