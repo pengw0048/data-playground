@@ -9,6 +9,7 @@ import { Popover } from '../ui/Popover'
 import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
+import { uniqueNextStepConnection } from './nextStep'
 import { cn } from '@/lib/utils'
 import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 
@@ -26,7 +27,9 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 }) {
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
   const doc = useStore((s) => s.doc)
+  const selectedIds = useStore((s) => s.selectedIds)
   const addNode = useStore((s) => s.addNode)
+  const addConnectedNode = useStore((s) => s.addConnectedNode)
   const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
@@ -57,6 +60,29 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
       : base
     addNode(kind, pos)
     setOpen(null)
+    setOperationFinderOpen(false)
+  }
+
+  const selectedNode = selectedIds.length === 1
+    ? doc.nodes.find((node) => node.id === selectedIds[0]) ?? null
+    : null
+  const nextStepKinds = new Set(selectedNode
+    ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind)).map((spec) => spec.kind)
+    : [])
+  const nextStepSource = nextStepKinds.size ? selectedNode : null
+  const addNext = (kind: string, asNextStep?: boolean) => {
+    if (!asNextStep) { add(kind); return }
+    // Re-evaluate at activation time: a remote edit or a changed selection must never turn the
+    // explicit next-step affordance into a guessed connection.
+    const current = useStore.getState().doc
+    const currentSelection = useStore.getState().selectedIds
+    const source = currentSelection.length === 1
+      ? current.nodes.find((node) => node.id === currentSelection[0]) ?? null
+      : null
+    const connection = source && uniqueNextStepConnection(source, kind)
+    if (!source || !connection) return
+    const pos = freePosition(current.nodes, { x: source.position.x + 300, y: source.position.y })
+    addConnectedNode(kind, pos, { source: source.id, ...connection })
     setOperationFinderOpen(false)
   }
 
@@ -93,7 +119,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 
               <div className="mx-1 h-[22px] w-px bg-border" />
 
-              <ToolbarIconButton label="Add operation" icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
+              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
@@ -120,7 +146,14 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
           />
         </div>
       </div>
-      {operationFinderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
+      {operationFinderOpen && nextStepSource && <NodeFinder
+        specs={specs}
+        nextStepKinds={nextStepKinds}
+        nextStepLabel={nextStepSource.data.title}
+        onPick={addNext}
+        onClose={() => setOperationFinderOpen(false)}
+      />}
+      {operationFinderOpen && !nextStepSource && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </>
   )

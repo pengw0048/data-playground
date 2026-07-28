@@ -558,13 +558,10 @@ export function Canvas() {
             if (target) {
               const p = screenToFlowPosition({ x: finder.x, y: finder.y })
               const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
-              const node = useStore.getState().addNode(kind, pos)
-              if (node) {
-                useStore.getState().connect({
-                  id: newId('e'), source: finder.source.nodeId, target: node.id,
-                  sourceHandle: finder.source.handleId, targetHandle: target.id, data: { wire: finder.wire },
-                }, { history: 'current' })
-              }
+              useStore.getState().addConnectedNode(kind, pos, {
+                source: finder.source.nodeId, sourceHandle: finder.source.handleId ?? '',
+                targetHandle: target.id, wire: finder.wire,
+              })
             }
             setFinder(null)
           }}

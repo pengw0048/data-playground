@@ -394,6 +394,30 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
   })
 
+  test('selected-node Add explicitly creates the next connected step at 1280x720', async ({ page }) => {
+    await fresh(page)
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await addNode(page, 'Sources & sinks', 'source')
+
+    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
+    const firstPicker = page.getByRole('dialog', { name: 'Add an operation' })
+    await firstPicker.getByRole('textbox', { name: 'Search operations' }).fill('filter')
+    const filter = firstPicker.getByRole('option', { name: /filter/i }).first()
+    await expect(filter).toContainText('Add next step after source')
+    await filter.click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+
+    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
+    const secondPicker = page.getByRole('dialog', { name: 'Add an operation' })
+    await secondPicker.getByRole('textbox', { name: 'Search operations' }).fill('transform')
+    const transform = secondPicker.getByRole('option', { name: /transform/i }).first()
+    await expect(transform).toContainText('Add next step after filter')
+    await transform.click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+  })
+
   test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {
     const canvasId = `node-locator-${Date.now()}`
     const created = await page.request.post('/api/canvas', { data: {

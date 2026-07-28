@@ -5,6 +5,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 const viewport = vi.hoisted(() => ({ zoomIn: vi.fn(), zoomOut: vi.fn(), fitView: vi.fn(), zoom: 1 }))
 const toolbarState = vi.hoisted(() => ({
   doc: { nodes: [{ id: 'source-1' }] },
+  selectedIds: [],
   addNode: vi.fn(),
   select: vi.fn(),
   setAgentOpen: vi.fn(),
