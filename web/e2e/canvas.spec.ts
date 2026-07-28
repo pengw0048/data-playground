@@ -2387,10 +2387,12 @@ test.describe('Data Playground canvas', () => {
     const current = await page.request.get(`/api/catalog/tables/${encodeURIComponent(created.id)}`)
     expect(current.ok()).toBeTruthy()
     const original = await current.json()
+    let testError: unknown
     try {
       await goToWorkspace(page)
       await openWorkspaceDataset(page, original.name)
 
+      await page.getByText('Catalog maintenance', { exact: true }).click()
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()
       const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {
@@ -2426,15 +2428,24 @@ test.describe('Data Playground canvas', () => {
       expect(body.name).toBe('my staged catalog edit')
       expect(body.keys.some((key: { confidence: string; columns: string[] }) =>
         key.confidence === 'declared' && key.columns.join(',') === 'id')).toBeTruthy()
+    } catch (error) {
+      testError = error
     } finally {
-      const latest = await page.request.get(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
-      if (latest.ok()) {
-        const table = await latest.json()
-        await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`, { params: {
-          expected_registration_id: table.registrationId,
-          expected_revision: table.metadataRevision,
-        } })
+      try {
+        const latest = await page.request.get(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+        if (latest.ok()) {
+          const table = await latest.json()
+          const deleted = await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`, { params: {
+            expected_registration_id: table.registrationId,
+            expected_revision: table.metadataRevision,
+          } })
+          expect(deleted.ok(), await deleted.text()).toBeTruthy()
+        }
+      } catch (cleanupError) {
+        if (!testError) throw cleanupError
+        console.error('Catalog test cleanup failed after the primary test error:', cleanupError)
       }
     }
+    if (testError) throw testError
   })
 })
