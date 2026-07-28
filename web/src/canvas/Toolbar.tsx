@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
 import { useReactFlow, useViewport } from '@xyflow/react'
 import { allSpecs } from '../nodes'
-import { useStore, freePosition, roleCanEdit } from '../store/graph'
+import { useStore, roleCanEdit } from '../store/graph'
 import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
@@ -10,6 +10,7 @@ import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
 import { cn } from '@/lib/utils'
+import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
   io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'code',
@@ -41,7 +42,19 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 
   const add = (kind: string) => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
-    const pos = freePosition(useStore.getState().doc.nodes, { x: c.x - 116, y: c.y - 40 })
+    const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
+    const toolbar = toolbarRef.current?.getBoundingClientRect()
+    const bounds: ToolbarSafeBounds | null = surface && toolbar ? {
+      left: screenToFlowPosition({ x: surface.left, y: surface.top }).x,
+      top: screenToFlowPosition({ x: surface.left, y: surface.top }).y,
+      right: screenToFlowPosition({ x: surface.right, y: surface.top }).x,
+      // The shelf is part of the node's interaction footprint, so the toolbar itself is excluded.
+      bottom: screenToFlowPosition({ x: surface.left, y: toolbar.top }).y,
+    } : null
+    const base = { x: c.x - 116, y: c.y - 40 }
+    const pos = bounds
+      ? toolbarSafePosition(useStore.getState().doc.nodes, base, bounds)
+      : base
     addNode(kind, pos)
     setOpen(null)
     setOperationFinderOpen(false)

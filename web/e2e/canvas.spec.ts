@@ -60,6 +60,10 @@ async function fresh(page: Page) {
   // A new workspace deliberately lands on the explicit first-run choice. Tests that need a Canvas
   // take that same user-visible action instead of depending on bootstrap to create a remote blank.
   const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
+  await expect.poll(() => page.evaluate(() => (
+    location.hash.startsWith('#/canvas/')
+      || Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Start a blank Canvas')
+  ))).toBe(true)
   if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
@@ -798,6 +802,44 @@ test.describe('Data Playground canvas', () => {
     const editor = page.locator('.monaco-editor').first()
     await expect(editor).toBeVisible({ timeout: 15_000 }) // Monaco lazy-loads + its worker boots
     await expect(editor).toContainText('SELECT')
+  })
+
+  test('global-toolbar additions keep selected action shelves clickable above the toolbar @ux-smoke', async ({ page }) => {
+    await fresh(page)
+    await page.setViewportSize({ width: 1280, height: 720 })
+
+    const toolbar = page.getByTestId('toolbar')
+    for (const [category, title] of [
+      ['Sources & sinks', 'source'],
+      ['Shape', 'filter'],
+      ['Compute', 'transform'],
+    ] as const) {
+      await addNode(page, category, title)
+      const shelf = page.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'History' }).locator('..')
+      await expect(shelf).toBeVisible()
+      expect(overlaps(await boxOf(shelf), await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
+    }
+
+    const nodes = page.locator('.react-flow__node')
+    await expect(nodes).toHaveCount(3)
+    for (const [from, to] of [[nodes.nth(0), nodes.nth(1)], [nodes.nth(1), nodes.nth(2)]] as const) {
+      const sourcePort = await boxOf(from.locator('.react-flow__handle.source'))
+      const targetPort = await boxOf(to.locator('.react-flow__handle.target'))
+      await page.mouse.move(sourcePort.x + sourcePort.width / 2, sourcePort.y + sourcePort.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(targetPort.x + targetPort.width / 2, targetPort.y + targetPort.height / 2)
+      await page.mouse.up()
+    }
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+
+    await page.getByRole('button', { name: 'Edit code' }).click()
+    await expect(page.locator('.monaco-editor').first()).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByRole('button', { name: 'Agent' })).toHaveAttribute('aria-pressed', 'false')
+
+    await page.keyboard.press('Escape')
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Edit code' })).toBeVisible()
   })
 
   test('the file menu opens a fresh (empty) canvas as a new file', async ({ page }) => {
