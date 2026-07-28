@@ -24,8 +24,9 @@ import type {
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
 
-export function DataPanel({ nodeId, editorPreview }: {
+export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }: {
   nodeId: string
+  fillAvailableHeight?: boolean
   editorPreview?: {
     onRunUpstream?: () => void
     onPreview?: (offset: number, portId?: string) => void | Promise<void>
@@ -276,6 +277,7 @@ export function DataPanel({ nodeId, editorPreview }: {
         publicationKind={selectedOutput.publicationKind}
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation}
+        fillAvailableHeight={fillAvailableHeight}
         onRunUnavailable={() => requestRun(nodeId)} />)
     }
     if (editorPreview) {
@@ -306,6 +308,7 @@ export function DataPanel({ nodeId, editorPreview }: {
       publicationKind={selectedOutput.publicationKind}
       name={String(node?.data.title || node?.id || 'result')}
       modeToggle={resultModeToggle} presentation={artifactPresentation}
+      fillAvailableHeight={fillAvailableHeight}
       onRunUnavailable={() => requestRun(nodeId)} />)
   }
 
@@ -1018,9 +1021,13 @@ function ExportCluster({
   )
 }
 
-function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void }) {
+function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
+  columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void
+  fillAvailableHeight?: boolean
+}) {
   return (
-    <div className="max-h-[440px] overflow-auto">
+    <div data-testid="full-result-body"
+      className={cn(fillAvailableHeight ? 'min-h-0 flex-1 overflow-auto' : 'max-h-[440px] overflow-auto')}>
       <table className="w-full border-collapse text-[11px]">
         <thead>
           <tr>
@@ -1264,7 +1271,7 @@ type ArtifactPresentation =
 
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
-  onRunUnavailable,
+  onRunUnavailable, fillAvailableHeight = false,
 }: {
   uri: string
   total: number | null
@@ -1276,6 +1283,7 @@ export function FullResult({
   modeToggle?: ReactNode
   presentation?: ArtifactPresentation
   onRunUnavailable?: () => void
+  fillAvailableHeight?: boolean
 }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
@@ -1399,7 +1407,7 @@ export function FullResult({
     setData(null); setDetail(null); setOffset(prior)
   }
   return (
-    <div className="dp-dark text-foreground">
+    <div className={cn('dp-dark text-foreground', fillAvailableHeight && 'flex min-h-0 flex-1 flex-col')}>
       <div data-testid="full-result-toolbar"
         className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-border px-[11px] py-2">
         <div className="flex shrink-0 items-center gap-1.5">
@@ -1453,7 +1461,8 @@ export function FullResult({
           ? <MetricValue rows={rows} />
           : detail != null && rows[detail]
             ? <RowDetail columns={cols} row={rows[detail]} />
-            : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
+            : <RowsTable columns={cols} rows={rows} onRowClick={setDetail}
+              fillAvailableHeight={fillAvailableHeight} />}
     </div>
   )
 }
