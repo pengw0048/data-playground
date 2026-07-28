@@ -206,7 +206,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
         )}
         {!loading && !error && items.length === 0 && (
           <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">
-            {filter === 'unread' ? 'You’re all caught up.' : 'No completed work yet. Finished runs and failures you own will appear here.'}
+            {filter === 'unread' ? 'You’re all caught up.' : 'No completed background work yet. When a durable task finishes, its outcome will appear here.'}
           </div>
         )}
         {items.length > 0 && (

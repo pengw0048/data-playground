@@ -46,6 +46,15 @@ describe('InboxView', () => {
     expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
   })
 
+  it('keeps the empty-state promise limited to durable tasks', async () => {
+    mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+    render(<InboxView />)
+    expect(await screen.findByText(
+      'No completed background work yet. When a durable task finishes, its outcome will appear here.',
+    )).toBeInTheDocument()
+    expect(screen.queryByText(/finished runs/i)).toBeNull()
+  })
+
   it('loads items, marks read, and opens an authorized job', async () => {
     const user = userEvent.setup()
     mocks.inboxMarkRead.mockResolvedValue(item({ readAt: '2026-07-17T12:05:00Z' }))
