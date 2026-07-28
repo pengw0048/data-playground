@@ -44,7 +44,6 @@ RunConfirmationReason = Literal[
 ]
 MAX_SAFE_INTEGER = 2**53 - 1
 ROW_IDENTITY_FIELD_NAME_MAX = 256
-MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH = 8192
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
     str,
@@ -538,68 +537,12 @@ class DatasetRevisionSummary(Wire):
     fragment_count: int | None = Field(default=None, ge=0)
 
 
-class MediaCellIdentityValue(Wire):
-    """One ordered, typed logical-row identity value for an exact media-cell read."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
-
-    name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
-    arrow_type: Literal[
-        "int8", "int16", "int32", "int64",
-        "uint8", "uint16", "uint32", "uint64", "string",
-    ]
-    value: str = Field(max_length=MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH)
-
-
-MediaCellIdentity = Annotated[
-    list[MediaCellIdentityValue],
-    Field(min_length=1, max_length=32),
-]
-
-
 class DatasetRevisionPreview(Wire):
     """A fixed, exact-revision preview window; it is never a read of current head."""
     columns: list[ColumnSchema] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     has_more: bool
     row_limit: Literal[100] = 100
-
-
-class DatasetRevisionRowIdentityField(Wire):
-    """One ordered logical identity field retained for internal exact-row consumers."""
-    name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
-    arrow_type: Literal[
-        "int8", "int16", "int32", "int64",
-        "uint8", "uint16", "uint32", "uint64", "string",
-    ]
-
-
-class DatasetRevisionRowIdentity(Wire):
-    """Internal descriptor for persisted exact-row evidence; no longer a public revision response."""
-    dataset_id: str = Field(min_length=1, max_length=512)
-    revision_id: str = Field(min_length=1, max_length=256)
-    proof_status: Literal["certified", "unavailable"]
-    certification_supported: bool
-    fields: list[DatasetRevisionRowIdentityField] = Field(default_factory=list, max_length=32)
-    encoding_version: Literal["row-identity-v1"] | None = None
-
-    @model_validator(mode="after")
-    def _validate_proof_shape(self) -> "DatasetRevisionRowIdentity":
-        if self.proof_status == "certified":
-            if not self.fields or self.encoding_version is None:
-                raise ValueError("certified row identity requires fields and encoding")
-        elif self.fields or self.encoding_version is not None:
-            raise ValueError("unavailable row identity cannot expose a descriptor")
-        return self
-
-
-class MediaCellRequest(Wire):
-    """Internal exact-cell request retained until certificate persistence is removed."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
-
-    identity: list[MediaCellIdentityValue] = Field(min_length=1, max_length=32)
-    column: str = Field(min_length=1, max_length=256)
 
 
 class ExactDatasetRevisionRequest(Wire):

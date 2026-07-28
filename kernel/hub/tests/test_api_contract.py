@@ -142,7 +142,7 @@ def test_committed_openapi_snapshot_matches_the_app():
     assert matches, diff
 
 
-def test_retired_row_identity_certification_is_not_a_public_or_executable_contract():
+def test_retired_row_identity_contract_has_no_public_surface():
     import importlib.util
 
     from hub import metadb
