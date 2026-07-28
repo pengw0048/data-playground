@@ -1175,10 +1175,19 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           </div>
 
           <details className="rounded-lg border border-border px-3 py-2 text-[11px]">
-            <summary className="cursor-pointer font-semibold text-foreground">Dataset location &amp; identity</summary>
-            <div className="mt-2 flex items-start gap-2">
-              <code className="min-w-0 flex-1 break-all text-[10.5px] text-muted-foreground">{table.uri}</code>
-              <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
+            <summary className="grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] items-center gap-2 font-semibold text-foreground">
+              <span>Dataset location &amp; identity</span>
+              <code className="truncate text-right text-[10.5px] font-normal text-muted-foreground" title={table.uri}>{table.uri}</code>
+            </summary>
+            <div className="mt-2 grid gap-2">
+              <div className="flex items-start gap-2">
+                <code className="min-w-0 flex-1 break-all text-[10.5px] text-muted-foreground">{table.uri}</code>
+                <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
+              </div>
+              {table.registrationId ? <div>
+                <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
+                <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
+              </div> : null}
             </div>
           </details>
 
@@ -1214,9 +1223,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</div>
               <span className="text-[10.5px] text-muted-foreground">{displayColumns.length} columns</span>
             </div>
-            {displayColumns.length ? <div className="grid grid-cols-2 gap-x-3 gap-y-1 rounded-lg border border-border px-3 py-2 text-[11px]">
-              {displayColumns.slice(0, 10).map((column) => <div key={column.name} className="flex min-w-0 items-center gap-1"><span className="min-w-0 flex-1 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span><FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" /></div>)}
-              {displayColumns.length > 10 && <div className="col-span-2 text-muted-foreground">{displayColumns.length - 10} more columns in Catalog maintenance.</div>}
+            {displayColumns.length ? <div tabIndex={0} aria-label="Dataset schema columns" data-testid="detail-schema-scroll"
+              className="grid max-h-[132px] grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto overscroll-contain rounded-lg border border-border px-3 py-2 text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+              {displayColumns.map((column) => <div key={column.name} className="flex min-w-0 items-center gap-1"><span className="min-w-0 flex-1 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span><FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" /></div>)}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
           </section>
 

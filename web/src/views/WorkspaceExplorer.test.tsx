@@ -1507,6 +1507,7 @@ describe('WorkspaceExplorer', () => {
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     const content = within(detail).getByTestId('provider-dataset-detail-content')
     expect(content).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto', 'overscroll-contain')
+    expect(content).toHaveAttribute('tabindex', '0')
     expect(within(detail).getByRole('button', { name: 'Close' })).toBeVisible()
     expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeVisible()
   })

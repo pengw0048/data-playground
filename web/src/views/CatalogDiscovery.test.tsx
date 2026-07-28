@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Suspense, startTransition, type ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
@@ -411,10 +411,26 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
+    expect(screen.getByText('Dataset location & identity').parentElement).toHaveTextContent(TABLE.uri)
     expect(screen.getByText('Catalog maintenance').parentElement).not.toHaveAttribute('open')
     expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
     expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
+  })
+
+  it('keeps every wide-schema field evidence action in the default Schema inspection', async () => {
+    const columns = Array.from({ length: 12 }, (_, index) => ({
+      name: `column_${index + 1}`, type: 'int64', capabilities: [],
+    }))
+    render(<CatalogDetail table={{ ...TABLE, columns }} onClose={vi.fn()} onUse={vi.fn()}
+      onChanged={vi.fn()} onFolder={vi.fn()} onDeleted={vi.fn()} onOpenTable={vi.fn()}
+      onColumn={vi.fn()} />)
+
+    const schema = screen.getByTestId('detail-schema-scroll')
+    expect(schema).toHaveAttribute('tabindex', '0')
+    expect(await within(schema).findByRole('button', { name: 'Inspect evidence for column_12' })).toBeInTheDocument()
+    expect(screen.queryByText(/more columns in Catalog maintenance/)).not.toBeInTheDocument()
+    await waitFor(() => expect(mocks.sample).toHaveBeenCalled())
   })
 
   it('labels a catalog prefix preview as non-random and exposes its input revision', async () => {

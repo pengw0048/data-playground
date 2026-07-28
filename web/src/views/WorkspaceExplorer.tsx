@@ -1791,7 +1791,8 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
         className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      <div data-testid="provider-dataset-detail-content" className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px]">
+      <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
+        className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
         <section><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Dataset</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div>
           <div className="mt-1 text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
             ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact revision · {canonicalContext.revisionId ?? 'identity unavailable'}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
