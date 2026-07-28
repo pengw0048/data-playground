@@ -460,6 +460,16 @@ def test_inbox_keyset_cursor_filter_and_role_revocation():
 
 def test_canvas_delete_cascades_inbox_items():
     uid, canvas_id = _user_canvas("cascade")
+    published_uri = f"file:///tmp/cascade-published-{uuid.uuid4().hex}.parquet"
+    assert metadb.catalog_upsert_entry(published_uri, "Published dataset", {
+        "id": f"cascade-published-{uuid.uuid4().hex}",
+        "name": "Published dataset", "uri": published_uri, "columns": [],
+    })
+    assert metadb.snapshot_canvas(canvas_id, "{}", 1, label="before delete")
+    with metadb.session() as session:
+        session.add(metadb.RunRecord(
+            id=f"cascade-run-{uuid.uuid4().hex}", canvas_id=canvas_id,
+            run_id=f"cascade-run-{uuid.uuid4().hex}", status="done", outputs="[]"))
     task = _submit_local(uid, canvas_id)
     claimed = metadb.claim_durable_task(task["id"], "owner")
     attempt = claimed["attempts"][-1]
@@ -469,8 +479,11 @@ def test_canvas_delete_cascades_inbox_items():
         task["id"], attempt["id"], "owner", failed.model_dump())
     assert len(_inbox_for(uid, task["id"])) == 1
     metadb.delete_canvas_cascade(canvas_id)
+    assert metadb.list_versions(canvas_id) == []
+    assert metadb.list_runs(canvas_id) == []
     assert metadb.list_durable_task_inbox_items(uid)["items"] == []
     assert metadb.durable_task(task["id"]) is None
+    assert metadb.catalog_get(published_uri) is not None
 
 
 def test_invalid_diagnostic_maps_to_fallback():
