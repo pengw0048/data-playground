@@ -41,6 +41,37 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
   })
 
+  test('makes an All Workspace query explicit and clears old rows after a submitted no-match search', async ({ page }) => {
+    const canvasId = `workspace-search-${Date.now()}`
+    const canvasName = 'Workspace search candidate'
+    const created = await page.request.post('/api/canvas', {
+      data: { id: canvasId, name: canvasName, version: 1, nodes: [], edges: [] },
+    })
+    expect(created.ok()).toBe(true)
+
+    try {
+      await page.goto('/#/workspace')
+      const search = page.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' })
+      const submit = page.getByRole('button', { name: 'Search Workspace' })
+
+      await search.fill(canvasName)
+      await expect(page.getByRole('status')).toHaveText(`Select Search to look for “${canvasName}”.`)
+      await submit.click()
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
+
+      await search.fill('zzzz-no-match')
+      await expect(page.getByRole('status')).toHaveText(`Results are still for “${canvasName}”. Select Search to update.`)
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
+      await submit.click()
+
+      await expect(page).toHaveURL(/#\/workspace\?q=zzzz-no-match/)
+      await expect(page.getByText('No views, datasets, canvases, or containers match this query.')).toBeVisible()
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toHaveCount(0)
+    } finally {
+      await page.request.delete(`/api/canvas/${canvasId}`)
+    }
+  })
+
   test('creates, explores, and adds by exact local targets across reload', async ({ page }) => {
     const catalog = await page.request.get('/api/catalog/tables?limit=1')
     expect(catalog.ok()).toBe(true)
