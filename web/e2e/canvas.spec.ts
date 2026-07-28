@@ -1600,15 +1600,17 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
   })
 
-  test('settings Execution shows the real compute topology', async ({ page }) => {
+  test('settings Execution explains built-in runners without exposing local worker ids', async ({ page }) => {
     await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Execution' }).click()
-    await expect(page.getByText('Compute', { exact: true })).toBeVisible()
-    // the local backend reports a worker with real host capacity (e.g. "N cpu")
-    await expect(page.getByText('local-out-of-core:local')).toBeVisible()
+    await expect(page.getByText('When to use each runner', { exact: true })).toBeVisible()
+    await expect(page.getByText(/streams and spills data/i)).toBeVisible()
+    await expect(page.getByText(/isolated in its own OS process/i)).toBeVisible()
+    await expect(page.getByText(/durable worker per Canvas/i)).toBeVisible()
+    // Capacity remains visible, but an implementation-specific local worker id is not researcher-facing.
+    await expect(page.getByText('local-out-of-core:local')).toHaveCount(0)
     await expect(page.getByText(/\d+ cpu/).first()).toBeVisible()
   })
 
