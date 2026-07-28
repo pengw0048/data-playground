@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
 
 import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
-from hub import metadb
+from hub import execution_manifest, metadb
 from hub.deps import get_deps
 from hub.main import app
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
@@ -90,8 +92,8 @@ def _wait(run_id: str) -> dict:
     pytest.fail(f"run {run_id} did not finish")
 
 
-@pytest.fixture
-def retained_sample(tmp_path):
+@contextmanager
+def _retained_sample(tmp_path, configure_graph=None):
     lance = pytest.importorskip("lance")
     canvas_id = f"retained-editor-{uuid.uuid4().hex}"
     source_uri = str(tmp_path / f"{canvas_id}.lance")
@@ -112,6 +114,8 @@ def retained_sample(tmp_path):
             "revisionId": "1",
         },
     }
+    if configure_graph is not None:
+        configure_graph(graph)
     with metadb.session() as session:
         session.add(metadb.Canvas(
             id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="Retained editor input"))
@@ -134,6 +138,12 @@ def retained_sample(tmp_path):
         shutil.rmtree(source_uri, ignore_errors=True)
 
 
+@pytest.fixture
+def retained_sample(tmp_path):
+    with _retained_sample(tmp_path) as retained:
+        yield retained
+
+
 def _preview(graph: dict, port_id: str = "out"):
     return client.post("/api/run/editor-preview", json={
         "graph": graph,
@@ -146,7 +156,7 @@ def _preview(graph: dict, port_id: str = "out"):
 
 def test_retained_editor_preview_reuses_current_upstream_without_freezing_transform(
         retained_sample):
-    graph, run_id, _output = retained_sample
+    graph, run_id, output = retained_sample
     first = _preview(graph)
     assert first.status_code == 200, first.text
     body = first.json()
@@ -159,7 +169,8 @@ def test_retained_editor_preview_reuses_current_upstream_without_freezing_transf
         "rows": 3,
     }
     assert "inputManifest" not in body or body["inputManifest"] is None
-    assert "uri" not in str(body).lower()
+    assert body.get("sampleProvenance") is None
+    assert output["uri"] not in json.dumps(body, sort_keys=True)
 
     edited = copy.deepcopy(graph)
     edited["nodes"][2]["data"]["config"]["code"] = (
@@ -173,6 +184,113 @@ def test_retained_editor_preview_reuses_current_upstream_without_freezing_transf
     edited_edge["edges"][1]["data"] = {"wire": "dataset"}
     changed_edge = _preview(edited_edge)
     assert changed_edge.status_code == 200, changed_edge.text
+
+
+@pytest.mark.parametrize("drift", ["core-package", "node-spec", "plugin-version"])
+def test_retained_editor_preview_rejects_descriptor_drift(tmp_path, monkeypatch, drift):
+    deps = get_deps()
+    plugin_status = None
+    if drift == "plugin-version":
+        plugin_status = {
+            "name": "retained-editor-descriptor",
+            "package": "retained-editor-descriptor",
+            "version": "1.0.0",
+            "source": "test",
+        }
+        monkeypatch.setattr(deps, "plugins", [*deps.plugins, plugin_status])
+        monkeypatch.setitem(
+            deps.node_specs,
+            "sample",
+            deps.node_specs["sample"].model_copy(
+                update={"source": "plugin:retained-editor-descriptor"}),
+        )
+
+    with _retained_sample(tmp_path) as (graph, _run_id, _output):
+        baseline = _preview(graph)
+        assert baseline.status_code == 200, baseline.text
+        if drift == "core-package":
+            monkeypatch.setattr(
+                execution_manifest, "core_package_version",
+                lambda: "retained-editor-drift",
+            )
+        elif drift == "node-spec":
+            spec = deps.node_specs["sample"]
+            monkeypatch.setitem(
+                deps.node_specs,
+                "sample",
+                spec.model_copy(update={"can_bypass": not spec.can_bypass}),
+            )
+        else:
+            assert plugin_status is not None
+            monkeypatch.setitem(plugin_status, "version", "2.0.0")
+
+        response = _preview(graph)
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "retained_upstream_stale"
+
+
+def test_transform_only_parameter_binding_does_not_change_upstream_identity(tmp_path):
+    def configure(graph):
+        graph["parameters"] = [{
+            "name": "editor_code",
+            "type": "string",
+            "required": True,
+        }]
+
+    with _retained_sample(tmp_path, configure) as (graph, _run_id, _output):
+        edited = copy.deepcopy(graph)
+        edited["nodes"][2]["data"]["config"]["code"] = {
+            "parameterRef": "editor_code",
+        }
+        response = client.post("/api/run/editor-preview", json={
+            "graph": edited,
+            "nodeId": "transform",
+            "portId": "out",
+            "k": 2,
+            "offset": 0,
+            "parameterBindings": [{
+                "name": "editor_code",
+                "value": "def fn(row):\n    return {**row, 'parameterized': True}",
+            }],
+        })
+        assert response.status_code == 200, response.text
+        assert all(row["parameterized"] is True for row in response.json()["rows"])
+
+
+def test_upstream_parameter_binding_change_remains_stale(tmp_path):
+    def configure(graph):
+        graph["parameters"] = [{
+            "name": "sample_size",
+            "type": "integer",
+            "default": 3,
+        }]
+        graph["nodes"][1]["data"]["config"]["n"] = {
+            "parameterRef": "sample_size",
+        }
+
+    with _retained_sample(tmp_path, configure) as (graph, _run_id, _output):
+        response = client.post("/api/run/editor-preview", json={
+            "graph": graph,
+            "nodeId": "transform",
+            "portId": "out",
+            "k": 2,
+            "offset": 0,
+            "parameterBindings": [{"name": "sample_size", "value": 4}],
+        })
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "retained_upstream_stale"
+
+
+def test_retained_editor_preview_bounds_a_long_upstream_title(tmp_path):
+    title = "S" * 257
+
+    def configure(graph):
+        graph["nodes"][1]["data"]["title"] = title
+
+    with _retained_sample(tmp_path, configure) as (graph, _run_id, _output):
+        response = _preview(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["label"] == title[:256]
 
 
 def test_invalid_transform_output_is_a_request_error_not_a_candidate_miss(retained_sample):

@@ -3860,6 +3860,14 @@ def _retained_editor_output(
     retained_graph._parameter_bindings = copy.deepcopy(admission.get("parameters") or [])
     retained_cone._parameter_bindings = copy.deepcopy(retained_graph._parameter_bindings)
     try:
+        rebuilt_retained_digest, _ = build_execution_manifest(
+            retained_graph,
+            target_node_id=upstream.id,
+            target_port_id=None,
+            input_manifest=retained_inputs,
+            write_intent=None,
+            deps=deps,
+        )
         current_digest, _ = build_execution_manifest(
             current_cone,
             target_node_id=upstream.id,
@@ -3880,7 +3888,10 @@ def _retained_editor_output(
         raise _retained_editor_error(
             409, "current upstream execution plan cannot be verified",
             APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
-    if current_digest != retained_digest:
+    if (
+        rebuilt_retained_digest != str(manifest_sha256)
+        or current_digest != retained_digest
+    ):
         raise _retained_editor_error(
             409, "the immediate upstream execution plan changed",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
@@ -3931,8 +3942,12 @@ def preview_transform_with_retained_upstream(
     graph = _resolve_parameters(
         req.graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
-    edge, upstream, upstream_port, current_cone = _retained_editor_target(
+    edge, upstream, upstream_port, _ = _retained_editor_target(
         graph, req.node_id, deps)
+    upstream_graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, upstream.id, deps, freeze_latest=False)
+    graph_mod.resolve_source_refs(upstream_graph, deps.catalog.resolve_ref)
+    current_cone = _target_execution_graph(upstream_graph, upstream.id)
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
     candidates = metadb.retained_run_editor_candidates(
@@ -3986,9 +4001,11 @@ def preview_transform_with_retained_upstream(
             run_id=run_id,
             node_id=output.node_id,
             port_id=output.port_id,
-            label=str(upstream.data.get("title") or upstream.id),
+            label=(str(upstream.data.get("title") or upstream.id).strip()
+                   or str(upstream.id))[:256],
             rows=output.rows,
         )
+        result.sample_provenance = None
         result.input_manifest = None
         return result
     if saw_expired:
