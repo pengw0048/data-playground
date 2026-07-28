@@ -1251,7 +1251,9 @@ test.describe('Data Playground canvas', () => {
     await sec.getByText('Edit script →').click()
     await page.getByPlaceholder('out').fill('passed, failed')
     await expect(sec.locator('.react-flow__handle-right')).toHaveCount(2)
-    await sec.getByText('Edit script →').click() // close the panel so it doesn't cover the output handles
+    const sectionPanel = page.getByTestId('panel-section')
+    await sectionPanel.getByTitle('Close').click()
+    await expect(sectionPanel).toHaveCount(0)
     // Wire a downstream filter off the SECOND port ("failed") via the shared click-from-port picker.
     await sec.locator('.react-flow__handle-right').nth(1).click()
     const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
