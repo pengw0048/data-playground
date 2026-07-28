@@ -82,10 +82,10 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByText(/Latest version/)).not.toBeInTheDocument()
   })
 
-  it('keeps the run scope out of the canvas card', () => {
+  it('labels ad-hoc transforms with their actual operator semantics', () => {
     const adhocNode = {
       ...node,
-      data: { ...node.data, config: { source: 'adhoc', mode: 'map', scope: 'dataset', code: 'def fn(row): return row' } },
+      data: { ...node.data, config: { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' } },
     }
     useStore.setState({
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [adhocNode], edges: [] },
@@ -97,14 +97,14 @@ describe('Transform exact processor labels', () => {
       </ReactFlowProvider></TooltipProvider>,
     )
 
-    expect(screen.queryByRole('button', { name: 'dataset' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'sample' })).not.toBeInTheDocument()
+    expect(screen.getByText('map · Python')).toBeInTheDocument()
+    expect(screen.queryByText(/runs over/i)).not.toBeInTheDocument()
   })
 
-  it('edits the run scope from the fullscreen ad-hoc editor', async () => {
+  it('does not expose a run-scope control in the fullscreen ad-hoc editor', async () => {
     const adhocNode = {
       ...node,
-      data: { ...node.data, config: { source: 'adhoc', mode: 'map', scope: 'dataset', code: 'def fn(row): return row' } },
+      data: { ...node.data, config: { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' } },
     }
     useStore.setState({
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [adhocNode], edges: [] },
@@ -113,8 +113,7 @@ describe('Transform exact processor labels', () => {
 
     render(<CodeFullscreen />)
 
-    const scope = await screen.findByRole('combobox', { name: /runs over/ })
-    fireEvent.change(scope, { target: { value: 'sample' } })
-    expect(useStore.getState().doc.nodes[0].data.config.scope).toBe('sample')
+    expect(await screen.findByTestId('code-editor')).toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: /runs over/i })).not.toBeInTheDocument()
   })
 })

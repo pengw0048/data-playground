@@ -256,6 +256,15 @@ function compareIdentityText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0
 }
 
+function executionConfig(node: CanvasDoc['nodes'][number]): Record<string, unknown> {
+  const config = node.data.config
+  if (node.type !== 'transform' || !('scope' in config)) return config
+  // `scope` was a display-only Transform label. Legacy documents may retain it, but it cannot
+  // stale previews or fork profile/write identity because execution never reads it.
+  const { scope: _scope, ...semanticConfig } = config
+  return semanticConfig
+}
+
 // Preview and profile requests execute the same target-scoped graph cone on the server. Keep one
 // canonical document identity for every client-side consumer. Write admission additionally observes
 // ordered edge ids and upstream node status because structural validation and placement ownership
@@ -306,7 +315,7 @@ function targetExecutionPlanIdentity(
       type: node.type,
       parentId: node.parentId ?? null,
       title: node.data.title,
-      config: node.data.config,
+      config: executionConfig(node),
       bypassed: !!node.data.bypassed,
       disabled: !!node.data.disabled,
       ...(writeAdmission && node.id !== nodeId ? { status: node.data.status } : {}),

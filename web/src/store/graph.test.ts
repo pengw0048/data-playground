@@ -1101,6 +1101,22 @@ describe('graph store — core authority ops', () => {
     expect(previewPlanIdentity(metricRename, 'metric')).not.toBe(previewPlanIdentity(metricDoc, 'metric'))
   })
 
+  it('does not treat a legacy Transform scope label as execution semantics', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    const transform = NODE('transform', 'transform')
+    transform.data.config = { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, transform],
+      edges: [{ id: 'edge', source: 'source', target: 'transform', data: { wire: 'dataset' as const } }],
+    }
+    const legacyScope = structuredClone(doc)
+    ;(legacyScope.nodes[1].data.config as Record<string, unknown>).scope = 'sample'
+
+    expect(previewPlanIdentity(legacyScope, 'transform')).toBe(previewPlanIdentity(doc, 'transform'))
+    expect(profilePlanIdentity(legacyScope, 'transform')).toBe(profilePlanIdentity(doc, 'transform'))
+  })
+
   it('keeps an in-flight profile attached across an unrelated branch edit', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }

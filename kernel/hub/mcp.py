@@ -799,7 +799,7 @@ class Playground:
         canvas_id, code = self._req(args, "canvasId"), self._req(args, "code")
         mode = args.get("mode") or "map"
         node_id, upstream = args.get("nodeId"), args.get("upstreamNodeId")
-        config = {"source": "adhoc", "scope": "dataset", "mode": mode, "code": code}
+        config = {"source": "adhoc", "mode": mode, "code": code}
         if mode == "map_batches" and args.get("batchFormat"):
             config["batchFormat"] = args["batchFormat"]
 

@@ -63,6 +63,10 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
             cfg = {key: value for key, value in cfg.items() if key not in {
                 "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName",
             }}
+        elif n.type == "transform" and isinstance(cfg, dict):
+            # Transform scope was a display-only label and never changed the lowered plan. Legacy
+            # documents may retain it, but it must not fork either warm or durable cache identity.
+            cfg = {key: value for key, value in cfg.items() if key != "scope"}
         # bypassed/disabled/title are SIBLINGS of config on data, and the engine changes the lowered
         # relation based on them (engine.py reads node.data.bypassed / .disabled; a metric node emits its
         # title as the output value) — so they must be in the key, else a toggle or a metric rename serves

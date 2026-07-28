@@ -175,6 +175,26 @@ def test_digest_ignores_nonsemantic_canvas_display_and_admission_time():
     }
     assert "parameters" not in doc
 
+
+def test_digest_ignores_legacy_transform_scope_label():
+    graph = Graph.model_validate({
+        "id": "transform-scope", "version": 1,
+        "nodes": [{
+            "id": "transform", "type": "transform", "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "source": "adhoc", "mode": "map", "code": "def fn(row): return row",
+            }},
+        }], "edges": [],
+    })
+    legacy = graph.model_copy(deep=True)
+    legacy.nodes[0].data["config"]["scope"] = "sample"
+
+    digest, payload = _build(graph, inputs=[], target="transform")
+    observed, observed_payload = _build(legacy, inputs=[], target="transform")
+    assert observed == digest
+    assert observed_payload == payload
+    assert "scope" not in validate_execution_manifest(digest, payload)["graph"]["nodes"][0]["data"]["config"]
+
     reordered_requirements = _graph()
     reordered_requirements.requirements = ["polars==1.32.0", "numpy==2.5.0"]
     first_order, _ = _build(reordered_requirements)
