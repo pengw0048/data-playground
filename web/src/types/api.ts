@@ -614,7 +614,12 @@ export interface SampleResult {
   error?: boolean
   reason?: string | null
   suggestedAction?: 'run' | null
-  failureCategory?: 'not_previewable' | 'user_code_exception' | 'runtime_error' | null
+  failureCategory?: 'not_previewable' | 'syntax_error' | 'user_code_exception' | 'runtime_error' | null
+  syntaxError?: {
+    line: number
+    column?: number | null
+    message: string
+  } | null
   userCodeException?: {
     nodeId?: string | null
     nodeTitle?: string | null

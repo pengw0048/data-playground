@@ -124,6 +124,8 @@ export function CodeFullscreen() {
   // — NOT every node's previews (that leaked unrelated columns from across the whole graph).
   const inputNames = inputCols.map((c) => c.name)
   const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
+  const syntaxErrorLine = preview?.result?.failureCategory === 'syntax_error'
+    ? preview.result.syntaxError?.line : undefined
   const freshUpstreamResultReady = Boolean(
     freshUpstreamRunDone && upstreamRunId
     && preview?.result?.editorTestInput?.runId === upstreamRunId,
@@ -237,6 +239,7 @@ export function CodeFullscreen() {
           <div className="min-h-0 flex-1">
             <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
               <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary || !canEdit} completions={completions}
+                errorLine={syntaxErrorLine}
                 onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
             </Suspense>
           </div>

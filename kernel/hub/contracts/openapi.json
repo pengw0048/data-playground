@@ -10559,6 +10559,7 @@
               {
                 "enum": [
                   "not_previewable",
+                  "syntax_error",
                   "user_code_exception",
                   "runtime_error"
                 ],
@@ -10714,6 +10715,16 @@
             ],
             "description": "A safe user action that resolves this preview refusal. Absent when running would not fix the current state.",
             "title": "Suggestedaction"
+          },
+          "syntaxError": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SyntaxErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "truncated": {
             "default": false,
@@ -11027,6 +11038,39 @@
           "revision"
         ],
         "title": "SettingsSnapshot",
+        "type": "object"
+      },
+      "SyntaxErrorDetail": {
+        "description": "Location-aware diagnostics for code that Python cannot compile.",
+        "properties": {
+          "column": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          },
+          "line": {
+            "minimum": 1.0,
+            "title": "Line",
+            "type": "integer"
+          },
+          "message": {
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "line",
+          "message"
+        ],
+        "title": "SyntaxErrorDetail",
         "type": "object"
       },
       "TemporalWindowV1": {

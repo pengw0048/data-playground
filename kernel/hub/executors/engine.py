@@ -93,6 +93,17 @@ class UserCodeError(Exception):
         super().__init__(text)
 
 
+class TransformSyntaxError(Exception):
+    """A compile failure tied to one editable Transform node."""
+
+    def __init__(self, node: GraphNode, error: sandbox.SandboxSyntaxError):
+        self.node = node
+        self.line = error.line
+        self.column = error.column
+        self.message = error.message
+        super().__init__(self.message)
+
+
 def _user_code_error(
         node: GraphNode, exc: Exception, *,
         row_index: int | None = None,
@@ -1580,7 +1591,10 @@ class BuildEngine:
             mode = cfg.get("mode", "map")
             if not code:
                 return parent
-            fn = sandbox.compile_operator(code, mode)
+            try:
+                fn = sandbox.compile_operator(code, mode)
+            except sandbox.SandboxSyntaxError as exc:
+                raise TransformSyntaxError(node, exc) from exc
 
         if mode not in PREVIEWABLE_MODES:
             raise NotPreviewable(
@@ -1617,7 +1631,7 @@ class BuildEngine:
                 input_row_offset += batch.num_rows
             table = pa.Table.from_pylist(out) if out else parent.limit(0).to_arrow_table()
             return db.conn().from_arrow(table)
-        except (NotPreviewable, UserCodeError):
+        except (NotPreviewable, TransformSyntaxError, UserCodeError):
             raise
         except Exception as e:  # noqa: BLE001
             raise _user_code_error(

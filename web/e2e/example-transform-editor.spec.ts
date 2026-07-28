@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
 test('Example rows stay local to the fullscreen Transform editor', async ({ page }) => {
   const canvasId = `example-transform-${Date.now()}`
@@ -110,3 +110,47 @@ test('Example rows stay local to the fullscreen Transform editor', async ({ page
       `/api/catalog/tables/${encodeURIComponent(registeredTable.id)}?${query}`)).ok()).toBe(true)
   }
 })
+
+async function assertSyntaxFeedback(page: Page, viewportWidth: number) {
+  const canvasId = `transform-syntax-${viewportWidth}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const graph = {
+    id: canvasId, name: 'Transform syntax feedback', version: 1, requirements: [], edges: [],
+    nodes: [{
+      id: 'transform', type: 'transform', position: { x: 240, y: 160 },
+      data: { title: 'Syntax feedback', status: 'draft', config: {
+        source: 'adhoc', mode: 'map',
+        code: 'def helper(row):\n    return row\ndef fn(row)\n    return row',
+        onError: 'raise',
+      } },
+    }],
+  }
+  const created = await page.request.post('/api/canvas', { data: graph })
+  expect(created.ok(), await created.text()).toBe(true)
+  try {
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}?node=transform`)
+    await page.getByRole('button', { name: 'Edit code' }).last().click()
+    await page.getByRole('button', { name: 'Example rows', exact: true }).click()
+    const fixture = page.getByRole('textbox', { name: 'Example rows JSON' })
+    await fixture.fill('[{"value":1}]')
+    await page.getByRole('button', { name: 'Test code' }).click()
+    await expect(page.getByText('Fix the Python syntax')).toBeVisible()
+    await expect(page.getByText("Line 3: expected ':'")).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Test again' })).toHaveCount(0)
+    const editor = page.locator('.monaco-editor')
+    await expect(editor).toBeVisible()
+    await expect(editor).toHaveAttribute('data-cursor-line-number', '3')
+  } finally {
+    await page.goto('about:blank')
+    expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBe(true)
+  }
+}
+
+for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+  test.describe(`Transform syntax feedback at ${viewport.width}x${viewport.height}`, () => {
+    test.use({ viewport })
+
+    test('identifies and focuses the editable line', async ({ page }) => {
+      await assertSyntaxFeedback(page, viewport.width)
+    })
+  })
+}

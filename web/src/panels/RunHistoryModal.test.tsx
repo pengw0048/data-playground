@@ -1512,6 +1512,26 @@ describe('durable full results', () => {
     expect(screen.queryByText(/previewing again/)).not.toBeInTheDocument()
   })
 
+  it('presents Example rows syntax errors as editable line feedback without a blind retry', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'failed', config: { source: 'adhoc', mode: 'map' }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, error: true, failureCategory: 'syntax_error',
+        syntaxError: { line: 1, column: 12, message: "expected ':'" },
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, resultContext: 'example-rows' }} />)
+    expect(screen.getByText('Fix the Python syntax')).toBeInTheDocument()
+    expect(screen.getByText("Line 1: expected ':'")).toBeInTheDocument()
+    expect(screen.getByText('Edit the code, then test it again.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Test again' })).not.toBeInTheDocument()
+  })
+
   it('warns when the graph preview is bounded per source', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'filter', position: { x: 0, y: 0 },
