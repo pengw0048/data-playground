@@ -1589,14 +1589,14 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
         <span className="block text-[12px] font-semibold">Add to a recent Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable recent Canvas'}</span>
       </button>
       <button onClick={() => setMode('choose')} disabled={targetState !== 'ready'} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}>
-        <span className="block text-[12px] font-semibold">Choose a Canvas</span><span className="text-[10.5px] text-muted-foreground">Select an editable destination</span>
+        <span className="block text-[12px] font-semibold">Choose another Canvas</span><span className="text-[10.5px] text-muted-foreground">Select an editable destination</span>
       </button>
     </div>
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name
       <input aria-label="New canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label> : targetState !== 'ready' ? <div role="status" className="text-[12px] text-muted-foreground">{targetState === 'loading' ? 'Refreshing editable Canvases…' : 'Editable Canvases could not be refreshed. Close and try again.'}</div>
       : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong>. Source nodes will be added; your data is not copied or modified.</div>
-      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose another Canvas
       <select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">
         {editable.map((file) => <option key={file.id} value={file.id}>{file.name} · {file.id}</option>)}
       </select>
@@ -1915,12 +1915,12 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
     <div className="grid gap-2 sm:grid-cols-3">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in a new Canvas</span></button>
       <button onClick={() => setMode('current')} disabled={targetState !== 'ready' || !currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to a recent Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable recent Canvas'}</span></button>
-      <button onClick={() => setMode('choose')} disabled={targetState !== 'ready'} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Choose a Canvas</span></button>
+      <button onClick={() => setMode('choose')} disabled={targetState !== 'ready'} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Choose another Canvas</span></button>
     </div>
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input aria-label="New canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
       : targetState !== 'ready' ? <div role="status" className="text-[12px] text-muted-foreground">{targetState === 'loading' ? 'Refreshing editable Canvases…' : 'Editable Canvases could not be refreshed. Close and try again.'}</div>
       : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong>. Source nodes will be added; your data is not copied or modified.</div>
-      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select><span className="text-[11px] text-muted-foreground">Source nodes will be added; your data is not copied or modified.</span></label>
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose another Canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select><span className="text-[11px] text-muted-foreground">Source nodes will be added; your data is not copied or modified.</span></label>
         : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available.</div>}
     {mode === 'explore' && !destination && <div role="status" className="text-[12px] text-muted-foreground">{canvasDestinationTitle(container, 'create')}</div>}
     {error && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>{error}</span>{conflict && <button onClick={() => void refreshAfterConflict()} disabled={busy} className="font-semibold underline">Refresh Canvases</button>}</div>}

@@ -98,7 +98,7 @@ async function addWorkspaceDatasetToCurrentCanvas(page: Page, name: string) {
   await backToWorkspace(page)
   await openWorkspaceDataset(page, name)
   await page.getByTestId('detail-use').click()
-  await page.getByRole('button', { name: /^Choose a Canvas/ }).click()
+  await page.getByRole('button', { name: /^Choose another Canvas/ }).click()
   await page.getByLabel('Target canvas').selectOption(canvasId)
   await page.getByRole('button', { name: 'Add and open' }).click()
   await expect(page.getByTestId('toolbar')).toBeVisible()

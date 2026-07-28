@@ -270,7 +270,7 @@ test.describe('provider Workspace Source acceptance', () => {
     )
     await duplicateDetail.getByRole('button', { name: 'Use in canvas' }).click()
     const duplicateUseDialog = page.getByRole('dialog', { name: `Use ${datasetNameB}` })
-    const chooseCanvas = duplicateUseDialog.getByRole('button', { name: /^Choose a Canvas/ })
+    const chooseCanvas = duplicateUseDialog.getByRole('button', { name: /^Choose another Canvas/ })
     await expect(chooseCanvas).toBeEnabled()
     await chooseCanvas.click()
     const targetCanvas = duplicateUseDialog.getByRole('combobox', { name: 'Target canvas' })

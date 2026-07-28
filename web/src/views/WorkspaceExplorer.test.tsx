@@ -716,8 +716,8 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
     expect(screen.getByRole('button', { name: /^Explore in a new Canvas/ })).toBeVisible()
     expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose another Canvas/ }))
     await waitFor(() => expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas'))
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     expect(screen.getByText('Source nodes will be added; your data is not copied or modified.')).toBeVisible()
@@ -764,7 +764,7 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
     await waitFor(() => expect(store.refreshFiles).toHaveBeenCalled())
     expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeDisabled()
-    expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeDisabled()
     expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
   })
 
@@ -780,7 +780,7 @@ describe('WorkspaceExplorer', () => {
         store.files = [{ id: 'current-canvas', name: 'Current analysis', version: 13, role: 'editor' }]
         return true
       })
-    render(<WorkspaceExplorer />)
+    const { rerender } = render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
     await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
@@ -791,6 +791,18 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Canvases refreshed. Try adding the Source again.'))
     expect(mocks.workspaceAddDatasets).toHaveBeenCalledTimes(1)
     expect(store.openFile).not.toHaveBeenCalled()
+    rerender(<WorkspaceExplorer />)
+    mocks.workspaceAddDatasets.mockResolvedValueOnce({ ok: true, id: 'current-canvas', version: 14 })
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledTimes(2))
+    expect(mocks.workspaceAddDatasets).toHaveBeenLastCalledWith('current-canvas', expect.objectContaining({
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 13, requestId: expect.any(String),
+    }))
+    const firstRequest = mocks.workspaceAddDatasets.mock.calls[0]?.[1] as { requestId: string }
+    const retryRequest = mocks.workspaceAddDatasets.mock.calls[1]?.[1] as { requestId: string }
+    expect(retryRequest.requestId).not.toBe(firstRequest.requestId)
+    expect(store.openFile).toHaveBeenCalledTimes(1)
+    expect(store.openFile).toHaveBeenCalledWith('current-canvas')
   })
 
   it('labels the bounded local Catalog scope and preserves independent URL state', async () => {
@@ -1231,8 +1243,8 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
     )
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose another Canvas/ }))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Add and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', expect.objectContaining({
