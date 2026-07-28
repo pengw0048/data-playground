@@ -1425,6 +1425,35 @@ describe('WorkspaceExplorer', () => {
     expect(context).toHaveTextContent('2 more columns')
   })
 
+  it('keeps a wide provider detail scrollable while its close and use actions stay reachable', async () => {
+    const columns = Array.from({ length: 100 }, (_, index) => ({
+      name: `provider-column-${index}`, type: 'string', provenance: 'provider' as const,
+      capabilities: [], annotations: [],
+    }))
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({
+      ...CANONICAL_DATASET_CONTEXT,
+      datasetIdentity: 'provider://warehouse/' + 'long-revision-identity/'.repeat(20),
+      revisionId: 'revision-' + 'a'.repeat(200),
+      columns,
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    const content = within(detail).getByTestId('provider-dataset-detail-content')
+    expect(content).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto', 'overscroll-contain')
+    expect(within(detail).getByRole('button', { name: 'Close' })).toBeVisible()
+    expect(within(detail).getByRole('button', { name: 'Use in canvas' })).toBeVisible()
+  })
+
   it('retries canonical provider detail without changing the placement', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     mocks.workspaceResource.mockResolvedValue({
