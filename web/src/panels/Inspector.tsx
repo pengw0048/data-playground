@@ -16,9 +16,9 @@ import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeCon
 import { UpsertControl } from '../components/UpsertControl'
 import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
-import type { JoinAnalysis, JoinSuggestion } from '../types/api'
+import type { CatalogTable, DatasetRevisionDetail, JoinAnalysis, JoinSuggestion } from '../types/api'
 import { serializeJoinKeys } from '../nodes/joinKeys'
-import type { ColumnSchema } from '../types/graph'
+import { datasetRefIdentity, isParameterRef, type ColumnSchema, type DatasetRef } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -207,6 +207,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           )}
         </Section>
       </EditOnly>
+
+      {kind === 'source' && <SourceConnectionDetails nodeId={nodeId} />}
 
       {(kind === 'source' || kind === 'join') && <EditOnly enabled={canEdit}>
         <Section title="Related data">
@@ -618,6 +620,111 @@ function RunPlan({ nodeId }: { nodeId: string }) {
       </div>
     </Section>
   )
+}
+
+type ExactDetailState = 'idle' | 'loading' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
+
+function exactDetailState(error: unknown): Exclude<ExactDetailState, 'idle' | 'loading' | 'available'> {
+  const facts = typeof error === 'object' && error !== null ? error as { code?: unknown; status?: unknown } : {}
+  if (facts.code === 'permission_denied' || facts.status === 403) return 'permission'
+  if (facts.code === 'service_unavailable' || facts.status === 503) return 'offline'
+  if (facts.code === 'resource_gone' || facts.status === 404 || facts.status === 410) return 'unavailable'
+  return 'error'
+}
+
+function sourceTable(catalog: CatalogTable[], config: Record<string, unknown>): CatalogTable | undefined {
+  const tableId = typeof config.tableId === 'string' ? config.tableId : undefined
+  const uri = typeof config.uri === 'string' ? config.uri : ''
+  return catalog.find((table) => (tableId && table.id === tableId) || table.uri === uri || table.name === uri)
+}
+
+function SourceConnectionDetails({ nodeId }: { nodeId: string }) {
+  const node = useStore((s) => s.doc.nodes.find((candidate) => candidate.id === nodeId))
+  const catalog = useStore((s) => s.catalog)
+  const [open, setOpen] = useState(false)
+  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [detailState, setDetailState] = useState<ExactDetailState>('idle')
+
+  const config = (node?.data.config ?? {}) as Record<string, unknown>
+  const table = sourceTable(catalog, config)
+  const datasetRef = config.datasetRef
+  const parameter = isParameterRef(datasetRef) ? datasetRef : null
+  const selectedRef = datasetRef && !isParameterRef(datasetRef) ? datasetRef as DatasetRef : null
+  const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
+  const provider = typeof config.providerResourceRef === 'string'
+  const providerName = typeof config.providerName === 'string' ? config.providerName : undefined
+
+  useEffect(() => {
+    let live = true
+    setDetail(null)
+    if (!open || !exact) { setDetailState('idle'); return () => { live = false } }
+    setDetailState('loading')
+    void api.datasetRevision(exact.datasetId, exact.revisionId).then((next) => {
+      if (!live) return
+      setDetail(next); setDetailState('available')
+    }).catch((error) => {
+      if (live) setDetailState(exactDetailState(error))
+    })
+    return () => { live = false }
+  }, [exact?.datasetId, exact?.revisionId, open])
+
+  const columns = exact ? detail?.preview.columns : table?.columns
+  const values: Array<[string, string]> = [
+    ['Source', provider ? (providerName ?? 'Mounted provider') : 'Local catalog'],
+  ]
+  const stringValue = (key: string) => typeof config[key] === 'string' ? config[key] as string : undefined
+  const add = (label: string, value: string | null | undefined) => { if (value) values.push([label, value]) }
+  if (parameter) add('Dataset parameter', parameter.parameterRef)
+  if (provider) {
+    add('Provider resource', stringValue('providerResourceRef'))
+    add('Provider mount', stringValue('providerMountId'))
+    add('Provider source binding', stringValue('providerSourceBindingId'))
+  } else {
+    add('Catalog registration', table?.registrationId ?? stringValue('registrationId') ?? table?.id)
+  }
+  add('Dataset location', stringValue('uri'))
+  if (exact) {
+    add('Exact dataset identity', exact.datasetId)
+    add('Exact revision identity', exact.revisionId)
+  }
+  if (selectedRef?.kind === 'as_of') add('As-of selection (UTC)', selectedRef.asOf)
+
+  if (!node) return null
+
+  return (
+    <Section title="Data source">
+      <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
+        <summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
+        <div aria-label="Source connection details" className="mt-2 grid gap-2">
+          <div className="text-[10px] leading-relaxed text-muted-foreground">Identifiers are shown here for inspection and copying; they do not replace the selected version.</div>
+          <dl className="grid gap-1.5">
+            {values.map(([label, value]) => <ConnectionFact key={label} label={label} value={value} />)}
+          </dl>
+          {exact && detailState === 'loading' && <div role="status" className="text-muted-foreground">Loading selected version fields…</div>}
+          {exact && detailState === 'unavailable' && <div role="alert" className="text-destructive">The selected version is unavailable. The current dataset was not substituted.</div>}
+          {exact && detailState === 'permission' && <div role="alert" className="text-destructive">Permission to inspect the selected version was lost.</div>}
+          {exact && detailState === 'offline' && <div role="alert" className="text-destructive">The provider is offline; selected version fields cannot be checked.</div>}
+          {exact && detailState === 'error' && <div role="alert" className="text-destructive">Selected version fields could not be loaded.</div>}
+          {columns && <div>
+            <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-muted-foreground">Field evidence · {columns.length} {columns.length === 1 ? 'column' : 'columns'}</div>
+            {columns.length ? <div className="grid max-h-32 gap-0.5 overflow-y-auto rounded border border-border bg-background/60 p-1">
+              {columns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
+            </div> : <div className="text-muted-foreground">No fields were supplied for this version.</div>}
+          </div>}
+        </div>
+      </details>
+    </Section>
+  )
+}
+
+function ConnectionFact({ label, value }: { label: string; value: string }) {
+  const copy = () => { if (navigator.clipboard) void navigator.clipboard.writeText(value) }
+  return <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-2 gap-y-0.5">
+    <dt className="text-muted-foreground">{label}</dt>
+    <button type="button" aria-label={`Copy ${label}`} title={`Copy ${label}`} onClick={copy}
+      className="rounded px-1 text-[9px] font-semibold text-primary hover:bg-accent">Copy</button>
+    <dd className="col-span-2 break-all rounded bg-background/70 px-1.5 py-1 font-mono text-[9.5px] text-foreground">{value}</dd>
+  </div>
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

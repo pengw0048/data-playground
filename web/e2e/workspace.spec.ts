@@ -264,9 +264,9 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     const node = page.locator('.react-flow__node', { hasText: 'Pinned source' })
     await expect(node).toBeVisible()
     await page.getByRole('button', { name: 'Pin exact revision' }).click()
-    const revisionPicker = page.getByText('Persist one exact provider revision. The Source will never retarget it to latest.').locator('..')
+    const revisionPicker = page.getByText('Select one retained version. This Source will not switch to latest automatically.').locator('..')
     await revisionPicker.getByText('1', { exact: true }).click()
-    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    await expect(node).toContainText('Local catalog · Version 1 · 1 row · 1 column')
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${canvasId}`)
       return (await response.json()).nodes[0].data.config.datasetRef
@@ -276,9 +276,10 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     })
 
     await page.reload()
-    const control = page.getByRole('button', { name: 'Change pinned revision 1' })
+    const control = page.getByRole('button', { name: 'Change selected version' })
     await expect(control).toBeVisible()
-    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    await expect(page.locator('.react-flow__node', { hasText: 'Pinned source' })).toContainText(
+      'Local catalog · Version 1 · 1 row · 1 column')
     const box = await control.boundingBox()
     expect(box).not.toBeNull()
     expect(box!.x).toBeGreaterThanOrEqual(0)
@@ -343,11 +344,14 @@ test('keeps an exact Source binding through provider outage and retries at the s
 
   try {
     await page.goto(`/#/canvas/${canvasId}`)
-    await expect(page.getByText(/provider is offline.*exact revision 1.*latest was not substituted/i)).toBeVisible()
+    await expect(page.getByText(
+      /provider is offline.*selected version could not be verified.*latest was not substituted/i,
+    )).toBeVisible()
 
     providerAvailable = true
     await page.getByRole('button', { name: 'Retry provider' }).click()
-    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    await expect(page.locator('.react-flow__node', { hasText: 'Recoverable source' })).toContainText(
+      'Local catalog · Version 1 · 1 row · 1 column')
     const response = await page.request.get(`/api/canvas/${canvasId}`)
     expect((await response.json()).nodes[0].data.config.datasetRef).toEqual(selected)
   } finally {

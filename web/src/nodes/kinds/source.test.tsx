@@ -48,9 +48,9 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     vi.unstubAllEnvs()
   })
 
-  it('shows "—" for an unknown row count, not a fake "0 rows"', () => {
+  it('labels an unknown row count without inventing a fake zero', () => {
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
-    expect(screen.getByText(/—\s*rows/)).toBeInTheDocument()
+    expect(screen.getByText(/Rows unknown/i)).toBeInTheDocument()
     expect(screen.queryByText(/\b0\s*rows/)).toBeNull()
   })
 
@@ -73,7 +73,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().selectedIds).toEqual(['s1'])
   })
 
-  it('uses the selected provider exact schema for field evidence even without a local catalog table', async () => {
+  it('keeps a selected provider exact summary on the card without field evidence clutter', async () => {
     mocks.datasetRevision.mockResolvedValueOnce({
       datasetId: 'provider-orders', revisionId: 'empty-r7', retentionOwner: 'provider', summary: { rowCount: 0 },
       preview: {
@@ -90,12 +90,30 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('Pinned revision empty-r7 field evidence · 1 columns')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Pinned revision empty-r7 field evidence · 1 columns'))
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
-    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
+    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 1 column')).toBeInTheDocument()
+    expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
+  })
+
+  it('keeps a long exact identity out of the Source card summary', async () => {
+    const revisionId = 'revision:an-intentionally-long-opaque-identity'
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'provider-orders', revisionId, retentionOwner: 'provider', summary: { rowCount: 12 },
+      preview: {
+        columns: [{ name: 'customer_id', type: 'int64', capabilities: [] }],
+        rows: [], hasMore: false, rowLimit: 100,
+      },
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
+    render1({ title: 'provider orders', status: 'latest', config: {
+      providerResourceRef: 'dataset:provider-orders', providerName: 'fixture', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId },
+    } })
+
+    expect(await screen.findByText('fixture · Selected version · 12 rows · 1 column')).toBeInTheDocument()
+    expect(screen.queryByText(/intentionally-long-opaque/i)).not.toBeInTheDocument()
   })
 
   it('cold start: kernel up + no recents fetches a server page, then says the catalog is empty (not "offline")', async () => {
@@ -195,7 +213,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
   })
 
-  it('labels advanced current-head facts separately from the exact pin', async () => {
+  it('uses only the selected exact version facts on the card, not current-head or field detail', async () => {
     const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'rev-1' }
     const data = { title: 'orders', status: 'latest', config: {
       uri: '/data/orders.lance', tableId: 't1', datasetRef: selected,
@@ -223,12 +241,9 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     render1(data)
 
-    expect(screen.getByText('Current head · 1,500 rows · 5 cols · v4')).toBeInTheDocument()
-    expect(await screen.findByLabelText('Pinned revision facts')).toHaveTextContent(
-      'Pinned exact revision rev-1 · 1,000 rows · 4 cols',
-    )
-    expect(screen.getByText('Pinned revision rev-1 field evidence · 4 columns')).toBeInTheDocument()
-    expect(screen.queryByText(/^1,500 rows · 5 cols · v4$/)).toBeNull()
+    expect(await screen.findByText('Local catalog · Version rev-1 · 1,000 rows · 4 columns')).toBeInTheDocument()
+    expect(screen.queryByText(/Current head/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
   })
 
   it('omits revision controls once the provider proves it has no selector capability', async () => {
@@ -297,7 +312,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     render1(data)
 
-    expect(await screen.findByText(/revision missing.*missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Last known provider commit.*stale/i)
     expect(screen.queryByRole('button', { name: 'Revision selection unavailable' })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -325,7 +340,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/revision missing.*missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -345,7 +360,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/revision 3.*registration is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Choose a new dataset above to create a new binding/i)
     expect(screen.queryByRole('button', { name: /follow current latest explicitly/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -369,9 +384,9 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       })
     render1(data)
 
-    expect(await screen.findByText(/Permission to open exact revision 7 was lost.*latest was not substituted/i)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry exact revision' }))
-    expect(await screen.findByText(/Pinned exact revision 7.*1 rows.*0 cols/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Permission to open the selected version was lost.*latest was not substituted/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry selected version' }))
+    expect(await screen.findByText('Local catalog · Version 7 · 1 row · 0 columns')).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -411,14 +426,12 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     render1(data)
 
     const control = await screen.findByRole('button', {
-      name: 'As of Jul 16, 2026, 12:38:00 UTC → rev-pin',
+      name: 'Change version selected as of Jul 16, 2026, 12:38:00 UTC',
     })
     fireEvent.click(control)
     expect(screen.getByText('Jul 16, 2026, 15:38:00 UTC')).toBeInTheDocument()
     expect(screen.getByLabelText('As-of UTC date and time')).toBeInTheDocument()
-    expect(screen.getByLabelText('Pinned revision facts')).toHaveTextContent(
-      'As-of intent Jul 16, 2026, 12:38:00 UTC resolved once to pinned exact revision rev-pin',
-    )
+    expect(await screen.findByText('Local catalog · Version rev-pin · 1 row · 0 columns')).toBeInTheDocument()
   })
 
   it('stores UTC as-of intent with exact and as-of capabilities after history is ready', async () => {

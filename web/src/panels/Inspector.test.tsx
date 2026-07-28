@@ -6,6 +6,7 @@ import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
+import '../nodes/kinds/source'
 
 const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
@@ -397,6 +398,47 @@ describe('Inspector — effective named outputs', () => {
     fireEvent.click(screen.getByText('Advanced write operations'))
     expect(advanced).toHaveAttribute('open')
     expect(screen.getByLabelText('Certified column merge')).toBeInTheDocument()
+  })
+})
+
+describe('Inspector — Source connection details', () => {
+  it('keeps opaque Source bindings and field evidence out of the Canvas card surface until requested', async () => {
+    const exact = vi.spyOn(api, 'datasetRevision').mockResolvedValue({
+      datasetId: 'provider:dataset:an-intentionally-long-opaque-identity',
+      revisionId: 'revision:an-intentionally-long-opaque-identity', retentionOwner: 'provider',
+      summary: { rowCount: 100 }, preview: {
+        columns: [{ name: 'customer_id', type: 'int64', capabilities: [], annotations: [{
+          key: 'provider.note', value: 'selected exact schema', encoding: 'utf8', provenance: 'provider',
+        }] }], rows: [], hasMore: false, rowLimit: 100,
+      }, rowIdentity: { supported: false, reason: 'unsupported' },
+    } as any)
+    useStore.setState({
+      selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {},
+      catalog: [], doc: { id: 'source-connection', name: 'Source connection', version: 1, requirements: [], edges: [],
+        nodes: [{ id: 'source', type: 'source', position: { x: 0, y: 0 }, data: {
+          title: 'orders', status: 'latest', history: [], config: {
+            providerName: 'Luma Data API', providerResourceRef: 'provider://datasets/orders',
+            providerMountId: 'mount:very-long-provider-mount', providerSourceBindingId: 'binding:very-long-provider-source-binding',
+            datasetRef: { kind: 'exact', datasetId: 'provider:dataset:an-intentionally-long-opaque-identity', revisionId: 'revision:an-intentionally-long-opaque-identity' },
+          },
+        } }],
+      },
+    } as any)
+
+    render(<Inspector />)
+    expect(screen.getByText('binding:very-long-provider-source-binding')).not.toBeVisible()
+    expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Connection details'))
+    const details = await screen.findByLabelText('Source connection details')
+    expect(details).toHaveTextContent('provider://datasets/orders')
+    expect(details).toHaveTextContent('binding:very-long-provider-source-binding')
+    expect(details).toHaveTextContent('revision:an-intentionally-long-opaque-identity')
+    expect(await screen.findByText('Field evidence · 1 column')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
+    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
+    expect(exact).toHaveBeenCalledWith('provider:dataset:an-intentionally-long-opaque-identity', 'revision:an-intentionally-long-opaque-identity')
+    exact.mockRestore()
   })
 })
 
