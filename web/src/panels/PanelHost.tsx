@@ -9,6 +9,7 @@ import { HistoryPanel } from './HistoryPanel'
 import { LineagePanel } from './LineagePanel'
 import { SectionPanel } from './SectionPanel'
 import { ErrorBoundary } from '../ui/ErrorBoundary'
+import { dataPanelPlacement } from './panelPlacement'
 
 // Panels anchor 12px below the node's action row, one open per node (§5.2, actions page).
 export function PanelHost() {
@@ -56,7 +57,8 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   // maximized → a full-viewport overlay (same content), like the code editor's fullscreen
   if (max) {
     return (
-      <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={() => setMax(false)}>
+      <div data-testid={`panel-${kind}`} data-presentation="maximized"
+        className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={() => setMax(false)}>
         <div onClick={(e) => e.stopPropagation()}
           className="flex min-h-0 flex-1 flex-col overflow-hidden"
           style={{ background: 'hsl(var(--card))', border: `1px solid ${color.border}`, borderRadius: radius.panel, boxShadow: shadow.panel }}>
@@ -72,6 +74,29 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   // inside the actual canvas after the responsive Inspector is expanded or collapsed.
   const rightEdge = document.querySelector<HTMLElement>('[data-layout-region="inspector"]')?.getBoundingClientRect().left
     ?? window.innerWidth
+  if (kind === 'data') {
+    const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
+    const placement = dataPanelPlacement({
+      anchor: rect, width, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+      rightEdge, toolbarTop,
+    })
+    return (
+      <div className="dp-float dp-panel" data-testid={`panel-${kind}`} data-presentation={placement.presentation}
+        style={{ position: 'fixed', left: placement.left, top: placement.top, width: placement.width, zIndex: 25 }}>
+        <div
+          style={{
+            background: 'hsl(var(--card))', border: `1px solid ${color.border}`,
+            borderRadius: radius.panel, boxShadow: shadow.panel, overflow: 'hidden',
+            height: placement.presentation === 'docked' ? placement.maxHeight : undefined,
+            maxHeight: placement.maxHeight, display: 'flex', flexDirection: 'column',
+          }}
+        >
+          {content}
+        </div>
+      </div>
+    )
+  }
+
   // Prefer to the RIGHT of the node so the panel never covers it; fall back to below-left.
   const gap = 12
   let left: number
@@ -127,7 +152,8 @@ function PanelTitle({ nodeId, title, kind, dark, maximized, onToggleMax, onClose
         <button onClick={() => runPreview(nodeId)} title="Refresh" style={iconBtn(dark)}><Icon name="refresh" size={13} /></button>
       )}
       {onToggleMax && (
-        <button onClick={onToggleMax} title={maximized ? 'Restore' : 'Maximize'} style={iconBtn(dark)}>
+        <button onClick={onToggleMax} aria-label={maximized ? 'Restore' : 'Maximize'}
+          title={maximized ? 'Restore' : 'Maximize'} style={iconBtn(dark)}>
           <Icon name={maximized ? 'minimize' : 'maximize'} size={13} />
         </button>
       )}
