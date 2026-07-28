@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from hub import execution_manifest, metadb
 from hub.deps import get_deps
 from hub.main import app
+from hub.models import SampleResult
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.routers import runs as runs_router
 
@@ -336,6 +337,57 @@ def test_retained_editor_preview_classifies_missing_expired_and_denied(
     expired = _preview(graph)
     assert expired.status_code == 410
     assert expired.json()["code"] == "retained_upstream_expired"
+
+
+def test_corrupt_retained_editor_artifact_redacts_private_diagnostics(
+        retained_sample):
+    graph, _run_id, output = retained_sample
+    target_uri = output["uri"]
+    with open(target_uri, "wb") as stream:
+        stream.write(b"not a parquet artifact")
+    response = _preview(graph)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["error"] is True
+    assert body["failureCategory"] == "runtime_error"
+    assert body["reason"]
+    assert "retained upstream result" in body["reason"]
+    assert body["reason"] != "retained upstream result"
+    encoded = json.dumps(body, sort_keys=True)
+    assert output["uri"] not in body["reason"] and output["uri"] not in encoded
+    assert target_uri not in body["reason"] and target_uri not in encoded
+
+
+def test_retained_editor_redaction_covers_structured_diagnostics_not_user_rows():
+    output_uri = "/private/result-root"
+    target_uri = "/private/result-root/member.parquet"
+    result = SampleResult(
+        error=True,
+        reason=f"failed to read {output_uri} through {target_uri}",
+        user_code_exception={
+            "node_id": "transform",
+            "exception_type": "ValueError",
+            "message": f"bad input from {target_uri}",
+            "guidance": f"inspect {output_uri}",
+        },
+    )
+    runs_router._redact_retained_editor_diagnostics(
+        result, (output_uri, target_uri))
+    assert result.reason == (
+        "failed to read retained upstream result through retained upstream result")
+    assert result.user_code_exception is not None
+    assert result.user_code_exception.message == "bad input from retained upstream result"
+    assert result.user_code_exception.guidance == "inspect retained upstream result"
+
+    successful = SampleResult(
+        rows=[{"value": target_uri}],
+        row_count=1,
+        has_more=False,
+        completeness="complete",
+    )
+    runs_router._redact_retained_editor_diagnostics(
+        successful, (output_uri, target_uri))
+    assert successful.rows == [{"value": target_uri}]
 
 
 def test_retained_editor_preview_rejects_mutable_local_source_without_reading(

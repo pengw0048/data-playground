@@ -3763,6 +3763,31 @@ def _retained_editor_error(status: int, detail: str, code: APIErrorCode) -> APIE
     return APIError(status, detail, code=code, retryable=False)
 
 
+def _redact_retained_editor_diagnostics(
+        result: SampleResult, private_identities: tuple[str, ...]) -> None:
+    """Remove exact server-owned artifact identities from editor-only diagnostic text."""
+    identities = sorted(
+        {identity for identity in private_identities if identity},
+        key=len,
+        reverse=True,
+    )
+
+    def redact(value: str | None) -> str | None:
+        if value is None:
+            return None
+        for identity in identities:
+            value = value.replace(identity, "retained upstream result")
+        return value
+
+    result.reason = redact(result.reason)
+    if result.user_code_exception is not None:
+        detail = result.user_code_exception
+        result.user_code_exception = detail.model_copy(update={
+            "message": redact(detail.message),
+            "guidance": redact(detail.guidance),
+        })
+
+
 def _retained_editor_target(
         graph: Graph, transform_id: str, deps) -> tuple[object, Graph, str, Graph]:
     """Resolve the current immediate-upstream target without touching any Source."""
@@ -4007,6 +4032,7 @@ def preview_transform_with_retained_upstream(
         )
         result.sample_provenance = None
         result.input_manifest = None
+        _redact_retained_editor_diagnostics(result, (uri, target_uri))
         return result
     if saw_expired:
         raise _retained_editor_error(
