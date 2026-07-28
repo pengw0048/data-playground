@@ -96,6 +96,26 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
   })
 
+  it('keeps a long exact identity out of the Source card summary', async () => {
+    const revisionId = 'revision:an-intentionally-long-opaque-identity'
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'provider-orders', revisionId, retentionOwner: 'provider', summary: { rowCount: 12 },
+      preview: {
+        columns: [{ name: 'customer_id', type: 'int64', capabilities: [] }],
+        rows: [], hasMore: false, rowLimit: 100,
+      },
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
+    render1({ title: 'provider orders', status: 'latest', config: {
+      providerResourceRef: 'dataset:provider-orders', providerName: 'fixture', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId },
+    } })
+
+    expect(await screen.findByText('fixture · Selected version · 12 rows · 1 column')).toBeInTheDocument()
+    expect(screen.queryByText(/intentionally-long-opaque/i)).not.toBeInTheDocument()
+  })
+
   it('cold start: kernel up + no recents fetches a server page, then says the catalog is empty (not "offline")', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ kernelUp: true, catalog: [] } as any)

@@ -41,8 +41,8 @@ function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle
   return 'error'
 }
 
-function shortRevision(value: string): string {
-  return value.length > 24 ? `${value.slice(0, 12)}…${value.slice(-8)}` : value
+function versionSummary(value: string): string {
+  return value.length > 24 ? 'Selected version' : `Version ${value}`
 }
 
 function countSummary(rowCount: number | null | undefined, columnCount: number | null | undefined): string {
@@ -174,7 +174,7 @@ function Source({ id, data }: NodeComponentProps) {
     ? `${sourceLabel} · Run-time dataset parameter · Rows and columns vary by run`
     : selectedExact
       ? exactDetailState === 'available' && exactDetail
-        ? `${sourceLabel} · Version ${shortRevision(exactDetail.revisionId)} · ${countSummary(exactDetail.summary.rowCount, exactDetail.preview.columns.length)}`
+        ? `${sourceLabel} · ${versionSummary(exactDetail.revisionId)} · ${countSummary(exactDetail.summary.rowCount, exactDetail.preview.columns.length)}`
         : exactDetailState === 'unavailable'
           ? `${sourceLabel} · Selected version unavailable`
           : exactDetailState === 'permission'
