@@ -125,6 +125,52 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByRole('button', { name: 'Open run run-older in Climate analysis' })).toBeVisible()
 })
 
+test('a completed Jobs row stays concise and opens human-named retained results @ux-smoke', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 })
+  const completed = {
+    ...failedJob,
+    id: 'history-complete',
+    runId: 'run-complete',
+    status: 'done',
+    progress: 1,
+    rows: 1,
+    error: null,
+    outputs: [
+      {
+        nodeId: 'transform', portId: 'clean', portLabel: 'Clean rows', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: 'file:///clean.parquet', rows: 1,
+      },
+      {
+        nodeId: 'transform', portId: 'rejected', portLabel: 'Rejected rows', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: 'file:///rejected.parquet', rows: 0,
+      },
+    ],
+  }
+  await page.route('**/api/canvas', async (route) => route.fulfill({
+    json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }],
+  }))
+  await page.route('**/api/jobs?*', async (route) => route.fulfill({
+    json: { items: [completed], nextCursor: null, hasMore: false },
+  }))
+
+  await page.goto('/#/jobs')
+  const row = page.getByRole('button', {
+    name: 'Open run run-complete in Climate analysis', expanded: false,
+  })
+  await expect(row).toContainText('done')
+  await expect(row).toContainText('2 outputs retained')
+  await expect(row).toContainText('1 row')
+  await expect(row).not.toContainText('100%')
+  await expect(row).not.toContainText('●')
+
+  await row.click()
+  await expect(page.getByRole('button', { name: 'Open result 1' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open result 2' })).toBeVisible()
+  await expect(page.getByText(/transform:clean/)).toBeHidden()
+  await page.getByText('Technical evidence', { exact: true }).click()
+  await expect(page.getByText(/Result 1 · transform:clean, Result 2 · transform:rejected/)).toBeVisible()
+})
+
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
   const mergeJob = {
     id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
