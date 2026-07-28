@@ -7,7 +7,7 @@ import {
   type SettingChange,
   type SettingsSnapshot,
 } from '../api/client'
-import type { PluginConfigField, PluginInfo, ResourceSpec } from '../types/api'
+import type { BackendInfo, PluginConfigField, PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -36,6 +36,11 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
 const INHERIT = '__default__'
 // Radix Select forbids an empty value — sentinels for "no credential" pickers (mapped to '' on save).
 const NO_CRED = '__none__'
+const BUILTIN_RUNNER_GUIDANCE: Record<string, string> = {
+  'local-out-of-core': 'Use for a direct local run. It streams and spills data instead of requiring it to fit in memory.',
+  'local-subprocess': 'Use when each run should be isolated in its own OS process. A failed or cancelled run does not take down the hub.',
+  kernel: 'Use for a durable worker per Canvas. It keeps warm state and can continue after a hub restart.',
+}
 const OBJECT_STORE_FIELDS: { key: string; placeholder: string }[] = [
   { key: 'accessKeyId', placeholder: 'env:AWS_ACCESS_KEY_ID' },
   { key: 'secretAccessKey', placeholder: 'env:AWS_SECRET_ACCESS_KEY' },
@@ -585,6 +590,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }
   const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
+  // /settings carries explicit user/workspace choices, but not the deployment's DP_EXECUTION
+  // override. Do not guess the deployment default from registration order: this action is only
+  // meaningful when Settings explicitly selects the kernel.
+  const selectedRunner = u.backend && u.backend !== INHERIT
+    ? String(u.backend)
+    : g.backend ? String(g.backend) : null
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) requestClose() }}>
@@ -708,13 +719,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
                       <SelectTrigger aria-label="Runner"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value={INHERIT}>Workspace default{g.backend ? ` (${String(g.backend)})` : ` (${runners[0]})`}</SelectItem>
+                        <SelectItem value={INHERIT}>Workspace default{g.backend ? ` (${String(g.backend)})` : ' (deployment default)'}</SelectItem>
                         {runners.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
                       </SelectContent>
                     </Select>
                   </Field>
-                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs — falls back to the workspace default.</div>
-                  {((u.backend && u.backend !== INHERIT ? String(u.backend) : (g.backend ? String(g.backend) : runners[0])) === 'kernel') && (
+                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs. Workspace default uses the workspace choice; if it is unset, the deployment default applies.</div>
+                  {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
                       <span className="text-[10.5px] text-muted-foreground">Applies immediately; it does not save staged Settings. Clears this canvas's warm kernel; the next run starts fresh.</span>
@@ -724,23 +735,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Compute</div>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Backends and the workers (pods / processes) they offer, with capacity. A pod/Ray backend plugin adds its own here.</div>
+                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">When to use each runner</div>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Capacity is reported beside each runner.</div>
                   <div className="flex flex-col gap-1.5">
                     {(kernelInfo?.backends ?? []).map((b) => (
-                      <div key={b.name} className="rounded-md border border-border p-2">
-                        <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                      <div key={b.name} className="rounded-md border border-border px-2.5 py-2">
+                        <div className="flex items-baseline gap-1.5 text-xs font-semibold text-foreground">
                           <Icon name="db" size={12} /> {b.name}
-                          <span className="text-[10px] font-normal text-muted-foreground">· {b.workers.length} worker{b.workers.length === 1 ? '' : 's'}</span>
+                          <span className="text-[10px] font-normal text-muted-foreground">· {backendCapacitySummary(b)}</span>
                         </div>
-                        <div className="mt-1 flex flex-col gap-0.5">
-                          {b.workers.map((w) => (
-                            <div key={w.id} className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground">
-                              <span className={cn('h-1.5 w-1.5 rounded-full', w.state === 'idle' ? 'bg-green-500' : w.state === 'busy' ? 'bg-amber-500' : 'bg-muted-foreground')} />
-                              <span className="font-mono">{w.id}</span><span>· {capLabel(w.capacity)}</span>
-                            </div>
-                          ))}
-                        </div>
+                        <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">{runnerGuidance(b.name)}</div>
                       </div>
                     ))}
                     {(kernelInfo?.backends ?? []).length === 0 && <div className="text-[11.5px] text-muted-foreground">No backends reported.</div>}
@@ -1044,6 +1048,25 @@ function capLabel(c: ResourceSpec): string {
   if (c.cpu) parts.push(`${c.cpu} cpu`)
   if (c.mem) parts.push(String(c.mem))
   return parts.join(' · ') || 'unspecified'
+}
+
+function runnerGuidance(name: string): string {
+  return BUILTIN_RUNNER_GUIDANCE[name]
+    ?? 'Provider-owned runner. Its provider controls execution behavior and capacity.'
+}
+
+function backendCapacitySummary(backend: BackendInfo): string {
+  const { workers } = backend
+  if (workers.length === 0) return 'No workers reported'
+  const workerLabel = `${workers.length} worker${workers.length === 1 ? '' : 's'}`
+  if (workers.length === 1) return `${workerLabel} · ${capLabel(workers[0].capacity)}`
+  const byCapacity = new Map<string, number>()
+  for (const worker of workers) {
+    const label = capLabel(worker.capacity)
+    byCapacity.set(label, (byCapacity.get(label) ?? 0) + 1)
+  }
+  const capacities = [...byCapacity].map(([label, count]) => count === 1 ? label : `${count}× ${label}`)
+  return `${workerLabel} · ${capacities.join('; ')}`
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

@@ -583,6 +583,90 @@ describe('SettingsModal — plugin config form', () => {
     ))
   })
 
+  it('explains built-in runners, keeps capacity secondary, and leaves provider runners neutral', async () => {
+    state.kernelInfo = {
+      runners: ['local-out-of-core', 'local-subprocess', 'kernel', 'acme-batch'],
+      backends: [
+        { name: 'local-out-of-core', workers: [{ id: 'local-out-of-core:local', state: 'idle', capacity: { cpu: 8, mem: '32GiB' } }] },
+        { name: 'local-subprocess', workers: [{ id: 'local-subprocess:local', state: 'idle', capacity: { cpu: 8, mem: '32GiB' } }] },
+        { name: 'kernel', workers: [{ id: 'kernel:local', state: 'idle', capacity: { cpu: 8, mem: '32GiB' } }] },
+        { name: 'acme-batch', workers: [
+          { id: 'acme-01', state: 'busy', capacity: { cpu: 32, mem: '128GiB' } },
+          { id: 'acme-02', state: 'idle', capacity: { cpu: 64, mem: '256GiB' } },
+        ] },
+        { name: 'acme-offline', workers: [] },
+      ],
+    } as typeof state.kernelInfo
+    getSettings.mockResolvedValue({
+      global: { backend: 'kernel' }, user: {}, revision: { global: 2, user: 4 },
+    })
+
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+
+    expect(screen.getByText('When to use each runner')).toBeVisible()
+    expect(screen.getByText(/streams and spills data/i)).toBeVisible()
+    expect(screen.getByText(/isolated in its own OS process/i)).toBeVisible()
+    expect(screen.getByText(/durable worker per Canvas/i)).toBeVisible()
+    expect(screen.getAllByText('Provider-owned runner. Its provider controls execution behavior and capacity.')).toHaveLength(2)
+    expect(screen.getAllByText(/1 worker · 8 cpu · 32GiB/)).toHaveLength(3)
+    expect(screen.getByText(/2 workers · 32 cpu · 128GiB; 64 cpu · 256GiB/)).toBeVisible()
+    expect(screen.getByText(/No workers reported/)).toBeVisible()
+    expect(screen.queryByText('kernel:local')).toBeNull()
+    expect(screen.queryByText('acme-01')).toBeNull()
+
+    fireEvent.click(screen.getByLabelText('Runner'))
+    expect(await screen.findByRole('option', { name: 'Workspace default (kernel)' })).toBeVisible()
+  })
+
+  it('does not guess the deployment runner when no workspace default is configured', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByLabelText('Runner'))
+    expect(await screen.findByRole('option', { name: 'Workspace default (deployment default)' })).toBeVisible()
+  })
+
+  it('does not expose Restart kernel when Settings has no explicit runner selection', async () => {
+    state.kernelInfo = {
+      runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
+      backends: [],
+    } as typeof state.kernelInfo
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+  })
+
+  it('offers Restart kernel for an explicit user runner selection', async () => {
+    state.kernelInfo = {
+      runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
+      backends: [],
+    } as typeof state.kernelInfo
+    getSettings.mockResolvedValue({
+      global: {}, user: { backend: 'kernel' }, revision: { global: 2, user: 4 },
+    })
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+
+    await waitFor(() => expect(restartKernel).toHaveBeenCalledWith('canvas'))
+  })
+
+  it('does not expose Restart kernel for an explicit non-kernel runner', async () => {
+    state.kernelInfo = {
+      runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
+      backends: [],
+    } as typeof state.kernelInfo
+    getSettings.mockResolvedValue({
+      global: { backend: 'local-out-of-core' }, user: {}, revision: { global: 2, user: 4 },
+    })
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+  })
+
   it('keeps every edit when the atomic save fails and retries without claiming success', async () => {
     putSettingsBatch.mockRejectedValueOnce(new Error('HTTP 500: write failed'))
     render(<SettingsModal onClose={vi.fn()} />)
@@ -741,6 +825,9 @@ describe('SettingsModal — plugin config form', () => {
 
   it('reports a failed kernel restart without committing staged Settings', async () => {
     state.kernelInfo = { runners: ['kernel'], backends: [] }
+    getSettings.mockResolvedValue({
+      global: { backend: 'kernel' }, user: {}, revision: { global: 2, user: 4 },
+    })
     let rejectRestart: ((reason?: unknown) => void) | undefined
     restartKernel.mockReturnValueOnce(new Promise((_, reject) => { rejectRestart = reject }))
     render(<SettingsModal onClose={vi.fn()} />)
