@@ -468,6 +468,27 @@ def test_logical_workspace_source_reuses_retained_rows_after_head_advances(
         assert response.json()["editorTestInput"]["runId"] == run_id
 
 
+def test_retained_editor_preview_uses_terminal_state_before_history_projection(tmp_path):
+    """The editor can open immediately after a local run reaches terminal state."""
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        # Model the narrow real ordering window: RunState has committed first, but the asynchronous
+        # history projection has not yet run.  The terminal state remains Canvas- and manifest-bound.
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            assert state is not None
+            assert state.canvas_id == graph["id"]
+            assert state.status == "done"
+            assert json.loads(state.doc)["target_node_id"] == "sample"
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            assert record is not None
+            session.delete(record)
+
+        response = _preview(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
+
+
 def test_logical_workspace_source_registration_change_invalidates_reuse(tmp_path):
     with _retained_sample(tmp_path, logical_source=True) as (graph, _run_id, _output):
         changed = copy.deepcopy(graph)
