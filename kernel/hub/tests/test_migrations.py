@@ -55,11 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
-        ("0051_lance_identity_task", "0050_receipt_names"),
-        ("0050_receipt_names", "0049_lance_row_identity_cert"),
-        ("0049_lance_row_identity_cert", "0048_row_identity_task"),
-        ("0048_row_identity_task", "0047_row_identity_cert"),
-        ("0047_row_identity_cert", "0046_relationship_incident"),
+        ("0050_receipt_names", "0046_relationship_incident"),
         ("0046_relationship_incident", "0045_canvas_dataset_add_replays"),
         ("0045_canvas_dataset_add_replays", "0044_provider_lineage_identity"),
         ("0044_provider_lineage_identity", "0043_provider_source_binding"),
@@ -107,49 +103,52 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0051_lance_identity_task"]
-    assert metadb.expected_schema_head() == "0051_lance_identity_task"
+    assert scripts.get_heads() == ["0050_receipt_names"]
+    assert metadb.expected_schema_head() == "0050_receipt_names"
 
 
-def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
-    db_path = tmp_path / "lance-row-identity-downgrade.db"
-    with _isolated_metadata(f"sqlite:///{db_path}"):
+def test_fresh_schema_omits_retired_row_identity_storage(tmp_path):
+    owner = "retired-row-identity-owner"
+    canvas = "retired-row-identity-canvas"
+    task_id = "retired-row-identity-task"
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'retired-row-identity.db'}"):
         with metadb.engine().connect() as connection:
-            command.upgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
             command.upgrade(metadb._alembic_cfg(connection), "head")
             tables = set(inspect(connection).get_table_names())
-            assert {
-                "managed_local_lance_row_identity_fences",
-                "managed_local_lance_row_identity_certificates",
-            } <= tables
-            connection.execute(sa.text(
-                "INSERT INTO catalog_entries (uri, registration_id, name, doc, updated_at) VALUES "
-                "('file:///migration.lance', 'lance-registration', 'migration', '{}', "
-                "CURRENT_TIMESTAMP)"))
-            connection.execute(sa.text(
-                "INSERT INTO managed_local_lance_row_identity_fences "
-                "(registration_id, revision_id, physical_incarnation_sha256, schema_sha256, "
-                "row_identity_spec_sha256, created_at) VALUES "
-                "('lance-registration', '1', :incarnation, :schema, :spec, CURRENT_TIMESTAMP)"), {
-                    "incarnation": "a" * 64, "schema": "b" * 64, "spec": "c" * 64,
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text("""
+                INSERT INTO users (id, name, is_admin, token_epoch, created_at)
+                VALUES (:owner, 'Retired row identity owner', false, 0, CURRENT_TIMESTAMP)
+            """), {"owner": owner})
+            connection.execute(sa.text("""
+                INSERT INTO canvases (id, owner_id, name, version, doc, visibility, created_at, updated_at)
+                VALUES (:canvas, :owner, 'Retired row identity canvas', 1, '{}', 'private',
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """), {"canvas": canvas, "owner": owner})
+        with pytest.raises(sa.exc.IntegrityError, match="ck_durable_task_kind"):
+            with metadb.engine().begin() as connection:
+                connection.execute(sa.text("""
+                    INSERT INTO durable_tasks
+                        (id, owner_id, canvas_id, submission_id, intent_sha256, target_node_id, task_kind,
+                         backend_kind, status, status_doc, cancel_requested, retry_count, max_attempts,
+                         created_at, updated_at)
+                    VALUES
+                        (:task_id, :owner, :canvas, 'retired-submission', :intent_sha, 'retired-node',
+                         'row_identity_certification', 'local', 'queued', '{}', false, 0, 3,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """), {
+                    "task_id": task_id, "owner": owner, "canvas": canvas, "intent_sha": "a" * 64,
                 })
-            connection.commit()
-            with pytest.raises(RuntimeError, match="cannot downgrade"):
-                command.downgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
-
-
-def test_lance_identity_task_migration_rejects_a_null_physical_fence(tmp_path):
-    db_path = tmp_path / "lance-identity-task-constraint.db"
-    with _isolated_metadata(f"sqlite:///{db_path}"):
         with metadb.engine().connect() as connection:
-            command.upgrade(metadb._alembic_cfg(connection), "head")
-            constraints = {
-                row["name"]: " ".join(str(row["sqltext"]).lower().split())
-                for row in inspect(connection).get_check_constraints(
-                    "row_identity_certification_task_envelopes")
-            }
-    assert "physical_incarnation_sha256 is not null" in constraints[
-        "ck_row_identity_task_source_fence"]
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM durable_tasks WHERE id = :task_id"),
+                {"task_id": task_id}).scalar_one() == 0
+    assert {
+        "managed_local_row_identity_certificates",
+        "row_identity_certification_task_envelopes",
+        "managed_local_lance_row_identity_fences",
+        "managed_local_lance_row_identity_certificates",
+    }.isdisjoint(tables)
 
 
 def _legacy_receipt(*, provider: str, dataset_id: str, revision_id: str,
@@ -257,7 +256,7 @@ def test_receipt_name_migration_backfills_only_exact_ledger_evidence(tmp_path):
     }
     with _isolated_metadata(f"sqlite:///{db_path}"):
         with metadb.engine().connect() as connection:
-            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            command.upgrade(metadb._alembic_cfg(connection), "0046_relationship_incident")
             connection.execute(sa.text("""
                 INSERT INTO managed_local_file_revisions (
                     revision_id, logical_id, artifact_uri, publish_seq, table_doc,
@@ -381,7 +380,7 @@ def test_receipt_name_migration_refuses_ambiguous_or_mismatched_legacy_evidence(
     }
     with _isolated_metadata(f"sqlite:///{db_path}"):
         with metadb.engine().connect() as connection:
-            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            command.upgrade(metadb._alembic_cfg(connection), "0046_relationship_incident")
             connection.execute(sa.text("""
                 INSERT INTO managed_local_lance_write_receipts (
                     idempotency_key, dataset_id, logical_uri, revision_id,
@@ -415,7 +414,7 @@ def test_receipt_name_migration_refuses_publication_identity_mismatch(tmp_path, 
     }
     with _isolated_metadata(f"sqlite:///{db_path}"):
         with metadb.engine().connect() as connection:
-            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            command.upgrade(metadb._alembic_cfg(connection), "0046_relationship_incident")
             connection.execute(sa.text("""
                 INSERT INTO managed_local_file_revisions (
                     revision_id, logical_id, artifact_uri, publish_seq, table_doc,
@@ -765,20 +764,8 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
-        "0051_lance_identity_task.py": (
-            "f331815f35690973bae6002da4fcf419032d8770b338cb71d873632abd251e94"
-        ),
         "0050_backfill_receipt_names.py": (
-            "47ad43fa39ebfad6f2ee265dd2e4aa6bff45e3b01e3bc9e8ad986378ab3c13dd"
-        ),
-        "0049_lance_row_identity_certificates.py": (
-            "c96c91cee5f570d9d7dda09d633a9432d635470a80a32b4cba3f7fed3b17773e"
-        ),
-        "0048_row_identity_task.py": (
-            "c3c7b6c5c81ca9a88707207bb3cacfbcb9b07bbad99083f8ff534dbad9812ea9"
-        ),
-        "0047_row_identity_certificates.py": (
-            "cb015a34c78ad146f22cfdaaaf4407a401fd44bb6f926cecfca9b676ff13adfc"
+            "a48889b47befd8798b8f86cac96a230e137bc4798f18030b0c69f315b19fe706"
         ),
         "0046_relationship_incident.py": (
             "ed37ceedf4177be14df96f890f6b065f41ce83bca7b876ede3e32c99c0ddce2d"

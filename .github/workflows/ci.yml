@@ -85,7 +85,6 @@ jobs:
             test_execution_manifests.py
             test_external_wait.py
             test_kernel_status.py
-            test_lance_media_cells.py
             test_local_named_outputs.py
             test_local_run_input_admission.py
             test_merge_columns.py
@@ -114,13 +113,10 @@ jobs:
             test_linear_checkpoint_admission.py
             test_linear_checkpoint_tasks.py
             test_local_result_lifecycle.py
-            test_managed_lance_row_identity_certificates.py
             test_managed_local_file_revisions.py
             test_managed_source_e2e.py
             test_managed_source_lifecycle.py
             test_mcp_http.py
-            test_media_adapter_contract.py
-            test_media_cells.py
             test_named_output_process_runners.py
             test_prepared_exact_row_restriction.py
             test_preview_boundary.py
@@ -294,8 +290,6 @@ jobs:
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_managed_local_file_revisions.py -k typed_local
           && uv run pytest -q -o faulthandler_timeout=60 hub/tests/test_row_identity.py
-          && uv run pytest -q -o faulthandler_timeout=60
-          hub/tests/test_row_identity_certificates.py -k postgres_concurrent_first_standalone
       - name: Verify exact ordinary local input admission on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
@@ -305,7 +299,6 @@ jobs:
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_managed_local_lance_writes.py
-          hub/tests/test_managed_lance_row_identity_certificates.py
       - name: Verify durable external wait contracts on PostgreSQL
         run: cd kernel && uv run pytest -q hub/tests/test_durable_external_wait_tasks.py
       - name: Verify hidden linear checkpoint contracts on PostgreSQL

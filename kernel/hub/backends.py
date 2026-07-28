@@ -13,7 +13,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import duckdb
 
@@ -22,9 +22,6 @@ from hub.models import (
     CompilePlan, Facets, FieldLineagePage, Graph, GraphNode, LineageFactsPage, LineagePublication,
     LineageResult, Placement, Relationship, RunEstimate, RunStatus,
 )
-
-if TYPE_CHECKING:
-    from hub.media_cells import ExactMediaCellRead, ExactMediaCellResult
 
 # The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
 Relation = duckdb.DuckDBPyRelation
@@ -412,24 +409,6 @@ class DatasetRevisionSchemaAdapter(Protocol):
     """
 
     def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]: ...
-
-
-@runtime_checkable
-class DatasetRevisionMediaCellAdapter(Protocol):
-    """Optional exact media-cell capability for one immutable adapter revision.
-
-    This is intentionally separate from revision detail and catalog browse capabilities.  Core
-    supplies one core-owned request with an already-certified logical identity, exact revision,
-    schema column, bounded response budget, and schema-derived media kind.  The adapter's bound
-    URI remains its dispatch argument, but no URI, mount configuration, or credential crosses the
-    public request/result boundary.
-    """
-
-    def supports_media_cell(self, uri: str, revision_id: str) -> bool: ...
-
-    def media_cell_identity_descriptor(self, uri: str, revision_id: str) -> Any: ...
-
-    def read_media_cell(self, uri: str, request: "ExactMediaCellRead") -> "ExactMediaCellResult": ...
 
 
 @runtime_checkable

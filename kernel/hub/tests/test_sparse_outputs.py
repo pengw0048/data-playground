@@ -152,13 +152,6 @@ def test_admission_retains_only_existing_exact_base_and_replays_atomically(local
     assert len(refs) == 1
     assert refs[0].uri == metadb.managed_local_file_revision_artifact(
         published["dataset_id"], published["revision_id"])
-    assert metadb.managed_local_row_identity_certificate_descriptor(
-        storage, published["dataset_id"], published["revision_id"]) == {
-            "datasetId": published["dataset_id"], "revisionId": published["revision_id"],
-            "proofStatus": "certified", "certificationSupported": True,
-            "fields": [{"name": "id", "arrowType": "int32"}],
-            "encodingVersion": "row-identity-v1",
-        }
     assert sorted(path.relative_to(storage.root) for path in Path(storage.root).rglob("*")) == before_files
     with metadb.session() as session:
         assert session.scalar(select(func.count()).select_from(metadb.LocalResultArtifact)) == before_artifacts
@@ -187,33 +180,6 @@ def test_different_valid_identity_spec_does_not_block_sparse_admission(local_cat
 
     assert by_id.created is by_name.created is True
     assert by_id.id != by_name.id
-    assert metadb.managed_local_row_identity_certificate_descriptor(
-        storage, published["dataset_id"], published["revision_id"])["fields"] == [
-            {"name": "id", "arrowType": "int32"},
-        ]
-
-
-def test_failed_admission_does_not_publish_row_identity_certificate(local_catalog, tmp_path):
-    storage, catalog = local_catalog
-    published = _publish(storage, catalog, str(tmp_path / "failed-admission.parquet"), pa.table({
-        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
-    }))
-    owner, _canvas = _owner_canvas()
-
-    with pytest.raises(PermissionError):
-        admit_sparse_output(storage, _request(
-            published, owner=owner, canvas=f"missing-{uuid.uuid4().hex}",
-            submission="must-rollback"))
-
-    with metadb.session() as session:
-        assert session.scalar(select(func.count()).select_from(metadb.SparseOutput).where(
-            metadb.SparseOutput.input_revision_id == published["revision_id"])) == 0
-        assert session.get(
-            metadb.ManagedLocalRowIdentityCertificate, published["revision_id"]) is None
-    assert metadb.managed_local_row_identity_certificate_descriptor(
-        storage, published["dataset_id"], published["revision_id"]) is None
-
-
 def test_materialization_writes_one_sidecar_and_reopens_exact_evidence(local_catalog, tmp_path):
     storage, catalog = local_catalog
     published = _publish(storage, catalog, str(tmp_path / "materialize.parquet"), pa.table({

@@ -25,7 +25,6 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
@@ -37,13 +36,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-from hub.models import (
-    ColumnSchema, DatasetRevisionRowIdentity, SchemaCompatibility, SchemaFieldCompatibility,
-)
+from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
 from hub.settings import settings
-
-if TYPE_CHECKING:
-    from hub.row_identity import RowIdentityCoverageV1
 
 DEFAULT_USER_ID = "local"
 LOCAL_WORKSPACE_ROOT_ID = "workspace-local-root"
@@ -659,8 +653,7 @@ class DurableTask(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'restore_revision_write','keyed_upsert_write','distribution_report',"
-            "'row_identity_certification')",
+            "'restore_revision_write','keyed_upsert_write','distribution_report')",
             name="ck_durable_task_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
@@ -671,14 +664,9 @@ class DurableTask(Base):
             "AND dataset_view_id IS NULL AND target_node_id = 'restore-revision') OR "
             "(task_kind = 'keyed_upsert_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'keyed-upsert') OR "
-            "(task_kind = 'row_identity_certification' AND canvas_id IS NULL "
-            "AND dataset_view_id IS NULL AND target_node_id = 'row-identity-certification' "
-            "AND execution_manifest_sha256 IS NULL AND graph_doc IS NULL "
-            "AND write_intent IS NULL) OR "
             "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'managed-sidecar-merge') OR "
-            "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write',"
-            "'row_identity_certification') "
+            "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NOT NULL AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
         UniqueConstraint(
@@ -778,19 +766,16 @@ class DurableTaskInboxItem(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'distribution_report','restore_revision_write','keyed_upsert_write',"
-            "'row_identity_certification')",
+            "'distribution_report','restore_revision_write','keyed_upsert_write')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
             "AND dataset_view_id IS NOT NULL) OR "
-            "(task_kind IN ('restore_revision_write','keyed_upsert_write',"
-            "'row_identity_certification') "
+            "(task_kind IN ('restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NULL AND dataset_view_id IS NULL) OR "
             "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL) OR (task_kind NOT IN "
-            "('distribution_report','restore_revision_write','keyed_upsert_write',"
-            "'row_identity_certification') "
+            "('distribution_report','restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_inbox_subject"),
         CheckConstraint(
@@ -907,49 +892,6 @@ class KeyedUpsertTaskEnvelope(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
         UniqueConstraint("write_idempotency_key", name="uq_keyed_upsert_write_key"),
-    )
-
-
-class RowIdentityCertificationTaskEnvelope(Base):
-    """Frozen exact-revision proof admission plus its bounded terminal receipt."""
-    __tablename__ = "row_identity_certification_task_envelopes"
-    task_id: Mapped[str] = mapped_column(
-        String, ForeignKey("durable_tasks.id"), primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
-    source_kind: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="parquet", server_default="parquet")
-    physical_incarnation_sha256: Mapped[str | None] = mapped_column(
-        String(64), nullable=True)
-    dataset_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    keys_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    supported: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    confirmation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    estimated_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    estimated_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    receipt_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    completed_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True)
-    __table_args__ = (
-        CheckConstraint("length(schema_sha256) = 64", name="ck_row_identity_task_schema_sha"),
-        CheckConstraint("length(spec_sha256) = 64", name="ck_row_identity_task_spec_sha"),
-        CheckConstraint(
-            "length(confirmation_sha256) = 64", name="ck_row_identity_task_confirm_sha"),
-        CheckConstraint(
-            "estimated_rows IS NULL OR estimated_rows >= 0",
-            name="ck_row_identity_task_estimated_rows"),
-        CheckConstraint(
-            "estimated_bytes IS NULL OR estimated_bytes >= 0",
-            name="ck_row_identity_task_estimated_bytes"),
-        CheckConstraint(
-            "(source_kind = 'parquet' AND physical_incarnation_sha256 IS NULL) "
-            "OR (source_kind = 'lance' AND physical_incarnation_sha256 IS NOT NULL "
-            "AND length(physical_incarnation_sha256) = 64)",
-            name="ck_row_identity_task_source_fence"),
     )
 
 
@@ -1621,32 +1563,6 @@ class ManagedLocalFileRevision(Base):
     )
 
 
-class ManagedLocalRowIdentityCertificate(Base):
-    """One immutable reusable logical-row proof for an exact managed-local revision."""
-    __tablename__ = "managed_local_row_identity_certificates"
-    revision_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("managed_local_file_revisions.revision_id", ondelete="CASCADE"),
-        primary_key=True)
-    logical_id: Mapped[str] = mapped_column(
-        String, ForeignKey("catalog_logical_datasets.logical_id", ondelete="CASCADE"), nullable=False)
-    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    row_identity_spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    certificate_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    certificate_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    artifact_dev: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    artifact_ino: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now)
-    __table_args__ = (
-        CheckConstraint("length(schema_sha256) = 64", name="ck_row_identity_cert_schema_sha"),
-        CheckConstraint("length(row_identity_spec_sha256) = 64", name="ck_row_identity_cert_spec_sha"),
-        CheckConstraint("length(certificate_sha256) = 64", name="ck_row_identity_cert_doc_sha"),
-        CheckConstraint("artifact_dev >= 0", name="ck_row_identity_cert_artifact_dev"),
-        CheckConstraint("artifact_ino >= 0", name="ck_row_identity_cert_artifact_ino"),
-        Index("ix_row_identity_certificates_logical_revision", "logical_id", "revision_id"),
-    )
-
-
 class ManagedLocalLanceWriteReceipt(Base):
     """One durable typed receipt for an exact provider-owned local Lance version."""
     __tablename__ = "managed_local_lance_write_receipts"
@@ -1665,65 +1581,6 @@ class ManagedLocalLanceWriteReceipt(Base):
         UniqueConstraint(
             "dataset_id", "revision_id", name="uq_managed_local_lance_write_revision"),
     )
-
-
-class ManagedLocalLanceRowIdentityFence(Base):
-    """One exact registered-Lance incarnation admitted for an internal row-identity proof.
-
-    ``registration_id`` is deliberately the catalog registration incarnation, not a path-derived
-    logical identity.  Deleting and re-registering the same URI therefore cannot reuse this fence.
-    """
-    __tablename__ = "managed_local_lance_row_identity_fences"
-    registration_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("catalog_entries.registration_id", ondelete="CASCADE"),
-        primary_key=True)
-    revision_id: Mapped[str] = mapped_column(String(256), primary_key=True)
-    physical_incarnation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    row_identity_spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now)
-    __table_args__ = (
-        CheckConstraint(
-            "length(physical_incarnation_sha256) = 64",
-            name="ck_lance_row_identity_fence_incarnation_sha"),
-        CheckConstraint("length(schema_sha256) = 64", name="ck_lance_row_identity_fence_schema_sha"),
-        CheckConstraint(
-            "length(row_identity_spec_sha256) = 64",
-            name="ck_lance_row_identity_fence_spec_sha"),
-    )
-
-
-class ManagedLocalLanceRowIdentityCertificate(Base):
-    """One complete reusable proof for a Lance registration incarnation and native revision."""
-    __tablename__ = "managed_local_lance_row_identity_certificates"
-    registration_id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    revision_id: Mapped[str] = mapped_column(String(256), primary_key=True)
-    certificate_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    certificate_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now)
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["registration_id", "revision_id"],
-            [
-                "managed_local_lance_row_identity_fences.registration_id",
-                "managed_local_lance_row_identity_fences.revision_id",
-            ],
-            ondelete="CASCADE",
-        ),
-        CheckConstraint(
-            "length(certificate_sha256) = 64",
-            name="ck_lance_row_identity_cert_doc_sha"),
-    )
-
-
-def _drop_managed_local_lance_row_identity_evidence(s, entry: CatalogEntry) -> None:
-    """Mirror the registration FK cascade on SQLite, where foreign keys are not globally enabled."""
-    s.execute(delete(ManagedLocalLanceRowIdentityCertificate).where(
-        ManagedLocalLanceRowIdentityCertificate.registration_id == entry.registration_id))
-    s.execute(delete(ManagedLocalLanceRowIdentityFence).where(
-        ManagedLocalLanceRowIdentityFence.registration_id == entry.registration_id))
 
 
 class MergeColumnsPublication(Base):
@@ -4830,16 +4687,12 @@ def sparse_output_admit(*, owner_id: str, canvas_id: str, submission_id: str,
         _validate_sparse_output_documents(row)
         if not inserted:
             _validate_sparse_output_reference(s, row)
-            _retain_sparse_row_identity_certificate(
-                s, row, documents["evidence"], artifact_dev, artifact_ino)
             return _sparse_output_doc(row), False
 
         # The local registry is the lifecycle mutex. Keep the caller's read guard alive through this
         # transaction; sync rechecks the exact ready ledger binding before adding its sole durable hold.
         sync_local_result_owner(s, "sparse_output", sparse_id, documents["input"])
         _validate_sparse_output_reference(s, row)
-        _retain_sparse_row_identity_certificate(
-            s, row, documents["evidence"], artifact_dev, artifact_ino)
         return _sparse_output_doc(row), True
 
 
@@ -6827,12 +6680,7 @@ _CHECKPOINT_PARENT_KINDS = frozenset({
 })
 # #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. Distribution
 # reports have their own read-only projection.
-_JOBS_HIDDEN_TASK_KINDS = frozenset({
-    "distribution_report",
-    # #983 retires this public task. Keep persisted legacy rows out of the public projection
-    # until #984 removes its storage contract.
-    "row_identity_certification",
-})
+_JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write", "distribution_report",
@@ -6850,10 +6698,7 @@ _INBOX_COMPLETED_WRITE_SUMMARY_KINDS = frozenset({
 })
 # Task kinds that carry their terminal failure code into the Inbox diagnostic allowlist.
 _DIAGNOSTIC_BEARING_TASK_KINDS = _DATASET_SCOPED_TASK_KINDS
-_INBOX_HIDDEN_TASK_KINDS = frozenset({
-    "distribution_report",
-    "row_identity_certification",
-})
+_INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -16037,7 +15882,6 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
                         _delete_catalog_children(s, [current_uri]))
                     entry = s.get(CatalogEntry, current_uri, with_for_update=True)
                     if entry is not None:
-                        _drop_managed_local_lance_row_identity_evidence(s, entry)
                         s.delete(entry)
                 execution_manifest_candidates.update(
                     _delete_catalog_governance(s, logical.catalog_key))
@@ -16052,7 +15896,6 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             for entry in remaining_entries:
                 execution_manifest_candidates.update(
                     _delete_catalog_children(s, [entry.uri]))
-                _drop_managed_local_lance_row_identity_evidence(s, entry)
                 s.delete(entry)
 
             for lease in list(s.scalars(select(ObjectAttemptLease).where(
@@ -20771,469 +20614,6 @@ def managed_local_file_revision_artifact(dataset_id: str, revision_id: str) -> s
         return row.artifact_uri
 
 
-class RowIdentityCertificateConflict(RuntimeError):
-    """An exact revision already has a different immutable logical-row proof."""
-
-
-class RowIdentityCertificateUnrepresentable(ValueError):
-    """A valid internal proof cannot fit the bounded public descriptor."""
-
-
-def _canonical_document(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-class ManagedLocalLanceRowIdentityCertificateConflict(RuntimeError):
-    """A registration incarnation/native revision already owns different identity evidence."""
-
-
-def _managed_local_lance_row_identity_checked_uri(entry: CatalogEntry | None) -> str | None:
-    """Return the checked local Lance path accepted by this private foundation."""
-    if entry is None or entry.logical_id is not None:
-        return None
-    from hub.paths import checked_local_path
-
-    try:
-        checked = checked_local_path(entry.uri)
-    except (OSError, ValueError):
-        return None
-    if checked is None or not checked.lower().rstrip("/").endswith(".lance"):
-        return None
-    return checked
-
-
-def managed_local_lance_row_identity_binding(dataset_id: str) -> dict | None:
-    """Resolve only the current registered local Lance access point for an exact identity proof.
-
-    The opaque DatasetRef ``dataset_id`` is the CatalogEntry registration incarnation.  There is no
-    path/name fallback: an unregister/re-register cannot silently retarget a retained certificate.
-    """
-    with session() as s:
-        entry = s.scalars(select(CatalogEntry).where(
-            CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
-        checked_uri = _managed_local_lance_row_identity_checked_uri(entry)
-        if entry is None or checked_uri is None:
-            return None
-        return {
-            "dataset_id": entry.registration_id,
-            "dataset_name": entry.name,
-            "uri": checked_uri,
-        }
-
-
-def managed_local_lance_row_identity_binding_for_uri(uri: str) -> dict | None:
-    """Resolve the direct current registration only when its checked canonical URI matches."""
-    from hub.paths import checked_local_path
-
-    registered_uri = str(uri).rstrip("/")
-    try:
-        checked = checked_local_path(registered_uri)
-    except (OSError, ValueError):
-        return None
-    if checked is None or not checked.lower().rstrip("/").endswith(".lance"):
-        return None
-    with session() as s:
-        entry = s.get(CatalogEntry, registered_uri)
-        if (entry is None
-                or _managed_local_lance_row_identity_checked_uri(entry) != checked):
-            return None
-        return {
-            "dataset_id": entry.registration_id,
-            "dataset_name": entry.name,
-            "uri": checked,
-        }
-
-
-def _lance_row_identity_digests_are_valid(*values: object) -> bool:
-    return all(
-        isinstance(value, str) and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-        for value in values
-    )
-
-
-def _managed_local_lance_row_identity_certificate_store(
-        s, dataset_id: str, revision_id: str, certificate: object, *,
-        physical_incarnation_sha256: str, schema_sha256: str,
-        row_identity_spec_sha256: str,
-) -> tuple[dict, bool]:
-    """Persist one complete exact Lance proof under its registration-incarnation fence."""
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
-
-    if (not _lance_row_identity_digests_are_valid(
-            physical_incarnation_sha256, schema_sha256, row_identity_spec_sha256)
-            or not str(dataset_id) or not str(revision_id)):
-        raise ValueError("managed Lance row identity fence is invalid")
-    entry = s.scalars(select(CatalogEntry).where(
-        CatalogEntry.registration_id == str(dataset_id)).with_for_update()).first()
-    if _managed_local_lance_row_identity_checked_uri(entry) is None:
-        raise ValueError("managed Lance row identity registration is unavailable")
-    decoded, spec_digest, canonical, descriptor = _row_identity_certificate_payload(
-        str(dataset_id), str(revision_id), certificate)
-    if decoded.spec.schema_digest != schema_sha256 or spec_digest != row_identity_spec_sha256:
-        raise ValueError("managed Lance row identity evidence does not match its fence")
-    certificate_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
-    fence_values = {
-        "registration_id": str(dataset_id),
-        "revision_id": str(revision_id),
-        "physical_incarnation_sha256": physical_incarnation_sha256,
-        "schema_sha256": schema_sha256,
-        "row_identity_spec_sha256": row_identity_spec_sha256,
-        "created_at": _now(),
-    }
-    certificate_values = {
-        "registration_id": str(dataset_id),
-        "revision_id": str(revision_id),
-        "certificate_doc": canonical,
-        "certificate_sha256": certificate_sha256,
-        "created_at": _now(),
-    }
-    dialect = s.get_bind().dialect.name
-    if dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as dialect_insert
-    elif dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as dialect_insert
-    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
-        raise RuntimeError("unsupported metadata database dialect")
-    created_fence = s.scalar(dialect_insert(ManagedLocalLanceRowIdentityFence).values(
-        **fence_values,
-    ).on_conflict_do_nothing(
-        index_elements=[
-            ManagedLocalLanceRowIdentityFence.registration_id,
-            ManagedLocalLanceRowIdentityFence.revision_id,
-        ],
-    ).returning(ManagedLocalLanceRowIdentityFence.registration_id)) is not None
-    fence = s.get(ManagedLocalLanceRowIdentityFence, {
-        "registration_id": str(dataset_id), "revision_id": str(revision_id),
-    }, with_for_update=True)
-    if fence is None:  # pragma: no cover - defensive database contract check
-        raise RuntimeError("managed Lance row identity fence reservation failed")
-    if (fence.physical_incarnation_sha256 != physical_incarnation_sha256
-            or fence.schema_sha256 != schema_sha256
-            or fence.row_identity_spec_sha256 != row_identity_spec_sha256):
-        raise ManagedLocalLanceRowIdentityCertificateConflict(
-            "exact Lance revision already has a different row identity fence")
-    created_certificate = s.scalar(
-        dialect_insert(ManagedLocalLanceRowIdentityCertificate).values(
-            **certificate_values,
-        ).on_conflict_do_nothing(
-            index_elements=[
-                ManagedLocalLanceRowIdentityCertificate.registration_id,
-                ManagedLocalLanceRowIdentityCertificate.revision_id,
-            ],
-        ).returning(ManagedLocalLanceRowIdentityCertificate.registration_id)) is not None
-    row = s.get(ManagedLocalLanceRowIdentityCertificate, {
-        "registration_id": str(dataset_id), "revision_id": str(revision_id),
-    }, with_for_update=True)
-    if row is None:  # pragma: no cover - defensive database contract check
-        raise RuntimeError("managed Lance row identity certificate reservation failed")
-    if (row.certificate_doc != canonical or row.certificate_sha256 != certificate_sha256):
-        raise ManagedLocalLanceRowIdentityCertificateConflict(
-            "exact Lance revision already has a different row identity certificate")
-    # Validate the immutable document after the collision comparisons. This keeps a corrupt retained
-    # row fail-closed even when its canonical digest was syntactically well formed.
-    try:
-        decoded = decode_row_identity_coverage(
-            json.loads(row.certificate_doc),
-            ExactDatasetRef(kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id)),
-            row_identity_spec_sha256)
-    except (KeyError, TypeError, ValueError, RowIdentityValidationError) as exc:
-        raise RuntimeError("managed Lance row identity certificate is invalid") from exc
-    if decoded.status != "complete":  # pragma: no cover - guarded by payload validation
-        raise RuntimeError("managed Lance row identity certificate is incomplete")
-    return descriptor, created_fence or created_certificate
-
-
-def managed_local_lance_row_identity_certificate_store(
-        dataset_id: str, revision_id: str, certificate: object, *,
-        physical_incarnation_sha256: str, schema_sha256: str,
-        row_identity_spec_sha256: str,
-) -> dict:
-    """Atomically retain one complete internal exact-Lance certificate or reject a collision."""
-    with session() as s:
-        descriptor, _created = _managed_local_lance_row_identity_certificate_store(
-            s, dataset_id, revision_id, certificate,
-            physical_incarnation_sha256=physical_incarnation_sha256,
-            schema_sha256=schema_sha256,
-            row_identity_spec_sha256=row_identity_spec_sha256)
-        return descriptor
-
-
-def managed_local_lance_row_identity_certificate_for_fence(
-        dataset_id: str, revision_id: str, *, physical_incarnation_sha256: str,
-        schema_sha256: str, row_identity_spec_sha256: str,
-):
-    """Return a revalidated private certificate only for the supplied exact Lance fence."""
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
-
-    if not _lance_row_identity_digests_are_valid(
-            physical_incarnation_sha256, schema_sha256, row_identity_spec_sha256):
-        return None
-    try:
-        with session() as s:
-            entry = s.scalars(select(CatalogEntry).where(
-                CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
-            fence = s.get(ManagedLocalLanceRowIdentityFence, {
-                "registration_id": str(dataset_id), "revision_id": str(revision_id),
-            })
-            row = s.get(ManagedLocalLanceRowIdentityCertificate, {
-                "registration_id": str(dataset_id), "revision_id": str(revision_id),
-            })
-            if (_managed_local_lance_row_identity_checked_uri(entry) is None
-                    or fence is None or row is None
-                    or fence.physical_incarnation_sha256 != physical_incarnation_sha256
-                    or fence.schema_sha256 != schema_sha256
-                    or fence.row_identity_spec_sha256 != row_identity_spec_sha256
-                    or row.certificate_sha256 != hashlib.sha256(
-                        row.certificate_doc.encode()).hexdigest()
-                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
-                return None
-            exact = ExactDatasetRef(
-                kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
-            certificate = decode_row_identity_coverage(
-                json.loads(row.certificate_doc), exact, row_identity_spec_sha256)
-            if (certificate.status != "complete"
-                    or certificate.spec.schema_digest != schema_sha256):
-                return None
-            return certificate
-    except (KeyError, RuntimeError, TypeError, ValueError, RowIdentityValidationError):
-        return None
-
-
-def managed_local_lance_row_identity_certificate_for_incarnation(
-        dataset_id: str, revision_id: str, *, physical_incarnation_sha256: str,
-        schema_sha256: str):
-    """Load one retained proof by its live exact incarnation when the caller does not know its spec."""
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
-
-    if not _lance_row_identity_digests_are_valid(
-            physical_incarnation_sha256, schema_sha256):
-        return None
-    try:
-        with session() as s:
-            entry = s.scalars(select(CatalogEntry).where(
-                CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
-            fence = s.get(ManagedLocalLanceRowIdentityFence, {
-                "registration_id": str(dataset_id), "revision_id": str(revision_id),
-            })
-            row = s.get(ManagedLocalLanceRowIdentityCertificate, {
-                "registration_id": str(dataset_id), "revision_id": str(revision_id),
-            })
-            if (_managed_local_lance_row_identity_checked_uri(entry) is None
-                    or fence is None or row is None
-                    or fence.physical_incarnation_sha256 != physical_incarnation_sha256
-                    or fence.schema_sha256 != schema_sha256
-                    or row.certificate_sha256 != hashlib.sha256(
-                        row.certificate_doc.encode()).hexdigest()
-                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
-                return None
-            exact = ExactDatasetRef(
-                kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
-            certificate = decode_row_identity_coverage(
-                json.loads(row.certificate_doc), exact, fence.row_identity_spec_sha256)
-            if (certificate.status != "complete"
-                    or certificate.spec.schema_digest != schema_sha256):
-                return None
-            return certificate
-    except (KeyError, RuntimeError, TypeError, ValueError, RowIdentityValidationError):
-        return None
-
-
-def _row_identity_certificate_payload(
-        dataset_id: str, revision_id: str, certificate: object,
-) -> tuple[object, str, str, dict]:
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import (
-        RowIdentityValidationError, decode_row_identity_coverage,
-        serialize_row_identity_coverage,
-    )
-
-    expected = ExactDatasetRef(kind="exact", dataset_id=dataset_id, revision_id=revision_id)
-    try:
-        spec_digest = certificate["spec"]["digest"]  # type: ignore[index]
-        decoded = decode_row_identity_coverage(certificate, expected, spec_digest)
-        if decoded.status != "complete":
-            raise ValueError
-        canonical = _canonical_document(
-            serialize_row_identity_coverage(decoded, expected, spec_digest))
-    except (KeyError, TypeError, ValueError, RowIdentityValidationError) as exc:
-        raise ValueError("row identity certificate is invalid") from exc
-
-    descriptor = {
-        "datasetId": dataset_id,
-        "revisionId": revision_id,
-        "proofStatus": "certified",
-        "certificationSupported": True,
-        "fields": [{"name": field.name, "arrowType": field.arrow_type}
-                   for field in decoded.spec.fields],
-        "encodingVersion": decoded.spec.encoding_version,
-    }
-    try:
-        DatasetRevisionRowIdentity.model_validate(descriptor)
-    except ValueError as exc:
-        raise RowIdentityCertificateUnrepresentable(
-            "row identity certificate has no bounded public descriptor") from exc
-    return decoded, spec_digest, canonical, descriptor
-
-
-def _managed_local_row_identity_certificate_store(
-        s, dataset_id: str, revision_id: str, certificate: object,
-        artifact_dev: int | None, artifact_ino: int | None,
-) -> tuple[dict, bool]:
-    if (type(artifact_dev) is not int or artifact_dev < 0
-            or type(artifact_ino) is not int or artifact_ino < 0):
-        raise ValueError("row identity artifact evidence is invalid")
-    decoded, spec_digest, canonical, descriptor = _row_identity_certificate_payload(
-        dataset_id, revision_id, certificate)
-    certificate_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
-    revision = s.get(ManagedLocalFileRevision, revision_id, with_for_update=True)
-    artifact = (s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
-                if revision is not None and revision.logical_id == dataset_id else None)
-    if revision is None or artifact is None or artifact.state != "ready":
-        raise ValueError("row identity exact revision is unavailable")
-    values = {
-        "revision_id": revision_id,
-        "logical_id": dataset_id,
-        "schema_sha256": decoded.spec.schema_digest,
-        "row_identity_spec_sha256": spec_digest,
-        "certificate_doc": canonical,
-        "certificate_sha256": certificate_sha256,
-        "artifact_dev": artifact_dev,
-        "artifact_ino": artifact_ino,
-        "created_at": _now(),
-    }
-    # The insert is the missing-row mutex on SQLite, where the FOR UPDATE reads above are ignored.
-    dialect = s.get_bind().dialect.name
-    if dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as dialect_insert
-    elif dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as dialect_insert
-    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
-        raise RuntimeError("unsupported metadata database dialect")
-    created = s.scalar(dialect_insert(ManagedLocalRowIdentityCertificate).values(
-        **values,
-    ).on_conflict_do_nothing(
-        index_elements=[ManagedLocalRowIdentityCertificate.revision_id],
-    ).returning(ManagedLocalRowIdentityCertificate.revision_id)) is not None
-    existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
-    if existing is None:  # pragma: no cover - defensive database contract check
-        raise RuntimeError("row identity certificate reservation failed")
-    if (existing.logical_id != dataset_id or existing.schema_sha256 != decoded.spec.schema_digest
-            or existing.row_identity_spec_sha256 != spec_digest
-            or existing.certificate_doc != canonical
-            or existing.certificate_sha256 != certificate_sha256
-            or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
-        raise RowIdentityCertificateConflict(
-            "exact revision already has a different row identity certificate")
-    return descriptor, created
-
-
-def managed_local_row_identity_certificate_store(
-        dataset_id: str, revision_id: str, certificate: object, *,
-        artifact_dev: int, artifact_ino: int,
-) -> dict:
-    """Durably retain one complete exact-revision certificate, or reject a conflicting proof."""
-    with session() as s:
-        descriptor, _created = _managed_local_row_identity_certificate_store(
-            s, dataset_id, revision_id, certificate, artifact_dev, artifact_ino)
-        return descriptor
-
-
-def _retain_sparse_row_identity_certificate(
-        s, row: SparseOutput, evidence_doc: str,
-        artifact_dev: int | None, artifact_ino: int | None,
-) -> None:
-    """Retain one reusable descriptor without changing valid SparseOutput admission semantics."""
-    evidence = json.loads(evidence_doc)
-    if evidence.get("status") != "complete":
-        return
-    try:
-        _managed_local_row_identity_certificate_store(
-            s, row.input_dataset_id, row.input_revision_id, evidence,
-            artifact_dev, artifact_ino)
-    except (RowIdentityCertificateConflict, RowIdentityCertificateUnrepresentable):
-        # One exact revision advertises one unambiguous public identity. A later valid SparseOutput
-        # may use another key without replacing that descriptor or changing its admission semantics.
-        return
-
-
-def managed_local_row_identity_certificate_descriptor(
-        storage, dataset_id: str, revision_id: str,
-) -> dict | None:
-    """Return checked retained evidence while a bounded exact-artifact identity guard is held."""
-    from hub.row_identity import RowIdentityValidationError
-    from hub.storage import ManagedSourceUnavailable, source_read_scope
-
-    try:
-        artifact_uri = managed_local_file_revision_artifact(dataset_id, revision_id)
-        if artifact_uri is None:
-            return None
-        with source_read_scope(
-                storage, [artifact_uri], owner=f"row-identity-descriptor:{uuid.uuid4().hex}") as guards:
-            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
-                return None
-            info = os.fstat(guards[0].artifact_fileno())
-            certificate = managed_local_row_identity_certificate_for_artifact(
-                dataset_id, revision_id, artifact_uri,
-                artifact_dev=int(info.st_dev), artifact_ino=int(info.st_ino),
-            )
-            if certificate is not None:
-                descriptor = {
-                    "datasetId": dataset_id,
-                    "revisionId": revision_id,
-                    "proofStatus": "certified",
-                    "certificationSupported": True,
-                    "fields": [{"name": field.name, "arrowType": field.arrow_type}
-                               for field in certificate.spec.fields],
-                    "encodingVersion": certificate.spec.encoding_version,
-                }
-                DatasetRevisionRowIdentity.model_validate(descriptor)
-                return descriptor
-    except (ManagedSourceUnavailable, OSError, RuntimeError, TypeError, ValueError,
-            RowIdentityValidationError):
-        return None
-
-
-def managed_local_row_identity_certificate_for_artifact(
-        dataset_id: str, revision_id: str, artifact_uri: str, *,
-        artifact_dev: int, artifact_ino: int,
-) -> RowIdentityCoverageV1 | None:
-    """Revalidate and return retained proof bound to one already-held exact artifact inode."""
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
-
-    try:
-        if (type(artifact_dev) is not int or artifact_dev < 0
-                or type(artifact_ino) is not int or artifact_ino < 0):
-            return None
-        with session() as s:
-            row = s.get(ManagedLocalRowIdentityCertificate, str(revision_id))
-            revision = s.get(ManagedLocalFileRevision, str(revision_id))
-            artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
-                        if revision is not None else None)
-            if (row is None or revision is None or row.logical_id != str(dataset_id)
-                    or revision.logical_id != str(dataset_id)
-                    or revision.artifact_uri != str(artifact_uri)
-                    or artifact is None or artifact.state != "ready"
-                    or (row.artifact_dev, row.artifact_ino) != (artifact_dev, artifact_ino)
-                    or row.certificate_sha256
-                    != hashlib.sha256(row.certificate_doc.encode()).hexdigest()
-                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
-                return None
-            expected = ExactDatasetRef(
-                kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
-            certificate = decode_row_identity_coverage(
-                json.loads(row.certificate_doc), expected, row.row_identity_spec_sha256)
-            if certificate.status != "complete" or certificate.spec.schema_digest != row.schema_sha256:
-                return None
-            return certificate
-    except (KeyError, RuntimeError, TypeError, ValueError, RowIdentityValidationError):
-        return None
-
-
 def managed_local_file_revision_gc_batch(
         retention_seconds: float, *, limit: int = 50) -> dict[str, int | bool]:
     """Retire one DB-clock-bounded batch of expired, unreferenced core revisions.
@@ -21594,7 +20974,6 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
             logical.metadata_version += 1
             logical.governance_doc = "{}"
         if entry is not None:
-            _drop_managed_local_lance_row_identity_evidence(s, entry)
             s.delete(entry)
         # Object governance/ref mutations above always precede the local registry lock.
         _drop_local_result_owner(s, "catalog_entry", current_uri)
@@ -21665,7 +21044,6 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
                 logical.state = "unregistered"
                 logical.metadata_version += 1
                 logical.governance_doc = "{}"
-            _drop_managed_local_lance_row_identity_evidence(s, entries[uri])
             s.delete(entries[uri])
         _lock_local_result_registry(s)
         for uri in current_uris:

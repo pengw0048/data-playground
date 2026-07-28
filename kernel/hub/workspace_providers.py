@@ -297,7 +297,6 @@ class _BoundProviderDatasetAdapter:
         "scan", "preview_scan", "schema", "count", "metadata_count", "fingerprint",
         "resolve_revision", "open_revision", "preview_revision", "revision_history",
         "revision_detail", "revision_schema", "open_revision_native_rows",
-        "supports_media_cell", "media_cell_identity_descriptor", "read_media_cell",
     }
 
     def __init__(self, source_uri: str, physical_uri: str, adapter: object):

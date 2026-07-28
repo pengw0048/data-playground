@@ -122,7 +122,6 @@ def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
             "mediaKind": None,
             "rowReference": None,
         }],
-        "rowIdentities": None,
         "rows": [[1]],
     }
     meaningful = {
@@ -133,7 +132,6 @@ def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
             "mediaKind": "image",
             "rowReference": {"target": {"kind": "canonical", "datasetId": "owners"}},
         }],
-        "rowIdentities": [{"rowId": "row-1"}],
         "rows": [[1]],
     }
 

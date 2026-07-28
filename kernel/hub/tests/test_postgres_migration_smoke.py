@@ -48,6 +48,57 @@ def _reset_postgres(url: str):
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
+def test_postgres_head_omits_retired_row_identity_storage_and_task_kind() -> None:
+    url = os.environ["DP_TEST_DATABASE_URL"]
+    assert url.startswith("postgresql"), "DP_TEST_DATABASE_URL must name a dedicated Postgres database"
+    admin_engine = _reset_postgres(url)
+    owner = f"retired-row-identity-owner-{uuid.uuid4().hex}"
+    canvas = f"retired-row-identity-canvas-{uuid.uuid4().hex}"
+    task_id = f"retired-row-identity-task-{uuid.uuid4().hex}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        with admin_engine.begin() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            tables = set(connection.dialect.get_table_names(connection))
+            assert {
+                "managed_local_row_identity_certificates",
+                "row_identity_certification_task_envelopes",
+                "managed_local_lance_row_identity_fences",
+                "managed_local_lance_row_identity_certificates",
+            }.isdisjoint(tables)
+            connection.execute(text("""
+                INSERT INTO users (id, name, is_admin, token_epoch, created_at)
+                VALUES (:owner, 'Retired row identity owner', false, 0, :now)
+            """), {"owner": owner, "now": now})
+            connection.execute(text("""
+                INSERT INTO canvases (id, owner_id, name, version, doc, visibility, created_at, updated_at)
+                VALUES (:canvas, :owner, 'Retired row identity canvas', 1, '{}', 'private', :now, :now)
+            """), {"canvas": canvas, "owner": owner, "now": now})
+
+        with pytest.raises(IntegrityError) as rejected:
+            with admin_engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO durable_tasks
+                        (id, owner_id, canvas_id, submission_id, intent_sha256, target_node_id, task_kind,
+                         backend_kind, status, status_doc, cancel_requested, retry_count, max_attempts,
+                         created_at, updated_at)
+                    VALUES
+                        (:task_id, :owner, :canvas, :submission, :intent_sha, 'retired-node',
+                         'row_identity_certification', 'local', 'queued', '{}', false, 0, 3, :now, :now)
+                """), {
+                    "task_id": task_id, "owner": owner, "canvas": canvas,
+                    "submission": f"retired-{uuid.uuid4().hex}", "intent_sha": "a" * 64, "now": now,
+                })
+        assert rejected.value.orig.diag.constraint_name == "ck_durable_task_kind"
+        with admin_engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT count(*) FROM durable_tasks WHERE id = :task_id"),
+                {"task_id": task_id}).scalar_one() == 0
+    finally:
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
 def test_postgres_0040_accepts_managed_sidecar_subject_and_rejects_unknown_producer() -> None:
     url = os.environ["DP_TEST_DATABASE_URL"]
     assert url.startswith("postgresql"), "DP_TEST_DATABASE_URL must name a dedicated Postgres database"

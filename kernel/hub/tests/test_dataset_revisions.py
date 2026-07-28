@@ -489,10 +489,6 @@ def test_revision_detail_body_route_preserves_slash_bearing_opaque_identity(monk
         "dataset_id": value, "uri": "workspace-provider://canonical-source",
     })
     monkeypatch.setattr(catalog_router, "_revision_adapter", lambda _uri: adapter)
-    monkeypatch.setattr(catalog_router.metadb, "managed_local_lance_row_identity_binding",
-                        lambda _dataset_id: None)
-    monkeypatch.setattr(catalog_router.metadb, "catalog_managed_local_revision_certification_facts",
-                        lambda _exact: None)
 
     response = client.post("/api/catalog/revision-details", json={
         "datasetId": dataset_id, "revisionId": revision_id,

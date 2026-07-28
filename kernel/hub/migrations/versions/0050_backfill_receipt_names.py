@@ -1,7 +1,7 @@
 """Backfill exact names in retained pre-#860 write receipts.
 
 Revision ID: 0050_receipt_names
-Revises: 0049_lance_row_identity_cert
+Revises: 0046_relationship_incident
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from alembic import op
 
 
 revision = "0050_receipt_names"
-down_revision = "0049_lance_row_identity_cert"
+down_revision = "0046_relationship_incident"
 branch_labels = None
 depends_on = None
 
