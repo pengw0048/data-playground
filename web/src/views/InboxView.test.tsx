@@ -42,17 +42,15 @@ describe('InboxView', () => {
 
   it('describes Inbox scope without internal task terminology', () => {
     render(<InboxView />)
-    expect(screen.getByText('Completed background tasks assigned to you')).toBeInTheDocument()
+    expect(screen.queryByText('Completed background tasks assigned to you')).toBeNull()
     expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
     expect(screen.queryByText(/durable/i)).toBeNull()
   })
 
-  it('keeps the empty-state promise limited to durable tasks', async () => {
+  it('keeps the empty-state promise limited to background tasks', async () => {
     mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
     render(<InboxView />)
-    expect(await screen.findByText(
-      'No completed background work yet. Completed background tasks will appear here.',
-    )).toBeInTheDocument()
+    expect(await screen.findByText('No completed background tasks yet.')).toBeInTheDocument()
     expect(screen.queryByText(/finished runs/i)).toBeNull()
   })
 
