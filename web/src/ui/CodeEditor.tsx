@@ -15,6 +15,8 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
   errorLine?: number
 }) {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
+  const cursorListenerRef = useRef<{ dispose: () => void } | null>(null)
+  useEffect(() => () => cursorListenerRef.current?.dispose(), [])
   useEffect(() => {
     if (!errorLine || !editorRef.current) return
     editorRef.current.setPosition({ lineNumber: errorLine, column: 1 })
@@ -23,6 +25,16 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
   }, [errorLine])
   const onMount: OnMount = (editor) => {
     editorRef.current = editor
+    cursorListenerRef.current?.dispose()
+    const editorNode = editor.getDomNode()
+    const reflectCursorLine = (lineNumber: number) => {
+      editorNode?.setAttribute('data-cursor-line-number', String(lineNumber))
+    }
+    const position = editor.getPosition()
+    if (position) reflectCursorLine(position.lineNumber)
+    cursorListenerRef.current = editor.onDidChangeCursorPosition((event) => {
+      reflectCursorLine(event.position.lineNumber)
+    })
     if (errorLine) {
       editor.setPosition({ lineNumber: errorLine, column: 1 })
       editor.revealLineInCenter(errorLine)

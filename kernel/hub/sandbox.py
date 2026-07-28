@@ -199,9 +199,12 @@ def compile_operator(code: str, mode: str) -> Callable:
     ns = _namespace()
     try:
         compiled = compile(code, "<adhoc-cell>", "exec")
-        exec(compiled, ns)  # noqa: S102 — intentional, sandboxed namespace
     except SyntaxError as e:
         raise SandboxSyntaxError(e) from e
+    try:
+        # This phase can execute imports and top-level dependency code. A SyntaxError raised there is
+        # a runtime/dependency failure, not evidence that the authored cell failed Python parsing.
+        exec(compiled, ns)  # noqa: S102 — intentional, sandboxed namespace
     except Exception as e:  # noqa: BLE001
         raise SandboxError(f"cell failed to compile: {type(e).__name__}: {e}") from e
 

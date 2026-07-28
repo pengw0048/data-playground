@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -18,6 +19,7 @@ from hub.editor_examples import (
 from hub.main import app
 from hub.models import SampleResult
 from hub.routers import runs as runs_router
+from hub import sandbox
 
 client = TestClient(app)
 
@@ -127,6 +129,52 @@ def test_example_rows_preserve_syntax_location_without_sandbox_wrapper():
     assert body["reason"] == "Line 1: expected ':'"
     assert "adhoc-cell" not in body["reason"]
     assert "SandboxError" not in body["reason"]
+
+
+def test_dependency_syntax_error_during_cell_exec_remains_a_runtime_failure(monkeypatch):
+    def parse_dependency_code():
+        raise SyntaxError("dependency generated code failed")
+
+    monkeypatch.setitem(
+        sandbox._ALLOWED_MODULES,
+        "fixture_dependency",
+        SimpleNamespace(parse=parse_dependency_code),
+    )
+    response = _preview(_graph(code=(
+        "fixture_dependency.parse()\n"
+        "def fn(row):\n"
+        "    return row"
+    )), '[{"value":1}]')
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["failureCategory"] == "runtime_error"
+    assert body["syntaxError"] is None
+    assert body["userCodeException"] is None
+    assert "dependency generated code failed" in body["reason"]
+
+
+def test_dependency_syntax_error_while_processing_a_row_remains_user_code_failure(monkeypatch):
+    def parse_dependency_code():
+        raise SyntaxError("dependency generated code failed")
+
+    monkeypatch.setitem(
+        sandbox._ALLOWED_MODULES,
+        "fixture_dependency",
+        SimpleNamespace(parse=parse_dependency_code),
+    )
+    response = _preview(_graph(code=(
+        "def fn(row):\n"
+        "    fixture_dependency.parse()\n"
+        "    return row"
+    )), '[{"value":1}]')
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["failureCategory"] == "user_code_exception"
+    assert body["syntaxError"] is None
+    assert body["userCodeException"]["exceptionType"] == "SyntaxError"
+    assert body["userCodeException"]["message"] == "dependency generated code failed"
 
 
 @pytest.mark.parametrize("flag", ["bypassed", "disabled"])
