@@ -142,8 +142,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   const [editingDraftSourceUri, setEditingDraftSourceUri] = useState(false)
+  const [advancedExecutionOpen, setAdvancedExecutionOpen] = useState(false)
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
   useEffect(() => setEditingDraftSourceUri(false), [nodeId])
+  useEffect(() => setAdvancedExecutionOpen(false), [nodeId])
   if (!node) return null
 
   const kind = node.type
@@ -158,9 +160,11 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const showDraftSourceEntry = unboundSource || (kind === 'source' && editingDraftSourceUri)
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
-  const schemaCapableKind = canDeclareSchemaKind(kind)
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
-  const perPortSchemaDeferred = schemaCapableKind && outputPorts.length > 1
+  const resourceRequirements = resourceRequirementSummary(cfg)
+  const checkpointed = cfg.checkpoint === true
+  const hasResourceControls = kind === 'transform' || kind === 'section'
+  const hasCheckpointControls = kind !== 'source' && kind !== 'note' && kind !== 'write'
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
@@ -270,11 +274,17 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
       {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}
 
-      {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
-      {(kind === 'transform' || kind === 'section') && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} /></EditOnly>}
-
-      {/* checkpoint: materialize this node's output → inspectable + reused across runs (splits a region) */}
-      {kind !== 'source' && kind !== 'note' && kind !== 'write' && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} /></EditOnly>}
+      {(resourceRequirements || checkpointed) && <ExecutionSummary resourceRequirements={resourceRequirements} checkpointed={checkpointed}
+        canEdit={canEdit} onEdit={() => setAdvancedExecutionOpen(true)} />}
+      {(hasResourceControls || hasCheckpointControls) && <details open={advancedExecutionOpen}
+        onToggle={(event) => setAdvancedExecutionOpen(event.currentTarget.open)}
+        className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
+        <summary className="cursor-pointer font-semibold text-foreground">Advanced execution</summary>
+        <div className="mt-2 grid gap-2">
+          {hasResourceControls && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} /></EditOnly>}
+          {hasCheckpointControls && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} /></EditOnly>}
+        </div>
+      </details>}
 
       {/* run plan: appears only when placement actually splits/routes this run (a cluster backend, an
           engine label, or a checkpoint) — makes the cost-aware scheduler + tiering visible before running */}
@@ -300,14 +310,6 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
           user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
       {canDeclareSchema && <EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} /></EditOnly>}
-      {perPortSchemaDeferred && (
-        <Section title="Output schema (contract)">
-          <div className="text-[11px] leading-relaxed text-muted-foreground">
-            This node has multiple named outputs. Node-wide schema contracts are unavailable because
-            they would assign one schema to every port; per-port schema contracts are deferred.
-          </div>
-        </Section>
-      )}
 
       {/* actions */}
       <Section title="Actions">
@@ -470,6 +472,38 @@ export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boole
     && (selectIn.targetHandle == null || selectIn.targetHandle === 'in')
     && (writeIn.sourceHandle == null || writeIn.sourceHandle === 'out')
     && (writeIn.targetHandle == null || writeIn.targetHandle === 'in')
+}
+
+function resourceRequirementSummary(config: Record<string, unknown>): string | null {
+  const requires = config.requires
+  if (!requires || typeof requires !== 'object') return null
+  const { cpu, gpu, gpuType } = requires as { cpu?: unknown; gpu?: unknown; gpuType?: unknown }
+  const parts = [
+    typeof gpu === 'number' ? `${gpu} GPU${gpu === 1 ? '' : 's'}` : null,
+    typeof gpuType === 'string' && gpuType ? gpuType : null,
+    typeof cpu === 'number' ? `${cpu} CPU${cpu === 1 ? '' : 's'}` : null,
+  ].filter((part): part is string => part != null)
+  return parts.length ? parts.join(' · ') : null
+}
+
+function ExecutionSummary({ resourceRequirements, checkpointed, canEdit, onEdit }: {
+  resourceRequirements: string | null
+  checkpointed: boolean
+  canEdit: boolean
+  onEdit: () => void
+}) {
+  return <Section title="Execution">
+    <div className="grid gap-1.5 text-[11px]">
+      {resourceRequirements && <div className="flex items-center justify-between gap-2">
+        <span><strong>Resources</strong> · {resourceRequirements}</span>
+        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit resources</Button>
+      </div>}
+      {checkpointed && <div className="flex items-center justify-between gap-2">
+        <span><strong>Materialization</strong> · Checkpointed output</span>
+        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>
+      </div>}
+    </div>
+  </Section>
 }
 
 function CheckpointToggle({ nodeId }: { nodeId: string }) {

@@ -28,7 +28,12 @@ describe('FieldEvidenceButton', () => {
     render(<FieldEvidenceButton column={CUSTOMER} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
-    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('dataset:customers-logical · revision:customer-r7')
+    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('customers-logical')
+    expect(screen.getByText('customer-r7')).toBeVisible()
+    expect(screen.getByText('Logical type')).toBeVisible()
+    expect(screen.getByText('Nullable')).toBeVisible()
+    expect(screen.getByText('owned by the orders provider')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Technical metadata'))
     expect(screen.getByText('owned by the orders provider')).toBeVisible()
     expect(screen.getByText('utf8')).toBeVisible()
     await waitFor(() => expect(screen.getByText('Customers (renamed)')).toBeVisible())
@@ -43,19 +48,20 @@ describe('FieldEvidenceButton', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Target catalog identity is unavailable; no current dataset was substituted.')
-    expect(screen.getByTestId('field-evidence-customer_id')).toHaveTextContent('dataset:customers-logical · revision:customer-r7')
+    expect(screen.getByTestId('field-evidence-customer_id')).toHaveTextContent('customers-logical')
     expect(screen.queryByRole('link', { name: 'Open current catalog entry' })).toBeNull()
   })
 
-  it('makes absent facts explicit without claiming redacted adapter values exist', async () => {
+  it('omits unavailable reference and annotation copy from a field without evidence', async () => {
     const absent: ColumnSchema = { name: 'legacy_row_id', type: 'int', capabilities: [], provenance: 'inferred' }
     render(<FieldEvidenceButton column={absent} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for legacy_row_id' }))
     const detail = await screen.findByTestId('field-evidence-legacy_row_id')
-    expect(detail).toHaveTextContent('not supplied')
-    expect(detail).toHaveTextContent('No row-reference target was supplied.')
-    expect(detail).toHaveTextContent('No safe raw annotations were supplied. Values excluded by the adapter redaction contract are not exposed here.')
+    expect(detail).toHaveTextContent('Logical type')
+    expect(detail).not.toHaveTextContent('Row-reference target')
+    expect(detail).not.toHaveTextContent('Raw annotations')
+    expect(detail).not.toHaveTextContent('not supplied')
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
   })
 })

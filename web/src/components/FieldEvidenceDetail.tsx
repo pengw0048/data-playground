@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api } from '../api/client'
 import type { CatalogTable } from '../types/api'
-import type { ColumnSchema, TypedRowReference } from '../types/graph'
+import type { ColumnSchema } from '../types/graph'
 import { Popover } from '../ui/Popover'
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error)
@@ -11,13 +11,6 @@ const status = (error: unknown) => typeof error === 'object' && error !== null
 function fact(value: string | boolean | null | undefined, unknown = 'not supplied') {
   if (value == null) return unknown
   return typeof value === 'boolean' ? (value ? 'yes' : 'no') : value
-}
-
-function retainedTarget(reference: TypedRowReference) {
-  const { target } = reference
-  return target.kind === 'exact'
-    ? [`dataset:${target.datasetId}`, `revision:${target.revisionId}`]
-    : [`dataset:${target.datasetId}`, 'revision:not supplied']
 }
 
 function unavailableTarget(error: unknown) {
@@ -78,46 +71,54 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
     return () => { live = false }
   }, [reference?.target.datasetId, reference?.target.kind, reference?.target.kind === 'exact' ? reference.target.revisionId : undefined])
 
+  const technicalFacts: Array<[string, string]> = [
+    ...(column.physicalType != null ? [['Physical type', column.physicalType]] as Array<[string, string]> : []),
+    ...(column.hasDefault != null ? [['Has default', fact(column.hasDefault)]] as Array<[string, string]> : []),
+    ...(column.fieldId != null ? [['Stable field identity', column.fieldId]] as Array<[string, string]> : []),
+    ...(column.provenance != null ? [['Schema provenance', column.provenance]] as Array<[string, string]> : []),
+    ...(reference ? [['Reference provenance', reference.provenance]] as Array<[string, string]> : []),
+    ...(target ? [['Current catalog identity', target.registrationId ?? target.id]] as Array<[string, string]> : []),
+  ]
+  const annotations = column.annotations ?? []
+
   return <div data-testid={`field-evidence-${column.name}`} className="grid gap-3 p-2 text-[10.5px]">
     <div>
       <div className="dp-mono break-all text-[12px] font-semibold text-foreground">{column.name}</div>
-      <div className="text-muted-foreground">Field detail · API-sanitized evidence only</div>
     </div>
 
-    <EvidenceSection title="Schema">
+    <EvidenceSection title="Field detail">
       <Facts values={[
-        ['Logical type', column.type], ['Physical type', fact(column.physicalType)],
-        ['Nullable', fact(column.nullable)], ['Has default', fact(column.hasDefault)],
-        ['Stable field identity', fact(column.fieldId)], ['Schema provenance', fact(column.provenance, 'unknown')],
+        ['Logical type', column.type],
+        ...(column.nullable != null ? [['Nullable', fact(column.nullable)]] as Array<[string, string]> : []),
       ]} />
     </EvidenceSection>
 
-    <EvidenceSection title="Row-reference target">
-      {!reference ? <div className="text-muted-foreground">No row-reference target was supplied.</div> : <>
+    {reference && <EvidenceSection title="Row-reference target">
         <Facts values={[
-          ['Retained identity', retainedTarget(reference).join(' · ')],
-          ['Target key', reference.keyFields.join(', ')], ['Evidence', reference.provenance],
-          ['Semantic type', fact(reference.semanticType)],
+          ['Target dataset', reference.target.datasetId],
+          ...(reference.target.kind === 'exact' ? [['Target version', reference.target.revisionId]] as Array<[string, string]> : []),
+          ['Key columns', reference.keyFields.join(', ')],
+          ...(reference.semanticType != null ? [['Semantic type', reference.semanticType]] as Array<[string, string]> : []),
         ]} />
         {targetState === 'loading' && <div role="status" className="text-muted-foreground">Resolving current catalog display…</div>}
         {targetState === 'unavailable' && <div role="alert" className="rounded border border-destructive/30 bg-destructive/5 p-1.5 text-destructive">{targetError}</div>}
         {target && <div className="rounded border border-border bg-muted/30 p-1.5">
-          <div>Current catalog display: <strong>{target.name}</strong></div>
-          <div className="mt-0.5 break-all font-mono text-[9.5px]">catalog:{target.registrationId ?? target.id}</div>
+          <div>Current catalog entry: <strong>{target.name}</strong></div>
           <a href={`#/workspace/${encodeURIComponent(`dataset:${target.registrationId ?? target.id}`)}`} className="mt-1 inline-block font-semibold text-primary underline">Open current catalog entry</a>
-          <div className="mt-1 text-[9.5px] text-muted-foreground">The retained reference above is not replaced by this current display.</div>
         </div>}
-      </>}
-    </EvidenceSection>
+    </EvidenceSection>}
 
-    <EvidenceSection title="Raw annotations">
-      {!column.annotations?.length ? <div className="text-muted-foreground">No safe raw annotations were supplied. Values excluded by the adapter redaction contract are not exposed here.</div>
-        : <div className="grid gap-1.5">{column.annotations.map((annotation) => <div key={annotation.key} className="rounded border border-border bg-muted/20 p-1.5">
+    {(technicalFacts.length || annotations.length) ? <details className="rounded border border-border bg-muted/20 p-1.5">
+      <summary className="cursor-pointer font-semibold text-foreground">Technical metadata</summary>
+      <div className="mt-2 grid gap-3">
+        {technicalFacts.length ? <EvidenceSection title="Schema metadata"><Facts values={technicalFacts} /></EvidenceSection> : null}
+        {annotations.length ? <EvidenceSection title="Raw annotations"><div className="grid gap-1.5">{annotations.map((annotation) => <div key={annotation.key} className="rounded border border-border bg-muted/20 p-1.5">
           <div className="flex flex-wrap gap-x-2 text-[9.5px] text-muted-foreground"><span>{annotation.provenance}</span><span>{annotation.encoding}</span></div>
           <div className="mt-0.5 break-all font-mono font-semibold text-foreground">{annotation.key}</div>
           <div className="max-h-24 overflow-auto break-all font-mono text-[9.5px] text-foreground">{annotation.value}</div>
-        </div>)}</div>}
-    </EvidenceSection>
+        </div>)}</div></EvidenceSection> : null}
+      </div>
+    </details> : null}
   </div>
 }
 

@@ -89,7 +89,7 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for actual' }))
-    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.getByTestId('field-evidence-actual')).not.toHaveTextContent('Row-reference target')
     expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
 
@@ -132,7 +132,7 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     expect(screen.getByText(/changed since this contract was pinned/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for copied' }))
-    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.getByTestId('field-evidence-copied')).not.toHaveTextContent('Row-reference target')
     expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
 
@@ -179,7 +179,7 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     render(<Inspector />)
     fireEvent.click(screen.getByTitle('Show columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for owner_id' }))
-    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.getByTestId('field-evidence-owner_id')).not.toHaveTextContent('Row-reference target')
     expect(screen.queryByText(/forged-target/i)).not.toBeInTheDocument()
   })
 })
@@ -213,7 +213,7 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.queryByText('out')).not.toBeInTheDocument()
   })
 
-  it('defers node-wide schema contracts without blocking a runnable multi-output node', () => {
+  it('omits unavailable node-wide schema controls without blocking a runnable multi-output node', () => {
     register({
       kind: 'inspector-multi-plugin', title: 'multi', category: 'compute', inputs: [],
       outputs: [{ id: 'left', wire: 'dataset' }, { id: 'right', wire: 'dataset' }],
@@ -234,7 +234,8 @@ describe('Inspector — effective named outputs', () => {
       },
     }))
     render(<Inspector />)
-    expect(screen.getByText(/per-port schema contracts are deferred/i)).toBeInTheDocument()
+    expect(screen.queryByText(/per-port schema contracts are deferred/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Node-wide schema contracts are unavailable/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Untyped until it runs\. Declare a contract/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Full runs for multi-output nodes are not available yet/i)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run' })).toHaveAttribute('aria-disabled', 'false')
@@ -401,6 +402,45 @@ describe('Inspector — effective named outputs', () => {
   })
 })
 
+describe('Inspector — advanced execution', () => {
+  const selectTransform = (config: Record<string, unknown>) => {
+    useStore.setState({
+      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: {},
+      doc: { id: 'execution', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+        data: { title: 'transform', status: 'draft', history: [], config },
+      }] },
+    } as any)
+  }
+
+  it('keeps an unconfigured Transform free of execution controls until Advanced execution opens', () => {
+    selectTransform({})
+    render(<Inspector />)
+
+    const advanced = screen.getByText('Advanced execution').closest('details')
+    expect(advanced).not.toHaveAttribute('open')
+    expect(screen.getByText('Resources (placement)')).not.toBeVisible()
+    expect(screen.getByText('Materialization')).not.toBeVisible()
+
+    fireEvent.click(screen.getByText('Advanced execution'))
+    expect(advanced).toHaveAttribute('open')
+    expect(screen.getByText('Resources (placement)')).toBeVisible()
+    expect(screen.getByText('Materialization')).toBeVisible()
+  })
+
+  it('keeps configured resources visible as a summary and edits the existing requirements payload', () => {
+    selectTransform({ requires: { gpu: 8, gpuType: 'a100', cpu: 4 } })
+    render(<Inspector />)
+
+    expect(screen.getByText('Resources').parentElement).toHaveTextContent('8 GPUs · a100 · 4 CPUs')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit resources' }))
+    const gpu = screen.getByLabelText('GPUs') as HTMLInputElement
+    expect(gpu).toHaveValue(8)
+    fireEvent.change(gpu, { target: { value: '4' } })
+    expect((useStore.getState().doc.nodes[0].data.config as any).requires).toEqual({ gpu: 4, gpuType: 'a100', cpu: 4 })
+  })
+})
+
 describe('Inspector — linear checkpoint availability', () => {
   it('enables a checkpoint only on the supported Source → Select → Write route', () => {
     const source = { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', history: [], config: {} } }
@@ -418,10 +458,12 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
+    fireEvent.click(screen.getByText('Advanced execution'))
     const toggle = screen.getByTestId('checkpoint-toggle')
     expect(toggle).toBeEnabled()
     fireEvent.click(toggle)
     expect((useStore.getState().doc.nodes.find((node) => node.id === 'select')?.data.config as any).checkpoint).toBe(true)
+    expect(screen.getByRole('button', { name: 'Edit materialization' }).parentElement).toHaveTextContent('Checkpointed output')
   })
 
   it('disables an unsupported checkpoint where a researcher encounters it', () => {
@@ -440,6 +482,7 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
+    fireEvent.click(screen.getByText('Advanced execution'))
     expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
     expect(screen.getByText('Checkpoints are available only for Source → Select → Write.')).toBeInTheDocument()
   })
@@ -507,6 +550,7 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
+    fireEvent.click(screen.getByText('Advanced execution'))
     expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
   })
 })

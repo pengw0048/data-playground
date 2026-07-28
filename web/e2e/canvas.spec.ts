@@ -1426,14 +1426,23 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
-  test('the inspector edits a step resource requirement (placement)', async ({ page }) => {
+  test('the Inspector keeps new Transform execution controls advanced and summarizes a configured GPU requirement', async ({ page }) => {
     await fresh(page)
     const inspector = page.getByTestId('inspector')
     await addNode(page, 'Compute', 'transform') // auto-selected; transform can declare compute needs
+    const advanced = inspector.getByText('Advanced execution')
+    await expect(advanced.locator('..')).not.toHaveAttribute('open')
+    await expect(inspector.getByText('Resources (placement)')).not.toBeVisible()
+    await expect(inspector.getByText('Materialization')).not.toBeVisible()
+    await advanced.click()
     await expect(inspector.getByText('Resources (placement)')).toBeVisible()
     const gpus = inspector.locator('label').filter({ hasText: 'GPUs' }).locator('input')
     await gpus.fill('8')
     await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
+    await advanced.click()
+    await expect(inspector.getByText('8 GPUs')).toBeVisible()
+    await inspector.getByRole('button', { name: 'Edit resources' }).click()
+    await expect(gpus).toHaveValue('8')
   })
 
   test('checkpoint controls prevent unsupported graphs and allow the linear checkpoint route', async ({ page }) => {
@@ -1471,15 +1480,22 @@ test.describe('Data Playground canvas', () => {
       const inspector = page.getByTestId('inspector')
       await page.getByText('TRANSFORM', { exact: true }).click()
       await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
+      await inspector.getByText('Advanced execution').click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeDisabled()
       await expect(inspector.getByText('Checkpoints are available only for Source → Select → Write.')).toBeVisible()
 
       await page.goto(`/#/canvas/${supportedId}`)
       await page.getByText('SELECT', { exact: true }).click()
       await expect(inspector.getByText('SELECT', { exact: true })).toBeVisible()
+      const advanced = inspector.getByText('Advanced execution')
+      await advanced.click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeEnabled()
       await inspector.getByTestId('checkpoint-toggle').click()
       await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
+      await advanced.click()
+      await expect(inspector.getByText('Checkpointed output')).toBeVisible()
+      await inspector.getByRole('button', { name: 'Edit materialization' }).click()
+      await expect(inspector.getByTestId('checkpoint-toggle')).toBeVisible()
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(unsupportedId)}`)
       await page.request.delete(`/api/canvas/${encodeURIComponent(supportedId)}`)
