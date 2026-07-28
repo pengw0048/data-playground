@@ -3352,7 +3352,12 @@ describe('graph store — core authority ops', () => {
 
   it('preserves a valid node selection when reopening the same canvas', async () => {
     const doc = { id: 'shared', version: 2, name: 'shared', nodes: [NODE('a')], edges: [] }
-    useStore.setState({ doc: { ...doc, version: 1 }, selectedId: 'a', selectedIds: ['a'] })
+    useStore.setState({
+      doc: { ...doc, version: 1 },
+      selectedId: 'a',
+      selectedIds: ['a'],
+      firstRunChoice: true,
+    })
     apiMocks.getCanvas.mockResolvedValue(doc)
     apiMocks.listCanvases.mockResolvedValue([
       { id: 'shared', name: 'shared', version: 2, role: 'owner' },
@@ -3361,6 +3366,7 @@ describe('graph store — core authority ops', () => {
     expect(await useStore.getState().openFile('shared')).toBe(true)
 
     expect(useStore.getState().selectedId).toBe('a')
+    expect(useStore.getState().firstRunChoice).toBe(false)
   })
 
   it('requests one initial viewport fit for a non-empty saved Canvas unless a node deep link owns the view', async () => {
