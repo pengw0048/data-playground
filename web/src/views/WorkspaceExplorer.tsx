@@ -469,6 +469,12 @@ function WorkspaceMixedExplorer() {
 
   useEffect(() => { setSearchDraft(searchQuery) }, [searchQuery])
 
+  // Search is an explicit, bounded action. Keep the text being edited separate from the query
+  // whose results are currently on screen so an old result set is never implied to match a new
+  // draft merely because the input changed.
+  const normalizedSearchDraft = searchDraft.trim().replace(/\s+/g, ' ')
+  const searchDraftPending = normalizedSearchDraft !== searchQuery
+
   const load = useCallback(async (targetId: string, nextCursor?: string | null) => {
     const sequence = ++request.current
     const more = !!nextCursor
@@ -724,7 +730,7 @@ function WorkspaceMixedExplorer() {
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
           event.preventDefault()
-          setWorkspaceSearchQuery(searchDraft)
+          if (searchDraftPending) setWorkspaceSearchQuery(searchDraft)
         }} className="flex min-w-[220px] max-w-sm flex-1 items-center gap-1 rounded-md border border-border bg-card px-2">
           <Icon name="search" size={13} />
           <input aria-label="Search views, datasets, canvases, and containers" value={searchDraft}
@@ -733,6 +739,8 @@ function WorkspaceMixedExplorer() {
           {searchDraft && <button type="button" aria-label="Clear Workspace search" onClick={() => {
             setSearchDraft(''); setWorkspaceSearchQuery('')
           }}><Icon name="close" size={12} /></button>}
+          <button type="submit" disabled={!searchDraftPending} aria-label="Search Workspace"
+            className="rounded px-1.5 py-1 text-[11.5px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:text-muted-foreground disabled:hover:bg-transparent">Search</button>
         </form>
         <button type="button" onClick={() => setAddDataOpen(true)} data-testid="workspace-add-data"
           className="rounded-md bg-foreground px-2.5 py-1.5 text-[12px] font-semibold text-background">Add data</button>
@@ -754,6 +762,12 @@ function WorkspaceMixedExplorer() {
           title={!undoDestination ? canvasDestinationTitle(undoMove.previousContainer, 'move') : undefined}
           className="font-semibold text-primary underline disabled:opacity-50">{undoBusy ? 'Undoing…' : undoDestination ? 'Undo move' : 'Undo unavailable'}</button>
         <button onClick={() => setUndoMove(null)} aria-label="Dismiss move confirmation"><Icon name="close" size={13} /></button>
+      </div>}
+
+      {searchDraftPending && <div role="status" className="border-b border-border bg-muted/30 px-7 py-1.5 text-[11.5px] text-muted-foreground">
+        {searchQuery
+          ? <>Results are still for “{searchQuery}”. Select Search to update.</>
+          : <>Select Search to look for “{normalizedSearchDraft}”.</>}
       </div>}
 
       {!searchQuery && (sources.some((source) => source.kind !== 'local') || completeness === 'partial')

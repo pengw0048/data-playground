@@ -463,6 +463,35 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 25, cursor: undefined })
   })
 
+  it('keeps submitted results distinct from an unsubmitted Workspace search draft', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [{ source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' }, items: [DATASET] }],
+      })
+      .mockResolvedValueOnce({
+        query: 'zzzz-no-match', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [],
+      })
+    const view = render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('button', { name: 'Open dataset observations' })).toBeVisible()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' }), {
+      target: { value: 'zzzz-no-match' },
+    })
+    expect(screen.getByRole('status')).toHaveTextContent('Results are still for “observations”. Select Search to update.')
+    expect(screen.getByRole('button', { name: 'Open dataset observations' })).toBeVisible()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Search Workspace' }))
+    expect(store.setWorkspaceSearchQuery).toHaveBeenCalledWith('zzzz-no-match')
+    store.workspaceSearchQuery = 'zzzz-no-match'
+    view.rerender(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('No views, datasets, canvases, or containers match this query.')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Open dataset observations' })).not.toBeInTheDocument()
+  })
+
   it('keeps capability-driven Folder and Canvas actions available from search results without leaving search context', async () => {
     const searchableFolder = { ...FOLDER, canCreateFolder: true, canRenameFolder: true, canDeleteFolder: true }
     const searchableCanvas = { ...CANVAS, parentId: FOLDER.id }
