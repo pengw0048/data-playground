@@ -12,6 +12,7 @@ import { locateNode } from './locateNode'
 import { uniqueNextStepConnection } from './nextStep'
 import { cn } from '@/lib/utils'
 import { toolbarRevealDelta, toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
+import { canvasFitOptions } from './viewportFit'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
   io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'code',
@@ -229,6 +230,7 @@ export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, hasN
 }) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const { zoom } = useViewport()
+  const nodeCount = useStore((s) => s.doc.nodes.length)
 
   return (
     <div data-testid="toolbar-view-controls" role="group" aria-label="View controls" className="flex items-center gap-1">
@@ -236,7 +238,7 @@ export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, hasN
       {hasNodes && <div role="group" aria-label="Viewport controls" className="flex items-center gap-1">
         <ToolbarIconButton label="Zoom in" icon="plus" onClick={() => { void zoomIn() }} disabled={zoom >= 2.5} showLabel={labelsVisible} />
         <ToolbarIconButton label="Zoom out" icon="minus" onClick={() => { void zoomOut() }} disabled={zoom <= 0.2} showLabel={labelsVisible} />
-        <ToolbarIconButton label="Fit view" icon="maximize" onClick={() => { void fitView({ padding: 0.3, maxZoom: 1 }) }} showLabel={labelsVisible} />
+        <ToolbarIconButton label="Fit view" icon="maximize" onClick={() => { void fitView(canvasFitOptions(nodeCount)) }} showLabel={labelsVisible} />
       </div>}
       {hasNodes && <div aria-hidden className="mx-1 h-[22px] w-px bg-border" />}
       <div role="group" aria-label="Panel controls" className="flex items-center gap-1">

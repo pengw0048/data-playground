@@ -26,6 +26,7 @@ import { Button } from '@/components/ui/button'
 import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
+import { canvasFitOptions } from './viewportFit'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -288,7 +289,7 @@ export function Canvas() {
     if (!measured) return
     const requestId = viewportFitRequest.id
     fittedRequestId.current = requestId
-    void fitView({ padding: 0.3, maxZoom: 1 }).then((fitted) => {
+    void fitView(canvasFitOptions(doc.nodes.length)).then((fitted) => {
       if (fitted) acknowledgeViewportFit(requestId)
       else if (fittedRequestId.current === requestId) fittedRequestId.current = null
     })
@@ -562,7 +563,7 @@ export function Canvas() {
         minZoom={0.2}
         maxZoom={2.5}
         fitView
-        fitViewOptions={{ padding: 0.3, maxZoom: 1 }}
+        fitViewOptions={canvasFitOptions(doc.nodes.length)}
         panOnScroll
         connectOnClick={false}
         selectionOnDrag
