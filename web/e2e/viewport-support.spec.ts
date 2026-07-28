@@ -2,7 +2,7 @@ import { test, expect, type Page, type Locator } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { MIN_VIEWPORT } from '../support/min-viewport'
-import { backToWorkspace, workspaceResource } from './support/workspace'
+import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
 
@@ -50,23 +50,31 @@ async function expectToolbarGroupsDoNotOverlap(page: Page, label: string) {
 }
 
 async function goToWorkspaceShell(page: Page) {
-  await page.goto('/')
-  await expect(page.getByTestId('toolbar')).toBeVisible()
-  await backToWorkspace(page)
+  // Enter the shell through its route. Clicking the Canvas menu while the initial router is still
+  // restoring the last Canvas races the bootstrap remount; openCanvasWithSource below still covers
+  // the real Back to Workspace action after the Canvas has settled.
+  await goToWorkspace(page)
   await expect(page.getByTestId('rail-workspace')).toBeVisible()
 }
 
 async function openCanvasWithSource(page: Page) {
   // Full-profile workflows create named canvases before this spec. Start fresh so the visibility
-  // assertions exercise one source node rather than inheriting their graph.
-  await page.goto('/')
+  // assertions exercise one source node rather than inheriting their graph. Create the fixture
+  // through the API so the test does not race the initial router while clicking a remounting menu;
+  // the settled Back to Workspace action below remains covered through the real UI.
+  const canvasId = `viewport-source-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const created = await page.request.post('/api/canvas', { data: {
+    id: canvasId,
+    name: 'Viewport source',
+    version: 1,
+    nodes: [],
+    edges: [],
+  } })
+  expect(created.ok()).toBe(true)
+  await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
   await expect(page.getByTestId('toolbar')).toBeVisible()
-  const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('file-menu').click()
-  await page.getByText('New file').click()
-  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await expect(page.getByTestId('autosave')).toContainText('saved')
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
-  const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
   await backToWorkspace(page)
 
   // The full UX fixture replaces the small smoke catalog, so follow bounded load-more pages.
@@ -155,6 +163,8 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByLabel('Source connection details')).toBeVisible()
     await expect(page.getByLabel('Source connection details').getByText('Catalog registration')).toBeVisible()
     await expect(page.getByLabel('Source connection details').getByText(/Field evidence/i)).toBeVisible()
+    await connectionDetails.click()
+    await expect(page.getByLabel('Source connection details')).not.toBeVisible()
     // Inspector run control stays reachable at the minimum viewport (sources label it Count rows).
     await expectFullyInViewport(
       page,
