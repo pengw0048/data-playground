@@ -43,8 +43,10 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
 
-  const add = (kind: string) => {
-    const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
+  const safeToolbarPosition = (
+    nodes: typeof doc.nodes,
+    base: { x: number; y: number },
+  ) => {
     const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
     const toolbar = toolbarRef.current?.getBoundingClientRect()
     const bounds: ToolbarSafeBounds | null = surface && toolbar ? {
@@ -54,10 +56,13 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
       // The shelf is part of the node's interaction footprint, so the toolbar itself is excluded.
       bottom: screenToFlowPosition({ x: surface.left, y: toolbar.top }).y,
     } : null
+    return bounds ? toolbarSafePosition(nodes, base, bounds) : base
+  }
+
+  const add = (kind: string) => {
+    const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     const base = { x: c.x - 116, y: c.y - 40 }
-    const pos = bounds
-      ? toolbarSafePosition(useStore.getState().doc.nodes, base, bounds)
-      : base
+    const pos = safeToolbarPosition(useStore.getState().doc.nodes, base)
     addNode(kind, pos)
     setOpen(null)
     setOperationFinderOpen(false)
@@ -81,7 +86,10 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
       : null
     const connection = source && uniqueNextStepConnection(source, kind, current.edges)
     if (!source || !connection) return
-    const pos = freePosition(current.nodes, { x: source.position.x + 300, y: source.position.y })
+    const pos = safeToolbarPosition(
+      current.nodes,
+      { x: source.position.x + 300, y: source.position.y },
+    )
     addConnectedNode(kind, pos, { source: source.id, ...connection })
     setOperationFinderOpen(false)
   }

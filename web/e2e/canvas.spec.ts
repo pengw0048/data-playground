@@ -434,6 +434,19 @@ test.describe('Data Playground canvas', () => {
     await transform.click()
     await expect(page.locator('.react-flow__node')).toHaveCount(3)
     await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+
+    const transformShelf = page.getByRole('button', { name: 'Edit code' }).locator('..')
+    await expect(transformShelf).toBeVisible()
+    const shelfBox = await boxOf(transformShelf)
+    expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), 'next-step shelf is outside the visible Canvas').toBe(true)
+    expect(overlaps(shelfBox, await boxOf(page.getByTestId('toolbar'))), 'next-step shelf overlaps the toolbar').toBe(false)
+
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    await page.getByRole('button', { name: 'Redo', exact: true }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
   })
 
   test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {
