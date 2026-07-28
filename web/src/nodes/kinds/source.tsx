@@ -7,6 +7,7 @@ import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
 import { FieldEvidenceButton } from '../../components/FieldEvidenceDetail'
+import { JoinWithRelated } from '../../components/JoinWithRelated'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
@@ -282,6 +283,7 @@ function Source({ id, data }: NodeComponentProps) {
       {!datasetParameter && !providerDataset && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
         exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
+      <JoinWithRelated nodeId={id} surface="canvas" />
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}

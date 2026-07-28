@@ -250,6 +250,9 @@ def source_identity_from_config(catalog, config: dict) -> RelatedDatasetIdentity
     This is intentionally separate from catalog lookup so older URI/tableId-only Source documents
     do not silently gain the Join-with action.
     """
+    dataset_ref = config.get("datasetRef")
+    if isinstance(dataset_ref, dict) and "parameterRef" in dataset_ref:
+        raise ValueError("parameter-bound Source has no fixed dataset identity for related discovery")
     registration_id = config.get("registrationId")
     if isinstance(registration_id, str) and registration_id:
         table = catalog.get_table(registration_id)

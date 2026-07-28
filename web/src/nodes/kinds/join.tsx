@@ -8,6 +8,7 @@ import { parseJoinKeys, serializeJoinCondition, serializeJoinKeys, type JoinKeyP
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import type { NodeConfig } from '../../types/graph'
+import { JoinWithRelated } from '../../components/JoinWithRelated'
 
 function Join({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
@@ -88,6 +89,7 @@ function Join({ id, data }: NodeComponentProps) {
           </div>
         </div>
       )}
+      <JoinWithRelated nodeId={id} surface="canvas" />
     </NodeCard>
   )
 }
