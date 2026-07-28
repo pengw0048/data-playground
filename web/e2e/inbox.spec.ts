@@ -40,8 +40,22 @@ const cancelledLocal = {
   jobAvailable: false,
 }
 
+const retiredIdentityItem = {
+  id: 'inbox-retired-identity',
+  taskId: 'retired-identity-task',
+  canvasId: null,
+  canvasName: null,
+  taskKind: 'row_identity_certification',
+  outcome: 'completed',
+  diagnosticCode: null,
+  terminalAt: '2026-07-17T09:00:00Z',
+  readAt: null,
+  jobAvailable: true,
+  datasetContext: { taskKind: 'row_identity_certification', datasetId: 'dataset-retired', revisionId: 'rev-retired', name: 'Camera frames' },
+}
+
 test('Inbox badge, filter, open job, and redacted outcomes @ux-smoke', async ({ page }) => {
-  await page.setViewportSize({ width: 1024, height: 768 })
+  await page.setViewportSize({ width: 1280, height: 720 })
   let unread = 3
   await page.route('**/api/inbox/unread-count', async (route) => {
     await route.fulfill({ json: { count: unread } })
@@ -49,8 +63,8 @@ test('Inbox badge, filter, open job, and redacted outcomes @ux-smoke', async ({ 
   await page.route('**/api/inbox?*', async (route) => {
     const filter = new URL(route.request().url()).searchParams.get('filter')
     const items = filter === 'unread'
-      ? [completedLocal, failedWait, cancelledLocal]
-      : [completedLocal, failedWait, cancelledLocal]
+      ? [completedLocal, failedWait, cancelledLocal, retiredIdentityItem]
+      : [completedLocal, failedWait, cancelledLocal, retiredIdentityItem]
     await route.fulfill({ json: { items, nextCursor: null, hasMore: false } })
   })
   await page.route('**/api/inbox/*/read', async (route) => {
@@ -73,6 +87,8 @@ test('Inbox badge, filter, open job, and redacted outcomes @ux-smoke', async ({ 
   await expect(page.getByText('external wait deadline')).toBeVisible()
   await expect(page.getByText('Cancelled', { exact: true })).toBeVisible()
   await expect(page.getByText(/traceback|secret boom/i)).toHaveCount(0)
+  await expect(page.getByText('Row identity certification')).toHaveCount(0)
+  await expect(page.getByTestId('inbox-item-inbox-retired-identity')).toHaveCount(0)
 
   const disabledOpen = page.getByRole('button', { name: 'Open job' }).nth(2)
   await expect(disabledOpen).toBeDisabled()

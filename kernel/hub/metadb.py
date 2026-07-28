@@ -6826,9 +6826,12 @@ _DURABLE_TASK_LEASE_SECONDS = 15
 _CHECKPOINT_PARENT_KINDS = frozenset({
     "linear_checkpoint_write", "bounded_fanout_write", "merge_columns_write",
 })
-# #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. The hidden
-# distribution-report lifecycle has no Jobs projection until its own product surface exists.
-_JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
+# #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. Distribution
+# reports have their own read-only projection; retired row-identity certification tasks remain
+# durable until their backend cleanup, but no longer belong in the researcher-facing Jobs list.
+_JOBS_HIDDEN_TASK_KINDS = frozenset({
+    "distribution_report", "row_identity_certification",
+})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write", "distribution_report",
@@ -6847,7 +6850,9 @@ _INBOX_COMPLETED_WRITE_SUMMARY_KINDS = frozenset({
 })
 # Task kinds that carry their terminal failure code into the Inbox diagnostic allowlist.
 _DIAGNOSTIC_BEARING_TASK_KINDS = _DATASET_SCOPED_TASK_KINDS
-_INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
+_INBOX_HIDDEN_TASK_KINDS = frozenset({
+    "distribution_report", "row_identity_certification",
+})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -12366,6 +12371,7 @@ def list_workspace_runs(
             dataset_task_predicates = [
                 DurableTask.owner_id == str(uid),
                 DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
+                DurableTask.task_kind.notin_(_JOBS_HIDDEN_TASK_KINDS),
                 DurableTask.canvas_id.is_(None),
             ]
             if run_id:

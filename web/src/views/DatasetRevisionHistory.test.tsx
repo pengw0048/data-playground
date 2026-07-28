@@ -114,51 +114,6 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
-  it('moves exact route state with a clicked revision and drops an incompatible certification task', async () => {
-    store.workspaceDatasetQuery =
-      'folder=robotics&revision=rev-a&revisionDataset=dataset-stable&rowIdentityAction=certify&rowIdentityTask=task-a'
-    mocks.datasetRevisions.mockResolvedValue({
-      items: [revision('rev-a'), revision('rev-b')],
-      nextCursor: null,
-      hasMore: false,
-    })
-    mocks.datasetRevision.mockImplementation((_datasetId: string, revisionId: string) =>
-      Promise.resolve(detail(revisionId)))
-    mocks.rowIdentityCertificationTask.mockRejectedValue(new Error('old task detached'))
-    const view = render(
-      <DatasetRevisionHistory
-        table={TABLE}
-        initialRevisionId="rev-a"
-        initialRevisionDatasetId="dataset-stable"
-      />,
-    )
-
-    await screen.findByText('Exact revision rev-a')
-    fireEvent.click(screen.getByRole('button', { name: 'Open revision rev-b' }))
-    view.rerender(
-      <DatasetRevisionHistory
-        table={TABLE}
-        initialRevisionId="rev-b"
-        initialRevisionDatasetId="dataset-stable"
-      />,
-    )
-    await screen.findByText('Exact revision rev-b')
-    const next = new URLSearchParams(
-      store.setWorkspaceDatasetQuery.mock.calls.at(-1)?.[0],
-    )
-    expect(next.get('folder')).toBe('robotics')
-    expect(next.get('revision')).toBe('rev-b')
-    expect(next.get('revisionDataset')).toBe('dataset-stable')
-    expect(next.has('rowIdentityAction')).toBe(false)
-    expect(next.has('rowIdentityTask')).toBe(false)
-    expect(
-      mocks.datasetRevision.mock.calls.filter(
-        ([datasetId, revisionId]) =>
-          datasetId === 'dataset-stable' && revisionId === 'rev-b',
-      ),
-    ).toHaveLength(1)
-  })
-
   it('distinguishes empty, unavailable, and provider-error history states', async () => {
     mocks.datasetRevisions.mockResolvedValueOnce({ items: [], nextCursor: null, hasMore: false })
     const first = render(<DatasetRevisionHistory table={TABLE} />)
@@ -279,7 +234,7 @@ describe('DatasetRevisionHistory', () => {
       .toHaveTextContent('retained empty-revision schema')
   })
 
-  it('opens the stable exact certification action for uncertified binary media without a cell request', async () => {
+  it('keeps unsupported binary media truthful when an exact row identity is unavailable', async () => {
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
     mocks.datasetRevision.mockResolvedValue(detail('rev-media', {
       preview: {
@@ -291,12 +246,11 @@ describe('DatasetRevisionHistory', () => {
     }))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
-    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
+    expect(await screen.findByRole('status')).toHaveTextContent('no exact row identity')
     expect(mocks.openMediaCell).not.toHaveBeenCalled()
   })
 
-  it('refreshes the same exact revision before reopening certification for a stale retained identity', async () => {
+  it('reports a stale exact media identity without changing the selected revision', async () => {
     const certified = detail('rev-media', {
       preview: {
         columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
@@ -311,26 +265,16 @@ describe('DatasetRevisionHistory', () => {
       },
       mediaCellSupported: true,
     })
-    const unavailable = detail('rev-media', {
-      preview: certified.preview,
-      rowIdentity: {
-        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable',
-        certificationSupported: true, fields: [], encodingVersion: null,
-      },
-    })
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
-    mocks.datasetRevision.mockResolvedValueOnce(certified).mockResolvedValueOnce(unavailable)
+    mocks.datasetRevision.mockResolvedValue(certified)
     mocks.openMediaCell.mockRejectedValue(
       new KernelError(409, 'identity unavailable', 'media_cell_identity_unavailable'),
     )
 
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
-
-    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledTimes(2))
-    expect(mocks.datasetRevision).toHaveBeenLastCalledWith('dataset-stable', 'rev-media')
-    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
+    expect(await screen.findByRole('status')).toHaveTextContent('identity is no longer available')
+    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
   })
 
   it('never falls back to latest when the selected exact revision was compacted', async () => {

@@ -155,6 +155,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 })
 
 test('browses and opens one exact retained dataset revision without drifting to latest', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 })
   const catalog = await page.request.get('/api/catalog/tables?limit=1')
   expect(catalog.ok()).toBe(true)
   const dataset = (await catalog.json()).items[0] as { id: string; name: string }
@@ -214,6 +215,8 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByText(/Parent rev-1 · producer append/)).toBeVisible()
   await expect(page.getByText('breaking')).toBeVisible()
   await expect(page.getByText(/Preview truncated at 100 rows.*exact revision/i)).toBeVisible()
+  await expect(page.getByRole('button', { name: /certify/i })).toHaveCount(0)
+  await expect(page.getByText(/row identity/i)).toHaveCount(0)
   expect(historyRequests).toBeGreaterThanOrEqual(2)
 
   await page.reload()

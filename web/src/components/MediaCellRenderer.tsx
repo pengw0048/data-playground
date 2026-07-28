@@ -11,10 +11,7 @@ export interface ExactMediaCellContext {
   datasetId: string
   revisionId: string
   identity: MediaCellIdentityValue[] | null
-  proofStatus: 'certified' | 'unavailable'
-  certificationSupported: boolean
   mediaCellSupported: boolean
-  onOpenCertification?: () => void
 }
 
 export interface MediaCellRendererProps {
@@ -27,7 +24,7 @@ export interface MediaCellRendererProps {
 
 type DirectMedia = { source: string; kind: DisplayKind }
 type RemoteMedia = DirectMedia & { requestKey: string }
-type Failure = { requestKey: string; message: string; canOpenCertification?: boolean }
+type Failure = { requestKey: string; message: string }
 
 const imageExtensions = new Set(['avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'webp'])
 const videoExtensions = new Set(['m4v', 'mkv', 'mov', 'mp4', 'webm'])
@@ -93,16 +90,16 @@ function endpointFailure(error: unknown): string {
     if (error.status === 401 || error.status === 403) return 'You are not authorized to open this media cell.'
     if (error.status === 410) return 'This exact revision is no longer available.'
     if (error.status === 409 && error.code === 'media_cell_identity_unavailable') {
-      return 'The certified row identity is no longer available for this exact revision.'
+      return 'The exact row identity is no longer available for this revision.'
     }
     if (error.status === 409 && error.code === 'media_cell_row_ambiguous') {
-      return 'The certified row identity matches more than one row, so this media cannot be opened.'
+      return 'The exact row identity matches more than one row, so this media cannot be opened.'
     }
     if (error.status === 409) {
       return 'This exact media cell cannot be opened because its row identity is unavailable or ambiguous.'
     }
     if (error.status === 404 || error.status === 422) {
-      return 'This exact media cell could not be found for its certified row identity.'
+      return 'This exact media cell could not be found for its exact row identity.'
     }
     if (error.status >= 500) return 'The media service failed while loading this cell. Try again.'
   }
@@ -129,17 +126,14 @@ function MediaElement({ media, onError, viewport }: {
   return <img alt="Media image" src={media.source} loading="lazy" className={`${fit} rounded object-cover`} onError={onError} />
 }
 
-function State({ children, action }: { children: string; action?: () => void }) {
+function State({ children }: { children: string }) {
   return <div role="status" className="grid place-items-center p-2 text-center leading-snug text-muted-foreground">
-    <div>
-      <div>{children}</div>
-      {action && <button type="button" onClick={action} className="mt-1 font-semibold text-primary underline">Open certification</button>}
-    </div>
+    <div>{children}</div>
   </div>
 }
 
 // This component is deliberately the only media renderer used by generic and exact previews. A
-// generic surface has no certified exact context, so it can render only public/data URLs; the exact
+// generic surface has no exact-revision context, so it can render only public/data URLs; the exact
 // context is the narrow opt-in that may use the bounded cell endpoint.
 export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 'grid' }: MediaCellRendererProps) {
   const direct = directMedia(value, mediaKind)
@@ -216,9 +210,6 @@ export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 
         setFailure({
           requestKey,
           message: endpointFailure(error),
-          canOpenCertification: error instanceof KernelError
-            && error.code === 'media_cell_identity_unavailable'
-            && exact.certificationSupported,
         })
       })
     return () => {
@@ -233,7 +224,7 @@ export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 
   const remoteForRequest = remote?.requestKey === requestKey ? remote : null
   const failureForRequest = failure?.requestKey === displayKey ? failure : null
   const media = failureForRequest ? null : (direct ?? remoteForRequest)
-  const unrepresentable = endpointNeeded && exact && (!exact.identity || exact.proofStatus !== 'certified')
+  const missingIdentity = endpointNeeded && exact && !exact.identity
   const source = media?.source
 
   const loadFailed = () => {
@@ -246,17 +237,12 @@ export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 
   return <div ref={frame} className={`grid overflow-hidden rounded-md border border-border/60 bg-muted/30 ${frameClass(viewport)}`}>
     {value == null ? <State>Media value is empty.</State>
       : media ? <MediaElement key={source} media={media} viewport={viewport} onError={loadFailed} />
-        : failureForRequest ? <State action={failureForRequest.canOpenCertification ? exact?.onOpenCertification : undefined}>{failureForRequest.message}</State>
+        : failureForRequest ? <State>{failureForRequest.message}</State>
             : publicDirect ? <State>This public media URL is not a supported image or video.</State>
-              : !exact ? <State>Open an exact certified revision to view this media.</State>
+              : !exact ? <State>Open an exact revision to view this media.</State>
                 : !exact.mediaCellSupported ? <State>This exact revision does not support bounded media-cell reads.</State>
-            : exact.proofStatus !== 'certified' ? <State action={exact.certificationSupported ? exact.onOpenCertification : undefined}>
-              {exact.certificationSupported
-                ? 'Certify row identity to open media from this exact revision.'
-                : 'This exact revision cannot certify row identity, so this media cannot be opened.'}
-            </State>
-              : unrepresentable ? <State>This preview row has no representable certified identity.</State>
-                : !exact.identity ? <State>This preview row has no representable certified identity.</State>
+            : missingIdentity ? <State>This preview row has no exact row identity for opening binary media.</State>
+                : !exact.identity ? <State>This preview row has no exact row identity for opening binary media.</State>
                   : <State>Loading exact media…</State>}
   </div>
 }

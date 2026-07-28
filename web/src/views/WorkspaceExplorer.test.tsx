@@ -778,24 +778,6 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:dataset-1')
   })
 
-  it('keeps an exact certification task attached while dataset filters change', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:dataset-1'
-    store.workspaceDatasetQuery =
-      'revision=rev-7&revisionDataset=dataset-stable&rowIdentityAction=certify&rowIdentityTask=task-7'
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Change dataset query' }))
-    const next = new URLSearchParams(
-      store.setWorkspaceDatasetQuery.mock.calls.at(-1)?.[0],
-    )
-    expect(next.get('revision')).toBe('rev-7')
-    expect(next.get('revisionDataset')).toBe('dataset-stable')
-    expect(next.get('rowIdentityAction')).toBe('certify')
-    expect(next.get('rowIdentityTask')).toBe('task-7')
-    expect(next.get('dq')).toBe('robot hands')
-  })
-
   it('translates a nested Datasets folder into its exact opaque Catalog projection', async () => {
     store.workspaceScope = 'datasets'
     store.workspaceDatasetQuery = 'folder=robotics'

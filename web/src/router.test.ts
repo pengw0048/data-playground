@@ -47,32 +47,6 @@ describe('Workspace routes', () => {
     })
   })
 
-  it('round-trips row-identity action and task state through the dataset query allowlist', () => {
-    const datasetQuery = new URLSearchParams({
-      revision: 'rev-9', revisionDataset: 'logical-receipt-id',
-      rowIdentityAction: 'certify', rowIdentityTask: 'task-9',
-      rowIdentitySubmission: 'must-not-leak', rowIdentityKeys: 'id,email',
-    }).toString()
-    window.location.hash = routeHash('workspace', undefined, 'dataset:registration-current', undefined,
-      undefined, undefined, undefined, 'datasets', datasetQuery)
-    const allowedQuery = new URLSearchParams({
-      revision: 'rev-9', revisionDataset: 'logical-receipt-id',
-      rowIdentityAction: 'certify', rowIdentityTask: 'task-9',
-    }).toString()
-    expect(parseHash()).toEqual({
-      view: 'workspace', workspaceResourceId: 'dataset:registration-current', workspaceScope: 'datasets',
-      workspaceDatasetQuery: allowedQuery,
-    })
-    expect(window.location.hash).not.toContain('rowIdentitySubmission')
-    expect(window.location.hash).not.toContain('rowIdentityKeys')
-
-    window.location.hash += '&rowIdentitySubmission=must-not-parse&rowIdentityKeys=id%2Cemail'
-    expect(parseHash()).toEqual({
-      view: 'workspace', workspaceResourceId: 'dataset:registration-current', workspaceScope: 'datasets',
-      workspaceDatasetQuery: allowedQuery,
-    })
-  })
-
   it('deliberately redirects former Recents and Tables URLs to Workspace', () => {
     window.location.hash = '#/files'
     expect(parseHash()).toEqual({ view: 'workspace' })

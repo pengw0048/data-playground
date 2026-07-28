@@ -155,7 +155,7 @@ def _exact_lance_data_file(lance, uri: str, revision_id: str) -> Path:
     return Path(str(matches[0]["base_uri"])) / str(matches[0]["path"])
 
 
-def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
+def test_preflight_submit_worker_replay_and_retired_product_surfaces(
         dataset, monkeypatch):
     deps, publish = dataset
     published = publish(pa.table({
@@ -190,18 +190,11 @@ def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
     assert replay_status == 200 and replay.task_id == task.task_id
     assert replay.receipt == done.receipt
 
-    jobs = WorkspaceRunPage.model_validate(metadb.list_workspace_runs("owner"))
-    job = next(item for item in jobs.items if item.task_id == task.task_id)
-    assert job.canvas_id is None and job.dataset_context is not None
-    assert job.dataset_context.revision_id == published["revision_id"]
-    assert job.dataset_context.deep_link is not None
-    assert f"revision={published['revision_id']}" in job.dataset_context.deep_link
-    assert "rowIdentityAction=certify" in job.dataset_context.deep_link
-    assert f"rowIdentityTask={task.task_id}" in job.dataset_context.deep_link
-    inbox = DurableTaskInboxPage.model_validate(
-        metadb.list_durable_task_inbox_items("owner", limit=50))
-    item = next(item for item in inbox.items if item.task_id == task.task_id)
-    assert item.outcome == "completed" and item.dataset_context == job.dataset_context
+    assert WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs("owner", run_id=task.task_id)).items == []
+    assert DurableTaskInboxPage.model_validate(
+        metadb.list_durable_task_inbox_items("owner", limit=50)).items == []
+    assert metadb.count_durable_task_inbox_unread("owner") == 0
 
 
 def test_lance_task_certifies_exact_preview_and_replays_without_rescan(

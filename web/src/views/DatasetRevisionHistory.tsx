@@ -8,7 +8,6 @@ import type {
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
-import { RowIdentityCertificationControl } from '../components/RowIdentityCertificationControl'
 import { MediaCellRenderer } from '../components/MediaCellRenderer'
 
 const PAGE_SIZE = 20
@@ -66,14 +65,8 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
 
   const navigateRevision = useCallback((revision: DatasetRevision) => {
     const params = new URLSearchParams(encodedQuery)
-    const sameExact = params.get('revision') === revision.revisionId
-      && params.get('revisionDataset') === revision.datasetId
     params.set('revision', revision.revisionId)
     params.set('revisionDataset', revision.datasetId)
-    if (!sameExact) {
-      params.delete('rowIdentityAction')
-      params.delete('rowIdentityTask')
-    }
     setEncodedQuery(params.toString())
   }, [encodedQuery, setEncodedQuery])
 
@@ -209,8 +202,7 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
       {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
-        onRestore={setRestoreDetail}
-        declaredKey={table.keys?.find((key) => key.confidence === 'declared')?.columns ?? []} />}
+        onRestore={setRestoreDetail} />}
     </>}
     {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
     {restoreDetail && <RestoreRevisionDialog detail={restoreDetail} headRevisionId={items[0]?.revisionId ?? ''}
@@ -232,14 +224,13 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
 }
 
 function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave,
-  headRevisionId, onRestore, declaredKey }: {
+  headRevisionId, onRestore }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
-  declaredKey: string[]
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
@@ -266,7 +257,6 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
       </div>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
-    <RowIdentityCertificationControl detail={detail} declaredKey={declaredKey} onRefresh={onRetry} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
       : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">No retained parent evidence is available; schema and summary changes are unknown.</div>
         : !parent ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading parent comparison…</div>
@@ -280,7 +270,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
               </div>)}
             </div> : <div className="mt-1 text-[9.5px] text-muted-foreground">No schema field changes.</div>}
           </div>}
-    <ExactPreview detail={detail} onRefresh={onRetry} />
+    <ExactPreview detail={detail} />
   </div>
 }
 
@@ -307,23 +297,8 @@ function Summary({ current, parent }: { current: DatasetRevisionSummary; parent:
   </div>
 }
 
-function ExactPreview({ detail, onRefresh }: { detail: DatasetRevisionDetail; onRefresh: () => void }) {
+function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
   const { columns, rows, hasMore, rowLimit } = detail.preview
-  const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
-  const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
-  const openCertification = () => {
-    const params = new URLSearchParams(encodedQuery)
-    params.set('revision', detail.revisionId)
-    params.set('revisionDataset', detail.datasetId)
-    params.set('rowIdentityAction', 'certify')
-    params.delete('rowIdentityTask')
-    setEncodedQuery(params.toString())
-    // A certified detail can expose this action only after the exact cell endpoint reports that
-    // its retained identity is no longer valid. Re-read the same exact revision so the existing
-    // certification control receives the authoritative unavailable state instead of dead-ending
-    // behind the stale certified summary.
-    if (detail.rowIdentity.proofStatus === 'certified') onRefresh()
-  }
   return <div>
     <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
       <span>Exact revision preview</span>
@@ -338,10 +313,7 @@ function ExactPreview({ detail, onRefresh }: { detail: DatasetRevisionDetail; on
             ? <MediaCellRenderer column={column.name} value={row[column.name]} mediaKind={column.mediaKind} viewport="table"
                 exact={{ datasetId: detail.datasetId, revisionId: detail.revisionId,
                   identity: detail.preview.rowIdentities?.[index] ?? null,
-                  proofStatus: detail.rowIdentity.proofStatus,
-                  certificationSupported: detail.rowIdentity.certificationSupported,
-                  mediaCellSupported: detail.mediaCellSupported === true,
-                  onOpenCertification: openCertification }} />
+                  mediaCellSupported: detail.mediaCellSupported === true }} />
             : cell(row[column.name])}</td>)}</tr>)}</tbody>
         </table>
         {!rows.length && <div className="border-t border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This exact revision returned no preview rows; its retained schema remains inspectable above.</div>}
