@@ -125,6 +125,19 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
       if (body.runId) runIds.push(body.runId)
     })
     await page.getByRole('button', { name: /rerun all/i }).click()
+    for (let pending = 0; pending < 2; pending += 1) {
+      if (pending > 0) {
+        const confirmButton = page.getByRole('button', { name: 'Confirm run…' }).first()
+        await expect(confirmButton).toBeVisible()
+        await confirmButton.click()
+      }
+      const runPanel = page.getByTestId('panel-run')
+      await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+      await runPanel.getByRole('button', {
+        name: /^(?:Run with unknown row count|Run [\d,]+ rows)$/,
+      }).click()
+      await expect.poll(() => runIds.length).toBe(pending + 1)
+    }
     await expect.poll(() => runIds.length).toBe(2)
     await expect.poll(async () => {
       return Promise.all(runIds.map(async (runId) => {
