@@ -56,6 +56,7 @@ export function Shell() {
 function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) => void; unreadCount: number }) {
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
+  const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
   const inboxQuery = useStore((s) => s.inboxQuery)
   const currentUser = useStore((s) => s.currentUser)
@@ -65,7 +66,11 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
   const item = (v: DpView, icon: IconName, label: string, badge?: number) => (
-    <Button variant="ghost" onClick={() => (v === 'inbox' ? setInboxQuery(inboxQuery) : setView(v))} data-testid={`rail-${v}`}
+    <Button variant="ghost" onClick={() => {
+      if (v === 'workspace') setWorkspaceResource(null)
+      else if (v === 'inbox') setInboxQuery(inboxQuery)
+      else setView(v)
+    }} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}
       aria-label={collapsed ? (badge ? `${label}, ${badge} unread` : label) : undefined}
       className={cn('h-auto w-full gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
