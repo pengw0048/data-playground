@@ -224,7 +224,7 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     expect(await screen.findByText(/No active jobs · Updated/)).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'Node and Canvas runs · Durable tasks' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Runs and background tasks' })).toBeVisible()
   })
 
   it('does not treat an active direct-link result as an active first page', async () => {
@@ -337,7 +337,7 @@ describe('JobsView', () => {
     })
     expect(row).toHaveTextContent('done')
     expect(row).not.toHaveTextContent('100%')
-    expect(row).toHaveTextContent('2 outputs retained')
+    expect(row).toHaveTextContent('2 outputs available')
     expect(row.textContent?.match(/1 row/g)).toHaveLength(1)
 
     fireEvent.click(row)
@@ -367,7 +367,7 @@ describe('JobsView', () => {
     expect(row).not.toHaveTextContent('●')
   })
 
-  it('labels ordinary Transform and Profile artifacts as retained while preserving row counts', async () => {
+  it('labels ordinary Transform and Profile outputs as available while preserving row counts', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [
       job({
         id: 'transform-history', runId: 'transform-run', status: 'done', error: null,
@@ -394,14 +394,14 @@ describe('JobsView', () => {
     const transform = (await screen.findByRole('button', {
       name: 'Open run transform-run in Alpha research', expanded: false,
     })).closest('article')
-    expect(transform).toHaveTextContent('1 output retained')
+    expect(transform).toHaveTextContent('1 output available')
     expect(transform).toHaveTextContent('12 rows')
     expect(transform).not.toHaveTextContent('published')
 
     const profile = screen.getByRole('button', {
       name: 'Open run profile-run in Alpha research', expanded: false,
     }).closest('article')
-    expect(profile).toHaveTextContent('1 output retained')
+    expect(profile).toHaveTextContent('1 output available')
     expect(profile).toHaveTextContent('987 rows')
     expect(profile).not.toHaveTextContent('published')
   })

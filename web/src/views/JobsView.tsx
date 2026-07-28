@@ -387,7 +387,7 @@ export function JobsView() {
         {!loading && !error && selectedRunUnavailable && <div className="mb-3 rounded-lg border border-border bg-card p-5 text-center text-[12.5px] text-muted-foreground"><p>This Job is unavailable or you no longer have access.</p><Button variant="outline" size="sm" className="mt-3" onClick={clearSelection}>Back to Jobs</Button></div>}
         {!loading && !error && items.length === 0 && !selectedRunUnavailable && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
         {items.length > 0 && <section aria-labelledby="jobs-list-heading">
-          <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Node and Canvas runs · Durable tasks</h2>
+          <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Runs and background tasks</h2>
           <div className="min-w-[850px] overflow-hidden rounded-lg border border-border bg-card">
             <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
               <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
@@ -476,7 +476,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       : item.status === 'cancelled' ? 'Cancelled'
         : item.cancelRequested ? 'Cancellation requested'
           : publishedRevision ? 'Dataset revision published'
-            : committed.length ? `${committed.length} output${committed.length === 1 ? '' : 's'} retained`
+            : committed.length ? `${committed.length} output${committed.length === 1 ? '' : 's'} available`
               : item.status === 'done' ? 'Completed'
                 : item.externalWait ? 'Waiting for external work'
                   : item.status === 'queued' ? 'Queued'
