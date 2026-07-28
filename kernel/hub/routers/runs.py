@@ -2598,11 +2598,6 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
-    # Every supported Write entry point crosses the same admission/CAS boundary. The browser keeps
-    # its UUID for response-loss replay; direct Python, MCP, and CLI calls get a one-shot identity
-    # before any destination or schema evidence is inspected.
-    if submission_id is None and submitted_target is not None and submitted_target.type == "write":
-        submission_id = str(uuid.uuid4())
     graph_canvas = str(getattr(graph, "id", "") or "") or None
     operational_canvas = auth_canvas or (
         graph_canvas if graph_canvas is not None and metadb.canvas_exists(graph_canvas) else None)
@@ -2947,9 +2942,35 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             effective_write_intent = write_admission.intent
             _inject_write_intent(graph, target_node_id, write_admission.intent)
             _inject_write_intent(durable_graph, target_node_id, write_admission.intent)
-    elif target is not None and target.type == "write":
-        # Defensive fallback for a target that changed type during parameter resolution.
-        _preflight_write_target_destination(deps, graph, str(target_node_id))
+    elif submission_id is None:
+        # Direct API, MCP, and CLI callers predate browser submission identities. Preserve that
+        # execution lifecycle for ordinary writes, but do not let it bypass a structural-drift card.
+        # A full-graph run has no requested target, so use the public output contract's exact
+        # single-Write inference instead of checking only an explicit targetNodeId.
+        unadmitted_write_target = (
+            str(target_node_id)
+            if target is not None and target.type == "write"
+            else None
+        )
+        if target_node_id is None:
+            probe_plan = compiler.compile_plan(
+                graph, None, deps.registry, deps.node_specs, getattr(deps, "node_ir", {}))
+            if probe_plan.acyclic:
+                inferred_target = _run_output_preflight(probe_plan, None)
+                inferred_node = next(
+                    (node for node in graph.nodes if node.id == inferred_target), None)
+                if inferred_node is not None and inferred_node.type == "write":
+                    unadmitted_write_target = inferred_node.id
+        if unadmitted_write_target is not None:
+            admission = _write_admission_for_graph(
+                deps, graph, unadmitted_write_target, uid, str(uuid.uuid4()))
+            drift = admission.intent.schema_drift if admission.intent is not None else None
+            if admission.managed and drift is not None and drift.requires_confirmation:
+                raise HTTPException(
+                    409,
+                    "schema drift confirmation requires the displayed write admission")
+            _preflight_write_target_destination(
+                deps, graph, unadmitted_write_target)
     intent_sha256 = _local_run_intent_sha256(
         intent_graph, target_node_id, input_manifest, effective_write_intent)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)

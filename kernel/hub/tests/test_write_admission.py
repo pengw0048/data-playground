@@ -575,6 +575,11 @@ def test_direct_and_mcp_runs_cannot_bypass_drift_without_an_admission(
             deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
     assert direct.value.status_code == 409
 
+    with pytest.raises(HTTPException, match="displayed write admission") as implicit:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), None, "researcher", confirmed=True)
+    assert implicit.value.status_code == 409
+
     playground = Playground(deps, "researcher", "http://test.local")
     payload = graph.model_dump(by_alias=True, mode="json")
     monkeypatch.setattr(playground, "_get_doc", lambda _canvas_id: payload)
