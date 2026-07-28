@@ -862,16 +862,26 @@ def _write_admission_for_graph(
                     and type(deps.catalog) is InMemoryCatalog
                 )
                 managed = managed_file or lance_candidate
-            except Exception:
-                managed = False
+            except Exception as exc:
+                raise APIError(
+                    503,
+                    "write admission could not resolve the selected destination adapter",
+                    code=APIErrorCode.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                ) from exc
         controller = getattr(deps, "controller", None)
         plan_for_run = getattr(controller, "plan_for_run", None)
         if managed and callable(plan_for_run):
             _rows, _byts, sizes = _cone_size(graph, node_id, deps)
             try:
                 managed = not bool(plan_for_run(graph, node_id, sizes=sizes))
-            except Exception:
-                managed = False
+            except Exception as exc:
+                raise APIError(
+                    503,
+                    "write admission could not resolve the selected execution owner",
+                    code=APIErrorCode.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                ) from exc
     lance_binding = None
     lance_table = None
     if managed and lance_candidate:

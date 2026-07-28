@@ -261,6 +261,82 @@ def test_direct_run_returns_the_same_name_error_before_run_allocation(
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
+@pytest.mark.parametrize("failed_probe", ["runner_adapter", "controller_ownership"])
+def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers(
+        contract, monkeypatch, failed_probe):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", f"{failed_probe}-create")
+    receipt = _publish(deps, create, [1])
+    _set_exact_revision_schema(receipt.revision_id, [
+        {"name": "value", "type": "int64", "physicalType": "BIGINT"},
+    ])
+    proposed = [
+        ColumnSchema(name="value", type="string", physical_type="VARCHAR"),
+    ]
+    monkeypatch.setattr(
+        run_routes,
+        "schema_for_graph",
+        lambda *_args, **_kwargs: {"source": proposed, "write": proposed},
+    )
+
+    class RecoveringRunner:
+        def __init__(self):
+            self.resolve_calls = 0
+
+        @staticmethod
+        def supports_managed_local_write_intents():
+            return True
+
+        def resolve_adapter(self, uri):
+            self.resolve_calls += 1
+            if failed_probe == "runner_adapter" and self.resolve_calls == 1:
+                raise ConnectionError("transient admission adapter failure")
+            return deps.resolve_adapter(uri)
+
+    class RecoveringController:
+        def __init__(self):
+            self.plan_calls = 0
+
+        def plan_for_run(self, *_args, **_kwargs):
+            self.plan_calls += 1
+            if failed_probe == "controller_ownership" and self.plan_calls == 1:
+                raise ConnectionError("transient admission ownership failure")
+            return []
+
+    runner = RecoveringRunner()
+    controller = RecoveringController()
+    deps.runner = runner
+    deps.runners = []
+    deps.node_ir = {}
+    deps.pick_runner = lambda _plan, _uid: runner
+    deps.controller = controller
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    before_head = metadb.catalog_managed_local_write_head(create.destination)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+        "confirmed": True,
+    })
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == APIErrorCode.SERVICE_UNAVAILABLE
+    assert response.json()["retryable"] is True
+    assert "write admission" in response.json()["detail"]
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+    assert metadb.catalog_managed_local_write_head(create.destination) == before_head
+    # The injected dependency is healthy after the admission probe; failure, rather than a lasting
+    # inability to write, is what must prevent provider-neutral fallback.
+    assert runner.resolve_adapter(create.destination) is deps.resolve_adapter(create.destination)
+    assert controller.plan_for_run(graph, "write", sizes={}) == []
+
+
 def test_sink_config_treats_injected_null_filename_as_absent():
     from hub.sinks import SinkSpec
 
