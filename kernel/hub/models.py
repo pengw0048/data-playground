@@ -31,7 +31,7 @@ DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
 SampleStrategy = Literal["prefix", "reservoir"]
-SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
+SampleFailureCategory = Literal["not_previewable", "syntax_error", "user_code_exception", "runtime_error"]
 SampleSuggestedAction = Literal["run"]
 ProfileSuggestedAction = Literal["full_profile"]
 RunConfirmationReason = Literal[
@@ -1623,6 +1623,13 @@ class UserCodeExceptionDetail(Wire):
     guidance: str | None = None
 
 
+class SyntaxErrorDetail(Wire):
+    """Location-aware diagnostics for code that Python cannot compile."""
+    line: int = Field(ge=1)
+    column: int | None = Field(default=None, ge=1)
+    message: str = Field(min_length=1)
+
+
 class EditorTestInput(Wire):
     """Opaque, server-proved identity of the retained rows used by one editor preview."""
 
@@ -1704,12 +1711,19 @@ class SampleResult(Wire):
         ),
     )
     failure_category: SampleFailureCategory | None = None
+    syntax_error: SyntaxErrorDetail | None = None
     user_code_exception: UserCodeExceptionDetail | None = None
     wire: WireType = "dataset"
 
     @model_validator(mode="after")
     def _truthful_scope(self) -> "SampleResult":
-        if self.user_code_exception is not None:
+        if self.syntax_error is not None:
+            if not self.error or self.not_previewable:
+                raise ValueError("a syntax error must be an error, not a preview refusal")
+            if self.failure_category not in (None, "syntax_error"):
+                raise ValueError("syntaxError requires failureCategory=syntax_error")
+            self.failure_category = "syntax_error"
+        elif self.user_code_exception is not None:
             if not self.error or self.not_previewable:
                 raise ValueError("a user-code exception must be an error, not a preview refusal")
             if self.failure_category not in (None, "user_code_exception"):

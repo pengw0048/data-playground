@@ -230,6 +230,9 @@ export function DataPanel({ nodeId, editorPreview }: {
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
   const res = preview.result!
+  if (res.failureCategory === 'syntax_error' && res.syntaxError) {
+    return withOutputPorts(<SyntaxFailure failure={res.syntaxError} />)
+  }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
     const failureNode = doc.nodes.find((candidate) => candidate.id === failureNodeId)
@@ -422,6 +425,21 @@ export function DataPanel({ nodeId, editorPreview }: {
         })()
       )}
     </div>,
+  )
+}
+
+function SyntaxFailure({ failure }: { failure: NonNullable<SampleResult['syntaxError']> }) {
+  return (
+    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-destructive/10 text-destructive">
+        <Icon name="code" size={18} />
+      </div>
+      <div className="text-[13px] font-semibold text-destructive">Fix the Python syntax</div>
+      <div className="dp-mono mx-auto mt-2 max-w-[420px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">
+        Line {failure.line}: {failure.message}
+      </div>
+      <div className="mx-auto mt-2 max-w-[380px] text-[11px]">Edit the code, then test it again.</div>
+    </div>
   )
 }
 

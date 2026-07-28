@@ -11,7 +11,7 @@ import uuid
 from typing import Any
 
 from hub import db, graph as g, paths
-from hub.executors.engine import BuildEngine, NotPreviewable, UserCodeError
+from hub.executors.engine import BuildEngine, NotPreviewable, TransformSyntaxError, UserCodeError
 from hub.executors.schema import apply_derived_references, derived_schemas_for_engine
 from hub.models import Graph, SampleResult, dataset_ref_identity
 from hub.plugins.adapters import revision_adapter_for_uri
@@ -209,6 +209,13 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
     except ManagedSourceReadError as e:
         return SampleResult(error=True, reason=str(e))
+    except TransformSyntaxError as e:
+        return SampleResult(
+            error=True,
+            failure_category="syntax_error",
+            reason=f"Line {e.line}: {e.message}" if e.line else e.message,
+            syntax_error={"line": e.line or 1, "column": e.column, "message": e.message},
+        )
     except UserCodeError as e:
         return SampleResult(
             error=True,

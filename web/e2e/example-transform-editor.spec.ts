@@ -110,3 +110,36 @@ test('Example rows stay local to the fullscreen Transform editor', async ({ page
       `/api/catalog/tables/${encodeURIComponent(registeredTable.id)}?${query}`)).ok()).toBe(true)
   }
 })
+
+test('syntax errors in fullscreen Transform tests identify and focus the editable line at supported desktop sizes', async ({ page }) => {
+  for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+    await page.setViewportSize(viewport)
+    const canvasId = `transform-syntax-${viewport.width}-${Date.now()}`
+    const graph = {
+      id: canvasId, name: 'Transform syntax feedback', version: 1, requirements: [], edges: [],
+      nodes: [{
+        id: 'transform', type: 'transform', position: { x: 240, y: 160 },
+        data: { title: 'Syntax feedback', status: 'draft', config: {
+          source: 'adhoc', mode: 'map', code: 'def fn(row)\n    return row', onError: 'raise',
+        } },
+      }],
+    }
+    const created = await page.request.post('/api/canvas', { data: graph })
+    expect(created.ok(), await created.text()).toBe(true)
+    try {
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}?node=transform`)
+      await page.getByRole('button', { name: 'Edit code' }).last().click()
+      await page.getByRole('button', { name: 'Example rows', exact: true }).click()
+      const fixture = page.getByRole('textbox', { name: 'Example rows JSON' })
+      await fixture.fill('[{"value":1}]')
+      await page.getByRole('button', { name: 'Test code' }).click()
+      await expect(page.getByText('Fix the Python syntax')).toBeVisible()
+      await expect(page.getByText("Line 1: expected ':'")).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Test again' })).toHaveCount(0)
+      await expect(page.locator('.monaco-editor')).toBeVisible()
+      await expect.poll(() => page.locator('.monaco-editor').evaluate((editor) => editor.contains(document.activeElement))).toBe(true)
+    } finally {
+      expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBe(true)
+    }
+  }
+})

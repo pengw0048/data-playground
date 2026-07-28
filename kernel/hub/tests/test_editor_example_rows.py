@@ -113,6 +113,22 @@ def test_example_rows_preserve_structured_transform_diagnostics():
     }
 
 
+def test_example_rows_preserve_syntax_location_without_sandbox_wrapper():
+    response = _preview(_graph(code="def fn(row)\n    return row"), '[{"value":1}]')
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["failureCategory"] == "syntax_error"
+    assert body["syntaxError"] == {
+        "line": 1,
+        "column": 12,
+        "message": "expected ':'",
+    }
+    assert body["reason"] == "Line 1: expected ':'"
+    assert "adhoc-cell" not in body["reason"]
+    assert "SandboxError" not in body["reason"]
+
+
 @pytest.mark.parametrize("flag", ["bypassed", "disabled"])
 def test_example_rows_test_code_despite_canvas_execution_flags(flag):
     graph = _graph()
