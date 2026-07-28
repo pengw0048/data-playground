@@ -4955,6 +4955,49 @@
         "title": "ExactMediaCellRequest",
         "type": "object"
       },
+      "ExactRunReadiness": {
+        "description": "Whether every ordinary local Source can enter a final immutable manifest now.",
+        "properties": {
+          "message": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          },
+          "reason": {
+            "enum": [
+              "ready",
+              "registration_required"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "sourceNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1024,
+            "title": "Sourcenodeids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ready",
+          "reason"
+        ],
+        "title": "ExactRunReadiness",
+        "type": "object"
+      },
       "ExecutionManifestDetail": {
         "description": "One subject-authorized immutable execution-manifest read.",
         "properties": {
@@ -8108,6 +8151,16 @@
             ],
             "title": "Bytes"
           },
+          "exactRunReadiness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactRunReadiness"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "inputManifest": {
             "anyOf": [
               {
@@ -9935,6 +9988,16 @@
               }
             ],
             "title": "Bytes"
+          },
+          "exactRunReadiness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactRunReadiness"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "needsConfirm": {
             "title": "Needsconfirm",
@@ -13787,6 +13850,16 @@
           "destination": {
             "title": "Destination",
             "type": "string"
+          },
+          "exactRunReadiness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactRunReadiness"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "expectedHead": {
             "anyOf": [

@@ -66,7 +66,11 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
   const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
   const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
-  const primaryActionLabel = isManagedWrite ? 'Publish revision' : 'Run'
+  const exactRunReadiness = writeAdmission?.exactRunReadiness ?? est?.exactRunReadiness
+  const exactRunReady = exactRunReadiness?.ready !== false
+  const primaryActionLabel = isManagedWrite
+    ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
+    : exactRunReady ? 'Run' : 'Exact input registration required'
   const previewActionLabel = isManagedWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
   if (isConfiguredManagedSidecarMerge) return (
@@ -134,16 +138,22 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               Uses the pinned exact Source version{pinnedInputs.length === 1 ? '' : 's'} shown on this Canvas.
             </div>
           )}
+          {!isWrite && exactRunReadiness?.ready === false && (
+            <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
+              <strong>Not exact-run-ready:</strong> {exactRunReadiness.message}
+            </div>
+          )}
           {phase === 'confirm' ? (
             <div className="mt-3.5 flex gap-2">
-              <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit}
-                title={canEdit ? primaryActionLabel : 'View-only canvas'}
+              <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit || !exactRunReady}
+                title={!canEdit ? 'View-only canvas' : exactRunReady ? primaryActionLabel : exactRunReadiness?.message ?? undefined}
                 className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">{primaryActionLabel}</Button>
               <Button size="sm" variant="outline" onClick={() => useStore.getState().closePanel(nodeId)} className="flex-1">Cancel</Button>
             </div>
           ) : (
-            <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit}
-              title={canEdit ? primaryActionLabel : 'View-only canvas'} className="mt-3.5 w-full">{primaryActionLabel}</Button>
+            <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit || !exactRunReady}
+              title={!canEdit ? 'View-only canvas' : exactRunReady ? primaryActionLabel : exactRunReadiness?.message ?? undefined}
+              className="mt-3.5 w-full">{primaryActionLabel}</Button>
           )}
         </>
       )}

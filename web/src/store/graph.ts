@@ -2263,7 +2263,11 @@ export const useStore = create<Store>((set, get) => ({
       }
     }
     const schemaDriftConfirm = writeAdmission?.intent?.schemaDrift?.requiresConfirmation === true
-    if (estimate.needsConfirm || schemaDriftConfirm) {
+    if (estimate.exactRunReadiness?.ready === false) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), estimate, phase: 'estimated',
+      } }, openPanels: { [id]: 'run' } }))
+    } else if (estimate.needsConfirm || schemaDriftConfirm) {
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate, phase: 'confirm',
       } }, openPanels: { [id]: 'run' } }))
@@ -2469,6 +2473,10 @@ export const useStore = create<Store>((set, get) => ({
     if (hasConfiguredUpsertWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Keyed upsert uses its certified admission flow.', 'info')
+      return
+    }
+    if (get().runs[id]?.estimate?.exactRunReadiness?.ready === false) {
+      set((s) => ({ openPanels: { [id]: 'run' } }))
       return
     }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return

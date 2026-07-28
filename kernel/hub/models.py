@@ -1942,12 +1942,22 @@ class PipelineImport(Wire):
 # --------------------------------------------------------------------------- #
 # Execution
 # --------------------------------------------------------------------------- #
+class ExactRunReadiness(Wire):
+    """Whether every ordinary local Source can enter a final immutable manifest now."""
+
+    ready: bool
+    reason: Literal["ready", "registration_required"]
+    source_node_ids: list[str] = Field(default_factory=list, max_length=1024)
+    message: str | None = Field(default=None, max_length=4096)
+
+
 class RunEstimate(Wire):
     rows: int | None = None   # real source-row count; None when no source is countable (size unknown)
     bytes: int | None = None  # estimated peak data volume (rows × row width); the confirm gate's cost signal
     placement: Placement
     needs_confirm: bool
     breakdown: str | None = None
+    exact_run_readiness: ExactRunReadiness | None = None
 
 
 class ProfileEstimate(RunEstimate):
@@ -3058,3 +3068,4 @@ class WriteAdmission(Wire):
     intent: WriteIntent | None = None
     recovered_receipt: WriteReceipt | None = None
     blocker: str | None = Field(default=None, max_length=4096)
+    exact_run_readiness: ExactRunReadiness | None = None
