@@ -134,7 +134,7 @@ export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; om
                 {val ? 'true' : 'false'}
               </button>
             ) : p.type === 'int' || p.type === 'float' ? (
-              <NumberField param={p} value={val} draft={numericDrafts?.[p.name]}
+              <NumberField param={p} value={configured} draft={numericDrafts?.[p.name]}
                 onDraft={(text) => setNumericDraft(nodeId, p.name, text)}
                 onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
             ) : (
@@ -180,16 +180,23 @@ function NumberField({ param, value, draft, onDraft, onCommit }: {
   param: BackendParam; value: unknown; draft?: string
   onDraft: (text: string | undefined) => void; onCommit: (n: number | undefined) => void
 }) {
-  const text = draft ?? (value == null ? '' : String(value))
+  const settled = value ?? param.default
+  const text = draft ?? (settled == null ? '' : String(settled))
   const reason = draft !== undefined
     ? numericParamReason(param, draft)
-    : value != null && (typeof value !== 'number'
-      || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value)))
-      ? numericTypeReason(param)
-      : null
-  const clearHint = param.default != null
-    ? `Clear to use the declared default (${String(param.default)}).`
-    : !param.required ? 'Clear to leave this value unset.' : null
+    : value == null
+      ? numericParamReason(param, text)
+      : typeof value !== 'number'
+        || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value))
+        ? numericTypeReason(param)
+        : null
+  const parsedText = parseNumericParam(text, param.type as 'int' | 'float')
+  const clearHint = parsedText.kind !== 'valid' ? null
+    : param.default != null && parsedText.value !== Number(param.default)
+      ? `Clear to reset to the default (${String(param.default)}).`
+      : param.default == null && !param.required
+        ? 'Clear to leave this value unset.'
+        : null
   return (
     <>
       <MiniInput mono value={text} onChange={(v) => onDraft(v)} onBlur={() => {
