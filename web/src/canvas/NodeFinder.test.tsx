@@ -43,6 +43,31 @@ describe('node finder', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
+  it('uses the same keyboard-first picker for compatible port connections', () => {
+    const onPick = vi.fn()
+    const onClose = vi.fn()
+    const specs = [
+      node({ kind: 'transform', title: 'Transform', source: 'plugin:quality-pack' }),
+      node({ kind: 'metric-only', title: 'Metric only', inputs: [{ id: 'metric', wire: 'metric', accepts: ['metric'] }] }),
+    ]
+    render(<NodeFinder specs={specs} wire="dataset" compatibleOnly onPick={onPick} onClose={onClose} />)
+
+    const search = screen.getByRole('textbox', { name: 'Search operations' })
+    expect(screen.getByRole('dialog', { name: 'Connect to an operation' })).toBeVisible()
+    expect(search).toHaveFocus()
+    expect(screen.getAllByRole('option')).toHaveLength(1)
+    expect(screen.getByRole('option')).toHaveTextContent('Plugin · quality-pack')
+    fireEvent.change(search, { target: { value: 't' } })
+    fireEvent.keyDown(search, { key: 'ArrowDown' })
+    fireEvent.keyDown(search, { key: 'ArrowUp' })
+    fireEvent.keyDown(search, { key: 'Enter' })
+    expect(onPick).toHaveBeenCalledWith('transform')
+    fireEvent.click(screen.getByRole('option'))
+    expect(onPick).toHaveBeenCalledTimes(2)
+    fireEvent.keyDown(search, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
   it('renders only the first 100 results while reporting a truncated full search', () => {
     const specs = Array.from({ length: 101 }, (_, index) => node({ kind: `plugin-${index}`, title: `Plugin ${index}` }))
     render(<NodeFinder specs={specs} onPick={vi.fn()} onClose={vi.fn()} />)

@@ -350,10 +350,16 @@ test.describe('Data Playground canvas', () => {
 
   test('operation search is explicit about adding and keeps category browsing available', async ({ page }) => {
     await fresh(page)
+    await page.setViewportSize({ width: 1280, height: 720 })
     await page.getByRole('button', { name: 'Add operation', exact: true }).click()
     const finder = page.getByRole('dialog', { name: 'Add an operation' })
     const search = finder.getByRole('textbox', { name: 'Search operations' })
     await expect(search).toBeFocused()
+    const box = await boxOf(finder)
+    expect(box.x).toBeGreaterThanOrEqual(16)
+    expect(box.x + box.width).toBeLessThanOrEqual(1264)
+    expect(box.y).toBeGreaterThanOrEqual(0)
+    expect(box.y + box.height).toBeLessThanOrEqual(720)
     await search.fill('descriptor_contract')
     await expect(finder.getByRole('option', { name: /descriptor_contract/i }).first()).toContainText('Plugin · dp-descriptor-contract')
     await search.fill('filter')
@@ -579,15 +585,29 @@ test.describe('Data Playground canvas', () => {
     expect(insideCard, 'tooltip is still inside the node card and gets clipped').toBe(false)
   })
 
-  test('clicking an output port opens the node menu; sql can connect out', async ({ page }) => {
+  test('clicking an output port opens the focused compatible picker and creates one connected node', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Query', 'sql')
-    // a plain click (no drag) on the sql output handle opens the connect-from-port menu…
+    await page.setViewportSize({ width: 1440, height: 900 })
+    // A plain click (no drag) on the sql output handle opens the same picker as toolbar Add.
     await page.locator('.react-flow__node .react-flow__handle-right').first().click()
-    await expect(page.getByText('accepts dataset')).toBeVisible()
-    // …and it is NOT empty — proves sql (a SQL view) can feed downstream dataset nodes
-    await expect(page.locator('.dp-panel').getByText('filter', { exact: true })).toBeVisible()
-    await expect(page.getByText('no compatible node')).toHaveCount(0)
+    const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
+    const search = finder.getByRole('textbox', { name: 'Search operations' })
+    await expect(search).toBeFocused()
+    await expect(page.getByText('Search all nodes…')).toHaveCount(0)
+    const box = await boxOf(finder)
+    expect(box.x).toBeGreaterThanOrEqual(16)
+    expect(box.x + box.width).toBeLessThanOrEqual(1424)
+    expect(box.y).toBeGreaterThanOrEqual(0)
+    expect(box.y + box.height).toBeLessThanOrEqual(900)
+    await search.pressSequentially('t')
+    await expect(finder.getByRole('option', { name: /transform/i })).toHaveCount(1)
+    await search.press('ArrowDown')
+    await search.press('ArrowUp')
+    await search.press('Enter')
+    await expect(finder).toBeHidden()
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
   })
 
   test('dragging from an output port and releasing shows no menu', async ({ page }) => {
@@ -599,7 +619,7 @@ test.describe('Data Playground canvas', () => {
     await page.mouse.down()
     await page.mouse.move(b.x + 160, b.y + 120, { steps: 8 }) // a real drag onto empty pane
     await page.mouse.up()
-    await expect(page.getByText('accepts dataset')).toHaveCount(0) // drag-release must not pop the picker
+    await expect(page.getByRole('dialog', { name: 'Connect to an operation' })).toHaveCount(0) // drag-release must not pop the picker
   })
 
   test('a node with no upstream source has Run disabled', async ({ page }) => {
