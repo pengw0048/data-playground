@@ -370,7 +370,9 @@ describe('Catalog discovery request and mutation truth', () => {
 
     expect(await screen.findByText(/Couldn't load lineage: HTTP 503/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-lineage-retry'))
-    expect(await screen.findByText('No related datasets yet.')).toBeInTheDocument()
+    expect(await screen.findAllByText('No related datasets yet.')).toHaveLength(1)
+    expect(screen.queryByText('Parents')).not.toBeInTheDocument()
+    expect(screen.queryByText('Children')).not.toBeInTheDocument()
 
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
