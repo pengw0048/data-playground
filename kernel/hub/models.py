@@ -642,7 +642,11 @@ class RelatedDatasetIdentity(Wire):
 
 
 class RelatedDatasetCandidate(Wire):
-    """One reviewed way to add a second dataset to a Join."""
+    """One reviewed way to add a second dataset to a Join.
+
+    Cardinality is a join-risk measurement, not semantic relationship evidence.  Consumers must
+    use the page group and ``evidence``/``evidence_status`` when describing how the match is known.
+    """
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
     identity: RelatedDatasetIdentity
@@ -669,10 +673,16 @@ class RelatedDatasetExclusion(Wire):
 
 
 class RelatedDatasetPage(Wire):
-    """One bounded related-dataset review page; there is intentionally no continuation."""
+    """One bounded related-dataset review page; there is intentionally no continuation.
+
+    ``candidates`` contains only relationships backed by catalog or reference evidence.
+    ``possible_matches`` keeps name/schema inference discoverable without presenting it as known
+    catalog knowledge.
+    """
     source: RelatedDatasetIdentity
     source_name: str
     candidates: list[RelatedDatasetCandidate]
+    possible_matches: list[RelatedDatasetCandidate]
     excluded: list[RelatedDatasetExclusion] = Field(default_factory=list)
     limit: int
     inspected: int

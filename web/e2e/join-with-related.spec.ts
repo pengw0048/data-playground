@@ -136,7 +136,7 @@ test.describe('Join with related data', () => {
     try {
       await seedSourceCanvas(page, canvasId, left)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
-      await expect(page.getByText('Declared and proven references')).toBeVisible()
+      await expect(page.getByText('Related data')).toBeVisible()
       await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
       await expect(page.getByText('Selected dataset')).toBeVisible()
       await expect(page.getByText('Related dataset', { exact: true })).toBeVisible()
@@ -171,7 +171,7 @@ test.describe('Join with related data', () => {
     try {
       await seedSourceCanvas(page, canvasId, left)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
-      await expect(page.getByText('Declared and proven references')).toBeVisible()
+      await expect(page.getByText('Related data')).toBeVisible()
       await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
       await page.getByLabel('Join type').selectOption('left')
       await page.getByTestId('confirm-related-join').click()
@@ -282,35 +282,19 @@ test.describe('Join with related data', () => {
     }
   })
 
-  test('a real local inferred candidate is reviewable and cancellation stays non-mutating', async ({ page }) => {
-    const token = `join-inferred-${Date.now()}`
-    const dataRoot = resolve(process.cwd(), '.e2e-workspace', 'data')
-    const sourcePath = resolve(dataRoot, `${token}-source.csv`)
-    const targetPath = resolve(dataRoot, `${token}-target.csv`)
-    const canvasId = `${token}-canvas`
-    const registered: Array<Table & { metadataRevision?: string }> = []
-    writeFileSync(sourcePath, 'id,value\n1,source\n')
-    writeFileSync(targetPath, 'id,label\n1,target\n')
+  test('seeded name-only IDs are possible matches, not related data', async ({ page }) => {
+    const source = await catalogTable(page.request, 'events')
+    const target = await catalogTable(page.request, 'images')
+    const canvasId = `join-inferred-${Date.now()}`
     try {
-      const sourceResponse = await page.request.post('/api/catalog/register', { data: {
-        uri: sourcePath, name: `${token}-source`,
-      } })
-      expect(sourceResponse.ok()).toBeTruthy()
-      const source = await sourceResponse.json() as Table & { metadataRevision?: string }
-      registered.push(source)
-      const targetResponse = await page.request.post('/api/catalog/register', { data: {
-        uri: targetPath, name: `${token}-target`,
-      } })
-      expect(targetResponse.ok()).toBeTruthy()
-      const target = await targetResponse.json() as Table & { metadataRevision?: string }
-      registered.push(target)
-
       await seedSourceCanvas(page, canvasId, source)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
       await page.getByPlaceholder('Dataset, column, tag…').fill(target.name)
-      await expect(page.getByText('Inferred candidates')).toBeVisible()
+      await expect(page.getByRole('heading', { name: 'Related data' })).toHaveCount(0)
+      await page.getByRole('button', { name: /Show possible matches/ }).click()
+      await expect(page.getByText('Possible matches')).toBeVisible()
       await page.getByRole('button', { name: new RegExp(target.name, 'i') }).click()
-      await expect(page.getByText('Related dataset', { exact: true })).toBeVisible()
+      await expect(page.getByText('Possible match', { exact: true })).toBeVisible()
       await page.getByRole('button', { name: 'Cancel', exact: true }).click()
       const unchanged = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
       expect(unchanged.version).toBe(1)
@@ -318,10 +302,6 @@ test.describe('Join with related data', () => {
       expect(unchanged.edges).toHaveLength(0)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
-      await Promise.all(registered.map((table) => unregisterTable(page.request, table)))
-      for (const path of [sourcePath, targetPath]) {
-        try { unlinkSync(path) } catch { /* source files are disposable test fixtures */ }
-      }
     }
   })
 

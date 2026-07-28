@@ -10,9 +10,9 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 
 const EVIDENCE_LABEL = {
-  declared_relationship: 'Declared relationship',
-  typed_reference: 'Typed reference',
-  schema_match: 'Inferred schema match',
+  declared_relationship: 'Persisted catalog relationship',
+  typed_reference: 'Declared key/reference',
+  schema_match: 'Schema-name inference',
 } as const
 
 const CARDINALITY_TONE: Record<string, string> = {
@@ -85,13 +85,6 @@ function friendlyActionError(error: string) {
   return 'The Join could not be added. Try again.'
 }
 
-function relationshipEvidence(candidate: RelatedDatasetCandidate) {
-  if (candidate.cardinality === 'unknown' || candidate.reason.includes('cardinality not measurable')) {
-    return 'Matching key columns.'
-  }
-  return candidate.reason
-}
-
 export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   nodeId: string
   surface?: 'inspector' | 'canvas'
@@ -148,6 +141,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const [q, setQ] = useState('')
   const [folder, setFolder] = useState('')
   const [page, setPage] = useState<RelatedDatasetPage | null>(null)
+  const [showPossibleMatches, setShowPossibleMatches] = useState(false)
   const [candidate, setCandidate] = useState<RelatedDatasetCandidate | null>(null)
   const [candidateBase, setCandidateBase] = useState<RelatedDatasetCandidate | null>(null)
   const [requestedRevisionId, setRequestedRevisionId] = useState('')
@@ -182,8 +176,9 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
       })
       if (generation !== request.current) return
       setPage(next)
+      setShowPossibleMatches(false)
       if (preserveSelection && candidate) {
-        const refreshed = next.candidates.find((item) => (
+        const refreshed = [...next.candidates, ...(next.possibleMatches ?? [])].find((item) => (
           (item.identity.registrationId ?? item.identity.sourceBindingId)
             === (candidate.identity.registrationId ?? candidate.identity.sourceBindingId)
         ))
@@ -377,8 +372,8 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const reviewedRevisionId = candidate?.identity.revisionMode === 'exact'
     ? candidate.identity.revisionId ?? '' : ''
   const exactRevisionPending = Boolean(requestedRevisionId && requestedRevisionId !== reviewedRevisionId)
-  const declared = page?.candidates.filter((item) => item.evidence !== 'schema_match') ?? []
-  const inferred = page?.candidates.filter((item) => item.evidence === 'schema_match') ?? []
+  const related = page?.candidates ?? []
+  const possibleMatches = page?.possibleMatches ?? []
   const sourceOnRight = context.emptyPort === 'a'
   const oriented = candidate ? orientedJoinFacts(candidate, sourceOnRight) : null
   const sourceReview = {
@@ -387,7 +382,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   }
   const relatedReview = candidate ? {
     name: candidate.name,
-    role: 'Related dataset',
+    role: candidate.evidence === 'schema_match' ? 'Possible match' : 'Related dataset',
   } : null
   const leftReview = sourceOnRight ? relatedReview : sourceReview
   const rightReview = sourceOnRight ? sourceReview : relatedReview
@@ -428,7 +423,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
           <div className="overflow-y-auto p-4">
             {!candidate ? <>
               {page && <div className="mb-3 text-xs text-muted-foreground">
-                Join <strong className="text-foreground">{page.sourceName}</strong> with a related dataset.
+                Find catalog-backed relationships for <strong className="text-foreground">{page.sourceName}</strong>.
               </div>}
               <div className="grid grid-cols-2 gap-2">
                 <Label className="text-[10.5px]">Search
@@ -444,17 +439,21 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                 {error} <button className="ml-1 font-semibold underline" onClick={() => void load()}>Retry</button>
               </div>}
               {loading && <div className="py-8 text-center text-xs text-muted-foreground">Finding bounded candidates…</div>}
-              {!loading && page && page.candidates.length === 0 && <div data-testid="related-no-results"
+              {!loading && page && related.length === 0 && possibleMatches.length === 0 && <div data-testid="related-no-results"
                 className="py-8 text-center text-xs text-muted-foreground">
-                No related datasets in this search/folder scope.
+                No known relationships in this search/folder scope.
               </div>}
-              {!loading && declared.length > 0 && <CandidateGroup title="Declared and proven references"
-                candidates={declared} swapInputs={sourceOnRight} onSelect={(item) => {
+              {!loading && related.length > 0 && <CandidateGroup title="Related data"
+                candidates={related} swapInputs={sourceOnRight} onSelect={(item) => {
                   setCandidate(item); setCandidateBase(item)
                   setRequestedRevisionId(item.identity.revisionMode === 'exact' ? item.identity.revisionId ?? '' : '')
                 }} />}
-              {!loading && inferred.length > 0 && <CandidateGroup title="Inferred candidates"
-                candidates={inferred} swapInputs={sourceOnRight} onSelect={(item) => {
+              {!loading && possibleMatches.length > 0 && !showPossibleMatches && <Button type="button" variant="outline"
+                className="mt-4" onClick={() => setShowPossibleMatches(true)}>
+                Show possible matches ({possibleMatches.length})
+              </Button>}
+              {!loading && showPossibleMatches && possibleMatches.length > 0 && <CandidateGroup title="Possible matches"
+                candidates={possibleMatches} swapInputs={sourceOnRight} onSelect={(item) => {
                   setCandidate(item); setCandidateBase(item)
                   setRequestedRevisionId(item.identity.revisionMode === 'exact' ? item.identity.revisionId ?? '' : '')
                 }} />}
@@ -571,7 +570,7 @@ function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
           className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent">
           <span className="min-w-0">
             <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
-            <span className="block text-[10.5px] text-muted-foreground">{relationshipEvidence(candidate)}</span>
+            <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
             <span className="block truncate font-mono text-[10px] text-muted-foreground">
               {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
             </span>

@@ -8617,7 +8617,7 @@
       },
       "RelatedDatasetCandidate": {
         "additionalProperties": false,
-        "description": "One reviewed way to add a second dataset to a Join.",
+        "description": "One reviewed way to add a second dataset to a Join.\n\nCardinality is a join-risk measurement, not semantic relationship evidence.  Consumers must\nuse the page group and ``evidence``/``evidence_status`` when describing how the match is known.",
         "properties": {
           "cardinality": {
             "default": "unknown",
@@ -8845,7 +8845,7 @@
         "type": "object"
       },
       "RelatedDatasetPage": {
-        "description": "One bounded related-dataset review page; there is intentionally no continuation.",
+        "description": "One bounded related-dataset review page; there is intentionally no continuation.\n\n``candidates`` contains only relationships backed by catalog or reference evidence.\n``possible_matches`` keeps name/schema inference discoverable without presenting it as known\ncatalog knowledge.",
         "properties": {
           "candidates": {
             "items": {
@@ -8868,6 +8868,13 @@
           "limit": {
             "title": "Limit",
             "type": "integer"
+          },
+          "possibleMatches": {
+            "items": {
+              "$ref": "#/components/schemas/RelatedDatasetCandidate"
+            },
+            "title": "Possiblematches",
+            "type": "array"
           },
           "refinementRequired": {
             "default": false,
@@ -8903,6 +8910,7 @@
           "source",
           "sourceName",
           "candidates",
+          "possibleMatches",
           "limit",
           "inspected"
         ],
