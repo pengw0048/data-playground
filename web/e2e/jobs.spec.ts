@@ -216,6 +216,10 @@ test('long shared-prefix Canvas names keep their suffixes visible without wideni
   await expect(zwj).toHaveText(zwjName)
   for (const [width, height] of [[1280, 720], [1440, 900]] as const) {
     await page.setViewportSize({ width, height })
+    const recorded = left.locator('xpath=ancestor::button').locator(':scope > span').last()
+    await expect(recorded).toBeVisible()
+    expect(await recorded.evaluate((element) => getComputedStyle(element).whiteSpace),
+      `Recorded timestamp should stay on one line at ${width}px`).toBe('nowrap')
     for (const subject of [left, right, unicodeLeft, unicodeRight, combining, zwj]) {
       await expect(subject).toBeVisible()
       const row = subject.locator('xpath=ancestor::button')

@@ -388,8 +388,8 @@ export function JobsView() {
         {!loading && !error && items.length === 0 && !selectedRunUnavailable && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
         {items.length > 0 && <section aria-labelledby="jobs-list-heading">
           <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Runs and background tasks</h2>
-          <div className="min-w-[850px] overflow-hidden rounded-lg border border-border bg-card">
-            <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <div className="min-w-[900px] overflow-hidden rounded-lg border border-border bg-card">
+            <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
               <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
             </div>
             {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} />)}
@@ -505,7 +505,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
-      className="grid w-full grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
+      className="grid w-full grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
       <span className="flex flex-wrap items-center gap-1.5">
         <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
         {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
@@ -519,7 +519,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
       <span className="text-muted-foreground">{duration}</span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
-      <span className="text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
+      <span className="whitespace-nowrap text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">

@@ -55,6 +55,7 @@ describe('JobsView', () => {
     expect(await screen.findByText('Alpha research')).toBeVisible()
     expect(screen.getByText('Publish observations')).toBeVisible()
     expect(screen.getByText('destination unavailable')).toBeVisible()
+    expect(screen.getByText(new Date('2026-07-16T12:00:00Z').toLocaleString())).toHaveClass('whitespace-nowrap')
     fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
