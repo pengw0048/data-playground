@@ -1333,7 +1333,15 @@ export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'tran
 // tolerate an offline kernel, but a deliberate invalid_graph refusal needs a visible explanation.
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
-  const message = error.message || 'The graph cannot run.'
+  const leftMissing = /Join node .+ requires exactly one incoming edge on input 'a'/.test(error.message)
+  const rightMissing = /Join node .+ requires exactly one incoming edge on input 'b'/.test(error.message)
+  // The execution contract uses stable registry IDs, but they are not recovery instructions for
+  // researchers. Keep the exact backend message for every other graph refusal.
+  const message = leftMissing
+    ? 'This Join needs a left dataset before it can run.'
+    : rightMissing
+      ? 'This Join needs a right dataset before it can run.'
+      : error.message || 'The graph cannot run.'
   if (!state.toasts.some((toast) => toast.kind === 'error' && toast.msg === message)) {
     state.pushToast(message, 'error')
   }

@@ -12,7 +12,9 @@ import { JoinWithRelated } from '../../components/JoinWithRelated'
 
 function Join({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
-  const config = useStore((s) => s.doc.nodes.find((node) => node.id === id)?.data.config ?? data.config)
+  const doc = useStore((s) => s.doc)
+  const incoming = doc.edges.filter((edge) => edge.target === id)
+  const config = doc.nodes.find((node) => node.id === id)?.data.config ?? data.config
   const on = String(config.on ?? '')
   const condition = String(config.condition ?? '')
   const how = (config.how as NodeConfig['how']) ?? 'inner'
@@ -23,6 +25,7 @@ function Join({ id, data }: NodeComponentProps) {
     ?? ['inner', 'left', 'right', 'outer']) as NonNullable<NodeConfig['how']>[])
   const leftColumns = useInputColumnsForPort(id, 'a')
   const rightColumns = useInputColumnsForPort(id, 'b')
+  const connectedInput = incoming.length === 1 ? incoming[0].targetHandle : null
   const parsed = parseJoinKeys(on, condition)
   const [advanced, setAdvanced] = useState(parsed === null)
   // A half-selected pair is an editor draft, not an executable join. Keeping it locally lets a
@@ -54,6 +57,21 @@ function Join({ id, data }: NodeComponentProps) {
   const addPair = () => commit([...pairs, { left: '', right: '' }])
   return (
     <NodeCard id={id} data={data} metaOverride={`${how}${condition ? ` · on ${condition}` : on ? ` · on ${on}` : ''}`}>
+      {incoming.length === 0 && (
+        <p data-testid="join-missing-datasets" className="text-[10.5px] leading-snug text-muted-foreground">
+          Choose a left dataset and a right dataset before this Join can run.
+        </p>
+      )}
+      {connectedInput === 'a' && (
+        <p data-testid="join-missing-right-dataset" className="text-[10.5px] leading-snug text-muted-foreground">
+          Left dataset connected. Connect a right dataset to continue.
+        </p>
+      )}
+      {connectedInput === 'b' && (
+        <p data-testid="join-missing-left-dataset" className="text-[10.5px] leading-snug text-muted-foreground">
+          Right dataset connected. Connect a left dataset to continue.
+        </p>
+      )}
       <Field label="join type">
         <select aria-label="Join type" value={how} onClick={(event) => event.stopPropagation()}
           onChange={(event) => updateConfig(id, { how: event.target.value as NodeConfig['how'] })} className={cn('nodrag', miniSelectClass)}>

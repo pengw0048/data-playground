@@ -1207,6 +1207,20 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().refreshSchemas()
     expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
     expect(useStore.getState().toasts).toHaveLength(1)
+
+    useStore.setState({ toasts: [] })
+    const incompleteJoin = new KernelError(
+      400,
+      "invalid graph: Join node 'join-1' requires exactly one incoming edge on input 'b'",
+      'invalid_graph',
+    )
+    apiMocks.schema.mockRejectedValue(incompleteJoin)
+    apiMocks.graphSizes.mockRejectedValue(incompleteJoin)
+    await useStore.getState().refreshSchemas()
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'This Join needs a right dataset before it can run.',
+    }])
+    expect(useStore.getState().toasts[0].msg).not.toContain("input 'b'")
   })
 
   it('keeps preview inputs for full runs and refreshes moved heads only after acceptance', async () => {

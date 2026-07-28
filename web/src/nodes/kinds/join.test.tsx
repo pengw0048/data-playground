@@ -47,6 +47,24 @@ describe('Join card — join types come from the backend spec (UX-05)', () => {
     }
   })
 
+  it('describes bare and one-sided drafts with dataset roles instead of internal port IDs', () => {
+    const Join = getComponent('join')!
+    useStore.setState((state) => ({
+      doc: { ...state.doc, edges: [] },
+    }))
+    const { rerender } = render(<ReactFlowProvider><Join id="j" data={useStore.getState().doc.nodes[0].data} /></ReactFlowProvider>)
+    expect(screen.getByTestId('join-missing-datasets'))
+      .toHaveTextContent('Choose a left dataset and a right dataset before this Join can run.')
+    expect(screen.queryByTestId('join-missing-datasets')).not.toHaveTextContent(/input \([ab]\)/)
+
+    useStore.setState((state) => ({
+      doc: { ...state.doc, edges: [{ id: 'a', source: 'left', target: 'j', targetHandle: 'a', data: { wire: 'dataset' } }] },
+    }))
+    rerender(<ReactFlowProvider><Join id="j" data={useStore.getState().doc.nodes[0].data} /></ReactFlowProvider>)
+    expect(screen.getByTestId('join-missing-right-dataset'))
+      .toHaveTextContent('Left dataset connected. Connect a right dataset to continue.')
+  })
+
   it('uses separate port-aware selectors and serializes ordered heterogeneous pairs', () => {
     const Join = getComponent('join')!
     const data = useStore.getState().doc.nodes[0].data

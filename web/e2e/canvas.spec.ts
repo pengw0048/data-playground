@@ -512,6 +512,47 @@ test.describe('Data Playground canvas', () => {
     await page.getByRole('button', { name: 'Redo', exact: true }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(3)
     await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+
+    const selectedTransform = page.locator('.react-flow__node-transform')
+    const transformId = await selectedTransform.getAttribute('data-id')
+    expect(transformId).not.toBeNull()
+    await selectedTransform.click()
+    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
+    const joinPicker = page.getByRole('dialog', { name: 'Add an operation' })
+    await joinPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
+    const contextualJoin = joinPicker.getByRole('option', { name: /join/i })
+    await expect(contextualJoin).toContainText('Add next step after transform')
+    await joinPicker.getByRole('textbox', { name: 'Search operations' }).press('Escape')
+    await expect(joinPicker).toBeHidden()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+
+    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
+    const confirmedJoinPicker = page.getByRole('dialog', { name: 'Add an operation' })
+    await confirmedJoinPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
+    await confirmedJoinPicker.getByRole('option', { name: /join/i }).click()
+    const joinNode = page.locator('.react-flow__node-join')
+    await expect(joinNode).toHaveCount(1)
+    await expect(joinNode).toContainText('Left dataset connected. Connect a right dataset to continue.')
+    await expect(page.getByText('This Join needs a right dataset before it can run.')).toBeVisible()
+    await expect(page.locator('.react-flow__edge')).toHaveCount(3)
+    await expect.poll(async () => {
+      const saved = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
+      const join = saved.nodes.find((node: { type: string }) => node.type === 'join')
+      return join && saved.edges.some((edge: { source: string; target: string; targetHandle?: string }) => (
+        edge.source === transformId && edge.target === join.id && edge.targetHandle === 'a'
+      ))
+    }).toBeTruthy()
+    const joinBox = await boxOf(joinNode)
+    expect(contains(await boxOf(page.locator('.react-flow')), joinBox), 'Join card is outside the visible Canvas').toBe(true)
+    expect(overlaps(joinBox, await boxOf(page.getByTestId('toolbar'))), 'Join card overlaps the toolbar').toBe(false)
+
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+    await page.getByRole('button', { name: 'Redo', exact: true }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(4)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(3)
   })
 
   test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {

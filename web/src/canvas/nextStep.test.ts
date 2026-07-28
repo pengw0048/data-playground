@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { register } from '../nodes/registry'
 import type { CanvasEdge, CanvasNode } from '../types/graph'
 import { uniqueNextStepConnection } from './nextStep'
+import '../nodes/kinds/join'
 
 const Empty = () => null
 const node = (id: string, type: string): CanvasNode => ({
@@ -53,7 +54,13 @@ describe('uniqueNextStepConnection', () => {
     })
   })
 
-  it('refuses to guess a multiple-output or multiple-input connection', () => {
+  it('uses Join\'s built-in left input for one unambiguous dataset output', () => {
+    expect(uniqueNextStepConnection(node('source', 'next-source-test'), 'join')).toEqual({
+      sourceHandle: 'out', targetHandle: 'a', wire: 'dataset',
+    })
+  })
+
+  it('refuses to guess a multiple-output or arbitrary multiple-input connection', () => {
     expect(uniqueNextStepConnection(node('split', 'next-ambiguous-output-test'), 'next-sample-test')).toBeNull()
     expect(uniqueNextStepConnection(node('source', 'next-source-test'), 'next-ambiguous-input-test')).toBeNull()
   })
