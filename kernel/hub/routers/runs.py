@@ -2316,8 +2316,9 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     placement policy, and the UI hint all share ONE estimator: also returns the full per-node `sizes` so
     the caller can hand THIS schema+actual-aware estimate to the RunController's placement (else placement
     would re-estimate with coarse default widths and the measured vector/decimal widths would be inert
-    there). A known row count plus an unknown column width keeps bytes=None so the confirm gate can ask;
-    (None, None, {}) when nothing is countable retains the existing fast-failure behavior."""
+    there). A known row count plus an unknown column width keeps bytes=None; the runner admits the
+    normal bounded-preview envelope directly and confirms beyond it. (None, None, {}) when nothing is
+    countable retains the existing fast-failure behavior."""
     from hub.estimate import estimate_sizes
     from hub.local_run_inputs import prepared_ancestor_source_node_ids
     prepared_sources = prepared_ancestor_source_node_ids(
@@ -2358,8 +2359,8 @@ def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimat
         ))
         if reasons:
             # A prepared node is allowed to return no restriction, or another enabled branch may
-            # still consume the Source normally. Unknown pre-admission cost therefore requires the
-            # same explicit confirmation as a known row count with unknown width.
+            # still consume the Source normally. With no bounded row count at all, unknown
+            # pre-admission cost still requires explicit confirmation.
             estimate.needs_confirm = True
             estimate.breakdown = (
                 f"{estimate.breakdown} · confirmation required: {reasons[0]}"
@@ -2371,10 +2372,11 @@ def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimat
         size.uncertainty for size in sizes.values()
         if size.rows is not None and size.bytes is None and size.uncertainty
     ))
-    reason = reasons[0] if reasons else (
-        "Byte size is unknown because bounded column-width evidence is unavailable."
-    )
-    estimate.breakdown = f"{estimate.breakdown} · confirmation required: {reason}"
+    if estimate.needs_confirm:
+        reason = reasons[0] if reasons else (
+            "Byte size is unknown because bounded column-width evidence is unavailable."
+        )
+        estimate.breakdown = f"{estimate.breakdown} · confirmation required: {reason}"
     return estimate
 
 

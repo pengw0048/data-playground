@@ -44,8 +44,9 @@ from hub.run_outputs import (
     sole_output,
 )
 
-_CONFIRM_ROWS = 5_000_000   # fallback gate when byte size is unknown but the row count is known
+_CONFIRM_ROWS = 5_000_000   # row floor even when a narrow fixed-width estimate stays below 2 GiB
 _CONFIRM_BYTES = 2 << 30    # 2 GiB — the primary confirm signal: a full pass moving this much data
+_DIRECT_UNKNOWN_WIDTH_ROWS = 2_000  # the normal bounded-preview envelope may run without an extra prompt
 
 
 def _safe_abandon_attempt(uri: str) -> None:
@@ -358,9 +359,9 @@ class LocalRunner:
         # No fabricated ETA — a per-op seconds guess is uncalibrated and misleadingly precise. The honest
         # cost signal is DATA VOLUME: confirm on estimated bytes (primary), because a 5M-row pass over one
         # int (~20 MB) is trivial while 200k wide rows can be gigabytes — the old pure row gate misfired on
-        # both. A known row count with unknown byte width requires confirmation: variable binary columns
-        # can make a small-looking row count arbitrarily expensive. Unknown-and-uncountable keeps its
-        # existing fast-failure behavior and does not add a gate.
+        # both. Unknown byte width is not a reason to block a normal bounded-preview-sized pass by itself,
+        # but beyond that small envelope the missing byte bound still requires an explicit decision.
+        # Unknown-and-uncountable keeps its existing fast-failure behavior and does not add a gate.
         placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
         if rows is None and byts is None:
             return RunEstimate(rows=None, bytes=None, placement=placement, needs_confirm=False,
@@ -369,7 +370,7 @@ class LocalRunner:
         # misses) OR a large row count (the width estimate can under-count variable-length strings, so
         # the row threshold stays a floor). Neither subsumes the other.
         needs = (
-            (rows is not None and byts is None)
+            (rows is not None and byts is None and rows > _DIRECT_UNKNOWN_WIDTH_ROWS)
             or (byts is not None and byts >= _CONFIRM_BYTES)
             or (rows is not None and rows >= _CONFIRM_ROWS)
         )

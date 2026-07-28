@@ -24,7 +24,12 @@ import time
 import uuid
 
 from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunOutput, RunStatus
-from hub.plugins.runner import _CONFIRM_ROWS, _MAX_RUNS, _persist_local_result_done
+from hub.plugins.runner import (
+    _CONFIRM_ROWS,
+    _DIRECT_UNKNOWN_WIDTH_ROWS,
+    _MAX_RUNS,
+    _persist_local_result_done,
+)
 from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
 from hub.run_outputs import (
     discard_unpublished_outputs,
@@ -361,7 +366,7 @@ class SubprocessRunner:
             return RunEstimate(rows=None, bytes=None, placement="local", needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · isolated process")
         needs = (
-            (rows is not None and byts is None)
+            (rows is not None and byts is None and rows > _DIRECT_UNKNOWN_WIDTH_ROWS)
             or (byts is not None and byts >= _CONFIRM_BYTES)
             or (rows is not None and rows >= _CONFIRM_ROWS)
         )

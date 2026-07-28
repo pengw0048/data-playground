@@ -13,9 +13,7 @@ const DEFAULT_CODE = `def fn(row):
     # edit me — runs per row
     return row`
 
-// The single Python-code compute node. `scope` labels whether you're exploring a sample or producing
-// a dataset — execution is identical. Code is edited in the one fullscreen editor (mode / on_error /
-// Promote live there too).
+// The single Python-code compute node. Code and its operator controls live in the fullscreen editor.
 function Transform({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const openFullscreen = useStore((s) => s.openCodeFullscreen)
@@ -44,8 +42,7 @@ function Transform({ id, data }: NodeComponentProps) {
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {/* two segmented toggles — wrap (not clip) on the narrow card; the scope drops to its own row */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center' }}>
           <Segmented<TransformSource>
             options={[{ value: 'library', label: 'Library' }, { value: 'adhoc', label: 'Ad-hoc' }]}
             value={src}
@@ -55,13 +52,6 @@ function Transform({ id, data }: NodeComponentProps) {
               code: v === 'adhoc' ? (data.config.code ?? DEFAULT_CODE) : data.config.code,
             })}
           />
-          {src === 'adhoc' && (
-            <Segmented<'dataset' | 'sample'>
-              options={[{ value: 'dataset', label: 'dataset' }, { value: 'sample', label: 'sample' }]}
-              value={scope} accent={color.focus}
-              onChange={(v) => updateConfig(id, { scope: v })}
-            />
-          )}
         </div>
 
         {src === 'library' ? (
