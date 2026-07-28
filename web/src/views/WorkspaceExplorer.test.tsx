@@ -1239,7 +1239,7 @@ describe('WorkspaceExplorer', () => {
     expect(detail).toHaveTextContent('Source-only mount warehouse · fixture')
     expect(detail).toHaveTextContent('Using the dataset creates only a local Source; it never writes to the provider')
     expect(screen.getByRole('button', { name: 'Create a local Canvas here' })).toBeEnabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use in Canvas' }))
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
     )
@@ -1265,7 +1265,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in Canvas' }))
     await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
@@ -1291,7 +1291,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in Canvas' }))
     await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
@@ -1325,7 +1325,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'provider-explore', created: true, resource: CANVAS })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in Canvas' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.objectContaining({
       containerId: 'local-overlay-anchor', expectedContainerVersion: 7,
@@ -1343,7 +1343,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: unavailable, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in Canvas' }))
     const create = screen.getByRole('button', { name: 'Create and open' })
     expect(create).toBeDisabled()
     expect(create).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
@@ -1374,15 +1374,11 @@ describe('WorkspaceExplorer', () => {
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     expect(detail).toHaveTextContent('Workspace placementremote-dataset')
-    expect(detail).toHaveTextContent('Canonical datasetMountwarehouseDataset IDcanonical-observations')
+    expect(detail).toHaveTextContent('Canonical dataset IDcanonical-observations')
+    expect(detail).toHaveTextContent('Source dataset identityworkspace-provider:canonical-source')
+    expect(detail).toHaveTextContent('Exact revision')
     expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
-      'Source dataset identityworkspace-provider:canonical-source',
-    )
-    expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
-      'Read modeExact revision · revision-7',
-    )
-    expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
-      'Canonical columnsvalue · int64',
+      'Schemavalue · int64',
     )
     expect(detail).toHaveTextContent('Also observed atRemote B / observations')
     expect(detail).toHaveTextContent('Only placements already loaded in this Workspace session are shown.')
@@ -1458,7 +1454,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const context = await screen.findByTestId('canonical-provider-dataset-context')
-    expect(context).toHaveTextContent('Current/latest provider state · not an exact revision')
+    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Current/latest provider state · not an exact revision')
     expect(context).not.toHaveTextContent('Exact revision')
   })
 
@@ -1512,7 +1508,7 @@ describe('WorkspaceExplorer', () => {
     const content = within(detail).getByTestId('provider-dataset-detail-content')
     expect(content).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto', 'overscroll-contain')
     expect(within(detail).getByRole('button', { name: 'Close' })).toBeVisible()
-    expect(within(detail).getByRole('button', { name: 'Use in canvas' })).toBeVisible()
+    expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeVisible()
   })
 
   it('retries canonical provider detail without changing the placement', async () => {
@@ -1533,11 +1529,10 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText(/Canonical dataset context is unavailable/)).toHaveTextContent(
       'canonical detail timed out',
     )
-    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Retry canonical detail' }))
-    expect(await screen.findByTestId('canonical-provider-dataset-context')).toHaveTextContent(
-      'Exact revision · revision-7',
-    )
+    await screen.findByTestId('canonical-provider-dataset-context')
+    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Exact revision')
     expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledTimes(2)
     expect(store.workspaceResourceId).toBe(EXTERNAL_DATASET.id)
   })
@@ -1848,7 +1843,7 @@ describe('WorkspaceExplorer', () => {
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     expect(detail).toHaveTextContent('Canonical dataset state · offline')
     expect(detail).toHaveTextContent('Placement state · current')
-    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Retry canonical dataset' }))
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
     second.unmount()
@@ -1871,7 +1866,7 @@ describe('WorkspaceExplorer', () => {
     const both = await screen.findByRole('dialog', { name: 'observations' })
     expect(both).toHaveTextContent('Placement state · offline')
     expect(both).toHaveTextContent('Canonical dataset state · offline')
-    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
   })
 
   it('preserves an external selection and ancestors when its refresh becomes unavailable', async () => {

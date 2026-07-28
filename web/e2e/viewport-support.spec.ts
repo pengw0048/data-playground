@@ -137,6 +137,12 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Close' }), 'dataset detail close')
+    await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Row preview', { exact: true })).toBeVisible()
+    await expect(detail.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
+    const maintenance = detail.getByText('Catalog maintenance', { exact: true })
+    await expect(maintenance.locator('..')).not.toHaveAttribute('open', '')
+    await maintenance.click()
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
     await keyAction.scrollIntoViewIfNeeded()
     await expectFullyInViewport(page, keyAction, 'column key action')
@@ -288,9 +294,13 @@ test.describe('minimum viewport support', () => {
     const detail = page.getByRole('dialog', { name: dataset.name })
     const content = detail.getByTestId('provider-dataset-detail-content')
     const close = detail.getByRole('button', { name: 'Close' })
-    const use = detail.getByRole('button', { name: 'Use in canvas' })
+    const use = detail.getByRole('button', { name: 'Use in Canvas' })
     await expectFullyInViewport(page, close, `${vp?.width}px provider detail close`)
     await expectFullyInViewport(page, use, `${vp?.width}px provider use action`)
+    const connectionDetails = detail.getByText('Connection details', { exact: true })
+    await expect(connectionDetails.locator('..')).not.toHaveAttribute('open', '')
+    await connectionDetails.click()
+    await expect(detail.getByText('Source dataset identity', { exact: true })).toBeVisible()
 
     const contentSize = await content.evaluate((element) => ({
       clientHeight: element.clientHeight,
