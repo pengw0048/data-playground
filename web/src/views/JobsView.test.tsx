@@ -316,6 +316,84 @@ describe('JobsView', () => {
     expect(screen.getByTestId('full-result')).toBeVisible()
   })
 
+  it('labels ordinary Transform and Profile artifacts as retained while preserving row counts', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [
+      job({
+        id: 'transform-history', runId: 'transform-run', status: 'done', error: null,
+        targetNodeId: 'transform-1', nodeLabel: 'Normalize readings', rows: 12,
+        outputs: [{
+          nodeId: 'transform-1', portId: 'out', portLabel: 'Result', wire: 'dataset',
+          publicationKind: 'result', outcome: 'committed',
+          uri: 'file:///transform-result.parquet', rows: 12,
+        }],
+      }),
+      job({
+        id: 'profile-history', runId: 'profile-run', jobType: 'profile', status: 'done',
+        error: null, targetNodeId: 'profile-1', nodeLabel: 'Profile readings',
+        rows: null, profile: { rowCount: 987 },
+        outputs: [{
+          nodeId: 'profile-1', portId: 'profile', portLabel: 'Profile', wire: 'dataset',
+          publicationKind: 'result', outcome: 'committed',
+          uri: 'file:///profile-result.parquet', rows: 987,
+        }],
+      }),
+    ], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    const transform = (await screen.findByRole('button', {
+      name: 'Open run transform-run in Alpha research', expanded: false,
+    })).closest('article')
+    expect(transform).toHaveTextContent('1 output retained')
+    expect(transform).toHaveTextContent('12 rows')
+    expect(transform).not.toHaveTextContent('published')
+
+    const profile = screen.getByRole('button', {
+      name: 'Open run profile-run in Alpha research', expanded: false,
+    }).closest('article')
+    expect(profile).toHaveTextContent('1 output retained')
+    expect(profile).toHaveTextContent('987 rows')
+    expect(profile).not.toHaveTextContent('published')
+  })
+
+  it('uses a managed Write receipt to label an exact dataset revision as published', async () => {
+    const receipt = {
+      datasetId: 'dataset-1', revisionId: 'revision-7', name: 'Published readings',
+      rows: 12, bytes: 120, durable: true as const,
+      head: { datasetId: 'dataset-1', revisionId: 'revision-7', retentionOwner: 'core' },
+      schema: [], partitions: [],
+      publication: {
+        provider: 'managed-local-file', logicalUri: 'managed://dataset-1',
+        artifactUri: 'file:///managed/revision-7.parquet', publishSequence: 1,
+        idempotencyKey: 'write-run',
+      },
+    }
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      id: 'write-history', runId: 'write-run', taskId: 'write-run',
+      status: 'done', error: null, targetNodeId: 'write-1', nodeLabel: 'Store readings',
+      outputs: [{
+        nodeId: 'write-1', portId: 'out', portLabel: 'Dataset', wire: 'dataset',
+        publicationKind: 'catalog', outcome: 'committed',
+        uri: receipt.publication.artifactUri, table: receipt.name, rows: 12,
+        writeReceipt: receipt,
+      }],
+      outputReceipt: receipt,
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    const row = await screen.findByRole('button', {
+      name: 'Open run write-run in Alpha research', expanded: false,
+    })
+    expect(row.closest('article')).toHaveTextContent('Dataset revision published')
+    expect(row.closest('article')).toHaveTextContent('12 rows')
+    expect(row.closest('article')).not.toHaveTextContent('output retained')
+    fireEvent.click(row)
+    openTechnicalEvidence()
+    expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
+      'dataset dataset-1 · revision revision-7 · 12 rows',
+    )
+    expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+  })
+
   it('shows exact durable task state and requests cancellation from Jobs', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'task-1', taskId: 'task-1', status: 'running', error: null,
