@@ -1704,6 +1704,68 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).not.toHaveBeenCalled()
   })
 
+  it('submits a provider overwrite after re-admitting the displayed destination', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    const admission = {
+      nodeId: 'write', managed: false, destination: 's3://provider/output.parquet',
+      mode: 'overwrite' as const, provider: 'provider-sink', expectedSchema: [], partitions: [],
+    }
+    useStore.setState({ doc, runs: {} })
+    apiMocks.writeAdmission.mockResolvedValueOnce(admission).mockResolvedValueOnce(admission)
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'provider-overwrite', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [], outputs: [],
+    })
+
+    await useStore.getState().requestRun('write')
+    const displayedSubmission = useStore.getState().runs.write.writeSubmissionId
+    await useStore.getState().run('write', true)
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+    const submittedAdmission = apiMocks.writeAdmission.mock.calls[1][2]
+    expect(submittedAdmission).not.toBe(displayedSubmission)
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      doc, 'write', true, submittedAdmission, undefined, undefined, undefined, undefined)
+  })
+
+  it('re-admits a provider overwrite and does not reuse confirmation after destination drift', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    const shown = {
+      nodeId: 'write', managed: false, destination: 's3://provider-a/output.parquet',
+      mode: 'overwrite' as const, provider: 'provider-a', expectedSchema: [], partitions: [],
+    }
+    const fresh = {
+      ...shown, destination: 's3://provider-b/output.parquet', provider: 'provider-b',
+    }
+    useStore.setState({ doc, runs: {} })
+    apiMocks.writeAdmission.mockResolvedValueOnce(shown).mockResolvedValueOnce(fresh)
+
+    await useStore.getState().requestRun('write')
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'confirm', writeAdmission: shown,
+    })
+
+    await useStore.getState().run('write', true)
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'confirm', writeAdmission: fresh,
+    })
+    expect(apiMocks.run).not.toHaveBeenCalled()
+  })
+
   it('shows exact drift admission before submitting that same confirmed write', async () => {
     const source = NODE('source')
     const write = NODE('write', 'write')

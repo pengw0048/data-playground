@@ -482,6 +482,19 @@ export function writeAdmissionRequestIdentity(state: Store, nodeId: string): str
   )
 }
 
+function providerOverwriteAdmissionIdentity(admission?: WriteAdmission): string | undefined {
+  if (!admission || admission.managed || admission.mode !== 'overwrite') return undefined
+  return JSON.stringify({
+    nodeId: admission.nodeId,
+    destination: admission.destination,
+    mode: admission.mode,
+    provider: admission.provider,
+    expectedSchema: admission.expectedSchema,
+    partitions: admission.partitions,
+    expectedHead: admission.expectedHead,
+  })
+}
+
 function sameInputManifest(
   left: RunInputManifestItem[] | undefined,
   right: RunInputManifestItem[] | undefined,
@@ -2719,14 +2732,32 @@ export const useStore = create<Store>((set, get) => ({
     }
     // Capture the evidence behind this click before a fresh admission observes a concurrently
     // edited graph. A boolean confirmation must never authorize replacement evidence.
-    const confirmedWriteIntent = confirmed ? get().runs[id]?.writeAdmission?.intent ?? undefined : undefined
+    const displayedWriteAdmission = confirmed ? get().runs[id]?.writeAdmission : undefined
+    const confirmedWriteIntent = displayedWriteAdmission?.intent ?? undefined
+    const displayedProviderOverwrite = providerOverwriteAdmissionIdentity(displayedWriteAdmission)
     let writeAdmission: WriteAdmission | undefined
     if (doc.nodes.find((node) => node.id === id)?.type === 'write') {
       try {
+        // Provider-neutral overwrites do not have a frozen managed WriteIntent. Re-admit on the
+        // confirmation click and compare the complete displayed destination contract so a mount or
+        // provider change cannot reuse an earlier boolean confirmation.
+        if (confirmed && displayedProviderOverwrite) {
+          set((s) => ({ runs: { ...s.runs, [id]: {
+            ...(s.runs[id] ?? {}), writeAdmission: undefined,
+            writeSubmissionId: undefined, writeAdmissionFingerprint: undefined,
+          } } }))
+        }
         writeAdmission = await get().prepareWrite(id)
         if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
         if (writeAdmission.blocker) throw new Error(writeAdmission.blocker)
         if (confirmed && writeAdmission.managed && writeAdmission.intent !== confirmedWriteIntent) {
+          set((s) => ({ runs: { ...s.runs, [id]: {
+            ...(s.runs[id] ?? {}), phase: 'confirm', error: undefined,
+          } }, openPanels: { [id]: 'run' } }))
+          return
+        }
+        if (confirmed && !writeAdmission.managed && writeAdmission.mode === 'overwrite'
+            && providerOverwriteAdmissionIdentity(writeAdmission) !== displayedProviderOverwrite) {
           set((s) => ({ runs: { ...s.runs, [id]: {
             ...(s.runs[id] ?? {}), phase: 'confirm', error: undefined,
           } }, openPanels: { [id]: 'run' } }))
