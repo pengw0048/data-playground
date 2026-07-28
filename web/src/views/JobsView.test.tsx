@@ -211,7 +211,7 @@ describe('JobsView', () => {
     try {
       render(<JobsView />)
       await act(async () => { await Promise.resolve() })
-      expect(screen.getByText(/Live first page\. Last successful refresh:/)).toBeVisible()
+      expect(screen.getByText(/Active jobs refresh automatically · Updated/)).toBeVisible()
 
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
@@ -220,10 +220,11 @@ describe('JobsView', () => {
     }
   })
 
-  it('labels a successful first page without active Jobs as a snapshot', async () => {
+  it('labels a successful first page without active jobs in user-facing terms', async () => {
     render(<JobsView />)
 
-    expect(await screen.findByText(/Snapshot; no active Jobs\. Last successful refresh:/)).toBeVisible()
+    expect(await screen.findByText(/No active jobs · Updated/)).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Node and Canvas runs · Durable tasks' })).toBeVisible()
   })
 
   it('does not treat an active direct-link result as an active first page', async () => {
@@ -237,7 +238,7 @@ describe('JobsView', () => {
       await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
       expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
-      expect(screen.getByText(/Snapshot; no active Jobs\. Last successful refresh:/)).toBeVisible()
+      expect(screen.getByText(/No active jobs · Updated/)).toBeVisible()
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
     } finally {
@@ -253,7 +254,7 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
 
     expect(await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).toBeVisible()
-    expect(screen.getByText(/Automatic refresh paused after loading more\. Last successful refresh:/)).toBeVisible()
+    expect(screen.getByText(/Loaded job history · Auto-refresh paused · Updated/)).toBeVisible()
   })
 
   it('replaces paginated pages with a fresh first page on manual refresh', async () => {
@@ -268,7 +269,7 @@ describe('JobsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     expect(await screen.findByRole('button', { name: 'Open run run-3 in Alpha research', expanded: false })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).not.toBeInTheDocument()
-    expect(screen.getByText(/Live first page\. Last successful refresh:/)).toBeVisible()
+    expect(screen.getByText(/Active jobs refresh automatically · Updated/)).toBeVisible()
     expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: undefined, limit: 50 }))
   })
 
@@ -298,7 +299,7 @@ describe('JobsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t refresh Jobs: network unavailable')
     expect(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })).toBeVisible()
-    expect(screen.getByText(/Refresh failed; showing the last successful first page\. Last successful refresh:/)).toBeVisible()
+    expect(screen.getByText(/Refresh failed · Updated/)).toBeVisible()
   })
 
   it('deep-links and opens a retained result by run/node/port identity', async () => {

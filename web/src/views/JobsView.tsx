@@ -311,13 +311,13 @@ export function JobsView() {
     ? null
     : refreshError
       ? loadedMore
-        ? `Refresh failed; showing the prior paginated snapshot. Automatic refresh remains paused. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
-        : `Refresh failed; showing the last successful first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+        ? `Refresh failed · Showing loaded job history · Auto-refresh paused · Updated ${refreshLabel(lastSuccessfulRefresh)}`
+        : `Refresh failed · Updated ${refreshLabel(lastSuccessfulRefresh)}`
       : loadedMore
-        ? `Automatic refresh paused after loading more. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+        ? `Loaded job history · Auto-refresh paused · Updated ${refreshLabel(lastSuccessfulRefresh)}`
         : hasActiveFirstPage
-          ? `Live first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
-          : `Snapshot; no active Jobs. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+          ? `Active jobs refresh automatically · Updated ${refreshLabel(lastSuccessfulRefresh)}`
+          : `No active jobs · Updated ${refreshLabel(lastSuccessfulRefresh)}`
   const quickView = selectedQuickView(params)
   const ordinaryFilters = hasOrdinaryFilters(params)
 
@@ -383,15 +383,18 @@ export function JobsView() {
         {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
         {loading && <div className="p-5 text-[12.5px] text-muted-foreground">Loading Jobs…</div>}
         {!loading && error && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-[12.5px] text-destructive">Couldn’t load Jobs: {error} <button className="ml-2 font-semibold underline" onClick={() => void load()}>Retry</button></div>}
-        {!loading && refreshError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t refresh Jobs: {refreshError} Showing the prior Jobs snapshot.</div>}
+        {!loading && refreshError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t refresh Jobs: {refreshError} Showing previously loaded jobs.</div>}
         {!loading && !error && selectedRunUnavailable && <div className="mb-3 rounded-lg border border-border bg-card p-5 text-center text-[12.5px] text-muted-foreground"><p>This Job is unavailable or you no longer have access.</p><Button variant="outline" size="sm" className="mt-3" onClick={clearSelection}>Back to Jobs</Button></div>}
         {!loading && !error && items.length === 0 && !selectedRunUnavailable && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
-        {items.length > 0 && <div className="min-w-[850px] overflow-hidden rounded-lg border border-border bg-card">
-          <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
-            <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
+        {items.length > 0 && <section aria-labelledby="jobs-list-heading">
+          <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Node and Canvas runs · Durable tasks</h2>
+          <div className="min-w-[850px] overflow-hidden rounded-lg border border-border bg-card">
+            <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+              <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
+            </div>
+            {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} />)}
           </div>
-          {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} />)}
-        </div>}
+        </section>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
         {hasMore && !loadMoreError && <Button variant="outline" className="mt-3 w-full" disabled={loadingMore || !cursor} onClick={() => cursor && void load(cursor)}>{loadingMore ? 'Loading…' : 'Load more'}</Button>}
       </div>

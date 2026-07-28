@@ -83,6 +83,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
 
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Node and Canvas runs · Durable tasks' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
   await page.getByText('Advanced filters', { exact: true }).click()
   for (const width of [1024, 1280, 1440]) {
