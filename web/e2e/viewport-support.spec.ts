@@ -145,7 +145,9 @@ test.describe('minimum viewport support', () => {
     await expect(datasetDetails.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
     await expect(detail.getByText('Row preview', { exact: true })).toBeVisible()
-    await expect(detail.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
+    await expect(detail.getByRole('status').filter({
+      hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
+    })).toBeVisible({ timeout: 15_000 })
     await expect(detail.getByTestId('detail-relationships')).toBeVisible()
     const maintenance = detail.getByText('Catalog maintenance', { exact: true })
     await expect(maintenance.locator('..')).not.toHaveAttribute('open', '')
