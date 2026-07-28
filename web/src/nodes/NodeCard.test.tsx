@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { TooltipProvider } from '@/components/ui/tooltip'
 
 const apiMocks = vi.hoisted(() => ({
   schema: vi.fn(),
@@ -51,6 +52,20 @@ describe('NodeCard result summary', () => {
 
     expect(screen.getByText('2 outputs · 250ms')).toBeInTheDocument()
     expect(screen.queryByText(/\b250 rows\b/)).not.toBeInTheDocument()
+  })
+
+  it('names retained successful snapshots as output versions', () => {
+    const data = useStore.getState().doc.nodes[0].data
+    useStore.setState({ selectedIds: ['target'] })
+
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    expect(screen.getByRole('button', { name: 'Output versions' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument()
   })
 
   it('removes an old Sample size hint immediately after its configuration changes', () => {
