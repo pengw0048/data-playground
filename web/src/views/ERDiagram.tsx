@@ -55,7 +55,7 @@ const nodeTypes = { entity: EntityNode }
 // The catalog rail is outside React Flow, but these controls are overlays inside its pane. Reserve
 // the whole top strip rather than only the panel's left corner so every entity title remains
 // directly usable after fitting. The left inset also keeps nodes clear of the viewport buttons.
-const ER_FIT_PADDING = { top: 164, right: 16, bottom: 16, left: 344 }
+const ER_FIT_PADDING = { top: '164px', right: '16px', bottom: '16px', left: '344px' } as const
 const ER_FIT_OPTIONS = { padding: ER_FIT_PADDING, maxZoom: 1 }
 
 function ERViewportControls({ layoutKey, container }: { layoutKey: string; container: RefObject<HTMLDivElement | null> }) {

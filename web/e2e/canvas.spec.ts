@@ -1395,6 +1395,8 @@ test.describe('Data Playground canvas', () => {
       await openWorkspaceDataset(page, 'events')
       await page.getByTestId('detail-relationships').click()
       await expect(page.getByTestId('er-clear-focus')).toBeVisible({ timeout: 10_000 })
+      const focusedEntity = page.locator('.react-flow__node').filter({ hasText: 'events' }).first()
+      await expect.poll(async () => (await boxOf(focusedEntity)).width).toBeGreaterThanOrEqual(200)
       await page.getByTestId('er-clear-focus').click()
 
       const entities = page.locator('.react-flow__node')
@@ -1408,7 +1410,7 @@ test.describe('Data Playground canvas', () => {
         const controls = await boxOf(page.locator('.react-flow__controls'))
         const boxes = await Promise.all(expectedEntities.map(boxOf))
         return boxes.every((box) =>
-          box.x >= flow.x && box.y >= flow.y
+          box.width >= 120 && box.x >= flow.x && box.y >= flow.y
           && box.x + box.width <= flow.x + flow.width
           && box.y + box.height <= flow.y + flow.height
           && !overlaps(box, panel) && !overlaps(box, controls))

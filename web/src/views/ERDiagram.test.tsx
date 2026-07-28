@@ -123,7 +123,7 @@ describe('ERDiagram request truth', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Fit view' }))
 
     expect(mocks.fitView).toHaveBeenCalledWith({
-      padding: { top: 164, right: 16, bottom: 16, left: 344 }, maxZoom: 1,
+      padding: { top: '164px', right: '16px', bottom: '16px', left: '344px' }, maxZoom: 1,
     })
   })
 
