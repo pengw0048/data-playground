@@ -260,7 +260,11 @@ export function DataPanel({ nodeId, editorPreview }: {
             {activeTab === 'rows' && res.rows.length > 0 && (
               <ExportCluster columns={columns as ColumnSchema[]} rows={res.rows}
                 name={String(node?.data.title || node?.id || 'data')} offset={offset}
-                scope="preview" sampleProvenance={res.sampleProvenance} pushToast={pushToast} />
+                scope={editorPreview?.resultContext === 'example-rows' ? 'test-result' : 'preview'}
+                sampleProvenance={editorPreview?.resultContext === 'example-rows'
+                  ? undefined
+                  : res.sampleProvenance}
+                pushToast={pushToast} />
             )}
           </>
         )}
@@ -847,7 +851,7 @@ function _download(name: string, text: string, mime: string): void {
 
 function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, pushToast }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; offset: number
-  scope: 'preview' | 'full-result' | 'published-dataset'
+  scope: 'preview' | 'test-result' | 'full-result' | 'published-dataset'
   sampleProvenance?: SampleProvenance | null
   pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
 }) {
@@ -856,6 +860,7 @@ function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, p
   const range = `rows ${start}–${end}`
   const fileBase = `${_slug(name)}-${scope}-page-${start}-${end}`
   const scopeLabel = scope === 'preview' ? 'preview page'
+    : scope === 'test-result' ? 'test result page'
     : scope === 'published-dataset' ? 'published dataset page' : 'full-result page'
   const copy = () => {
     // navigator.clipboard is undefined in an insecure context (plain http on a LAN IP — a supported
