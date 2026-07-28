@@ -4158,6 +4158,11 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
         assert len(doc["nodes"]) == 3
         assert doc["nodes"][1]["data"]["config"]["uri"] == workspace_scope["uri"]
         assert doc["nodes"][2]["data"]["config"]["uri"] == second_uri
+        assert [node["position"] for node in doc["nodes"]] == [
+            {"x": 160, "y": 160},
+            {"x": 440, "y": 160},
+            {"x": 720, "y": 160},
+        ]
         snapshots = list(session.scalars(select(metadb.CanvasVersion).where(
             metadb.CanvasVersion.canvas_id == canvas_id)))
         assert any(snapshot.label == "before Workspace dataset add" for snapshot in snapshots)

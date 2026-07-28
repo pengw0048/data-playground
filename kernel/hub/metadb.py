@@ -3822,15 +3822,47 @@ def _workspace_dataset_sources_in_session(s, dataset_ids: list[str]) -> list[dic
 
 
 def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
-    occupied = {(node.get("position", {}).get("x"), node.get("position", {}).get("y"))
-                for node in nodes if isinstance(node, dict)}
-    x, y = 160, 160
+    source_width, source_height = 232, 243
+    horizontal_gap, vertical_gap = 48, 32
+    columns = 4
+
+    def footprint(node: dict) -> tuple[float, float, float, float] | None:
+        # Child positions are relative to their Section, so ignore them here. The top-level Section
+        # footprint already prevents a newly added top-level Source from covering its contents.
+        if node.get("parentId") is not None:
+            return None
+        position = node.get("position")
+        if not isinstance(position, dict):
+            return None
+        x, y = position.get("x"), position.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        width, height = (360, 240) if node.get("type") == "section" else (
+            source_width, source_height)
+        return float(x), float(y), width, height
+
+    occupied = [box for node in nodes if isinstance(node, dict)
+                if (box := footprint(node)) is not None]
+
+    def available(x: float, y: float) -> bool:
+        return all(
+            x + source_width + horizontal_gap <= other_x
+            or other_x + other_width + horizontal_gap <= x
+            or y + source_height + vertical_gap <= other_y
+            or other_y + other_height + vertical_gap <= y
+            for other_x, other_y, other_width, other_height in occupied
+        )
+
+    candidate = 0
     for source in sources:
-        while (x, y) in occupied:
-            x += 60
-            y += 40
+        while True:
+            x = 160 + (candidate % columns) * (source_width + horizontal_gap)
+            y = 160 + (candidate // columns) * (source_height + vertical_gap)
+            candidate += 1
+            if available(x, y):
+                break
         source["position"] = {"x": x, "y": y}
-        occupied.add((x, y))
+        occupied.append((x, y, source_width, source_height))
         nodes.append(source)
 
 

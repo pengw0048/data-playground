@@ -114,8 +114,22 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByRole('button', { name: 'Create and open' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
     canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
-    await expect(page.locator('.react-flow__node', { hasText: registeredName })).toBeVisible()
-    await expect(page.locator('.react-flow__node', { hasText: uploaded.name })).toBeVisible()
+    const registeredSource = page.locator('.react-flow__node', { hasText: registeredName })
+    const uploadedSource = page.locator('.react-flow__node', { hasText: uploaded.name })
+    await expect(registeredSource).toBeVisible()
+    await expect(uploadedSource).toBeVisible()
+    const [registeredBox, uploadedBox] = await Promise.all([
+      registeredSource.boundingBox(),
+      uploadedSource.boundingBox(),
+    ])
+    expect(registeredBox).not.toBeNull()
+    expect(uploadedBox).not.toBeNull()
+    expect(
+      registeredBox!.x < uploadedBox!.x + uploadedBox!.width
+      && registeredBox!.x + registeredBox!.width > uploadedBox!.x
+      && registeredBox!.y < uploadedBox!.y + uploadedBox!.height
+      && registeredBox!.y + registeredBox!.height > uploadedBox!.y,
+    ).toBe(false)
 
     const runIds: string[] = []
     page.on('response', async (response) => {
