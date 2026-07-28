@@ -136,11 +136,11 @@ test.describe('Join with related data', () => {
     try {
       await seedSourceCanvas(page, canvasId, left)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
-      await expect(page.getByText('Related data')).toBeVisible()
+      await expect(page.getByRole('heading', { name: 'Related data', exact: true })).toBeVisible()
       await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
       await expect(page.getByText('Selected dataset')).toBeVisible()
       await expect(page.getByText('Related dataset', { exact: true })).toBeVisible()
-      await expect(page.getByText('Declared relationship')).toBeVisible()
+      await expect(page.getByText('Persisted catalog relationship')).toBeVisible()
       await page.getByRole('button', { name: 'Cancel', exact: true }).click()
 
       const cancelled = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
@@ -171,7 +171,7 @@ test.describe('Join with related data', () => {
     try {
       await seedSourceCanvas(page, canvasId, left)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
-      await expect(page.getByText('Related data')).toBeVisible()
+      await expect(page.getByRole('heading', { name: 'Related data', exact: true })).toBeVisible()
       await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
       await page.getByLabel('Join type').selectOption('left')
       await page.getByTestId('confirm-related-join').click()
