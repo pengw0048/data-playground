@@ -17,6 +17,7 @@ import { UpsertControl } from '../components/UpsertControl'
 import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
+import { serializeJoinKeys } from '../nodes/joinKeys'
 import type { ColumnSchema } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -490,7 +491,7 @@ const CARD_TONE: Record<string, string> = {
 }
 
 // Join hints (catalog-driven): the backend suggests key columns for the two inputs, with the join
-// cardinality MEASURED from the data. Clicking a suggestion fills the join's `on`/`condition`. A
+// cardinality MEASURED from the data. Clicking a suggestion fills the same key-pair contract the card uses. A
 // non-1:1 join gets a fan-out warning (the result lands at the finer grain — rows multiply).
 function JoinHints({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
@@ -515,9 +516,7 @@ function JoinHints({ nodeId }: { nodeId: string }) {
   }, [nodeId, sig])
 
   const apply = (s: JoinSuggestion) => {
-    const same = s.leftColumns.length === s.rightColumns.length && s.leftColumns.every((c, i) => c === s.rightColumns[i])
-    if (same) updateConfig(nodeId, { on: s.leftColumns.join(', '), condition: '' })
-    else updateConfig(nodeId, { condition: s.leftColumns.map((c, i) => `a.${c} = b.${s.rightColumns[i]}`).join(' AND '), on: '' })
+    updateConfig(nodeId, serializeJoinKeys(s.leftColumns.map((left, index) => ({ left, right: s.rightColumns[index] ?? '' }))))
   }
 
   const suggestions = analysis?.suggestions ?? []

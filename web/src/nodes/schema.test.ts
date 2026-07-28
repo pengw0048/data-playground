@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { schemaWarnings, codeHash, inputColumns } from './schema'
+import { schemaWarnings, codeHash, inputColumns, inputColumnsForPort } from './schema'
 import { register } from './registry'
 
 // minimal doc/schema builders — schemaWarnings only reads node.type/config, edges, and the schema map.
@@ -44,6 +44,24 @@ describe('schemaWarnings — column references vs known input', () => {
     const schemas = { split: { out: cols('left_value'), right: cols('right_value') } } as never
     expect(schemaWarnings(doc, schemas, {} as never, [] as never, 'left')).toEqual([])
     expect(schemaWarnings(doc, schemas, {} as never, [] as never, 'right')).toEqual([])
+  })
+
+  it('keeps Join key choices and warnings bound to their explicit a/b ports after rewiring', () => {
+    const join = node('join', 'join', { condition: 'a._rowid = b.original_row_id' })
+    const doc = {
+      id: 'c', version: 1, nodes: [node('left', 'source'), node('right', 'source'), join],
+      edges: [edge('left', 'join', 'a'), edge('right', 'join', 'b')],
+    } as never
+    const schemas = { left: { out: cols('_rowid') }, right: { out: cols('original_row_id') } } as never
+    expect(inputColumnsForPort(doc, schemas, {} as never, [], 'join', 'a')).toEqual(cols('_rowid'))
+    expect(inputColumnsForPort(doc, schemas, {} as never, [], 'join', 'b')).toEqual(cols('original_row_id'))
+    expect(schemaWarnings(doc, schemas, {} as never, [], 'join')).toEqual([])
+
+    const rewired = { ...doc, nodes: [...doc.nodes, node('rewired-left', 'source')], edges: [edge('rewired-left', 'join', 'a'), edge('right', 'join', 'b')] } as never
+    const rewiredSchemas = { ...schemas, 'rewired-left': { out: cols('replacement_id') } } as never
+    expect(schemaWarnings(rewired, rewiredSchemas, {} as never, [], 'join')).toEqual(['unknown left column: _rowid'])
+    expect(schemaWarnings(rewired, { ...rewiredSchemas, right: { out: null } } as never, {} as never, [], 'join'))
+      .toEqual(['unknown left column: _rowid'])
   })
 
   it('resolves an omitted handle to a sole named output instead of assuming out', () => {
