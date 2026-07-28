@@ -1180,6 +1180,59 @@ describe('durable full results', () => {
     expect(screen.queryByText('purchase')).not.toBeInTheDocument()
   })
 
+  it('uses test language for stale and failed Example rows results', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { source: 'adhoc', mode: 'map' }, history: [] },
+    }] }
+    const onPreview = vi.fn()
+    useStore.setState({
+      doc,
+      editorPreviews: { target: {
+        canvasId: doc.id, nodeId: 'target', planIdentity: 'old-test-code', requestGeneration: 1,
+        offset: 0, result: { columns: [], rows: [], truncated: false },
+      } },
+    } as any)
+
+    const { rerender } = render(<DataPanel nodeId="target" editorPreview={{
+      autoLoad: false, resultContext: 'example-rows', onPreview,
+    }} />)
+    expect(screen.getByRole('status')).toHaveTextContent('Example rows test out of date')
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeInTheDocument()
+    expect(screen.queryByText(/Refresh preview/)).not.toBeInTheDocument()
+
+    useStore.setState({ editorPreviews: { target: boundPreview(doc, 'target', {
+      columns: [], rows: [], truncated: false, error: true, reason: 'fixture parse failed',
+    }) } } as any)
+    rerender(<DataPanel nodeId="target" editorPreview={{
+      autoLoad: false, resultContext: 'example-rows', onPreview,
+    }} />)
+    expect(screen.getByText('Example rows test failed')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test again' })).toBeInTheDocument()
+    expect(screen.queryByText('Preview failed')).not.toBeInTheDocument()
+  })
+
+  it('uses test language for an Example rows user-code failure', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'failed', config: { source: 'adhoc', mode: 'map' }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, error: true,
+        failureCategory: 'user_code_exception',
+        userCodeException: {
+          nodeId: 'target', exceptionType: 'TypeError', message: 'fixture boom', availableColumns: ['id'],
+        },
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, resultContext: 'example-rows' }} />)
+    expect(screen.getByText('Edit the transform code or example rows, then test again.')).toBeInTheDocument()
+    expect(screen.queryByText(/previewing again/)).not.toBeInTheDocument()
+  })
+
   it('describes the graph preview limit as a per-source scan cap, not an output prefix', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'filter', position: { x: 0, y: 0 },

@@ -165,4 +165,36 @@ describe('Transform exact processor labels', () => {
     expect(screen.getByRole('textbox', { name: 'Example rows JSON' }))
       .toHaveValue('[\n  {\n    "value": 1\n  }\n]')
   })
+
+  it('starts an Example rows test with numeric values from a known Join schema', async () => {
+    const join = {
+      id: 'join', type: 'join', position: { x: 0, y: 0 },
+      data: { title: 'join', status: 'latest' as const, config: {} },
+    }
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row):\n  row["id_plus_one"] = row["id"] + 1\n  return row',
+      } },
+    }
+    useStore.setState({
+      doc: {
+        id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [join, adhocNode],
+        edges: [{ id: 'join-transform', source: 'join', sourceHandle: 'out', target: 'transform', data: { wire: 'dataset' } }],
+      },
+      schemas: { join: { out: [
+        { name: 'id', type: 'bigint', capabilities: [] },
+        { name: 'user_id', type: 'int64', capabilities: [] },
+      ] } },
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Example rows' }))
+    const fixture = screen.getByRole('textbox', { name: 'Example rows JSON' })
+    const row = JSON.parse((fixture as HTMLTextAreaElement).value)[0]
+    expect(row).toEqual({ id: 1, user_id: 1 })
+    expect(row.id + 1).toBe(2)
+  })
 })
