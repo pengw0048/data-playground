@@ -142,8 +142,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   const [editingDraftSourceUri, setEditingDraftSourceUri] = useState(false)
+  const [advancedExecutionOpen, setAdvancedExecutionOpen] = useState(false)
+  const [advancedOutputSchemaOpen, setAdvancedOutputSchemaOpen] = useState(false)
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
   useEffect(() => setEditingDraftSourceUri(false), [nodeId])
+  useEffect(() => setAdvancedExecutionOpen(false), [nodeId])
+  useEffect(() => setAdvancedOutputSchemaOpen(false), [nodeId])
   if (!node) return null
 
   const kind = node.type
@@ -158,9 +162,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const showDraftSourceEntry = unboundSource || (kind === 'source' && editingDraftSourceUri)
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
-  const schemaCapableKind = canDeclareSchemaKind(kind)
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
-  const perPortSchemaDeferred = schemaCapableKind && outputPorts.length > 1
+  const outputSchemaSummary = outputSchemaContractSummary(cfg)
+  const outputSchemaIsStale = schemaContractStale(kind, cfg)
+  const resourceRequirements = resourceRequirementSummary(cfg)
+  const checkpointed = cfg.checkpoint === true
+  const hasResourceControls = kind === 'transform' || kind === 'section'
+  const hasCheckpointControls = kind !== 'source' && kind !== 'note' && kind !== 'write'
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
@@ -270,11 +278,18 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
       {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}
 
-      {/* compute placement: what this step needs → the run routes to a matching worker (e.g. a GPU pool) */}
-      {(kind === 'transform' || kind === 'section') && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} /></EditOnly>}
-
-      {/* checkpoint: materialize this node's output → inspectable + reused across runs (splits a region) */}
-      {kind !== 'source' && kind !== 'note' && kind !== 'write' && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} /></EditOnly>}
+      {(resourceRequirements || checkpointed) && <ExecutionSummary resourceRequirements={resourceRequirements} checkpointed={checkpointed}
+        canEdit={canEdit} onEdit={() => setAdvancedExecutionOpen(true)} />}
+      {(hasResourceControls || hasCheckpointControls) && <details open={advancedExecutionOpen}
+        onToggle={(event) => setAdvancedExecutionOpen(event.currentTarget.open)}
+        className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 p-3 text-[10.5px]">
+        <summary className="cursor-pointer font-semibold text-foreground">Advanced execution</summary>
+        <div className="mt-3 grid gap-3">
+          {hasResourceControls && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} embedded /></EditOnly>}
+          {hasResourceControls && hasCheckpointControls && <Separator />}
+          {hasCheckpointControls && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} embedded /></EditOnly>}
+        </div>
+      </details>}
 
       {/* run plan: appears only when placement actually splits/routes this run (a cluster backend, an
           engine label, or a checkpoint) — makes the cost-aware scheduler + tiering visible before running */}
@@ -297,17 +312,18 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {kind === 'section' && <><Separator className="my-1" /><EditOnly enabled={canEdit}><OutputPortsEditor nodeId={nodeId} /></EditOnly></>}
       </Section>}
 
-      {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
-          user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
-      {canDeclareSchema && <EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} /></EditOnly>}
-      {perPortSchemaDeferred && (
-        <Section title="Output schema (contract)">
-          <div className="text-[11px] leading-relaxed text-muted-foreground">
-            This node has multiple named outputs. Node-wide schema contracts are unavailable because
-            they would assign one schema to every port; per-port schema contracts are deferred.
-          </div>
-        </Section>
-      )}
+      {/* Schema contracts are an advanced declaration. Once configured, keep a compact signal and a
+          direct route back to it in the normal flow. */}
+      {canDeclareSchema && <>
+        {outputSchemaSummary && <OutputSchemaSummary summary={outputSchemaSummary} stale={outputSchemaIsStale}
+          canEdit={canEdit} onEdit={() => setAdvancedOutputSchemaOpen(true)} />}
+        <details open={advancedOutputSchemaOpen}
+          onToggle={(event) => setAdvancedOutputSchemaOpen(event.currentTarget.open)}
+          className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 p-3 text-[10.5px]">
+          <summary className="cursor-pointer font-semibold text-foreground">Advanced output schema</summary>
+          <div className="mt-3"><EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} embedded /></EditOnly></div>
+        </details>
+      </>}
 
       {/* actions */}
       <Section title="Actions">
@@ -472,7 +488,67 @@ export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boole
     && (writeIn.targetHandle == null || writeIn.targetHandle === 'in')
 }
 
-function CheckpointToggle({ nodeId }: { nodeId: string }) {
+function resourceRequirementSummary(config: Record<string, unknown>): string | null {
+  const requires = config.requires
+  if (!requires || typeof requires !== 'object') return null
+  const { cpu, gpu, gpuType } = requires as { cpu?: unknown; gpu?: unknown; gpuType?: unknown }
+  const parts = [
+    typeof gpu === 'number' ? `${gpu} GPU${gpu === 1 ? '' : 's'}` : null,
+    typeof gpuType === 'string' && gpuType ? gpuType : null,
+    typeof cpu === 'number' ? `${cpu} CPU${cpu === 1 ? '' : 's'}` : null,
+  ].filter((part): part is string => part != null)
+  return parts.length ? parts.join(' · ') : null
+}
+
+function outputSchemaContractSummary(config: Record<string, unknown>): string | null {
+  const outputSchema = config.outputSchema
+  if (Array.isArray(outputSchema) && outputSchema.length > 0) {
+    return `${outputSchema.length} declared column${outputSchema.length === 1 ? '' : 's'}`
+  }
+  if (outputSchema && typeof outputSchema === 'object' && typeof (outputSchema as { ref?: unknown }).ref === 'string') {
+    const ref = (outputSchema as { ref: string }).ref.trim()
+    return ref ? `Named contract · ${ref}` : null
+  }
+  return null
+}
+
+function ExecutionSummary({ resourceRequirements, checkpointed, canEdit, onEdit }: {
+  resourceRequirements: string | null
+  checkpointed: boolean
+  canEdit: boolean
+  onEdit: () => void
+}) {
+  return <Section title="Execution">
+    <div className="grid gap-1.5 text-[11px]">
+      {resourceRequirements && <div className="flex items-center justify-between gap-2">
+        <span><strong>Resources</strong> · {resourceRequirements}</span>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit resources</Button>}
+      </div>}
+      {checkpointed && <div className="flex items-center justify-between gap-2">
+        <span><strong>Materialization</strong> · Checkpointed output</span>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>}
+      </div>}
+    </div>
+  </Section>
+}
+
+function OutputSchemaSummary({ summary, stale, canEdit, onEdit }: {
+  summary: string
+  stale: boolean
+  canEdit: boolean
+  onEdit: () => void
+}) {
+  return <Section title="Output schema">
+    <div className="grid gap-1.5 text-[11px]">
+      <div className="flex items-center justify-between gap-2">
+        <span>{summary}{stale && <span className="text-amber-700 dark:text-amber-300"> · Needs review</span>}</span>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">{stale ? 'Review output schema' : 'Edit output schema'}</Button>}
+      </div>
+    </div>
+  </Section>
+}
+
+function CheckpointToggle({ nodeId, embedded = false }: { nodeId: string; embedded?: boolean }) {
   const doc = useStore((s) => s.doc)
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
@@ -480,7 +556,7 @@ function CheckpointToggle({ nodeId }: { nodeId: string }) {
   const available = canEnableLinearCheckpoint(doc, nodeId)
   const disabled = !available && !on
   return (
-    <Section title="Materialization">
+    <Section title="Materialization" embedded={embedded}>
       <button data-testid="checkpoint-toggle" disabled={disabled}
         onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
         className="flex w-full items-start gap-2 rounded-md border border-border px-2.5 py-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
@@ -498,7 +574,7 @@ function CheckpointToggle({ nodeId }: { nodeId: string }) {
   )
 }
 
-function ResourcesSection({ nodeId }: { nodeId: string }) {
+function ResourcesSection({ nodeId, embedded = false }: { nodeId: string; embedded?: boolean }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const req = ((node?.data.config as Record<string, unknown>)?.requires ?? {}) as { cpu?: number; gpu?: number; gpuType?: string }
@@ -509,7 +585,7 @@ function ResourcesSection({ nodeId }: { nodeId: string }) {
   }
   const num = (v: string) => (v === '' ? undefined : Number(v))
   return (
-    <Section title="Resources (placement)">
+    <Section title="Resources (placement)" embedded={embedded}>
       <div className="mb-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
         What this step needs — the run routes to a worker that satisfies it (e.g. a GPU pool). Blank = no requirement.
       </div>
@@ -822,11 +898,15 @@ function ConnectionFact({ label, value }: { label: string; value: string }) {
   </div>
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, children, embedded = false }: { title: string; children: React.ReactNode; embedded?: boolean }) {
+  const contents = <>
+    <div className="text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">{title}</div>
+    {children}
+  </>
+  if (embedded) return <div className="flex flex-col gap-2">{contents}</div>
   return (
     <div className="flex flex-col gap-2 border-b border-border px-3.5 py-3">
-      <div className="text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">{title}</div>
-      {children}
+      {contents}
     </div>
   )
 }
@@ -881,7 +961,7 @@ export function PortRow({ dir, name, wire, schema }: {
 // can DECLARE the output columns (types this port + everything downstream via a typed stand-in) or
 // INFER them from a bounded sample run. Both write config.outputSchema — declaring is just the manual
 // path, inferring auto-fills it. Clearing it returns the port to untyped (dynamic) — all fine.
-function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolean }) {
+function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string; runnable: boolean; embedded?: boolean }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const [busy, setBusy] = useState(false)
@@ -949,7 +1029,7 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
   }
 
   return (
-    <Section title="Output schema (contract)">
+    <Section title="Output schema (contract)" embedded={embedded}>
       {refName ? (
         <>
           <div className="text-[10.5px] leading-relaxed text-muted-foreground">

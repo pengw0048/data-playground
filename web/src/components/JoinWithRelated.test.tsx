@@ -128,6 +128,33 @@ describe('JoinWithRelated', () => {
     expect(screen.getByText('Possible match', { exact: true })).toBeVisible()
   })
 
+  it('does not disclose stale possible matches while a filtered search is still debouncing', async () => {
+    let resolveInitial!: (value: typeof page) => void
+    let resolveFiltered!: (value: typeof page) => void
+    mocks.related
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFiltered = resolve }))
+
+    render(<JoinWithRelated nodeId="source-1" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    await waitFor(() => expect(mocks.related).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByPlaceholderText('Dataset, column, tag…'), { target: { value: 'images' } })
+    resolveInitial(page)
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+
+    expect(screen.queryByRole('button', { name: 'Show possible matches (1)' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /orders/ })).toBeNull()
+    await waitFor(() => expect(mocks.related).toHaveBeenCalledTimes(2))
+    resolveFiltered({
+      ...page,
+      candidates: [],
+      possibleMatches: [{ ...page.possibleMatches[0], name: 'images' }],
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Show possible matches (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: /images/ }))
+    expect(screen.getByText('Possible match', { exact: true })).toBeVisible()
+  })
+
   it('shows measured cardinality evidence without stale unmeasured copy', async () => {
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))

@@ -17,7 +17,7 @@ export function Popover({
   maxHeight?: number
 }) {
   const popRef = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number; width: number } | null>(null)
+  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number; width: number; maxHeight: number } | null>(null)
 
   useLayoutEffect(() => {
     if (!open || !anchorRef.current) return
@@ -28,10 +28,14 @@ export function Popover({
       const w = width ?? r.width
       let left = align === 'right' ? r.right - w : r.left
       left = Math.max(8, Math.min(left, window.innerWidth - w - 8))
+      const availableHeight = placement === 'top'
+        ? r.top - 14
+        : window.innerHeight - r.bottom - 14
+      const boundedMaxHeight = Math.max(0, Math.min(maxHeight, availableHeight))
       // 'top' placement grows UPWARD from just above the anchor (anchor its bottom edge), so it
       // sits flush regardless of content height — no guessed offset, no jump.
-      if (placement === 'top') setPos({ left, bottom: window.innerHeight - r.top + 6, width: w })
-      else setPos({ left, top: r.bottom + 6, width: w })
+      if (placement === 'top') setPos({ left, bottom: window.innerHeight - r.top + 6, width: w, maxHeight: boundedMaxHeight })
+      else setPos({ left, top: r.bottom + 6, width: w, maxHeight: boundedMaxHeight })
     }
     update()
     // reposition while open (window resize); canvas pan/zoom closes via outside-mousedown/wheel
@@ -68,7 +72,7 @@ export function Popover({
       ref={popRef}
       className="dp-panel fixed z-[1000] overflow-y-auto rounded-lg border border-border bg-popover p-[5px] text-popover-foreground shadow-lg"
       onMouseDown={(e) => e.stopPropagation()}
-      style={{ left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight }}
+      style={{ left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight: pos.maxHeight }}
     >
       {children}
     </div>,
