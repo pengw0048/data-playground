@@ -10,6 +10,7 @@ import { api } from '../api/client'
 import { registerGenericNodes } from '../nodes/generic'
 import '../nodes/kinds/source'
 import '../nodes/kinds/transform'
+import '../nodes/kinds/join'
 
 const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
@@ -926,6 +927,72 @@ describe('Inspector — draft Source entry', () => {
     })
     expect(screen.getByTitle('Choose a registered dataset')).toBeInTheDocument()
     expect(screen.getByText('Choose data')).toBeInTheDocument()
+  })
+})
+
+describe('Inspector — Join configuration', () => {
+  const selectJoin = (config: Record<string, unknown>) => {
+    registerGenericNodes([{
+      kind: 'join', title: 'join', category: 'compute', tag: 'join',
+      inputs: [
+        { id: 'a', label: 'left', wire: 'dataset' },
+        { id: 'b', label: 'right', wire: 'dataset' },
+      ],
+      outputs: [{ id: 'out', wire: 'dataset' }],
+      params: [
+        { name: 'how', type: 'select', label: 'how', default: 'inner', options: ['inner', 'left', 'right', 'outer'] },
+        { name: 'on', type: 'string', label: 'shared key(s)' },
+        { name: 'condition', type: 'string', label: 'or ON expression (a.x = b.y)' },
+      ],
+      canBypass: false, previewable: true, blurb: 'Combine two datasets by matching rows',
+    }])
+    useStore.setState({
+      selectedIds: ['join'], canvasRole: 'owner', runs: {},
+      doc: {
+        id: 'join-inspector', name: 'Join Inspector', version: 1, requirements: [],
+        nodes: [{
+          id: 'join', type: 'join', position: { x: 100, y: 100 },
+          data: { title: 'join', status: 'draft', history: [], config },
+        }],
+        edges: [],
+      },
+      schemas: { join: { out: cols } },
+      nodeRevealRequest: null,
+    } as any)
+  }
+
+  it('summarizes different-name and multi-column keys without a second generic editor', () => {
+    selectJoin({
+      how: 'left',
+      on: '',
+      condition: 'a._rowid = b.original_row_id AND a.region = b.region_id',
+    })
+    render(<Inspector />)
+
+    expect(screen.getByText('Join configuration')).toBeVisible()
+    expect(screen.getByText('a._rowid = b.original_row_id')).toBeVisible()
+    expect(screen.getByText('a.region = b.region_id')).toBeVisible()
+    expect(screen.queryByText('shared key(s)')).not.toBeInTheDocument()
+    expect(screen.queryByText(/ON expression/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit keys on Join card' }))
+    expect(useStore.getState().nodeRevealRequest).toMatchObject({
+      canvasId: 'join-inspector',
+      nodeId: 'join',
+    })
+  })
+
+  it('preserves an unrepresentable condition as a read-only advanced summary', () => {
+    const condition = 'a.id = b.id OR a.region = b.region_id'
+    selectJoin({ how: 'inner', on: 'obsolete', condition })
+    render(<Inspector />)
+
+    expect(screen.getByText('Advanced condition')).toBeVisible()
+    expect(screen.getByText(condition)).toBeVisible()
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({
+      on: 'obsolete',
+      condition,
+    })
   })
 })
 

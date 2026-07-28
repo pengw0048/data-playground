@@ -17,7 +17,7 @@ import { UpsertControl } from '../components/UpsertControl'
 import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { CatalogTable, DatasetRevisionDetail, JoinAnalysis, JoinSuggestion } from '../types/api'
-import { serializeJoinKeys } from '../nodes/joinKeys'
+import { parseJoinKeys, serializeJoinKeys } from '../nodes/joinKeys'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type ColumnSchema, type DatasetRef } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -286,7 +286,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* properties (reused generic param editor) */}
       {showDraftSourceEntry ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit}
         onUriEditingChange={setEditingDraftSourceUri} /> : <>
-        {!boundSource && <EditOnly enabled={canEdit}>
+        {kind === 'join' ? <JoinConfigurationSummary nodeId={nodeId} canEdit={canEdit} />
+          : !boundSource && <EditOnly enabled={canEdit}>
           <Section title="Properties">
             <NodeParamFields nodeId={nodeId} omitNames={omittedParamNames} />
             {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
@@ -411,6 +412,43 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       </Section>
     </div>
   )
+}
+
+function JoinConfigurationSummary({ nodeId, canEdit }: { nodeId: string; canEdit: boolean }) {
+  const node = useStore((state) => state.doc.nodes.find((candidate) => candidate.id === nodeId))
+  const canvasId = useStore((state) => state.doc.id)
+  const requestNodeReveal = useStore((state) => state.requestNodeReveal)
+  const config = (node?.data.config ?? {}) as Record<string, unknown>
+  const on = String(config.on ?? '')
+  const condition = String(config.condition ?? '')
+  const pairs = parseJoinKeys(on, condition)
+  const how = String(config.how ?? 'inner')
+  const advancedPredicate = condition.trim() ? condition : on
+
+  return <Section title="Join configuration">
+    <div className="flex items-center justify-between gap-2 text-[11.5px]">
+      <span className="text-muted-foreground">Join type</span>
+      <span className="capitalize text-foreground">{how}</span>
+    </div>
+    {pairs === null ? <>
+      <div className="text-[10.5px] font-semibold text-muted-foreground">Advanced condition</div>
+      <code className="break-words rounded-md border border-border bg-muted/30 px-2 py-1.5 text-[10.5px] text-foreground">
+        {advancedPredicate}
+      </code>
+    </> : pairs.length > 0 ? (
+      <div className="grid gap-1" aria-label="Configured join keys">
+        {pairs.map((pair, index) => (
+          <code key={`${pair.left}\u0000${pair.right}\u0000${index}`} className="break-words text-[10.5px] text-foreground">
+            a.{pair.left} = b.{pair.right}
+          </code>
+        ))}
+      </div>
+    ) : <div className="text-[10.5px] text-muted-foreground">No join keys selected.</div>}
+    <Button variant="outline" size="sm" className="h-auto self-start px-2.5 py-1.5 text-[11px]"
+      onClick={() => requestNodeReveal(canvasId, nodeId)}>
+      {canEdit ? 'Edit keys on Join card' : 'Show Join card'}
+    </Button>
+  </Section>
 }
 
 // Add / rename / remove a section's named output ports (config.outputs). The store drops edges
