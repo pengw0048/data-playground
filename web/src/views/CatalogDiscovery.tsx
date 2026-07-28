@@ -7,6 +7,7 @@ import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { PreviewDetails, PreviewSummary } from '../components/PreviewPresentation'
 import type {
   CatalogQueryParams, CatalogTable, CatalogUnregisterResult, DatasetRevisionDetail,
   DatasetRevisionResolution, Facets, FolderNode, KernelInfo, LineageResult, SampleResult,
@@ -1235,7 +1236,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               ) : null}
               {preview ? (
                 <div className="flex flex-col gap-1">
-                  {!preview.error && !preview.notPreviewable && <CatalogPreviewScope preview={preview} />}
+                  {!preview.error && !preview.notPreviewable && <CatalogPreviewScope preview={preview} stale={Boolean(previewError)} />}
                   {preview.error || preview.notPreviewable || !preview.rows.length
                     ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
                         {preview.reason || emptyCatalogPreviewMessage(preview)}
@@ -1307,33 +1308,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   )
 }
 
-function CatalogPreviewScope({ preview }: { preview: SampleResult }) {
-  const shown = preview.rows.length
-  const total = preview.rowCount ?? null
-  const provenance = preview.sampleProvenance
-  const provenanceCounts = provenance
-    ? `Requested ${provenance.requestedRows.toLocaleString()} rows · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}.`
-    : null
-  let label: string
-  if (preview.completeness === 'complete') {
-    label = `Complete dataset · ${total ?? shown} ${(total ?? shown) === 1 ? 'row' : 'rows'}`
-  } else if (preview.completeness === 'capped') {
-    label = `Dataset preview · stopped at ${(preview.rowLimit ?? shown).toLocaleString()} rows${total == null ? '; total unknown' : ` of ${total.toLocaleString()}`}`
-  } else if (total != null) {
-    label = `Dataset preview · showing ${shown.toLocaleString()} of ${total.toLocaleString()} rows`
-  } else {
-    label = `Dataset preview · showing ${shown.toLocaleString()} rows; total unknown`
-  }
+function CatalogPreviewScope({ preview, stale }: { preview: SampleResult; stale: boolean }) {
   return (
-    <div role="status" className="rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
-      <div>{label}</div>
-      {provenance && (
-        <div className="mt-0.5 space-y-0.5">
-          <div>{preview.completeness === 'complete' ? 'Complete dataset.' : 'Prefix preview.'} {provenanceCounts}</div>
-          <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
-          {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
-        </div>
-      )}
+    <div className="rounded-md bg-muted/50 px-2 py-1">
+      <PreviewSummary data={preview} surface="catalog" />
+      <PreviewDetails provenance={preview.sampleProvenance} stale={stale} />
     </div>
   )
 }

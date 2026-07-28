@@ -13,6 +13,9 @@ import {
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCellRenderer'
+import {
+  PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
+} from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
@@ -283,7 +286,7 @@ export function DataPanel({ nodeId, editorPreview }: {
         <ExampleRowsResultBanner data={res} offset={offset} />
       ) : (
         <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
-          allowNextAttempt={!special} />
+          showDetails={activeTab !== 'stats'} showWarning={node?.type !== 'source'} />
       )}
 
       {isChart ? (
@@ -444,32 +447,38 @@ function ExampleRowsResultBanner({ data, offset }: { data: SampleResult; offset:
   )
 }
 
-function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }: {
+function DataScopeBanner({ data, offset, unit, scope, showDetails = true, showWarning = true }: {
   data: SampleResult
   offset: number
   unit: 'rows' | 'points' | 'groups'
   scope: 'preview' | 'full-result' | 'published-dataset'
-  allowNextAttempt?: boolean
+  showDetails?: boolean
+  showWarning?: boolean
 }) {
   const end = offset + data.rows.length
   const total = data.rowCount ?? null
-  const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
   const provenance = data.sampleProvenance
-  const provenanceCounts = provenance
-    ? `Requested ${provenance.requestedRows.toLocaleString()} rows · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}.`
-    : null
+  const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
   const resultCapped = data.limitScope === 'result-window'
     || data.limitReason === 'interactive-row-budget'
     || (data.completeness === 'capped' && !sourceCapped)
-  const label = scope === 'preview' ? (provenance?.strategy === 'reservoir' ? 'Random sample' : 'Preview prefix')
-    : scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
+  if (scope === 'preview') {
+    return (
+      <>
+        <PreviewSummary data={data} offset={offset} unit={unit} showRange={false}
+          showWarning={showWarning} />
+        {showDetails && provenance && (
+          <div className="px-[11px]">
+            <PreviewDetails provenance={provenance} />
+          </div>
+        )}
+      </>
+    )
+  }
+  const label = scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
   const range = pageRangeLabel(unit, offset, data.rows.length)
   let detail: string
-  if (scope === 'preview') {
-    detail = provenance?.strategy === 'reservoir'
-      ? `${range} · Deterministic reservoir sample.`
-      : `${range} · Full dataset not scanned.`
-  } else if (total == null) {
+  if (total == null) {
     detail = `Current page · ${range} · Total ${unit} unknown.`
   } else if (data.completeness === 'complete') {
     detail = `Complete artifact · ${total.toLocaleString()} ${unit}.`
@@ -482,35 +491,16 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }:
         <span className="rounded bg-muted px-1.5 py-px font-semibold text-foreground">{label}</span>
         <span>{detail}</span>
       </div>
-      {sourceCapped && (
-        <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
-          Each source read was limited to at most {(data.rowLimit ?? end).toLocaleString()} rows before this preview was computed.
-          {' '}Output rows are not necessarily the first {(data.rowLimit ?? end).toLocaleString()} rows of the final result.
-        </div>
-      )}
-      {provenance && (
-        <div className="mt-1 space-y-0.5 text-muted-foreground">
-          <div>{provenance.strategy === 'reservoir' ? `Reservoir sample · seed ${provenance.seed}.` : 'Prefix preview.'} {provenanceCounts}</div>
-          <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
-          {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
-        </div>
-      )}
       {resultCapped && (
         <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
           Interactive view stopped at {(data.rowLimit ?? end).toLocaleString()} {unit}
           {total != null ? ` of ${total.toLocaleString()}` : '; total is unknown'}.
-          {' '}{scope === 'preview'
-            ? 'Run the node to materialize and inspect the complete result.'
-            : scope === 'published-dataset'
-              ? 'The published dataset retains rows beyond this interactive window.'
-              : 'The committed artifact retains the complete result.'}
+          {' '}{scope === 'published-dataset'
+            ? 'The published dataset retains rows beyond this interactive window.'
+            : 'The committed artifact retains the complete result.'}
         </div>
       )}
-      {data.hasMore == null && (
-        <div className="mt-1 font-medium text-muted-foreground">
-          Next page availability unknown{allowNextAttempt && data.rows.length > 0 ? ' · You can try the next offset.' : '.'}
-        </div>
-      )}
+      {provenance && <PreviewDetails provenance={provenance} />}
     </div>
   )
 }
@@ -805,16 +795,7 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
 }
 
 export function SampleProvenanceSummary({ provenance }: { provenance: SampleProvenance }) {
-  const counts = `requested ${provenance.requestedRows.toLocaleString()} · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}`
-  return (
-    <div className="max-w-[290px] text-right text-[9.5px] leading-snug text-muted-foreground">
-      <div>{provenance.strategy === 'reservoir' ? 'Deterministic reservoir sample' : 'Bounded preview prefix'}{provenance.seed != null ? ` · seed ${provenance.seed}` : ''}</div>
-      <div>{counts}</div>
-      <div className="break-all">input {provenance.datasetIdentity ?? 'unknown'}</div>
-      {provenance.datasetRevision && <div title={provenance.datasetRevision}>revision {provenance.datasetRevision}</div>}
-      {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
-    </div>
-  )
+  return <PreviewProvenance provenance={provenance} />
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
@@ -1294,7 +1275,7 @@ export function FullResult({
       </div>
       <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
         unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
-        scope={pageScope} allowNextAttempt={presentation?.kind !== 'chart'} />
+        scope={pageScope} />
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}

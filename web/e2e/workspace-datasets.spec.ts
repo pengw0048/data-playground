@@ -71,7 +71,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page.getByRole('dialog', { name: registeredName })).toBeVisible()
     await expect(page).toHaveURL(new RegExp(`#\\/workspace\\/dataset%3A${encodeURIComponent(registered.registrationId)}`))
     await page.getByTestId('detail-preview').click()
-    await expect(page.getByRole('status').filter({ hasText: /Complete dataset|Dataset preview/ })).toBeVisible()
+    await expect(page.getByRole('status').filter({ hasText: 'rows 1–2' })).toBeVisible()
     await expect(page.getByRole('cell', { name: 'registered' })).toBeVisible()
 
     await page.goBack()

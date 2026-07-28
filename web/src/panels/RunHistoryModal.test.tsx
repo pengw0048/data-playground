@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { fmtMs, DurationTrend, PerNodeBreakdown } from './RunHistoryModal'
@@ -326,9 +326,11 @@ describe('durable full results', () => {
 
     render(<RunHistoryModal onClose={() => {}} />)
 
-    expect(await screen.findByText(/Deterministic reservoir sample/)).toBeInTheDocument()
-    expect(screen.getByText(/seed 7/)).toBeInTheDocument()
-    expect(screen.getByText(/requested 4/)).toBeInTheDocument()
+    expect(await screen.findByText('Random sample · 4 rows · seed 7')).toBeInTheDocument()
+    expect(screen.getByText('Preview details')).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Preview details'))
+    expect(screen.getByText(/Requested 4 rows.*scanned 12.*returned 4.*total 12/i)).toBeInTheDocument()
   })
 
   it('pages beyond the first 50 materialized rows', async () => {
@@ -369,15 +371,15 @@ describe('durable full results', () => {
     const user = userEvent.setup()
     render(<FullResult uri="/outputs/unknown-pages.parquet" total={null} {...fullIdentity} />)
 
-    expect(await screen.findByText('Next page availability unknown · You can try the next offset.')).toBeInTheDocument()
-    const next = screen.getByRole('button', { name: 'Next page' })
+    const next = await screen.findByRole('button', { name: 'Next page' })
+    expect(screen.queryByText(/Next page availability unknown/)).not.toBeInTheDocument()
     expect(next).toBeEnabled()
     await user.click(next)
 
-    expect(await screen.findByText('Next page availability unknown.')).toBeInTheDocument()
+    expect(await screen.findByText(/No rows at offset 1/)).toBeInTheDocument()
+    expect(screen.queryByText(/Next page availability unknown/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
-    expect(screen.getByText(/No rows at offset 1/)).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 1)
     await user.click(screen.getByRole('button', { name: 'Previous page' }))
     expect(await screen.findByText(/rows 1–1/)).toBeInTheDocument()
@@ -635,7 +637,7 @@ describe('durable full results', () => {
 
     expect(screen.getByText(
       'Testing with Clean events result · 1,234 rows')).toBeInTheDocument()
-    expect(screen.getByText('Preview prefix')).toBeInTheDocument()
+    expect(screen.getByText('rows 1–1')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Export this preview page' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()
   })
@@ -1233,7 +1235,7 @@ describe('durable full results', () => {
     expect(screen.queryByText(/previewing again/)).not.toBeInTheDocument()
   })
 
-  it('describes the graph preview limit as a per-source scan cap, not an output prefix', () => {
+  it('warns when the graph preview is bounded per source', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'filter', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'latest', config: { predicate: 'score > 0' }, history: [] },
@@ -1248,8 +1250,7 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(screen.getByText(/Each source read was limited to at most 2,000 rows before this preview was computed/)).toBeInTheDocument()
-    expect(screen.getByText(/Output rows are not necessarily the first 2,000 rows of the final result/)).toBeInTheDocument()
+    expect(screen.getByText('Preview uses up to 2,000 rows from each input; output may differ from a full run.')).toBeInTheDocument()
     expect(screen.queryByText(/preview did not inspect beyond the first/i)).not.toBeInTheDocument()
   })
 

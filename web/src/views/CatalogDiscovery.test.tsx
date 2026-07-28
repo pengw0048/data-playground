@@ -372,7 +372,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
-    expect(screen.getByText('Dataset preview · showing 1 of 2 rows')).toBeInTheDocument()
+    expect(screen.getByText('rows 1–1')).toBeInTheDocument()
 
     const folder = screen.getByTestId('detail-folder') as HTMLInputElement
     fireEvent.change(folder, { target: { value: 'curated/sales' } })
@@ -399,7 +399,7 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
-    expect(await screen.findByText('Complete dataset · 50 rows')).toBeInTheDocument()
+    expect(await screen.findByText('rows 1–50')).toBeInTheDocument()
     expect(screen.getAllByRole('cell')).toHaveLength(50)
   })
 
@@ -417,7 +417,10 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
-    expect(await screen.findByText(/Prefix preview.*Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
+    expect(await screen.findByText('rows 1–1')).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Preview details'))
+    expect(screen.getByText(/Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
     expect(screen.getByText(`Input ${TABLE.uri} · revision revision-1.`)).toBeInTheDocument()
     expect(screen.getByText('This is a prefix preview, not representative or random.')).toBeInTheDocument()
   })
