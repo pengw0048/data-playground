@@ -160,8 +160,6 @@ def recover(deps) -> None:
     recover_restore_revision(deps)
     from hub.keyed_upsert_tasks import recover as recover_keyed_upsert
     recover_keyed_upsert(deps)
-    from hub.row_identity_tasks import recover as recover_row_identity
-    recover_row_identity(deps)
     from hub.bounded_fanout_tasks import recover as recover_bounded_fanout
     recover_bounded_fanout(deps)
     from hub.distribution_report_tasks import recover as recover_distribution_reports

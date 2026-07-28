@@ -599,15 +599,4 @@ describe('JobsView', () => {
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9')
   })
 
-  it('does not render retired row-identity task rows or actions', async () => {
-    mocks.workspaceJobs.mockResolvedValue({ items: [job({
-      id: 't:ric-1', runId: 'ric-1', taskId: 'ric-1', status: 'running', canvasId: null, canvasName: null,
-      nodeLabel: 'Camera frames', datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Camera frames' },
-      canCancel: true,
-    })], hasMore: false, nextCursor: null })
-    render(<JobsView />)
-    expect(await screen.findByText('No Jobs yet. Run a Canvas to see its progress and results here.')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /ric-1/ })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Cancel task' })).not.toBeInTheDocument()
-  })
 })

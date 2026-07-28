@@ -69,9 +69,9 @@ Workspace, Jobs, or the write receipt, then use its revision entry when you need
 state. See [Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md) for what
 admitted inputs, managed revisions, and receipts guarantee.
 
-Media previews display public `http(s)` or `data:` image/video values directly. Byte-backed media is
-viewable only from an exact revision with a certified row identity; unsupported, unavailable, or
-uncertified cells explain the limit and never substitute a current revision or a private URL proxy.
+Media previews display public `http(s)` or `data:` image/video values directly. Byte-backed media
+remains raw data because the product has no exact-cell addressing capability. It never substitutes a
+current revision or proxies a private URL.
 
 ## Add the exact dataset you chose
 

@@ -27,7 +27,7 @@ function outcomeSummary(item: InboxItemDto): string {
   return item.outcome === 'cancelled' ? 'Cancelled before completion' : 'Finished successfully'
 }
 
-const TASK_KIND_LABELS: Omit<Record<InboxTaskKind, string>, 'row_identity_certification'> = {
+const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
   managed_local_write: 'Managed local write',
   external_wait: 'External wait',
   linear_checkpoint_write: 'Checkpointed write',
@@ -38,7 +38,7 @@ const TASK_KIND_LABELS: Omit<Record<InboxTaskKind, string>, 'row_identity_certif
 }
 
 export function kindLabel(kind: InboxItemDto['taskKind'] | string): string {
-  return TASK_KIND_LABELS[kind as Exclude<InboxTaskKind, 'row_identity_certification'>] ?? `Unknown task type: ${kind}`
+  return TASK_KIND_LABELS[kind as InboxTaskKind] ?? `Unknown task type: ${kind}`
 }
 
 function relTime(iso: string): string {
@@ -109,7 +109,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       const page = await api.inboxList({ limit: PAGE_SIZE, cursor: nextCursor, filter })
       if (sequence !== request.current) return
       if (!nextCursor) setError('')
-      const incoming = hydrate(page.items).filter((row) => row.taskKind !== 'row_identity_certification' && (filter !== 'unread' || !row.readAt))
+      const incoming = hydrate(page.items).filter((row) => filter !== 'unread' || !row.readAt)
       setItems((current) => nextCursor ? mergeMonotonic(current, incoming) : incoming)
       setCursor(page.nextCursor ?? null)
       setHasMore(page.hasMore)

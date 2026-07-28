@@ -105,9 +105,6 @@ _POSTGRES_DURABLE_TASK_SELECTORS = {
         "postgres_runtime_claim_recovers_and_fences_expired_owner",
     ),
     "distribution_report": ("hub/tests/test_distribution_reports.py",),
-    "row_identity_certification": (
-        "hub/tests/test_row_identity_certification_tasks.py -k postgres",
-    ),
 }
 
 
@@ -238,13 +235,17 @@ def test_every_admitted_durable_task_kind_has_a_postgres_ci_selector() -> None:
         if constraint.name == "ck_durable_task_kind"
     )
     admitted = set(re.findall(r"'([^']+)'", str(kind_constraint.sqltext)))
-    assert admitted == set(_POSTGRES_DURABLE_TASK_SELECTORS)
+    # #983 removes the public worker and API; #984 owns the forward schema migration that drops
+    # the retained legacy task kind and envelope table.
+    assert admitted - {"row_identity_certification"} == set(_POSTGRES_DURABLE_TASK_SELECTORS)
 
     job = _workflow("ci.yml")["jobs"]["postgres-migration"]
     commands = " ".join(
         step.get("run", "") for step in job["steps"] if step.get("run")
     )
     commands = " ".join(commands.split())
+    assert "row_identity_certification" not in commands
+    assert "test_row_identity_certification_tasks.py" not in commands
     for kind, selectors in _POSTGRES_DURABLE_TASK_SELECTORS.items():
         for selector in selectors:
             assert selector in commands, f"{kind} is missing PostgreSQL CI selector {selector!r}"

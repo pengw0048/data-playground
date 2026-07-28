@@ -561,21 +561,12 @@ class DatasetRevisionPreview(Wire):
     """A fixed, exact-revision preview window; it is never a read of current head."""
     columns: list[ColumnSchema] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
-    row_identities: list[MediaCellIdentity | None] | None = Field(
-        max_length=100)
     has_more: bool
     row_limit: Literal[100] = 100
 
-    @model_validator(mode="after")
-    def _validate_row_identity_alignment(self) -> "DatasetRevisionPreview":
-        if (self.row_identities is not None
-                and len(self.row_identities) != len(self.rows)):
-            raise ValueError("preview row identities must align one-to-one with rows")
-        return self
-
 
 class DatasetRevisionRowIdentityField(Wire):
-    """One ordered, certified logical row-identity field for an exact revision."""
+    """One ordered logical identity field retained for internal exact-row consumers."""
     name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
     arrow_type: Literal[
         "int8", "int16", "int32", "int64",
@@ -584,7 +575,7 @@ class DatasetRevisionRowIdentityField(Wire):
 
 
 class DatasetRevisionRowIdentity(Wire):
-    """Bounded availability of logical row-addressed reads for one exact revision."""
+    """Internal descriptor for persisted exact-row evidence; no longer a public revision response."""
     dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     proof_status: Literal["certified", "unavailable"]
@@ -603,7 +594,7 @@ class DatasetRevisionRowIdentity(Wire):
 
 
 class MediaCellRequest(Wire):
-    """Address one column in one certified logical row; never a storage URI or physical offset."""
+    """Internal exact-cell request retained until certificate persistence is removed."""
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
@@ -620,13 +611,6 @@ class ExactDatasetRevisionRequest(Wire):
     revision_id: str = Field(min_length=1, max_length=256)
 
 
-class ExactMediaCellRequest(ExactDatasetRevisionRequest):
-    """One bounded media read plus its opaque exact-revision identity."""
-
-    identity: list[MediaCellIdentityValue] = Field(min_length=1, max_length=32)
-    column: str = Field(min_length=1, max_length=256)
-
-
 class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
     dataset_id: str = Field(min_length=1, max_length=512)
@@ -638,31 +622,6 @@ class DatasetRevisionDetail(Wire):
     producer_operation: str | None = Field(default=None, max_length=128)
     summary: DatasetRevisionSummary
     preview: DatasetRevisionPreview
-    row_identity: DatasetRevisionRowIdentity
-    media_cell_supported: bool = False
-
-    @model_validator(mode="after")
-    def _validate_row_identity_preview(self) -> "DatasetRevisionDetail":
-        if (self.row_identity.dataset_id != self.dataset_id
-                or self.row_identity.revision_id != self.revision_id):
-            raise ValueError("row identity must bind the exact revision detail")
-        identities = self.preview.row_identities
-        if self.row_identity.proof_status == "unavailable":
-            if identities is not None:
-                raise ValueError("unavailable row identity cannot expose preview identities")
-            return self
-        if identities is None:
-            raise ValueError("certified row identity requires aligned preview identities")
-        expected = [
-            (field.name, field.arrow_type)
-            for field in self.row_identity.fields
-        ]
-        if any(identity is not None and [
-                (value.name, value.arrow_type) for value in identity
-        ] != expected for identity in identities):
-            raise ValueError("preview identity must contain every certified field in order")
-        return self
-
 
 class CatalogPublicationReceipt(Wire):
     """Durable acknowledgement returned by an idempotent catalog output publication."""
@@ -2428,20 +2387,11 @@ class DurableTaskDatasetContextView(Wire):
 
     task_kind: Literal[
         "restore_revision_write", "keyed_upsert_write", "merge_columns_write",
-        "row_identity_certification",
     ]
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str | None = Field(default=None, min_length=1, max_length=256)
     name: str | None = None
     deep_link: str | None = Field(default=None, min_length=1, max_length=2048)
-
-    @model_validator(mode="after")
-    def _exact_certification_link_is_complete(self) -> "DurableTaskDatasetContextView":
-        exact = self.task_kind == "row_identity_certification"
-        if exact != (self.revision_id is not None and self.deep_link is not None):
-            raise ValueError("row identity certification context requires one exact deep link")
-        return self
-
 
 class DurableTaskInboxCompletedWriteView(Wire):
     """Bounded, display-safe facts from one authorized committed Write receipt."""
@@ -2461,7 +2411,7 @@ class DurableTaskInboxItemView(Wire):
     task_kind: Literal[
         "managed_local_write", "external_wait", "linear_checkpoint_write",
         "bounded_fanout_write", "merge_columns_write",
-        "restore_revision_write", "keyed_upsert_write", "row_identity_certification",
+        "restore_revision_write", "keyed_upsert_write",
     ]
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)

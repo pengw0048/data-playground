@@ -21,11 +21,8 @@ published `0.2.3` artifact or a release-support claim.
 - **Join with related data** offers a provenance-aware reviewed-join path that preserves the
   selected source and relationship evidence, and truthfully labels cardinality as `available`
   or `unmeasured` rather than presenting an exact candidate without a scan as measured.
-- Exact row-identity certification can be requested as durable work and retained with the exact
-  revision, so row-level navigation and byte-backed media remain tied to the data that was proved.
-- Media cells render public image and video values, while byte-backed cells require an exact revision
-  and certified row identity. Unsupported or uncertified values explain the limit rather than falling
-  back to a current revision or proxying a private URL.
+- Media cells render public image and video values directly. Byte-backed media remains truthful raw
+  data until a provider offers an exact-cell addressing capability.
 - Plugin authors have a bounded immediate-input seam for checking directly wired, already-proved
   upstream identities without receiving a graph traversal or mutable display-name shortcut.
 

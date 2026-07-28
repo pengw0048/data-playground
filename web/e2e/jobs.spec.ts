@@ -10,13 +10,6 @@ const failedJob = {
   createdAt: '2026-07-16T12:00:00Z',
 }
 
-const retiredIdentityJob = {
-  id: 'retired-identity-task', runId: 'retired-identity-task', taskId: 'retired-identity-task', jobType: 'run', status: 'running',
-  canvasId: null, canvasName: null, targetNodeId: null, nodeLabel: 'Camera frames', backend: 'local', placement: 'local', attempt: 'retired-identity-task',
-  rows: null, ms: null, error: null, outputs: [], createdAt: '2026-07-16T12:01:00Z',
-  datasetContext: { taskKind: 'row_identity_certification', datasetId: 'dataset-retired', revisionId: 'rev-retired', name: 'Camera frames' },
-}
-
 const jobFilterLabels = [
   'Filter jobs by status',
   'Filter jobs by canvas',
@@ -73,7 +66,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
       } })
       return
     }
-    await route.fulfill({ json: { items: [failedJob, retiredIdentityJob], nextCursor: 'opaque-next', hasMore: true } })
+    await route.fulfill({ json: { items: [failedJob], nextCursor: 'opaque-next', hasMore: true } })
   })
   await page.route('**/api/canvas/canvas-jobs/runs/history-failed/manifest', async (route) => {
     await route.fulfill({ json: {
@@ -97,7 +90,6 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
     await expectJobsFiltersToFit(page)
   }
   await page.setViewportSize({ width: 1280, height: 720 })
-  await expect(page.getByText('Row identity certification')).toHaveCount(0)
   await expect(page.getByRole('button', { name: /retired-identity-task/ })).toHaveCount(0)
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('canvas-jobs')
   await expect(page).toHaveURL(/canvas=canvas-jobs/)

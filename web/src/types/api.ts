@@ -127,37 +127,11 @@ export interface DatasetRevisionSummary {
   fragmentCount?: number | null
 }
 
-export interface MediaCellIdentityValue {
-  name: string
-  arrowType: 'int8' | 'int16' | 'int32' | 'int64' | 'uint8' | 'uint16' | 'uint32' | 'uint64' | 'string'
-  value: string
-}
-
-export interface MediaCellRequest {
-  // These wire values are deliberately strings. In particular, int64 and uint64 identities must
-  // never take a trip through a JavaScript number before reaching the exact-cell endpoint.
-  identity: MediaCellIdentityValue[]
-  column: string
-}
-
 export interface DatasetRevisionPreview {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]
-  rowIdentities: Array<MediaCellIdentityValue[] | null> | null
   hasMore: boolean
   rowLimit: 100
-}
-
-export interface DatasetRevisionRowIdentity {
-  datasetId: string
-  revisionId: string
-  proofStatus: 'certified' | 'unavailable'
-  certificationSupported: boolean
-  fields: Array<{
-    name: string
-    arrowType: MediaCellIdentityValue['arrowType']
-  }>
-  encodingVersion?: 'row-identity-v1' | null
 }
 
 export interface DatasetRevisionDetail extends DatasetRevision {
@@ -166,37 +140,6 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   producerOperation?: string | null
   summary: DatasetRevisionSummary
   preview: DatasetRevisionPreview
-  rowIdentity: DatasetRevisionRowIdentity
-  /** Explicit exact-revision declaration; absent legacy responses fail closed. */
-  mediaCellSupported?: boolean
-}
-
-export interface RowIdentityCertificationPreflight {
-  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string }
-  keyFields: Array<{ name: string; arrowType: string }>
-  schemaSha256: string
-  specSha256: string
-  estimatedScanRows?: number | null
-  estimatedScanBytes?: number | null
-  needsConfirmation: boolean
-  reason?: 'unknown_size' | 'large_scan' | null
-  supported: boolean
-  confirmationSha256: string
-}
-
-export interface RowIdentityCertificationTask {
-  taskId: string
-  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
-  datasetId: string
-  revisionId: string
-  schemaSha256: string
-  specSha256: string
-  keyColumns: string[]
-  canCancel: boolean
-  receipt?: {
-    outcome: 'certified' | 'already_certified_same_spec' | 'conflicting_retained_spec' | 'duplicate_key' | 'null_key' | 'unsupported_type' | 'stale_or_unavailable_revision' | 'cancelled' | 'failed'
-    certificate?: DatasetRevisionRowIdentity | null
-  } | null
 }
 
 export type DatasetViewSampling =

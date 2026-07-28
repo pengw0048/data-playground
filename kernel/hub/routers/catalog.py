@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -36,7 +36,7 @@ from hub.backends import (
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, LanceAdapter, RevisionPermissionLost, RevisionProviderOffline,
+    BoundedPreviewUnsupported, RevisionPermissionLost, RevisionProviderOffline,
     RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
     revision_adapter_for_uri,
 )
@@ -56,7 +56,6 @@ from hub.models import (
     CatalogTable,
     ColumnSchema,
     DatasetRevisionDetail,
-    DatasetRevisionRowIdentity,
     DatasetRevisionCapabilities,
     DatasetRevision,
     DatasetRevisionPage,
@@ -64,8 +63,6 @@ from hub.models import (
     DatasetRevisionResolution,
     DatasetRevisionSummary,
     ExactDatasetRevisionRequest,
-    ExactDatasetRef,
-    ExactMediaCellRequest,
     Facets,
     FieldLineagePage,
     ImportRequest,
@@ -79,7 +76,6 @@ from hub.models import (
     TransformLibraryDetail,
     TransformLibraryPage,
     MAX_CODE_LEN,
-    MediaCellRequest,
     Relationship,
     RelatedDatasetCandidate,
     RelatedDatasetPage,
@@ -89,11 +85,7 @@ from hub.models import (
     SampleResult,
     normalize_column_schemas,
 )
-from hub.row_identity import (
-    RowIdentityError,
-    canonicalize_preview_row_identities,
-    managed_local_lance_revision_incarnation,
-)
+from hub.row_identity import RowIdentityError
 from hub.security import current_user
 
 
@@ -593,34 +585,15 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     try:
         deps = get_deps()
         adapter = _revision_adapter(binding["uri"])
-        exact = ExactDatasetRef(
-            kind="exact", dataset_id=binding["dataset_id"], revision_id=revision_id)
-        lance_binding = metadb.managed_local_lance_row_identity_binding(
-            binding["dataset_id"])
-        lance_supported = (
-            type(adapter) is LanceAdapter
-            and lance_binding is not None
-            and lance_binding["uri"] == binding["uri"])
-        lance_fence_before = (
-            managed_local_lance_revision_incarnation(exact)
-            if lance_supported else None)
-        try:
-            certification_facts = metadb.catalog_managed_local_revision_certification_facts(exact)
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            certification_facts = None
-        artifact_uri = (
-            certification_facts["artifact_uri"]
-            if certification_facts is not None else None)
-        source_scope = (source_read_scope(
-            deps.storage, [artifact_uri],
-            owner=f"catalog-revision:{dataset_id}:{uuid.uuid4().hex}")
-            if artifact_uri is not None else contextlib.nullcontext([]))
-        with source_scope as guards:
-            artifact_info = None
-            if certification_facts is not None:
-                if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
-                    raise RevisionUnavailable("revision_unavailable")
-                artifact_info = os.fstat(guards[0].artifact_fileno())
+        artifact_uri = metadb.managed_local_file_revision_artifact(
+            binding["dataset_id"], revision_id)
+        source_scope = (
+            source_read_scope(
+                deps.storage, [artifact_uri],
+                owner=f"catalog-revision:{dataset_id}:{uuid.uuid4().hex}")
+            if artifact_uri is not None else contextlib.nullcontext()
+        )
+        with source_scope:
             with db.base_guard():
                 raw = adapter.revision_detail(
                     binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
@@ -635,54 +608,6 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
                 normalize_column_schemas(raw["columns"]), sample_rows=raw_preview_rows,
             )
             resolved_revision_id = str(raw["revision_id"])
-            if (certification_facts is not None
-                    and resolved_revision_id != certification_facts["revision_id"]):
-                raise RevisionUnavailable("revision_unavailable")
-            if lance_supported and resolved_revision_id != exact.revision_id:
-                raise RevisionUnavailable("revision_unavailable")
-            if lance_supported:
-                lance_fence_after = managed_local_lance_revision_incarnation(exact)
-                if lance_fence_after != lance_fence_before:
-                    raise RevisionUnavailable("revision_unavailable")
-                certificate = (
-                    metadb.managed_local_lance_row_identity_certificate_for_incarnation(
-                        binding["dataset_id"], resolved_revision_id,
-                        schema_sha256=lance_fence_after[0],
-                        physical_incarnation_sha256=lance_fence_after[1]))
-            else:
-                certificate = (
-                    metadb.managed_local_row_identity_certificate_for_artifact(
-                        binding["dataset_id"], resolved_revision_id, artifact_uri,
-                        artifact_dev=int(artifact_info.st_dev),
-                        artifact_ino=int(artifact_info.st_ino),
-                    )
-                    if certification_facts is not None and artifact_info is not None else None
-                )
-            row_identities = (
-                canonicalize_preview_row_identities(
-                    raw.get("row_identity_preview_table", preview_table).slice(
-                        0, DATASET_REVISION_PREVIEW_ROWS),
-                    certificate,
-                )
-                if certificate is not None else None
-            )
-            certificate_valid = certificate is not None and row_identities is not None
-            from hub.media_cells import supports_exact_media_cell
-            media_cell_supported = supports_exact_media_cell(
-                adapter, binding["uri"], resolved_revision_id)
-            row_identity = {
-                "datasetId": binding["dataset_id"],
-                "revisionId": resolved_revision_id,
-                "proofStatus": "certified" if certificate_valid else "unavailable",
-                "certificationSupported": (
-                    certification_facts is not None or lance_supported),
-                "fields": ([
-                    {"name": field.name, "arrowType": field.arrow_type}
-                    for field in certificate.spec.fields
-                ] if certificate_valid else []),
-                "encodingVersion": (
-                    certificate.spec.encoding_version if certificate_valid else None),
-            }
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
@@ -711,10 +636,8 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             row_count=raw.get("row_count"), data_file_count=raw.get("data_file_count"),
             total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),
         preview=DatasetRevisionPreview(
-            columns=preview_columns, rows=preview_rows, row_identities=row_identities,
+            columns=preview_columns, rows=preview_rows,
             has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
-        row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
-        media_cell_supported=media_cell_supported,
     )
 
 
@@ -723,115 +646,6 @@ def open_dataset_revision_by_identity(
         request: ExactDatasetRevisionRequest) -> DatasetRevisionDetail:
     """Open one exact revision whose opaque IDs may contain path separators."""
     return open_dataset_revision(request.dataset_id, request.revision_id)
-
-
-@router.post(
-    "/catalog/revisions/{dataset_id}/{revision_id}/media-cell",
-    response_class=Response,
-    responses={
-        200: {
-            "description": "The exact bounded media cell bytes.",
-            "content": {
-                media_type: {"schema": {"type": "string", "format": "binary"}}
-                for media_type in (
-                    "image/png", "image/jpeg", "image/gif", "image/webp",
-                    "image/avif", "image/heic", "image/heif",
-                    "video/webm", "video/x-matroska", "video/mp4", "video/quicktime",
-                )
-            },
-        },
-    },
-)
-def open_media_cell(
-        req: MediaCellRequest,
-        dataset_id: str = Path(..., min_length=1, max_length=512),
-        revision_id: str = Path(..., min_length=1, max_length=256),
-) -> Response:
-    """Return one bounded media cell addressed only by certified exact logical identity."""
-    from hub.media_cells import (
-        MediaCellIdentityInvalid,
-        MediaCellIdentityUnavailable,
-        MediaCellOffline,
-        MediaCellRowAmbiguous,
-        MediaCellRowNotFound,
-        MediaCellSourceDenied,
-        MediaCellTooLarge,
-        MediaCellUnavailable,
-        MediaCellUnsupported,
-        read_exact_media_cell,
-    )
-
-    binding = _revision_binding_for_dataset_id(dataset_id)
-    try:
-        # Preserve the managed-local route's minimal dependency surface: its adapter is selected
-        # directly from the immutable ledger, while provider adapters still resolve only after
-        # their canonical Workspace binding has been established.
-        from hub.plugins.adapters import managed_local_file_revision_adapter
-        adapter = managed_local_file_revision_adapter(binding["uri"]) or _revision_adapter(binding["uri"])
-        content, content_type = read_exact_media_cell(
-            storage=get_deps().storage, adapter=adapter, dataset_uri=binding["uri"],
-            dataset_id=dataset_id, revision_id=revision_id, request=req)
-    except MediaCellIdentityUnavailable:
-        raise APIError(409, "media_cell_identity_unavailable",
-                       code=APIErrorCode.MEDIA_CELL_IDENTITY_UNAVAILABLE, retryable=False)
-    except MediaCellIdentityInvalid:
-        raise APIError(422, "media_cell_identity_invalid",
-                       code=APIErrorCode.MEDIA_CELL_IDENTITY_INVALID, retryable=False)
-    except MediaCellRowNotFound:
-        raise APIError(404, "media_cell_row_not_found",
-                       code=APIErrorCode.MEDIA_CELL_ROW_NOT_FOUND, retryable=False)
-    except MediaCellRowAmbiguous:
-        raise APIError(409, "media_cell_row_ambiguous",
-                       code=APIErrorCode.MEDIA_CELL_ROW_AMBIGUOUS, retryable=False)
-    except MediaCellTooLarge:
-        raise APIError(413, "media_cell_too_large",
-                       code=APIErrorCode.PAYLOAD_TOO_LARGE, retryable=False)
-    except MediaCellSourceDenied:
-        raise APIError(403, "media_cell_source_denied",
-                       code=APIErrorCode.PERMISSION_DENIED, retryable=False)
-    except MediaCellUnsupported:
-        raise APIError(415, "media_cell_unsupported",
-                       code=APIErrorCode.MEDIA_CELL_UNSUPPORTED, retryable=False)
-    except MediaCellUnavailable:
-        raise APIError(410, "media_cell_unavailable",
-                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    except MediaCellOffline:
-        raise APIError(503, "media_cell_provider_offline",
-                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    return Response(
-        content=content,
-        media_type=content_type,
-        headers={
-            "Cache-Control": "private, no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
-
-
-@router.post(
-    "/catalog/revision-media-cell",
-    response_class=Response,
-    responses={
-        200: {
-            "description": "The exact bounded media cell bytes.",
-            "content": {
-                media_type: {"schema": {"type": "string", "format": "binary"}}
-                for media_type in (
-                    "image/png", "image/jpeg", "image/gif", "image/webp",
-                    "image/avif", "image/heic", "image/heif",
-                    "video/webm", "video/x-matroska", "video/mp4", "video/quicktime",
-                )
-            },
-        },
-    },
-)
-def open_media_cell_by_identity(request: ExactMediaCellRequest) -> Response:
-    """Read one exact media cell when dataset and revision IDs are opaque strings."""
-    return open_media_cell(
-        MediaCellRequest(identity=request.identity, column=request.column),
-        request.dataset_id,
-        request.revision_id,
-    )
 
 
 @router.put("/catalog/tables/{table_id}/metadata", response_model=CatalogTable)

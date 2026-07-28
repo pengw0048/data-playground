@@ -203,15 +203,6 @@ describe('InboxView', () => {
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')
   })
 
-  it('does not render retired row-identity task items', async () => {
-    mocks.inboxList.mockResolvedValue({ items: [item({
-      taskKind: 'row_identity_certification', canvasId: null, canvasName: null,
-      datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Media' },
-    })], hasMore: false, nextCursor: null })
-    render(<InboxView />)
-    expect(await screen.findByText(/No completed background work yet/)).toBeInTheDocument()
-    expect(screen.queryByTestId('inbox-item-item-1')).not.toBeInTheDocument()
-  })
 })
 
 describe('mergeMonotonic (load-more ordering)', () => {

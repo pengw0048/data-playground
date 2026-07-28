@@ -181,24 +181,26 @@ test('browses and opens one exact retained dataset revision without drifting to 
       retentionOwner: 'provider', parentRevisionId: 'rev-1', producerOperation: 'append',
       summary: { rowCount: 2, dataFileCount: 2, totalBytes: 32, fragmentCount: 2 },
       preview: {
-        columns: [{ fieldId: 'amount', name: 'amount', type: 'int', nullable: false, provenance: 'provider', capabilities: [] }],
-        rows: [{ amount: 2 }], rowIdentities: null, hasMore: true, rowLimit: 100,
-      },
-      rowIdentity: {
-        datasetId: 'stable-dataset', revisionId: 'rev-2', proofStatus: 'unavailable',
-        certificationSupported: false, fields: [], encodingVersion: null,
+        columns: [
+          { fieldId: 'amount', name: 'amount', type: 'int', nullable: false, provenance: 'provider', capabilities: [] },
+          { fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' },
+          { fieldId: 'broken_asset', name: 'broken_asset', type: 'string', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' },
+        ],
+        rows: [{ amount: 2, frame: '<128 bytes>', broken_asset: 'http://127.0.0.1:1/missing.png' }],
+        hasMore: true, rowLimit: 100,
       },
     } : {
       datasetId: 'stable-dataset', revisionId: 'rev-1', committedAt: '2026-07-15T12:00:00Z',
       retentionOwner: 'provider', parentRevisionId: null, producerOperation: 'create',
       summary: { rowCount: 1, dataFileCount: 1, totalBytes: 16, fragmentCount: 1 },
       preview: {
-        columns: [{ fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
-        rows: [{ amount: 1 }], rowIdentities: null, hasMore: false, rowLimit: 100,
-      },
-      rowIdentity: {
-        datasetId: 'stable-dataset', revisionId: 'rev-1', proofStatus: 'unavailable',
-        certificationSupported: false, fields: [], encodingVersion: null,
+        columns: [
+          { fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] },
+          { fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' },
+          { fieldId: 'broken_asset', name: 'broken_asset', type: 'string', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' },
+        ],
+        rows: [{ amount: 1, frame: '<64 bytes>', broken_asset: 'http://127.0.0.1:1/missing.png' }],
+        hasMore: false, rowLimit: 100,
       },
     } })
   })
@@ -215,6 +217,9 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByText(/Parent rev-1 · producer append/)).toBeVisible()
   await expect(page.getByText('breaking')).toBeVisible()
   await expect(page.getByText(/Preview truncated at 100 rows.*exact revision/i)).toBeVisible()
+  await expect(page.getByText('Binary media preview is unavailable.', { exact: true })).toBeVisible()
+  await expect(page.getByText('The browser could not display this media.', { exact: true })).toBeVisible()
+  await expect(page.getByRole('img', { name: 'Media image' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /certify/i })).toHaveCount(0)
   await expect(page.getByText(/row identity/i)).toHaveCount(0)
   expect(historyRequests).toBeGreaterThanOrEqual(2)

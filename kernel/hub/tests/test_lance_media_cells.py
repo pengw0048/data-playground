@@ -209,7 +209,7 @@ def test_certified_lance_object_reference_reuses_core_bounded_filesystem_policy(
     assert _read(LanceAdapter(), registered, exact, "1")[0] == PNG + b"object"
 
 
-def test_lance_detail_tags_supported_private_references_and_routes_exact_reads(
+def test_lance_detail_tags_supported_private_references(
         tmp_path, monkeypatch):
     local = tmp_path / "asset.png"
     local.write_bytes(PNG + b"local")
@@ -269,29 +269,8 @@ def test_lance_detail_tags_supported_private_references_and_routes_exact_reads(
         assert columns[name]["capabilities"] == []
         assert columns[name]["mediaKind"] is None
     assert detail["preview"]["rows"][0] == {"id": 1, **values}
-    assert detail["preview"]["rowIdentities"] == [[{
-        "name": "id", "arrowType": "int64", "value": "1",
-    }]]
-    assert detail["mediaCellSupported"] is True
-
-    request = {
-        "identity": [{"name": "id", "arrowType": "int64", "value": "1"}],
-        "column": "",
-    }
-    expected = {
-        "local_media": PNG + b"local",
-        "file_media": PNG + b"local",
-        "object_media": object_payload,
-    }
-    for column, content in expected.items():
-        request["column"] = column
-        opened = client.post(
-            f"/api/catalog/revisions/{exact.dataset_id}/{exact.revision_id}/media-cell",
-            json=request,
-        )
-        assert opened.status_code == 200, opened.text
-        assert opened.content == content
-        assert opened.headers["content-type"] == "image/png"
+    assert "rowIdentities" not in detail["preview"]
+    assert "mediaCellSupported" not in detail
 
 
 def test_string_scanners_use_exact_bounded_plans_without_take_or_encoding(
@@ -418,7 +397,7 @@ def test_blob_v2_inline_and_packed_payloads_use_descriptor_then_blobfile(
     assert _read(LanceAdapter(), registered, exact, "1") == (payload, "image/png")
 
 
-def test_mixed_blob_and_plain_binary_revision_detail_and_media_route(
+def test_mixed_blob_and_plain_binary_revision_detail(
         tmp_path):
     inline = "data:image/png;base64," + base64.b64encode(PNG + b"string").decode()
     table = (
@@ -448,37 +427,8 @@ def test_mixed_blob_and_plain_binary_revision_detail_and_media_route(
         "raw": None,
         "string_media": inline,
     }]
-    assert detail["preview"]["rowIdentities"] == [[{
-        "name": "id", "arrowType": "int64", "value": "1",
-    }]]
-    assert detail["mediaCellSupported"] is True
-
-    request = {
-        "identity": [{"name": "id", "arrowType": "int64", "value": "1"}],
-        "column": "media",
-    }
-    opened = client.post(
-        f"/api/catalog/revisions/{exact.dataset_id}/{exact.revision_id}/media-cell",
-        json=request,
-    )
-    assert opened.status_code == 200, opened.text
-    assert opened.content == PNG + b"route"
-    assert opened.headers["content-type"] == "image/png"
-
-    request["column"] = "string_media"
-    opened_string = client.post(
-        f"/api/catalog/revisions/{exact.dataset_id}/{exact.revision_id}/media-cell",
-        json=request,
-    )
-    assert opened_string.status_code == 200, opened_string.text
-    assert opened_string.content == PNG + b"string"
-
-    request["column"] = "raw"
-    rejected = client.post(
-        f"/api/catalog/revisions/{exact.dataset_id}/{exact.revision_id}/media-cell",
-        json=request,
-    )
-    assert rejected.status_code == 415, rejected.text
+    assert "rowIdentities" not in detail["preview"]
+    assert "mediaCellSupported" not in detail
 
 
 def test_blob_preview_sniff_has_strict_cell_and_total_byte_budgets(

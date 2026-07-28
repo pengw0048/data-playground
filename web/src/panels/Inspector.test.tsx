@@ -410,7 +410,7 @@ describe('Inspector — Source connection details', () => {
         columns: [{ name: 'customer_id', type: 'int64', capabilities: [], annotations: [{
           key: 'provider.note', value: 'selected exact schema', encoding: 'utf8', provenance: 'provider',
         }] }], rows: [], hasMore: false, rowLimit: 100,
-      }, rowIdentity: { supported: false, reason: 'unsupported' },
+      },
     } as any)
     useStore.setState({
       selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {},

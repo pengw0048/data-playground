@@ -10,7 +10,6 @@ import type {
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
-  RowIdentityCertificationPreflight, RowIdentityCertificationTask, MediaCellRequest,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -108,41 +107,6 @@ async function reqVoid(path: string, opts?: RequestInit): Promise<void> {
     }
     throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
   }
-}
-
-// Media cells are the one catalog read that intentionally returns bounded bytes rather than a
-// JSON document. Keep its auth and KernelError envelope handling aligned with req(), without
-// teaching the generic JSON helper to consume a Blob response.
-async function reqBlob(path: string, opts?: RequestInit): Promise<Blob> {
-  const rawBody = opts?.body != null && typeof opts.body !== 'string'
-  const headers: Record<string, string> = {
-    ...(rawBody ? {} : { 'Content-Type': 'application/json' }),
-    ...(opts?.headers as Record<string, string>),
-  }
-  if (_userId) headers['X-DP-User'] = _userId
-  const res = await fetch(`${BASE}${path}`, { ...opts, headers })
-  if (!res.ok) {
-    let detail = res.statusText
-    let code: string | undefined
-    let retryable: boolean | undefined
-    let field: string | undefined
-    let reason: string | undefined
-    try {
-      const body = await res.json()
-      detail = body.detail ?? detail
-      code = typeof body.code === 'string' ? body.code : undefined
-      retryable = typeof body.retryable === 'boolean' ? body.retryable : undefined
-      field = typeof body.field === 'string' ? body.field : undefined
-      reason = typeof body.reason === 'string' ? body.reason : undefined
-    } catch {
-      /* A non-JSON intermediary response still becomes a truthful network/load state. */
-    }
-    throw new KernelError(
-      res.status, typeof detail === 'string' ? detail : JSON.stringify(detail),
-      code, retryable, field, reason,
-    )
-  }
-  return res.blob()
 }
 
 // Strip transient UI-only fields the kernel does not need before sending a graph.
@@ -403,24 +367,6 @@ export const api = {
     req<DatasetRevisionDetail>('/catalog/revision-details', {
       method: 'POST', body: JSON.stringify({ datasetId, revisionId }),
     }),
-  openMediaCell: (
-    datasetId: string, revisionId: string, body: MediaCellRequest, options?: { signal?: AbortSignal },
-  ) => reqBlob(
-    '/catalog/revision-media-cell',
-    { method: 'POST', body: JSON.stringify({ datasetId, revisionId, ...body }), signal: options?.signal },
-  ),
-  rowIdentityCertificationPreflight: (body: { datasetId: string; revisionId: string; keyColumns: string[] }) =>
-    req<RowIdentityCertificationPreflight>('/catalog/row-identity-certifications/preflight', {
-      method: 'POST', body: JSON.stringify(body),
-    }),
-  submitRowIdentityCertification: (body: { datasetId: string; revisionId: string; keyColumns: string[]; submissionId: string; confirmationSha256?: string }) =>
-    req<RowIdentityCertificationTask>('/catalog/row-identity-certifications', {
-      method: 'POST', body: JSON.stringify(body),
-    }),
-  rowIdentityCertificationTask: (taskId: string) =>
-    req<RowIdentityCertificationTask>(`/row-identity-certifications/${encodeURIComponent(taskId)}`),
-  cancelRowIdentityCertificationTask: (taskId: string) =>
-    req<RowIdentityCertificationTask>(`/row-identity-certifications/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
   restoreRevision: (datasetId: string, revisionId: string, body: { submissionId: string; expectedHeadRevisionId: string }) =>
     req<RestoreRevisionTask>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/restore`, {
       method: 'POST', body: JSON.stringify(body),
@@ -863,7 +809,7 @@ export interface BoundedFanoutJobDto {
 }
 export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
-export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write' | 'row_identity_certification'
+export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write'
 export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; revisionId?: string | null; name?: string | null; deepLink?: string | null }
 export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
@@ -890,7 +836,6 @@ export type InboxTaskKind =
   | 'merge_columns_write'
   | 'restore_revision_write'
   | 'keyed_upsert_write'
-  | 'row_identity_certification'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface InboxUnreadCount { count: number }
 export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }

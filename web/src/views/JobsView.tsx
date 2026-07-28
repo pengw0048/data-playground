@@ -70,7 +70,7 @@ function selectedQuickView(params: URLSearchParams): QuickView | null {
   return null
 }
 
-const DATASET_TASK_LABELS: Omit<Record<DatasetTaskKind, string>, 'row_identity_certification'> = {
+const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
   merge_columns_write: 'Column merge',
@@ -153,7 +153,7 @@ export function JobsView() {
     try {
       const page = await api.workspaceJobs(queryFrom(new URLSearchParams(filterKey), nextCursor))
       if (sequence !== request.current) return
-      const visibleItems = page.items.filter((item) => item.datasetContext?.taskKind !== 'row_identity_certification')
+      const visibleItems = page.items
       if (!nextCursor) {
         setError('')
         setRefreshError('')
@@ -197,7 +197,7 @@ export function JobsView() {
     void api.workspaceJobs({ ...queryFrom(new URLSearchParams(filterKey)), limit: 1, runId })
       .then((page) => {
         if (!live) return
-        const exact = page.items.find((item) => item.datasetContext?.taskKind !== 'row_identity_certification' && jobKey(item) === runId)
+        const exact = page.items.find((item) => jobKey(item) === runId)
         if (exact) setItems((current) => [exact, ...current.filter((item) => item.id !== exact.id)])
         else setSelectedRunUnavailable(true)
       })
@@ -461,7 +461,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const dataset = item.datasetContext
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
-    : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind as Exclude<DatasetTaskKind, 'row_identity_certification'>]} · ${dataset.name || dataset.datasetId}`
+    : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
     : item.canvasName || 'Unavailable canvas'
   const context = report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report'
     : dataset ? `Dataset ${dataset.name || dataset.datasetId}`

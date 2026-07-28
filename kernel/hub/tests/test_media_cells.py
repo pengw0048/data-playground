@@ -9,7 +9,6 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from fastapi.testclient import TestClient
 
 from hub import metadb
 from hub import media_cells
@@ -105,10 +104,7 @@ def _read(storage, published: dict, request: MediaCellRequest, *, max_bytes: int
 
 
 def test_certified_exact_cell_returns_bytes_with_conservative_headers_contract(
-        local_catalog, tmp_path, monkeypatch):
-    from hub.main import app
-    from hub.routers import catalog as catalog_routes
-
+        local_catalog, tmp_path):
     storage, catalog = local_catalog
     published = _publish(
         storage, catalog, tmp_path,
@@ -121,44 +117,9 @@ def test_certified_exact_cell_returns_bytes_with_conservative_headers_contract(
     assert content == PNG + b"second"
     assert content_type == "image/png"
 
-    monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
-    monkeypatch.setattr(
-        catalog_routes, "get_deps",
-        lambda: type("Deps", (), {"storage": storage})(),
-    )
-    response = TestClient(app).post(
-        f"/api/catalog/revisions/{published['dataset_id']}/{published['revision_id']}/media-cell",
-        headers={"X-DP-User": "media-cell-test"},
-        json={
-            "identity": [{"name": "id", "arrowType": "int32", "value": "2"}],
-            "column": "media",
-        },
-    )
-    assert response.status_code == 200
-    assert response.content == PNG + b"second"
-    assert response.headers["content-type"] == "image/png"
-    assert response.headers["cache-control"] == "private, no-store"
-    assert response.headers["x-content-type-options"] == "nosniff"
-
     oversized_identity = "9" * 8192
     with pytest.raises(MediaCellIdentityInvalid):
         _read(storage, published, _request(oversized_identity))
-    rejected = TestClient(app).post(
-        f"/api/catalog/revisions/{published['dataset_id']}/{published['revision_id']}/media-cell",
-        headers={"X-DP-User": "media-cell-test"},
-        json={
-            "identity": [{
-                "name": "id", "arrowType": "int32", "value": oversized_identity,
-            }],
-            "column": "media",
-        },
-    )
-    assert rejected.status_code == 422
-    assert rejected.json() == {
-        "detail": "media_cell_identity_invalid",
-        "code": "media_cell_identity_invalid",
-        "retryable": False,
-    }
 
 
 def test_missing_proof_and_missing_or_ambiguous_exact_rows_fail_closed(
@@ -399,18 +360,3 @@ def test_object_cell_uses_existing_filesystem_contract_and_bounded_reads(monkeyp
     )
     with pytest.raises(MediaCellSourceDenied):
         media_cells._uri_bytes(None, "https://private.example.test/image.png", 32)
-
-
-def test_media_cell_http_surface_requires_authentication(monkeypatch):
-    from hub.main import app
-
-    monkeypatch.setenv("DP_AUTH_SECRET", "media-cell-auth-test")
-    response = TestClient(app).post(
-        "/api/catalog/revisions/dataset/revision/media-cell",
-        json={
-            "identity": [{"name": "id", "arrowType": "int32", "value": "1"}],
-            "column": "media",
-        },
-    )
-    assert response.status_code == 401
-    assert response.json()["code"] == "authentication_required"
