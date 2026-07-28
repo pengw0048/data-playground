@@ -9,6 +9,7 @@ import { Popover } from '../ui/Popover'
 import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
+import { uniqueNextStepConnection } from './nextStep'
 import { cn } from '@/lib/utils'
 import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 
@@ -26,7 +27,9 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 }) {
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
   const doc = useStore((s) => s.doc)
+  const selectedIds = useStore((s) => s.selectedIds)
   const addNode = useStore((s) => s.addNode)
+  const addConnectedNode = useStore((s) => s.addConnectedNode)
   const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
@@ -40,8 +43,10 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
 
-  const add = (kind: string) => {
-    const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
+  const safeToolbarPosition = (
+    nodes: typeof doc.nodes,
+    base: { x: number; y: number },
+  ) => {
     const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
     const toolbar = toolbarRef.current?.getBoundingClientRect()
     const bounds: ToolbarSafeBounds | null = surface && toolbar ? {
@@ -51,12 +56,41 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
       // The shelf is part of the node's interaction footprint, so the toolbar itself is excluded.
       bottom: screenToFlowPosition({ x: surface.left, y: toolbar.top }).y,
     } : null
+    return bounds ? toolbarSafePosition(nodes, base, bounds) : base
+  }
+
+  const add = (kind: string) => {
+    const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     const base = { x: c.x - 116, y: c.y - 40 }
-    const pos = bounds
-      ? toolbarSafePosition(useStore.getState().doc.nodes, base, bounds)
-      : base
+    const pos = safeToolbarPosition(useStore.getState().doc.nodes, base)
     addNode(kind, pos)
     setOpen(null)
+    setOperationFinderOpen(false)
+  }
+
+  const selectedNode = selectedIds.length === 1
+    ? doc.nodes.find((node) => node.id === selectedIds[0]) ?? null
+    : null
+  const nextStepKinds = new Set(selectedNode
+    ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind, doc.edges)).map((spec) => spec.kind)
+    : [])
+  const nextStepSource = nextStepKinds.size ? selectedNode : null
+  const addNext = (kind: string, asNextStep?: boolean) => {
+    if (!asNextStep) { add(kind); return }
+    // Re-evaluate at activation time: a remote edit or a changed selection must never turn the
+    // explicit next-step affordance into a guessed connection.
+    const current = useStore.getState().doc
+    const currentSelection = useStore.getState().selectedIds
+    const source = currentSelection.length === 1
+      ? current.nodes.find((node) => node.id === currentSelection[0]) ?? null
+      : null
+    const connection = source && uniqueNextStepConnection(source, kind, current.edges)
+    if (!source || !connection) return
+    const pos = safeToolbarPosition(
+      current.nodes,
+      { x: source.position.x + 300, y: source.position.y },
+    )
+    addConnectedNode(kind, pos, { source: source.id, ...connection })
     setOperationFinderOpen(false)
   }
 
@@ -93,7 +127,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
 
               <div className="mx-1 h-[22px] w-px bg-border" />
 
-              <ToolbarIconButton label="Add operation" icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
+              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
@@ -120,7 +154,14 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
           />
         </div>
       </div>
-      {operationFinderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
+      {operationFinderOpen && nextStepSource && <NodeFinder
+        specs={specs}
+        nextStepKinds={nextStepKinds}
+        nextStepLabel={nextStepSource.data.title}
+        onPick={addNext}
+        onClose={() => setOperationFinderOpen(false)}
+      />}
+      {operationFinderOpen && !nextStepSource && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </>
   )

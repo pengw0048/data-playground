@@ -66,8 +66,8 @@ function secondaryCue(result: FinderResult, results: FinderResult[]): string | n
   return source ?? result.spec.category
 }
 
-export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClose }: {
-  specs: NodeSpec[]; wire?: WireType; compatibleOnly?: boolean; onPick: (kind: string) => void; onClose: () => void
+export function NodeFinder({ specs, wire, compatibleOnly = false, nextStepKinds, nextStepLabel, onPick, onClose }: {
+  specs: NodeSpec[]; wire?: WireType; compatibleOnly?: boolean; nextStepKinds?: ReadonlySet<string>; nextStepLabel?: string; onPick: (kind: string, asNextStep?: boolean) => void; onClose: () => void
 }) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
@@ -80,7 +80,12 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClos
   useEffect(() => { input.current?.focus() }, [])
   useEffect(() => { setActive(0) }, [query, wire])
 
-  const choose = (result?: FinderResult) => { if (result && (!compatibleOnly || result.compatible)) onPick(result.spec.kind) }
+  const choose = (result?: FinderResult) => {
+    if (!result || (compatibleOnly && !result.compatible)) return
+    const asNextStep = nextStepKinds?.has(result.spec.kind)
+    if (asNextStep) onPick(result.spec.kind, true)
+    else onPick(result.spec.kind)
+  }
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Escape') { event.preventDefault(); onClose(); return }
     if (event.key === 'ArrowDown') { event.preventDefault(); setActive((index) => Math.min(index + 1, shownResults.length - 1)); return }
@@ -109,6 +114,7 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClos
               <span className="min-w-0 flex-1">
                 <span className="text-[13px] font-semibold text-foreground">{result.spec.title}</span>
                 <span className="mt-0.5 block text-[11px] text-muted-foreground">{result.spec.blurb || 'No description.'}</span>
+                {nextStepKinds?.has(result.spec.kind) && <span className="mt-1 block text-[10px] font-medium text-primary">Add next step{nextStepLabel ? ` after ${nextStepLabel}` : ''}</span>}
                 {cue && <span className="mt-1 block text-[10px] text-muted-foreground">{cue}</span>}
               </span>
             </button>

@@ -328,20 +328,25 @@ describe('graph store — core authority ops', () => {
 
   it('keeps menu-created node and edge in the same undo action', () => {
     register({
+      kind: 'history-auto-source', title: 'History source', category: 'io',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'History source', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    register({
       kind: 'history-auto-node', title: 'History node', category: 'compute',
       inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
       canBypass: false, blurb: '',
       defaultData: () => ({ title: 'History node', config: {}, status: 'draft', history: [] }),
     }, () => null)
     useStore.setState((state) => ({
-      doc: { ...state.doc, nodes: [NODE('source')], edges: [] },
+      doc: { ...state.doc, nodes: [NODE('source', 'history-auto-source')], edges: [] },
     }))
 
-    const node = useStore.getState().addNode('history-auto-node', { x: 100, y: 0 })
+    const node = useStore.getState().addConnectedNode('history-auto-node', { x: 100, y: 0 }, {
+      source: 'source', sourceHandle: 'out', targetHandle: 'in', wire: 'dataset',
+    })
     expect(node).not.toBeNull()
-    useStore.getState().connect({
-      id: 'auto-edge', source: 'source', target: node!.id, data: { wire: 'dataset' },
-    }, { history: 'current' })
 
     expect(useStore.getState().past).toHaveLength(1)
     expect(useStore.getState().doc.nodes).toHaveLength(2)

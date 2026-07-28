@@ -8,7 +8,7 @@ import type {
   CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
   RunInputManifestItem, RunStatus, SampleResult, WriteAdmission,
 } from '../types/api'
-import { getSpec, nodeOutputs } from '../nodes/registry'
+import { canConnect, getSpec, nodeOutputs, portWire } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash, type Route } from '../router'
@@ -1110,6 +1110,9 @@ interface Store {
   setNodes: (nodes: CanvasNode[]) => void
   setEdges: (edges: CanvasEdge[]) => void
   addNode: (kind: string, position: { x: number; y: number }, config?: Partial<NodeConfig>, title?: string) => CanvasNode | null
+  addConnectedNode: (kind: string, position: { x: number; y: number }, connection: {
+    source: string; sourceHandle: string; targetHandle: string; wire: WireType
+  }) => CanvasNode | null
   setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
   setNumericParamDraft: (id: string, param: string, text: string | undefined) => void
@@ -1740,6 +1743,48 @@ export const useStore = create<Store>((set, get) => ({
       },
     }
     set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, node] }, selectedId: node.id, selectedIds: [node.id] }))
+    return node
+  },
+
+  // Creation plus its initial edge is one graph mutation: subscribers never observe a detached
+  // node, and one undo returns to the exact pre-add document. Port-started and selected-node adds
+  // both use this boundary so their compatibility rules cannot drift.
+  addConnectedNode: (kind, position, connection) => {
+    if (!roleCanEdit(get().canvasRole)) return null
+    const source = get().doc.nodes.find((node) => node.id === connection.source)
+    const spec = getSpec(kind)
+    if (!source || !spec) return null
+    const sourceWire = portWire(get().doc.nodes, source.id, connection.sourceHandle, 'source')
+    if (sourceWire !== connection.wire || !canConnect(sourceWire, kind, connection.targetHandle)) return null
+    if (!spec.inputs.some((port) => port.id === connection.targetHandle)) return null
+
+    get().commit()
+    const base = spec.defaultData()
+    const node: CanvasNode = {
+      id: newId(kind), type: kind, position,
+      data: { ...base, title: base.title, config: { ...base.config } },
+    }
+    set((s) => {
+      const stale = downstream(s.doc, node.id)
+      const nodes = [...s.doc.nodes, node].map((candidate) => (
+        candidate.id === node.id && candidate.data.status === 'latest'
+          ? { ...candidate, data: { ...candidate.data, status: 'stale' as NodeStatus } }
+          : candidate
+      ))
+      const runs = invalidateWriteAdmissions(s.doc, s.runs, [node.id, ...stale])
+      return {
+        doc: {
+          ...s.doc,
+          nodes,
+          edges: [...s.doc.edges, {
+            id: newId('e'), source: connection.source, target: node.id,
+            sourceHandle: connection.sourceHandle, targetHandle: connection.targetHandle,
+            data: { wire: connection.wire },
+          }],
+        },
+        selectedId: node.id, selectedIds: [node.id], runs,
+      }
+    })
     return node
   },
 
