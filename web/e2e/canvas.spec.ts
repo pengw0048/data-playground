@@ -2345,7 +2345,7 @@ test.describe('Data Playground canvas', () => {
     await inspector.getByRole('button', { name: 'Select dataset' }).click()
     await page.getByText('events', { exact: true }).first().click()
     await expect(inspector.getByRole('button', { name: 'Count rows' })).toBeVisible()
-    await expect(inspector.getByText('Related data')).toBeVisible()
+    await expect(inspector.getByText('Related data', { exact: true })).toBeVisible()
     await expect(inspector.getByText('Ports')).toBeVisible()
   })
 
