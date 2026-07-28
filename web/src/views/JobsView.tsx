@@ -455,6 +455,25 @@ function Filter({ label, name, value, onChange, placeholder }: { label: string; 
   return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">{label}<input aria-label={`Filter jobs by ${label.toLowerCase()}`} value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onBlur={() => onChange(name, draft.trim())} onKeyDown={(event) => { if (event.key === 'Enter') onChange(name, draft.trim()) }} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
 }
 
+const JOB_SUBJECT_SUFFIX_LENGTH = 18
+const jobSubjectSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+
+function JobSubject({ name }: { name: string }) {
+  const graphemes = Array.from(jobSubjectSegmenter.segment(name), ({ segment }) => segment)
+  if (graphemes.length <= JOB_SUBJECT_SUFFIX_LENGTH) {
+    return <span className="block truncate font-semibold text-foreground" title={name}>{name}</span>
+  }
+  const split = graphemes.length - JOB_SUBJECT_SUFFIX_LENGTH
+  return (
+    <span className="flex min-w-0 font-semibold text-foreground" title={name}>
+      <span className="min-w-0 truncate">{graphemes.slice(0, split).join('')}</span>
+      <span className="flex max-w-full shrink-0 justify-end overflow-hidden whitespace-nowrap">
+        <span className="shrink-0">{graphemes.slice(split).join('')}</span>
+      </span>
+    </span>
+  )
+}
+
 function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
@@ -491,7 +510,12 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
         {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
       </span>
-      <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{subject}</span><span className="block truncate text-muted-foreground">{context}</span></span>
+      <span className="min-w-0">
+        {!report && !dataset
+          ? <JobSubject name={subject} />
+          : <span className="block truncate font-semibold text-foreground">{subject}</span>}
+        <span className="block truncate text-muted-foreground">{context}</span>
+      </span>
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
       <span className="text-muted-foreground">{duration}</span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>

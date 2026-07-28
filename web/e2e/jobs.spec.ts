@@ -172,6 +172,83 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   await expect(page.getByText(/Result 1 · transform:clean, Result 2 · transform:rejected/)).toBeVisible()
 })
 
+test('long shared-prefix Canvas names keep their suffixes visible without widening Jobs @ux-smoke', async ({ page }) => {
+  const prefix = 'Robotics preprocessing experiment with shared discovery and filtering context — '
+  const leftName = `${prefix}left-camera-pass`
+  const rightName = `${prefix}right-camera-pass`
+  const unicodePrefix = '多语言研究画布😀共享前缀数据清洗实验阶段一二三四五六七八九十—'
+  const unicodeLeftName = `${unicodePrefix}左侧相机`
+  const unicodeRightName = `${unicodePrefix}右侧相机`
+  const combiningName = `${'a'.repeat(10)}e\u0301${'x'.repeat(17)}`
+  const zwjName = `${'a'.repeat(10)}👩🏽‍🔬${'x'.repeat(17)}`
+  const jobs = [
+    { ...failedJob, id: 'history-left', runId: 'run-left', canvasId: 'canvas-left', canvasName: leftName },
+    { ...failedJob, id: 'history-right', runId: 'run-right', canvasId: 'canvas-right', canvasName: rightName },
+    { ...failedJob, id: 'history-unicode-left', runId: 'run-unicode-left', canvasId: 'canvas-unicode-left', canvasName: unicodeLeftName },
+    { ...failedJob, id: 'history-unicode-right', runId: 'run-unicode-right', canvasId: 'canvas-unicode-right', canvasName: unicodeRightName },
+    { ...failedJob, id: 'history-combining', runId: 'run-combining', canvasId: 'canvas-combining', canvasName: combiningName },
+    { ...failedJob, id: 'history-zwj', runId: 'run-zwj', canvasId: 'canvas-zwj', canvasName: zwjName },
+  ]
+  await page.route('**/api/canvas', async (route) => route.fulfill({
+    json: jobs.map((job) => ({
+      id: job.canvasId, name: job.canvasName, version: 1, role: 'viewer',
+    })),
+  }))
+  await page.route('**/api/jobs?*', async (route) => route.fulfill({
+    json: { items: jobs, nextCursor: null, hasMore: false },
+  }))
+
+  await page.goto('/#/jobs')
+  const left = page.getByTitle(leftName)
+  const right = page.getByTitle(rightName)
+  const unicodeLeft = page.getByTitle(unicodeLeftName)
+  const unicodeRight = page.getByTitle(unicodeRightName)
+  const combining = page.getByTitle(combiningName)
+  const zwj = page.getByTitle(zwjName)
+  await expect(left).toHaveText(leftName)
+  await expect(right).toHaveText(rightName)
+  expect(Array.from(unicodeLeftName)).toHaveLength(35)
+  await expect(unicodeLeft).toHaveText(unicodeLeftName)
+  await expect(unicodeRight).toHaveText(unicodeRightName)
+  expect(Array.from(combiningName)).toHaveLength(29)
+  expect(Array.from(zwjName)).toHaveLength(31)
+  await expect(combining).toHaveText(combiningName)
+  await expect(zwj).toHaveText(zwjName)
+  for (const [width, height] of [[1280, 720], [1440, 900]] as const) {
+    await page.setViewportSize({ width, height })
+    for (const subject of [left, right, unicodeLeft, unicodeRight, combining, zwj]) {
+      await expect(subject).toBeVisible()
+      const row = subject.locator('xpath=ancestor::button')
+      expect(await row.evaluate((element) => element.scrollWidth <= element.clientWidth),
+        `Jobs row should not overflow at ${width}px`).toBe(true)
+      const [subjectBox, rowBox] = await Promise.all([subject.boundingBox(), row.boundingBox()])
+      if (!subjectBox || !rowBox) throw new Error('Jobs subject has no bounding box')
+      expect(subjectBox.x + subjectBox.width).toBeLessThanOrEqual(rowBox.x + rowBox.width + 0.5)
+    }
+    await expect(left.locator('span').last()).toContainText('left-camera-pass')
+    await expect(right.locator('span').last()).toContainText('right-camera-pass')
+    await expect(unicodeLeft.locator('span').last()).toContainText('左侧相机')
+    await expect(unicodeRight.locator('span').last()).toContainText('右侧相机')
+    await expect(combining.locator('span').last()).toHaveText(`e\u0301${'x'.repeat(17)}`)
+    await expect(zwj.locator('span').last()).toHaveText(`👩🏽‍🔬${'x'.repeat(17)}`)
+    for (const subject of [unicodeLeft, unicodeRight]) {
+      expect(await subject.evaluate((element) => {
+        const suffix = element.lastElementChild?.lastElementChild
+        const text = suffix?.firstChild
+        if (!(suffix instanceof HTMLElement) || !(text instanceof Text) || text.length === 0) return false
+        const finalCharacter = document.createRange()
+        finalCharacter.setStart(text, text.length - 1)
+        finalCharacter.setEnd(text, text.length)
+        const characterBox = finalCharacter.getBoundingClientRect()
+        const subjectBox = element.getBoundingClientRect()
+        return characterBox.left >= subjectBox.left && characterBox.right <= subjectBox.right
+      }), `Canvas suffix ending should remain visible at ${width}px`).toBe(true)
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      `Jobs should not create page overflow at ${width}px`).toBe(true)
+  }
+})
+
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
   const mergeJob = {
     id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
