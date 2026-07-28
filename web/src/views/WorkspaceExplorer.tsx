@@ -767,7 +767,7 @@ function WorkspaceMixedExplorer() {
         {selectedProviderResource && <button onClick={() => setRelinkResource(selectedProviderResource)} className="shrink-0 font-semibold underline">Relink</button>}
       </div>}
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+      <div data-testid="workspace-scroll-surface" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {searchQuery ? <WorkspaceSearchResults query={searchQuery} revision={revision} onOpen={open}
           onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
@@ -1762,7 +1762,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      <div className="mt-5 grid gap-3 text-[12px]">
+      <div data-testid="provider-dataset-detail-content" className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px]">
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Workspace placement</div><div className="break-all font-mono text-[11px]">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-[11px] text-muted-foreground">{placementPath}</div>}</div>
         {resource.providerDatasetId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Canonical dataset</div>
@@ -1807,7 +1807,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
         {alternatePlacements.length > 0 && <div className="rounded-md border border-border bg-muted/25 p-2 text-[11px] text-muted-foreground"><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1">Only placements already loaded in this Workspace session are shown.</div></div>}
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
       </div>
-      <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
+      <div className="mt-4 shrink-0 rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
         This provider placement is source-only. Using the dataset creates only a local Source; it never writes to the provider. Other Workspace placements use that same canonical Source.
         <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
           className="mt-3 block w-full rounded-md bg-foreground px-3 py-2 font-semibold text-background disabled:opacity-50">Use in canvas</button>
