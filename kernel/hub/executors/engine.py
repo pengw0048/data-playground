@@ -1158,6 +1158,7 @@ class BuildEngine:
                 t == "sort"
                 and node.id == self._output_node
                 and not self.full
+                and not _bypassed(node)
                 and (cfg.get("by") or "").strip()
                 and exc.suggested_action == "run"
             ):

@@ -1596,6 +1596,16 @@ def test_sort_preview_refusal_override_is_scoped_to_configured_sort():
     assert blank_result["reason"] == (
         "Grouped aggregation needs all input rows. Run this step to see the result.")
 
+    bypassed_target = N("target", "sort", {"by": "n DESC"})
+    bypassed_target["data"]["bypassed"] = True
+    bypassed_sort = {"id": "bypassed-sort-refusal", "version": 1, "nodes": [
+        *base_nodes, bypassed_target,
+    ], "edges": [*base_edges, E("aggregate", "target")]}
+    bypassed_result = client.post(
+        "/api/run/preview", json={"graph": bypassed_sort, "nodeId": "target", "k": 5}).json()
+    assert bypassed_result["reason"] == (
+        "Grouped aggregation needs all input rows. Run this step to see the result.")
+
     other_target = {"id": "other-target-refusal", "version": 1, "nodes": [
         *base_nodes,
         N("upstream-sort", "sort", {"by": "n DESC"}),
