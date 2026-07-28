@@ -5,7 +5,7 @@ import type { ColumnSchema } from '../types/graph'
 import type { CatalogTable } from '../types/api'
 import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
-import { useStore } from '../store/graph'
+import { previewPlanIdentity, useStore } from '../store/graph'
 import { api } from '../api/client'
 import { registerGenericNodes } from '../nodes/generic'
 import '../nodes/kinds/source'
@@ -514,6 +514,66 @@ describe('Inspector — output schema disclosure', () => {
     expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Edit materialization' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Review output schema' })).not.toBeInTheDocument()
+  })
+})
+
+describe('Inspector — observed output schema', () => {
+  const selectTransform = (config: Record<string, unknown> = {}) => {
+    const doc = {
+      id: 'observed-output', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+        data: { title: 'transform', status: 'draft', history: [], config },
+      }],
+    }
+    useStore.setState({
+      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: { transform: { out: null } }, previews: {}, doc,
+    } as any)
+    return doc as any
+  }
+
+  const observedPreview = (doc: any, portId = 'out', planIdentity = previewPlanIdentity(doc, 'transform', portId)) => ({
+    canvasId: doc.id, nodeId: 'transform', portId, planIdentity, requestGeneration: 1,
+    result: { columns: cols },
+  })
+
+  it('keeps a dynamic Transform output untyped before a current result exists', () => {
+    selectTransform()
+    render(<Inspector />)
+    expect(screen.getByText('untyped')).toBeVisible()
+  })
+
+  it('shows columns observed from a current matching result', () => {
+    const doc = selectTransform()
+    useStore.setState({ previews: { transform: observedPreview(doc) } } as any)
+    render(<Inspector />)
+    fireEvent.click(screen.getByTitle('Show columns'))
+    expect(screen.getByText('id')).toBeVisible()
+    expect(screen.getByText('amount')).toBeVisible()
+    expect(screen.getByText('2 cols')).toBeVisible()
+  })
+
+  it('does not use stale or mismatched-port results as output schema evidence', () => {
+    const staleDoc = selectTransform()
+    useStore.setState({ previews: { transform: observedPreview(staleDoc, 'out', 'stale-plan') } } as any)
+    const staleView = render(<Inspector />)
+    expect(screen.getByText('untyped')).toBeVisible()
+    staleView.unmount()
+
+    const mismatchedDoc = selectTransform()
+    useStore.setState({ previews: { transform: observedPreview(mismatchedDoc, 'other') } } as any)
+    render(<Inspector />)
+    expect(screen.getByText('untyped')).toBeVisible()
+  })
+
+  it('keeps a current explicit declared contract ahead of observed columns', () => {
+    const declared = [{ name: 'declared_id', type: 'string', capabilities: [] }]
+    const doc = selectTransform({ code: 'return current_input', outputSchema: declared, outputSchemaCodeHash: codeHash('return current_input') })
+    useStore.setState({ previews: { transform: observedPreview(doc) } } as any)
+    render(<Inspector />)
+    fireEvent.click(screen.getByTitle('Show columns'))
+    expect(screen.getByText('declared_id')).toBeVisible()
+    expect(screen.queryByText('amount')).not.toBeInTheDocument()
+    expect(screen.getByText('1 cols')).toBeVisible()
   })
 })
 

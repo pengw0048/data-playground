@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
+  currentPreviews, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useInputColumns, useSchemaWarnings } from '../nodes/fields'
-import { codeHash, outputPortId } from '../nodes/schema'
+import { codeHash, nodeColumns, outputPortId } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
@@ -181,12 +181,14 @@ function EditOnly({ enabled, children }: { enabled: boolean; children: React.Rea
 
 function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const doc = useStore((s) => s.doc)
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, nodeId))
   const configuredManagedSidecarMerge = useStore((s) => hasConfiguredManagedSidecarMerge(s.doc, nodeId))
   const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, nodeId))
   const allSchemas = useStore((s) => s.schemas)
+  const previews = useStore((s) => s.previews)
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const inputColumns = useInputColumns(nodeId)
@@ -239,11 +241,20 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
   const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
+  // Runtime columns are display-only evidence. Reuse the current-preview filter used by editor
+  // completions, then route through nodeColumns so an observation cannot cross named output ports.
+  const observedOut = canDeclareSchema && outputPorts.length === 1
+    ? nodeColumns(doc, allSchemas, currentPreviews(doc, previews), catalog, nodeId, outputPorts[0]?.id)
+    : []
   const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
     kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(kind, cfg)
       && !node.data.bypassed && outputPorts.length === 1
       ? declaredOut
-      : allSchemas[nodeId]?.[portId]
+      : canDeclareSchema && outputPorts.length === 1
+        ? observedOut.length
+          ? observedOut
+          : allSchemas[nodeId]?.[portId]
+        : allSchemas[nodeId]?.[portId]
   )
   // INPUT port schema = the OUTPUT schema of whatever is wired into that port (routed by targetHandle).
   const inputSchemaFor = (portId: string): ColumnSchema[] | null | undefined => {
