@@ -257,4 +257,36 @@ describe('JoinWithRelated', () => {
       expect.objectContaining({ revisionMode: 'exact', revisionId: 'source-v4' }), expect.any(Object),
     ))
   })
+
+  it('offers the Canvas action only for a canonical Source binding', () => {
+    const { unmount } = render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    expect(screen.getByTestId('join-with-related-canvas-source-1')).toHaveAccessibleName('Join with related data')
+    unmount()
+
+    mocks.state.doc.nodes[0].data.config = {
+      uri: 'events.parquet', tableId: 'tbl-events',
+      providerMountId: '', providerSourceBindingId: '',
+    }
+    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
+  })
+
+  it('labels the empty side of a one-input Join without guessing a missing port', () => {
+    mocks.state.doc.nodes.push({
+      id: 'join-1', type: 'join', position: { x: 200, y: 0 },
+      data: { title: 'join', status: 'draft', config: {} },
+    })
+    mocks.state.doc.edges = [{
+      id: 'source-to-right', source: 'source-1', target: 'join-1',
+      sourceHandle: 'out', targetHandle: 'b',
+    }]
+    const { unmount } = render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
+    expect(screen.getByTestId('join-with-related-canvas-join-1'))
+      .toHaveAccessibleName('Join with related data on left input')
+    unmount()
+
+    mocks.state.doc.edges[0].targetHandle = null
+    render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
+    expect(screen.queryByTestId('join-with-related-canvas-join-1')).toBeNull()
+  })
 })

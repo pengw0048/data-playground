@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
 import type { DatasetRevisionPage, RelatedDatasetCandidate, RelatedDatasetPage } from '../types/api'
@@ -28,7 +29,10 @@ function exactLabel(ref: DatasetRef | undefined, fallback: string) {
   return `${exact.datasetId}@${exact.revisionId}`
 }
 
-export function JoinWithRelated({ nodeId }: { nodeId: string }) {
+export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
+  nodeId: string
+  surface?: 'inspector' | 'canvas'
+}) {
   const doc = useStore((state) => state.doc)
   const canEdit = useStore((state) => roleCanEdit(state.canvasRole))
   const serverVersion = useStore((state) => state.serverVersion)
@@ -36,15 +40,21 @@ export function JoinWithRelated({ nodeId }: { nodeId: string }) {
   const selectedNode = doc.nodes.find((node) => node.id === nodeId)
   const context = useMemo(() => {
     if (selectedNode?.type === 'source') {
-      return { source: selectedNode, joinNodeId: undefined as string | undefined }
+      return { source: selectedNode, joinNodeId: undefined as string | undefined, emptyPort: undefined }
     }
     if (selectedNode?.type !== 'join') return null
     const incoming = doc.edges.filter((edge) => edge.target === nodeId)
     if (incoming.length !== 1) return null
+    const occupiedPort = incoming[0].targetHandle
+    if (occupiedPort !== 'a' && occupiedPort !== 'b') return null
     const source = doc.nodes.find(
       (node) => node.id === incoming[0].source && node.type === 'source',
     )
-    return source ? { source, joinNodeId: nodeId } : null
+    return source ? {
+      source,
+      joinNodeId: nodeId,
+      emptyPort: occupiedPort === 'a' ? 'b' as const : 'a' as const,
+    } : null
   }, [doc.edges, doc.nodes, nodeId, selectedNode])
   const sourceIdentity = useMemo(() => {
     const config = context?.source.data.config
@@ -58,7 +68,8 @@ export function JoinWithRelated({ nodeId }: { nodeId: string }) {
         ...(exact ? { revisionId: exact.revisionId } : {}),
       }
     }
-    if (typeof config.providerMountId === 'string' && typeof config.providerSourceBindingId === 'string') {
+    if (typeof config.providerMountId === 'string' && config.providerMountId
+        && typeof config.providerSourceBindingId === 'string' && config.providerSourceBindingId) {
       const ref = config.datasetRef as DatasetRef | undefined
       const exact = ref && !('parameterRef' in ref) ? datasetRefIdentity(ref) : null
       return {
@@ -306,14 +317,26 @@ export function JoinWithRelated({ nodeId }: { nodeId: string }) {
   const exactRevisionPending = Boolean(requestedRevisionId && requestedRevisionId !== reviewedRevisionId)
   const declared = page?.candidates.filter((item) => item.evidence !== 'schema_match') ?? []
   const inferred = page?.candidates.filter((item) => item.evidence === 'schema_match') ?? []
+  const triggerLabel = surface === 'canvas'
+    ? context.joinNodeId
+      ? `Join with related data on ${context.emptyPort === 'a' ? 'left' : 'right'} input`
+      : 'Join with related data'
+    : 'Join with…'
 
   return (
     <>
-      <Button type="button" size="sm" variant="outline" data-testid={`join-with-related-${nodeId}`}
-        className="w-full justify-start" onClick={(event) => { openerRef.current = event.currentTarget; setOpen(true); setError('') }}>
-        Join with…
+      <Button type="button" size="sm" variant="outline"
+        data-testid={`${surface === 'canvas' ? 'join-with-related-canvas' : 'join-with-related'}-${nodeId}`}
+        className={cn('w-full justify-start', surface === 'canvas' && 'nodrag mt-1.5 h-7 px-2 text-[10.5px]')}
+        onClick={(event) => {
+          event.stopPropagation()
+          openerRef.current = event.currentTarget
+          setOpen(true)
+          setError('')
+        }}>
+        {triggerLabel}
       </Button>
-      {open && <div className="fixed inset-0 z-[80] grid place-items-center bg-black/40 p-4"
+      {open && createPortal(<div className="fixed inset-0 z-[80] grid place-items-center bg-black/40 p-4"
         onMouseDown={(event) => { if (event.target === event.currentTarget && !confirming) close() }}>
         <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Join with related data"
           className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
@@ -437,7 +460,7 @@ export function JoinWithRelated({ nodeId }: { nodeId: string }) {
             </Button>}
           </div>
         </div>
-      </div>}
+      </div>, document.body)}
     </>
   )
 }
