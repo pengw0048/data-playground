@@ -93,6 +93,30 @@ def test_related_join_placement_reserves_the_full_code_annotation_envelope():
     assert not _related_footprints_overlap(join, code)
 
 
+def test_related_join_placement_reserves_a_persisted_ten_key_join_builder():
+    # A persisted structured Join with ten pairs mounts to 654.25px in Chromium. The old fixed
+    # 400px obstacle accepted the source candidate at (400, 300), where it visibly overlapped.
+    # This must use the same server-visible config persisted by the Canvas, not browser geometry.
+    selected = {"id": "selected", "type": "source", "position": {"x": 0, "y": 0}}
+    ten_keys = ", ".join(f"key_{index}" for index in range(10))
+    tall_join = {
+        "id": "tall-join",
+        "type": "join",
+        "position": {"x": 450, "y": -150},
+        "data": {"config": {"how": "inner", "on": ten_keys}},
+    }
+    related = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+
+    assert metadb._workspace_related_join_footprint(tall_join) == (232, 655)
+    metadb._workspace_related_join_positions([selected, tall_join], selected, related, join)
+
+    assert related["position"] == {"x": 800.0, "y": 300.0}
+    assert join["position"] == {"x": 1160.0, "y": 110.0}
+    assert not _related_footprints_overlap(related, tall_join)
+    assert not _related_footprints_overlap(join, tall_join)
+
+
 class _UnavailableAdapter:
     @staticmethod
     def scan(_uri, columns=None):

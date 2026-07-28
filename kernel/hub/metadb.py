@@ -3869,16 +3869,52 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
 _RELATED_JOIN_CARD_FOOTPRINTS: dict[str, tuple[float, float]] = {
     # These are the mounted top-level card envelopes, not a graph layout.  Keep them in lockstep
     # with the product's fixed card contracts: CodeBlock is w-80 with a 240px clipped body; Note
-    # is w-[268px] with its 400px clipped body; Section is explicitly 360x240.  NodeCard forms are
-    # all 232px wide and use a 400px vertical envelope so a configured Join/Form cannot be placed
-    # beneath an adjacent card merely because its current fields happen to be short.
+    # is w-[268px] with its 400px clipped body; Section is explicitly 360x240. Ordinary NodeCard
+    # forms are all 232px wide and use a 400px vertical envelope. Join's repeated key builder is
+    # sized from its persisted config below, so it cannot be placed beneath an adjacent card just
+    # because its current fields happen to be short.
     "code": (320, 275),
     "note": (268, 424),
     "section": (360, 240),
-    "join": (232, 400),
     "source": (232, 400),
 }
 _RELATED_JOIN_DEFAULT_FOOTPRINT = (232, 400)
+_RELATED_JOIN_CARD_MIN_HEIGHT = 400
+# Match the mounted key-builder geometry in web/src/nodes/kinds/join.tsx: its one-key card is
+# 195.25px high, then each additional persisted key pair contributes a 45px Field row and 6px
+# flex gap.  Round upward at the server boundary so the deterministic placement envelope never
+# falls short of the actual fractional-pixel DOM box.
+_RELATED_JOIN_KEY_BUILDER_BASE_HEIGHT = 196
+_RELATED_JOIN_KEY_BUILDER_ADDITIONAL_PAIR_HEIGHT = 51
+
+
+def _workspace_related_join_key_pair_count(config: object) -> int | None:
+    """Count only the key-builder shapes the Join card will render as repeated rows.
+
+    The persisted engine accepts broader predicates, but the Canvas uses its one-row advanced
+    editor for those.  A malformed/advanced expression must therefore not be guessed as many
+    key rows; only the UI's exact same-name ``on`` and equality ``condition`` contracts count.
+    """
+    if not isinstance(config, dict):
+        return None
+    condition = config.get("condition")
+    if isinstance(condition, str) and condition.strip():
+        terms = re.split(r"\s+AND\s+", condition.strip(), flags=re.IGNORECASE)
+        equality = re.compile(
+            r'a\.(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+            r'b\.(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)$',
+            re.IGNORECASE,
+        )
+        return len(terms) if terms and all(equality.fullmatch(term.strip()) for term in terms) else None
+    on = config.get("on")
+    if not isinstance(on, str):
+        return None
+    value = on.strip()
+    if not value:
+        return 1
+    identifier = re.compile(r'^(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_]*)$')
+    columns = [column.strip() for column in value.split(",")]
+    return len(columns) if columns and all(identifier.fullmatch(column) for column in columns) else None
 
 
 def _workspace_related_join_footprint(node: dict) -> tuple[float, float]:
@@ -3889,8 +3925,17 @@ def _workspace_related_join_footprint(node: dict) -> tuple[float, float]:
     bounded envelope above.  Children of Sections are positioned in their parent coordinate space
     and are not top-level obstacles.
     """
-    return _RELATED_JOIN_CARD_FOOTPRINTS.get(str(node.get("type") or ""),
-                                             _RELATED_JOIN_DEFAULT_FOOTPRINT)
+    kind = str(node.get("type") or "")
+    if kind == "join":
+        data = node.get("data")
+        config = data.get("config") if isinstance(data, dict) else None
+        pairs = _workspace_related_join_key_pair_count(config)
+        height = _RELATED_JOIN_CARD_MIN_HEIGHT
+        if pairs is not None:
+            height = max(height, _RELATED_JOIN_KEY_BUILDER_BASE_HEIGHT
+                         + _RELATED_JOIN_KEY_BUILDER_ADDITIONAL_PAIR_HEIGHT * (pairs - 1))
+        return 232, height
+    return _RELATED_JOIN_CARD_FOOTPRINTS.get(kind, _RELATED_JOIN_DEFAULT_FOOTPRINT)
 
 
 def _workspace_related_join_positions(

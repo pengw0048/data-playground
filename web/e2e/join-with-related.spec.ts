@@ -134,6 +134,33 @@ async function seedPlacementReproductionCanvas(page: Page, canvasId: string, tab
   await expect(page.getByTestId('join-with-related-canvas-selected-source')).toBeVisible()
 }
 
+async function seedTallJoinPlacementCanvas(page: Page, canvasId: string, table: Table) {
+  const config = { uri: table.uri, tableId: table.id, registrationId: table.registrationId }
+  const tenKeys = Array.from({ length: 10 }, (_, index) => `key_${index}`).join(', ')
+  const response = await page.request.post('/api/canvas', { data: {
+    id: canvasId,
+    name: 'Tall related Join placement reproduction',
+    version: 1,
+    nodes: [
+      { id: 'selected-source', type: 'source', position: { x: 0, y: 0 }, data: {
+        title: table.name, status: 'draft', history: [], config,
+      } },
+      // Ten persisted structured keys render ten key-builder rows.  This is deliberately a
+      // legal disconnected Join: placement must reserve every existing top-level card.
+      { id: 'existing-tall-join', type: 'join', position: { x: 450, y: -150 }, data: {
+        title: 'Existing ten-key Join', status: 'draft', history: [],
+        config: { how: 'inner', on: tenKeys },
+      } },
+    ],
+    edges: [],
+  } })
+  expect(response.ok()).toBeTruthy()
+  await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+  await expect(page.locator('.react-flow__node')).toHaveCount(2)
+  await expect(page.locator('.react-flow__node[data-id="existing-tall-join"]')
+    .getByLabel('Left key 10')).toBeVisible()
+}
+
 function disjoint(first: { x: number, y: number, width: number, height: number }, second: { x: number, y: number, width: number, height: number }) {
   return first.x + first.width <= second.x || second.x + second.width <= first.x
     || first.y + first.height <= second.y || second.y + second.height <= first.y
@@ -211,6 +238,67 @@ test.describe('Related data and possible key matches', () => {
               expect(box.y + box.height).toBeLessThanOrEqual(surface!.y + surface!.height - 208)
               for (const other of existing) expect(disjoint(box, other)).toBeTruthy()
             }
+          }).toPass({ timeout: 5_000 })
+        } finally {
+          await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+        }
+      }
+    } finally {
+      await page.request.post('/api/catalog/relationships/delete', { data: relation })
+    }
+  })
+
+  test('keeps a confirmed related pair clear of a persisted ten-key Join at desktop widths', async ({ page }) => {
+    test.setTimeout(60_000)
+    const left = await catalogTable(page.request, 'events')
+    const right = await catalogTable(page.request, 'movies')
+    const relation = {
+      leftUri: left.uri,
+      leftColumns: [left.columns[0]?.name ?? 'id'],
+      rightUri: right.uri,
+      rightColumns: [right.columns[0]?.name ?? 'id'],
+      cardinality: '1:1',
+      confidence: 'declared',
+    }
+    expect((await page.request.post('/api/catalog/relationships', { data: relation })).ok()).toBeTruthy()
+    try {
+      for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+        await page.setViewportSize(viewport)
+        const canvasId = `join-related-tall-placement-${viewport.width}-${Date.now()}`
+        try {
+          await seedTallJoinPlacementCanvas(page, canvasId, left)
+          const sourceIdentity = { kind: 'local', registrationId: left.registrationId, revisionMode: 'current' }
+          const candidates = await page.request.post('/api/catalog/related-datasets', {
+            data: { source: sourceIdentity, limit: 12 },
+          })
+          expect(candidates.ok()).toBeTruthy()
+          const pageOfCandidates = await candidates.json() as { candidates: any[], possibleMatches: any[] }
+          const candidate = [...pageOfCandidates.candidates, ...pageOfCandidates.possibleMatches]
+            .find((item) => item.name === right.name)
+          expect(candidate).toBeDefined()
+          const confirmed = await page.request.post(`/api/canvas/${encodeURIComponent(canvasId)}/join-with-related`, {
+            data: {
+              expectedCanvasVersion: 1,
+              sourceNodeId: 'selected-source',
+              sourceIdentity,
+              candidate,
+              how: 'inner',
+            },
+          })
+          expect(confirmed.ok()).toBeTruthy()
+          await page.reload()
+          const inserted = page.locator('.react-flow__node[data-id^="source_related_"], .react-flow__node[data-id^="join_related_"]')
+          const existingTallJoin = page.locator('.react-flow__node[data-id="existing-tall-join"]')
+          await expect(inserted).toHaveCount(2)
+          await expect(async () => {
+            const tallBox = await existingTallJoin.boundingBox()
+            const insertedBoxes = await inserted.evaluateAll((elements) => elements.map((element) => {
+              const box = element.getBoundingClientRect()
+              return { x: box.x, y: box.y, width: box.width, height: box.height }
+            }))
+            expect(tallBox).not.toBeNull()
+            expect(insertedBoxes).toHaveLength(2)
+            for (const box of insertedBoxes) expect(disjoint(box, tallBox!)).toBeTruthy()
           }).toPass({ timeout: 5_000 })
         } finally {
           await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
