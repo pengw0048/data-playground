@@ -3,6 +3,72 @@ import { readFileSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
+async function expectCompactFullResult(
+  surface: import('@playwright/test').Locator,
+  minimumVisibleTableHeight: number,
+) {
+  await expect(surface.getByTestId('full-result-status')).toHaveCount(1)
+  await expect(surface.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
+  await expect(surface.getByText('Full result artifact')).toHaveCount(0)
+  await expect(surface.getByText(/Complete artifact/)).toHaveCount(0)
+  await expect(surface.getByRole('button', { name: 'Export result' })).toHaveText('Export')
+  const geometry = await surface.evaluate((element) => {
+    const status = element.querySelector<HTMLElement>('[data-testid="full-result-status"]')
+    const table = element.querySelector<HTMLTableElement>('table')
+    const toolbar = element.querySelector<HTMLElement>('[data-testid="full-result-toolbar"]')
+    if (!status || !table || !toolbar) return null
+    const surfaceBox = element.getBoundingClientRect()
+    const toolbarBox = toolbar.getBoundingClientRect()
+    const tableBox = table.getBoundingClientRect()
+    return {
+      gapBelowToolbar: Math.round(tableBox.top - toolbarBox.bottom),
+      visibleTableHeight: Math.round(
+        Math.max(0, Math.min(tableBox.bottom, surfaceBox.bottom, window.innerHeight) - tableBox.top),
+      ),
+      surfaceClientWidth: element.clientWidth,
+      surfaceScrollWidth: element.scrollWidth,
+      toolbarClientWidth: toolbar.clientWidth,
+      toolbarScrollWidth: toolbar.scrollWidth,
+    }
+  })
+  expect(geometry).not.toBeNull()
+  expect(geometry!.gapBelowToolbar).toBeLessThanOrEqual(1)
+  expect(geometry!.visibleTableHeight).toBeGreaterThanOrEqual(minimumVisibleTableHeight)
+  expect(geometry!.surfaceScrollWidth).toBeLessThanOrEqual(geometry!.surfaceClientWidth)
+  expect(geometry!.toolbarScrollWidth).toBeLessThanOrEqual(geometry!.toolbarClientWidth)
+}
+
+async function expectBoundedFullResultEvidence(
+  surface: import('@playwright/test').Locator,
+  runId: string,
+  output: string,
+) {
+  const trigger = surface.getByRole('button', { name: 'Technical details' })
+  await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  await trigger.click()
+  await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  const evidence = surface.getByTestId('full-result-technical-details')
+  await expect(evidence).toContainText(runId)
+  await expect(evidence).toContainText(output)
+  await expect(evidence).toContainText('State')
+  await expect(evidence).toContainText('committed')
+  const [surfaceBox, evidenceBox, widths] = await Promise.all([
+    surface.boundingBox(),
+    evidence.boundingBox(),
+    evidence.evaluate((element) => ({
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+    })),
+  ])
+  expect(surfaceBox).not.toBeNull()
+  expect(evidenceBox).not.toBeNull()
+  expect(evidenceBox!.x).toBeGreaterThanOrEqual(surfaceBox!.x)
+  expect(evidenceBox!.x + evidenceBox!.width).toBeLessThanOrEqual(surfaceBox!.x + surfaceBox!.width)
+  expect(widths.scrollWidth).toBeLessThanOrEqual(widths.clientWidth)
+  await trigger.click()
+  await expect(evidence).toHaveCount(0)
+}
+
 test.describe('researcher golden workflow @ux-smoke', () => {
   test('targets the chosen canvas and labels/downloads only the visible preview page', async ({ page }) => {
     const primary = goldenCanvas('ux-golden-primary', 'UX primary canvas', 'UX primary source')
@@ -102,10 +168,11 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history').click()
     await page.getByRole('button', { name: 'Open full result' }).click()
-    await expect(page.getByText('Full result artifact')).toBeVisible()
+    await expect(page.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
 
     const downloaded = page.waitForEvent('download')
-    await page.getByRole('button', { name: 'Export full result' }).click()
+    await page.getByRole('button', { name: 'Export result' }).click()
+    await page.getByRole('menuitem', { name: 'Export all rows' }).click()
     const download = await downloaded
     expect(download.suggestedFilename()).toMatch(/-full-result\.parquet$/)
     const file = await download.path()
@@ -167,7 +234,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
 
       const panel = freshPage.getByTestId('panel-data')
-      await expect(panel.getByText('Full result artifact')).toBeVisible()
+      await expect(panel.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
       await expect(panel.getByRole('button', { name: 'Full result', exact: true }))
         .toHaveAttribute('aria-pressed', 'true')
       const historyAfterOpen = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
@@ -175,12 +242,208 @@ test.describe('researcher golden workflow @ux-smoke', () => {
 
       await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup'")
       await expect(filter.getByTitle('stale')).toBeVisible()
-      await expect(panel.getByText('Full result artifact')).toHaveCount(0)
+      await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
       await expect(panel.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(0)
     } finally {
       await freshContext.close()
       await page.request.delete(`/api/canvas/${doc.id}`)
     }
+  })
+
+  test('keeps one complete-result header and table space from Canvas through Jobs', async ({ page }) => {
+    const doc = goldenCanvas('ux-full-result-header', 'UX full result header', 'UX full result source')
+    await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const started = await page.request.post('/api/run', {
+      data: { graph, targetNodeId: 'filter', confirmed: true },
+    })
+    expect(started.ok(), started.ok() ? '' : await started.text()).toBe(true)
+    const runId = (await started.json()).runId as string
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+      return (await response.json()).status
+    }, { timeout: 30_000 }).toBe('done')
+
+    await page.goto(`/#/canvas/${doc.id}`)
+    const filter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await filter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const canvasResult = page.getByTestId('panel-data')
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expect(canvasResult.getByRole('button', { name: 'Full result', exact: true }))
+        .toHaveAttribute('aria-pressed', 'true')
+      await expect(canvasResult.getByRole('button', { name: 'Preview sample' })).toHaveCount(1)
+      await expect(canvasResult.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(1)
+      await expectCompactFullResult(canvasResult, 430)
+      await expectBoundedFullResultEvidence(canvasResult, runId, 'filter:out')
+    }
+    await canvasResult.getByRole('button', { name: 'Export result' }).click()
+    await expect(page.getByRole('menuitem', { name: 'Export all rows' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Download current page as CSV' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Download current page as JSON' })).toBeVisible()
+    await page.keyboard.press('Escape')
+
+    await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
+    const job = page.getByRole('button', { name: new RegExp(`Open run ${runId}`) })
+    await expect(job).toHaveAttribute('aria-expanded', 'true')
+    await page.getByRole('button', { name: 'Open result' }).click()
+    const jobsResult = page.getByRole('complementary', { name: 'Retained result' })
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expectCompactFullResult(jobsResult, viewport.height === 720 ? 190 : 250)
+      await expectBoundedFullResultEvidence(jobsResult, runId, 'filter:out')
+    }
+
+    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
+    await page.route(sampleRoute, async (route) => {
+      await route.fulfill({
+        status: 410,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          detail: 'run output artifact is missing or expired',
+          code: 'resource_gone',
+        }),
+      })
+    })
+    await page.goto(`/#/canvas/${doc.id}`)
+    const expiredFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await expiredFilter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const expiredResult = page.getByTestId('panel-data')
+    await expect(expiredResult.getByText('Full result expired or removed')).toBeVisible()
+    await expectBoundedFullResultEvidence(expiredResult, runId, 'filter:out')
+
+    await page.unroute(sampleRoute)
+    await page.route(sampleRoute, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          columns: [],
+          rows: [],
+          rowCount: null,
+          hasMore: false,
+          truncated: false,
+          completeness: 'unknown',
+          error: true,
+          reason: 'adapter failed while opening the retained artifact',
+        }),
+      })
+    })
+    await page.goto(`/#/canvas/${doc.id}`)
+    const errorFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await errorFilter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const errorResult = page.getByTestId('panel-data')
+    await expect(errorResult.getByText('Couldn’t read full result')).toBeVisible()
+    await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
+    await expectBoundedFullResultEvidence(errorResult, runId, 'filter:out')
+    await page.unroute(sampleRoute)
+  })
+
+  test('states a capped chart window once while keeping whole-result export', async ({ page }) => {
+    const doc = goldenCanvas('ux-capped-chart', 'UX capped chart canvas', 'UX capped chart source')
+    doc.nodes.push({
+      id: 'chart', type: 'chart', position: { x: 700, y: 180 },
+      data: {
+        title: 'UX capped chart', status: 'latest',
+        config: { chartType: 'bar', x: 'event', agg: 'count' },
+      },
+    })
+    doc.edges.push({
+      id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' },
+    })
+    await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const started = await page.request.post('/api/run', {
+      data: { graph, targetNodeId: 'chart', confirmed: true },
+    })
+    expect(started.ok(), started.ok() ? '' : await started.text()).toBe(true)
+    const runId = (await started.json()).runId as string
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+      return (await response.json()).status
+    }, { timeout: 30_000 }).toBe('done')
+
+    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
+    await page.route(sampleRoute, async (route) => {
+      expect(route.request().postDataJSON()).toMatchObject({
+        nodeId: 'chart', portId: 'out', k: 2_000, offset: 0,
+      })
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          columns: [
+            { name: 'x', type: 'VARCHAR', capabilities: [] },
+            { name: 'y', type: 'DOUBLE', capabilities: [] },
+          ],
+          rows: Array.from({ length: 2_000 }, (_, index) => ({
+            x: `group-${index}`, y: index,
+          })),
+          rowCount: 2_001,
+          hasMore: false,
+          truncated: true,
+          completeness: 'capped',
+          rowLimit: 2_000,
+          limitScope: 'result-window',
+          limitReason: 'interactive-row-budget',
+        }),
+      })
+    })
+
+    await page.goto(`/#/canvas/${doc.id}`)
+    await page.getByTestId('rf__node-chart').click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const result = page.getByTestId('panel-data')
+    await expect(result.getByTestId('full-result-status')).toHaveText('Complete · 2,001 rows')
+    await expect(result.getByText('count(*) vs event · Showing 2,000 groups · display capped')).toBeVisible()
+    await expect(result.getByText(/Interactive view reached its 2,000 group display limit/)).toBeVisible()
+    await expect(result.getByText(/Export all rows to use data beyond this window/)).toBeVisible()
+    await expect(result.getByText('Interactive chart')).toHaveCount(0)
+    const text = await result.innerText()
+    expect(text.match(/2,001/g)).toHaveLength(1)
+    expect(text.match(/\bComplete\b/g)).toHaveLength(1)
+    await result.getByRole('button', { name: 'Export result' }).click()
+    await expect(page.getByRole('menuitem', { name: 'Export all rows' })).toBeVisible()
+    await page.unroute(sampleRoute)
   })
 
   test('never falls back to an older default-binding result in a fresh browser', async ({ page, browser, baseURL }) => {
@@ -269,7 +532,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
         name: 'Retained result parameters unavailable',
       })).toBeVisible()
       await expect(panel.getByRole('button', { name: 'Run this step' })).toBeVisible()
-      await expect(panel.getByText('Full result artifact')).toHaveCount(0)
+      await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
       const historyAfter = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
       expect(await historyAfter.json()).toEqual(runsBefore)
     } finally {

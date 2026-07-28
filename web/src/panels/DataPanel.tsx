@@ -8,7 +8,7 @@ import { api } from '../api/client'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
@@ -18,7 +18,7 @@ import {
 } from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
-  ProfileResult, RetainedResultIdentity, RunOutput, RunState, SampleProvenance, SampleResult,
+  ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
 } from '../types/api'
 
 const PAGE = 50
@@ -188,7 +188,7 @@ export function DataPanel({ nodeId, editorPreview }: {
       <OutputPortSelector ports={outputPorts} outputs={displayedRunOutputs}
         selectedPortId={selectedPortId} onSelect={choosePort} />
       {!editorPreview && (
-        <SelectedOutputOutcome runStatus={run?.status?.status} output={displayedSelectedOutput} />
+        <SelectedOutputOutcome output={displayedSelectedOutput} />
       )}
       {retainedBindingsUnavailable && (
         <div role="status" aria-label="Retained result parameters unavailable"
@@ -392,7 +392,7 @@ export function DataPanel({ nodeId, editorPreview }: {
       {isChart ? (
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
           grouped={node?.data.config.agg !== 'none'} completeness={res.completeness}
-          total={res.rowCount ?? null} scope="preview"
+          scope="preview"
           xLabel={String(node?.data.config.x ?? 'x')}
           yLabel={String(node?.data.config.agg && node?.data.config.agg !== 'none' ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})` : (node?.data.config.y ?? 'y'))} />
       ) : isMetric ? (
@@ -460,35 +460,12 @@ function OutputPortSelector({ ports, outputs, selectedPortId, onSelect }: {
   )
 }
 
-function SelectedOutputOutcome({ runStatus, output }: { runStatus?: RunState; output?: RunOutput }) {
-  if (!runStatus && !output) return null
-  const label = output?.portLabel || output?.portId
+function SelectedOutputOutcome({ output }: { output?: RunOutput }) {
+  if (!output?.error) return null
   return (
     <div aria-label="Selected output status"
       className="dp-dark border-b border-border px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span>Latest run</span>
-        <span className={cn(
-          'rounded px-1 py-px text-[9px] font-semibold uppercase tracking-[0.3px]',
-          runStatus === 'done' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-            : runStatus === 'failed' ? 'bg-destructive/10 text-destructive'
-              : 'bg-muted text-muted-foreground',
-        )}>{runStatus}</span>
-        {output && (
-          <>
-            <span>·</span>
-            <span className="dp-mono font-semibold text-foreground">{label}</span>
-            <OutputOutcomeBadge outcome={output.outcome} />
-            {output.rows != null && (
-              <span>
-                {output.rows.toLocaleString()} {output.rows === 1 ? 'row' : 'rows'}
-                {output.publicationKind === 'catalog' ? ' written' : ''}
-              </span>
-            )}
-          </>
-        )}
-      </div>
-      {output?.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+      <div className="dp-mono whitespace-pre-wrap text-destructive">{output.error}</div>
     </div>
   )
 }
@@ -559,7 +536,6 @@ function DataScopeBanner({
   suppressSourceCapWarning?: boolean
 }) {
   const end = offset + data.rows.length
-  const total = data.rowCount ?? null
   const provenance = data.sampleProvenance
   const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
   const resultCapped = data.limitScope === 'result-window'
@@ -578,29 +554,15 @@ function DataScopeBanner({
       </>
     )
   }
-  const label = scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
-  const range = pageRangeLabel(unit, offset, data.rows.length)
-  let detail: string
-  if (total == null) {
-    detail = `Current page · ${range} · Total ${unit} unknown.`
-  } else if (data.completeness === 'complete') {
-    detail = `Complete artifact · ${total.toLocaleString()} ${unit}.`
-  } else {
-    detail = `Current page · ${range} of ${total.toLocaleString()}.`
-  }
+  if (!resultCapped && !provenance) return null
   return (
-    <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="rounded bg-muted px-1.5 py-px font-semibold text-foreground">{label}</span>
-        <span>{detail}</span>
-      </div>
+    <div className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
       {resultCapped && (
-        <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
-          Interactive view stopped at {(data.rowLimit ?? end).toLocaleString()} {unit}
-          {total != null ? ` of ${total.toLocaleString()}` : '; total is unknown'}.
+        <div role="status" className="font-medium text-amber-700 dark:text-amber-300">
+          Interactive view reached its {(data.rowLimit ?? end).toLocaleString()} {unit.slice(0, -1)} display limit.
           {' '}{scope === 'published-dataset'
-            ? 'The published dataset retains rows beyond this interactive window.'
-            : 'The committed artifact retains the complete result.'}
+            ? 'Use the published dataset for rows beyond this window.'
+            : 'Export all rows to use data beyond this window.'}
         </div>
       )}
       {provenance && <PreviewDetails provenance={provenance} />}
@@ -617,7 +579,7 @@ function ResultModeToggle({ mode, onChange, fullLabel = 'Full result' }: {
   mode: 'sample' | 'full'; onChange: (mode: 'sample' | 'full') => void; fullLabel?: string
 }) {
   return (
-    <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5 text-[10px]">
+    <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5 text-[10px]">
       {(['sample', 'full'] as const).map((value) => (
         <button key={value} onClick={() => onChange(value)} aria-pressed={mode === value}
           className={`rounded px-1.5 py-0.5 ${mode === value ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
@@ -967,11 +929,14 @@ function _download(name: string, text: string, mime: string): void {
   URL.revokeObjectURL(url)
 }
 
-function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, pushToast }: {
+function ExportCluster({
+  columns, rows, name, offset, scope, sampleProvenance, pushToast, fullResultExport,
+}: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; offset: number
   scope: 'preview' | 'test-result' | 'full-result' | 'published-dataset'
   sampleProvenance?: SampleProvenance | null
   pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
+  fullResultExport?: { exporting: boolean; onExport: () => void | Promise<void> }
 }) {
   const start = rows.length ? offset + 1 : 0
   const end = offset + rows.length
@@ -980,6 +945,9 @@ function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, p
   const scopeLabel = scope === 'preview' ? 'preview page'
     : scope === 'test-result' ? 'test result page'
     : scope === 'published-dataset' ? 'published dataset page' : 'full-result page'
+  const compactResultMenu = scope === 'full-result' || scope === 'published-dataset'
+  const pageActionLabel = compactResultMenu ? 'current page' : scopeLabel
+  const hasPageActions = rows.length > 0
   const copy = () => {
     // navigator.clipboard is undefined in an insecure context (plain http on a LAN IP — a supported
     // `--host 0.0.0.0` deployment), where `.writeText` would throw synchronously past the .catch.
@@ -1002,15 +970,31 @@ function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, p
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <button aria-label={`Export this ${scopeLabel}`}
-          className="ml-1.5 inline-flex items-center gap-1 rounded border-l border-border px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
-          Export this page <Icon name="chevronDown" size={11} />
+        <button aria-label={compactResultMenu ? 'Export result' : `Export this ${scopeLabel}`}
+          className={cn(
+            'inline-flex shrink-0 items-center gap-1 rounded border-l border-border px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground',
+            !compactResultMenu && 'ml-1.5',
+          )}>
+          {compactResultMenu ? 'Export' : 'Export this page'} <Icon name="chevronDown" size={11} />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-[220px]">
-        <DropdownMenuItem onSelect={copy}>Copy {scopeLabel} as CSV</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => exportPage('CSV')}>Download {scopeLabel} as CSV</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => exportPage('JSON')}>Download {scopeLabel} as JSON</DropdownMenuItem>
+        {fullResultExport && (
+          <>
+            <DropdownMenuItem disabled={fullResultExport.exporting}
+              onSelect={() => { void fullResultExport.onExport() }}>
+              {fullResultExport.exporting ? 'Preparing all rows…' : 'Export all rows'}
+            </DropdownMenuItem>
+            {hasPageActions && <DropdownMenuSeparator />}
+          </>
+        )}
+        {hasPageActions && (
+          <>
+            <DropdownMenuItem onSelect={copy}>Copy {pageActionLabel} as CSV</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => exportPage('CSV')}>Download {pageActionLabel} as CSV</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => exportPage('JSON')}>Download {pageActionLabel} as JSON</DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -1074,14 +1058,13 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
 // A dependency-free SVG chart of the (x, y) series the `chart` node emits — bar / line / area /
 // scatter. Colors are theme tokens so it works in dark mode; the axis labels come from the node's
 // chosen columns. Kept simple on purpose (the heavy lifting — grouping/aggregation — is server-side).
-function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness = 'unknown', total = null, scope = 'preview' }: {
+function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness = 'unknown', scope = 'preview' }: {
   rows: Record<string, unknown>[]
   type: string
   xLabel: string
   yLabel: string
   grouped?: boolean
   completeness?: SampleResult['completeness']
-  total?: number | null
   scope?: 'preview' | 'full-result' | 'published-dataset'
 }) {
   const pts = rows.flatMap((row) => {
@@ -1124,15 +1107,13 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
   const unit = grouped ? 'group' : 'point'
   const units = pts.length === 1 ? unit : `${unit}s`
   const scopeSummary = completeness === 'capped'
-    ? `Showing ${pts.length.toLocaleString()}${total != null ? ` of ${total.toLocaleString()}` : ''} ${units} · display capped`
+    ? `Showing ${pts.length.toLocaleString()} ${units} · display capped`
     : scope === 'preview'
       ? `${pts.length.toLocaleString()} ${units} · Preview sample; full dataset not scanned`
-      : completeness === 'complete'
-        ? `${pts.length.toLocaleString()} ${units} · ${scope === 'published-dataset' ? 'Complete published dataset' : 'Complete full result'}`
-        : `${pts.length.toLocaleString()} ${units} · Total ${units} unknown`
+      : null
   const ariaScope = completeness === 'capped'
     ? `showing ${pts.length} capped ${units}`
-    : completeness === 'complete' ? `complete ${units}` : `${units}, completeness unknown`
+    : scope === 'preview' ? `${units}, preview sample` : 'retained result'
 
   return (
     <div className="p-3">
@@ -1160,7 +1141,9 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
         ))}
         <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
-      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{yLabel} vs {xLabel} · {scopeSummary}</div>
+      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">
+        {yLabel} vs {xLabel}{scopeSummary && <> · {scopeSummary}</>}
+      </div>
       {omitted > 0 && (
         <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
           {omittedMessage}
@@ -1283,6 +1266,7 @@ export function FullResult({
   const previousOffsets = useRef<number[]>([])
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
+  const [technicalOpen, setTechnicalOpen] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
   const pageSize = presentation?.kind === 'chart' ? CHART_DISPLAY_LIMIT : PAGE
   const publishedDataset = publicationKind === 'catalog'
@@ -1295,6 +1279,7 @@ export function FullResult({
   useEffect(() => {
     previousOffsets.current = []
     setOffset(0)
+    setTechnicalOpen(false)
   }, [uri, runId, nodeId, portId])
   useEffect(() => {
     let live = true
@@ -1333,8 +1318,28 @@ export function FullResult({
   const exportAction = canExportFull ? (
     <Button variant="outline" size="sm" className="h-6 px-2 text-[10.5px]"
       disabled={exporting} onClick={exportFull}>
-      {exporting ? 'Preparing export…' : 'Export full result'}
+      {exporting ? 'Preparing export…' : 'Export all rows'}
     </Button>
+  ) : undefined
+  const technicalTrigger = hasRunIdentity ? (
+    <button type="button" aria-label="Technical details" aria-expanded={technicalOpen}
+      onClick={() => setTechnicalOpen((open) => !open)}
+      className="shrink-0 rounded px-1 py-0.5 text-[10.5px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
+      Details
+    </button>
+  ) : undefined
+  const technicalPanel = hasRunIdentity && technicalOpen ? (
+    <FullResultEvidence runId={runId!} nodeId={nodeId!} portId={portId!}
+      state={publishedDataset ? 'published' : 'committed'} />
+  ) : undefined
+  const technicalChrome = hasRunIdentity ? (
+    <>
+      <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-[11px] py-2">
+        {modeToggle}
+        {technicalTrigger}
+      </div>
+      {technicalPanel}
+    </>
   ) : undefined
 
   if (!hasRunIdentity) return (
@@ -1346,26 +1351,23 @@ export function FullResult({
     <Button variant="outline" size="sm" onClick={onRunUnavailable}>Run this step</Button>
   ) : undefined
 
-  if (err) return <ArtifactUnavailable error={err} modeToggle={modeToggle}
+  if (err) return <ArtifactUnavailable error={err} chrome={technicalChrome}
     label={viewLabel} action={exportAction} missingAction={runAction}
     onRetry={() => setRetry((n) => n + 1)} />
   if (!data) return <div className="dp-dark text-foreground">
-    <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-      <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
-      {modeToggle}
-    </div>
+    {technicalChrome}
     <Skeleton />
   </div>
   if (data.error) return (
     <FullResultMessage title={`Couldn’t read ${viewLabel.toLowerCase()}`}
       reason={data.reason ?? 'The kernel reported an error while reading this run output.'}
-      modeToggle={modeToggle} action={exportAction}
+      chrome={technicalChrome} action={exportAction}
       onRetry={() => setRetry((n) => n + 1)} />
   )
   if (data.notPreviewable) return (
     <FullResultMessage title={`${viewLabel} cannot be previewed`}
       reason={data.reason ?? 'This artifact adapter does not provide a bounded interactive preview.'}
-      modeToggle={modeToggle} action={exportAction} />
+      chrome={technicalChrome} action={exportAction} />
   )
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
@@ -1380,36 +1382,55 @@ export function FullResult({
   }
   return (
     <div className="dp-dark text-foreground">
-      <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-        <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
-        {modeToggle}
-        {detail != null && (
-          <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
-            <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
-          </button>
-        )}
-        <span className="flex-1" />
-        {detail == null && canExportFull && (
-          exportAction
-        )}
-        {detail == null && presentation?.kind !== 'chart' && (
-          <span className="inline-flex gap-0.5">
-            <PageBtn dir="prev" disabled={offset === 0} onClick={previousPage} />
-            <PageBtn dir="next" disabled={!canTryNext} onClick={nextPage} />
+      <div data-testid="full-result-toolbar"
+        className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-border px-[11px] py-2">
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span data-testid="full-result-status" role="status"
+            className="shrink-0 rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">
+            {publishedDataset ? 'Published dataset' : 'Complete'}
+            {' · '}{reportedTotal == null ? 'row count unknown' : `${reportedTotal.toLocaleString()} ${reportedTotal === 1 ? 'row' : 'rows'}`}
           </span>
-        )}
-        {detail == null && rows.length > 0 && (
-          <ExportCluster columns={cols} rows={rows} name={name} offset={offset}
-            scope={pageScope} pushToast={pushToast} />
+          {modeToggle}
+          {technicalTrigger}
+          {detail != null && (
+            <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
+              <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
+            </button>
+          )}
+        </div>
+        {detail == null && (
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {presentation?.kind !== 'chart' && (
+              <span className="shrink-0 text-[10.5px] text-muted-foreground">
+                {pageRangeLabel('rows', offset, rows.length)}
+              </span>
+            )}
+            {presentation?.kind !== 'chart' && (
+              <span className="inline-flex gap-0.5">
+                <PageBtn dir="prev" disabled={offset === 0} onClick={previousPage} />
+                <PageBtn dir="next" disabled={!canTryNext} onClick={nextPage} />
+              </span>
+            )}
+            {(rows.length > 0 || canExportFull) && (
+              <ExportCluster columns={cols} rows={rows} name={name} offset={offset}
+                scope={pageScope} pushToast={pushToast}
+                fullResultExport={canExportFull
+                  ? { exporting, onExport: exportFull }
+                  : undefined} />
+            )}
+          </div>
         )}
       </div>
-      <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
-        unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
-        scope={pageScope} />
+      {technicalPanel}
+      {(data.completeness === 'capped' || data.limitScope || data.limitReason || data.sampleProvenance) && (
+        <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
+          unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
+          scope={pageScope} />
+      )}
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}
-          completeness={data.completeness} total={reportedTotal} scope={pageScope} />
+          completeness={data.completeness} scope={pageScope} />
         : presentation?.kind === 'metric'
           ? <MetricValue rows={rows} />
           : detail != null && rows[detail]
@@ -1419,38 +1440,62 @@ export function FullResult({
   )
 }
 
-function FullResultMessage({ title, reason, onRetry, modeToggle, action }: {
+function FullResultEvidence({ runId, nodeId, portId, state }: {
+  runId: string
+  nodeId: string
+  portId: string
+  state: 'committed' | 'published'
+}) {
+  return (
+    <dl data-testid="full-result-technical-details"
+      className="grid min-w-0 grid-cols-[44px_minmax(0,1fr)] gap-x-2 gap-y-1 border-b border-border bg-muted/20 px-[11px] py-2 text-[10.5px] text-muted-foreground">
+      <dt className="font-medium text-foreground">Run</dt>
+      <dd className="dp-mono min-w-0 break-all">{runId}</dd>
+      <dt className="font-medium text-foreground">Output</dt>
+      <dd className="dp-mono min-w-0 break-all">{nodeId}:{portId}</dd>
+      <dt className="font-medium text-foreground">State</dt>
+      <dd>{state}</dd>
+    </dl>
+  )
+}
+
+function FullResultMessage({ title, reason, onRetry, modeToggle, action, chrome }: {
   title: string
   reason: string
   onRetry?: () => void
   modeToggle?: ReactNode
   action?: ReactNode
+  chrome?: ReactNode
 }) {
   return (
-    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
-      {modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
-      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
-        <Icon name="power" size={18} />
-      </div>
-      <div className="text-[13px] font-semibold text-foreground">{title}</div>
-      <div className="mx-auto mt-1.5 max-w-[380px] text-[11.5px] leading-normal">{reason}</div>
-      {(onRetry || action) && (
-        <div className="mt-3.5 flex items-center justify-center gap-2">
-          {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}
-          {action}
+    <div className="dp-dark text-muted-foreground">
+      {chrome}
+      <div className="px-5 py-6 text-center">
+        {!chrome && modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
+        <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+          <Icon name="power" size={18} />
         </div>
-      )}
+        <div className="text-[13px] font-semibold text-foreground">{title}</div>
+        <div className="mx-auto mt-1.5 max-w-[380px] text-[11.5px] leading-normal">{reason}</div>
+        {(onRetry || action) && (
+          <div className="mt-3.5 flex items-center justify-center gap-2">
+            {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}
+            {action}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
-function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction, label }: {
+function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction, label, chrome }: {
   error: Error & { status?: number }
   onRetry: () => void
   modeToggle?: ReactNode
   action?: ReactNode
   missingAction?: ReactNode
   label: string
+  chrome?: ReactNode
 }) {
   const status = error.status
   const denied = status === 401 || status === 403
@@ -1462,17 +1507,20 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction
       ? 'The stored artifact is no longer available. Run the node again to create a new full result.'
       : 'The artifact may still exist. Check the connection and retry, or switch back to the sample.'
   return (
-    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
-      {modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
-      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
-        <Icon name="clock" size={18} />
-      </div>
-      <div className="text-[13px] font-semibold text-foreground">{title}</div>
-      <div className="mx-auto mt-1.5 max-w-[360px] text-[11.5px] leading-normal">{note}</div>
-      <div title={error.message} className="dp-mono mx-auto mt-2 max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground/70">{error.message}</div>
-      <div className="mt-3.5 flex items-center justify-center gap-2">
-        <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>
-        {missing && missingAction ? missingAction : action}
+    <div className="dp-dark text-muted-foreground">
+      {chrome}
+      <div className="px-5 py-6 text-center">
+        {!chrome && modeToggle && <div className="mb-3 flex justify-center">{modeToggle}</div>}
+        <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+          <Icon name="clock" size={18} />
+        </div>
+        <div className="text-[13px] font-semibold text-foreground">{title}</div>
+        <div className="mx-auto mt-1.5 max-w-[360px] text-[11.5px] leading-normal">{note}</div>
+        <div title={error.message} className="dp-mono mx-auto mt-2 max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground/70">{error.message}</div>
+        <div className="mt-3.5 flex items-center justify-center gap-2">
+          <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>
+          {missing && missingAction ? missingAction : action}
+        </div>
       </div>
     </div>
   )

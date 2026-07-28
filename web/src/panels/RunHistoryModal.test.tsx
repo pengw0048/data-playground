@@ -283,14 +283,33 @@ describe('durable full results', () => {
     render(<RunHistoryModal onClose={() => {}} />)
 
     await user.click(await screen.findByRole('button', { name: 'Open full result' }))
-    expect(await screen.findByText(/rows 1–50 of 105/)).toBeInTheDocument()
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 105 rows')
+    expect(screen.getByText('rows 1–50')).toBeInTheDocument()
+    expect(screen.getAllByTestId('full-result-status')).toHaveLength(1)
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 0)
-    await user.click(screen.getByRole('button', { name: 'Export full result' }))
+    await user.click(screen.getByRole('button', { name: 'Export result' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Export all rows' }))
     await waitFor(() => expect(apiMock.preflightFullResultExport).toHaveBeenCalledWith(
       'run-real', 'target', 'out', 'target-out',
     ))
     expect(apiMock.fullResultExportUrl).not.toHaveBeenCalled()
     expect(document.querySelector('iframe')?.getAttribute('src')).toBe('/api/run/full-result-export')
+  })
+
+  it('keeps whole-result export available for a successful zero-row artifact', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [{ name: 'v', type: 'BIGINT', capabilities: [] }],
+      rows: [], rowCount: 0, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    const user = userEvent.setup()
+
+    render(<FullResult uri="/outputs/empty.parquet" total={0} {...fullIdentity} />)
+
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 0 rows')
+    expect(screen.getByText('No rows returned')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Export result' }))
+    expect(screen.getByRole('menuitem', { name: 'Export all rows' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /current page/i })).not.toBeInTheDocument()
   })
 
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
@@ -354,13 +373,13 @@ describe('durable full results', () => {
     // History can hold rows written by one append attempt (50), while the reopened artifact is
     // cumulative (105). The artifact's measured rowCount is authoritative for display/paging.
     render(<FullResult uri="/outputs/result.parquet" total={50} {...fullIdentity} />)
-    await screen.findByText(/rows 1–50 of 105/)
+    await screen.findByText('rows 1–50')
 
     await user.click(screen.getByRole('button', { name: 'Next page' }))
-    expect(await screen.findByText(/rows 51–100 of 105/)).toBeInTheDocument()
+    expect(await screen.findByText('rows 51–100')).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 50)
-    await user.click(screen.getByRole('button', { name: 'Export this full-result page' }))
-    await user.click(screen.getByRole('menuitem', { name: 'Download full-result page as CSV' }))
+    await user.click(screen.getByRole('button', { name: 'Export result' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Download current page as CSV' }))
     expect(downloads).toContain('result-full-result-page-51-100.csv')
   })
 
@@ -405,24 +424,29 @@ describe('durable full results', () => {
 
     render(<FullResult uri="/outputs/budget-terminal.parquet" total={100_000} {...fullIdentity} />)
 
-    await screen.findByText(/rows 1–50 of 100,000/)
-    expect(screen.queryByText(/Interactive view stopped/)).not.toBeInTheDocument()
+    await screen.findByText('rows 1–50')
+    expect(screen.queryByText(/Interactive view reached/)).not.toBeInTheDocument()
     for (let offset = 50; offset <= 1950; offset += 50) {
       await user.click(screen.getByRole('button', { name: 'Next page' }))
-      await screen.findByText(new RegExp(
-        `rows ${(offset + 1).toLocaleString()}–${(offset + 50).toLocaleString()} of 100,000`,
-      ))
+      await screen.findByText(
+        `rows ${(offset + 1).toLocaleString()}–${(offset + 50).toLocaleString()}`,
+      )
     }
     expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
-    expect(screen.getByText(/Interactive view stopped at 2,000 rows of 100,000/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Export this full-result page' })).toHaveTextContent('Export this page')
+    expect(screen.getByText(/Interactive view reached its 2,000 row display limit/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export result' })).toHaveTextContent('Export')
   })
 
   it('labels a missing or expired artifact explicitly', async () => {
     apiMock.runOutputSample.mockRejectedValue(new Error('404: no such file'))
+    const user = userEvent.setup()
     render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
     expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Technical details' }))
+    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/run-direct/)
+    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/target:out/)
+    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/Statecommitted/)
   })
 
   it('does not mislabel an authorization failure as expiration', async () => {
@@ -441,20 +465,27 @@ describe('durable full results', () => {
       completeness: 'unknown', wire: 'dataset', notPreviewable: false, ...response,
     })
 
+    const user = userEvent.setup()
     render(<FullResult uri="/outputs/opaque.parquet" total={105} {...fullIdentity} />)
 
     expect(await screen.findByText(title)).toBeInTheDocument()
     expect(screen.getByText(response.reason)).toBeInTheDocument()
     expect(screen.queryByText(/Complete artifact/)).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export all rows' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Technical details' }))
+    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(
+      /run-direct.*target:out.*Statecommitted/s,
+    )
   })
 
   it('lets HEAD preflight decide exportability for a result URI without a file suffix', async () => {
     apiMock.runOutputSample.mockResolvedValue(sample(0, 1, false))
+    const user = userEvent.setup()
 
     render(<FullResult uri="s3://bucket/runs/attempt-123/" total={1} {...fullIdentity} />)
 
-    expect(await screen.findByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Export result' }))
+    expect(screen.getByRole('menuitem', { name: 'Export all rows' })).toBeInTheDocument()
   })
 
   it('preflights a native export and reports rejection without navigating the SPA', async () => {
@@ -463,9 +494,10 @@ describe('durable full results', () => {
     apiMock.preflightFullResultExport.mockRejectedValueOnce(new Error('artifact is not exportable'))
     const user = userEvent.setup()
     render(<FullResult uri="/outputs/result.parquet" total={105} {...fullIdentity} />)
-    await screen.findByText(/rows 1–50 of 105/)
+    await screen.findByText('rows 1–50')
 
-    await user.click(screen.getByRole('button', { name: 'Export full result' }))
+    await user.click(screen.getByRole('button', { name: 'Export result' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Export all rows' }))
 
     await waitFor(() => expect(useStore.getState().toasts.at(-1)).toMatchObject({
       kind: 'error', msg: 'Could not start full-result export: artifact is not exportable',
@@ -486,7 +518,7 @@ describe('durable full results', () => {
     expect(await screen.findByText('Full result identity unavailable')).toBeInTheDocument()
     expect(screen.getByText(/has no durable run identity/i)).toBeInTheDocument()
     expect(apiMock.runOutputSample).not.toHaveBeenCalled()
-    expect(screen.queryByRole('button', { name: 'Export full result' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Export all rows' })).not.toBeInTheDocument()
   })
 
   it('labels write counts without treating them as the catalog artifact total or export capability', async () => {
@@ -514,15 +546,16 @@ describe('durable full results', () => {
     expect(await screen.findByText('12 rows written')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Open published dataset' }))
 
-    expect(await screen.findByText(/Total rows unknown/)).toBeInTheDocument()
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent(
+      'Published dataset · row count unknown',
+    )
     expect(screen.queryByText(/of 12/)).not.toBeInTheDocument()
-    expect(screen.getAllByText('Published dataset').length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: 'Export this published dataset page' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export result' })).toBeInTheDocument()
     expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Export full result' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Export all rows' })).not.toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('write-run', 'target', 'out', 50, 0)
-    await user.click(screen.getByRole('button', { name: 'Export this published dataset page' }))
-    await user.click(screen.getByRole('menuitem', { name: 'Download published dataset page as CSV' }))
+    await user.click(screen.getByRole('button', { name: 'Export result' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Download current page as CSV' }))
     expect(downloads).toContain('target-out-published-dataset-page-1-1.csv')
   })
 
@@ -868,7 +901,7 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
       'persisted-run', 'target', 'out', 50, 0,
     ))
-    expect(screen.getByText('Full result artifact')).toBeInTheDocument()
+    expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 105 rows')
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
   })
 
@@ -899,7 +932,7 @@ describe('durable full results', () => {
     expect(await screen.findByRole('status', { name: 'Retained result parameters unavailable' }))
       .toBeInTheDocument()
     expect(apiMock.retainedResult).not.toHaveBeenCalled()
-    expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Run this step' }))
     expect(requestRun).toHaveBeenCalledWith('target')
   })
@@ -922,7 +955,7 @@ describe('durable full results', () => {
       runs: {},
     } as any)
     const { rerender } = render(<DataPanel nodeId="target" />)
-    await screen.findByText('Full result artifact')
+    await screen.findByTestId('full-result-status')
 
     const staleDoc = {
       ...doc,
@@ -934,7 +967,7 @@ describe('durable full results', () => {
     } as any)
     rerender(<DataPanel nodeId="target" />)
 
-    await waitFor(() => expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument())
     expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
   })
 
@@ -1071,7 +1104,7 @@ describe('durable full results', () => {
 
     expect(within(screen.getByRole('button', { name: 'Passing' })).getByText('committed')).toBeInTheDocument()
     expect(within(screen.getByRole('button', { name: 'Violations' })).getByText('failed')).toBeInTheDocument()
-    expect(screen.getByLabelText('Selected output status')).toHaveTextContent(/Latest run\s*failed/)
+    expect(screen.getByLabelText('Selected output status')).toHaveTextContent('writer failed')
     expect(screen.getByText('writer failed')).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Passing' }))
@@ -1080,6 +1113,15 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
       'failed-named-output-run', 'target', 'pass', 50, 0,
     ))
+    const trigger = screen.getByRole('button', { name: 'Technical details' })
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    await user.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    const details = screen.getByTestId('full-result-technical-details')
+    expect(details).toHaveTextContent(/failed-named-output-run/)
+    expect(details).toHaveTextContent(/target:pass/)
+    expect(within(details).getByText('State')).toBeInTheDocument()
+    expect(within(details).getByText('committed')).toBeInTheDocument()
   })
 
   it('does not carry a same-named port selection across a nodeId change', () => {
@@ -1251,8 +1293,8 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, complete groups' })).toBeInTheDocument()
-    expect(screen.getByText('sum(count) vs task · 2 groups · Complete full result')).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
+    expect(screen.getByText('sum(count) vs task')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('chart-exact-run', 'target', 'out', 2_000, 0)
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
@@ -1291,7 +1333,7 @@ describe('durable full results', () => {
 
     const { container } = render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, complete group' })).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
     expect(container.querySelectorAll('svg rect')).toHaveLength(1)
     expect(screen.getByText('3 Y values omitted because they were null, blank, or non-numeric.')).toBeInTheDocument()
     expect(screen.getByText('valid-valu')).toBeInTheDocument()
@@ -1349,10 +1391,12 @@ describe('durable full results', () => {
       name: 'bar chart, showing 2000 capped groups',
     })).toBeInTheDocument()
     expect(screen.getByText(
-      'sum(count) vs task · Showing 2,000 of 2,001 groups · display capped',
+      'sum(count) vs task · Showing 2,000 groups · display capped',
     )).toBeInTheDocument()
-    expect(screen.getByText(/Interactive view stopped at 2,000 groups of 2,001/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Export full result' })).toBeInTheDocument()
+    expect(screen.getByText(/Interactive view reached its 2,000 group display limit/)).toBeInTheDocument()
+    expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 2,001 rows')
+    expect(screen.getByText(/2,001/)).toBe(screen.getByTestId('full-result-status'))
+    expect(screen.getByRole('button', { name: 'Export result' })).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith(
       'chart-capped-run', 'target', 'out', 2_000, 0,
     )
