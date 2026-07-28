@@ -25,6 +25,7 @@ import uuid
 
 from hub import metadb
 from hub.models import (
+    ColumnSchema,
     CatalogBrowse,
     CatalogPage,
     CatalogPublicationReceipt,
@@ -649,6 +650,7 @@ class InMemoryCatalog:
 
     def publish_managed_local_write(
             self, intent: WriteIntent, artifact_uri: str, *, total_bytes: int,
+            actual_schema: list[ColumnSchema] | None = None,
             merge_publication: metadb.MergeColumnsPublicationContext | None = None) -> WriteReceipt:
         """Publish one admitted local create/replace and return its exact durable receipt."""
         frozen = WriteIntent.model_validate(intent)
@@ -670,6 +672,9 @@ class InMemoryCatalog:
                 lineage=provenance.model_dump(),
                 write_intent=frozen.model_dump(by_alias=True, mode="json"),
                 total_bytes=total_bytes,
+                actual_schema=(
+                    [column.model_dump(by_alias=True, mode="json") for column in actual_schema]
+                    if actual_schema is not None else None),
                 merge_publication=merge_publication,
             )
         except Exception:

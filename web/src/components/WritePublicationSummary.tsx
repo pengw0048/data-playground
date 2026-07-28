@@ -81,11 +81,14 @@ function SchemaDriftEvidence({ evidence }: { evidence: WriteSchemaDrift }) {
 }
 
 function AdmissionDetails({ label, admission }: { label: string; admission: WriteAdmission }) {
+  const runtimeSchema = admission.intent?.schemaMode === 'runtime'
   return <>
     <div><strong>{label}:</strong> node <span className="font-mono">{admission.nodeId}</span> · {admission.managed ? 'managed' : 'provider-neutral'} · mode <span className="font-mono">{admission.mode}</span></div>
     <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
     <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
-    <div><strong>Schema:</strong> {schemaText(admission.expectedSchema)}</div>
+    <div><strong>Schema:</strong> {runtimeSchema
+      ? 'Full output schema will be validated during this run.'
+      : schemaText(admission.expectedSchema)}</div>
     <div><strong>Partitions:</strong> {partitionText(admission.partitions)}</div>
     {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
     {admission.intent && <>
@@ -161,6 +164,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
+  const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
       <div>
@@ -198,7 +202,9 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
             Confirm this exact schema comparison before publishing.
           </div>
         : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">
-            {managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
+            {runtimeSchema
+              ? 'Full output schema will be validated during this run before publication.'
+              : managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
           </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">

@@ -464,6 +464,11 @@ class BuildEngine:
         # runner deletes them in its finally so they don't accumulate across the kernel's lifetime.
         # Shared with sub-engines (sections) so a contained transform's spill is GC'd too.
         self.spill_files = spill_files if spill_files is not None else []
+        # A dynamic Transform establishes its full-run output schema only after an output table
+        # reaches the spill writer. Keep this separate from the returned Relation: when every row is
+        # absent/skipped, the compatibility fallback carries the input's zero-row schema and must not
+        # be mistaken for evidence about a map/flat-map output.
+        self._materialized_transform_schemas: set[str] = set()
         # warm: an optional cross-build RelationCache (the kernel's, preview scope) — reuses unchanged
         # upstream node relations across previews. warm_scope isolates preview vs run keys.
         self.warm = warm
@@ -834,6 +839,10 @@ class BuildEngine:
             name=n, type=display_type(str(t)), physical_type=str(t), provenance="inferred")
             for n, t in zip(tbl.column_names, tbl.schema.types)], sample_rows=preview_rows)
         return _table_to_rows(preview_rows), cols
+
+    def materialized_transform_schema(self, node_id: str) -> bool:
+        """Whether this full build observed a real output table from the Transform."""
+        return str(node_id) in self._materialized_transform_schemas
 
     # -- inputs ------------------------------------------------------------ #
     def _inputs(self, node: GraphNode) -> list[Relation]:
@@ -1676,8 +1685,12 @@ class BuildEngine:
                 pass
             raise
         if writer is None:
+            contract = declared_schema(node)
+            if contract is not None:
+                return self._stand_in(contract)
             return parent.limit(0)
         writer.close()
+        self._materialized_transform_schemas.add(str(node.id))
         self.spill_files.append(path)  # GC'd at end-of-run by the runner
         return db.conn().read_parquet(path)
 

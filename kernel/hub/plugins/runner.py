@@ -1686,13 +1686,27 @@ class LocalRunner:
                 )
             else:
                 intent = WriteIntent.model_validate(admitted)
+                actual_schema = relation_columns(parent_rel)
                 if (intent.destination.logical_uri != logical_uri
                         or intent.destination.name != spec.name
-                        or intent.expected_schema != relation_columns(parent_rel)
                         or intent.provenance.publication != lineage
                         or intent.provenance.parents != parent_uris):
                     raise RuntimeError(
                         "managed local write admission does not match the executing graph")
+                if intent.schema_mode == "declared" and intent.expected_schema != actual_schema:
+                    raise RuntimeError(
+                        "managed local write output schema does not match its declared admission")
+                if intent.schema_mode == "runtime":
+                    transform_id = inc[0].source
+                    if not engine.materialized_transform_schema(transform_id):
+                        raise RuntimeError(
+                            "the Transform produced no output rows, so its output schema could not "
+                            "be determined; declare an explicit output schema to publish an empty "
+                            "result")
+                    if not actual_schema:
+                        raise RuntimeError("managed local write full output schema is empty")
+            if admitted is None:
+                actual_schema = relation_columns(parent_rel)
             def write_candidate(candidate_uri: str) -> None:
                 committed_output_snapshot(
                     status, uri=candidate_uri, table=spec.name, rows=0)
@@ -1707,6 +1721,7 @@ class LocalRunner:
                 catalog=self.catalog,
                 intent=intent,
                 write_artifact=write_candidate,
+                actual_schema=actual_schema,
                 before_publish=(None if pre_publish is None
                                 else lambda: pre_publish(check_cancel=True)),
             )

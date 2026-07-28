@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from hub import metadb
 from hub.models import (
+    ColumnSchema,
     DatasetRevision,
     WriteIntent,
     WritePublicationIdentity,
@@ -29,6 +30,7 @@ def _finish_candidate(storage, artifact_uri: str, run_id: str, receipt: WriteRec
 def write_managed_local_file(
         *, storage, catalog, intent: WriteIntent,
         write_artifact: Callable[[str], object],
+        actual_schema: list[ColumnSchema] | list[dict] | None = None,
         before_publish: Callable[[], None] | None = None,
         merge_publication: metadb.MergeColumnsPublicationContext | None = None) -> WriteReceipt:
     """Execute one frozen local write with abortable staging and receipt-based recovery.
@@ -38,6 +40,12 @@ def write_managed_local_file(
     the writer fence is deliberately retained instead of guessing that an exact artifact is abortable.
     """
     frozen = WriteIntent.model_validate(intent)
+    runtime_schema = (
+        [ColumnSchema.model_validate(column) for column in actual_schema]
+        if actual_schema is not None else None
+    )
+    if frozen.schema_mode == "runtime" and not runtime_schema:
+        raise ValueError("runtime schema write requires a non-empty full output schema")
     frozen_doc = frozen.model_dump(by_alias=True, mode="json")
     prior = metadb.catalog_admit_managed_local_write(
         frozen_doc, merge_publication=merge_publication)
@@ -58,6 +66,7 @@ def write_managed_local_file(
         publication_started = True
         receipt = catalog.publish_managed_local_write(
             frozen, artifact_uri, total_bytes=total_bytes,
+            actual_schema=runtime_schema,
             merge_publication=merge_publication)
         if merge_publication is not None:
             semantic = metadb.catalog_managed_local_write_receipt(

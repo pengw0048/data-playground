@@ -13796,6 +13796,15 @@
                 "type": "null"
               }
             ]
+          },
+          "schemaMode": {
+            "default": "declared",
+            "enum": [
+              "declared",
+              "runtime"
+            ],
+            "title": "Schemamode",
+            "type": "string"
           }
         },
         "required": [
