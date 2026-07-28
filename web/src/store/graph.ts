@@ -31,6 +31,7 @@ import {
 } from './exampleReplacement'
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
+import { connectedBasePosition } from '../canvas/connectedPlacement'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -100,6 +101,17 @@ export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }
     }
   }
   return base
+}
+
+/** The collision-free presentation position for a product-created connected target. */
+export function connectedPosition(
+  nodes: CanvasNode[],
+  upstream: CanvasNode[],
+  fallback: { x: number; y: number },
+  targetId?: string,
+): { x: number; y: number } {
+  const base = connectedBasePosition(upstream) ?? fallback
+  return freePosition(nodes.filter((node) => node.id !== targetId), base)
 }
 
 /** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri —
@@ -1691,7 +1703,20 @@ export const useStore = create<Store>((set, get) => ({
   agentOpen: false,
   agentLog: [],
 
-  setNodes: (nodes) => { if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, nodes } })) },
+  setNodes: (nodes) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    set((s) => {
+      const previous = new Map(s.doc.nodes.map((node) => [node.id, node]))
+      // React Flow calls this only for settled user moves. That deliberate move takes ownership of
+      // the card's presentation, so later connections must never auto-nudge it again.
+      const settled = nodes.map((node) => {
+        const old = previous.get(node.id)
+        const moved = old && (old.position.x !== node.position.x || old.position.y !== node.position.y)
+        return moved && node.data.autoPlaced ? { ...node, data: { ...node.data, autoPlaced: false } } : node
+      })
+      return { doc: { ...s.doc, nodes: settled } }
+    })
+  },
   setEdges: (edges) => { if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, edges } })) },
 
   // push the current doc onto the undo stack (called before a structural mutation). While co-editing,
@@ -1761,8 +1786,11 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     const base = spec.defaultData()
     const node: CanvasNode = {
-      id: newId(kind), type: kind, position,
-      data: { ...base, title: base.title, config: { ...base.config } },
+      id: newId(kind), type: kind,
+      position: connectedPosition(get().doc.nodes, [source], position),
+      // A later second Join input can center this product-created card between its sources. A user
+      // drag clears the marker in setNodes, so this never reshuffles a hand-arranged canvas.
+      data: { ...base, title: base.title, config: { ...base.config }, autoPlaced: true },
     }
     set((s) => {
       const stale = downstream(s.doc, node.id)
@@ -1901,11 +1929,21 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => {
       // one edge per (target, targetHandle) for single-input ports; joins allow two.
       const stale = downstream(s.doc, edge.target)
-      const nodes = s.doc.nodes.map((n) =>
-        (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
-          ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
-          : n,
-      )
+      const target = s.doc.nodes.find((node) => node.id === edge.target)
+      const inputs = [...s.doc.edges, edge]
+        .filter((candidate) => candidate.target === edge.target)
+        .map((candidate) => s.doc.nodes.find((node) => node.id === candidate.source))
+        .filter((node): node is CanvasNode => !!node)
+      const autoPosition = target?.data.autoPlaced
+        ? connectedPosition(s.doc.nodes, inputs, target.position, target.id)
+        : null
+      const nodes = s.doc.nodes.map((n) => {
+        const staleTarget = (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
+        const movedTarget = n.id === edge.target && autoPosition
+        return staleTarget || movedTarget
+          ? { ...n, ...(movedTarget ? { position: autoPosition } : {}), data: staleTarget ? { ...n.data, status: 'stale' as NodeStatus } : n.data }
+          : n
+      })
       const runs = invalidateWriteAdmissions(
         s.doc, s.runs, [edge.target, ...stale],
       )
@@ -2121,7 +2159,7 @@ export const useStore = create<Store>((set, get) => ({
       parentId: null, // a duplicate lands on the top-level canvas (absolute coords below)
       // land in a clear spot near the original, never stacked on top of it
       position: freePosition(get().doc.nodes, { x: n.position.x + 40, y: n.position.y + 40 }),
-      data: { ...n.data, status: 'draft', history: [] },
+      data: { ...n.data, status: 'draft', history: [], autoPlaced: false },
     }
     set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id, selectedIds: [copy.id] }))
   },

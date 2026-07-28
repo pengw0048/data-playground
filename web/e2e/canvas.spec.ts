@@ -686,8 +686,21 @@ test.describe('Data Playground canvas', () => {
     await search.press('ArrowUp')
     await search.press('Enter')
     await expect(finder).toBeHidden()
-    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const nodes = page.locator('.react-flow__node')
+    await expect(nodes).toHaveCount(2)
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    const sourceBox = await boxOf(nodes.nth(0))
+    const targetBox = await boxOf(nodes.nth(1))
+    expect(targetBox.x, 'the connected target is downstream, not back through its source')
+      .toBeGreaterThan(sourceBox.x + sourceBox.width + 80)
+
+    await page.reload()
+    const reloadedNodes = page.locator('.react-flow__node')
+    await expect(reloadedNodes).toHaveCount(2)
+    const reloadedSource = await boxOf(reloadedNodes.nth(0))
+    const reloadedTarget = await boxOf(reloadedNodes.nth(1))
+    expect(reloadedTarget.x, 'reload preserves the readable downstream order')
+      .toBeGreaterThan(reloadedSource.x + reloadedSource.width + 80)
   })
 
   test('dragging from an output port and releasing shows no menu', async ({ page }) => {

@@ -160,6 +160,21 @@ def test_connect_canonicalizes_omitted_and_explicit_default_port_aliases():
             g, SPECS, "target-alias", "source_2", "filter_1", target_handle="in")
 
 
+def test_auto_placed_join_moves_right_of_both_sources_without_moving_them():
+    g = _empty()
+    for node_id, y in (("events", 120), ("images", 480)):
+        graph_ops.add_node(g, SPECS, node_id, "source")
+        graph_ops.find_node(g, node_id)["position"] = {"x": 80, "y": y}
+    graph_ops.add_node(g, SPECS, "join", "join")
+    graph_ops.connect(g, SPECS, "events-join", "events", "join", target_handle="a")
+    graph_ops.connect(g, SPECS, "images-join", "images", "join", target_handle="b")
+
+    positions = {node["id"]: node["position"] for node in g["nodes"]}
+    assert positions["events"] == {"x": 80, "y": 120}
+    assert positions["images"] == {"x": 80, "y": 480}
+    assert positions["join"] == {"x": 432, "y": 300}
+
+
 def test_layout_new_ignores_section_child_coords_for_anchor():
     # a section child's position is parent-relative; it must not skew the absolute anchor for new nodes
     g = _empty()
@@ -243,3 +258,15 @@ def test_layout_new_places_only_new_nodes_below_existing():
     assert pos["old"] == {"x": 500, "y": 500}              # existing node untouched
     assert pos["source_1"]["y"] >= 500 + 280               # new nodes placed below existing content
     assert pos["filter_1"]["x"] > pos["source_1"]["x"]     # chained node lands in the next column
+
+
+def test_layout_new_keeps_a_new_connected_target_right_of_an_existing_source():
+    g = _empty()
+    g["nodes"].append({"id": "old", "type": "source", "position": {"x": 80, "y": 120}, "data": {}})
+    graph_ops.add_node(g, SPECS, "filter_1", "filter")
+    graph_ops.connect(g, SPECS, "edge", "old", "filter_1")
+
+    graph_ops.layout_new(g, {"old"})
+
+    assert graph_ops.find_node(g, "old")["position"] == {"x": 80, "y": 120}
+    assert graph_ops.find_node(g, "filter_1")["position"] == {"x": 432, "y": 120}

@@ -49,7 +49,9 @@ def add_node(graph: dict, node_specs, node_id: str, kind: str,
         raise GraphOpError(f"unknown node kind '{kind}'")
     candidate = {
         "id": node_id, "type": kind, "position": {"x": 0, "y": 0},
-        "data": {"title": title or kind, "config": dict(config or {})},
+        # Presentation-only marker. A browser drag clears it, allowing later connections to place
+        # only product-created cards without disturbing a hand-arranged canvas.
+        "data": {"title": title or kind, "config": dict(config or {}), "autoPlaced": True},
     }
     try:
         node = GraphNode.model_validate(candidate)
@@ -128,6 +130,7 @@ def connect(graph: dict, node_specs, edge_id: str, source_id: str, target_id: st
                   "sourceHandle": canonical_source_handle,
                   "targetHandle": canonical_target_handle,
                   "data": {"wire": wire}})
+    _place_auto_target(graph, target_id)
     return {"ok": True, "edge_id": edge_id, "wire": wire,
             "source_handle": canonical_source_handle,
             "target_handle": canonical_target_handle}
@@ -323,6 +326,37 @@ def validate_graph(deps, graph: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Layout — place freshly-added nodes without disturbing what's already arranged.
 # --------------------------------------------------------------------------- #
+def _place_auto_target(graph: dict, target_id: str) -> None:
+    """Keep one still-auto-placed connected card to the right of every direct input.
+
+    This is intentionally not a general layout pass. It only adjusts a target that this product
+    created and that no browser drag has claimed, which lets a second Join input center the Join
+    without moving either source or unrelated existing cards.
+    """
+    target = find_node(graph, target_id)
+    if not target or target.get("parentId") or not target.get("data", {}).get("autoPlaced"):
+        return
+    by_id = {node.get("id"): node for node in graph.get("nodes", [])}
+    inputs = [by_id.get(edge.get("source")) for edge in graph.get("edges", [])
+              if edge.get("target") == target_id]
+    inputs = [node for node in inputs if node and not node.get("parentId")]
+    if not inputs:
+        return
+    x = max(node["position"]["x"] for node in inputs) + 352
+    y = sum(node["position"]["y"] for node in inputs) / len(inputs)
+    occupied = [node for node in graph.get("nodes", []) if node.get("id") != target_id]
+
+    def free(cx: float, cy: float) -> bool:
+        return not any(abs(node["position"]["x"] - cx) < 280
+                       and abs(node["position"]["y"] - cy) < 180 for node in occupied)
+
+    # Keep every fallback at or to the right of the topological column so wires cannot wrap back.
+    for dx, dy in ((0, 0), (210, 0), (420, 0), (0, 162), (0, -162), (210, 162), (210, -162)):
+        if free(x + dx, y + dy):
+            target["position"] = {"x": x + dx, "y": y + dy}
+            return
+
+
 def layout_new(graph: dict, keep_ids: set[str]) -> None:
     """Assign positions to the nodes NOT in `keep_ids` via a left-to-right topological layering,
     placed below any pre-existing content so a build never lands on top of the user's nodes. Existing
@@ -361,3 +395,9 @@ def layout_new(graph: dict, keep_ids: set[str]) -> None:
         row = per_col.get(col, 0)
         per_col[col] = row + 1
         n["position"] = {"x": base_x + col * 280, "y": base_y + row * 170}
+        n.setdefault("data", {})["autoPlaced"] = True
+    # A freshly-added target may be connected to an older card (the common MCP append path). Apply
+    # the narrow connected-placement rule after the batch anchor is known, rather than letting the
+    # generic below-content placement overwrite its downstream position.
+    for n in new:
+        _place_auto_target(graph, n["id"])

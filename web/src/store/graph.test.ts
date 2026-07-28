@@ -360,6 +360,53 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges).toHaveLength(1)
   })
 
+  it('places connected insertions rightward and only recenters an un-dragged Join', () => {
+    register({
+      kind: 'topology-source', title: 'Topology source', category: 'io',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Topology source', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    register({
+      kind: 'topology-join', title: 'Topology join', category: 'compute',
+      inputs: [{ id: 'a', wire: 'dataset' }, { id: 'b', wire: 'dataset' }],
+      outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Topology join', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    const source = (id: string, x: number, y: number) => ({
+      ...NODE(id, 'topology-source'), position: { x, y },
+    })
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [source('events', 80, 120), source('images', 80, 480)], edges: [] },
+    }))
+
+    const join = useStore.getState().addConnectedNode('topology-join', { x: -500, y: -500 }, {
+      source: 'events', sourceHandle: 'out', targetHandle: 'a', wire: 'dataset',
+    })!
+    expect(join.position).toEqual({ x: 432, y: 120 })
+
+    useStore.getState().connect({
+      id: 'images-to-join', source: 'images', target: join.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.position)
+      .toEqual({ x: 432, y: 300 })
+    expect(useStore.getState().doc.nodes.filter((node) => node.type === 'topology-source').map((node) => node.position))
+      .toEqual([{ x: 80, y: 120 }, { x: 80, y: 480 }])
+
+    // A settled drag opts out before a later wire is added; existing hand placement stays exact.
+    useStore.getState().setNodes(useStore.getState().doc.nodes.map((node) => (
+      node.id === join.id ? { ...node, position: { x: 960, y: 40 } } : node
+    )))
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.data.autoPlaced).toBe(false)
+    useStore.getState().removeEdge('images-to-join')
+    useStore.getState().connect({
+      id: 'images-to-join-again', source: 'images', target: join.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.position)
+      .toEqual({ x: 960, y: 40 })
+  })
+
   it('reconnects an edge as one undoable action while retaining its stable identity', () => {
     const latest = (id: string) => ({
       ...NODE(id),
