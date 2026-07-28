@@ -1552,6 +1552,71 @@ def test_grouped_aggregate_preview_refusal_contract_is_unchanged():
         "Grouped aggregation needs all input rows. Run this step to see the result.")
 
 
+@pytest.mark.parametrize(
+    ("upstream", "sort_by"),
+    [
+        (N("upstream", "aggregate", {
+            "groupBy": "user_id", "aggs": "sum(amount) AS total_purchase_amount",
+        }), "total_purchase_amount DESC"),
+        (N("upstream", "sample", {"n": 25, "seed": 42}), "user_id DESC"),
+    ],
+)
+def test_sort_preview_refusal_uses_target_semantics_after_upstream_run_refusal(
+        upstream, sort_by):
+    graph = {"id": "sort-refusal", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")}),
+        upstream,
+        N("sort", "sort", {"by": sort_by}),
+    ], "edges": [E("source", "upstream"), E("upstream", "sort")]}
+
+    response = client.post(
+        "/api/run/preview", json={"graph": graph, "nodeId": "sort", "k": 5})
+    assert response.status_code == 200, response.text
+    result = response.json()
+
+    assert result["notPreviewable"] is True and result["error"] is False
+    assert result["failureCategory"] == "not_previewable"
+    assert result["suggestedAction"] == "run"
+    assert result["reason"] == (
+        "Sorting needs all input rows to determine the final order. "
+        "Run this step to see the result.")
+
+
+def test_sort_preview_refusal_override_is_scoped_to_configured_sort():
+    aggregate = N(
+        "aggregate", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"})
+    base_nodes = [N("source", "source", {"uri": _uri("events")}), aggregate]
+    base_edges = [E("source", "aggregate")]
+
+    blank_sort = {"id": "blank-sort-refusal", "version": 1, "nodes": [
+        *base_nodes, N("target", "sort", {}),
+    ], "edges": [*base_edges, E("aggregate", "target")]}
+    blank_result = client.post(
+        "/api/run/preview", json={"graph": blank_sort, "nodeId": "target", "k": 5}).json()
+    assert blank_result["reason"] == (
+        "Grouped aggregation needs all input rows. Run this step to see the result.")
+
+    other_target = {"id": "other-target-refusal", "version": 1, "nodes": [
+        *base_nodes,
+        N("upstream-sort", "sort", {"by": "n DESC"}),
+        N("target", "select", {"expr": "event, n"}),
+    ], "edges": [
+        *base_edges, E("aggregate", "upstream-sort"), E("upstream-sort", "target"),
+    ]}
+    other_result = client.post(
+        "/api/run/preview", json={"graph": other_target, "nodeId": "target", "k": 5}).json()
+    assert other_result["reason"] == (
+        "Grouped aggregation needs all input rows. Run this step to see the result.")
+
+    missing_source = {"id": "missing-source-refusal", "version": 1, "nodes": [
+        N("source", "source", {}), N("target", "sort", {"by": "event DESC"}),
+    ], "edges": [E("source", "target")]}
+    missing_result = client.post(
+        "/api/run/preview", json={"graph": missing_source, "nodeId": "target", "k": 5}).json()
+    assert missing_result["reason"] == "no dataset selected"
+    assert missing_result["suggestedAction"] is None
+
+
 def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
     # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
     # can't pin the warm kernel forever. A 62.5B-row hashed cross join over the wired input cannot finish in

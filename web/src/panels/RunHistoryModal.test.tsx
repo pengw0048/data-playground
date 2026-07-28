@@ -1040,6 +1040,35 @@ describe('durable full results', () => {
     expect(screen.queryByRole('button', { name: 'Run this step' })).not.toBeInTheDocument()
   })
 
+  it('shows the backend Sort refusal for a configured Sort target', () => {
+    const doc = {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'target', type: 'sort', position: { x: 0, y: 0 },
+        data: {
+          title: 'Order purchases', status: 'draft',
+          config: { by: 'total_purchase_amount DESC' }, history: [],
+        },
+      }],
+    }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, failureCategory: 'not_previewable',
+        reason: 'Sorting needs all input rows to determine the final order. Run this step to see the result.',
+        suggestedAction: 'run',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText(
+      'Sorting needs all input rows to determine the final order. Run this step to see the result.',
+    )).toBeInTheDocument()
+    expect(screen.queryByText(/Grouped aggregation needs all input rows/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
+  })
+
   it('keeps the multi-user Python safety explanation beside its valid run action', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },
