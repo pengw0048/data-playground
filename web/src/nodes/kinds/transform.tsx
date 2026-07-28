@@ -24,7 +24,6 @@ function Transform({ id, data }: NodeComponentProps) {
 
   const src: TransformSource = (data.config.source as TransformSource) ?? 'adhoc'
   const mode: ProcessorMode = (data.config.mode as ProcessorMode) ?? 'map'
-  const scope = (data.config.scope as 'dataset' | 'sample') ?? 'dataset'
   const reference = references.find((candidate) => (
     candidate.id === data.config.processor && candidate.version === data.config.version
   ))
@@ -37,7 +36,7 @@ function Transform({ id, data }: NodeComponentProps) {
     ? (reference?.availability === 'deleted' ? `${configuredRef} · deleted`
       : reference?.availability === 'missing' ? `${configuredRef} · unavailable`
       : proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'choose in Transforms →'))
-    : `${mode} · on ${scope}`
+    : `${mode} · Python`
 
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>

@@ -43,7 +43,7 @@ _NODE_DATA_RUNTIME_FIELDS = frozenset({"history", "lastRun", "meta", "result"})
 _CORE_CONFIG_KEYS = frozenset({
     "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
     "delimiter", "header", "n", "seed", "method", "predicate", "select", "columns", "source", "processor",
-    "version", "params", "code", "io", "mode", "onError", "scope", "outputSchema", "outputSchemaSource",
+    "version", "params", "code", "io", "mode", "onError", "outputSchema", "outputSchemaSource",
     "outputSchemaCodeHash", "on", "how", "sql", "agg", "column", "chartType", "x", "y", "name", "writeMode",
     "partitionBy", "filename", "destination", "aggs", "by", "align", "count", "k", "lang", "markdown", "script",
 })
@@ -139,6 +139,10 @@ def _portable_canvas(doc: dict[str, Any]) -> dict[str, Any]:
             key: value for key, value in data.items()
             if key in _NODE_DATA_KEYS and key not in _NODE_DATA_RUNTIME_FIELDS
         }
+        if node.get("type") == "transform" and isinstance(node["data"].get("config"), dict):
+            node["data"]["config"] = {
+                key: value for key, value in node["data"]["config"].items() if key != "scope"
+            }
         node["data"]["status"] = "draft"
         result["nodes"].append(node)
     _assert_secret_free(result)
@@ -258,6 +262,8 @@ def parse_envelope(value: Any, *, filename: str) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise NativeCanvasError("native Canvas node data must be an object")
         _reject_unknown(data, _NODE_DATA_KEYS, "native Canvas node data")
+        if raw.get("type") == "transform" and isinstance(data.get("config"), dict):
+            data["config"] = {key: item for key, item in data["config"].items() if key != "scope"}
     for raw in canvas.get("edges", []):
         if not isinstance(raw, dict):
             raise NativeCanvasError("native Canvas payload has an invalid edge")

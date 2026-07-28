@@ -86,13 +86,6 @@ export function CodeFullscreen() {
                   <MiniSelect<ProcessorMode> value={(cfg.mode as ProcessorMode) ?? 'map'} onChange={(v) => updateConfig(fs.nodeId, { mode: v })}
                     options={[{ value: 'map', label: 'map' }, { value: 'map_batches', label: 'map_batches' }, { value: 'filter', label: 'filter' }, { value: 'flat_map', label: 'flat_map' }]} />
                 </div>
-                <label className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground">
-                  runs over
-                  <span className="w-[92px]">
-                    <MiniSelect<'dataset' | 'sample'> value={(cfg.scope as 'dataset' | 'sample') ?? 'dataset'} onChange={(v) => updateConfig(fs.nodeId, { scope: v })}
-                      options={[{ value: 'dataset', label: 'dataset' }, { value: 'sample', label: 'sample' }]} />
-                  </span>
-                </label>
                 <span className="text-[10.5px] text-muted-foreground">on_error</span>
                 <div className="w-[88px]">
                   <MiniSelect value={(cfg.onError as 'raise' | 'skip') ?? 'raise'} onChange={(v) => updateConfig(fs.nodeId, { onError: v })}

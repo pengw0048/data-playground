@@ -141,6 +141,11 @@ def _canonical_graph(
         # metric emits its title as a value, Write uses it as the destination fallback, and a
         # Section addresses contained children by title. Retain only those semantic titles.
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        if node.type == "transform":
+            # Legacy Canvas documents can carry a display-only scope label. It never changed
+            # execution, so it must not fork durable execution identity.
+            config = {key: value for key, value in config.items() if key != "scope"}
+            data["config"] = config
         if node.type == "transform" and config.get("source") == "library":
             # The exact promoted `(id, version)` is the durable definition. Never retain a stale
             # inline body as a second, hidden persistence or replay path.

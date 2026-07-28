@@ -63,6 +63,24 @@ def test_export_is_viewer_readable_and_omits_identity_and_run_history():
         metadb.delete_canvas_cascade(canvas_id)
 
 
+def test_native_canvas_drops_legacy_transform_scope():
+    doc = _doc("native-transform-scope")
+    doc["nodes"].append({
+        "id": "transform", "type": "transform", "position": {"x": 80, "y": 0},
+        "data": {"title": "transform", "status": "draft", "config": {
+            "source": "adhoc", "scope": "sample", "mode": "map",
+            "code": "def fn(row): return row",
+        }},
+    })
+    doc["edges"] = [{"id": "edge", "source": "source", "target": "transform"}]
+
+    envelope = native_canvas.export_envelope(doc, get_deps())
+    exported = envelope["canvas"]["nodes"][1]["data"]["config"]
+    assert "scope" not in exported
+    parsed = native_canvas.parse_envelope(envelope, filename="scope.dp-canvas.json")
+    assert "scope" not in parsed["canvas"]["nodes"][1]["data"]["config"]
+
+
 def test_import_warns_for_missing_data_creates_once_and_replays_after_response_loss():
     source_id = "native-import-source"
     _seed(source_id, _doc(source_id, dataset_ref={

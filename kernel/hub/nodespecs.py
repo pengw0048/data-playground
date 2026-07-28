@@ -85,12 +85,11 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              inputs=[_in()], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="select", type="string", label="columns / expressions")],
              blurb="project / rename / derive columns"),
-    # The single Python-code compute node. `scope` labels whether it's exploring a sample or producing
-    # a dataset — execution is identical, the tag just guides the mental model.
+    # The single Python-code compute node. Its input relation and Preview versus Run determine
+    # execution; there is no separate transform scope.
     NodeSpec(kind="transform", title="transform", category="compute", tag="code",
              inputs=[_in(("dataset", "sample", "selection"))], outputs=[_out()], can_bypass=True,
              params=[ParamSpec(name="source", type="select", options=["adhoc", "library"], default="adhoc"),
-                     ParamSpec(name="scope", type="select", options=["dataset", "sample"], default="dataset", label="runs over"),
                      ParamSpec(name="mode", type="select", options=["map", "map_batches", "filter", "flat_map"], default="map"),
                      ParamSpec(name="batchFormat", type="select", options=["rows", "pandas", "arrow"], default="rows",
                                label="batch format", show_when={"param": "mode", "in": ["map_batches"]}),

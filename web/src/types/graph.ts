@@ -71,7 +71,6 @@ export interface NodeConfig {
   io?: { inputs: PortSpec[]; outputs: PortSpec[] } | null
   mode?: ProcessorMode
   onError?: 'raise' | 'skip'
-  scope?: 'dataset' | 'sample'  // code node: label for whether it works over the full dataset or a sample
   outputSchema?: ColumnSchema[] | { ref: string; version?: number }  // inline contract, OR a ref to a named workspace contract
   outputSchemaSource?: 'declared' | 'inferred'  // how outputSchema was filled (for the UI hint)
   outputSchemaCodeHash?: string           // hash of the cell when the contract was pinned → detect drift

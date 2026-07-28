@@ -627,6 +627,8 @@ def test_set_transform_writes_code_and_previews_the_new_column():
     code = "def fn(row):\n    row['is_purchase'] = row.get('event') == 'purchase'\n    return row"
     out = data("set_transform", {"canvasId": cid, "code": code, "mode": "map", "upstreamNodeId": s})
     assert out["created"] is True
+    node = next(n for n in data("get_canvas", {"canvasId": cid})["nodes"] if n["id"] == out["nodeId"])
+    assert "scope" not in node["config"]
     cols = {c["name"] for c in out["preview"]["columns"]}
     assert "is_purchase" in cols  # the preview proves the authored code actually ran
 
