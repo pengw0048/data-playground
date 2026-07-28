@@ -14,7 +14,11 @@ function version(id: string, rows: number): NodeVersion {
   }
 }
 
-function setNode(status: NodeStatus, history: NodeVersion[] = []) {
+function setNode(
+  status: NodeStatus,
+  history: NodeVersion[] = [],
+  currentOutputVersionId?: string,
+) {
   const node: CanvasNode = {
     id: 'target', type: 'filter', position: { x: 0, y: 0 },
     data: {
@@ -23,6 +27,7 @@ function setNode(status: NodeStatus, history: NodeVersion[] = []) {
         ? { ...history[history.length - 1].config }
         : {},
       history,
+      currentOutputVersionId,
     },
   }
   useStore.setState({
@@ -43,7 +48,7 @@ describe('HistoryPanel output versions', () => {
   })
 
   it('identifies the current output without a no-op Restore or duplicate row count', () => {
-    setNode('latest', [version('old', 10), version('current', 20)])
+    setNode('latest', [version('old', 10), version('current', 20)], 'current')
 
     render(<HistoryPanel nodeId="target" />)
 
@@ -70,12 +75,16 @@ describe('HistoryPanel output versions', () => {
   it('marks a restored older configuration as current instead of assuming the newest run', () => {
     const old = version('old', 10)
     const newest = version('newest', 20)
-    setNode('latest', [old, newest])
+    setNode('latest', [old, newest], 'old')
     useStore.setState((state) => ({
       doc: {
         ...state.doc,
         nodes: state.doc.nodes.map((node) => ({
-          ...node, data: { ...node.data, config: { ...old.config } },
+          ...node, data: {
+            ...node.data,
+            config: { ...old.config },
+            currentOutputVersionId: old.id,
+          },
         })),
       },
     }))
@@ -87,6 +96,41 @@ describe('HistoryPanel output versions', () => {
     expect(within(restorable).getByText(/20 rows/)).toBeVisible()
     fireEvent.click(within(restorable).getByRole('button', { name: /Restore/ }))
     expect(restoreVersion).toHaveBeenCalledWith('target', 'newest')
+  })
+
+  it('uses persisted output identity when successive versions have identical configs', () => {
+    const older = version('older', 10)
+    const newer = { ...version('newer', 20), config: { ...older.config } }
+    setNode('latest', [older, newer], 'older')
+
+    render(<HistoryPanel nodeId="target" />)
+
+    expect(within(screen.getByLabelText('Current output version')).getByText(/10 rows/)).toBeVisible()
+    const restorable = screen.getByLabelText('Output version')
+    expect(within(restorable).getByText(/20 rows/)).toBeVisible()
+  })
+
+  it.each(['stale', 'failed'] as const)(
+    'does not label a retained identity Current while the node is %s',
+    (status) => {
+      const successful = version('successful', 10)
+      setNode(status, [successful], successful.id)
+
+      render(<HistoryPanel nodeId="target" />)
+
+      expect(screen.queryByText('Current output')).not.toBeInTheDocument()
+      expect(screen.getByText('Previous output')).toBeVisible()
+    },
+  )
+
+  it('does not guess a Current version when persisted identity is absent', () => {
+    const successful = version('successful', 10)
+    setNode('latest', [successful])
+
+    render(<HistoryPanel nodeId="target" />)
+
+    expect(screen.queryByText('Current output')).not.toBeInTheDocument()
+    expect(screen.getByText('Previous output')).toBeVisible()
   })
 
   it('sends an empty failed node to its filtered Jobs attempts', () => {

@@ -16,11 +16,6 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
   const canvasId = useStore((s) => s.doc.id)
   const history = node?.data.history ?? EMPTY
   const items = [...history].reverse()
-  const currentIndex = node?.data.status === 'latest'
-    ? items.findIndex((version) => (
-      JSON.stringify(version.config) === JSON.stringify(node.data.config)
-    ))
-    : -1
 
   if (items.length === 0) {
     return <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>
@@ -45,7 +40,8 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
   return (
     <div style={{ padding: 8 }}>
       {items.map((v, i) => {
-        const current = i === currentIndex
+        const current = node?.data.status === 'latest'
+          && v.id === node.data.currentOutputVersionId
         return (
           <div
             key={v.id}

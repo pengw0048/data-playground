@@ -377,6 +377,30 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
   })
 
+  it('restores the exact output identity when successive versions share a config', () => {
+    const target = NODE('target', 'filter')
+    const config = { predicate: 'score > 0' }
+    target.data.status = 'latest'
+    target.data.config = { ...config }
+    target.data.history = [
+      { id: 'older', ts: 1, rows: 10, label: 'run · 10 rows', config: { ...config } },
+      { id: 'newer', ts: 2, rows: 20, label: 'run · 20 rows', config: { ...config } },
+    ]
+    target.data.currentOutputVersionId = 'newer'
+    useStore.setState((state) => ({
+      canvasRole: 'owner',
+      doc: { ...state.doc, nodes: [target], edges: [] },
+    }))
+
+    useStore.getState().restoreVersion('target', 'older')
+
+    expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+      status: 'latest',
+      config,
+      currentOutputVersionId: 'older',
+    })
+  })
+
   it('keeps menu-created node and edge in the same undo action', () => {
     register({
       kind: 'history-auto-source', title: 'History source', category: 'io',
@@ -1414,6 +1438,7 @@ describe('graph store — core authority ops', () => {
     expect(data.lastRun?.rows).toBeUndefined()
     expect(data.history).toHaveLength(1)
     expect(data.history?.[0]).toMatchObject({ outputCount: 2, label: 'run · 2 outputs' })
+    expect(data.currentOutputVersionId).toBe(data.history?.[0].id)
     expect(data.history?.[0].rows).toBeUndefined()
     expect(data.history?.[0].label).not.toContain('999')
   })

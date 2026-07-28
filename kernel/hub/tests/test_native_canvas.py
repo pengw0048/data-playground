@@ -29,7 +29,13 @@ def _doc(canvas_id: str, *, dataset_ref: dict | None = None) -> dict:
             {"name": "limit", "type": "integer", "default": 10},
         ],
         "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0}, "data": {
-            "title": "source", "status": "latest", "lastRun": {"rows": 4}, "config": config,
+            "title": "source", "status": "latest", "lastRun": {"rows": 4},
+            "history": [{
+                "id": "v_1", "ts": 1, "rows": 4, "label": "run · 4 rows",
+                "config": config,
+            }],
+            "currentOutputVersionId": "v_1",
+            "config": config,
         }}],
         "edges": [],
     }
@@ -59,6 +65,8 @@ def test_export_is_viewer_readable_and_omits_identity_and_run_history():
         assert envelope["canvas"].get("id") is None
         assert envelope["canvas"]["nodes"][0]["data"]["status"] == "draft"
         assert "lastRun" not in envelope["canvas"]["nodes"][0]["data"]
+        assert "history" not in envelope["canvas"]["nodes"][0]["data"]
+        assert "currentOutputVersionId" not in envelope["canvas"]["nodes"][0]["data"]
     finally:
         metadb.delete_canvas_cascade(canvas_id)
 
