@@ -1910,6 +1910,62 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ runs: {} })
   })
 
+  it('enters confirmation only for an unconfirmed typed confirmation response', async () => {
+    const source = NODE('source')
+    const target = NODE('target', 'transform')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+        edges: [{ id: 'source-target', source: 'source', target: 'target' }],
+      },
+      runs: {}, toasts: [],
+    })
+    apiMocks.run.mockRejectedValueOnce(new KernelError(
+      409, 'run needs confirmation (large or unknown size — a full pass)', 'run_confirmation_required'))
+
+    await useStore.getState().run('target')
+
+    expect(useStore.getState().runs.target).toMatchObject({ phase: 'confirm' })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'target')?.data.status).toBe('stale')
+    expect(useStore.getState().toasts).toEqual([])
+
+    apiMocks.run.mockRejectedValueOnce(new KernelError(
+      409, 'run needs confirmation (large or unknown size — a full pass)', 'run_confirmation_required'))
+    await useStore.getState().run('target', true)
+
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'failed', error: 'run needs confirmation (large or unknown size — a full pass)',
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'target')?.data.status).toBe('failed')
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'run needs confirmation (large or unknown size — a full pass)',
+    }])
+  })
+
+  it('surfaces a structural conflict instead of returning it to confirmation', async () => {
+    const source = NODE('source')
+    const filter = NODE('filter', 'filter')
+    const transform = NODE('transform', 'transform')
+    const detail = 'linear checkpoint tasks require exactly Source -> Select(checkpoint) -> Write'
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, filter, transform],
+        edges: [
+          { id: 'source-filter', source: 'source', target: 'filter' },
+          { id: 'filter-transform', source: 'filter', target: 'transform' },
+        ],
+      },
+      runs: {}, toasts: [],
+    })
+    apiMocks.run.mockRejectedValueOnce(new KernelError(409, detail, 'conflict'))
+
+    await useStore.getState().run('transform', true)
+
+    expect(useStore.getState().runs.transform).toMatchObject({ phase: 'failed', error: detail })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'transform')?.data.status).toBe('failed')
+    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: detail }])
+  })
+
   it('surfaces a stale write admission as re-admission work, not a size confirmation', async () => {
     const write = NODE('write', 'write')
     write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }

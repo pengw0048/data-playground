@@ -37,6 +37,7 @@ class APIErrorCode(StrEnum):
     CANVAS_NOT_FOUND = "canvas_not_found"
     METHOD_NOT_ALLOWED = "method_not_allowed"
     CONFLICT = "conflict"
+    RUN_CONFIRMATION_REQUIRED = "run_confirmation_required"
     RETAINED_UPSTREAM_STALE = "retained_upstream_stale"
     RETAINED_UPSTREAM_UNAVAILABLE = "retained_upstream_unavailable"
     RETAINED_UPSTREAM_EXPIRED = "retained_upstream_expired"

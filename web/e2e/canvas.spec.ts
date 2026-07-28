@@ -1321,13 +1321,54 @@ test.describe('Data Playground canvas', () => {
     await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
   })
 
-  test('checkpointing a node marks it materialized on the graph', async ({ page }) => {
-    await fresh(page)
-    const inspector = page.getByTestId('inspector')
-    await addNode(page, 'Shape', 'filter') // auto-selected
-    await inspector.getByTestId('checkpoint-toggle').click()
-    // the card now shows the materialized ● (output persisted → inspectable + reused across runs)
-    await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
+  test('checkpoint controls prevent unsupported graphs and allow the linear checkpoint route', async ({ page }) => {
+    const unsupportedId = `checkpoint-unsupported-${Date.now()}`
+    const supportedId = `checkpoint-supported-${Date.now()}`
+    try {
+      for (const canvas of [{
+        id: unsupportedId, name: 'Unsupported checkpoint',
+        nodes: [
+          { id: 'source', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Source', status: 'draft', config: {} } },
+          { id: 'filter', type: 'filter', position: { x: 320, y: 80 }, data: { title: 'Filter', status: 'draft', config: {} } },
+          { id: 'transform', type: 'transform', position: { x: 560, y: 80 }, data: { title: 'Transform', status: 'draft', config: {} } },
+        ],
+        edges: [
+          { id: 'source-filter', source: 'source', target: 'filter' },
+          { id: 'filter-transform', source: 'filter', target: 'transform' },
+        ],
+      }, {
+        id: supportedId, name: 'Linear checkpoint',
+        nodes: [
+          { id: 'source', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Source', status: 'draft', config: {} } },
+          { id: 'select', type: 'select', position: { x: 320, y: 80 }, data: { title: 'Select', status: 'draft', config: { select: '*' } } },
+          { id: 'write', type: 'write', position: { x: 560, y: 80 }, data: { title: 'Write', status: 'draft', config: {} } },
+        ],
+        edges: [
+          { id: 'source-select', source: 'source', target: 'select' },
+          { id: 'select-write', source: 'select', target: 'write' },
+        ],
+      }]) {
+        const created = await page.request.post('/api/canvas', { data: { ...canvas, version: 1, requirements: [] } })
+        expect(created.ok()).toBe(true)
+      }
+
+      await page.goto(`/#/canvas/${unsupportedId}`)
+      const inspector = page.getByTestId('inspector')
+      await page.getByText('TRANSFORM', { exact: true }).click()
+      await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
+      await expect(inspector.getByTestId('checkpoint-toggle')).toBeDisabled()
+      await expect(inspector.getByText('Checkpoints are available only for Source → Select → Write.')).toBeVisible()
+
+      await page.goto(`/#/canvas/${supportedId}`)
+      await page.getByText('SELECT', { exact: true }).click()
+      await expect(inspector.getByText('SELECT', { exact: true })).toBeVisible()
+      await expect(inspector.getByTestId('checkpoint-toggle')).toBeEnabled()
+      await inspector.getByTestId('checkpoint-toggle').click()
+      await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(unsupportedId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(supportedId)}`)
+    }
   })
 
   test('a code block lives on the canvas and opens the fullscreen editor on double-click', async ({ page }) => {

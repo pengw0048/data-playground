@@ -2801,7 +2801,7 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId, undefined, writeAdmission)
     } catch (e) {
-      if (e instanceof KernelError && e.status === 409 && !e.message.includes('write admission')) {
+      if (e instanceof KernelError && e.code === 'run_confirmation_required' && !confirmed) {
         set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'confirm' } } }))
         get().updateData(id, { status: 'stale' })
         return

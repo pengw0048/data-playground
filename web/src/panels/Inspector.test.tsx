@@ -401,6 +401,50 @@ describe('Inspector — effective named outputs', () => {
   })
 })
 
+describe('Inspector — linear checkpoint availability', () => {
+  it('enables a checkpoint only on the supported Source → Select → Write route', () => {
+    const source = { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', history: [], config: {} } }
+    const select = { id: 'select', type: 'select', position: { x: 0, y: 0 }, data: { title: 'select', status: 'draft', history: [], config: { select: '*' } } }
+    const write = { id: 'write', type: 'write', position: { x: 0, y: 0 }, data: { title: 'write', status: 'draft', history: [], config: {} } }
+    useStore.setState({
+      selectedIds: ['select'], canvasRole: 'owner', runs: {}, schemas: {},
+      doc: {
+        id: 'checkpoint', version: 1, requirements: [], nodes: [source, select, write],
+        edges: [
+          { id: 'source-select', source: 'source', target: 'select' },
+          { id: 'select-write', source: 'select', target: 'write' },
+        ],
+      },
+    } as any)
+
+    render(<Inspector />)
+    const toggle = screen.getByTestId('checkpoint-toggle')
+    expect(toggle).toBeEnabled()
+    fireEvent.click(toggle)
+    expect((useStore.getState().doc.nodes.find((node) => node.id === 'select')?.data.config as any).checkpoint).toBe(true)
+  })
+
+  it('disables an unsupported checkpoint where a researcher encounters it', () => {
+    const source = { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', history: [], config: {} } }
+    const filter = { id: 'filter', type: 'filter', position: { x: 0, y: 0 }, data: { title: 'filter', status: 'draft', history: [], config: {} } }
+    const transform = { id: 'transform', type: 'transform', position: { x: 0, y: 0 }, data: { title: 'transform', status: 'draft', history: [], config: {} } }
+    useStore.setState({
+      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: {},
+      doc: {
+        id: 'checkpoint', version: 1, requirements: [], nodes: [source, filter, transform],
+        edges: [
+          { id: 'source-filter', source: 'source', target: 'filter' },
+          { id: 'filter-transform', source: 'filter', target: 'transform' },
+        ],
+      },
+    } as any)
+
+    render(<Inspector />)
+    expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
+    expect(screen.getByText('Checkpoints are available only for Source → Select → Write.')).toBeInTheDocument()
+  })
+})
+
 describe('Inspector — Source connection details', () => {
   it('keeps opaque Source bindings and field evidence out of the Canvas card surface until requested', async () => {
     const exact = vi.spyOn(api, 'datasetRevision').mockResolvedValue({
