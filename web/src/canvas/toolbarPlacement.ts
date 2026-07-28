@@ -78,3 +78,21 @@ export function toolbarSafePosition(
   // Keep the pre-existing free-position behavior when the visible region is genuinely full.
   return legacyCandidates(base).find((position) => !clashes(nodes, position.x, position.y, LEGACY_FREE_HEIGHT)) ?? base
 }
+
+/**
+ * Return the smallest viewport-center shift that reveals a connected node and its action shelf.
+ * The graph position stays untouched, preserving left-to-right topology.
+ */
+export function toolbarRevealDelta(
+  position: { x: number; y: number }, bounds: ToolbarSafeBounds,
+): { x: number; y: number } | null {
+  const minX = bounds.left + SAFE_GUTTER
+  const maxX = bounds.right - SAFE_GUTTER - TOOLBAR_NODE_WIDTH
+  const minY = bounds.top + SAFE_GUTTER
+  const maxY = bounds.bottom - SAFE_GUTTER - SAFE_FOOTPRINT_HEIGHT
+  if (minX > maxX || minY > maxY) return null
+  const visibleX = Math.max(minX, Math.min(position.x, maxX))
+  const visibleY = Math.max(minY, Math.min(position.y, maxY))
+  const delta = { x: position.x - visibleX, y: position.y - visibleY }
+  return delta.x || delta.y ? delta : null
+}
