@@ -1001,6 +1001,13 @@ class BuildEngine:
                         # depth for a malformed adapter response, never as evidence of bounded work.
                         return preview_revision(uri, revision_id, limit=self.sample_k).limit(self.sample_k)
                     return open_revision(uri, revision_id)
+                except BoundedPreviewUnsupported as exc:
+                    raise NotPreviewable(
+                        node,
+                        "This source cannot provide a bounded preview for the selected version. "
+                        "Run this step to read it through normal execution.",
+                        suggested_action="run",
+                    ) from exc
                 except NotPreviewable:
                     raise
                 except Exception as exc:
@@ -1073,10 +1080,23 @@ class BuildEngine:
                         preview_revision = getattr(revision_adapter, "preview_revision", None)
                         if not callable(preview_revision):
                             raise NotPreviewable(
-                                node, "persisted input revision has no bounded preview capability")
+                                node,
+                                "This version cannot provide a bounded preview. Run this step to "
+                                "read it through normal execution.",
+                                suggested_action="run",
+                            )
                         return preview_revision(uri, str(revision_id), limit=int(preview_limit)).limit(
                             int(preview_limit))
                     return open_revision(uri, str(revision_id))
+                except BoundedPreviewUnsupported as exc:
+                    raise NotPreviewable(
+                        node,
+                        "This version cannot provide a bounded preview. Run this step to read it "
+                        "through normal execution.",
+                        suggested_action="run",
+                    ) from exc
+                except NotPreviewable:
+                    raise
                 except Exception as exc:  # provider retention/removal must never fall back to head
                     raise NotPreviewable(node, "persisted input revision is unavailable") from exc
             if self.sample_k is not None and not self.full and not self.reservoir_preview:

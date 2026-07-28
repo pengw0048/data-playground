@@ -14,7 +14,7 @@ from hub.estimate import estimate_sizes
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.executors.preview import _reservoir_preview_allowed
 from hub.models import ColumnProfile, Graph, ProfileResult, SampleRequest, SampleResult
-from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
+from hub.plugins.adapters import BoundedPreviewUnsupported, DuckDBAdapter, LanceAdapter
 
 
 def _node(node_id: str, kind: str, config: dict | None = None) -> dict:
@@ -284,6 +284,9 @@ def test_exact_source_without_revision_preview_capability_fails_before_full_open
             opened.append(revision_id)
             raise AssertionError("exact preview must not open the unbounded full-run relation")
 
+        def preview_revision(self, _uri, _revision_id, *, limit):
+            raise BoundedPreviewUnsupported("no bounded exact preview")
+
     graph = Graph(
         id="exact-full-only-preview", version=1,
         nodes=[_node("source", "source", {
@@ -302,6 +305,41 @@ def test_exact_source_without_revision_preview_capability_fails_before_full_open
             NotPreviewable, match="cannot provide a bounded preview for the selected version") as exc:
         BuildEngine(graph, lambda _uri: ExactFullOnlyAdapter(), object(), sample_k=7, full=False).relation(
             "source")
+
+    assert opened == []
+    assert exc.value.suggested_action == "run"
+
+
+def test_admitted_revision_without_bounded_preview_keeps_the_run_action(monkeypatch) -> None:
+    import hub.executors.engine as engine_mod
+
+    opened: list[str] = []
+
+    class ExactFullOnlyAdapter:
+        name = "exact-full-only"
+
+        def open_revision(self, _uri, revision_id):
+            opened.append(revision_id)
+            return db.conn().from_arrow(pa.table({"value": [1]}))
+
+        def preview_revision(self, _uri, _revision_id, *, limit):
+            raise BoundedPreviewUnsupported("no bounded admitted preview")
+
+    graph = Graph(
+        id="admitted-exact-full-only-preview", version=1,
+        nodes=[_node("source", "source", {
+            "uri": "exact-full-only://dataset",
+            "_input_revision_id": "v1",
+            "_input_preview_limit": 7,
+        })],
+        edges=[],
+    )
+    monkeypatch.setattr(engine_mod, "revision_adapter_for_uri", lambda *_args: ExactFullOnlyAdapter())
+
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="cannot provide a bounded preview") as exc:
+        BuildEngine(graph, lambda _uri: ExactFullOnlyAdapter(), object(),
+                    sample_k=7, full=False).relation("source")
 
     assert opened == []
     assert exc.value.suggested_action == "run"
