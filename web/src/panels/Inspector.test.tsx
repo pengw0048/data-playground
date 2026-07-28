@@ -603,9 +603,27 @@ describe('Inspector — draft Source entry', () => {
     expect(JSON.stringify(useStore.getState().doc.nodes[0].data.config)).toBe(before)
   })
 
+  it('keeps focus while entering a manual URI, then restores the configured Source Inspector', async () => {
+    selectSource({})
+    render(<Inspector />)
+    fireEvent.click(screen.getByText('Advanced source configuration'))
+    const uri = screen.getByLabelText('Dataset URI')
+    uri.focus()
+    fireEvent.change(uri, { target: { value: 'events.parquet' } })
+
+    expect(uri).toHaveFocus()
+    expect(uri).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Count rows' })).toBeInTheDocument()
+    fireEvent.blur(uri)
+    await waitFor(() => expect(screen.getByText('Properties')).toBeInTheDocument())
+    expect(screen.getByText('Data source')).toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.config.uri).toBe('events.parquet')
+  })
+
   it.each([
     ['a local binding', { tableId: 'events', uri: 'events.parquet' }],
     ['a provider binding', { providerResourceRef: 'provider://datasets/events', providerName: 'Provider' }],
+    ['a manual URI', { uri: 'events.parquet' }],
   ])('preserves the normal Inspector for %s', (_case, config) => {
     selectSource(config)
     render(<Inspector />)

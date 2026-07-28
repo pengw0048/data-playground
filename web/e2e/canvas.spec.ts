@@ -1604,7 +1604,8 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector
     const inspector = page.getByTestId('inspector')
     // point the source at a dataset that doesn't exist → the run fails and must surface a toast
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await inspector.getByLabel('Dataset URI').fill('does-not-exist.parquet')
     // a source's run is a full count/scan — the Inspector labels it "Count rows"
     await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
@@ -1922,7 +1923,7 @@ test.describe('Data Playground canvas', () => {
     const inspector = page.getByTestId('inspector')
     await inspector.getByRole('button', { name: 'View data' }).click()
     await expect(page.getByText('purchase', { exact: true })).toBeVisible()
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('another-events.parquet')
+    await inspector.getByLabel('Dataset URI').fill('another-events.parquet')
 
     await expect(page.getByRole('status')).toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
@@ -2302,7 +2303,8 @@ test.describe('Data Playground canvas', () => {
       await addNode(page, 'Sources & sinks', 'source')
       const source = page.locator('.react-flow__node-source')
       const inspector = page.getByTestId('inspector')
-      await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(uri)
+      await inspector.getByText('Advanced source configuration', { exact: true }).click()
+      await inspector.getByLabel('Dataset URI').fill(uri)
 
       const blockedEstimatePromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === '/api/run/estimate'

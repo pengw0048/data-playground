@@ -55,7 +55,10 @@ const schemaContractStale = (kind: string, cfg: Record<string, unknown>): boolea
 }
 
 function isUnboundSource(config: Record<string, unknown>): boolean {
-  return !config.tableId && !config.datasetRef && !config.providerResourceRef
+  return !config.tableId
+    && !config.datasetRef
+    && !config.providerResourceRef
+    && !(typeof config.uri === 'string' && config.uri.trim())
 }
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
@@ -138,7 +141,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const kernelUp = useStore((s) => s.kernelUp)
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
+  const [editingDraftSourceUri, setEditingDraftSourceUri] = useState(false)
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
+  useEffect(() => setEditingDraftSourceUri(false), [nodeId])
   if (!node) return null
 
   const kind = node.type
@@ -150,6 +155,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
   const unboundSource = kind === 'source' && isUnboundSource(cfg)
+  const showDraftSourceEntry = unboundSource || (kind === 'source' && editingDraftSourceUri)
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const schemaCapableKind = canDeclareSchemaKind(kind)
@@ -205,7 +211,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       </div>
 
       {/* properties (reused generic param editor) */}
-      {unboundSource ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit} /> : <>
+      {showDraftSourceEntry ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit}
+        onUriEditingChange={setEditingDraftSourceUri} /> : <>
         <EditOnly enabled={canEdit}>
           <Section title="Properties">
             <NodeParamFields nodeId={nodeId} omitNames={kind === 'write' ? ['writeMode'] : []} />
@@ -672,7 +679,11 @@ function sourceTable(catalog: CatalogTable[], config: Record<string, unknown>): 
   return catalog.find((table) => (tableId && table.id === tableId) || table.uri === uri || table.name === uri)
 }
 
-function DraftSourceInspector({ nodeId, canEdit }: { nodeId: string; canEdit: boolean }) {
+function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
+  nodeId: string
+  canEdit: boolean
+  onUriEditingChange: (editing: boolean) => void
+}) {
   const config = useStore((s) => (s.doc.nodes.find((node) => node.id === nodeId)?.data.config ?? {}) as Record<string, unknown>)
   const updateConfig = useStore((s) => s.updateConfig)
   return <>
@@ -696,7 +707,14 @@ function DraftSourceInspector({ nodeId, canEdit }: { nodeId: string; canEdit: bo
           <div className="grid gap-2">
             <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-uri-${nodeId}`}>Dataset URI</Label>
             <Input id={`source-uri-${nodeId}`} aria-label="Dataset URI" value={String(config.uri ?? '')}
-              onChange={(event) => updateConfig(nodeId, { uri: event.target.value })}
+              onChange={(event) => {
+                onUriEditingChange(true)
+                updateConfig(nodeId, { uri: event.target.value })
+              }}
+              // Keep the advanced editor mounted through the click that moves focus away. A
+              // synchronous mode switch here removes an Inspector action between mousedown and
+              // click, so the user's first Count/View action is silently lost.
+              onBlur={() => window.setTimeout(() => onUriEditingChange(false), 0)}
               className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
             <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-delimiter-${nodeId}`}>CSV delimiter</Label>
             <Input id={`source-delimiter-${nodeId}`} aria-label="CSV delimiter" value={String(config.delimiter ?? '')}

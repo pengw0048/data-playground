@@ -109,7 +109,8 @@ test.describe('accessibility gate @ux-smoke', () => {
       items: Array<{ name: string; uri: string }>
     }).items.find((item) => item.name === 'images')
     expect(registered, 'the running-state fixture requires the registered images source').toBeTruthy()
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(registered!.uri)
+    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await inspector.getByLabel('Dataset URI').fill(registered!.uri)
     let releaseRun: (() => void) | undefined
     const held = new Promise<void>((resolve) => { releaseRun = resolve })
     let finishHold: (() => void) | undefined

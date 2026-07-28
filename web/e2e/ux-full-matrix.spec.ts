@@ -27,7 +27,8 @@ async function freshSource(page: Page, uri: string) {
   await page.getByRole('button', { name: 'Sources & sinks', exact: true }).click()
   await page.locator('.dp-panel', { hasText: 'source' }).last().getByText('source', { exact: true }).click()
   const inspector = page.getByTestId('inspector')
-  await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(uri)
+  await inspector.getByText('Advanced source configuration', { exact: true }).click()
+  await inspector.getByLabel('Dataset URI').fill(uri)
   return inspector
 }
 
