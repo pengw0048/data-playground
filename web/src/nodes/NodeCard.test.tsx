@@ -39,6 +39,28 @@ describe('NodeCard result summary', () => {
     expect(screen.queryByText(/\b250 rows\b/)).not.toBeInTheDocument()
   })
 
+  it('removes an old Sample size hint immediately after its configuration changes', () => {
+    const sample: NodeData = {
+      title: 'sample', status: 'latest', config: { n: 1000, seed: 42 }, history: [],
+    }
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [{
+          id: 'sample', type: 'sample', position: { x: 0, y: 0 }, data: sample,
+        }],
+      },
+      sizes: { sample: { rows: 1000, confidence: 'bounded' } },
+    }))
+
+    render(<ReactFlowProvider><NodeCard id="sample" data={sample} /></ReactFlowProvider>)
+    expect(screen.getByText('≤ 1,000 rows')).toBeInTheDocument()
+
+    act(() => useStore.getState().updateConfig('sample', { n: 25 }))
+
+    expect(screen.queryByText('≤ 1,000 rows')).not.toBeInTheDocument()
+  })
+
   it('keeps Source preview in the header for an unselected viewer', () => {
     useStore.setState({ canvasRole: 'viewer' })
     const data: NodeData = {

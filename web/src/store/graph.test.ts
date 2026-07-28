@@ -719,6 +719,44 @@ describe('graph store — core authority ops', () => {
     })])
   })
 
+  it('clears stale size estimates for an edited Sample and its downstream cone only', () => {
+    const latest = (id: string, type = 'source', config = {}) => ({
+      ...NODE(id, type),
+      data: { ...NODE(id, type).data, status: 'latest' as const, config },
+    })
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [
+          latest('source'),
+          latest('sample', 'sample', { n: 1000, seed: 42 }),
+          latest('transform', 'transform'),
+          latest('unrelated'),
+        ],
+        edges: [
+          { id: 'source-sample', source: 'source', target: 'sample', data: { wire: 'dataset' } },
+          { id: 'sample-transform', source: 'sample', target: 'transform', data: { wire: 'dataset' } },
+        ],
+      },
+      sizes: {
+        source: { rows: 10_000, confidence: 'exact' },
+        sample: { rows: 1_000, confidence: 'exact' },
+        transform: { rows: 1_000, confidence: 'bounded' },
+        unrelated: { rows: 500, confidence: 'exact' },
+      },
+    }))
+
+    useStore.getState().updateConfig('sample', { n: 25 })
+
+    expect(useStore.getState().sizes).toEqual({
+      source: { rows: 10_000, confidence: 'exact' },
+      unrelated: { rows: 500, confidence: 'exact' },
+    })
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['source', 'latest'], ['sample', 'stale'], ['transform', 'stale'], ['unrelated', 'latest'],
+    ])
+  })
+
   it('loads unsupported historical shapes verbatim instead of silently migrating them', () => {
     const legacy = {
       id: 'legacy', version: 1, nodes: [{
