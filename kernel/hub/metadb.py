@@ -4051,7 +4051,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         result = {
             "ok": True, "id": canvas_id, "created": True,
-            "nodeId": nodes[0]["id"] if transform is not None else None,
+            "nodeId": nodes[0]["id"] if len(nodes) == 1 else None,
             "resource": _workspace_public_placement_resource(s, placement, detached=False),
         }
         if normalized_request_id is not None and intent_sha256 is not None:
