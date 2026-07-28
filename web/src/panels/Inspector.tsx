@@ -54,11 +54,48 @@ const schemaContractStale = (kind: string, cfg: Record<string, unknown>): boolea
     && pinnedHash !== codeHash(String(contractText))
 }
 
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+function sourceDatasetRef(config: Record<string, unknown>): DatasetRef | null {
+  const value = config.datasetRef
+  if (!value || typeof value !== 'object' || Array.isArray(value) || isParameterRef(value)) return null
+  const ref = value as Record<string, unknown>
+  if (ref.kind === 'exact' && nonEmptyString(ref.datasetId) && nonEmptyString(ref.revisionId)) {
+    return value as DatasetRef
+  }
+  if (ref.kind !== 'as_of' || !nonEmptyString(ref.asOf)
+      || !ref.resolved || typeof ref.resolved !== 'object' || Array.isArray(ref.resolved)) {
+    return null
+  }
+  const resolved = ref.resolved as Record<string, unknown>
+  return resolved.selector === 'as_of'
+    && nonEmptyString(resolved.datasetId)
+    && nonEmptyString(resolved.revisionId)
+    ? value as DatasetRef
+    : null
+}
+
+function sourceDatasetParameter(config: Record<string, unknown>) {
+  const value = config.datasetRef
+  return isParameterRef(value) && nonEmptyString(value.parameterRef) ? value : null
+}
+
+function hasLocalSourceIdentity(config: Record<string, unknown>): boolean {
+  return nonEmptyString(config.registrationId)
+}
+
+function hasProviderSourceIdentity(config: Record<string, unknown>): boolean {
+  return nonEmptyString(config.providerMountId)
+    && nonEmptyString(config.providerSourceBindingId)
+}
+
 function hasBoundSourceIdentity(config: Record<string, unknown>): boolean {
-  return !!config.tableId
-    || !!config.registrationId
-    || !!config.datasetRef
-    || !!config.providerResourceRef
+  return hasLocalSourceIdentity(config)
+    || hasProviderSourceIdentity(config)
+    || sourceDatasetRef(config) !== null
+    || sourceDatasetParameter(config) !== null
 }
 
 function sourceUri(config: Record<string, unknown>): string {
@@ -778,24 +815,29 @@ function exactDetailState(error: unknown): Exclude<ExactDetailState, 'idle' | 'l
 }
 
 function sourceTable(catalog: CatalogTable[], config: Record<string, unknown>): CatalogTable | undefined {
+  const registrationId = typeof config.registrationId === 'string' ? config.registrationId : undefined
+  if (registrationId) return catalog.find((table) => table.registrationId === registrationId)
   const tableId = typeof config.tableId === 'string' ? config.tableId : undefined
   const uri = typeof config.uri === 'string' ? config.uri : ''
   return catalog.find((table) => (tableId && table.id === tableId) || table.uri === uri || table.name === uri)
 }
 
 function sourceInspectorSummary(catalog: CatalogTable[], config: Record<string, unknown>): string | null {
-  const table = sourceTable(catalog, config)
-  const datasetRef = config.datasetRef
-  const parameter = isParameterRef(datasetRef)
-  const selectedRef = datasetRef && !parameter ? datasetRef as DatasetRef : null
+  const table = hasLocalSourceIdentity(config) ? sourceTable(catalog, config) : undefined
+  const parameter = sourceDatasetParameter(config)
+  const selectedRef = sourceDatasetRef(config)
   const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
-  const provider = typeof config.providerResourceRef === 'string'
+  const provider = hasProviderSourceIdentity(config)
   const source = provider
     ? (typeof config.providerName === 'string' ? config.providerName : 'Mounted provider')
-    : 'Local catalog'
+    : hasLocalSourceIdentity(config)
+      ? 'Local catalog'
+      : 'Selected dataset'
 
   if (hasBoundSourceIdentity(config)) {
-    if (parameter) return `${source} · Run-time dataset parameter`
+    if (parameter) return hasLocalSourceIdentity(config) || provider
+      ? `${source} · Run-time dataset parameter`
+      : 'Run-time dataset parameter'
     const version = exact
       ? exact.revisionId.length > 24 ? 'Selected exact version' : `Exact version ${exact.revisionId}`
       : 'Current version'
@@ -879,20 +921,24 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   const [detailState, setDetailState] = useState<ExactDetailState>('idle')
 
   const config = (node?.data.config ?? {}) as Record<string, unknown>
-  const table = sourceTable(catalog, config)
-  const datasetRef = config.datasetRef
-  const parameter = isParameterRef(datasetRef) ? datasetRef : null
-  const selectedRef = datasetRef && !isParameterRef(datasetRef) ? datasetRef as DatasetRef : null
+  const local = hasLocalSourceIdentity(config)
+  const table = local ? sourceTable(catalog, config) : undefined
+  const parameter = sourceDatasetParameter(config)
+  const selectedRef = sourceDatasetRef(config)
   const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
-  const provider = typeof config.providerResourceRef === 'string'
+  const provider = hasProviderSourceIdentity(config)
   const providerName = typeof config.providerName === 'string' ? config.providerName : undefined
   const sourceLabel = provider
     ? (providerName ?? 'Mounted provider')
-    : hasBoundSourceIdentity(config)
+    : local
       ? 'Local catalog'
-      : sourceUri(config)
-        ? 'Manual URI'
-        : 'Not bound'
+      : parameter
+        ? 'Run-time dataset parameter'
+        : selectedRef
+          ? 'Selected dataset'
+          : sourceUri(config)
+            ? 'Manual URI'
+            : 'Not bound'
 
   useEffect(() => {
     let live = true
@@ -919,7 +965,7 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
     add('Provider resource', stringValue('providerResourceRef'))
     add('Provider mount', stringValue('providerMountId'))
     add('Provider source binding', stringValue('providerSourceBindingId'))
-  } else {
+  } else if (local) {
     add('Catalog registration', table?.registrationId ?? stringValue('registrationId') ?? table?.id)
   }
   add('Dataset location', stringValue('uri'))

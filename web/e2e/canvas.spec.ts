@@ -1985,9 +1985,17 @@ test.describe('Data Playground canvas', () => {
     }))
 
     const inspector = page.getByTestId('inspector')
+    await expect(inspector.locator('[title^="Local catalog · Current version"]')).toBeVisible()
+    await expect(inspector.getByLabel('Dataset URI')).toHaveCount(0)
+    await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
     await inspector.getByRole('button', { name: 'View data' }).click()
     await expect(page.getByText('purchase', { exact: true })).toBeVisible()
-    await inspector.getByLabel('Dataset URI').fill('another-events.parquet')
+    const source = page.locator('.react-flow__node-source')
+    await source.getByRole('button', { name: 'Change dataset' }).click()
+    const picker = page.locator('.dp-panel').filter({ has: page.getByTestId('source-search') })
+    await picker.getByTestId('source-search').fill('movies')
+    await picker.getByRole('button', { name: /^movies\b/i }).click()
+    await expect(source.getByRole('button', { name: 'Change dataset' })).toContainText('movies')
 
     await expect(page.getByRole('status')).toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()

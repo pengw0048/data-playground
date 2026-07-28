@@ -805,6 +805,63 @@ describe('Inspector — draft Source entry', () => {
     expect(details).toHaveTextContent('provider-revision-7')
   })
 
+  it.each([
+    ['exact', {
+      uri: 'file:///data/exact.csv',
+      datasetRef: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-3' },
+    }, 'Selected dataset · Exact version revision-3'],
+    ['as-of', {
+      uri: 'file:///data/as-of.csv',
+      datasetRef: {
+        kind: 'as_of', asOf: '2026-07-24T00:00:00Z',
+        resolved: {
+          datasetId: 'dataset-as-of', revisionId: 'revision-4',
+          committedAt: '2026-07-23T23:00:00Z', retentionOwner: 'provider', selector: 'as_of',
+        },
+      },
+    }, 'Selected dataset · Exact version revision-4'],
+    ['run-time parameter', {
+      uri: 'file:///data/runtime.csv',
+      datasetRef: { parameterRef: 'runtime_dataset' },
+    }, 'Run-time dataset parameter'],
+  ])('recognizes a legal %s dataset binding without transient catalog hints', (_case, config, summary) => {
+    selectSource(config)
+    render(<Inspector />)
+    expect(screen.getByTitle(summary)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['tableId only', { tableId: 'events', uri: 'file:///data/manual-input.csv' }],
+    ['stale transient hints', {
+      tableId: 'events', providerResourceRef: 'dataset:stale-placement', providerMountId: 'stale-mount',
+      uri: 'file:///data/manual-input.csv',
+    }],
+    ['providerResourceRef only', {
+      providerResourceRef: 'dataset:display-placement',
+      uri: 'file:///data/manual-input.csv',
+    }],
+  ])('does not treat %s as a bound Source identity', (_case, config) => {
+    const table: CatalogTable = {
+      id: 'events', registrationId: 'dataset:events', name: 'events',
+      uri: 'file:///workspace/events.parquet', rowCount: 2000, columns: cols,
+    }
+    selectSource(config, [table])
+    render(<Inspector />)
+    expect(screen.getByTitle('Manual URI · Delimited text')).toBeInTheDocument()
+    expect(screen.getByText('dataset uri')).toBeInTheDocument()
+    expect(screen.getByText(/CSV delimiter/)).toBeInTheDocument()
+    expect(screen.getByText('CSV header row')).toBeInTheDocument()
+    expect(screen.queryByTitle(/Current version/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Connection details'))
+    const details = screen.getByLabelText('Source connection details')
+    expect(details).toHaveTextContent('Manual URI')
+    expect(details).not.toHaveTextContent('Catalog registration')
+    expect(details).not.toHaveTextContent('Provider resource')
+  })
+
   it('keeps URI and CSV parsing controls for a manual CSV Source', () => {
     selectSource({ uri: 'file:///data/manual-input.csv', delimiter: ';', header: 'yes' })
     render(<Inspector />)
