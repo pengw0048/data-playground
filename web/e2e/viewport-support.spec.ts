@@ -318,6 +318,7 @@ test.describe('minimum viewport support', () => {
     await expect(detail.getByText('Version', { exact: true })).toBeVisible()
     await expect(detail.getByText('2 rows')).toBeVisible()
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
+    await expect(detail.getByText('114 more columns', { exact: true })).toBeVisible()
     await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
     await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })

@@ -1552,9 +1552,9 @@ describe('WorkspaceExplorer', () => {
 
     const context = await screen.findByTestId('canonical-provider-dataset-context')
     expect(within(context).getByText('column-0')).toBeVisible()
-    expect(within(context).getByText('column-24')).toBeVisible()
-    expect(within(context).queryByText('column-25')).not.toBeInTheDocument()
-    expect(context).toHaveTextContent('2 more columns')
+    expect(within(context).getByText('column-5')).toBeVisible()
+    expect(within(context).queryByText('column-6')).not.toBeInTheDocument()
+    expect(context).toHaveTextContent('21 more columns')
   })
 
   it('keeps a wide provider detail scrollable while its close and use actions stay reachable', async () => {
@@ -1583,6 +1583,7 @@ describe('WorkspaceExplorer', () => {
     const content = within(detail).getByTestId('provider-dataset-detail-content')
     expect(content).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto', 'overscroll-contain')
     expect(content).toHaveAttribute('tabindex', '0')
+    expect(within(detail).queryByLabelText('Provider dataset schema')).not.toBeInTheDocument()
     expect(within(detail).getByRole('button', { name: 'Close' })).toBeVisible()
     expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeVisible()
   })

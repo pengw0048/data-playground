@@ -19,7 +19,7 @@ const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
 const WORKSPACE_SEARCH_PAGE_SIZE = 25
 const WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS = 100
-const CANONICAL_CONTEXT_COLUMN_LIMIT = 25
+const CANONICAL_CONTEXT_COLUMN_LIMIT = 6
 const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
   id: `container:${LOCAL_ROOT_ID}`, kind: 'container', name: 'Workspace', detached: false, source: 'local',
 }
@@ -1872,7 +1872,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground"><span>{preview?.summary.rowCount == null ? 'Rows not reported' : `${preview.summary.rowCount.toLocaleString()} rows`}</span><span>· {canonicalContext.columns.length} columns</span></div>
           <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
             {canonicalContext.columns.length
-              ? <div tabIndex={0} aria-label="Provider dataset schema" className="mt-1 grid max-h-[140px] gap-0.5 overflow-y-auto overscroll-contain rounded-md border border-border p-2 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
+              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
                 {canonicalContext.columns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
                   && <div className="text-muted-foreground">{canonicalContext.columns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
               </div>
