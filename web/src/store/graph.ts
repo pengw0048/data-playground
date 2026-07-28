@@ -1752,6 +1752,21 @@ export const useStore = create<Store>((set, get) => ({
       const runs = invalidateWriteAdmissions(
         s.doc, s.runs, [id, ...stale],
       )
+      // A Source picker registration changes the durable catalog identity even when its URI stays
+      // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
+      // the next Run re-estimates against the new registration instead of caching the old refusal.
+      for (const nodeId of [id, ...stale]) {
+        const current = runs[nodeId]
+        if (current?.phase !== 'running'
+            && current?.estimate?.exactRunReadiness?.ready === false) {
+          runs[nodeId] = {
+            ...current,
+            phase: 'idle',
+            estimate: undefined,
+            error: undefined,
+          }
+        }
+      }
       return { doc: { ...s.doc, nodes, edges }, runs }
     })
   },

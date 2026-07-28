@@ -1,3 +1,5 @@
+import { copyFile, mkdir, unlink } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
@@ -1945,6 +1947,90 @@ test.describe('Data Playground canvas', () => {
     await page.getByText('Browse files…').click()
     await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
     await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
+  })
+
+  test('a post-startup local input registers and retries its formal run without restart @ux-smoke', async ({ page }) => {
+    const filename = `issue-956-${Date.now()}.parquet`
+    const uri = resolve('.e2e-workspace/outputs', filename)
+    let registration: {
+      id: string
+      registrationId: string
+      metadataRevision: string
+    } | null = null
+    let canvasId = ''
+    await mkdir(dirname(uri), { recursive: true })
+    await copyFile(resolve('.e2e-workspace/data/images.parquet'), uri)
+
+    try {
+      await fresh(page)
+      canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      await addNode(page, 'Sources & sinks', 'source')
+      const source = page.locator('.react-flow__node-source')
+      const inspector = page.getByTestId('inspector')
+      await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(uri)
+
+      const blockedEstimatePromise = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/api/run/estimate'
+        && response.request().method() === 'POST')
+      await inspector.getByRole('button', { name: 'Count rows' }).click()
+      const blockedEstimate = await blockedEstimatePromise
+      expect(blockedEstimate.ok(), await blockedEstimate.text()).toBeTruthy()
+      expect(await blockedEstimate.json()).toMatchObject({
+        exactRunReadiness: { ready: false, reason: 'registration_required' },
+      })
+
+      const runPanel = page.getByTestId('panel-run')
+      await expect(runPanel.getByLabel('Exact run readiness')).toContainText('Not exact-run-ready')
+      await expect(runPanel.getByRole('button', {
+        name: 'Exact input registration required',
+      })).toBeDisabled()
+      await runPanel.getByRole('button', { name: 'Close' }).click()
+
+      await source.getByRole('button', { name: 'Select dataset' }).click()
+      await page.getByText('Browse files…', { exact: true }).click()
+      await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+      const registrationPromise = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/api/catalog/register'
+        && response.request().method() === 'POST')
+      await page.getByText(filename, { exact: true }).click()
+      const registrationResponse = await registrationPromise
+      expect(registrationResponse.ok(), await registrationResponse.text()).toBeTruthy()
+      registration = await registrationResponse.json()
+
+      const readyEstimatePromise = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/api/run/estimate'
+        && response.request().method() === 'POST')
+      const runPromise = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/api/run'
+        && response.request().method() === 'POST')
+      await inspector.getByRole('button', { name: 'Count rows' }).click()
+      const readyEstimate = await readyEstimatePromise
+      expect(readyEstimate.ok(), await readyEstimate.text()).toBeTruthy()
+      expect(await readyEstimate.json()).toMatchObject({
+        exactRunReadiness: { ready: true, reason: 'ready' },
+      })
+      const started = await runPromise
+      expect(started.ok(), await started.text()).toBeTruthy()
+      const { runId } = await started.json() as { runId: string }
+      await expect.poll(async () => {
+        const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+        expect(response.ok(), await response.text()).toBeTruthy()
+        const status = await response.json() as { status: string; error?: string | null }
+        if (status.status === 'failed') throw new Error(status.error ?? 'formal run failed')
+        return status.status
+      }, { timeout: 20_000 }).toBe('done')
+    } finally {
+      if (registration) {
+        await page.request.delete(`/api/catalog/tables/${encodeURIComponent(registration.id)}`, {
+          params: {
+            expected_registration_id: registration.registrationId,
+            expected_revision: registration.metadataRevision,
+          },
+        })
+      }
+      if (canvasId) await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      await unlink(uri).catch(() => {})
+    }
   })
 
   test('a Workspace dataset is added to the canvas from its preserved detail surface', async ({ page }) => {

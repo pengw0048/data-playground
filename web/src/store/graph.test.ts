@@ -785,6 +785,34 @@ describe('graph store — core authority ops', () => {
 
     await useStore.getState().run('target')
     expect(apiMocks.run).not.toHaveBeenCalled()
+
+    useStore.getState().updateConfig('source', {
+      uri: '/data/post-startup.parquet',
+      tableId: 'registered-post-startup',
+    })
+    expect(useStore.getState().runs.target).toMatchObject({ phase: 'idle' })
+    expect(useStore.getState().runs.target.estimate).toBeUndefined()
+
+    apiMocks.estimate.mockResolvedValueOnce({
+      rows: 2, placement: 'local', needsConfirm: false,
+      exactRunReadiness: { ready: true, reason: 'ready', sourceNodeIds: [] },
+    })
+    await useStore.getState().requestRun('target')
+
+    expect(apiMocks.estimate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ nodes: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'source',
+          data: expect.objectContaining({
+            config: expect.objectContaining({ tableId: 'registered-post-startup' }),
+          }),
+        }),
+      ]) }),
+      'target',
+    )
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'target', false, expect.any(String),
+    )
   })
 
   it('explains why rerun all cannot start a legacy graph with no terminal sink', () => {
