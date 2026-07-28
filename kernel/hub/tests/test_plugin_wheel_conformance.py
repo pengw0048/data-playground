@@ -734,7 +734,8 @@ with TestClient(app) as client:
         "/api/run/preview", json={"graph": unavailable, "nodeId": "unavailable", "k": 10})
     assert blocked_preview.status_code == 200, blocked_preview.text
     assert blocked_preview.json()["notPreviewable"] is True
-    assert "not sample-previewable" in blocked_preview.json()["reason"]
+    assert blocked_preview.json()["suggestedAction"] == "run"
+    assert "Run this step" in blocked_preview.json()["reason"]
 
     blocked_plan = client.post(
         "/api/graph/plan", json={"graph": unavailable, "targetNodeId": "unavailable"})

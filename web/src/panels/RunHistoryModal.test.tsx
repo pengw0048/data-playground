@@ -714,9 +714,35 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" editorPreview={{ onRunUpstream }} />)
 
-    await user.click(screen.getByRole('button', { name: 'Run upstream →' }))
+    expect(screen.getByText('Run upstream to test this code')).toBeInTheDocument()
+    expect(screen.getByText('No current retained Sample result is available.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run upstream' }))
     expect(onRunUpstream).toHaveBeenCalledOnce()
     expect(screen.queryByText(/Run a full pass/)).not.toBeInTheDocument()
+  })
+
+  it('preserves connect-one-upstream guidance when the editor cannot identify an input', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row):\\n    return row',
+      }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true,
+        reason: 'No immediate upstream result can be identified. Connect one upstream output, then run it.',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{}} />)
+
+    expect(screen.getByText('Input needed to test this code')).toBeInTheDocument()
+    expect(screen.getByText(/Connect one upstream output/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run upstream' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run this step' })).not.toBeInTheDocument()
   })
 
   it('keeps unsupported binary media as raw data instead of advertising an unusable Media tab', async () => {
@@ -966,28 +992,82 @@ describe('durable full results', () => {
   })
 
   it('keeps each Section port explicitly not-previewable', async () => {
+    register({
+      kind: 'section', title: 'section', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }],
+      outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, previewable: false, blurb: '',
+      defaultData: () => ({ title: 'section', status: 'draft', config: { outputs: ['out'] }, history: [] }),
+    }, () => null)
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'section', position: { x: 0, y: 0 },
       data: { title: 'Branches', status: 'stale', config: { outputs: ['left', 'right'] }, history: [] },
     }] }
-    apiMock.preview.mockResolvedValueOnce({
-      columns: [], rows: [], truncated: false, notPreviewable: true, reason: 'right requires a full pass',
-    })
     useStore.setState({
       doc, runs: {},
       previews: { target: boundPreview(doc, 'target', {
-        columns: [], rows: [], truncated: false, notPreviewable: true, reason: 'left requires a full pass',
+        columns: [], rows: [], truncated: false, notPreviewable: true,
+        reason: 'section does not support bounded previews. Run this step to produce its result.',
+        suggestedAction: 'run',
       }, 'left') },
     } as any)
     const user = userEvent.setup()
     render(<DataPanel nodeId="target" />)
 
-    expect(screen.getByText(/left requires a full pass/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
+    expect(screen.getByText('Run this step to see results')).toBeInTheDocument()
+    expect(screen.getByText(/does not support bounded previews/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
+    expect(screen.queryByText(/left requires a full pass/i)).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'right' }))
-    expect(await screen.findByText(/right requires a full pass/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
-    expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'right')
+    expect(await screen.findByText('Run this step to see results')).toBeInTheDocument()
+    expect(screen.queryByText(/right requires a full pass/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+  })
+
+  it('preserves an actionable backend preview refusal without inventing a run action', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Unconfigured source', status: 'draft', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, reason: 'no dataset selected',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Preview unavailable')).toBeInTheDocument()
+    expect(screen.getByText('no dataset selected')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run this step' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the multi-user Python safety explanation beside its valid run action', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'Python transform', status: 'draft', config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row):\\n    return row',
+      }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true,
+        reason: 'Python previews are disabled in multi-user mode. Run this step to use an isolated, deadline-bounded process.',
+        suggestedAction: 'run',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Run this step to see results')).toBeInTheDocument()
+    expect(screen.getByText(/isolated, deadline-bounded process/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
+    expect(screen.queryByText(/needs all of its input/i)).not.toBeInTheDocument()
   })
 
   it('renders an exact grouped-chart artifact as a chart without starting another scan', async () => {
@@ -1616,7 +1696,8 @@ describe('durable full results', () => {
   it('keeps whole-dataset mode reachable when sample statistics are not previewable', async () => {
     apiMock.profile.mockResolvedValueOnce({
       columns: [], rowCount: 0, sampled: true, notPreviewable: true,
-      reason: 'sort statistics require a full pass',
+      reason: 'Sample-based statistics would be misleading for this step. Use the full dataset to profile it.',
+      suggestedAction: 'full_profile',
     })
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'sort', position: { x: 0, y: 0 },
@@ -1630,13 +1711,37 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
 
     await user.click(screen.getByRole('button', { name: 'Stats' }))
-    expect(await screen.findByText('Not sample-previewable')).toBeInTheDocument()
-    expect(screen.getByText(/switch to full dataset to estimate/i)).toBeInTheDocument()
+    expect(await screen.findByText('Use the full dataset for this profile')).toBeInTheDocument()
+    expect(screen.getByText(/sample-based statistics would be misleading/i)).toBeInTheDocument()
+    expect(screen.queryByText(/full pass/i)).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /run a full pass/i })).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'full dataset' }))
     await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
     await waitFor(() => expect(apiMock.profileEstimate).toHaveBeenCalledWith(doc, 'target', 'out'))
+  })
+
+  it('preserves an actionable sample-profile refusal when a full profile would not fix it', async () => {
+    apiMock.profile.mockResolvedValueOnce({
+      columns: [], rowCount: 0, sampled: true, notPreviewable: true,
+      reason: 'no dataset selected',
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Unconfigured source', status: 'draft', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+
+    expect(await screen.findByText('Sample profile unavailable')).toBeInTheDocument()
+    expect(screen.getByText('no dataset selected')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run this step' })).not.toBeInTheDocument()
   })
 
   it('hides Alice full-profile statistics synchronously when identity changes to Bob', async () => {

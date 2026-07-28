@@ -14,6 +14,7 @@ import json
 import re
 from collections.abc import Callable
 from types import MappingProxyType
+from typing import Literal
 
 import duckdb
 import pyarrow as pa
@@ -54,9 +55,12 @@ _TRANSFORM_KINDS = {"transform"}
 
 
 class NotPreviewable(Exception):
-    def __init__(self, node: GraphNode, reason: str):
+    def __init__(
+            self, node: GraphNode, reason: str, *,
+            suggested_action: Literal["run"] | None = None):
         self.node = node
         self.reason = reason
+        self.suggested_action = suggested_action
         super().__init__(reason)
 
 
@@ -988,13 +992,22 @@ class BuildEngine:
                     if self.sample_k is not None and not self.full and not self.reservoir_preview:
                         if not callable(preview_revision):
                             raise NotPreviewable(
-                                node, f"source adapter '{getattr(revision_adapter, 'name', type(revision_adapter).__name__)}' "
-                                "does not guarantee a bounded exact-revision preview — needs a full pass",
+                                node,
+                                "This source cannot provide a bounded preview for the selected "
+                                "version. Run this step to read it through normal execution.",
+                                suggested_action="run",
                             )
                         # The adapter-side bound is the contract. Keep this outer cap as defense in
                         # depth for a malformed adapter response, never as evidence of bounded work.
                         return preview_revision(uri, revision_id, limit=self.sample_k).limit(self.sample_k)
                     return open_revision(uri, revision_id)
+                except BoundedPreviewUnsupported as exc:
+                    raise NotPreviewable(
+                        node,
+                        "This source cannot provide a bounded preview for the selected version. "
+                        "Run this step to read it through normal execution.",
+                        suggested_action="run",
+                    ) from exc
                 except NotPreviewable:
                     raise
                 except Exception as exc:
@@ -1067,24 +1080,48 @@ class BuildEngine:
                         preview_revision = getattr(revision_adapter, "preview_revision", None)
                         if not callable(preview_revision):
                             raise NotPreviewable(
-                                node, "persisted input revision has no bounded preview capability")
+                                node,
+                                "This version cannot provide a bounded preview. Run this step to "
+                                "read it through normal execution.",
+                                suggested_action="run",
+                            )
                         return preview_revision(uri, str(revision_id), limit=int(preview_limit)).limit(
                             int(preview_limit))
                     return open_revision(uri, str(revision_id))
+                except BoundedPreviewUnsupported as exc:
+                    raise NotPreviewable(
+                        node,
+                        "This version cannot provide a bounded preview. Run this step to read it "
+                        "through normal execution.",
+                        suggested_action="run",
+                    ) from exc
+                except NotPreviewable:
+                    raise
                 except Exception as exc:  # provider retention/removal must never fall back to head
                     raise NotPreviewable(node, "persisted input revision is unavailable") from exc
             if self.sample_k is not None and not self.full and not self.reservoir_preview:
                 preview_scan = getattr(adapter, "preview_scan", None)
                 if not callable(preview_scan):
                     raise NotPreviewable(
-                        node, f"source adapter '{getattr(adapter, 'name', type(adapter).__name__)}' "
-                        "does not guarantee a bounded preview — needs a full pass",
+                        node,
+                        "This source cannot provide a bounded preview. Run this step to read it "
+                        "through normal execution.",
+                        suggested_action="run",
                     )
                 try:
                     rel = preview_scan(uri, limit=self.sample_k, **extra)
                 except BoundedPreviewUnsupported as exc:
-                    reason = "provider dataset inspection failed" if provider_inspection else str(exc)
-                    raise NotPreviewable(node, reason) from exc
+                    reason = (
+                        "provider dataset inspection failed"
+                        if provider_inspection
+                        else ("This source cannot provide a bounded preview. Run this step to read "
+                              "it through normal execution.")
+                    )
+                    raise NotPreviewable(
+                        node,
+                        reason,
+                        suggested_action=None if provider_inspection else "run",
+                    ) from exc
                 except Exception as exc:
                     if provider_inspection:
                         raise NotPreviewable(node, "provider dataset inspection failed") from exc
@@ -1111,12 +1148,20 @@ class BuildEngine:
         # can define a 0-input source/generator. Honor the plugin's declared previewable.
         if t in self.node_builders:
             if not self.full and not self._spec_previewable(t):
-                raise NotPreviewable(node, f"'{t}' is not sample-previewable — needs a full pass")
+                raise NotPreviewable(
+                    node, f"{t} does not support bounded previews. Run this step to produce its result.",
+                    suggested_action="run",
+                )
             return self.node_builders[t](self, node, inputs)
 
         if t == "section":  # composite node implemented by a driver script over contained nodes
             if not self.full:  # runs real work over its nodes — not faithful on a sample (P8)
-                raise NotPreviewable(node, "a section runs real work over its nodes — needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "A Section executes its contained steps as one unit. Run this step to produce "
+                    "its result.",
+                    suggested_action="run",
+                )
             from hub.section import run_section
             return run_section(self, node, inputs)  # {port -> Relation}: routed by _pick per edge
 
@@ -1135,7 +1180,11 @@ class BuildEngine:
             # A faithful reservoir sample must inspect the full input. Its result cardinality is bounded,
             # but its source scan is not, so only a durable full run may execute it.
             if not self.full and not self.reservoir_preview:
-                raise NotPreviewable(node, "reservoir sampling needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "Random sampling must inspect all input rows. Run this step to produce the sample.",
+                    suggested_action="run",
+                )
             src = parent
             v = self._view(src, "s")
             return db.conn().sql(f"SELECT * FROM {v} USING SAMPLE {n} ROWS (reservoir, {seed})")
@@ -1184,7 +1233,12 @@ class BuildEngine:
             # The true top-N requires an unbounded input scan unless the source exposes a dedicated
             # index-backed contract. The generic relation path has no such proof.
             if not self.full:
-                raise NotPreviewable(node, "sort needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "Sorting needs all input rows to determine the final order. Run this step to "
+                    "see the result.",
+                    suggested_action="run",
+                )
             return parent.order(by)
 
         if t == "dedup":
@@ -1216,7 +1270,11 @@ class BuildEngine:
             # A window ranks/aggregates across the complete relation. Running it over a bounded prefix
             # would lie; rebuilding its input unbounded inside preview would violate the preview budget.
             if not self.full:
-                raise NotPreviewable(node, "window needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "Window calculations need all input rows. Run this step to see the result.",
+                    suggested_action="run",
+                )
             v = self._view(parent, "w")
             return db.conn().sql(
                 f"SELECT *, {expr} OVER ({over}) AS {quote_identifier(col)} FROM {quote_identifier(v)}"
@@ -1243,7 +1301,11 @@ class BuildEngine:
             # mean/min/max impute from a whole-column aggregate. Constant/zero stay previewable because
             # they are row-local; aggregate-derived values require a durable full pass.
             if method in ("mean", "min", "max") and not self.full:
-                raise NotPreviewable(node, f"fill {method} needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    f"Filling with {method} needs the complete column. Run this step to see the result.",
+                    suggested_action="run",
+                )
             v = self._view(parent, "fl")
             repl = ", ".join(f"{_fill(c)} AS {quote_identifier(c)}" for c in cols)
             return db.conn().sql(f"SELECT * REPLACE ({repl}) FROM {quote_identifier(v)}")
@@ -1290,7 +1352,12 @@ class BuildEngine:
             if not on_col:
                 raise NotPreviewable(node, "pivot needs a column to pivot on")
             if not self.full:  # PIVOT's output columns are the DISTINCT values of on_col → a sample would
-                raise NotPreviewable(node, "pivot reshapes rows into data-dependent columns — needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "Pivot needs all input rows to determine its output columns. Run this step to "
+                    "see the result.",
+                    suggested_action="run",
+                )
             on_col = identifier(on_col, parent.columns, label="pivot column")
             group = identifier_list(cfg.get("groupBy") or "", parent.columns, label="pivot group column")
             using = using or "count(*)"
@@ -1304,7 +1371,12 @@ class BuildEngine:
         if t == "aggregate":
             if not self.full:
                 grouped = (cfg.get("groupBy") or cfg.get("group") or "").strip()
-                raise NotPreviewable(node, f"{'grouped' if grouped else 'global'} aggregate — needs a full pass (a sample would lie)")
+                raise NotPreviewable(
+                    node,
+                    f"{'Grouped' if grouped else 'Global'} aggregation needs all input rows. "
+                    "Run this step to see the result.",
+                    suggested_action="run",
+                )
             aggs = (cfg.get("aggs") or "count(*) AS n").strip()
             group = (cfg.get("groupBy") or "").strip()  # resolver canonicalizes groupBy/group → 'groupBy'
             validate_fragment(FragmentKind.AGGREGATES, aggs, con=db.conn())
@@ -1324,11 +1396,19 @@ class BuildEngine:
             # a GROUP BY / global aggregate over the 2000-row sample would present a PARTIAL result as
             # complete (the aggregate node already refuses a sample for exactly this reason) — refuse it.
             if not self.full and sql_reduces_rows(q):
-                raise NotPreviewable(node, "this SQL aggregates/reduces rows — a sample would mislead; run a full pass")
+                raise NotPreviewable(
+                    node,
+                    "This SQL query needs all input rows. Run this step to see the result.",
+                    suggested_action="run",
+                )
             # JOIN / window / QUALIFY / statement ORDER BY require complete inputs. A generic SQL
             # relation has no bounded, index-backed proof, so preview must hand this to a durable run.
             if not self.full and sql_needs_full_input(q):
-                raise NotPreviewable(node, "this SQL needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "This SQL query needs all input rows. Run this step to see the result.",
+                    suggested_action="run",
+                )
             # Expose inputs as query-scoped CTEs named input/input2/... backed by UNIQUE views,
             # so two sql nodes in one graph never clobber a shared literal 'input' view.
             wrapped = bind_input_ctes(validated, [self._view(rel) for rel in inputs])
@@ -1340,7 +1420,12 @@ class BuildEngine:
             # Joining bounded prefixes is misleading, while rebuilding both sources unbounded inside a
             # preview is unsafe. The durable run path executes the exact join.
             if not self.full:
-                raise NotPreviewable(node, "join needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "A join needs complete inputs to match rows correctly. Run this step to see "
+                    "the result.",
+                    suggested_action="run",
+                )
             a, b = self._view(inputs[0], "ja"), self._view(inputs[1], "jb")
             return db.conn().sql(join_sql(list(inputs[0].columns), list(inputs[1].columns), a, b,
                                           cfg.get("on"), cfg.get("condition"), cfg.get("how"),
@@ -1371,7 +1456,11 @@ class BuildEngine:
             # A metric reduces over every row. Even an out-of-core relational scan is unbounded work and
             # therefore belongs to the durable run lifecycle, never an interactive preview request.
             if not self.full:
-                raise NotPreviewable(node, "metric needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "This metric needs all input rows. Run this step to compute it.",
+                    suggested_action="run",
+                )
             base = parent
             if col:
                 col = identifier(col, base.columns, label="metric column")
@@ -1392,7 +1481,11 @@ class BuildEngine:
             if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
                 raise NotPreviewable(node, f"pick a Y column to {agg}")
             if agg != "none" and not self.full:
-                raise NotPreviewable(node, "grouped chart needs a full pass")
+                raise NotPreviewable(
+                    node,
+                    "This grouped chart needs all input rows. Run this step to compute its series.",
+                    suggested_action="run",
+                )
             base = parent
             x = identifier(x, base.columns, label="chart X column")
             if y:
@@ -1418,7 +1511,11 @@ class BuildEngine:
         if t == "write":
             if self.full and parent is not None:
                 return parent  # runner performs the real work / commit; here we pass through
-            raise NotPreviewable(node, "commit is all-or-nothing — needs a full pass")
+            raise NotPreviewable(
+                node,
+                "Writing is completed as one operation. Run this step to create the output.",
+                suggested_action="run",
+            )
         # any other kind reaching here is unhandled — a missing plugin or a typo. Fail closed (P0-DATA-02):
         # never silently pass the input through, which would omit the intended work yet report success.
         if t not in self.node_specs and t not in self.node_builders:
@@ -1457,7 +1554,12 @@ class BuildEngine:
             fn = sandbox.compile_operator(code, mode)
 
         if mode not in PREVIEWABLE_MODES:
-            raise NotPreviewable(node, f"transform mode '{mode}' needs a full pass")
+            raise NotPreviewable(
+                node,
+                f"Transform mode '{mode}' runs only as a complete step. Run this step to produce "
+                "its result.",
+                suggested_action="run",
+            )
 
         on_error = cfg.get("onError", "raise")
         # map_batches can hand the whole batch to the cell as a pandas DataFrame or a pyarrow Table
@@ -1570,7 +1672,11 @@ class BuildEngine:
         # has no usable index, and the generic adapter protocol cannot prove otherwise, so preview fails
         # closed instead of silently issuing an unbounded search.
         if not self.full:
-            raise NotPreviewable(node, "vector-search needs a full pass")
+            raise NotPreviewable(
+                node,
+                "Finding the nearest rows needs the complete input. Run this step to compute the result.",
+                suggested_action="run",
+            )
         src = inputs[0]
         col = identifier(col, src.columns, label="vector column")
         base = self._view(src, "vs")

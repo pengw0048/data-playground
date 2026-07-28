@@ -14,7 +14,7 @@ from hub.estimate import estimate_sizes
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.executors.preview import _reservoir_preview_allowed
 from hub.models import ColumnProfile, Graph, ProfileResult, SampleRequest, SampleResult
-from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
+from hub.plugins.adapters import BoundedPreviewUnsupported, DuckDBAdapter, LanceAdapter
 
 
 def _node(node_id: str, kind: str, config: dict | None = None) -> dict:
@@ -92,9 +92,10 @@ def test_preview_full_pass_operators_never_issue_an_unbounded_source_scan(
     nodes.append(_node("target", kind, config))
     graph = Graph(id=f"preview-boundary-{kind}", version=1, nodes=nodes, edges=edges)
 
-    with db.run_scope(), pytest.raises(NotPreviewable, match="full pass"):
+    with db.run_scope(), pytest.raises(NotPreviewable) as exc_info:
         _engine(graph, adapter).relation("target")
 
+    assert exc_info.value.suggested_action == "run"
     assert adapter.scan_limits
     assert set(adapter.scan_limits) == {7}, "preview source scans must carry the adapter limit"
     assert adapter.nearest_calls == 0
@@ -170,10 +171,11 @@ def test_remote_ipc_source_preview_refuses_before_opening_the_object_store(monke
         edges=[],
     )
 
-    with db.run_scope(), pytest.raises(NotPreviewable, match="no strict bounded preview"):
+    with db.run_scope(), pytest.raises(NotPreviewable, match="cannot provide a bounded preview") as exc:
         _engine(graph, adapter).relation("source")
 
     assert opened == []
+    assert exc.value.suggested_action == "run"
 
 
 def test_reservoir_preview_does_not_turn_a_remote_duckdb_source_into_a_full_scan() -> None:
@@ -191,19 +193,19 @@ def test_reservoir_preview_does_not_turn_a_remote_duckdb_source_into_a_full_scan
 
 
 @pytest.mark.parametrize(
-    ("uri", "reason"),
+    "uri",
     [
-        ("s3://bucket/partitioned-prefix", "object-store prefixes"),
-        ("s3://bucket/**/*.parquet", "glob sources"),
+        "s3://bucket/partitioned-prefix",
+        "s3://bucket/**/*.parquet",
     ],
 )
-def test_object_namespace_preview_refuses_before_listing(monkeypatch, uri, reason) -> None:
+def test_object_namespace_preview_refuses_before_listing(monkeypatch, uri) -> None:
     monkeypatch.setattr(
         "hub.db.ensure_object_store",
         lambda: pytest.fail("preview initialized or listed the object namespace"),
     )
 
-    with pytest.raises(NotPreviewable, match=reason):
+    with pytest.raises(NotPreviewable, match="cannot provide a bounded preview") as exc:
         graph = Graph(
             id="object-prefix-preview", version=1,
             nodes=[_node("source", "source", {"uri": uri})], edges=[],
@@ -212,6 +214,7 @@ def test_object_namespace_preview_refuses_before_listing(monkeypatch, uri, reaso
             BuildEngine(
                 graph, lambda _uri: DuckDBAdapter(), object(), sample_k=7, full=False,
             ).relation("source")
+    assert exc.value.suggested_action == "run"
 
 
 def test_local_directory_preview_refuses_before_recursive_glob(tmp_path, monkeypatch) -> None:
@@ -226,8 +229,10 @@ def test_local_directory_preview_refuses_before_recursive_glob(tmp_path, monkeyp
         nodes=[_node("source", "source", {"uri": str(directory)})], edges=[],
     )
 
-    with db.run_scope(), pytest.raises(NotPreviewable, match="directory datasets"):
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="cannot provide a bounded preview") as exc:
         _engine(graph, DuckDBAdapter()).relation("source")
+    assert exc.value.suggested_action == "run"
 
 
 def test_local_ipc_preview_fails_closed_before_opening_a_record_batch(tmp_path, monkeypatch) -> None:
@@ -242,8 +247,10 @@ def test_local_ipc_preview_fails_closed_before_opening_a_record_batch(tmp_path, 
         nodes=[_node("source", "source", {"uri": str(path)})], edges=[],
     )
 
-    with db.run_scope(), pytest.raises(NotPreviewable, match="no strict bounded preview"):
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="cannot provide a bounded preview") as exc:
         _engine(graph, DuckDBAdapter()).relation("source")
+    assert exc.value.suggested_action == "run"
 
 
 def test_adapter_without_explicit_preview_capability_fails_closed() -> None:
@@ -259,8 +266,10 @@ def test_adapter_without_explicit_preview_capability_fails_closed() -> None:
         edges=[],
     )
 
-    with db.run_scope(), pytest.raises(NotPreviewable, match="does not guarantee a bounded preview"):
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="cannot provide a bounded preview") as exc:
         _engine(graph, FullOnlyAdapter()).relation("source")
+    assert exc.value.suggested_action == "run"
 
 
 def test_exact_source_without_revision_preview_capability_fails_before_full_open(monkeypatch) -> None:
@@ -274,6 +283,9 @@ def test_exact_source_without_revision_preview_capability_fails_before_full_open
         def open_revision(self, _uri, revision_id):
             opened.append(revision_id)
             raise AssertionError("exact preview must not open the unbounded full-run relation")
+
+        def preview_revision(self, _uri, _revision_id, *, limit):
+            raise BoundedPreviewUnsupported("no bounded exact preview")
 
     graph = Graph(
         id="exact-full-only-preview", version=1,
@@ -290,11 +302,47 @@ def test_exact_source_without_revision_preview_capability_fails_before_full_open
     monkeypatch.setattr(engine_mod, "revision_adapter_for_uri", lambda *_args: ExactFullOnlyAdapter())
 
     with db.run_scope(), pytest.raises(
-            NotPreviewable, match="does not guarantee a bounded exact-revision preview"):
+            NotPreviewable, match="cannot provide a bounded preview for the selected version") as exc:
         BuildEngine(graph, lambda _uri: ExactFullOnlyAdapter(), object(), sample_k=7, full=False).relation(
             "source")
 
     assert opened == []
+    assert exc.value.suggested_action == "run"
+
+
+def test_admitted_revision_without_bounded_preview_keeps_the_run_action(monkeypatch) -> None:
+    import hub.executors.engine as engine_mod
+
+    opened: list[str] = []
+
+    class ExactFullOnlyAdapter:
+        name = "exact-full-only"
+
+        def open_revision(self, _uri, revision_id):
+            opened.append(revision_id)
+            return db.conn().from_arrow(pa.table({"value": [1]}))
+
+        def preview_revision(self, _uri, _revision_id, *, limit):
+            raise BoundedPreviewUnsupported("no bounded admitted preview")
+
+    graph = Graph(
+        id="admitted-exact-full-only-preview", version=1,
+        nodes=[_node("source", "source", {
+            "uri": "exact-full-only://dataset",
+            "_input_revision_id": "v1",
+            "_input_preview_limit": 7,
+        })],
+        edges=[],
+    )
+    monkeypatch.setattr(engine_mod, "revision_adapter_for_uri", lambda *_args: ExactFullOnlyAdapter())
+
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="cannot provide a bounded preview") as exc:
+        BuildEngine(graph, lambda _uri: ExactFullOnlyAdapter(), object(),
+                    sample_k=7, full=False).relation("source")
+
+    assert opened == []
+    assert exc.value.suggested_action == "run"
 
 
 @pytest.mark.parametrize(
@@ -538,6 +586,11 @@ def test_sample_result_accepts_empty_complete_and_unproven_short_page() -> None:
 
     unavailable = SampleResult(error=True, reason="failed")
     assert unavailable.completeness == "unknown" and unavailable.rows == []
+    actionable = SampleResult(
+        not_previewable=True, reason="requires complete input", suggested_action="run")
+    assert actionable.suggested_action == "run"
+    with pytest.raises(ValidationError, match="valid only for a preview refusal"):
+        SampleResult(suggested_action="run")
 
 
 def test_profile_result_requires_an_explicit_success_scope() -> None:
@@ -562,6 +615,12 @@ def test_profile_result_requires_an_explicit_success_scope() -> None:
     assert ProfileResult(completeness="sample", sampled=True).completeness == "sample"
     assert ProfileResult(completeness="complete", sampled=False).completeness == "complete"
     assert ProfileResult(error=True, reason="failed").completeness == "unknown"
+    actionable = ProfileResult(
+        not_previewable=True, reason="requires complete input", suggested_action="full_profile")
+    assert actionable.suggested_action == "full_profile"
+    with pytest.raises(ValidationError, match="valid only for an unavailable sample profile"):
+        ProfileResult(
+            completeness="sample", sampled=True, suggested_action="full_profile")
 
 
 def test_unknown_source_estimate_never_calls_full_count() -> None:

@@ -32,6 +32,8 @@ DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
 SampleStrategy = Literal["prefix", "reservoir"]
 SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
+SampleSuggestedAction = Literal["run"]
+ProfileSuggestedAction = Literal["full_profile"]
 MAX_SAFE_INTEGER = 2**53 - 1
 ROW_IDENTITY_FIELD_NAME_MAX = 256
 MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH = 8192
@@ -1764,6 +1766,13 @@ class SampleResult(Wire):
     not_previewable: bool = False
     error: bool = False        # a real failure (bad code / bad query), distinct from P8 not_previewable
     reason: str | None = None
+    suggested_action: SampleSuggestedAction | None = Field(
+        default=None,
+        description=(
+            "A safe user action that resolves this preview refusal. Absent when running would not "
+            "fix the current state."
+        ),
+    )
     failure_category: SampleFailureCategory | None = None
     user_code_exception: UserCodeExceptionDetail | None = None
     wire: WireType = "dataset"
@@ -1792,6 +1801,8 @@ class SampleResult(Wire):
             raise ValueError("rowLimit, limitReason, and limitScope must be provided together")
         if self.error and self.not_previewable:
             raise ValueError("a sample result cannot be both an error and not previewable")
+        if self.suggested_action is not None and not self.not_previewable:
+            raise ValueError("suggestedAction is valid only for a preview refusal")
         unavailable = self.error or self.not_previewable
         if unavailable:
             if self.completeness != "unknown":
@@ -1894,11 +1905,20 @@ class ProfileResult(Wire):
     not_previewable: bool = False
     error: bool = False
     reason: str | None = None
+    suggested_action: ProfileSuggestedAction | None = Field(
+        default=None,
+        description=(
+            "A safe next action for an unavailable sample profile. Absent when a full profile would "
+            "not resolve the current state."
+        ),
+    )
 
     @model_validator(mode="after")
     def _truthful_scope(self) -> "ProfileResult":
         if self.error and self.not_previewable:
             raise ValueError("a profile result cannot be both an error and not previewable")
+        if self.suggested_action is not None and not self.not_previewable:
+            raise ValueError("suggestedAction is valid only for an unavailable sample profile")
         unavailable = self.error or self.not_previewable
         if unavailable:
             if self.completeness != "unknown":

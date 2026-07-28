@@ -27,7 +27,8 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
         A driver script over the contained nodes. Call a node by alias: <code>run(alias, data=inputs['in'], output_port='port', **cfg)</code>;
         choose <code>output_port</code> when that child has multiple outputs;
         read a scalar with <code>value(...)</code>; <code>concat([...])</code>; return results with <code>emit(rel)</code> or,
-        for multiple output ports, <code>emit("port", rel)</code>. Loops are bounded by maxRuns. Not sample-previewable — runs on a full pass.
+        for multiple output ports, <code>emit("port", rel)</code>. Loops are bounded by maxRuns.
+        Preview is unavailable; run the Section to produce its result.
       </div>
 
       {!canEdit && <div className="rounded-md bg-muted px-2.5 py-1.5 text-[10.5px] text-muted-foreground">View-only access</div>}

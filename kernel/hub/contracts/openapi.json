@@ -8649,6 +8649,19 @@
             "title": "Sampled",
             "type": "boolean"
           },
+          "suggestedAction": {
+            "anyOf": [
+              {
+                "const": "full_profile",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A safe next action for an unavailable sample profile. Absent when a full profile would not resolve the current state.",
+            "title": "Suggestedaction"
+          },
           "targetPortId": {
             "anyOf": [
               {
@@ -11203,6 +11216,19 @@
                 "type": "null"
               }
             ]
+          },
+          "suggestedAction": {
+            "anyOf": [
+              {
+                "const": "run",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A safe user action that resolves this preview refusal. Absent when running would not fix the current state.",
+            "title": "Suggestedaction"
           },
           "truncated": {
             "default": false,

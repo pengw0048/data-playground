@@ -669,6 +669,7 @@ export interface SampleResult {
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
+  suggestedAction?: 'run' | null
   failureCategory?: 'not_previewable' | 'user_code_exception' | 'runtime_error' | null
   userCodeException?: {
     nodeId?: string | null
@@ -718,6 +719,7 @@ export interface ProfileResult {
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
+  suggestedAction?: 'full_profile' | null
 }
 
 export interface ProcessorDescriptor {

@@ -110,5 +110,6 @@ test('the installed descriptor fixture survives registration, editing, reload, a
   const unavailableNode = page.locator('.react-flow__node').filter({ hasText: 'unavailable' })
   await unavailableNode.click()
   await unavailableNode.getByRole('button', { name: 'View data' }).click()
-  await expect(page.getByText('Not sample-previewable', { exact: true })).toBeVisible()
+  await expect(page.getByText('Run this step to see results', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Run this step' })).toBeVisible()
 })

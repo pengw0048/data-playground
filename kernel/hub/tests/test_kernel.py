@@ -275,7 +275,8 @@ def test_sort_requires_a_full_run_and_preserves_exact_order():
         N("srt", "sort", {"by": "area DESC"}),
     ], "edges": [E("src", "flt"), E("flt", "sel"), E("sel", "srt")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "srt", "k": 10}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and "all input rows" in (r["reason"] or "")
+    assert r["suggestedAction"] == "run"
     _, result = _full_result(g, "srt", 10)
     assert "area" in [c["name"] for c in result["columns"]]
     areas = [row["area"] for row in result["rows"]]
@@ -475,7 +476,7 @@ def test_aggregate_not_previewable():
         N("agg", "aggregate", {"groupBy": "format", "aggs": "count(*) AS n"}),
     ], "edges": [E("src", "agg")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "agg", "k": 10}).json()
-    assert r["notPreviewable"] is True and "full pass" in r["reason"]
+    assert r["notPreviewable"] is True and r["suggestedAction"] == "run"
 
 
 def test_full_run_of_a_non_write_target_materializes_an_inspectable_result():
@@ -527,7 +528,7 @@ def test_join_and_sql():
         N("q", "sql", {"sql": "SELECT user_id, amount FROM input WHERE amount > 0"}),
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b"), E("j", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 5}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"
     _, result = _full_result(g, "q", 5)
     assert result["rows"]
 
@@ -627,7 +628,7 @@ def test_sql_groupby_preview_refuses_the_sample():
         N("q", "sql", {"sql": "SELECT event, count(*) AS n FROM input GROUP BY event"}),
     ], "edges": [E("s", "q")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 50}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")   # honest, not a partial lie
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"  # honest, not a partial lie
     # the SAME query is correct on a full run (not-previewable is a preview stance, not a run block)
     done = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "q", "confirmed": True}).json()["runId"])
     assert done["status"] == "done"
@@ -680,7 +681,7 @@ def test_sql_join_and_window_require_a_full_pass(tmp_path):
         N("q", "sql", {"sql": "SELECT a.id FROM input a JOIN input2 b USING (id)"}),
     ], "edges": [E("l", "q"), E("r", "q")]}
     res = client.post("/api/run/preview", json={"graph": g, "nodeId": "q", "k": 50}).json()
-    assert res["notPreviewable"] and "full pass" in (res["reason"] or "")
+    assert res["notPreviewable"] and res["suggestedAction"] == "run"
     _, result = _full_result(g, "q", 50)
     assert result["rowCount"] > 0, "the durable SQL join must see matching rows beyond preview prefixes"
 
@@ -699,13 +700,15 @@ def test_sql_query_scope_cte_and_aggregate_message_reflects_groupby():
         N("a", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"}),
     ], "edges": [E("s", "a")]}
     ra = client.post("/api/run/preview", json={"graph": gg, "nodeId": "a", "k": 5}).json()
-    assert ra["notPreviewable"] and "grouped" in (ra["reason"] or "")
+    assert ra["notPreviewable"] and "Grouped aggregation" in (ra["reason"] or "")
+    assert ra["suggestedAction"] == "run"
     g0 = {"id": "c", "version": 1, "nodes": [
         N("s", "source", {"uri": _uri("events")}),
         N("a", "aggregate", {"aggs": "count(*) AS n"}),
     ], "edges": [E("s", "a")]}
     r0 = client.post("/api/run/preview", json={"graph": g0, "nodeId": "a", "k": 5}).json()
-    assert r0["notPreviewable"] and "global" in (r0["reason"] or "")
+    assert r0["notPreviewable"] and "Global aggregation" in (r0["reason"] or "")
+    assert r0["suggestedAction"] == "run"
 
 
 def test_tight_memory_limit_caps_threads(monkeypatch, tmp_path):
@@ -745,14 +748,14 @@ def test_join_and_sort_preview_refuse_instead_of_scanning_full_inputs(tmp_path):
         N("j", "join", {"on": "id", "how": "inner"}),
     ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
     rj = client.post("/api/run/preview", json={"graph": gj, "nodeId": "j", "k": 50}).json()
-    assert rj["notPreviewable"] and "full pass" in (rj["reason"] or "")
+    assert rj["notPreviewable"] and rj["suggestedAction"] == "run"
     _, joined = _full_result(gj, "j", 50)
     assert joined["rowCount"] > 0
     gs = {"id": "c2", "version": 1, "nodes": [
         N("l", "source", {"uri": left}), N("s", "sort", {"by": "lval DESC"}),
     ], "edges": [E("l", "s")]}
     rs = client.post("/api/run/preview", json={"graph": gs, "nodeId": "s", "k": 5}).json()
-    assert rs["notPreviewable"] and "full pass" in (rs["reason"] or "")
+    assert rs["notPreviewable"] and rs["suggestedAction"] == "run"
     _, sorted_result = _full_result(gs, "s", 5)
     assert sorted_result["rows"][0]["lval"] == 29990
 
@@ -770,7 +773,7 @@ def test_join_on_expression_with_differing_keys(tmp_path):
         N("j", "join", {"how": "inner", "condition": "a.id = b.uid"}),
     ], "edges": [E("l", "j", None, "a"), E("r", "j", None, "b")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 50}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"
     _, result = _full_result(g, "j", 50)
     cols = [c["name"] for c in result["columns"]]
     assert cols == ["id", "name", "uid", "name_2"]  # right-side 'name' renamed → no ambiguity
@@ -1542,7 +1545,9 @@ def test_grouped_aggregate_preview_refusal_contract_is_unchanged():
     assert result["notPreviewable"] is True and result["error"] is False
     assert result["failureCategory"] == "not_previewable"
     assert result["userCodeException"] is None
-    assert result["reason"] == "grouped aggregate — needs a full pass (a sample would lie)"
+    assert result["suggestedAction"] == "run"
+    assert result["reason"] == (
+        "Grouped aggregation needs all input rows. Run this step to see the result.")
 
 
 def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
@@ -1600,7 +1605,7 @@ def test_metric_requires_a_full_run_for_its_true_value(tmp_path):
         N("m", "metric", {"agg": "count"}),
     ], "edges": [E("src", "m")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"
     _, result = _full_result(g, "m", 5)
     assert result["rows"][0]["value"] == 5000.0
 
@@ -2106,7 +2111,8 @@ def test_plugin_previewability_and_requirements_are_truthful_end_to_end():
         preview = client.post("/api/run/preview", json={"graph": restored.json(), "nodeId": "plugin", "k": 10})
         assert preview.status_code == 200
         assert preview.json()["notPreviewable"] is True
-        assert "not sample-previewable" in preview.json()["reason"]
+        assert preview.json()["suggestedAction"] == "run"
+        assert "Run this step" in preview.json()["reason"]
 
         plan = client.post("/api/graph/plan", json={"graph": restored.json(), "targetNodeId": "plugin"})
         assert plan.status_code == 200
@@ -3507,7 +3513,7 @@ def test_metric_over_transform_upstream_not_previewable():
         N("m", "metric", {"agg": "count"}),
     ], "edges": [E("src", "xf"), E("xf", "m")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "m", "k": 5}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"
 
 
 def test_agent_status_and_fallback_without_key(monkeypatch):
@@ -4441,7 +4447,7 @@ def test_vector_search_lance_ann_and_external_query(tmp_path):
     g = {"id": "cv", "version": 1, "nodes": [N("s", "source", {"uri": p}),
          N("vs", "vector-search", {"column": "embedding", "queryRow": 0, "k": 3})], "edges": [E("s", "vs")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "vs", "k": 10}).json()
-    assert r["notPreviewable"] and "full pass" in (r["reason"] or "")
+    assert r["notPreviewable"] and r["suggestedAction"] == "run"
     _, result = _full_result(g, "vs", 10)
     assert "_score" in [c["name"] for c in result["columns"]] and result["rows"][0]["id"] == 0
     # an external query vector [0,1,0,0] → row 2 is nearest (no such row was the query)
@@ -10287,8 +10293,9 @@ def test_window_fill_unnest_nodes(tmp_path):
         prev = BuildEngine(gwin, d.resolve_adapter, d.registry, sample_k=10, full=False,
                            node_specs=d.node_specs, node_builders=d.node_builders)
         from hub.executors.engine import NotPreviewable
-        with pytest.raises(NotPreviewable, match="full pass"):
+        with pytest.raises(NotPreviewable) as exc_info:
             prev.relation("w")
+        assert exc_info.value.suggested_action == "run"
 
 
 def test_pivot_unpivot_nodes(tmp_path):
@@ -11214,7 +11221,7 @@ def test_chart_node_produces_series():
         g = chart_graph(cfg)
         return client.post("/api/run/preview", json={"graph": g, "nodeId": "ch", "k": 50}).json()
     bar = chart({"chartType": "bar", "x": "event", "agg": "count"})
-    assert bar.get("notPreviewable") and "full pass" in (bar.get("reason") or "")
+    assert bar.get("notPreviewable") and bar.get("suggestedAction") == "run"
     _, grouped = _full_result(chart_graph({"chartType": "bar", "x": "event", "agg": "count"}), "ch", 50)
     assert {c["name"] for c in grouped["columns"]} == {"x", "y"}
     assert {r["x"] for r in grouped["rows"]} == {"view", "click", "purchase", "signup"}
@@ -12172,6 +12179,7 @@ def test_obsolete_source_table_alias_does_not_execute():
     assert preview.status_code == 200
     assert preview.json()["notPreviewable"] is True
     assert preview.json()["reason"] == "no dataset selected"
+    assert preview.json()["suggestedAction"] is None
 
 
 def test_resolve_config_is_the_shared_builtin_resolver():
