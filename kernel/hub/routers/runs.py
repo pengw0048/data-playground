@@ -3476,7 +3476,12 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             req.parameter_bindings,
         )
     except RunNeedsConfirm:
-        raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
+        raise APIError(
+            409,
+            "run needs confirmation (large or unknown size — a full pass)",
+            code=APIErrorCode.RUN_CONFIRMATION_REQUIRED,
+            retryable=False,
+        )
     except metadb.DurableTaskSubmissionConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     return status

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from hub.contracts.openapi import check_snapshot, render_openapi
 from hub.api_errors import APIError, APIErrorCode, classify_http_error
 from hub.main import app
+from hub.models import RunEstimate
 
 
 client = TestClient(app)
@@ -61,6 +62,26 @@ def test_invalid_graph_has_stable_error_fields():
 
     _assert_error(response, status=400, code="invalid_graph", retryable=False)
     assert "missing source node 'missing'" in response.json()["detail"]
+
+
+def test_run_confirmation_is_distinct_from_structural_conflicts(monkeypatch):
+    from hub.routers import runs
+
+    def needs_confirmation(*_args, **_kwargs):
+        raise runs.RunNeedsConfirm(RunEstimate(placement="local", needs_confirm=True))
+
+    monkeypatch.setattr(runs, "start_run", needs_confirmation)
+    request = {"graph": {"id": "contract-run", "version": 1, "nodes": [], "edges": []}}
+    confirmation = client.post("/api/run", json=request)
+    _assert_error(confirmation, status=409, code="run_confirmation_required", retryable=False)
+
+    def structural_conflict(*_args, **_kwargs):
+        raise HTTPException(409, "linear checkpoint tasks require exactly Source -> Select(checkpoint) -> Write")
+
+    monkeypatch.setattr(runs, "start_run", structural_conflict)
+    conflict = client.post("/api/run", json=request)
+    _assert_error(conflict, status=409, code="conflict", retryable=False)
+    assert conflict.json()["detail"].startswith("linear checkpoint tasks require")
 
 
 def test_unauthenticated_request_has_stable_error_fields(monkeypatch):

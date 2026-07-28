@@ -19,6 +19,7 @@
           "canvas_not_found",
           "method_not_allowed",
           "conflict",
+          "run_confirmation_required",
           "retained_upstream_stale",
           "retained_upstream_unavailable",
           "retained_upstream_expired",

@@ -18,7 +18,7 @@ import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { CatalogTable, DatasetRevisionDetail, JoinAnalysis, JoinSuggestion } from '../types/api'
 import { serializeJoinKeys } from '../nodes/joinKeys'
-import { datasetRefIdentity, isParameterRef, type ColumnSchema, type DatasetRef } from '../types/graph'
+import { datasetRefIdentity, isParameterRef, type CanvasDoc, type ColumnSchema, type DatasetRef } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -439,18 +439,45 @@ function CodeBtn({ icon, label, onClick, disabled }: { icon: IconName; label: st
   )
 }
 
+export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boolean {
+  const checkpoint = doc.nodes.find((node) => node.id === nodeId)
+  if (!checkpoint || checkpoint.type !== 'select' || doc.nodes.length !== 3 || doc.edges.length !== 2) return false
+  const otherCheckpoint = doc.nodes.some((node) =>
+    node.id !== nodeId && (node.data.config as Record<string, unknown>)?.checkpoint === true)
+  if (otherCheckpoint) return false
+  const source = doc.nodes.find((node) => node.type === 'source')
+  const write = doc.nodes.find((node) => node.type === 'write')
+  if (!source || !write || [source, checkpoint, write].some((node) => node.data.bypassed || node.data.disabled)) return false
+  const selectIn = doc.edges.find((edge) => edge.target === checkpoint.id)
+  const writeIn = doc.edges.find((edge) => edge.target === write.id)
+  return selectIn?.source === source.id
+    && writeIn?.source === checkpoint.id
+    && (selectIn.sourceHandle == null || selectIn.sourceHandle === 'out')
+    && (selectIn.targetHandle == null || selectIn.targetHandle === 'in')
+    && (writeIn.sourceHandle == null || writeIn.sourceHandle === 'out')
+    && (writeIn.targetHandle == null || writeIn.targetHandle === 'in')
+}
+
 function CheckpointToggle({ nodeId }: { nodeId: string }) {
+  const doc = useStore((s) => s.doc)
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const on = !!(node?.data.config as Record<string, unknown>)?.checkpoint
+  const available = canEnableLinearCheckpoint(doc, nodeId)
+  const disabled = !available && !on
   return (
     <Section title="Materialization">
-      <button data-testid="checkpoint-toggle" onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
-        className="flex w-full items-start gap-2 rounded-md border border-border px-2.5 py-2 text-left hover:bg-accent">
+      <button data-testid="checkpoint-toggle" disabled={disabled}
+        onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
+        className="flex w-full items-start gap-2 rounded-md border border-border px-2.5 py-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
         <span className={cn('mt-[3px] h-2.5 w-2.5 shrink-0 rounded-full', on ? 'bg-primary' : 'border border-muted-foreground')} />
         <span className="min-w-0 flex-1">
           <span className="block text-[11.5px] font-medium text-foreground">{on ? 'Checkpointed' : 'Checkpoint here'}</span>
-          <span className="mt-0.5 block text-[10.5px] leading-snug text-muted-foreground">{on ? 'Output materialized — inspectable and reused across runs.' : 'Materialize this step’s output.'}</span>
+          <span className="mt-0.5 block text-[10.5px] leading-snug text-muted-foreground">
+            {on ? 'Output materialized — inspectable and reused across runs.'
+              : available ? 'Materialize this step’s output.'
+                : 'Checkpoints are available only for Source → Select → Write.'}
+          </span>
         </span>
       </button>
     </Section>
