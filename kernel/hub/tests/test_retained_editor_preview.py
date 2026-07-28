@@ -93,6 +93,19 @@ def _wait(run_id: str) -> dict:
     pytest.fail(f"run {run_id} did not finish")
 
 
+def _wait_for_history_projection(run_id: str) -> None:
+    """Terminal operational state may commit before its asynchronous history row."""
+    for _ in range(200):
+        with metadb.session() as session:
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(
+                    metadb.RunRecord.run_id == run_id))
+            if record is not None:
+                return
+        time.sleep(0.05)
+    pytest.fail(f"run {run_id} did not reach projected history")
+
+
 @contextmanager
 def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     lance = pytest.importorskip("lance")
@@ -132,6 +145,7 @@ def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     assert started.status_code == 200, started.text
     status = _wait(started.json()["runId"])
     assert status["status"] == "done", status
+    _wait_for_history_projection(status["runId"])
     output = status["outputs"][0]
     assert output["nodeId"] == "sample" and output["portId"] == "out"
     try:
