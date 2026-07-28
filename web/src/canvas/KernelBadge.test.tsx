@@ -9,6 +9,10 @@ const mocks = vi.hoisted(() => ({
     doc: { id: 'canvas-1' },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
     runs: {} as Record<string, { phase: string }>,
+    previews: {} as Record<string, {
+      canvasId: string; nodeId: string; portId?: string; requestGeneration: number
+      result?: { error?: string; notPreviewable?: boolean }
+    }>,
   },
 }))
 
@@ -33,6 +37,7 @@ describe('KernelBadge', () => {
     vi.clearAllMocks()
     mocks.state.canvasRole = 'owner'
     mocks.state.doc.id = 'canvas-1'
+    mocks.state.previews = {}
     mocks.restartKernel.mockResolvedValue({ ok: true, restarted: true })
   })
 
@@ -79,6 +84,39 @@ describe('KernelBadge', () => {
     await waitFor(() => expect(mocks.restartKernel).toHaveBeenCalledWith('canvas-1'))
     await waitFor(() => expect(mocks.kernelState).toHaveBeenCalled())  // refresh after restart
     expect(mocks.pushToast).toHaveBeenCalledWith(expect.stringContaining('restarting'), 'success')
+  })
+
+  it('refreshes authoritative kernel state when a current-canvas preview succeeds', async () => {
+    mocks.kernelState.mockResolvedValue({ exists: false })
+    const { rerender } = render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+    const badge = await screen.findByTestId('kernel-badge')
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    mocks.kernelState.mockClear()
+
+    mocks.kernelState.mockResolvedValue({ exists: true, state: 'ready', stale: false })
+    mocks.state.previews = {
+      source: { canvasId: 'canvas-1', nodeId: 'source', requestGeneration: 1, result: {} },
+    }
+    rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+
+    await waitFor(() => expect(mocks.kernelState).toHaveBeenCalledWith('canvas-1'))
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
+  })
+
+  it('does not refresh or fabricate warmth after a failed preview', async () => {
+    mocks.kernelState.mockResolvedValue({ exists: false })
+    const { rerender } = render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+    const badge = await screen.findByTestId('kernel-badge')
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    mocks.kernelState.mockClear()
+
+    mocks.state.previews = {
+      source: { canvasId: 'canvas-1', nodeId: 'source', requestGeneration: 1, result: { error: 'preview failed' } },
+    }
+    rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
+
+    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    expect(mocks.kernelState).not.toHaveBeenCalled()
   })
 
   it('disables Restart on a view-only canvas', async () => {
