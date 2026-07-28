@@ -23,6 +23,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A newer commit makes the older validation result unusable for the same PR. Release callers use
+  # an immutable candidate and therefore receive an isolated group instead of sharing the branch ref.
+  group: ci-${{ github.event_name == 'workflow_call' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   kernel-shards:
     # One isolated pytest process per shard, each on its own runner instead of three processes

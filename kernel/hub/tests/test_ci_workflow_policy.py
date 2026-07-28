@@ -285,6 +285,17 @@ def test_release_reuses_core_checks_at_the_candidate_revision() -> None:
                     assert step["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
 
 
+def test_ci_cancels_only_superseded_pull_request_heads() -> None:
+    concurrency = _workflow("ci.yml")["concurrency"]
+    assert concurrency == {
+        "group": (
+            "ci-${{ github.event_name == 'workflow_call' && github.run_id || "
+            "github.event.pull_request.number || github.ref }}"
+        ),
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+    }
+
+
 def test_release_workflow_requires_a_clean_version_identity() -> None:
     commands = [step.get("run", "") for step in _workflow("release.yml")["jobs"]["publish"]["steps"]]
     release_checks = [command for command in commands if "check_release_versions.py" in command]
