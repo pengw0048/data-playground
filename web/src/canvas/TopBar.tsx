@@ -169,7 +169,7 @@ function PeerAvatars() {
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
-function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onWorkspace: () => void; onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
+export function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onWorkspace: () => void; onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
   const inboxQuery = useStore((s) => s.inboxQuery)
@@ -194,9 +194,9 @@ function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistory, onIm
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
         {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="all Workspace work" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setInboxQuery(inboxQuery)}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my terminal outcomes" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> <MenuDestination label="Run history" detail="this Canvas audit trail" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setInboxQuery(inboxQuery)}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my background task results" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> <MenuDestination label="Run history" detail="runs from this Canvas" /></DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
