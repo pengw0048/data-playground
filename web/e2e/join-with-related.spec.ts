@@ -3,6 +3,8 @@ import { resolve } from 'node:path'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
+const dialogName = 'Find related data or possible key matches'
+const leftInputTrigger = 'Related / possible key matches · left'
 
 type Table = {
   id: string
@@ -22,7 +24,15 @@ async function catalogTable(request: APIRequestContext, query: string): Promise<
   return table
 }
 
-async function seedSourceCanvas(page: Page, canvasId: string, table: Table) {
+async function seedSourceCanvas(
+  page: Page,
+  canvasId: string,
+  table: Table,
+  includeBystander = false,
+) {
+  const sourceConfig = {
+    uri: table.uri, tableId: table.id, registrationId: table.registrationId,
+  }
   const response = await page.request.post('/api/canvas', { data: {
     id: canvasId,
     name: 'Join with related E2E',
@@ -35,14 +45,24 @@ async function seedSourceCanvas(page: Page, canvasId: string, table: Table) {
         title: table.name,
         status: 'draft',
         history: [],
-        config: { uri: table.uri, tableId: table.id, registrationId: table.registrationId },
+        config: sourceConfig,
       },
-    }],
+    }, ...(includeBystander ? [{
+      id: 'bystander-source',
+      type: 'source',
+      position: { x: 520, y: 180 },
+      data: {
+        title: `${table.name} copy`,
+        status: 'draft',
+        history: [],
+        config: sourceConfig,
+      },
+    }] : [])],
     edges: [],
   } })
   expect(response.ok()).toBeTruthy()
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
-  await expect(page.locator('.react-flow__node')).toHaveCount(1)
+  await expect(page.locator('.react-flow__node')).toHaveCount(includeBystander ? 2 : 1)
   await expect(page.getByTestId('join-with-related-selected-source')).toHaveCount(0)
   await expect(page.getByTestId('join-with-related-canvas-selected-source')).toBeVisible()
 }
@@ -82,7 +102,7 @@ async function seedOneSidedJoinCanvas(page: Page, canvasId: string, table: Table
   await expect(page.locator('.react-flow__node')).toHaveCount(2)
   await expect(page.getByTestId('join-with-related-empty-join')).toHaveCount(0)
   await expect(page.getByTestId('join-with-related-canvas-empty-join'))
-    .toHaveAccessibleName('Join with related data on left input')
+    .toHaveAccessibleName(leftInputTrigger)
 }
 
 async function unregisterTable(request: APIRequestContext, table: { id: string, registrationId?: string, metadataRevision?: string }) {
@@ -93,7 +113,7 @@ async function unregisterTable(request: APIRequestContext, table: { id: string, 
   } })
 }
 
-test.describe('Join with related data', () => {
+test.describe('Related data and possible key matches', () => {
   test('an open related-data dialog blocks the Canvas Delete shortcut', async ({ page }) => {
     const source = await catalogTable(page.request, 'events')
     const canvasId = `join-related-modal-${Date.now()}`
@@ -102,7 +122,7 @@ test.describe('Join with related data', () => {
       await page.locator('.react-flow__node[data-id="selected-source"]').click()
       await expect(page.getByTestId('join-with-related-selected-source')).toBeVisible()
       await page.getByTestId('join-with-related-canvas-selected-source').click()
-      const dialog = page.getByRole('dialog', { name: 'Join with related data' })
+      const dialog = page.getByRole('dialog', { name: dialogName })
       await expect(dialog).toBeVisible()
       await dialog.getByRole('button', { name: 'Cancel', exact: true }).focus()
       await page.keyboard.press('Delete')
@@ -113,6 +133,37 @@ test.describe('Join with related data', () => {
       expect(unchanged.version).toBe(1)
       expect(unchanged.nodes).toHaveLength(1)
       await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
+  test('modal interactions preserve the Canvas selection behind the portal at 1280x720', async ({ page }) => {
+    const source = await catalogTable(page.request, 'events')
+    const canvasId = `join-related-selection-${Date.now()}`
+    try {
+      await seedSourceCanvas(page, canvasId, source, true)
+      const selectedSource = page.locator('.react-flow__node[data-id="selected-source"]')
+      const bystander = page.locator('.react-flow__node[data-id="bystander-source"]')
+      await bystander.click()
+      await expect(bystander).toHaveClass(/selected/)
+      await expect(selectedSource).not.toHaveClass(/selected/)
+
+      await page.getByTestId('join-with-related-canvas-selected-source').click()
+      const dialog = page.getByRole('dialog', { name: dialogName })
+      await expect(dialog).toBeVisible()
+      await expect(bystander).toHaveClass(/selected/)
+      await expect(selectedSource).not.toHaveClass(/selected/)
+
+      await dialog.getByPlaceholder('Dataset, column, tag…').fill('images')
+      await expect(dialog.getByPlaceholder('Dataset, column, tag…')).toHaveValue('images')
+      await expect(bystander).toHaveClass(/selected/)
+      await expect(selectedSource).not.toHaveClass(/selected/)
+
+      await page.locator('.dp-modal-overlay').click({ position: { x: 2, y: 2 } })
+      await expect(dialog).toBeHidden()
+      await expect(bystander).toHaveClass(/selected/)
+      await expect(selectedSource).not.toHaveClass(/selected/)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }
@@ -136,11 +187,17 @@ test.describe('Join with related data', () => {
     try {
       await seedSourceCanvas(page, canvasId, left)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
+      const dialog = page.getByRole('dialog', { name: dialogName })
+      await expect(dialog).toContainText('declared or reference-backed relationships and possible key matches')
       await expect(page.getByRole('heading', { name: 'Related data', exact: true })).toBeVisible()
-      await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
+      const declaredCard = page.getByRole('button', { name: new RegExp(right.name, 'i') })
+      await expect(declaredCard).toContainText('Persisted catalog relationship')
+      await expect(declaredCard).not.toContainText('No relationship is declared')
+      await declaredCard.click()
       await expect(page.getByText('Selected dataset')).toBeVisible()
       await expect(page.getByText('Related dataset', { exact: true })).toBeVisible()
       await expect(page.getByText('Persisted catalog relationship')).toBeVisible()
+      await expect(page.getByTestId('possible-key-match-review')).toHaveCount(0)
       await page.getByRole('button', { name: 'Cancel', exact: true }).click()
 
       const cancelled = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
@@ -149,6 +206,52 @@ test.describe('Join with related data', () => {
       expect(cancelled.edges).toHaveLength(0)
     } finally {
       await page.request.post('/api/catalog/relationships/delete', { data: relation })
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
+  test('typed-reference candidates retain the strong related-data treatment in the browser', async ({ page }) => {
+    const source = await catalogTable(page.request, 'events')
+    const target = await catalogTable(page.request, 'images')
+    const canvasId = `join-reference-${Date.now()}`
+    await page.route('**/api/catalog/related-datasets', async (route) => {
+      const response = await route.fetch()
+      const body = await response.json() as {
+        candidates?: Array<Record<string, unknown>>
+        possibleMatches?: Array<Record<string, unknown>>
+      }
+      const candidates = [...(body.candidates ?? []), ...(body.possibleMatches ?? [])]
+      const seed = candidates.find((item) => item.name === target.name)
+      if (!seed) {
+        await route.fulfill({ response })
+        return
+      }
+      await route.fulfill({ response, json: {
+        ...body,
+        candidates: [{
+          ...seed,
+          evidence: 'typed_reference',
+          evidenceStatus: 'proven',
+          confidence: 'verified',
+          reason: `events.id has a typed reference to ${target.name}`,
+        }],
+        possibleMatches: [],
+      } })
+    })
+    try {
+      await seedSourceCanvas(page, canvasId, source)
+      await page.getByTestId('join-with-related-canvas-selected-source').click()
+      await page.getByPlaceholder('Dataset, column, tag…').fill(target.name)
+      const referenceCard = page.getByRole('button', { name: new RegExp(target.name, 'i') })
+      await expect(referenceCard).toContainText('Declared key/reference')
+      await expect(referenceCard).not.toContainText('No relationship is declared')
+      await expect(page.getByRole('heading', { name: 'Related data', exact: true })).toBeVisible()
+      await referenceCard.click()
+      await expect(page.getByText('Related dataset', { exact: true })).toBeVisible()
+      await expect(page.getByText('Declared key/reference')).toBeVisible()
+      await expect(page.getByTestId('possible-key-match-review')).toHaveCount(0)
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+    } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }
   })
@@ -232,7 +335,7 @@ test.describe('Join with related data', () => {
       await expect(page.getByTestId('join-with-related-empty-join')).toHaveCount(0)
       await page.getByPlaceholder('Dataset, column, tag…').fill(target.name)
       await page.getByRole('button', { name: new RegExp(target.name, 'i') }).click()
-      const review = page.getByRole('dialog', { name: 'Join with related data' })
+      const review = page.getByRole('dialog', { name: dialogName })
       await expect(review.getByText('a.id = b.user_id')).toBeVisible()
       await expect(review.getByText('N:1', { exact: true })).toBeVisible()
       await review.getByLabel('Join type').selectOption('left')
@@ -272,7 +375,8 @@ test.describe('Join with related data', () => {
       await page.getByTestId('join-with-related-canvas-selected-source').click()
       const search = page.getByPlaceholder('Dataset, column, tag…')
       await search.fill(`definitely-no-related-${Date.now()}`)
-      await expect(page.getByTestId('related-no-results')).toBeVisible()
+      await expect(page.getByTestId('related-no-results'))
+        .toHaveText('No related data or possible key matches in this search/folder scope.')
       const unchanged = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
       expect(unchanged.version).toBe(1)
       expect(unchanged.nodes).toHaveLength(1)
@@ -292,10 +396,21 @@ test.describe('Join with related data', () => {
       await page.getByTestId('join-with-related-canvas-selected-source').click()
       await page.getByPlaceholder('Dataset, column, tag…').fill(target.name)
       await expect(page.getByRole('heading', { name: 'Related data' })).toHaveCount(0)
-      await page.getByRole('button', { name: /Show possible matches/ }).click()
-      await expect(page.getByText('Possible matches')).toBeVisible()
-      await page.getByRole('button', { name: new RegExp(target.name, 'i') }).click()
-      await expect(page.getByText('Possible match', { exact: true })).toBeVisible()
+      await page.getByRole('button', { name: /Show possible key matches/ }).click()
+      await expect(page.getByRole('heading', { name: 'Possible key matches', exact: true })).toBeVisible()
+      await expect(page.getByText(/No relationship is declared.*Matching key names only/)).toBeVisible()
+      const targetCard = page.getByRole('button', { name: new RegExp(target.name, 'i') })
+      await expect(targetCard.getByText('Possible key match', { exact: true })).toBeVisible()
+      await expect(targetCard.getByText('No relationship is declared.')).toBeVisible()
+      await expect(targetCard.getByText(/Matching key names only/)).toBeVisible()
+      const cardinality = targetCard.locator('span.self-center')
+      await expect(cardinality).toHaveClass(/bg-muted/)
+      await expect(cardinality).not.toHaveClass(/bg-green-100/)
+      await targetCard.click()
+      await expect(page.getByText('Possible key match', { exact: true })).toBeVisible()
+      await expect(page.getByTestId('possible-key-match-review')).toContainText('No relationship is declared')
+      await expect(page.getByTestId('possible-key-match-review'))
+        .toContainText('Cardinality describes row matching, not relationship confidence')
       await page.getByRole('button', { name: 'Cancel', exact: true }).click()
       const unchanged = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
       expect(unchanged.version).toBe(1)

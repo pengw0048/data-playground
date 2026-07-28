@@ -30,6 +30,11 @@ vi.mock('../api/client', () => ({
 
 import { JoinWithRelated } from './JoinWithRelated'
 
+const inspectorTrigger = 'Related data / possible key matches…'
+const canvasTrigger = 'Related data / possible key matches'
+const leftInputTrigger = 'Related / possible key matches · left'
+const dialogName = 'Find related data or possible key matches'
+
 const page = {
   source: { kind: 'local', registrationId: 'reg-events', revisionMode: 'current' },
   sourceName: 'events',
@@ -83,11 +88,11 @@ describe('JoinWithRelated', () => {
 
   it('separates evidence, keeps unknown explicit, and cancellation mutates nothing', async () => {
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
-    expect(screen.queryByText('Possible matches')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
-    expect(screen.getByText('Possible matches')).toBeVisible()
+    expect(screen.queryByText('Possible key matches')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
+    expect(screen.getByText('Possible key matches')).toBeVisible()
     expect(screen.getByText(/Results are truncated/)).toBeVisible()
 
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
@@ -98,6 +103,58 @@ describe('JoinWithRelated', () => {
     expect(mocks.loadDoc).not.toHaveBeenCalled()
   })
 
+  it('keeps declared and reference-backed relationships strong while making name-only matches explicit and neutral', async () => {
+    const declaredCandidate = {
+      ...page.candidates[0],
+      identity: { kind: 'local', registrationId: 'reg-accounts', revisionMode: 'current' },
+      name: 'accounts',
+      reason: 'Persisted by a catalog owner',
+      evidence: 'declared_relationship',
+    }
+    mocks.related.mockResolvedValueOnce({
+      ...page,
+      candidates: [declaredCandidate, page.candidates[0]],
+      possibleMatches: [{ ...page.possibleMatches[0], cardinality: '1:1' }],
+      truncated: false,
+      refinementRequired: false,
+    })
+
+    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
+    const dialog = await screen.findByRole('dialog', { name: dialogName })
+    expect(within(dialog).getByText(/declared or reference-backed relationships and possible key matches/))
+      .toBeVisible()
+
+    const declaredCard = within(dialog).getByRole('button', { name: /accounts/ })
+    expect(within(declaredCard).getByText(/Persisted catalog relationship/)).toBeVisible()
+    expect(within(declaredCard).queryByText(/No relationship is declared/)).toBeNull()
+    const referenceCard = within(dialog).getByRole('button', { name: /users/ })
+    expect(within(referenceCard).getByText(/Declared key\/reference/)).toBeVisible()
+    expect(within(referenceCard).queryByText(/No relationship is declared/)).toBeNull()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Show possible key matches (1)' }))
+    expect(within(dialog).getByText('Possible key matches')).toBeVisible()
+    expect(within(dialog).getByText(/Matching key names only suggest where a join may be possible/))
+      .toBeVisible()
+    const possibleCard = within(dialog).getByRole('button', { name: /orders/ })
+    expect(possibleCard).toHaveClass('border-dashed', 'bg-muted/20')
+    expect(within(possibleCard).getByText('Possible key match', { exact: true })).toBeVisible()
+    expect(within(possibleCard).getByText('No relationship is declared.')).toBeVisible()
+    expect(within(possibleCard).getByText(/Matching key names only/)).toBeVisible()
+    const possibleCardinality = within(possibleCard).getByText('1:1', { exact: true })
+    expect(possibleCardinality).toHaveClass('bg-muted', 'text-muted-foreground')
+    expect(possibleCardinality).not.toHaveClass('bg-green-100')
+
+    fireEvent.click(possibleCard)
+    const review = screen.getByTestId('possible-key-match-review')
+    expect(review).toHaveTextContent('No relationship is declared')
+    expect(review).toHaveTextContent('Cardinality describes row matching, not relationship confidence')
+    expect(within(dialog).getByText('Possible key match', { exact: true })).toBeVisible()
+    const reviewedCardinality = within(dialog).getByText('1:1', { exact: true })
+    expect(reviewedCardinality).toHaveClass('bg-muted', 'text-muted-foreground')
+    expect(reviewedCardinality).not.toHaveClass('bg-green-100')
+  })
+
   it('removes stale possible matches while a scoped search is pending', async () => {
     let resolveFiltered!: (value: typeof page) => void
     mocks.related
@@ -105,9 +162,9 @@ describe('JoinWithRelated', () => {
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFiltered = resolve }))
 
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
-    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
     expect(screen.getByRole('button', { name: /orders/ })).toBeVisible()
 
     fireEvent.change(screen.getByPlaceholderText('Dataset, column, tag…'), {
@@ -122,10 +179,10 @@ describe('JoinWithRelated', () => {
       candidates: [],
       possibleMatches: [{ ...page.possibleMatches[0], name: 'images' }],
     })
-    const disclosure = await screen.findByRole('button', { name: 'Show possible matches (1)' })
+    const disclosure = await screen.findByRole('button', { name: 'Show possible key matches (1)' })
     fireEvent.click(disclosure)
     fireEvent.click(screen.getByRole('button', { name: /images/ }))
-    expect(screen.getByText('Possible match', { exact: true })).toBeVisible()
+    expect(screen.getByText('Possible key match', { exact: true })).toBeVisible()
   })
 
   it('does not disclose stale possible matches while a filtered search is still debouncing', async () => {
@@ -136,13 +193,13 @@ describe('JoinWithRelated', () => {
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFiltered = resolve }))
 
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await waitFor(() => expect(mocks.related).toHaveBeenCalledTimes(1))
     fireEvent.change(screen.getByPlaceholderText('Dataset, column, tag…'), { target: { value: 'images' } })
     resolveInitial(page)
     await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
 
-    expect(screen.queryByRole('button', { name: 'Show possible matches (1)' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Show possible key matches (1)' })).toBeNull()
     expect(screen.queryByRole('button', { name: /orders/ })).toBeNull()
     await waitFor(() => expect(mocks.related).toHaveBeenCalledTimes(2))
     resolveFiltered({
@@ -150,16 +207,16 @@ describe('JoinWithRelated', () => {
       candidates: [],
       possibleMatches: [{ ...page.possibleMatches[0], name: 'images' }],
     })
-    fireEvent.click(await screen.findByRole('button', { name: 'Show possible matches (1)' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Show possible key matches (1)' }))
     fireEvent.click(screen.getByRole('button', { name: /images/ }))
-    expect(screen.getByText('Possible match', { exact: true })).toBeVisible()
+    expect(screen.getByText('Possible key match', { exact: true })).toBeVisible()
   })
 
   it('shows measured cardinality evidence without stale unmeasured copy', async () => {
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
-    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
 
     expect(screen.getByText('Matching key columns')).toBeVisible()
     expect(screen.getByText(/Measured across both current dataset versions/)).toBeVisible()
@@ -183,10 +240,10 @@ describe('JoinWithRelated', () => {
 
     render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
     fireEvent.click(screen.getByRole('button', {
-      name: 'Join with related data on left input',
+      name: leftInputTrigger,
     }))
     await screen.findByText('Related data')
-    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
 
     const candidate = screen.getByRole('button', { name: /orders/ })
     expect(within(candidate).getByText('N:1', { exact: true })).toBeVisible()
@@ -205,7 +262,7 @@ describe('JoinWithRelated', () => {
       version: 5,
     })
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     fireEvent.click(screen.getByTestId('confirm-related-join'))
@@ -224,8 +281,9 @@ describe('JoinWithRelated', () => {
   it('shows a healthy no-result state separately from provider failure', async () => {
     mocks.related.mockResolvedValueOnce({ ...page, candidates: [], possibleMatches: [], truncated: false, refinementRequired: false })
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    expect(await screen.findByTestId('related-no-results')).toHaveTextContent('No known relationships')
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
+    expect(await screen.findByTestId('related-no-results'))
+      .toHaveTextContent('No related data or possible key matches')
     expect(mocks.confirm).not.toHaveBeenCalled()
   })
 
@@ -239,7 +297,7 @@ describe('JoinWithRelated', () => {
       cardinalityReason: 'Fan-out was not measured because this join uses an exact revision; measuring it would require scanning the pinned dataset.',
     })
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
@@ -253,7 +311,7 @@ describe('JoinWithRelated', () => {
   it('keeps a failed exact choice selected and cannot confirm the current candidate by mistake', async () => {
     mocks.reviewRevision.mockRejectedValueOnce(new Error('revision rev-2 is unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
@@ -281,7 +339,7 @@ describe('JoinWithRelated', () => {
     mocks.confirm.mockRejectedValueOnce(new Error('dataset revision changed'))
     mocks.related.mockResolvedValueOnce(page).mockResolvedValueOnce(refreshed)
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
@@ -300,7 +358,7 @@ describe('JoinWithRelated', () => {
   it('keeps the current candidate confirmable when revision history is unavailable', async () => {
     mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByText('Version history is unavailable for this dataset.')
@@ -310,7 +368,7 @@ describe('JoinWithRelated', () => {
   it('keeps opaque bindings and diagnostic codes out of the default review', async () => {
     mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByText('Version history is unavailable for this dataset.')
@@ -338,7 +396,7 @@ describe('JoinWithRelated', () => {
       cardinality: 'unknown', confidence: 'inferred',
     })
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
@@ -353,7 +411,7 @@ describe('JoinWithRelated', () => {
 
   it('closes with Escape and restores focus to the opener', async () => {
     render(<JoinWithRelated nodeId="source-1" />)
-    const opener = screen.getByRole('button', { name: 'Join with…' })
+    const opener = screen.getByRole('button', { name: inspectorTrigger })
     fireEvent.click(opener)
     await screen.findByText('Related data')
     fireEvent.keyDown(document, { key: 'Escape' })
@@ -363,9 +421,9 @@ describe('JoinWithRelated', () => {
 
   it('uses the Canvas modal shortcut-isolation contract and ignores Delete', async () => {
     render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with related data' }))
+    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
     await screen.findByText('Related data')
-    const dialog = screen.getByRole('dialog', { name: 'Join with related data' })
+    const dialog = screen.getByRole('dialog', { name: dialogName })
     expect(dialog.parentElement).toHaveClass('dp-modal-overlay')
     const cancel = screen.getByRole('button', { name: 'Cancel', exact: true })
     cancel.focus()
@@ -380,7 +438,7 @@ describe('JoinWithRelated', () => {
       kind: 'exact', datasetId: 'reg-events', revisionId: 'source-v4',
     }
     render(<JoinWithRelated nodeId="source-1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await waitFor(() => expect(mocks.related).toHaveBeenCalledWith(
       expect.objectContaining({ revisionMode: 'exact', revisionId: 'source-v4' }), expect.any(Object),
     ))
@@ -388,7 +446,7 @@ describe('JoinWithRelated', () => {
 
   it('offers the Canvas action only for a canonical Source binding', () => {
     const { unmount } = render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    expect(screen.getByTestId('join-with-related-canvas-source-1')).toHaveAccessibleName('Join with related data')
+    expect(screen.getByTestId('join-with-related-canvas-source-1')).toHaveAccessibleName(canvasTrigger)
     unmount()
 
     mocks.state.doc.nodes[0].data.config = {
@@ -421,7 +479,7 @@ describe('JoinWithRelated', () => {
     }]
     const { unmount } = render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
     expect(screen.getByTestId('join-with-related-canvas-join-1'))
-      .toHaveAccessibleName('Join with related data on left input')
+      .toHaveAccessibleName(leftInputTrigger)
     unmount()
 
     mocks.state.doc.edges[0].targetHandle = null
@@ -452,7 +510,7 @@ describe('JoinWithRelated', () => {
     }]
 
     render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Join with related data on left input' }))
+    fireEvent.click(screen.getByRole('button', { name: leftInputTrigger }))
     await screen.findByText('Related data')
     expect(screen.getByText('a.id = b.user_id')).toBeVisible()
     expect(screen.getByText('N:1')).toBeVisible()

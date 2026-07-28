@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils'
 const EVIDENCE_LABEL = {
   declared_relationship: 'Persisted catalog relationship',
   typed_reference: 'Declared key/reference',
-  schema_match: 'Schema-name inference',
+  schema_match: 'Matching key names only',
 } as const
 
 const CARDINALITY_TONE: Record<string, string> = {
@@ -21,6 +21,15 @@ const CARDINALITY_TONE: Record<string, string> = {
   'N:1': 'bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-200',
   'N:M': 'bg-rose-100 text-rose-800 dark:bg-rose-500/15 dark:text-rose-200',
   unknown: 'bg-muted text-muted-foreground',
+}
+
+function cardinalityTone(
+  candidate: RelatedDatasetCandidate,
+  cardinality: RelatedDatasetCandidate['cardinality'],
+) {
+  return candidate.evidence === 'schema_match'
+    ? CARDINALITY_TONE.unknown
+    : CARDINALITY_TONE[cardinality]
 }
 
 function orientedJoinFacts(candidate: RelatedDatasetCandidate, swapInputs: boolean) {
@@ -391,7 +400,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   }
   const relatedReview = candidate ? {
     name: candidate.name,
-    role: candidate.evidence === 'schema_match' ? 'Possible match' : 'Related dataset',
+    role: candidate.evidence === 'schema_match' ? 'Possible key match' : 'Related dataset',
   } : null
   const leftReview = sourceOnRight ? relatedReview : sourceReview
   const rightReview = sourceOnRight ? sourceReview : relatedReview
@@ -400,9 +409,9 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     : ''
   const triggerLabel = surface === 'canvas'
     ? context.joinNodeId
-      ? `Join with related data on ${context.emptyPort === 'a' ? 'left' : 'right'} input`
-      : 'Join with related data'
-    : 'Join with…'
+      ? `Related / possible key matches · ${context.emptyPort === 'a' ? 'left' : 'right'}`
+      : 'Related data / possible key matches'
+    : 'Related data / possible key matches…'
 
   return (
     <>
@@ -418,23 +427,30 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
         {triggerLabel}
       </Button>
       {open && createPortal(<div className="dp-modal-overlay fixed inset-0 z-[80] grid place-items-center bg-black/40 p-4"
-        onMouseDown={(event) => { if (event.target === event.currentTarget && !confirming) close() }}>
-        <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Join with related data"
+        onPointerDown={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation()
+          if (event.target === event.currentTarget && !confirming) close()
+        }}>
+        <div ref={dialogRef} role="dialog" aria-modal="true"
+          aria-label="Find related data or possible key matches"
           className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
           <div className="flex items-start justify-between border-b border-border px-4 py-3">
             <div>
-              <div className="text-sm font-semibold text-foreground">Join with related data</div>
+              <div className="text-sm font-semibold text-foreground">Find related data or possible key matches</div>
               <div className="mt-0.5 text-[11px] text-muted-foreground">
-                Review the relationship before adding this Join to the Canvas.
+                Review the evidence before adding this Join to the Canvas.
               </div>
             </div>
-            <button type="button" aria-label="Cancel Join with related data" disabled={confirming}
+            <button type="button" aria-label="Cancel finding data to join" disabled={confirming}
               onClick={close} className="text-lg text-muted-foreground">×</button>
           </div>
           <div className="overflow-y-auto p-4">
             {!candidate ? <>
               {page && <div className="mb-3 text-xs text-muted-foreground">
-                Find catalog-backed relationships for <strong className="text-foreground">{page.sourceName}</strong>.
+                Find declared or reference-backed relationships and possible key matches for{' '}
+                <strong className="text-foreground">{page.sourceName}</strong>.
               </div>}
               <div className="grid grid-cols-2 gap-2">
                 <Label className="text-[10.5px]">Search
@@ -462,7 +478,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
               {loading && <div className="py-8 text-center text-xs text-muted-foreground">Finding bounded candidates…</div>}
               {!loading && page && related.length === 0 && possibleMatches.length === 0 && <div data-testid="related-no-results"
                 className="py-8 text-center text-xs text-muted-foreground">
-                No known relationships in this search/folder scope.
+                No related data or possible key matches in this search/folder scope.
               </div>}
               {!loading && related.length > 0 && <CandidateGroup title="Related data"
                 candidates={related} swapInputs={sourceOnRight} onSelect={(item) => {
@@ -471,9 +487,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                 }} />}
               {!loading && possibleMatches.length > 0 && !showPossibleMatches && <Button type="button" variant="outline"
                 className="mt-4" onClick={() => setShowPossibleMatches(true)}>
-                Show possible matches ({possibleMatches.length})
+                Show possible key matches ({possibleMatches.length})
               </Button>}
-              {!loading && showPossibleMatches && possibleMatches.length > 0 && <CandidateGroup title="Possible matches"
+              {!loading && showPossibleMatches && possibleMatches.length > 0 && <CandidateGroup
+                title="Possible key matches"
+                description="No relationship is declared. Matching key names only suggest where a join may be possible."
                 candidates={possibleMatches} swapInputs={sourceOnRight} onSelect={(item) => {
                   setCandidate(item); setCandidateBase(item)
                   setRequestedRevisionId(item.identity.revisionMode === 'exact' ? item.identity.revisionId ?? '' : '')
@@ -493,6 +511,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
               <div className="grid gap-2 rounded-md border border-border bg-muted/20 p-3 text-[11px]">
                 {leftReview && <ReviewIdentity label="Left input (a)" {...leftReview} />}
                 {rightReview && <ReviewIdentity label="Right input (b)" {...rightReview} />}
+                {candidate.evidence === 'schema_match' && <div data-testid="possible-key-match-review"
+                  className="rounded border border-dashed border-border bg-background p-2 text-muted-foreground">
+                  <strong className="text-foreground">Possible key match.</strong>{' '}
+                  No relationship is declared. Cardinality describes row matching, not relationship confidence.
+                </div>}
                 <div className="grid grid-cols-[120px_1fr] gap-2">
                   <span className="text-muted-foreground">Evidence</span>
                   <span>{EVIDENCE_LABEL[candidate.evidence]} · {candidate.reason}</span>
@@ -501,7 +524,8 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                     {qualifiedColumns('a', oriented!.leftColumns)} = {qualifiedColumns('b', oriented!.rightColumns)}
                   </span>
                   <span className="text-muted-foreground">Cardinality</span>
-                  <span><span className={cn('rounded px-1.5 py-0.5 font-semibold', CARDINALITY_TONE[oriented!.cardinality])}>
+                  <span><span className={cn('rounded px-1.5 py-0.5 font-semibold',
+                    cardinalityTone(candidate, oriented!.cardinality))}>
                     {oriented!.cardinality}
                   </span> — {cardinalityCopy}</span>
                   <span className="text-muted-foreground">Version</span>
@@ -574,34 +598,46 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   )
 }
 
-function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
+function CandidateGroup({ title, description, candidates, swapInputs, onSelect }: {
   title: string
+  description?: string
   candidates: RelatedDatasetCandidate[]
   swapInputs: boolean
   onSelect: (candidate: RelatedDatasetCandidate) => void
 }) {
   return <section className="mt-4">
     <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
+    {description && <p className="mb-2 text-[10.5px] text-muted-foreground">{description}</p>}
     <div className="grid gap-1.5">
       {candidates.map((candidate) => {
         const oriented = orientedJoinFacts(candidate, swapInputs)
+        const possibleKeyMatch = candidate.evidence === 'schema_match'
         return <button type="button"
           key={candidate.identity.registrationId ?? candidate.identity.sourceBindingId}
           onClick={() => onSelect(candidate)}
-          className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent">
+          className={cn(
+            'grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent',
+            possibleKeyMatch && 'border-dashed bg-muted/20',
+          )}>
           <span className="min-w-0">
+            {possibleKeyMatch && <span className="mb-1 inline-block rounded bg-muted px-1.5 py-0.5 text-[9.5px] font-semibold text-muted-foreground">
+              Possible key match
+            </span>}
             <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
             <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
             <span className="block truncate font-mono text-[10px] text-muted-foreground">
               {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
             </span>
             <span className="block text-[10px] text-muted-foreground">{EVIDENCE_LABEL[candidate.evidence]} · Inner join</span>
+            {possibleKeyMatch && <span className="block text-[10px] font-medium text-muted-foreground">
+              No relationship is declared.
+            </span>}
             <span className="block text-[10px] text-muted-foreground">
               {cardinalityDescription(oriented.cardinality, candidate.cardinalityReason)}
             </span>
           </span>
           <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
-            CARDINALITY_TONE[oriented.cardinality])}>{oriented.cardinality}</span>
+            cardinalityTone(candidate, oriented.cardinality))}>{oriented.cardinality}</span>
         </button>
       })}
     </div>
