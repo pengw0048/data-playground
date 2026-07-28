@@ -142,6 +142,24 @@ def test_committed_openapi_snapshot_matches_the_app():
     assert matches, diff
 
 
+def test_retired_row_identity_certification_is_not_a_public_or_executable_contract():
+    from hub import metadb
+
+    paths = app.openapi()["paths"]
+    assert not any("row-identity-certifications" in path for path in paths)
+    assert "/api/catalog/revision-media-cell" not in paths
+    assert not any(path.endswith("/media-cell") for path in paths)
+    for name in (
+        "submit_row_identity_certification_task",
+        "claim_row_identity_certification_task",
+        "recoverable_row_identity_certification_task",
+        "finish_row_identity_certification_scan",
+        "finish_managed_local_lance_row_identity_certification_scan",
+        "finish_row_identity_certification_failure",
+    ):
+        assert not hasattr(metadb, name)
+
+
 def test_snapshot_check_returns_an_actionable_diff(tmp_path: Path):
     stale = tmp_path / "openapi.json"
     stale.write_text("{}\n", encoding="utf-8")

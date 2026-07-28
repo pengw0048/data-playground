@@ -5,7 +5,6 @@ import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from 
 const mocks = vi.hoisted(() => ({
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
   createDatasetView: vi.fn(), restoreRevision: vi.fn(), restoreRevisionTask: vi.fn(),
-  rowIdentityCertificationTask: vi.fn(), openMediaCell: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
@@ -42,11 +41,7 @@ const detail = (revisionId: string, overrides: Partial<DatasetRevisionDetail> = 
   summary: { rowCount: 2, dataFileCount: 1, totalBytes: 20, fragmentCount: 1 },
   preview: {
     columns: [{ fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
-    rows: [{ amount: 2 }], rowIdentities: null, hasMore: false, rowLimit: 100,
-  },
-  rowIdentity: {
-    datasetId: 'dataset-stable', revisionId, proofStatus: 'unavailable',
-    certificationSupported: false, fields: [], encodingVersion: null,
+    rows: [{ amount: 2 }], hasMore: false, rowLimit: 100,
   },
   ...overrides,
 })
@@ -181,7 +176,7 @@ describe('DatasetRevisionHistory', () => {
         summary: { rowCount: 4, dataFileCount: 2, totalBytes: 45, fragmentCount: 2 },
         preview: {
           columns: [{ fieldId: 'amount', name: 'amount', type: 'int', nullable: false, provenance: 'provider', capabilities: [] }],
-          rows: [{ amount: 4 }], rowIdentities: null, hasMore: true, rowLimit: 100,
+          rows: [{ amount: 4 }], hasMore: true, rowLimit: 100,
         },
       }))
       : Promise.resolve(detail('rev-1')))
@@ -219,7 +214,6 @@ describe('DatasetRevisionHistory', () => {
           }],
         }],
         rows: [],
-        rowIdentities: null,
         hasMore: false,
         rowLimit: 100,
       },
@@ -234,47 +228,17 @@ describe('DatasetRevisionHistory', () => {
       .toHaveTextContent('retained empty-revision schema')
   })
 
-  it('keeps unsupported binary media truthful when an exact row identity is unavailable', async () => {
+  it('keeps unsupported binary media truthful without a row-identity recovery action', async () => {
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
     mocks.datasetRevision.mockResolvedValue(detail('rev-media', {
       preview: {
         columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
-        rows: [{ frame: '<4 bytes>' }], rowIdentities: null, hasMore: false, rowLimit: 100,
+        rows: [{ frame: '<4 bytes>' }], hasMore: false, rowLimit: 100,
       },
-      rowIdentity: { datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable', certificationSupported: true, fields: [], encodingVersion: null },
-      mediaCellSupported: true,
     }))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
-    expect(await screen.findByRole('status')).toHaveTextContent('no exact row identity')
-    expect(mocks.openMediaCell).not.toHaveBeenCalled()
-  })
-
-  it('reports a stale exact media identity without changing the selected revision', async () => {
-    const certified = detail('rev-media', {
-      preview: {
-        columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
-        rows: [{ frame: '<4 bytes>' }],
-        rowIdentities: [[{ name: 'id', arrowType: 'int64', value: '1' }]],
-        hasMore: false,
-        rowLimit: 100,
-      },
-      rowIdentity: {
-        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'certified',
-        certificationSupported: true, fields: [{ name: 'id', arrowType: 'int64' }], encodingVersion: 'row-identity-v1',
-      },
-      mediaCellSupported: true,
-    })
-    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
-    mocks.datasetRevision.mockResolvedValue(certified)
-    mocks.openMediaCell.mockRejectedValue(
-      new KernelError(409, 'identity unavailable', 'media_cell_identity_unavailable'),
-    )
-
-    render(<DatasetRevisionHistory table={TABLE} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
-    expect(await screen.findByRole('status')).toHaveTextContent('identity is no longer available')
-    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('status')).toHaveTextContent('Binary media preview is unavailable.')
   })
 
   it('never falls back to latest when the selected exact revision was compacted', async () => {

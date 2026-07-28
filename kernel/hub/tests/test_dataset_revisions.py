@@ -163,17 +163,10 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     assert detail["summary"]["rowCount"] == 1
     assert detail["preview"]["columns"][0]["name"] == "value"
     assert detail["preview"]["rows"] == [{"value": 1}]
-    assert detail["preview"]["rowIdentities"] is None
     assert detail["preview"]["hasMore"] is False
-    assert detail["rowIdentity"] == {
-        "datasetId": dataset_id,
-        "revisionId": exact,
-        "proofStatus": "unavailable",
-        "certificationSupported": True,
-        "fields": [],
-        "encodingVersion": None,
-    }
-    assert detail["mediaCellSupported"] is True
+    assert "rowIdentities" not in detail["preview"]
+    assert "rowIdentity" not in detail
+    assert "mediaCellSupported" not in detail
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
 
 
@@ -510,33 +503,6 @@ def test_revision_detail_body_route_preserves_slash_bearing_opaque_identity(monk
     assert response.json()["revisionId"] == revision_id
     assert response.json()["preview"]["rows"] == [{"value": 7}]
     assert adapter.calls == [("workspace-provider://canonical-source", revision_id)]
-
-
-@pytest.mark.parametrize(("failure", "status", "detail", "code", "retryable"), [
-    (RevisionPermissionLost("denied"), 403, "dataset_revision_permission_lost",
-     "permission_denied", False),
-    (RevisionProviderOffline("offline"), 503, "dataset_revision_provider_offline",
-     "service_unavailable", True),
-    (RevisionUnavailable("gone"), 410, "dataset_revision_unavailable",
-     "resource_gone", False),
-])
-def test_lance_identity_fence_preserves_exact_revision_access_taxonomy(
-        tmp_path, monkeypatch, failure, status, detail, code, retryable):
-    _uri, table = _register_lance(tmp_path)
-    selected = client.get(
-        f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
-
-    def fail(*_args, **_kwargs):
-        raise failure
-
-    monkeypatch.setattr(LanceAdapter, "exact_revision_incarnation", fail)
-    response = client.get(
-        f"/api/catalog/revisions/{selected['datasetId']}/{selected['revisionId']}")
-
-    assert response.status_code == status
-    assert response.json() == {
-        "detail": detail, "code": code, "retryable": retryable,
-    }
 
 
 @pytest.mark.parametrize(("wrapped", "expected"), [
