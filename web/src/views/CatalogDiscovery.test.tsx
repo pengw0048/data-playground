@@ -35,7 +35,7 @@ vi.mock('../ui/VirtualList', () => ({
   </div>,
 }))
 
-import { AddDataModal, CatalogDiscovery } from './CatalogDiscovery'
+import { AddDataModal, CatalogDetail, CatalogDiscovery } from './CatalogDiscovery'
 
 const TABLE: CatalogTable = {
   id: 't1', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
@@ -592,6 +592,44 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalledWith('t1',
       expect.objectContaining({ name: 'daily orders' })))
+  })
+
+  it('renders an unselected column as an available key action, not a key', async () => {
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    expect(screen.getByText('No saved key')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Mark order_id as a key' })).toBeVisible()
+    expect(screen.queryByTestId('detail-key-state-order_id')).toBeNull()
+  })
+
+  it('keeps a one-column key as an explicit saved state and stages changes until Save', async () => {
+    const onChanged = vi.fn()
+    const saved = { ...TABLE, keys: [{ columns: ['order_id'], confidence: 'declared' as const }] }
+    mocks.saveTableEdit.mockResolvedValue(saved)
+    render(<CatalogDetail table={TABLE} onClose={vi.fn()} onUse={vi.fn()} onChanged={onChanged} onFolder={vi.fn()}
+      onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Mark order_id as a key' }))
+    expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Will be a key on Save')
+    expect(onChanged).not.toHaveBeenCalled()
+    expect(mocks.saveTableEdit).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId('detail-save'))
+    await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalledWith('t1', expect.objectContaining({ declaredKey: ['order_id'] })))
+    expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Key')
+    expect(onChanged).toHaveBeenCalledWith(saved)
+  })
+
+  it('labels multiple persisted columns as one composite key', async () => {
+    const composite = { ...TABLE, columns: [...TABLE.columns, { name: 'customer_id', type: 'int' }],
+      keys: [{ columns: ['order_id', 'customer_id'], confidence: 'declared' as const }] }
+    render(<CatalogDetail table={composite} onClose={vi.fn()} onUse={vi.fn()} onChanged={vi.fn()} onFolder={vi.fn()}
+      onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
+
+    expect(screen.getByText('Saved composite key')).toBeVisible()
+    expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Composite key')
+    expect(screen.getByTestId('detail-key-state-customer_id')).toHaveTextContent('Composite key')
   })
 
   it('stages keys with metadata and offers reload or reapply after a conflict', async () => {

@@ -1123,6 +1123,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
     setDeclaredPk(next)
   }
+  const persistedDeclaredKey = initialKey(base)
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={requestClose}>
@@ -1197,22 +1198,38 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </div>
           </section>
 
-          {/* columns — the 🔑 toggles the declared primary key; the name filters the list to tables with it */}
+          {/* A declared key is one ordered column list. Multiple columns are one composite key. */}
           <section>
-            <div className="mb-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Columns</div>
+            <div className="mb-1 flex items-baseline justify-between gap-2">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Columns</div>
+              <span className="text-[10.5px] text-muted-foreground">{persistedDeclaredKey.length > 1 ? 'Saved composite key' : persistedDeclaredKey.length === 1 ? 'Saved key' : 'No saved key'}</span>
+            </div>
+            <p className="mb-2 text-[11px] leading-snug text-muted-foreground">
+              Select one column for a key, or several columns for one composite key. Changes apply only when you save.
+            </p>
             <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
               {displayColumns.map((c) => {
-                const isPk = declaredPk.includes(c.name)
+                const selected = declaredPk.includes(c.name)
+                const persisted = persistedDeclaredKey.includes(c.name)
+                const pendingAdd = selected && !persisted
+                const pendingRemoval = !selected && persisted
+                const role = pendingAdd ? 'Will be a key on Save'
+                  : pendingRemoval ? 'Will be removed on Save'
+                    : persisted ? persistedDeclaredKey.length > 1 ? 'Composite key' : 'Key' : null
+                const action = selected ? `Remove ${c.name} from the declared key` : `Mark ${c.name} as a key`
                 return (
-                  <div key={c.name} className="flex w-full items-center gap-1 border-b border-border/60 px-2 py-1 last:border-0 hover:bg-accent">
-                    <button onClick={() => togglePk(c.name)} disabled={!atomicMetadataEditable} data-testid={`detail-pk-${c.name}`}
-                      title={isPk ? 'Declared primary key — click to clear' : 'Click to declare as the primary key'}
-                      className={`w-5 shrink-0 text-center text-[11px] ${isPk ? '' : 'opacity-25 hover:opacity-70'}`}>🔑</button>
+                  <div key={c.name} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 last:border-0 hover:bg-accent">
+                    <button type="button" onClick={() => togglePk(c.name)} disabled={!atomicMetadataEditable} data-testid={`detail-pk-${c.name}`}
+                      aria-label={action} title={`${action}. This is saved only when you select Save.`}
+                      className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">
+                      {selected ? 'Remove key' : 'Mark as key'}
+                    </button>
                     <button onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`}
                       className="flex min-w-0 flex-1 items-center gap-2 text-left">
                       <span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span>
                       <span className="text-[10px] text-muted-foreground">{c.type}</span>
                     </button>
+                    {role ? <span data-testid={`detail-key-state-${c.name}`} className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${persisted && !pendingRemoval ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>{role}</span> : null}
                     <FieldEvidenceButton column={c} label="ⓘ" marker className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
                   </div>
                 )
