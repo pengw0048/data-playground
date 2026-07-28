@@ -27,13 +27,15 @@ client = TestClient(app)
 
 
 def _related_footprints_overlap(first: dict, second: dict) -> bool:
-    """Match the conservative related-Join placement footprint and its practical gap."""
+    """Match the deterministic related-Join card envelopes and practical gap."""
     first_position, second_position = first["position"], second["position"]
+    first_width, first_height = metadb._workspace_related_join_footprint(first)
+    second_width, second_height = metadb._workspace_related_join_footprint(second)
     return (
-        first_position["x"] + 280 > second_position["x"]
-        and second_position["x"] + 280 > first_position["x"]
-        and first_position["y"] + 275 > second_position["y"]
-        and second_position["y"] + 275 > first_position["y"]
+        first_position["x"] + first_width + 48 > second_position["x"]
+        and second_position["x"] + second_width + 48 > first_position["x"]
+        and first_position["y"] + first_height + 32 > second_position["y"]
+        and second_position["y"] + second_height + 32 > first_position["y"]
     )
 
 
@@ -51,8 +53,8 @@ def test_related_join_placement_skips_reproduced_and_dense_slots_deterministical
     metadb._workspace_related_join_positions(
         [selected, transform, dense], selected, second_source, second_join)
 
-    assert first_source["position"] == {"x": 432.0, "y": 572.0}
-    assert first_join["position"] == {"x": 792.0, "y": 382.0}
+    assert first_source["position"] == {"x": 832.0, "y": 572.0}
+    assert first_join["position"] == {"x": 1192.0, "y": 382.0}
     assert second_source["position"] == {"x": 1232.0, "y": 572.0}
     assert second_join["position"] == {"x": 1592.0, "y": 382.0}
     for node in (selected, transform):
@@ -74,6 +76,21 @@ def test_related_join_fill_placement_uses_the_next_free_slot():
     assert added["position"] == {"x": 720.0, "y": 390.0}
     for node in (selected, join, blocker):
         assert not _related_footprints_overlap(added, node)
+
+
+def test_related_join_placement_reserves_the_full_code_annotation_envelope():
+    selected = {"id": "selected", "type": "source", "position": {"x": 32, "y": 272}}
+    # CodeBlock is a legitimate 320x275 top-level annotation.  It is wider than a NodeCard, so
+    # treating it as 232px creates a real DOM overlap even when the generic-node fixture passes.
+    code = {"id": "code", "type": "code", "position": {"x": 384, "y": 272}}
+    related = {"id": "related-source", "type": "source", "position": {"x": 0, "y": 0}}
+    join = {"id": "related-join", "type": "join", "position": {"x": 0, "y": 0}}
+
+    assert metadb._workspace_related_join_footprint(code) == (320, 275)
+    metadb._workspace_related_join_positions([selected, code], selected, related, join)
+
+    assert not _related_footprints_overlap(related, code)
+    assert not _related_footprints_overlap(join, code)
 
 
 class _UnavailableAdapter:

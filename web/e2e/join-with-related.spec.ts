@@ -116,8 +116,11 @@ async function seedPlacementReproductionCanvas(page: Page, canvasId: string, tab
       { id: 'selected-source', type: 'source', position: { x: 32, y: 272 }, data: {
         title: table.name, status: 'draft', history: [], config,
       } },
-      { id: 'existing-transform', type: 'transform', position: { x: 384, y: 272 }, data: {
-        title: 'Existing transform', status: 'draft', history: [], config: {},
+      { id: 'existing-code', type: 'code', position: { x: 384, y: 272 }, data: {
+        title: 'Existing code annotation', status: 'draft', history: [],
+        // The code annotation's clipped 320x275 mounted envelope is deliberately wider than a
+        // NodeCard.  This is the regression the server-side placement contract must reserve.
+        config: { lang: 'python', code: Array.from({ length: 40 }, (_, index) => `value_${index} = ${index}`).join('\n') },
       } },
       { id: 'existing-write', type: 'write', position: { x: 700, y: 272 }, data: {
         title: 'Existing write', status: 'draft', history: [], config: {},
@@ -164,9 +167,29 @@ test.describe('Related data and possible key matches', () => {
         const canvasId = `join-related-placement-${viewport.width}-${Date.now()}`
         try {
           await seedPlacementReproductionCanvas(page, canvasId, left)
-          await page.getByTestId('join-with-related-canvas-selected-source').click()
-          await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
-          await page.getByTestId('confirm-related-join').click()
+          const sourceIdentity = { kind: 'local', registrationId: left.registrationId, revisionMode: 'current' }
+          const candidates = await page.request.post('/api/catalog/related-datasets', {
+            data: { source: sourceIdentity, limit: 12 },
+          })
+          expect(candidates.ok()).toBeTruthy()
+          const pageOfCandidates = await candidates.json() as { candidates: any[], possibleMatches: any[] }
+          const candidate = [...pageOfCandidates.candidates, ...pageOfCandidates.possibleMatches]
+            .find((item) => item.name === right.name)
+          expect(candidate).toBeDefined()
+          // The action endpoint is the one used by the review dialog.  Calling it directly here
+          // keeps this visual regression focused on the persisted placement and Chromium geometry;
+          // the dialog's confirm journey is covered separately below.
+          const confirmed = await page.request.post(`/api/canvas/${encodeURIComponent(canvasId)}/join-with-related`, {
+            data: {
+              expectedCanvasVersion: 1,
+              sourceNodeId: 'selected-source',
+              sourceIdentity,
+              candidate,
+              how: 'inner',
+            },
+          })
+          expect(confirmed.ok()).toBeTruthy()
+          await page.reload()
           const inserted = page.locator('.react-flow__node[data-id^="source_related_"], .react-flow__node[data-id^="join_related_"]')
           await expect(inserted).toHaveCount(2)
           await expect(async () => {
@@ -175,7 +198,7 @@ test.describe('Related data and possible key matches', () => {
               const box = element.getBoundingClientRect()
               return { x: box.x, y: box.y, width: box.width, height: box.height }
             }))
-            const existing = await page.locator('.react-flow__node[data-id="selected-source"], .react-flow__node[data-id="existing-transform"], .react-flow__node[data-id="existing-write"]').evaluateAll((elements) => elements.map((element) => {
+            const existing = await page.locator('.react-flow__node[data-id="selected-source"], .react-flow__node[data-id="existing-code"], .react-flow__node[data-id="existing-write"]').evaluateAll((elements) => elements.map((element) => {
               const box = element.getBoundingClientRect()
               return { x: box.x, y: box.y, width: box.width, height: box.height }
             }))
@@ -357,6 +380,14 @@ test.describe('Related data and possible key matches', () => {
     const canvasId = `join-related-confirm-${Date.now()}`
     try {
       await seedSourceCanvas(page, canvasId, left)
+      const mutations: Array<{ method: string, pathname: string }> = []
+      page.on('request', (request) => {
+        const url = new URL(request.url())
+        if (url.pathname === `/api/canvas/${canvasId}/join-with-related`
+          || url.pathname === `/api/canvas/${canvasId}`) {
+          mutations.push({ method: request.method(), pathname: url.pathname })
+        }
+      })
       await page.getByTestId('join-with-related-canvas-selected-source').click()
       await expect(page.getByRole('heading', { name: 'Related data', exact: true })).toBeVisible()
       await page.getByRole('button', { name: new RegExp(right.name, 'i') }).click()
@@ -373,6 +404,16 @@ test.describe('Related data and possible key matches', () => {
       expect(source.data.config).toMatchObject({ uri: right.uri, tableId: right.id, registrationId: right.registrationId })
       expect(join.data.config.how).toBe('left')
       expect(saved.edges.map((edge: any) => edge.target)).toEqual([join.id, join.id])
+      // A related Join POST already returns the authoritative Canvas.  Installing that server
+      // document must not echo through autosave as a second PUT/version.  Wait past the debounce
+      // so this is an exact-wheel, real-kernel regression rather than a mocked store assertion.
+      await page.waitForTimeout(650)
+      const settled = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
+      expect(settled.version).toBe(2)
+      expect(mutations.filter((request) => request.method === 'POST'
+        && request.pathname.endsWith('/join-with-related'))).toHaveLength(1)
+      expect(mutations.filter((request) => request.method === 'PUT'
+        && request.pathname === `/api/canvas/${canvasId}`)).toHaveLength(0)
     } finally {
       await page.request.post('/api/catalog/relationships/delete', { data: relation })
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)

@@ -82,9 +82,9 @@ let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-naviga
 let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
 let _viewportFitGeneration = 0    // example fits are one-shot even when the same Canvas is reused
 const _draftSyncInFlight = new Set<string>()
-// True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
-// still refreshes the browser cache, but must not PUT that presentation-only normalization back into
-// the authoritative canvas or create a misleading Version history snapshot.
+// True while loadDoc synchronously installs a server-owned document. The autosave subscriber still
+// refreshes the browser cache, but must not PUT either that response or its presentation-only
+// normalization back into the authoritative Canvas and manufacture a second version.
 let _settlingLoadedDoc = false
 let _acceptingServerVersion = false
 
@@ -4238,7 +4238,10 @@ export const useStore = create<Store>((set, get) => ({
     // immediately replace these with the live run's authoritative per-node states.
     const d = settleAnimatingDoc(doc)
     const agentLog = d.id === get().doc.id ? get().agentLog : []
-    _settlingLoadedDoc = d !== doc
+    // Every loadDoc caller is installing a server response or a deliberately selected server
+    // snapshot.  The subscriber observes a different object identity, so it needs this synchronous
+    // settling fence even when there was no running-status normalization.
+    _settlingLoadedDoc = true
     try {
       const previewBindings = readPreviewBindings(get().currentUser?.id, d)
       const retainedRuns = Object.fromEntries(Object.entries(previewBindings).flatMap(([nodeId, binding]) => (

@@ -3866,16 +3866,42 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
         nodes.append(source)
 
 
+_RELATED_JOIN_CARD_FOOTPRINTS: dict[str, tuple[float, float]] = {
+    # These are the mounted top-level card envelopes, not a graph layout.  Keep them in lockstep
+    # with the product's fixed card contracts: CodeBlock is w-80 with a 240px clipped body; Note
+    # is w-[268px] with its 400px clipped body; Section is explicitly 360x240.  NodeCard forms are
+    # all 232px wide and use a 400px vertical envelope so a configured Join/Form cannot be placed
+    # beneath an adjacent card merely because its current fields happen to be short.
+    "code": (320, 275),
+    "note": (268, 424),
+    "section": (360, 240),
+    "join": (232, 400),
+    "source": (232, 400),
+}
+_RELATED_JOIN_DEFAULT_FOOTPRINT = (232, 400)
+
+
+def _workspace_related_join_footprint(node: dict) -> tuple[float, float]:
+    """Return the deterministic mounted-card envelope used by related-Join placement.
+
+    The server deliberately does not measure a browser.  Product cards with a distinct fixed
+    contract have an explicit entry; ordinary NodeCard implementations share the conservative
+    bounded envelope above.  Children of Sections are positioned in their parent coordinate space
+    and are not top-level obstacles.
+    """
+    return _RELATED_JOIN_CARD_FOOTPRINTS.get(str(node.get("type") or ""),
+                                             _RELATED_JOIN_DEFAULT_FOOTPRINT)
+
+
 def _workspace_related_join_positions(
         nodes: list[dict], source: dict, new_source: dict, new_join: dict | None) -> None:
     """Place the related-data addition without disturbing the existing Canvas.
 
-    These are deliberately conservative card footprints: source cards can grow with their bound
-    metadata and Join cards grow with their key editor.  The fixed candidate order keeps a retry or
-    another client on the same Canvas deterministic while the transaction lock makes the occupied
-    set authoritative.
+    The fixed candidate order keeps a retry or another client on the same Canvas deterministic
+    while the transaction lock makes the occupied set authoritative.
     """
-    source_width, source_height = 232, 243
+    source_width, source_height = _workspace_related_join_footprint(new_source)
+    join_width, join_height = _workspace_related_join_footprint(new_join or new_source)
     horizontal_gap, vertical_gap = 48, 32
 
     def footprint(node: dict) -> tuple[float, float, float, float] | None:
@@ -3887,25 +3913,24 @@ def _workspace_related_join_positions(
         x, y = position.get("x"), position.get("y")
         if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
             return None
-        width, height = (360, 240) if node.get("type") == "section" else (
-            source_width, source_height)
+        width, height = _workspace_related_join_footprint(node)
         return float(x), float(y), width, height
 
     occupied = [box for node in nodes if isinstance(node, dict)
                 if (box := footprint(node)) is not None]
 
-    def available(candidate: list[tuple[float, float]]) -> bool:
+    def available(candidate: list[tuple[float, float, float, float]]) -> bool:
         boxes = [*occupied]
-        for x, y in candidate:
+        for x, y, width, height in candidate:
             if any(
-                x + source_width + horizontal_gap > other_x
+                x + width + horizontal_gap > other_x
                 and other_x + other_width + horizontal_gap > x
-                and y + source_height + vertical_gap > other_y
+                and y + height + vertical_gap > other_y
                 and other_y + other_height + vertical_gap > y
                 for other_x, other_y, other_width, other_height in boxes
             ):
                 return False
-            boxes.append((x, y, source_width, source_height))
+            boxes.append((x, y, width, height))
         return True
 
     sx = float((source.get("position") or {}).get("x", 0))
@@ -3917,7 +3942,7 @@ def _workspace_related_join_positions(
         for row in range(32):
             for column in range(32):
                 x, y = sx + column * 300, sy + row * 275
-                if available([(x, y)]):
+                if available([(x, y, source_width, source_height)]):
                     new_source["position"] = {"x": x, "y": y}
                     return
     else:
@@ -3928,7 +3953,10 @@ def _workspace_related_join_positions(
                 base_x, base_y = sx + column * 400, sy + row * 320
                 source_position = (base_x, base_y + 300)
                 join_position = (base_x + 360, base_y + 110)
-                if available([source_position, join_position]):
+                if available([
+                    (*source_position, source_width, source_height),
+                    (*join_position, join_width, join_height),
+                ]):
                     new_source["position"] = {"x": source_position[0], "y": source_position[1]}
                     new_join["position"] = {"x": join_position[0], "y": join_position[1]}
                     return
