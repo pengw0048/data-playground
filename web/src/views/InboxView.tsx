@@ -172,7 +172,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
         <div>
           <h1 className="text-[20px] font-bold text-foreground">Inbox</h1>
-          <p className="text-[11.5px] text-muted-foreground">Outcomes from your durable background work</p>
+          <p className="text-[11.5px] text-muted-foreground">Completed background tasks assigned to you</p>
         </div>
         <span className="flex-1" />
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Filter
