@@ -26,6 +26,29 @@ test('bare entry stays neutral until a first-run Workspace destination is known'
   await expect(page).toHaveURL(/#\/workspace$/)
 })
 
+test('a real shell route replaces an unresolved ambiguous bootstrap', async ({ page }) => {
+  const canvasListBlocked = new Promise<void>(() => {})
+  await page.route('**/api/canvas', async (route) => {
+    const request = route.request()
+    if (request.method() !== 'GET' || new URL(request.url()).pathname !== '/api/canvas') {
+      await route.continue()
+      return
+    }
+    await canvasListBlocked
+  })
+
+  await page.goto('/')
+  await expect(page.getByTestId('app-destination-bootstrap')).toBeVisible()
+
+  // This is the real browser-history path: the router receives hashchange while the first
+  // bootstrap request is still unresolved. Jobs has an explicit destination and must not remain
+  // an indefinitely blank frame.
+  await page.evaluate(() => { location.hash = '#/jobs' })
+  await expect(page.getByTestId('workspace-rail')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+  await expect(page.getByTestId('app-destination-bootstrap')).toHaveCount(0)
+})
+
 test('auth bootstrap stays fenced while unavailable and recovers on Retry without reloading', async ({ page }) => {
   let authRequests = 0
   let bootstrapRequests = 0

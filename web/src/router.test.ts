@@ -83,6 +83,17 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'canvas-1', nodeId: 'write-1' })
   })
 
+  it.each([
+    ['#/canvas/%E0%A4%A', { view: 'canvas' }],
+    ['#/workspace/%E0%A4%A', { view: 'workspace' }],
+    ['#/transforms/%E0%A4%A', { view: 'transforms' }],
+    ['#/distribution-reports/%E0%A4%A', { view: 'canvas' }],
+  ])('keeps malformed encoded route identifiers inside routing for %s', (hash, expected) => {
+    window.location.hash = hash
+    expect(() => parseHash()).not.toThrow()
+    expect(parseHash()).toEqual(expected)
+  })
+
   it('round-trips an exact Transform upgrade context without mixing it into filters', () => {
     window.location.hash = routeHash(
       'transforms', undefined, undefined, undefined, undefined, undefined, undefined,

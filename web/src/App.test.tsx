@@ -104,6 +104,26 @@ describe('App auth bootstrap', () => {
     expect(await screen.findByText('Shell')).toBeVisible()
   })
 
+  it.each(['#/workspace', '#/jobs', '#/inbox', '#/transforms'])(
+    'renders %s when navigation changes while an ambiguous bootstrap is pending',
+    async (hash) => {
+      vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+      mocks.bootstrap.mockImplementation(async () => new Promise<never>(() => {}))
+
+      render(<App />)
+
+      await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+      expect(screen.getByTestId('app-destination-bootstrap')).toBeVisible()
+      history.replaceState(null, '', hash)
+      // The production router applies this view in response to hashchange. Model that store update
+      // here while the mocked initial bootstrap intentionally remains unresolved.
+      useStore.setState({ view: hash === '#/workspace' ? 'workspace' : hash.slice(2) } as never)
+
+      expect(await screen.findByText('Shell')).toBeVisible()
+      expect(screen.queryByTestId('app-destination-bootstrap')).not.toBeInTheDocument()
+    },
+  )
+
   it('keeps an explicit Canvas deep link on its Canvas loading surface', async () => {
     history.replaceState(null, '', '#/canvas/canvas-loading')
     vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
