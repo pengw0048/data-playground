@@ -171,6 +171,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
             </div>
 
             {/* soft schema cue: config points at a column not in the input (never blocks a run) */}
+            {kind === 'filter' && invalid && !off && (
+              <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={invalid}>
+                ⚠ {invalid}
+              </div>
+            )}
             {!invalid && warnings.length > 0 && !off && (
               <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={warnings.join(' · ')}>
                 ⚠ {warnings[0]}

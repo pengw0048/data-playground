@@ -10,6 +10,7 @@ import { CodeSnippet } from '../ui/CodeSnippet'
 import { color } from '../theme/tokens'
 import type { BackendNodeSpec, BackendParam } from '../api/client'
 import type { WireType } from '../theme/tokens'
+import { filterBuilderConditions, filterBuilderReason } from './filterValidation'
 
 let backendSpecs: Record<string, BackendNodeSpec> = {}
 
@@ -21,7 +22,7 @@ export function getBackendSpec(kind: string): BackendNodeSpec | undefined {
 /** Why a node can't run yet (a required param is empty), or null if it's valid. Drives the
  * disabled Run affordance + its reason, from the backend param schema (works for any kind/plugin). */
 export function nodeInvalidReason(
-  node: { type: string; data: { config: Record<string, unknown> } }, inputColumns?: { name: string }[],
+  node: { type: string; data: { config: Record<string, unknown> } }, inputColumns?: { name: string; type?: string }[],
   numericDrafts?: Record<string, string>,
 ): string | null {
   const spec = backendSpecs[node.type]
@@ -61,6 +62,10 @@ export function nodeInvalidReason(
         if (missing.length) return `${p.label ?? p.name} references unavailable column${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`
       }
     }
+  }
+  if (node.type === 'filter') {
+    const conditions = filterBuilderConditions(node.data.config)
+    if (conditions) return filterBuilderReason(conditions, inputColumns)
   }
   return null
 }
@@ -138,7 +143,10 @@ export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; om
                 onDraft={(text) => setNumericDraft(nodeId, p.name, text)}
                 onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
             ) : (
-              <MiniInput value={String(val)} onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
+              <MiniInput value={String(val)} onChange={(v) => updateConfig(nodeId,
+                node?.type === 'filter' && p.name === 'predicate'
+                  ? { predicate: v, filterBuilder: undefined }
+                  : { [p.name]: v })} />
             )}
           </Field>
         )

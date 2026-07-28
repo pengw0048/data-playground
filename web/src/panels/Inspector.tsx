@@ -1265,6 +1265,7 @@ function Action({ icon, label, onClick, disabled, danger }: { icon: IconName; la
   return (
     <Button
       variant="outline" size="sm"
+      disabled={disabled}
       onClick={() => { if (!disabled) onClick() }}
       aria-disabled={disabled}
       className={cn(
