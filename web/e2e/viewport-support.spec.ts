@@ -184,6 +184,120 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('settings-modal'), 'settings modal (canvas)')
   })
 
+  test('wide provider detail contains scrolling without hiding actions or scrolling Workspace', async ({ page }, testInfo) => {
+    const vp = page.viewportSize()
+    const expectedViewport = testInfo.project.name === 'chromium-reference-viewport'
+      ? REFERENCE_VIEWPORT
+      : MIN_VIEWPORT
+    expect(vp, 'Playwright project must pin an exercised desktop viewport').toEqual(expectedViewport)
+
+    const root = {
+      id: 'container:workspace-local-root', kind: 'container', name: 'Workspace',
+      detached: false, source: 'local', version: 1,
+    }
+    const folder = {
+      id: 'container:viewport-provider-folder', kind: 'container', name: 'Viewport provider',
+      parentId: root.id, detached: false, source: 'provider',
+      mountId: 'viewport-provider', provider: 'viewport-fixture',
+      resourceId: 'viewport-provider-folder', providerPlacementId: 'viewport-provider-folder',
+      providerMutation: false,
+    }
+    const dataset = {
+      id: 'dataset:viewport-provider-wide-dataset', kind: 'dataset', name: 'Wide provider dataset',
+      parentId: folder.id, detached: false, source: 'provider',
+      mountId: 'viewport-provider', provider: 'viewport-fixture',
+      resourceId: 'viewport-provider-wide-dataset',
+      providerPlacementId: 'viewport-provider-wide-dataset',
+      parentProviderPlacementId: 'viewport-provider-folder',
+      providerDatasetId: 'viewport-provider-canonical-dataset',
+      referenceState: 'current', canonicalReferenceState: 'current',
+      providerMutation: false,
+    }
+    const source = {
+      id: 'mount:viewport-provider', kind: 'provider', mountId: 'viewport-provider',
+      provider: 'viewport-fixture', completeness: 'complete', error: null,
+    }
+    const filler = Array.from({ length: 100 }, (_, index) => ({
+      ...dataset,
+      id: `dataset:viewport-provider-filler-${index}`,
+      name: `Provider filler ${index}`,
+      resourceId: `viewport-provider-filler-${index}`,
+      providerPlacementId: `viewport-provider-filler-${index}`,
+      providerDatasetId: `viewport-provider-filler-canonical-${index}`,
+    }))
+    const canonicalColumns = Array.from({ length: 120 }, (_, index) => ({
+      name: `provider_column_${index}`, type: 'string', provenance: 'provider',
+      capabilities: [], annotations: [],
+    }))
+    const resourcePath = `/api/workspace/resources/${dataset.id}`
+    await page.route((url) => decodeURIComponent(url.pathname) === resourcePath, (route) => route.fulfill({
+      json: {
+        resource: dataset, ancestors: [root, folder], source,
+        canonicalSourceBinding: {
+          mountId: 'viewport-provider',
+          sourceBindingId: 'viewport-provider-source-binding-generation',
+        },
+      },
+    }))
+    await page.route((url) => decodeURIComponent(url.pathname) === `${resourcePath}/canonical-dataset`, (route) => route.fulfill({
+      json: {
+        mountId: 'viewport-provider',
+        sourceBindingId: 'viewport-provider-source-binding-generation',
+        providerDatasetId: 'viewport-provider-canonical-dataset',
+        datasetIdentity: `provider://viewport/${'long-dataset-identity/'.repeat(20)}`,
+        readMode: 'exact',
+        revisionId: `revision-${'a'.repeat(240)}`,
+        committedAt: '2026-07-27T12:00:00Z',
+        columns: canonicalColumns,
+      },
+    }))
+    await page.route(
+      (url) => decodeURIComponent(url.pathname) === '/api/workspace/containers/viewport-provider-folder',
+      (route) => route.fulfill({
+        json: {
+          container: folder, items: [dataset, ...filler], nextCursor: null, hasMore: false,
+          completeness: 'complete', sources: [source],
+        },
+      }),
+    )
+
+    await page.goto(`/#/workspace/${encodeURIComponent(dataset.id)}`)
+    const detail = page.getByRole('dialog', { name: dataset.name })
+    const content = detail.getByTestId('provider-dataset-detail-content')
+    const close = detail.getByRole('button', { name: 'Close' })
+    const use = detail.getByRole('button', { name: 'Use in canvas' })
+    await expectFullyInViewport(page, close, `${vp?.width}px provider detail close`)
+    await expectFullyInViewport(page, use, `${vp?.width}px provider use action`)
+
+    const contentSize = await content.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+      overscrollBehaviorY: getComputedStyle(element).overscrollBehaviorY,
+    }))
+    expect(contentSize.scrollHeight, 'long provider metadata should overflow its detail region')
+      .toBeGreaterThan(contentSize.clientHeight)
+    expect(contentSize.overscrollBehaviorY).toBe('contain')
+    await content.hover()
+    await page.mouse.wheel(0, contentSize.scrollHeight)
+    await expect.poll(() => content.evaluate((element) => element.scrollTop))
+      .toBeGreaterThan(0)
+
+    const workspace = page.getByTestId('workspace-scroll-surface')
+    const workspaceSize = await workspace.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+    }))
+    expect(workspaceSize.scrollHeight, 'the Workspace fixture should be independently scrollable')
+      .toBeGreaterThan(workspaceSize.clientHeight)
+    await workspace.evaluate((element) => { element.scrollTop = 120 })
+    const workspaceScrollTop = await workspace.evaluate((element) => element.scrollTop)
+    await content.evaluate((element) => { element.scrollTop = element.scrollHeight })
+    await content.hover()
+    await page.mouse.wheel(0, 800)
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    expect(await workspace.evaluate((element) => element.scrollTop)).toBe(workspaceScrollTop)
+  })
+
   test('panel choices persist and the canvas tracks the real remaining viewport', async ({ page }) => {
     await goToWorkspaceShell(page)
     const rail = page.getByTestId('workspace-rail')

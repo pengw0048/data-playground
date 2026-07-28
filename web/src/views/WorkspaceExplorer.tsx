@@ -767,7 +767,7 @@ function WorkspaceMixedExplorer() {
         {selectedProviderResource && <button onClick={() => setRelinkResource(selectedProviderResource)} className="shrink-0 font-semibold underline">Relink</button>}
       </div>}
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+      <div data-testid="workspace-scroll-surface" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {searchQuery ? <WorkspaceSearchResults query={searchQuery} revision={revision} onOpen={open}
           onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
