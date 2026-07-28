@@ -1604,7 +1604,8 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector
     const inspector = page.getByTestId('inspector')
     // point the source at a dataset that doesn't exist → the run fails and must surface a toast
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await inspector.getByLabel('Dataset URI').fill('does-not-exist.parquet')
     // a source's run is a full count/scan — the Inspector labels it "Count rows"
     await inspector.getByRole('button', { name: 'Count rows' }).click()
     await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
@@ -1922,7 +1923,7 @@ test.describe('Data Playground canvas', () => {
     const inspector = page.getByTestId('inspector')
     await inspector.getByRole('button', { name: 'View data' }).click()
     await expect(page.getByText('purchase', { exact: true })).toBeVisible()
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('another-events.parquet')
+    await inspector.getByLabel('Dataset URI').fill('another-events.parquet')
 
     await expect(page.getByRole('status')).toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
@@ -2253,6 +2254,37 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('a draft Source Inspector leads with data entry and keeps manual parsing advanced @ux-smoke', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    const inspector = page.getByTestId('inspector')
+
+    await expect(inspector.getByRole('button', { name: 'Select dataset' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'Upload a file…' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'Register or browse an accessible path…' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'View data' })).toHaveCount(0)
+    await expect(inspector.getByRole('button', { name: 'Count rows' })).toHaveCount(0)
+    await expect(inspector.getByRole('button', { name: 'Delete' })).toBeVisible()
+    await expect(inspector.getByLabel('Dataset URI')).toBeHidden()
+
+    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await expect(inspector.getByLabel('Dataset URI')).toBeVisible()
+    await expect(inspector.getByLabel('CSV delimiter')).toBeVisible()
+    await expect(inspector.getByLabel('CSV header row')).toBeVisible()
+
+    await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
+    await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+
+    await inspector.getByRole('button', { name: 'Select dataset' }).click()
+    await page.getByText('events', { exact: true }).first().click()
+    await expect(inspector.getByRole('button', { name: 'Count rows' })).toBeVisible()
+    await expect(inspector.getByText('Related data')).toBeVisible()
+    await expect(inspector.getByText('Ports')).toBeVisible()
+  })
+
   test('a post-startup local input registers and retries its formal run without restart @ux-smoke', async ({ page }) => {
     const filename = `issue-956-${Date.now()}.parquet`
     const uri = resolve('.e2e-workspace/outputs', filename)
@@ -2271,7 +2303,8 @@ test.describe('Data Playground canvas', () => {
       await addNode(page, 'Sources & sinks', 'source')
       const source = page.locator('.react-flow__node-source')
       const inspector = page.getByTestId('inspector')
-      await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(uri)
+      await inspector.getByText('Advanced source configuration', { exact: true }).click()
+      await inspector.getByLabel('Dataset URI').fill(uri)
 
       const blockedEstimatePromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === '/api/run/estimate'

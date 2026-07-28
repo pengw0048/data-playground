@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ReactFlowProvider } from '@xyflow/react'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
 }))
 vi.mock('../../api/client', () => ({ api: mocks }))
 
-import './source'                          // registers the Source card via register()
+import { requestSourceEntryAction } from './source' // also registers the Source card via register()
 import { getComponent } from '../registry'
 import { useStore } from '../../store/graph'
 
@@ -71,6 +71,67 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     fireEvent.click(selector)
 
     expect(useStore.getState().selectedIds).toEqual(['s1'])
+  })
+
+  it('routes Inspector entry actions to the matching Source and focuses its picker', async () => {
+    render1({ title: 'source', status: 'draft', config: {} })
+
+    requestSourceEntryAction('another-source', 'select')
+    expect(screen.queryByTestId('source-search')).not.toBeInTheDocument()
+
+    requestSourceEntryAction('s1', 'select')
+    const search = await screen.findByTestId('source-search')
+    await waitFor(() => expect(search).toHaveFocus())
+  })
+
+  it('does not route an Inspector entry action to a different Source', async () => {
+    const sourceData = (title: string) => ({ title, status: 'draft', config: {} })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: {
+      id: 'c', name: 'test', version: 1, edges: [],
+      nodes: [
+        { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: sourceData('first') },
+        { id: 's2', type: 'source', position: { x: 200, y: 0 }, data: sourceData('second') },
+      ],
+    } } as any)
+    render(<TooltipProvider><ReactFlowProvider>
+      <Source id="s1" data={sourceData('first') as never} />
+      <Source id="s2" data={sourceData('second') as never} />
+    </ReactFlowProvider></TooltipProvider>)
+
+    requestSourceEntryAction('s2', 'select')
+    fireEvent.click(await screen.findByText('orders'))
+
+    const [first, second] = useStore.getState().doc.nodes
+    expect(first.data.config.tableId).toBeUndefined()
+    expect(second.data.config.tableId).toBe('t1')
+  })
+
+  it('ignores Inspector entry actions when the Source is read-only', () => {
+    const fileClick = vi.spyOn(HTMLInputElement.prototype, 'click')
+    render1({ title: 'source', status: 'draft', config: {} })
+    // Exercise the listener replacement as permission changes, not only its initial closure.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    act(() => useStore.setState({ canvasRole: 'viewer' } as any))
+
+    requestSourceEntryAction('s1', 'select')
+    requestSourceEntryAction('s1', 'upload')
+    requestSourceEntryAction('s1', 'browse')
+
+    expect(screen.queryByTestId('source-search')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open a dataset')).not.toBeInTheDocument()
+    expect(fileClick).not.toHaveBeenCalled()
+  })
+
+  it('removes its Inspector entry listener when the Source unmounts', () => {
+    const remove = vi.spyOn(window, 'removeEventListener')
+    const view = render1({ title: 'source', status: 'draft', config: {} })
+    view.unmount()
+
+    expect(remove).toHaveBeenCalledWith(
+      'dataplay:source-entry:s1',
+      expect.any(Function),
+    )
   })
 
   it('keeps a selected provider exact summary on the card without field evidence clutter', async () => {
