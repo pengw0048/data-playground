@@ -60,20 +60,20 @@ describe('editor Example rows fixture', () => {
   it('keeps known Join integer columns numeric for an int + 1 code test', () => {
     const starter = JSON.parse(editorExampleRowsStarter([
       { name: 'id', type: 'bigint', capabilities: [] },
-      { name: 'user_id', type: 'int64', capabilities: [] },
-      { name: 'width', type: 'smallint', capabilities: [] },
-      { name: 'height', type: 'hugeint', capabilities: [] },
-      { name: 'ratio', type: 'double', capabilities: [] },
-      { name: 'enabled', type: 'boolean', capabilities: [] },
-      { name: 'tags', type: 'list<string>', capabilities: [] },
-      { name: 'metadata', type: 'struct<kind: string>', capabilities: [] },
+      { name: 'ids', type: 'int[]', capabilities: [] },
+      { name: 'flags', type: 'bool[]', capabilities: [] },
+      { name: 'ratios', type: 'float[]', capabilities: [] },
+      { name: 'tags', type: 'string[]', capabilities: [] },
+      { name: 'nested', type: 'list<int64>', capabilities: [] },
+      { name: 'metadata', type: 'struct<kind: int64>', capabilities: [] },
+      { name: 'lookup', type: 'map<string, int64>', capabilities: [] },
       { name: 'opaque', type: 'unknown', capabilities: [] },
     ])) as Array<Record<string, unknown>>
 
     const row = starter[0]
     expect(row).toMatchObject({
-      id: 1, user_id: 1, width: 1, height: 1, ratio: 1.5, enabled: true,
-      tags: [], metadata: { example: 'value' }, opaque: null,
+      id: 1, ids: [], flags: [], ratios: [], tags: [], nested: [],
+      metadata: { example: 'value' }, lookup: { example: 'value' }, opaque: null,
     })
     expect((row.id as number) + 1).toBe(2)
     expect(validateEditorExampleRows(JSON.stringify(starter)).ok).toBe(true)

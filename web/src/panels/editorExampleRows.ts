@@ -65,11 +65,14 @@ function starterValue(column: ColumnSchema): unknown {
   // The logical schema is the contract shown to the researcher. Prefer it to an
   // implementation-specific physical spelling when preparing a test fixture.
   const type = String(column.type || column.physicalType || '').toLowerCase()
+  // Match the outer shape before its element/member spelling. Real normalized
+  // schemas include both `list` and DuckDB-style `int[]`; declared schemas may
+  // retain parameterized spellings such as `list<int64>` or `struct<id:int64>`.
+  if (type.endsWith('[]') || /(list|array)/.test(type)) return []
+  if (/(struct|map|json|object)/.test(type)) return { example: 'value' }
   if (type.includes('bool')) return true
   if (/(^|[^a-z])(?:u?int(?:8|16|32|64|128)?|u?(?:big|huge|small|tiny)int|integer)(?:[^a-z]|$)/.test(type)) return 1
   if (/(float|double|real|decimal|numeric|number)/.test(type)) return 1.5
-  if (/(list|array)/.test(type)) return []
-  if (/(struct|map|json)/.test(type)) return { example: 'value' }
   if (type.includes('timestamp') || type.includes('datetime')) return '2026-01-01T00:00:00Z'
   if (type.includes('date')) return '2026-01-01'
   if (/(char|text|string|varchar|uuid)/.test(type)) return 'example'
