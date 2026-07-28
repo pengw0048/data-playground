@@ -6,7 +6,6 @@ import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
-import { FieldEvidenceButton } from '../../components/FieldEvidenceDetail'
 import { JoinWithRelated } from '../../components/JoinWithRelated'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
@@ -40,6 +39,16 @@ function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle
   if (facts.code === 'service_unavailable' || facts.status === 503) return 'offline'
   if (facts.code === 'resource_gone' || facts.status === 404 || facts.status === 410) return 'unavailable'
   return 'error'
+}
+
+function shortRevision(value: string): string {
+  return value.length > 24 ? `${value.slice(0, 12)}…${value.slice(-8)}` : value
+}
+
+function countSummary(rowCount: number | null | undefined, columnCount: number | null | undefined): string {
+  const rows = rowCount == null ? 'Rows unknown' : `${rowCount.toLocaleString()} ${rowCount === 1 ? 'row' : 'rows'}`
+  const columns = columnCount == null ? 'columns unknown' : `${columnCount} ${columnCount === 1 ? 'column' : 'columns'}`
+  return `${rows} · ${columns}`
 }
 
 const localDatasetBinding = (table: CatalogTable) => ({
@@ -83,10 +92,6 @@ function Source({ id, data }: NodeComponentProps) {
   const selectedRef = datasetRef && !isParameterRef(datasetRef) ? datasetRef : null
   const canvasParameters = useStore((s) => s.doc.parameters)
   const datasetParameters = (canvasParameters ?? []).filter((item) => item.type === 'dataset')
-  const providerRevision = providerDataset && selectedRef
-    ? datasetRefIdentity(selectedRef).revisionId : undefined
-  const providerRevisionLabel = providerRevision && providerRevision.length > 24
-    ? `${providerRevision.slice(0, 12)}…${providerRevision.slice(-8)}` : providerRevision
   const selectedExact = selectedRef ? datasetRefIdentity(selectedRef) : null
   const [exactDetail, setExactDetail] = useState<DatasetRevisionDetail | null>(null)
   const [exactDetailState, setExactDetailState] = useState<ExactRevisionState>('idle')
@@ -107,10 +112,6 @@ function Source({ id, data }: NodeComponentProps) {
     })
     return () => { live = false }
   }, [selectedExact?.datasetId, selectedExact?.revisionId, exactDetailRequest])
-
-  // Never fall back to the current catalog cache after an exact revision has been selected.
-  // An empty revision still supplies its column schema in the exact detail payload.
-  const evidenceColumns = selectedExact ? exactDetail?.preview.columns : table?.columns
 
   useEffect(() => {
     if (!canEdit) { setOpen(false); setDialog(false) }
@@ -166,15 +167,28 @@ function Source({ id, data }: NodeComponentProps) {
     setDialog(false); setOpen(false)
   }
 
-  const headMeta = table
-    // an UNKNOWN count (null/undefined) shows "—", not a fake "0 rows" (UX-14)
-    ? `${table.rowCount == null ? '—' : table.rowCount.toLocaleString()} rows · ${table.columns.length} cols · ${table.version ?? 'v1'}`
-    : null
-  const meta = headMeta
-    ? selectedExact ? `Current head · ${headMeta}` : headMeta
-    : providerDataset
-      ? `${data.config.providerReadMode === 'exact' ? 'exact revision' : 'mutable preview only'} · ${data.config.providerName ?? 'provider'}`
-      : 'pick a table'
+  // A card is for choosing and orienting.  It deliberately names one source, one version state,
+  // and one count/schema summary; opaque identities belong in Inspector → Connection details.
+  const sourceLabel = providerDataset ? data.config.providerName ?? 'Provider' : 'Local catalog'
+  const meta = datasetParameter
+    ? `${sourceLabel} · Run-time dataset parameter · Rows and columns vary by run`
+    : selectedExact
+      ? exactDetailState === 'available' && exactDetail
+        ? `${sourceLabel} · Version ${shortRevision(exactDetail.revisionId)} · ${countSummary(exactDetail.summary.rowCount, exactDetail.preview.columns.length)}`
+        : exactDetailState === 'unavailable'
+          ? `${sourceLabel} · Selected version unavailable`
+          : exactDetailState === 'permission'
+            ? `${sourceLabel} · Selected version needs permission`
+            : exactDetailState === 'offline'
+              ? `${sourceLabel} · Selected version cannot be checked`
+              : exactDetailState === 'error'
+                ? `${sourceLabel} · Selected version could not be checked`
+                : `${sourceLabel} · Selected version · Loading rows and columns…`
+      : table
+        ? `${sourceLabel} · Current version · ${countSummary(table.rowCount, table.columns.length)}`
+        : providerDataset
+          ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Exact version not selected' : 'Current version'} · Rows and columns unknown`
+          : 'Choose a dataset'
 
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
@@ -255,24 +269,6 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       </Popover>
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
-      {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
-        Pinned provider revision {providerRevisionLabel}
-      </div>}
-      {selectedExact && exactDetailState === 'available' && exactDetail && (
-        <div aria-label="Pinned revision facts" className="mt-1 break-all text-[9.5px] text-muted-foreground">
-          {selectedRef?.kind === 'as_of'
-            ? `As-of intent ${formatRevisionUtc(selectedRef.asOf)} resolved once to pinned exact revision ${exactDetail.revisionId}`
-            : `Pinned exact revision ${exactDetail.revisionId}`} · {exactDetail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows · {exactDetail.preview.columns.length} cols
-        </div>
-      )}
-      {evidenceColumns && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
-        <summary className="cursor-pointer font-medium text-muted-foreground">
-          {selectedExact ? `Pinned revision ${selectedExact.revisionId} field evidence` : 'Field evidence'} · {evidenceColumns.length} columns
-        </summary>
-        <div className="mt-1 grid max-h-28 gap-0.5 overflow-y-auto">
-          {evidenceColumns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
-        </div>
-      </details>}
       {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
         disabled={!canEdit} onChange={(event) => updateConfig(id, {
           datasetRef: event.target.value ? { parameterRef: event.target.value } : undefined,
@@ -438,8 +434,8 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
   const capabilityError = availability === 'error' && !exactAvailable && !asOfAvailable
   const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
     : !controlAvailable ? 'Revision selection unavailable'
-      : selected?.kind === 'as_of' ? `As of ${formatRevisionUtc(selected.asOf)} → ${selectedExact?.revisionId}`
-        : selectedExact ? `Change pinned revision ${selectedExact.revisionId}`
+      : selected?.kind === 'as_of' ? `Change version selected as of ${formatRevisionUtc(selected.asOf)}`
+        : selectedExact ? 'Change selected version'
           : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
             : asOfAvailable ? 'Choose revision as of a time' : 'Pin exact revision'
 
@@ -460,10 +456,10 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
           <button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button>
         </div>
       )}
-      {selectedExact && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Opening selected revision {selectedExact.revisionId}…</div>}
+      {selectedExact && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Checking selected version…</div>}
       {selectedExact && detailState === 'unavailable' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Selected revision {selectedExact.revisionId} or its registration is missing or compacted. Selection preserved; latest was not substituted.
+          Selected version is missing or compacted. Selection preserved; latest was not substituted.
           {staleLastKnown}{' '}
           {registrationReplaced && 'The current catalog registration has a different dataset identity. '}
           {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another retained revision</button>}
@@ -474,24 +470,24 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
       )}
       {selectedExact && detailState === 'permission' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Permission to open exact revision {selectedExact.revisionId} was lost. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
-          <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry exact revision</button>
+          Permission to open the selected version was lost. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry selected version</button>
         </div>
       )}
       {selectedExact && detailState === 'offline' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          The provider is offline, so exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          The provider is offline, so the selected version could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
           <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry provider</button>
         </div>
       )}
       {selectedExact && detailState === 'error' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          The selected version could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
           <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry verification</button>
         </div>
       )}
       {showControl && <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
-        <div className="px-2 py-1 text-[10px] text-muted-foreground">Persist one exact provider revision. The Source will never retarget it to latest.</div>
+        <div className="px-2 py-1 text-[10px] text-muted-foreground">Select one retained version. This Source will not switch to latest automatically.</div>
         {selected && (
           <button type="button" onClick={() => { onChange(undefined); setOpen(false) }}
             className="w-full rounded-md px-2 py-1.5 text-left text-[11px] font-semibold text-primary hover:bg-accent">

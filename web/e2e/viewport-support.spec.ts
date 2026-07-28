@@ -145,6 +145,16 @@ test.describe('minimum viewport support', () => {
       await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `Canvas ${name}`)
     }
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
+    // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
+    // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
+    await expect(node).toContainText(/Local catalog · Current version · \d[\d,]* rows · \d+ columns/)
+    await expect(node.getByText(/Field evidence/i)).toHaveCount(0)
+    const connectionDetails = page.getByTestId('inspector').getByText('Connection details', { exact: true })
+    await expectFullyInViewport(page, connectionDetails, 'source connection details')
+    await connectionDetails.click()
+    await expect(page.getByLabel('Source connection details')).toBeVisible()
+    await expect(page.getByLabel('Source connection details').getByText('Catalog registration')).toBeVisible()
+    await expect(page.getByLabel('Source connection details').getByText(/Field evidence/i)).toBeVisible()
     // Inspector run control stays reachable at the minimum viewport (sources label it Count rows).
     await expectFullyInViewport(
       page,
