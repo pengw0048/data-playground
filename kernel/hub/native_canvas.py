@@ -39,7 +39,9 @@ _CANVAS_KEYS = frozenset({"name", "nodes", "edges", "requirements", "parameters"
 _NODE_KEYS = frozenset({"id", "type", "position", "data", "parentId"})
 _EDGE_KEYS = frozenset({"id", "source", "target", "sourceHandle", "targetHandle", "data"})
 _NODE_DATA_KEYS = frozenset({"title", "status", "config", "bypassed", "disabled"})
-_NODE_DATA_RUNTIME_FIELDS = frozenset({"history", "lastRun", "meta", "result"})
+_NODE_DATA_RUNTIME_FIELDS = frozenset({
+    "history", "lastRun", "currentOutputVersionId", "meta", "result",
+})
 _CORE_CONFIG_KEYS = frozenset({
     "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
     "delimiter", "header", "n", "seed", "method", "predicate", "filterBuilder", "select", "columns", "source", "processor",

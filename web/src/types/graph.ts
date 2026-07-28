@@ -121,6 +121,7 @@ export interface NodeData {
   lastRun?: LastRun
   needsFullPass?: boolean
   history?: NodeVersion[]
+  currentOutputVersionId?: string
   [k: string]: unknown
 }
 

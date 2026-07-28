@@ -233,7 +233,12 @@ function cloneSubgraph(nodes: CanvasNode[], edges: CanvasEdge[], dx = 40, dy = 4
     id: idMap.get(n.id)!,
     parentId: n.parentId && idMap.has(n.parentId) ? idMap.get(n.parentId)! : null, // keep containment only if the parent came too
     position: { x: n.position.x + dx, y: n.position.y + dy },
-    data: { ..._clone(n.data), status: 'draft' as const, history: [] },
+    data: {
+      ..._clone(n.data),
+      status: 'draft' as const,
+      history: [],
+      currentOutputVersionId: undefined,
+    },
   }))
   const clonedEdges = edges
     .filter((e) => idMap.has(e.source) && idMap.has(e.target))
@@ -2187,7 +2192,13 @@ export const useStore = create<Store>((set, get) => ({
       parentId: null, // a duplicate lands on the top-level canvas (absolute coords below)
       // land in a clear spot near the original, never stacked on top of it
       position: freePosition(get().doc.nodes, { x: n.position.x + 40, y: n.position.y + 40 }),
-      data: { ...n.data, status: 'draft', history: [], autoPlaced: false },
+      data: {
+        ...n.data,
+        status: 'draft',
+        history: [],
+        currentOutputVersionId: undefined,
+        autoPlaced: false,
+      },
     }
     set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, copy] }, selectedId: copy.id, selectedIds: [copy.id] }))
   },
@@ -3367,7 +3378,15 @@ export const useStore = create<Store>((set, get) => ({
           nodes: s.doc.nodes.map((n) => {
             if (n.id === id) {
               const v = (n.data.history ?? []).find((h) => h.id === versionId)
-              return v ? { ...n, data: { ...n.data, config: { ...v.config }, status: 'latest' } } : n
+              return v ? {
+                ...n,
+                data: {
+                  ...n.data,
+                  config: { ...v.config },
+                  status: 'latest',
+                  currentOutputVersionId: v.id,
+                },
+              } : n
             }
             // restoring a node's config invalidates its dependents
             if (stale.has(n.id) && n.data.status === 'latest') {
@@ -5054,7 +5073,10 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
                 : 'run · result',
             config: { ...node.data.config },
           }
-          g.updateData(nodeId, { history: [...(node.data.history ?? []), version] })
+          g.updateData(nodeId, {
+            history: [...(node.data.history ?? []), version],
+            currentOutputVersionId: version.id,
+          })
         }
         void g.refreshCatalog()
       }

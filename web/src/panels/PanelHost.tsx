@@ -143,7 +143,7 @@ function PanelTitle({ nodeId, title, kind, dark, maximized, onToggleMax, onClose
   nodeId: string; title: string; kind: PanelKind; dark?: boolean
   maximized?: boolean; onToggleMax?: () => void; onClose: () => void
 }) {
-  const label = { data: 'data', run: 'run', history: 'history', lineage: 'lineage', section: 'section' }[kind]
+  const label = { data: 'data', run: 'run', history: 'output versions', lineage: 'lineage', section: 'section' }[kind]
   const runPreview = useStore((s) => s.runPreview)
   return (
     <div

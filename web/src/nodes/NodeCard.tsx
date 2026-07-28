@@ -247,7 +247,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}
-          <ActionIcon name="clock" label="History" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
+          <ActionIcon name="clock" label="Output versions" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
           {hasCode && <ActionIcon name="code" label={canEdit ? 'Edit code' : 'View code'} onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
           <MoreMenu id={id} kind={kind} canEdit={canEdit} disabled={disabled} bypassed={bypassed} />
         </div>
