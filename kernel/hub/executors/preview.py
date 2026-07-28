@@ -131,7 +131,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
     reservoir_preview = _reservoir_preview_allowed(graph, node_id, preview_adapter)
     engine = BuildEngine(graph, preview_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_builders=node_builders, node_specs=node_specs,
-                            warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)
+                            warm=cache, warm_scope="preview", output_node=node_id,
+                            reservoir_preview=reservoir_preview)
 
     holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
 

@@ -51,6 +51,10 @@ Relation = duckdb.DuckDBPyRelation
 # Node kinds whose result cannot be faithfully computed on a truncated sample (P8).
 NOT_PREVIEWABLE_KINDS = {"aggregate", "write", "section"}
 _TRANSFORM_KINDS = {"transform"}
+_SORT_PREVIEW_REASON = (
+    "Sorting needs all input rows to determine the final order. "
+    "Run this step to see the result."
+)
 
 
 
@@ -1143,7 +1147,24 @@ class BuildEngine:
             and isinstance(self.node_builders.get(t), _PreparedNodeRegistration)
         ):
             self._prepare_node(node)
-        inputs = self._inputs(node)
+        try:
+            inputs = self._inputs(node)
+        except NotPreviewable as exc:
+            # A configured Sort has its own full-pass preview semantics. An upstream full-pass node
+            # is lowered first and can refuse before the Sort branch below runs, but the requested
+            # target still needs ordering-specific guidance. Keep setup/configuration refusals and
+            # every other target attached to the node that actually raised them.
+            if (
+                t == "sort"
+                and node.id == self._output_node
+                and not self.full
+                and not _bypassed(node)
+                and (cfg.get("by") or "").strip()
+                and exc.suggested_action == "run"
+            ):
+                raise NotPreviewable(
+                    node, _SORT_PREVIEW_REASON, suggested_action="run") from exc
+            raise
         # plugin-provided node kinds (§8.1) — dispatch BEFORE the no-inputs guard so a plugin
         # can define a 0-input source/generator. Honor the plugin's declared previewable.
         if t in self.node_builders:
@@ -1235,8 +1256,7 @@ class BuildEngine:
             if not self.full:
                 raise NotPreviewable(
                     node,
-                    "Sorting needs all input rows to determine the final order. Run this step to "
-                    "see the result.",
+                    _SORT_PREVIEW_REASON,
                     suggested_action="run",
                 )
             return parent.order(by)
