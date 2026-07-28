@@ -24,6 +24,9 @@
           "canvas_not_found",
           "method_not_allowed",
           "conflict",
+          "retained_upstream_stale",
+          "retained_upstream_unavailable",
+          "retained_upstream_expired",
           "local_run_input_binding_failed",
           "resource_gone",
           "payload_too_large",
@@ -4802,6 +4805,55 @@
         "title": "DurableTaskRetryRequest",
         "type": "object"
       },
+      "EditorTestInput": {
+        "description": "Opaque, server-proved identity of the retained rows used by one editor preview.",
+        "properties": {
+          "label": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "nodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "portId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Portid",
+            "type": "string"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
+          },
+          "runId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Runid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId",
+          "nodeId",
+          "portId",
+          "label"
+        ],
+        "title": "EditorTestInput",
+        "type": "object"
+      },
       "EstimateRequest": {
         "properties": {
           "graph": {
@@ -9375,6 +9427,62 @@
         "title": "RestoreRevisionTaskV1",
         "type": "object"
       },
+      "RetainedEditorPreviewRequest": {
+        "additionalProperties": false,
+        "description": "Editor-only preview request; the server selects the retained run and artifact.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "k": {
+            "default": 50,
+            "maximum": 2000.0,
+            "minimum": 0.0,
+            "title": "K",
+            "type": "integer"
+          },
+          "nodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "exclusiveMaximum": 2000.0,
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "parameterBindings": {
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "maxItems": 128,
+            "title": "Parameterbindings",
+            "type": "array"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
+          }
+        },
+        "required": [
+          "graph",
+          "nodeId"
+        ],
+        "title": "RetainedEditorPreviewRequest",
+        "type": "object"
+      },
       "RowIdentityCertificationFieldV1": {
         "properties": {
           "arrowType": {
@@ -10869,6 +10977,16 @@
             ],
             "title": "Completeness",
             "type": "string"
+          },
+          "editorTestInput": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EditorTestInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "error": {
             "default": false,
@@ -25525,6 +25643,89 @@
           }
         },
         "summary": "Run"
+      }
+    },
+    "/api/run/editor-preview": {
+      "post": {
+        "description": "Test one Transform against its newest current retained immediate-upstream result.",
+        "operationId": "preview_transform_with_retained_upstream_api_run_editor_preview_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetainedEditorPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SampleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preview Transform With Retained Upstream"
       }
     },
     "/api/run/estimate": {

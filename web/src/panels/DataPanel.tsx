@@ -19,9 +19,16 @@ import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
 
-export function DataPanel({ nodeId }: { nodeId: string }) {
-  const preview = useStore((s) => s.previews[nodeId])
+export function DataPanel({ nodeId, editorPreview }: {
+  nodeId: string
+  editorPreview?: { onRunUpstream?: () => void }
+}) {
+  const preview = useStore((s) => (
+    editorPreview ? s.editorPreviews[nodeId] : s.previews[nodeId]
+  ))
   const runPreview = useStore((s) => s.runPreview)
+  const runEditorPreview = useStore((s) => s.runEditorPreview)
+  const previewAction = editorPreview ? runEditorPreview : runPreview
   const requestRun = useStore((s) => s.requestRun)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -45,7 +52,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   )) ?? (outputPorts.length <= 1 && runOutputs.length === 1 ? runOutputs[0] : undefined)
   // A terminal run can fail or be cancelled after another named output was durably committed.
   // Keep that artifact readable without implying that non-committed sibling ports succeeded.
-  const selectedOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
+  const selectedOutput = !editorPreview
+    && selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
     ? selectedRunOutput
     : undefined
   const pushToast = useStore((s) => s.pushToast)
@@ -56,7 +64,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
-    if (!preview || preview.portId !== requestPortId) runPreview(nodeId, 0, requestPortId)
+    if (!preview || preview.portId !== requestPortId) previewAction(nodeId, 0, requestPortId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, requestPortId, preview?.portId])
   useEffect(() => setResultMode('sample'), [nodeId])
@@ -73,12 +81,12 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const nextPage = (rowsRead: number) => {
     previousOffsets.current.push(offset)
     setDetail(null)
-    runPreview(nodeId, offset + rowsRead, requestPortId)
+    previewAction(nodeId, offset + rowsRead, requestPortId)
   }
   const previousPage = () => {
     const prior = previousOffsets.current.pop() ?? Math.max(0, offset - PAGE)
     setDetail(null)
-    runPreview(nodeId, prior, requestPortId)
+    previewAction(nodeId, prior, requestPortId)
   }
   const choosePort = (portId: string) => {
     setPortSelection({ nodeId, portId })
@@ -89,17 +97,27 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
     <>
       <OutputPortSelector ports={outputPorts} outputs={runOutputs}
         selectedPortId={selectedPortId} onSelect={choosePort} />
-      <SelectedOutputOutcome runStatus={run?.status?.status} output={selectedRunOutput} />
+      {!editorPreview && (
+        <SelectedOutputOutcome runStatus={run?.status?.status} output={selectedRunOutput} />
+      )}
+      {editorPreview && preview?.result?.editorTestInput && (
+        <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
+          Testing with {preview.result.editorTestInput.label} result
+          {preview.result.editorTestInput.rows != null
+            ? ` · ${preview.result.editorTestInput.rows.toLocaleString()} rows`
+            : ''}
+        </div>
+      )}
       {content}
     </>
   )
 
   if (!preview || preview.portId !== requestPortId) return withOutputPorts(<Skeleton />)
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
-    return withOutputPorts(<StalePreview onRefresh={() => runPreview(nodeId, 0, requestPortId)} />)
+    return withOutputPorts(<StalePreview onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
-  if (preview.error) return withOutputPorts(<ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
+  if (preview.error) return withOutputPorts(<ErrorState reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
   const res = preview.result!
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
@@ -111,7 +129,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
         : undefined} />)
   }
-  if (res.error) return withOutputPorts(<ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
+  if (res.error) return withOutputPorts(<ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
   const isMetric = node?.type === 'metric'
   const isChart = node?.type === 'chart'
   const artifactPresentation: ArtifactPresentation | undefined = isChart
@@ -141,8 +159,16 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
-    return withOutputPorts(<NotPreviewable reason={res.reason ?? 'needs a full pass'}
-      onRun={() => requestRun(nodeId)} modeToggle={resultModeToggle} />)
+    return withOutputPorts(<NotPreviewable
+      title={editorPreview ? 'Run upstream' : undefined}
+      reason={res.reason ?? (editorPreview
+        ? 'No current retained upstream result is available.'
+        : 'needs a full pass')}
+      onRun={editorPreview
+        ? editorPreview.onRunUpstream
+        : () => requestRun(nodeId)}
+      runLabel={editorPreview ? 'Run upstream →' : undefined}
+      modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
     return withOutputPorts(<FullResult uri={selectedOutput.uri}
@@ -1274,9 +1300,11 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
   )
 }
 
-function NotPreviewable({ reason, onRun, modeToggle }: {
+function NotPreviewable({ title = 'Not sample-previewable', reason, onRun, runLabel = 'Run a full pass →', modeToggle }: {
+  title?: string
   reason: string
   onRun?: () => void
+  runLabel?: string
   modeToggle?: ReactNode
 }) {
   return (
@@ -1285,9 +1313,9 @@ function NotPreviewable({ reason, onRun, modeToggle }: {
       <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
         <Icon name="power" size={18} />
       </div>
-      <div className="text-[13px] font-semibold text-foreground">Not sample-previewable</div>
+      <div className="text-[13px] font-semibold text-foreground">{title}</div>
       <div className="mx-auto mt-[5px] max-w-[320px] text-[11.5px] leading-normal">{reason}</div>
-      {onRun && <Button variant="outline" size="sm" onClick={onRun} className="mt-3.5">Run a full pass →</Button>}
+      {onRun && <Button variant="outline" size="sm" onClick={onRun} className="mt-3.5">{runLabel}</Button>}
     </div>
   )
 }

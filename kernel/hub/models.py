@@ -1691,6 +1691,16 @@ class UserCodeExceptionDetail(Wire):
     guidance: str | None = None
 
 
+class EditorTestInput(Wire):
+    """Opaque, server-proved identity of the retained rows used by one editor preview."""
+
+    run_id: str = Field(min_length=1, max_length=512)
+    node_id: str = Field(min_length=1, max_length=256)
+    port_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=256)
+    rows: int | None = Field(default=None, ge=0)
+
+
 class SampleResult(Wire):
     """One page of rows plus an explicit statement of what that page represents.
 
@@ -1745,6 +1755,9 @@ class SampleResult(Wire):
     )
     sample_provenance: SampleProvenance | None = None
     preview_ref: str | None = None
+    # Present only for the fullscreen Transform editor's retained-upstream endpoint. The storage URI
+    # stays server-side; this is user-facing evidence, not an input accepted by any later Canvas run.
+    editor_test_input: EditorTestInput | None = None
     # The exact, secret-free Source revisions used for this preview. Inner keys intentionally remain
     # snake_case because the same minimal dict is persisted verbatim in run admission/history.
     input_manifest: list[dict[str, str]] | None = None

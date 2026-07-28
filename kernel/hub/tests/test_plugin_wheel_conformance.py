@@ -673,6 +673,7 @@ with TestClient(app) as client:
                   if item["name"] == "dp-descriptor-contract")
     assert status["state"] == "active"
     assert set(status["effective_capabilities"]) == {
+        "adapter:e2e-full-run-only",
         "node:descriptor_contract", "node:descriptor_contract_unavailable",
     }
 

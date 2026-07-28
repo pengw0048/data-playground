@@ -472,6 +472,15 @@ export const api = {
     req<SampleResult>(`/run/${encodeURIComponent(runId)}/sample`, {
       method: 'POST', body: JSON.stringify({ nodeId, portId, k, offset }),
     }),
+  retainedEditorPreview: (
+    doc: CanvasDoc, nodeId: string, k = 50, offset = 0,
+    portId?: string, parameterBindings?: CanvasParameterBinding[],
+  ) => req<SampleResult>('/run/editor-preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      graph: toGraph(doc), nodeId, portId, k, offset, parameterBindings,
+    }),
+  }),
   fullResultExportUrl: (runId: string, nodeId: string, portId: string, filename?: string) =>
     `${BASE}${fullResultExportPath(runId, nodeId, portId, filename)}`,
   preflightFullResultExport: async (runId: string, nodeId: string, portId: string, filename?: string) => {

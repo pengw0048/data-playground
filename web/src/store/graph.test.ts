@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  retainedEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
@@ -17,6 +18,8 @@ vi.mock('../api/client', () => ({
       ? apiMocks.listCanvases
       : property === 'listRuns'
         ? apiMocks.listRuns
+      : property === 'retainedEditorPreview'
+        ? apiMocks.retainedEditorPreview
       : property === 'getCanvas'
         ? apiMocks.getCanvas
         : property === 'canvasTransformReferences'
@@ -104,6 +107,7 @@ describe('graph store — core authority ops', () => {
     localStorage.clear()
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
+    apiMocks.retainedEditorPreview.mockReset()
     apiMocks.getCanvas.mockReset()
     apiMocks.canvasTransformReferences.mockReset().mockResolvedValue([])
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
@@ -640,6 +644,67 @@ describe('graph store — core authority ops', () => {
     await first
 
     expect(useStore.getState().previews.sample?.result).toBeUndefined()
+  })
+
+  it('tests Transform code through the server-owned retained candidate without binding formal preview state', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    const sample = NODE('sample', 'sample')
+    sample.data.config = { n: 25, seed: 42 }
+    const transform = NODE('transform', 'transform')
+    transform.data.config = { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, sample, transform],
+      edges: [
+        { id: 'source-sample', source: 'source', target: 'sample', data: { wire: 'dataset' as const } },
+        { id: 'sample-transform', source: 'sample', sourceHandle: 'out', target: 'transform', targetHandle: 'in', data: { wire: 'sample' as const } },
+      ],
+    }
+    const retained = {
+      ...previewResult('retained'),
+      editorTestInput: {
+        runId: 'retained-run', nodeId: 'sample', portId: 'out', label: 'sample', rows: 25,
+      },
+    }
+    const formalPreview = { sample: { result: previewResult('formal') } }
+    const formalBindings = { sample: { inputManifest: [{ node_id: 'source' }] } }
+    apiMocks.retainedEditorPreview.mockResolvedValue(retained)
+    useStore.setState({
+      doc, editorPreviews: {}, previews: formalPreview, previewBindings: formalBindings,
+    } as any)
+
+    await useStore.getState().runEditorPreview('transform')
+
+    expect(apiMocks.listRuns).not.toHaveBeenCalled()
+    expect(apiMocks.retainedEditorPreview).toHaveBeenCalledWith(
+      doc, 'transform', 50, 0, undefined, [],
+    )
+    expect(useStore.getState().editorPreviews.transform?.result).toEqual(retained)
+    expect(useStore.getState().previews).toBe(formalPreview)
+    expect(useStore.getState().previewBindings).toBe(formalBindings)
+  })
+
+  it('turns an explicit retained-input miss into the editor-only Run upstream state', async () => {
+    const upstream = NODE('sample', 'sample')
+    const transform = NODE('transform', 'transform')
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [upstream, transform],
+      edges: [{
+        id: 'sample-transform', source: 'sample', sourceHandle: 'out',
+        target: 'transform', targetHandle: 'in', data: { wire: 'sample' as const },
+      }],
+    }
+    apiMocks.retainedEditorPreview.mockRejectedValue(
+      new KernelError(409, 'no current input', 'retained_upstream_stale'))
+    useStore.setState({ doc, editorPreviews: {} })
+
+    await useStore.getState().runEditorPreview('transform')
+
+    expect(useStore.getState().editorPreviews.transform?.result).toMatchObject({
+      notPreviewable: true,
+      reason: 'No current retained sample result is available.',
+    })
+    expect(useStore.getState().previews.transform).toBeUndefined()
   })
 
   it('binds multi-output preview freshness to the selected port and preserves it on refresh', async () => {

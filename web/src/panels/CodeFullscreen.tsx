@@ -18,10 +18,13 @@ export function CodeFullscreen() {
   const node = fs ? doc.nodes.find((n) => n.id === fs.nodeId) : undefined
   const runnable = fs ? nodeRunnable(doc, fs.nodeId) : false
   const previews = useStore((s) => s.previews)
+  const editorPreviews = useStore((s) => s.editorPreviews)
   const processors = useStore((s) => s.processors)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const inputCols = useInputColumns(fs?.nodeId ?? '')  // THIS node's input schema — the precise completions
-  const { updateConfig, closeCodeFullscreen: close, runPreview, promote } = useStore.getState()
+  const {
+    updateConfig, closeCodeFullscreen: close, runPreview, runEditorPreview, requestRun, promote,
+  } = useStore.getState()
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
     window.addEventListener('keydown', onKey)
@@ -42,9 +45,11 @@ export function CodeFullscreen() {
   // references). Fall back to THIS node's own last-preview columns when the input schema isn't resolved yet
   // — NOT every node's previews (that leaked unrelated columns from across the whole graph).
   const inputNames = inputCols.map((c) => c.name)
-  const preview = previews[fs.nodeId]
+  const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
   const own = preview && previewIsCurrent(preview, doc, fs.nodeId) ? (preview.result?.columns ?? []).map((c) => c.name) : []
   const completions = [...new Set(inputNames.length ? inputNames : own)]
+  const upstreamEdges = isTransform ? doc.edges.filter((edge) => edge.target === fs.nodeId) : []
+  const editorUpstreamNodeId = upstreamEdges.length === 1 ? upstreamEdges[0]?.source : undefined
 
   return (
     <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>
@@ -71,7 +76,12 @@ export function CodeFullscreen() {
           {/* run + see results without leaving the editor — the node runs on its current input */}
           {canPreview && (
             <div className="flex min-h-0 w-[42%] max-w-[640px] flex-col overflow-auto border-l border-border">
-              <DataPanel nodeId={fs.nodeId} />
+              <DataPanel nodeId={fs.nodeId} editorPreview={isTransform ? {
+                onRunUpstream: editorUpstreamNodeId ? () => {
+                  close()
+                  void requestRun(editorUpstreamNodeId)
+                } : undefined,
+              } : undefined} />
             </div>
           )}
         </div>
@@ -101,9 +111,11 @@ export function CodeFullscreen() {
               </button>
             )}
             {canPreview && (
-              <button onClick={() => runPreview(fs.nodeId)}
+              <button onClick={() => (
+                isTransform ? runEditorPreview(fs.nodeId) : runPreview(fs.nodeId)
+              )}
                 className="inline-flex items-center gap-[5px] rounded-md bg-primary px-4 py-2 text-[12.5px] font-semibold text-primary-foreground hover:bg-primary/90">
-                <Icon name="eye" size={12} /> Preview
+                <Icon name="eye" size={12} /> {isTransform ? 'Test code' : 'Preview'}
               </button>
             )}
           </div>
