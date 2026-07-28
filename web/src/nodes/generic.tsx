@@ -183,10 +183,12 @@ function NumberField({ param, value, draft, onDraft, onCommit }: {
   const text = draft ?? (value == null ? '' : String(value))
   const reason = draft !== undefined
     ? numericParamReason(param, draft)
-    : value != null && value !== '' && (typeof value !== 'number'
-      || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value)))
-      ? numericTypeReason(param)
-      : null
+    : value == null || value === ''
+      ? numericParamReason(param, text)
+      : typeof value !== 'number'
+        || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value))
+        ? numericTypeReason(param)
+        : null
   const parsedText = parseNumericParam(text, param.type as 'int' | 'float')
   const clearHint = parsedText.kind !== 'valid' ? null
     : param.default != null && parsedText.value !== Number(param.default)

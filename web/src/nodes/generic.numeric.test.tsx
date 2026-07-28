@@ -97,4 +97,19 @@ describe('generic numeric plugin fields', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Count is required')
     expect(useStore.getState().doc.nodes[0].data.config.count).toBe(7)
   })
+
+  it('reports a required field that loads without a value', () => {
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: state.doc.nodes.map((node) => ({
+          ...node,
+          data: { ...node.data, config: { limit: 10 } },
+        })),
+      },
+    }))
+
+    render(<NodeParamFields nodeId="plugin" />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Count is required')
+  })
 })
