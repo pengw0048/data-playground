@@ -1329,11 +1329,35 @@ function hubExecutionAvailable(get: () => Store): boolean {
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
 export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'transforms' | 'relationships'
 
+function friendlyJoinInputRefusal(message: string): string | null {
+  const prefix = 'invalid graph: '
+  if (!message.startsWith(prefix)) return null
+  const clauses = message.slice(prefix.length).split('; ')
+  const parsed = clauses.map((clause) => (
+    /^Join node '([^']+)' requires exactly one incoming edge on input '([ab])'$/.exec(clause)
+  ))
+  // Translate only a complete canonical Join-input refusal. Any extra structural evidence must
+  // remain byte-for-byte visible rather than being hidden behind a partial recovery suggestion.
+  if (parsed.some((match) => match === null)) return null
+  if (parsed.length === 1) {
+    return parsed[0]![2] === 'a'
+      ? 'This Join needs a left dataset before it can run.'
+      : 'This Join needs a right dataset before it can run.'
+  }
+  if (parsed.length === 2
+      && parsed[0]![1] === parsed[1]![1]
+      && new Set(parsed.map((match) => match![2])).size === 2) {
+    return 'This Join needs a left dataset and a right dataset before it can run.'
+  }
+  return null
+}
+
 // The kernel is authoritative for graph validity. These metadata calls otherwise intentionally
 // tolerate an offline kernel, but a deliberate invalid_graph refusal needs a visible explanation.
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
-  const message = error.message || 'The graph cannot run.'
+  const message = friendlyJoinInputRefusal(error.message)
+    ?? (error.message || 'The graph cannot run.')
   if (!state.toasts.some((toast) => toast.kind === 'error' && toast.msg === message)) {
     state.pushToast(message, 'error')
   }
