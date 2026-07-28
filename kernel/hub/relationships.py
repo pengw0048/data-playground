@@ -415,6 +415,9 @@ def _input_identity(graph: Graph, node_id: str, catalog) -> RowReferenceInputIde
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
                  catalog, resolve_adapter, storage=None) -> JoinAnalysis:
     """Fence every managed input through all uniqueness scans."""
+    target = g.node_map(graph).get(node_id)
+    if target is None or target.type != "join":
+        return JoinAnalysis()
     from hub.storage import source_read_scope
 
     with source_read_scope(

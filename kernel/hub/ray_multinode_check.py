@@ -284,8 +284,10 @@ def main() -> int:
              "data": {"config": {"on": "cat", "how": "inner"}}},
         ], "edges": [
             {"id": "h1", "source": "src", "target": "agg", "data": {"wire": "dataset"}},
-            {"id": "h2", "source": "agg", "target": "join", "data": {"wire": "dataset"}},
-            {"id": "h3", "source": "dim", "target": "join", "data": {"wire": "dataset"}},
+            {"id": "h2", "source": "agg", "target": "join", "targetHandle": "a",
+             "data": {"wire": "dataset"}},
+            {"id": "h3", "source": "dim", "target": "join", "targetHandle": "b",
+             "data": {"wire": "dataset"}},
         ]})
         hive_status = rr.run_unit(hive_graph, "join", f"s3://{bucket}/native_hive_out.parquet")
         for _ in range(1800):
@@ -334,8 +336,10 @@ def main() -> int:
         {"id": "l", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": src}}},
         {"id": "r", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": dim}}},
         {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {"on": "cat", "how": "inner"}}},
-    ], "edges": [{"id": "e1", "source": "l", "target": "j", "data": {"wire": "dataset"}},
-                 {"id": "e2", "source": "r", "target": "j", "data": {"wire": "dataset"}}]})
+    ], "edges": [{"id": "e1", "source": "l", "target": "j", "targetHandle": "a",
+                  "data": {"wire": "dataset"}},
+                 {"id": "e2", "source": "r", "target": "j", "targetHandle": "b",
+                  "data": {"wire": "dataset"}}]})
     stj = rr.run_unit(jg, "j", jout)
     for _ in range(1800):
         if rr.status(stj.run_id).status in ("done", "failed", "cancelled"):
