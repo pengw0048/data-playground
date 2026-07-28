@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   cancelManagedSidecarMergeTask: vi.fn(), retryManagedSidecarMergeTask: vi.fn(), datasetRevision: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
-vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
+vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">result</div> }))
 
 import { useStore } from '../store/graph'
 import { JobsView } from './JobsView'
@@ -301,17 +301,69 @@ describe('JobsView', () => {
     expect(screen.getByText(/Refresh failed; showing the last successful first page\. Last successful refresh:/)).toBeVisible()
   })
 
-  it('deep-links and opens a retained artifact by run/node/port identity', async () => {
+  it('deep-links and opens a retained result by run/node/port identity', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({ status: 'done', error: null, outputs: [{
       nodeId: 'write-1', portId: 'out', portLabel: 'Result', wire: 'dataset',
       publicationKind: 'result', outcome: 'committed', uri: 'file:///result.parquet', rows: 12,
     }] })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
-    fireEvent.click(screen.getByRole('button', { name: 'Open Result' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open result' }))
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('output=write-1%3Aout'))
     expect(screen.getByTestId('full-result')).toBeVisible()
+    expect(screen.getByRole('complementary', { name: 'Retained result' })).toBeVisible()
+  })
+
+  it('keeps a completed row concise and moves multiple port identities into technical evidence', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      status: 'done', progress: 1, error: null, rows: 1,
+      outputs: [
+        {
+          nodeId: 'transform-1', portId: 'clean', portLabel: 'Clean rows', wire: 'dataset',
+          publicationKind: 'result', outcome: 'committed', uri: 'file:///clean.parquet', rows: 1,
+        },
+        {
+          nodeId: 'transform-1', portId: 'rejected', portLabel: 'Rejected rows', wire: 'dataset',
+          publicationKind: 'result', outcome: 'committed', uri: 'file:///rejected.parquet', rows: 0,
+        },
+      ],
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    const row = await screen.findByRole('button', {
+      name: 'Open run run-1 in Alpha research', expanded: false,
+    })
+    expect(row).toHaveTextContent('done')
+    expect(row).not.toHaveTextContent('100%')
+    expect(row).toHaveTextContent('2 outputs retained')
+    expect(row.textContent?.match(/1 row/g)).toHaveLength(1)
+
+    fireEvent.click(row)
+    expect(screen.queryByText('Duration:', { exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByText('Rows:', { exact: true })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Open result 1' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Open result 2' })).toBeVisible()
+    openTechnicalEvidence()
+    expect(screen.getByText('Retained results:', { exact: true }).closest('div')).toHaveTextContent(
+      'Result 1 · transform-1:clean, Result 2 · transform-1:rejected',
+    )
+  })
+
+  it('keeps progress visible for active work without adding a second status signal', async () => {
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ status: 'running', progress: 0.5, error: null })],
+      hasMore: false, nextCursor: null,
+    })
+    render(<JobsView />)
+
+    const row = await screen.findByRole('button', {
+      name: 'Open run run-1 in Alpha research', expanded: false,
+    })
+    expect(row).toHaveTextContent('running')
+    expect(row).toHaveTextContent('50%')
+    expect(row.textContent?.match(/running/g)).toHaveLength(1)
+    expect(row).not.toHaveTextContent('●')
   })
 
   it('labels ordinary Transform and Profile artifacts as retained while preserving row counts', async () => {

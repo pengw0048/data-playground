@@ -46,6 +46,7 @@ const readable = (value: string) => value.replaceAll('_', ' ')
 const progressLabel = (progress: number | null | undefined) => (
   progress == null ? 'Unavailable' : `${Math.round(progress * 100)}%`
 )
+const rowLabel = (rows: number) => `${rows.toLocaleString()} row${rows === 1 ? '' : 's'}`
 const updateLabel = (updatedAt: string | null | undefined) => (
   updatedAt ? new Date(updatedAt).toLocaleString() : 'Unavailable'
 )
@@ -396,8 +397,8 @@ export function JobsView() {
       </div>
 
       {selected && selectedOutput?.outcome === 'committed' && selectedOutput.uri && (
-        <aside aria-label="Retained artifact" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
-          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Retained artifact · {selectedOutput.portLabel || selectedOutput.portId}<span className="flex-1" /><button aria-label="Close retained artifact" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
+        <aside aria-label="Retained result" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
+          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Retained result<span className="flex-1" /><button aria-label="Close retained result" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
           <FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId} publicationKind={selectedOutput.publicationKind} name={selectedOutput.table ?? selectedOutput.portLabel ?? selectedOutput.portId} />
         </aside>
       )}
@@ -459,6 +460,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const phase = jobPhase(item)
   const report = item.distributionReport
   const dataset = item.datasetContext
+  const active = item.status === 'queued' || item.status === 'running'
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
     : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
@@ -476,25 +478,35 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
                 : item.externalWait ? 'Waiting for external work'
                   : item.status === 'queued' ? 'Queued'
                     : 'In progress'
+  const outcomeDetail = item.error || (!report && rows != null ? rowLabel(rows) : null)
+  const duration = item.ms != null ? fmtMs(item.ms) : active ? 'In progress' : 'Unavailable'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
       className="grid w-full grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_105px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
-      <span className="flex flex-wrap items-center gap-1.5"><span style={{ color: token.color }}>{token.glyph}</span><Badge variant="secondary" className="capitalize">{item.status}</Badge>{item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}</span>
+      <span className="flex flex-wrap items-center gap-1.5">
+        <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
+        {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
+      </span>
       <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{subject}</span><span className="block truncate text-muted-foreground">{context}</span></span>
-      <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span><span className="block truncate text-muted-foreground">{item.error || (rows != null ? `${rows.toLocaleString()} rows` : 'Rows unavailable')}</span></span>
-      <span className="text-muted-foreground">{item.ms != null ? fmtMs(item.ms) : 'In progress'}{rows != null && <span className="block">{rows.toLocaleString()} rows</span>}</span>
+      <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
+      <span className="text-muted-foreground">{duration}</span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
       <span className="text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
-      <div className="grid content-start gap-1"><div className="font-semibold text-foreground">{outcome}</div><div className="text-muted-foreground">{subject}{context ? ` · ${context}` : ''}</div>{item.ms != null && <div><strong>Duration:</strong> {fmtMs(item.ms)}</div>}{rows != null && <div><strong>Rows:</strong> {rows.toLocaleString()}</div>}{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
-      <div className="flex flex-wrap content-start gap-2">
+      {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
+        {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
+        {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
+      </div>}
+      <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
         {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
-        {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
+        {committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
+          {committed.length === 1 ? 'Open result' : `Open result ${index + 1}`}
+        </button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
       </div>
@@ -502,6 +514,8 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         <summary className="cursor-pointer font-semibold text-muted-foreground">Technical evidence</summary>
         <div className="mt-3 grid gap-2">
           <div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>
+          {committed.length > 0 && <div><strong>Retained results:</strong> {committed.map((output, index) =>
+            `Result ${index + 1} · ${output.nodeId}:${output.portId}`).join(', ')}</div>}
           {item.canvasId && <ExecutionManifestDetail canvasId={item.canvasId} subjectId={item.id} summary={item} onClone={onClone} />}
           {item.taskId && <>
             {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}
