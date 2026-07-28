@@ -143,6 +143,23 @@ export function NodeCard({ id, data, children, metaOverride }: {
               {(data.config as Record<string, unknown>)?.checkpoint ? (
                 <span className="shrink-0 text-[9px] leading-none text-primary" title="Checkpointed — output materialized (inspectable + reused across runs)">●</span>
               ) : null}
+              {kind === 'source' && (
+                <button type="button" aria-label={openPanel === 'data' ? 'Hide preview' : 'Preview data'}
+                  title={openPanel === 'data' ? 'Hide preview' : !kernelUp ? 'Hub offline — preview unavailable' : invalid ?? (!runnable ? 'Connect a dataset to preview' : 'Preview data')}
+                  disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
+                  aria-pressed={openPanel === 'data'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    if (openPanel === 'data') closePanel(id)
+                    else runPreview(id)
+                  }}
+                  className={cn(
+                    'nodrag grid h-6 w-6 shrink-0 place-items-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+                    openPanel === 'data' ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+                  )}>
+                  <Icon name="eye" size={13} />
+                </button>
+              )}
               <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">
                 {tag}
               </span>
@@ -207,13 +224,14 @@ export function NodeCard({ id, data, children, metaOverride }: {
           the hover wrapper, so the mouse can travel card ↔ bar without dropping the hover. */}
       {showShelf && (
         <div className="nodrag absolute left-0 top-[calc(100%+5px)] z-[4] inline-flex items-center gap-px rounded-lg border border-border bg-card px-1 py-[3px] shadow-sm">
-          <ActionIcon
+          {kind !== 'source' && <ActionIcon
             name="eye" label={openPanel === 'data' ? 'Hide data' : !kernelUp ? 'Hub offline — preview unavailable' : invalid ?? (runnable ? 'View data' : 'Connect a source to preview')}
             active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
             onClick={() => (openPanel === 'data' ? closePanel(id) : runPreview(id))}
-          />
+          />}
           {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick action
-              here; preview (eye) is. Run/materialize stays available in the Inspector. */}
+              here. Its always-visible header eye owns preview; run/materialize stays available in
+              the Inspector. */}
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}

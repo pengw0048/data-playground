@@ -1632,9 +1632,11 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     // start a pipeline from the seeded 'events' dataset via Workspace
     await addWorkspaceDatasetToCurrentCanvas(page, 'events')
-    await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
-    // preview via the Inspector's View data (always visible for the selected node — no hover needed)
-    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const source = page.locator('.react-flow__node-source')
+    await expect(source).toHaveCount(1) // the events source landed
+    await expect(source.getByRole('button', { name: 'Change dataset' })).toHaveAttribute('title', /Click to change dataset/)
+    // Source preview is a persistent header action; opening rows does not require hover.
+    await source.getByRole('button', { name: 'Preview data' }).click()
     // the data viewer shows rows, then Next paginates, then clicking a row opens its detail
     const panel = page.getByTestId('panel-data')
     await expect(panel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })

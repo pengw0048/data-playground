@@ -178,10 +178,11 @@ function Source({ id, data }: NodeComponentProps) {
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
       {table || providerDataset ? (
-        // show the BOUND dataset name (the node title is separately editable, so it can't be relied on
-        // to say what's bound); the row itself is the "change" affordance, uri in the tooltip
+        // Show the bound dataset name (the node title is separately editable, so it cannot be
+        // relied on to say what is bound). The header eye is the distinct preview affordance.
         <button
           ref={btnRef}
+          aria-label="Change dataset"
           title={`${table?.name ?? data.title} · ${String(data.config.uri ?? '')}\nClick to change dataset`}
           onClick={(e) => { e.stopPropagation(); select(id); setOpen((v) => !v) }}
           className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
@@ -193,6 +194,8 @@ function Source({ id, data }: NodeComponentProps) {
       ) : (
         <button
           ref={btnRef}
+          aria-label="Select dataset"
+          title="Select dataset"
           onClick={(e) => { e.stopPropagation(); select(id); setOpen((v) => !v) }}
           className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
