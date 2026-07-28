@@ -3856,7 +3856,10 @@ def test_start_run_prebinds_authorized_identity_before_ray_side_effects(
     monkeypatch.setattr(store, "write", _write)
     monkeypatch.setattr(client, "submit_job", _submit)
 
-    status, owner = runs_router.start_run(deps, graph, "write", uid)
+    # This fixture intentionally uses a provider-neutral overwrite. The test is about
+    # pre-dispatch identity binding, so explicitly accept that independently covered risk.
+    status, owner = runs_router.start_run(
+        deps, graph, "write", uid, confirmed=True)
     assert owner is runner
     _wait_submitted(client, status.backend_ref.submission_id)
     assert [kind for kind, _auth, _doc in observed] == ["artifact", "submit"]
@@ -4532,7 +4535,10 @@ def test_prebound_fast_terminal_does_not_rebind_after_identity_fence(
     monkeypatch.setattr(runs_router, "_cone_size", lambda *_args, **_kwargs: (None, None, {}))
     monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 0)
     try:
-        status, owner = runs_router.start_run(deps, _graph(), "write", "fast-owner")
+        # This fixture intentionally uses a provider-neutral overwrite. The test is about
+        # the prebound terminal identity fence, so explicitly accept that separately tested risk.
+        status, owner = runs_router.start_run(
+            deps, _graph(), "write", "fast-owner", confirmed=True)
     finally:
         metadb.set_setting("backend", previous)
 

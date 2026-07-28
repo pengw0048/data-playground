@@ -8266,6 +8266,22 @@
             ],
             "title": "Bytes"
           },
+          "confirmationReasons": {
+            "items": {
+              "enum": [
+                "unknown_population",
+                "unknown_byte_size",
+                "large_rows",
+                "large_bytes",
+                "schema_drift",
+                "destructive_overwrite"
+              ],
+              "type": "string"
+            },
+            "maxItems": 6,
+            "title": "Confirmationreasons",
+            "type": "array"
+          },
           "exactRunReadiness": {
             "anyOf": [
               {
@@ -10172,6 +10188,22 @@
               }
             ],
             "title": "Bytes"
+          },
+          "confirmationReasons": {
+            "items": {
+              "enum": [
+                "unknown_population",
+                "unknown_byte_size",
+                "large_rows",
+                "large_bytes",
+                "schema_drift",
+                "destructive_overwrite"
+              ],
+              "type": "string"
+            },
+            "maxItems": 6,
+            "title": "Confirmationreasons",
+            "type": "array"
           },
           "exactRunReadiness": {
             "anyOf": [

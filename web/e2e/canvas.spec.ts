@@ -18,6 +18,16 @@ function overlaps(a: { x: number; y: number; width: number; height: number }, b:
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
+async function confirmRun(page: Page, action: 'managed' | 'ordinary' = 'managed') {
+  const runPanel = page.getByTestId('panel-run')
+  await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+  await runPanel.getByRole('button', {
+    name: action === 'managed'
+      ? 'Publish a new version'
+      : /^(?:Run with unknown row count|Run [\d,]+ rows)$/,
+  }).click()
+}
+
 // The first-run project executes before the other mutating E2E projects against a fresh kernel.
 // Keep the assertion in one journey so later steps cannot depend on resetting shared metadata.
 async function canvasesFor(page: Page): Promise<Array<{ id: string }>> {
@@ -1809,6 +1819,7 @@ test.describe('Data Playground canvas', () => {
       await expect(publication).toContainText('Ready to publish')
       await expect(publication.locator('details')).not.toHaveAttribute('open')
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      await confirmRun(page)
       const firstReceipt = publication.getByRole('button', { name: 'Open exact revision' })
       await expect(firstReceipt).toBeVisible({ timeout: 20_000 })
       await firstReceipt.click()
@@ -1882,8 +1893,8 @@ test.describe('Data Playground canvas', () => {
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
-      await expect(runPanel.getByText('HEADS UP')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+      await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+      await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
@@ -1936,6 +1947,7 @@ test.describe('Data Playground canvas', () => {
         if (body?.runId) fixtureRunId = body.runId
       })
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      await confirmRun(page, 'ordinary')
       await expect.poll(async () => {
         if (!fixtureRunId) return 'starting'
         const response = await page.request.get(`/api/run/${fixtureRunId}`)
@@ -2017,8 +2029,8 @@ test.describe('Data Playground canvas', () => {
       })
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
-      await expect(runPanel.getByText('HEADS UP')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+      await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+      await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 

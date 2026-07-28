@@ -34,6 +34,14 @@ SampleStrategy = Literal["prefix", "reservoir"]
 SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
 SampleSuggestedAction = Literal["run"]
 ProfileSuggestedAction = Literal["full_profile"]
+RunConfirmationReason = Literal[
+    "unknown_population",
+    "unknown_byte_size",
+    "large_rows",
+    "large_bytes",
+    "schema_drift",
+    "destructive_overwrite",
+]
 MAX_SAFE_INTEGER = 2**53 - 1
 ROW_IDENTITY_FIELD_NAME_MAX = 256
 MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH = 8192
@@ -1989,6 +1997,9 @@ class RunEstimate(Wire):
     bytes: int | None = None  # estimated peak data volume (rows × row width); the confirm gate's cost signal
     placement: Placement
     needs_confirm: bool
+    # Structured, user-facing reasons for the explicit-run gate.  ``breakdown`` remains
+    # diagnostic detail; clients must not infer a safety decision from its prose.
+    confirmation_reasons: list[RunConfirmationReason] = Field(default_factory=list, max_length=6)
     breakdown: str | None = None
     exact_run_readiness: ExactRunReadiness | None = None
 

@@ -191,21 +191,25 @@ describe('RunPanel typed parameter gate', () => {
         bytes: null,
         placement: 'local',
         needsConfirm: true,
+        confirmationReasons: ['unknown_byte_size'],
         breakdown: 'size unknown · 2,001 rows · confirmation required: Binary column "payload" has no fixed-width byte-size evidence; Data Playground did not scan values to guess.',
       },
     }
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByText('HEADS UP')).toBeVisible()
-    expect(screen.getByText('2,001 rows')).toBeVisible()
+    expect(screen.queryByText('HEADS UP')).not.toBeInTheDocument()
+    expect(screen.getByText('CONFIRM RUN')).toBeVisible()
+    expect(screen.getAllByText('Run 2,001 rows')).toHaveLength(2)
     expect(screen.getByText(/This full run will process 2,001 rows/)).toBeVisible()
-    expect(screen.getByText(/"payload" contains variable-length binary data/)).toBeVisible()
-    expect(screen.getByText(/actual read may be much larger than the row count suggests/)).toBeVisible()
-    expect(screen.getByLabelText('Pinned run inputs')).toHaveTextContent('Uses the pinned exact Source version shown on this Canvas.')
+    expect(screen.getByText(/Data size is not available, and this input is above the small-run limit/)).toBeVisible()
     expect(screen.queryByText(datasetId)).not.toBeInTheDocument()
     expect(screen.queryByText(revisionId)).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
-    expect(screen.queryByText(/did not scan values to guess/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run 2,001 rows' })).toBeVisible()
+
+    const technicalDetails = screen.getByText('Technical details').parentElement!
+    expect(technicalDetails).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Technical details'))
+    expect(technicalDetails).toHaveAttribute('open')
   })
 
   it.each([
@@ -219,6 +223,7 @@ describe('RunPanel typed parameter gate', () => {
         bytes,
         placement: 'local',
         needsConfirm: true,
+        confirmationReasons: [bytes === 3 * 1024 ** 3 ? 'large_bytes' : 'large_rows'],
         breakdown: 'confirmation required',
       },
     }
@@ -227,8 +232,9 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getByText(new RegExp(`This full run will process ${rows.toLocaleString()} rows`))).toBeVisible()
     expect(screen.getByText(new RegExp(bytes === 3 * 1024 ** 3 ? '3 GiB' : '20 MiB'))).toBeVisible()
-    expect(screen.getByText(/Confirm before starting the full pass/)).toBeVisible()
-    expect(screen.queryByText(/estimated data size requires confirmation/i)).not.toBeInTheDocument()
+    expect(screen.getByText(bytes === 3 * 1024 ** 3
+      ? /estimated data volume is large/i : /row count is above the automatic-run limit/i)).toBeVisible()
+    expect(screen.queryByText(/heads up/i)).not.toBeInTheDocument()
   })
 
   it('shows configured column merges only through their certified admission control', async () => {
@@ -378,7 +384,7 @@ describe('RunPanel typed parameter gate', () => {
       'Structural schema drift requires explicit confirmation')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
       'Confirm this exact schema comparison before publishing')
-    fireEvent.click(screen.getByRole('button', { name: 'Publish revision' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Publish a new version' }))
     expect(mocks.state.run).toHaveBeenCalledWith('target', true)
   })
 

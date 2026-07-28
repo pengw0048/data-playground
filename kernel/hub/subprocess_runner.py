@@ -25,8 +25,7 @@ import uuid
 
 from hub.models import CompilePlan, Graph, PerNodeStatus, Placement, RunEstimate, RunOutput, RunStatus
 from hub.plugins.runner import (
-    _CONFIRM_ROWS,
-    _DIRECT_UNKNOWN_WIDTH_ROWS,
+    confirmation_reasons,
     _MAX_RUNS,
     _persist_local_result_done,
 )
@@ -361,18 +360,12 @@ class SubprocessRunner:
                 "parent managed-source lease cleanup failed")
 
     def estimate(self, plan: CompilePlan, rows: int | None, byts: int | None = None) -> RunEstimate:
-        from hub.plugins.runner import _CONFIRM_BYTES, _fmt_bytes
-        if rows is None and byts is None:  # uncountable → unreadable → fails fast; no fabricated ETA, no gate
-            return RunEstimate(rows=None, bytes=None, placement="local", needs_confirm=False,
-                               breakdown=f"size unknown · {len(plan.steps)} steps · isolated process")
-        needs = (
-            (rows is not None and byts is None and rows > _DIRECT_UNKNOWN_WIDTH_ROWS)
-            or (byts is not None and byts >= _CONFIRM_BYTES)
-            or (rows is not None and rows >= _CONFIRM_ROWS)
-        )
+        from hub.plugins.runner import _fmt_bytes
+        reasons = confirmation_reasons(rows, byts)
         size = _fmt_bytes(byts) if byts is not None else "size unknown"
         rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
-        return RunEstimate(rows=rows, bytes=byts, placement="local", needs_confirm=needs,
+        return RunEstimate(rows=rows, bytes=byts, placement="local", needs_confirm=bool(reasons),
+                           confirmation_reasons=reasons,
                            breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · isolated process")
 
     def _claim_sink_contracts(self, plan: CompilePlan, graph: Graph, run_id: str, status: RunStatus

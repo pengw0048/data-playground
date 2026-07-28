@@ -63,9 +63,12 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await publicationDetails.locator('summary').click()
     await expect(publicationDetails).toContainText(/Admission:.*node write.*mode create/)
     await expect(publicationDetails).toContainText('managed-local-file')
+    await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+    const runPanel = page.getByTestId('panel-run')
+    await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
     const runResponse = page.waitForResponse((response) => response.url().endsWith('/api/run')
       && response.request().method() === 'POST')
-    await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+    await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
     const started = await json<{ runId: string; status: 'queued' | 'running' | 'done' }>(await runResponse, 'start real managed Write')
     const runId = started.runId
     type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
