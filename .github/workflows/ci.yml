@@ -26,10 +26,11 @@ permissions:
 concurrency:
   # Superseded PR heads and main commits cannot describe the current tree, so cancel them to free
   # runners. This improves queue latency only; reducing current-run execution time is tracked
-  # separately in #1033/#1034. Release and manual candidates are immutable evidence, so isolate
-  # each by run identity rather than sharing a branch group that a later event could cancel.
-  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+  # separately in #1033/#1034. A reusable workflow inherits its caller's event context, so the
+  # required immutable candidate input—not event_name—isolates release calls by run identity.
+  # Manual candidates also fall through to run identity and never share a cancellable branch group.
+  group: ci-${{ inputs.expected_sha && github.run_id || github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ !inputs.expected_sha && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 jobs:
   kernel-shards:

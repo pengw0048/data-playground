@@ -286,14 +286,34 @@ def test_ci_cancels_only_superseded_branch_event_runs() -> None:
     concurrency = _workflow("ci.yml")["concurrency"]
     assert concurrency == {
         "group": (
-            "ci-${{ github.event_name == 'pull_request' && "
-            "github.event.pull_request.number || github.event_name == 'push' && "
-            "github.ref || github.run_id }}"
+            "ci-${{ inputs.expected_sha && github.run_id || "
+            "github.event_name == 'pull_request' && github.event.pull_request.number || "
+            "github.event_name == 'push' && github.ref || github.run_id }}"
         ),
         "cancel-in-progress": (
-            "${{ github.event_name == 'pull_request' || github.event_name == 'push' }}"
+            "${{ !inputs.expected_sha && "
+            "(github.event_name == 'pull_request' || github.event_name == 'push') }}"
         ),
     }
+
+    # `workflow_call` inherits the release caller's tag-push event context. The immutable input must
+    # therefore win before event_name is considered, while direct PR/main events remain cancellable.
+    cases = [
+        # event_name, expected_sha, expected group identity, cancel superseded
+        ("pull_request", "", "pull_request_number", True),
+        ("push", "", "ref", True),
+        ("workflow_dispatch", "", "run_id", False),
+        ("push", "immutable-release-sha", "run_id", False),
+    ]
+    for event_name, expected_sha, expected_group, expected_cancel in cases:
+        group_identity = (
+            "run_id" if expected_sha
+            else "pull_request_number" if event_name == "pull_request"
+            else "ref" if event_name == "push"
+            else "run_id"
+        )
+        cancel = not expected_sha and event_name in {"pull_request", "push"}
+        assert (group_identity, cancel) == (expected_group, expected_cancel)
 
 
 def test_release_workflow_requires_a_clean_version_identity() -> None:
