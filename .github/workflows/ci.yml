@@ -24,10 +24,12 @@ permissions:
   contents: read
 
 concurrency:
-  # A newer commit makes the older validation result unusable for the same PR. Release callers use
-  # an immutable candidate and therefore receive an isolated group instead of sharing the branch ref.
-  group: ci-${{ github.event_name == 'workflow_call' && github.run_id || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Superseded PR heads and main commits cannot describe the current tree, so cancel them to free
+  # runners. This improves queue latency only; reducing current-run execution time is tracked
+  # separately in #1033/#1034. Release and manual candidates are immutable evidence, so isolate
+  # each by run identity rather than sharing a branch group that a later event could cancel.
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   kernel-shards:
