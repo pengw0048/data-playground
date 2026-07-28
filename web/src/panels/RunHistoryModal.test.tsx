@@ -7,6 +7,7 @@ import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
 import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
 import { register } from '../nodes/registry'
+import '../nodes/capabilities'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
@@ -605,6 +606,53 @@ describe('durable full results', () => {
     expect(screen.getByText('Preview failed')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
     expect(screen.queryByText('Your Python transform raised an exception')).not.toBeInTheDocument()
+  })
+
+  it('keeps unsupported binary media as raw data instead of advertising an unusable Media tab', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Provider images', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [
+          { name: 'image_bytes', type: 'binary', capabilities: ['media'], mediaKind: 'image' },
+          { name: '_rowid', type: 'int64', capabilities: [] },
+        ],
+        rows: [{ image_bytes: '<3 bytes>', _rowid: 0 }], rowCount: 1, hasMore: false,
+        truncated: false, completeness: 'complete',
+      }) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.queryByRole('button', { name: 'Media' })).not.toBeInTheDocument()
+    expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
+
+    await user.click(screen.getByText('<3 bytes>'))
+    expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps the Media tab for directly renderable current-result values', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Public images', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [{ name: 'image_url', type: 'string', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [{ image_url: 'https://example.test/image.png' }], rowCount: 1, hasMore: false,
+        truncated: false, completeness: 'complete',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Media' })).toBeInTheDocument()
   })
 
   it('offers sample/full switching for previewable nodes after a full run', async () => {

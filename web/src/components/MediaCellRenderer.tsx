@@ -69,6 +69,13 @@ function directMedia(value: unknown, mediaKind?: ColumnSchema['mediaKind']): Dir
   return kind === 'image' || kind === 'video' ? { source: value, kind } : null
 }
 
+// A Canvas result has no exact-revision media-cell context. It may therefore advertise media only
+// when the value itself is independently displayable by the browser. Keep this evidence-based:
+// a capability tag alone is not permission to promise a working media viewer.
+export function canRenderDirectMedia(value: unknown, mediaKind?: ColumnSchema['mediaKind']): boolean {
+  return directMedia(value, mediaKind) !== null
+}
+
 function requestFingerprint(exact: ExactMediaCellContext | undefined, column: string) {
   if (!exact) return ''
   // This is only a React request-generation key. The request below receives the canonical sidecar
