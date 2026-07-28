@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from hub import db, metadb
 from hub.api_errors import APIErrorCode
 from hub.models import (
-    ColumnSchema, Graph, PerNodeStatus, RunOutput, RunStatus, WriteAdmission,
+    ColumnSchema, Graph, PerNodeStatus, RunEstimate, RunOutput, RunStatus, WriteAdmission,
 )
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
@@ -278,6 +278,8 @@ def test_normal_managed_name_is_preserved_across_admission_receipt_catalog_and_r
     from hub.routers import catalog as catalog_routes
 
     deps, graph = contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    deps.catalog._add(name="source", uri=source.data["config"]["uri"], strict_probe=True)
     write = next(node for node in graph.nodes if node.id == "write")
     write.data["config"]["filename"] = "family cost"
     monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
@@ -950,6 +952,8 @@ def test_runner_without_typed_write_capability_is_not_mislabeled_managed(contrac
 def test_write_admission_api_returns_the_frozen_camel_case_contract(
         contract, monkeypatch):
     deps, graph = contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    deps.catalog._add(name="source", uri=source.data["config"]["uri"], strict_probe=True)
     monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
 
     response = TestClient(app).post("/api/run/write-admission", json={
@@ -964,6 +968,70 @@ def test_write_admission_api_returns_the_frozen_camel_case_contract(
     assert body["intent"]["mode"] == "create"
     assert body["intent"]["destination"]["logicalUri"] == body["destination"]
     assert body["intent"]["expectedSchema"] == body["expectedSchema"]
+    assert body["exactRunReadiness"] == {
+        "ready": True, "reason": "ready", "sourceNodeIds": [], "message": None,
+    }
+
+
+def test_write_admission_requires_a_registered_exact_input_and_recovers_after_registration(
+        contract, monkeypatch):
+    """A post-startup local file remains inspectable, but cannot promise publication first."""
+    deps, graph = contract
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    payload = graph.model_dump(by_alias=True, mode="json")
+
+    blocked = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61555555-5555-4555-8555-555555555555",
+    })
+
+    assert blocked.status_code == 200, blocked.text
+    blocked_admission = WriteAdmission.model_validate(blocked.json())
+    assert blocked_admission.intent is None
+    assert blocked_admission.exact_run_readiness is not None
+    assert blocked_admission.exact_run_readiness.ready is False
+    assert blocked_admission.exact_run_readiness.reason == "registration_required"
+    assert blocked_admission.exact_run_readiness.source_node_ids == ["source"]
+    assert "Register this local input" in str(blocked_admission.blocker)
+
+    # This is the existing final-manifest boundary: no registration means a fail-closed 410, not
+    # a mutable path fallback. The write card now surfaces this same prerequisite earlier.
+    with pytest.raises(run_routes.APIError) as excinfo:
+        run_routes._resolve_local_run_manifest(graph, "write", deps)
+    assert excinfo.value.status_code == 410
+    assert excinfo.value.detail == "local_run_input_revision_unavailable"
+
+    deps.node_ir = {}
+    deps.runner = SimpleNamespace(estimate=lambda *_args: RunEstimate(
+        rows=2, bytes=10, placement="local", needs_confirm=False))
+    deps.pick_runner = lambda _plan, _uid: deps.runner
+    estimate = TestClient(app).post("/api/run/estimate", json={
+        "graph": payload, "targetNodeId": "source",
+    })
+    assert estimate.status_code == 200, estimate.text
+    assert estimate.json()["exactRunReadiness"]["ready"] is False
+    del deps.pick_runner
+
+    source = next(node for node in graph.nodes if node.id == "source")
+    deps.catalog._add(name="source", uri=source.data["config"]["uri"], strict_probe=True)
+    retried = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61666666-6666-4666-8666-666666666666",
+    })
+
+    assert retried.status_code == 200, retried.text
+    admission = WriteAdmission.model_validate(retried.json())
+    assert admission.exact_run_readiness is not None
+    assert admission.exact_run_readiness.ready is True
+    assert admission.intent is not None
+    deps.pick_runner = lambda _plan, _uid: deps.runner
+    ready_estimate = TestClient(app).post("/api/run/estimate", json={
+        "graph": payload, "targetNodeId": "source",
+    })
+    assert ready_estimate.status_code == 200, ready_estimate.text
+    assert ready_estimate.json()["exactRunReadiness"]["ready"] is True
 
 
 def test_write_admission_validates_only_the_target_execution_cone(

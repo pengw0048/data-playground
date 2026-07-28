@@ -185,7 +185,9 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
         <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
       </div>
       {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
-      {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+      {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Exact run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+        <strong>Not exact-run-ready:</strong> {summaryAdmission.exactRunReadiness.message}
+      </div> : summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Publication is blocked:</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">

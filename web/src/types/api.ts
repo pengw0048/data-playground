@@ -770,12 +770,20 @@ export interface CanvasTransformReference {
 
 export type Placement = 'local' | 'distributed'
 
+export interface ExactRunReadiness {
+  ready: boolean
+  reason: 'ready' | 'registration_required'
+  sourceNodeIds: string[]
+  message?: string | null
+}
+
 export interface RunEstimate {
   rows: number | null   // real source-row count; null when size is unknown (no countable source)
   bytes?: number | null // estimated peak data volume — the confirm gate's cost signal
   placement: Placement
   needsConfirm: boolean
   breakdown?: string | null
+  exactRunReadiness?: ExactRunReadiness | null
 }
 
 export interface ProfileEstimate extends RunEstimate {
@@ -867,6 +875,7 @@ export interface WriteAdmission {
   intent?: WriteIntent | null
   recoveredReceipt?: WriteReceipt | null
   blocker?: string | null
+  exactRunReadiness?: ExactRunReadiness | null
 }
 
 // Certified local add/replace-column work.  The browser deliberately carries only the small,

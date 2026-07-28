@@ -101,7 +101,15 @@ test.describe('accessibility gate @ux-smoke', () => {
     await addNode(page, 'Sources & sinks', 'source')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     const inspector = page.getByTestId('inspector')
-    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill('does-not-exist.parquet')
+    const catalogResponse = await page.request.get('/api/catalog/tables', {
+      params: { q: 'images', limit: '10' },
+    })
+    expect(catalogResponse.ok(), await catalogResponse.text()).toBeTruthy()
+    const registered = (await catalogResponse.json() as {
+      items: Array<{ name: string; uri: string }>
+    }).items.find((item) => item.name === 'images')
+    expect(registered, 'the running-state fixture requires the registered images source').toBeTruthy()
+    await inspector.locator('label').filter({ hasText: 'uri' }).locator('input').fill(registered!.uri)
     let releaseRun: (() => void) | undefined
     const held = new Promise<void>((resolve) => { releaseRun = resolve })
     let finishHold: (() => void) | undefined

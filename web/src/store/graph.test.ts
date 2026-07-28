@@ -758,6 +758,63 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
+  it('keeps requestRun at the estimate panel when exact input registration is required', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/post-startup.parquet' }
+    const target = NODE('target', 'filter')
+    const doc = {
+      id: 'c', version: 1, name: 'exact readiness', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    useStore.setState({ doc, runs: {}, openPanels: {} })
+    apiMocks.estimate.mockResolvedValueOnce({
+      rows: 2, placement: 'local', needsConfirm: false,
+      exactRunReadiness: {
+        ready: false, reason: 'registration_required', sourceNodeIds: ['source'],
+        message: 'Register this local input through the Source data picker before exact execution.',
+      },
+    })
+
+    await useStore.getState().requestRun('target')
+
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'estimated', estimate: { exactRunReadiness: { ready: false } },
+    })
+    expect(useStore.getState().openPanels).toEqual({ target: 'run' })
+
+    await useStore.getState().run('target')
+    expect(apiMocks.run).not.toHaveBeenCalled()
+
+    useStore.getState().updateConfig('source', {
+      uri: '/data/post-startup.parquet',
+      tableId: 'registered-post-startup',
+    })
+    expect(useStore.getState().runs.target).toMatchObject({ phase: 'idle' })
+    expect(useStore.getState().runs.target.estimate).toBeUndefined()
+
+    apiMocks.estimate.mockResolvedValueOnce({
+      rows: 2, placement: 'local', needsConfirm: false,
+      exactRunReadiness: { ready: true, reason: 'ready', sourceNodeIds: [] },
+    })
+    await useStore.getState().requestRun('target')
+
+    expect(apiMocks.estimate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ nodes: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'source',
+          data: expect.objectContaining({
+            config: expect.objectContaining({ tableId: 'registered-post-startup' }),
+          }),
+        }),
+      ]) }),
+      'target',
+    )
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }), 'target', false, expect.any(String),
+    )
+  })
+
   it('explains why rerun all cannot start a legacy graph with no terminal sink', () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }

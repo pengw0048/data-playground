@@ -61,6 +61,7 @@ from hub.models import (
     ColumnSchema,
     EstimateRequest,
     ExactDatasetRef,
+    ExactRunReadiness,
     Graph,
     GraphSchema,
     InputDrift,
@@ -781,9 +782,37 @@ def _managed_file_schema_drift(
     )
 
 
+def _exact_run_readiness(
+        graph, target_node_id: str | None, deps) -> ExactRunReadiness:
+    """Report whether ordinary local Sources have the durable identity a final run requires.
+
+    Preview/schema/estimate deliberately retain their direct local-file inspection path. A final run
+    instead needs a persisted catalog registration before it can mint an immutable input manifest.
+    This check is metadata-only: it neither snapshots files nor treats a path as a latest fallback.
+    """
+    unregistered: list[str] = []
+    for node in _local_run_source_nodes(graph, target_node_id):
+        config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        uri = str(config.get("uri") or "")
+        if not uri or workspace_providers.is_provider_dataset_uri(uri):
+            continue
+        if metadb.catalog_revision_binding_for_uri(uri) is None:
+            unregistered.append(str(node.id))
+    if unregistered:
+        return ExactRunReadiness(
+            ready=False,
+            reason="registration_required",
+            source_node_ids=unregistered,
+            message=("Register this local input through the Source data picker before exact execution. "
+                     "Preview, schema, and estimate do not create its immutable run binding."),
+        )
+    return ExactRunReadiness(ready=True, reason="ready")
+
+
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
-        supplied: WriteIntent | None = None, *, direct_local: bool = False) -> WriteAdmission:
+        supplied: WriteIntent | None = None, *, direct_local: bool = False,
+        require_exact_run_ready: bool = False) -> WriteAdmission:
     """Resolve one metadata-only Write card contract without allocating an artifact."""
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
@@ -851,6 +880,22 @@ def _write_admission_for_graph(
             provider=provider_name,
             partitions=partitions,
         )
+    exact_run_readiness = _exact_run_readiness(graph, node_id, deps)
+
+    def response(**kwargs) -> WriteAdmission:
+        return WriteAdmission(exact_run_readiness=exact_run_readiness, **kwargs)
+
+    if require_exact_run_ready and not exact_run_readiness.ready:
+        return response(
+            node_id=node_id,
+            managed=True,
+            destination=logical_uri,
+            mode=("append" if lance_candidate
+                  else "replace" if supplied and supplied.mode == "replace" else "create"),
+            provider=("managed-local-lance" if lance_candidate else "managed-local-file"),
+            partitions=partitions,
+            blocker=exact_run_readiness.message,
+        )
     schemas: dict[str, list | None] = {}
     try:
         if direct_local:
@@ -881,7 +926,7 @@ def _write_admission_for_graph(
     except Exception:
         schema = None
     if schema is None:
-        return WriteAdmission(
+        return response(
             node_id=node_id,
             managed=True,
             destination=logical_uri,
@@ -937,7 +982,7 @@ def _write_admission_for_graph(
                 ) from exc
             if recovered is not None:
                 receipt = WriteReceipt.model_validate(recovered)
-                return WriteAdmission(
+                return response(
                     node_id=node_id, managed=True, destination=logical_uri,
                     mode="append", provider="managed-local-lance",
                     expected_schema=intent.expected_schema, expected_head=intent.expected_head,
@@ -957,7 +1002,7 @@ def _write_admission_for_graph(
                 raise HTTPException(
                     409, "write admission cannot reopen the frozen Lance destination head"
                 ) from exc
-            return WriteAdmission(
+            return response(
                 node_id=node_id, managed=True, destination=logical_uri,
                 mode="append", provider="managed-local-lance",
                 expected_schema=normalized_schema,
@@ -970,7 +1015,7 @@ def _write_admission_for_graph(
                 raise HTTPException(
                     409, "write admission is stale; re-admit the current destination head and retry")
         if not _schemas_are_write_compatible(normalized_schema, destination_schema):
-            return WriteAdmission(
+            return response(
                 node_id=node_id, managed=True, destination=logical_uri,
                 mode="append", provider="managed-local-lance",
                 expected_schema=normalized_schema,
@@ -1001,7 +1046,7 @@ def _write_admission_for_graph(
             raise HTTPException(
                 409, "write admission is stale; re-admit the current destination head and retry"
             ) from exc
-        return WriteAdmission(
+        return response(
             node_id=node_id, managed=True, destination=logical_uri,
             mode="append", provider="managed-local-lance",
             expected_schema=intent.expected_schema, expected_head=intent.expected_head,
@@ -1026,7 +1071,7 @@ def _write_admission_for_graph(
                 409, "write admission is stale; re-admit the current destination head and retry"
             ) from exc
         if recovered is not None:
-            return WriteAdmission(
+            return response(
                 node_id=node_id,
                 managed=True,
                 destination=logical_uri,
@@ -1062,7 +1107,7 @@ def _write_admission_for_graph(
                 raise HTTPException(
                     409, "write admission cannot reopen the exact destination schema metadata"
                 ) from exc
-            return WriteAdmission(
+            return response(
                 node_id=node_id,
                 managed=True,
                 destination=logical_uri,
@@ -1111,7 +1156,7 @@ def _write_admission_for_graph(
         raise HTTPException(
             409, "write admission is stale; re-admit the current destination head and retry") from exc
     receipt = WriteReceipt.model_validate(recovered) if recovered is not None else None
-    return WriteAdmission(
+    return response(
         node_id=node_id,
         managed=True,
         destination=logical_uri,
@@ -1237,7 +1282,8 @@ def write_admission(
         graph = _bind_local_run_manifest(graph, req.input_manifest, deps, req.node_id)
     _reject_invalid(graph, deps, req.node_id)
     return _write_admission_for_graph(
-        deps, graph, req.node_id, uid, str(req.submission_id))
+        deps, graph, req.node_id, uid, str(req.submission_id),
+        require_exact_run_ready=True)
 
 
 def _input_drift(
@@ -2505,6 +2551,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
         _controller_regions_for_run(
             deps, graph, req.target_node_id, output_target, sizes, multi_output=True)
     est = _explain_unknown_byte_size(runner.estimate(plan, rows, byts), sizes)
+    est.exact_run_readiness = _exact_run_readiness(graph, req.target_node_id, deps)
     return est
 
 

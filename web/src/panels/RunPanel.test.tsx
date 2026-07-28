@@ -292,6 +292,58 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
   })
 
+  it('shows a registered-input prerequisite instead of offering publication', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { filename: 'results' } },
+    }]
+    mocks.state.doc.parameters = []
+    mocks.state.runs = { target: {
+      phase: 'estimated', estimate: { rows: 2, placement: 'local', needsConfirm: false },
+      writeAdmission: {
+        nodeId: 'target', mode: 'create', provider: 'managed-local-file',
+        destination: '/outputs/results.parquet', managed: true, expectedSchema: [], partitions: [],
+        blocker: 'Register this local input before publishing an exact managed revision.',
+        exactRunReadiness: {
+          ready: false, reason: 'registration_required', sourceNodeIds: ['source'],
+          message: 'Register this local input before publishing an exact managed revision.',
+        },
+      },
+    } }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Exact input registration required' })).toBeDisabled()
+    expect(screen.getByLabelText('Exact run readiness')).toHaveTextContent(
+      'Not exact-run-ready: Register this local input',
+    )
+  })
+
+  it('blocks a formal non-Write run until the estimate reports an exact input registration', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'Filter', status: 'draft', config: {} },
+    }]
+    mocks.state.doc.parameters = []
+    mocks.state.runs = { target: {
+      phase: 'estimated', estimate: {
+        rows: 2, placement: 'local', needsConfirm: false,
+        exactRunReadiness: {
+          ready: false, reason: 'registration_required', sourceNodeIds: ['source'],
+          message: 'Register this local input before running.',
+        },
+      },
+    } }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Exact input registration required' })).toBeDisabled()
+    expect(screen.getByLabelText('Exact run readiness')).toHaveTextContent(
+      'Not exact-run-ready: Register this local input before running.',
+    )
+  })
+
   it('shows exact schema drift before the confirmation click', () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },
