@@ -2,7 +2,19 @@ import { act, fireEvent, render, screen } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('../api/client', () => ({ api: new Proxy({}, { get: () => async () => ({}) }) }))
+const apiMocks = vi.hoisted(() => ({
+  schema: vi.fn(),
+  graphSizes: vi.fn(),
+}))
+vi.mock('../api/client', () => ({
+  api: new Proxy({}, {
+    get: (_target, property) => property === 'schema'
+      ? apiMocks.schema
+      : property === 'graphSizes'
+        ? apiMocks.graphSizes
+        : async () => ({}),
+  }),
+}))
 
 import { useStore } from '../store/graph'
 import type { NodeData } from '../types/graph'
@@ -15,6 +27,8 @@ describe('NodeCard result summary', () => {
   beforeEach(() => {
     runPreview.mockReset()
     closePanel.mockReset()
+    apiMocks.schema.mockReset().mockResolvedValue({})
+    apiMocks.graphSizes.mockReset().mockResolvedValue({})
     useStore.setState({
       canvasRole: 'owner', kernelUp: true, selectedIds: [], openPanels: {}, runs: {}, sizes: {},
       runPreview, closePanel,
@@ -59,6 +73,40 @@ describe('NodeCard result summary', () => {
     act(() => useStore.getState().updateConfig('sample', { n: 25 }))
 
     expect(screen.queryByText('≤ 1,000 rows')).not.toBeInTheDocument()
+  })
+
+  it('rejects an old size response that finishes after a Sample configuration change', async () => {
+    let finishOldSizes!: (sizes: { sample: { rows: number; confidence: 'bounded' } }) => void
+    apiMocks.graphSizes
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOldSizes = resolve }))
+      .mockResolvedValueOnce({ sample: { rows: 25, confidence: 'bounded' } })
+    const sample: NodeData = {
+      title: 'sample', status: 'latest', config: { n: 1000, seed: 42 }, history: [],
+    }
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [{
+          id: 'sample', type: 'sample', position: { x: 0, y: 0 }, data: sample,
+        }],
+      },
+      sizes: { sample: { rows: 1000, confidence: 'bounded' } },
+    }))
+    render(<ReactFlowProvider><NodeCard id="sample" data={sample} /></ReactFlowProvider>)
+
+    const oldRefresh = useStore.getState().refreshSchemas()
+    await vi.waitFor(() => expect(apiMocks.graphSizes).toHaveBeenCalledTimes(1))
+    act(() => useStore.getState().updateConfig('sample', { n: 25 }))
+    expect(screen.queryByText('≤ 1,000 rows')).not.toBeInTheDocument()
+
+    await act(async () => {
+      finishOldSizes({ sample: { rows: 1000, confidence: 'bounded' } })
+      await oldRefresh
+    })
+    expect(screen.queryByText('≤ 1,000 rows')).not.toBeInTheDocument()
+
+    await act(async () => { await useStore.getState().refreshSchemas() })
+    expect(screen.getByText('≤ 25 rows')).toBeInTheDocument()
   })
 
   it('keeps Source preview in the header for an unselected viewer', () => {
