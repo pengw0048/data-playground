@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseJoinCondition, parseJoinKeys, serializeJoinKeys } from './joinKeys'
+import { parseJoinCondition, parseJoinKeys, serializeJoinCondition, serializeJoinKeys } from './joinKeys'
 
 describe('Join key builder contract', () => {
   it('loads legacy same-name on keys and preserves their order', () => {
@@ -21,5 +21,10 @@ describe('Join key builder contract', () => {
   it('declines arbitrary predicates so the caller can preserve them in Advanced mode', () => {
     expect(parseJoinCondition('a.id = b.user_id OR a.email = b.email')).toBeNull()
     expect(parseJoinCondition('lower(a.email) = b.email')).toBeNull()
+  })
+
+  it('renders same-name on keys as the complete effective Advanced predicate', () => {
+    expect(serializeJoinCondition(parseJoinKeys('shared, region', '')!))
+      .toBe('a.shared = b.shared AND a.region = b.region')
   })
 })

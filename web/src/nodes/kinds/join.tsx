@@ -4,7 +4,7 @@ import { getBackendSpec } from '../generic'
 import { useStore } from '../../store/graph'
 import { Field, MiniInput, miniSelectClass } from '../../ui/controls'
 import { useInputColumnsForPort } from '../fields'
-import { parseJoinKeys, serializeJoinKeys, type JoinKeyPair } from '../joinKeys'
+import { parseJoinKeys, serializeJoinCondition, serializeJoinKeys, type JoinKeyPair } from '../joinKeys'
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import type { NodeConfig } from '../../types/graph'
@@ -43,6 +43,7 @@ function Join({ id, data }: NodeComponentProps) {
     committed.current = { on, condition }
   }, [condition, on])
   const pairs = draftPairs
+  const effectiveCondition = condition || (parsed ? serializeJoinCondition(parsed) : '')
   const commit = (next: JoinKeyPair[]) => {
     setDraftPairs(next)
     const nextConfig = serializeJoinKeys(next)
@@ -61,7 +62,8 @@ function Join({ id, data }: NodeComponentProps) {
       {advanced || parsed === null ? (
         <div className="mt-1.5 flex flex-col gap-1">
           <Field label="advanced ON condition">
-            <MiniInput value={condition} placeholder="a.user_id = b.uid" mono onChange={(value) => updateConfig(id, { condition: value })} />
+            <MiniInput value={effectiveCondition} placeholder="a.user_id = b.uid" mono
+              onChange={(value) => updateConfig(id, { on: '', condition: value })} />
           </Field>
           {parseJoinKeys(on, condition) !== null && <button type="button" className="nodrag self-start text-[10px] text-muted-foreground underline"
             onClick={(event) => { event.stopPropagation(); setAdvanced(false) }}>Use key builder</button>}

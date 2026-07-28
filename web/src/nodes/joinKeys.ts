@@ -49,6 +49,14 @@ function quoteIdentifier(column: string): string {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(column) ? column : `"${column.replaceAll('"', '""')}"`
 }
 
+/** Render key pairs as the explicit predicate Advanced mode edits. */
+export function serializeJoinCondition(pairs: JoinKeyPair[]): string {
+  return pairs
+    .filter((pair) => pair.left.trim() && pair.right.trim())
+    .map((pair) => `a.${quoteIdentifier(pair.left)} = b.${quoteIdentifier(pair.right)}`)
+    .join(' AND ')
+}
+
 /** Serialize to the existing backend contract, preserving pair order. */
 export function serializeJoinKeys(pairs: JoinKeyPair[]): { on: string; condition: string } {
   const complete = pairs.filter((pair) => pair.left.trim() && pair.right.trim())
@@ -57,6 +65,6 @@ export function serializeJoinKeys(pairs: JoinKeyPair[]): { on: string; condition
   }
   return {
     on: '',
-    condition: complete.map((pair) => `a.${quoteIdentifier(pair.left)} = b.${quoteIdentifier(pair.right)}`).join(' AND '),
+    condition: serializeJoinCondition(complete),
   }
 }

@@ -31,7 +31,7 @@ describe('Join card — join types come from the backend spec (UX-05)', () => {
                      { id: 'b', source: 'right', target: 'j', targetHandle: 'b', data: { wire: 'dataset' } }] },
       schemas: {
         left: { out: [{ name: '_rowid', type: 'string', capabilities: [] }, { name: 'id', type: 'string', capabilities: [] }, { name: 'region', type: 'string', capabilities: [] }] },
-        right: { out: [{ name: 'original_row_id', type: 'string', capabilities: [] }, { name: 'id', type: 'string', capabilities: [] }, { name: 'region_id', type: 'string', capabilities: [] }] },
+        right: { out: [{ name: 'original_row_id', type: 'string', capabilities: [] }, { name: 'id', type: 'string', capabilities: [] }, { name: 'shared', type: 'string', capabilities: [] }, { name: 'region_id', type: 'string', capabilities: [] }] },
       },
       canvasRole: 'owner',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -136,5 +136,34 @@ describe('Join card — join types come from the backend spec (UX-05)', () => {
     expect(screen.getByLabelText('advanced ON condition')).toHaveFocus()
     fireEvent.click(screen.getByRole('button', { name: 'Use key builder' }))
     expect(screen.getByLabelText('Left key 1')).toHaveValue('_rowid')
+  })
+
+  it('exposes an effective on predicate in Advanced and clears hidden on at first edit', async () => {
+    useStore.getState().updateConfig('j', { on: 'shared', condition: '' })
+    useStore.setState((state) => ({
+      schemas: {
+        ...state.schemas,
+        left: { out: [...(state.schemas.left?.out ?? []), { name: 'shared', type: 'string', capabilities: [] }] },
+      },
+    }))
+    const Join = getComponent('join')!
+    render(<ReactFlowProvider><Join id="j" data={useStore.getState().doc.nodes[0].data} /></ReactFlowProvider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced condition' }))
+    const raw = screen.getByLabelText('advanced ON condition')
+    expect(raw).toHaveValue('a.shared = b.shared')
+    fireEvent.change(raw, { target: { value: '' } })
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ on: '', condition: '' })
+    fireEvent.change(screen.getByLabelText('advanced ON condition'), {
+      target: { value: 'a.shared = b.shared OR a.region = b.region_id' },
+    })
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({
+      on: '', condition: 'a.shared = b.shared OR a.region = b.region_id',
+    })
+    fireEvent.change(screen.getByLabelText('advanced ON condition'), { target: { value: 'a.shared = b.shared' } })
+    await waitFor(() => expect(screen.getByLabelText('advanced ON condition')).toHaveValue('a.shared = b.shared'))
+    expect(screen.getByLabelText('advanced ON condition')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Use key builder' }))
+    expect(screen.getByLabelText('Left key 1')).toHaveValue('shared')
+    expect(screen.getByLabelText('Right key 1')).toHaveValue('shared')
   })
 })
