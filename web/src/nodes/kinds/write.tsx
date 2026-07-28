@@ -58,10 +58,13 @@ function Write({ id, data }: NodeComponentProps) {
   // owns admission while it estimates, waits at a gate, or executes; the card must not race it.
   }, [id, admission, admissionIdentity, runPhase, prepareWrite])
   const displayName = admission?.intent?.destination.name ?? name
+  const runtimeSchema = admission?.intent?.schemaMode === 'runtime'
   const semantics = receipt
     ? `published revision ${receipt.revisionId}`
     : admission?.managed
-      ? admission.blocker ? `blocked · ${admission.blocker}` : `${admission.mode} · ${admission.expectedSchema.length} cols`
+      ? admission.blocker ? `blocked · ${admission.blocker}` : runtimeSchema
+        ? `${admission.mode} · full schema validated during run`
+        : `${admission.mode} · ${admission.expectedSchema.length} cols`
       : admission ? `${admission.mode} · ${admission.provider}` : 'checking destination…'
   const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   const upsertSemantics = upsert?.taskId ? 'keyed upsert tracked' : upsert?.keys?.length ? 'keyed upsert configured' : null

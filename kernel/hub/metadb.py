@@ -19056,6 +19056,7 @@ def catalog_publish_managed_local_file(
         logical_uri: str, artifact_uri: str, name: str, doc: dict, *,
         parents: list[str] | None = None, lineage: dict | None = None,
         write_intent: object | None = None, total_bytes: int | None = None,
+        actual_schema: object | None = None,
         merge_publication: MergeColumnsPublicationContext | None = None) -> dict:
     """Atomically publish one already-validated local artifact as a new immutable revision.
 
@@ -19089,12 +19090,24 @@ def catalog_publish_managed_local_file(
         expected_schema = [
             (column.name, column.type) for column in typed_intent.expected_schema
         ]
-        actual_schema = [
+        payload_schema = [
             (str(column.get("name") or ""), str(column.get("type") or ""))
             for column in payload.get("columns") or []
         ]
-        if expected_schema != actual_schema:
-            raise ValueError("managed local write output schema does not match its intent")
+        if typed_intent.schema_mode == "declared":
+            if expected_schema != payload_schema:
+                raise ValueError("managed local write output schema does not match its intent")
+        else:
+            try:
+                runtime_schema = [ColumnSchema.model_validate(column) for column in actual_schema or []]
+            except ValueError as exc:
+                raise ValueError("runtime schema write has invalid full output schema") from exc
+            if not runtime_schema:
+                raise ValueError("runtime schema write requires a non-empty full output schema")
+            runtime_signature = [(column.name, column.type) for column in runtime_schema]
+            if runtime_signature != payload_schema:
+                raise ValueError(
+                    "runtime schema write output schema does not match the full run payload")
         if (canonical_lineage is None
                 or canonical_lineage["idempotency_key"] != typed_intent.idempotency_key
                 or parent_tokens != typed_intent.provenance.parents):

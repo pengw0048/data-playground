@@ -140,6 +140,63 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
   } finally { /* no shared execution settings are changed by this journey */ }
 })
 
+test('an ordinary ad-hoc Transform publishes its full runtime schema without opening Advanced', async ({ page }) => {
+  test.setTimeout(60_000)
+  const stamp = Date.now()
+  const canvasId = `runtime-schema-write-${stamp}`
+  const filename = `runtime-schema-write-${stamp}.parquet`
+  const canvas = {
+    id: canvasId, name: 'Runtime schema Write', version: 1, requirements: [], nodes: [
+      { id: 'source', type: 'source', position: { x: 80, y: 80 }, data: { title: 'Starter events', status: 'idle', config: { uri: 'events' } } },
+      { id: 'transform', type: 'transform', position: { x: 320, y: 80 }, data: { title: 'Add stable field', status: 'idle', config: {
+        source: 'adhoc', code: "def fn(row):\n    return {**row, 'stable_added': 'ready'}",
+      } } },
+      { id: 'write', type: 'write', position: { x: 560, y: 80 }, data: { title: 'Managed Write', status: 'idle', config: { filename, writeMode: 'overwrite' } } },
+    ], edges: [
+      { id: 'source-transform', source: 'source', target: 'transform' },
+      { id: 'transform-write', source: 'transform', target: 'write' },
+    ],
+  }
+  const created = await page.request.post('/api/canvas', { data: canvas })
+  expect(created.ok()).toBe(true)
+  try {
+    await page.goto(`/#/canvas/${canvasId}`)
+    const inspector = page.getByTestId('inspector')
+    await page.getByText('Add stable field', { exact: true }).click()
+    await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
+    const advanced = inspector.getByText('Advanced output schema').locator('..')
+    await expect(advanced).not.toHaveAttribute('open')
+
+    await page.getByText('Managed Write', { exact: true }).click()
+    const publication = inspector.getByLabel('Write publication')
+    await expect(publication.getByLabel('Write readiness')).toContainText(
+      'Full output schema will be validated during this run',
+    )
+    await expect(publication.getByLabel('Write blocker')).toHaveCount(0)
+    await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+    const runPanel = page.getByTestId('panel-run')
+    await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+    const runResponse = page.waitForResponse((response) => response.url().endsWith('/api/run')
+      && response.request().method() === 'POST')
+    await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
+    const started = await json<{ runId: string }>(await runResponse, 'start runtime-schema Write')
+    await expect(publication.getByLabel('Published result')).toContainText(
+      'Managed dataset published', { timeout: 30_000 })
+    let job: { runId: string; status: string; outputReceipt?: { schema: Array<{ name: string }> } | null } | undefined
+    await expect.poll(async () => {
+      const jobs = await json<{ items: Array<{ runId: string; status: string; outputReceipt?: { schema: Array<{ name: string }> } | null }> }>(
+        await page.request.get(`/api/jobs?run_id=${encodeURIComponent(started.runId)}&limit=1`),
+        'read runtime-schema Job',
+      )
+      job = jobs.items.find((item) => item.runId === started.runId)
+      return job?.status
+    }, { timeout: 30_000 }).toBe('done')
+    expect(job?.outputReceipt?.schema.map((field) => field.name)).toContain('stable_added')
+  } finally {
+    await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+  }
+})
+
 test('Canvas Inbox count omits failures and refreshes from confirmed mark-read state @ux-smoke', async ({ page }) => {
   const canvasId = 'canvas-inbox-count'
   const created = await page.request.post('/api/canvas', { data: {

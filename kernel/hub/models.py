@@ -911,6 +911,9 @@ class WriteIntent(Wire):
 
     destination: WriteDestination
     mode: Literal["create", "replace", "append"]
+    # ``declared`` preserves the existing frozen schema assertion. ``runtime`` is deliberately
+    # narrow: an ordinary managed-file create/replace establishes its schema from one full run.
+    schema_mode: Literal["declared", "runtime"] = "declared"
     expected_schema: list[ColumnSchema] = Field(default_factory=list, max_length=1024)
     expected_head: ExactDatasetRef | None = None
     idempotency_key: str = Field(min_length=1, max_length=2048)
@@ -951,6 +954,13 @@ class WriteIntent(Wire):
                 raise ValueError("append write requires a .lance destination")
         elif self.destination.provider != "managed-local-file":
             raise ValueError("create/replace writes require the managed-local-file provider")
+        if self.schema_mode == "runtime":
+            if (self.mode not in ("create", "replace")
+                    or self.destination.provider != "managed-local-file"
+                    or self.expected_schema or self.partitions or self.schema_drift is not None):
+                raise ValueError(
+                    "runtime schema writes require managed-local-file create/replace with no "
+                    "declared schema, partitions, or schema drift")
         if self.schema_drift is not None:
             if (self.mode != "replace"
                     or self.destination.provider != "managed-local-file"

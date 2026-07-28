@@ -784,6 +784,7 @@ export interface RunOutput {
 export interface WriteIntent {
   destination: { logicalUri: string; name: string; datasetId?: string | null; provider: 'managed-local-file' | 'managed-local-lance' }
   mode: 'create' | 'replace' | 'append'
+  schemaMode?: 'declared' | 'runtime'
   expectedSchema: { name: string; type: string; capabilities?: string[] }[]
   expectedHead?: { kind: 'exact'; datasetId: string; revisionId: string } | null
   idempotencyKey: string

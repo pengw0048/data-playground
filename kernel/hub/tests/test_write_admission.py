@@ -173,6 +173,155 @@ def _set_exact_revision_schema(revision_id: str, columns: list[dict]) -> None:
         row.table_doc = json.dumps(table)
 
 
+def _dynamic_transform_graph(graph: Graph, *, source: str = "adhoc") -> Graph:
+    """Turn the shared Source -> Write fixture into the ordinary dynamic Transform route."""
+    source_node, write = graph.nodes
+    return Graph.model_validate({
+        **graph.model_dump(by_alias=True),
+        "nodes": [
+            source_node.model_dump(by_alias=True),
+            {"id": "transform", "type": "transform", "data": {"config": {
+                "source": source,
+                "code": "def fn(row):\n    return row",
+            }}},
+            write.model_dump(by_alias=True),
+        ],
+        "edges": [
+            {"id": "source-transform", "source": "source", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+
+
+def _dynamic_transform_schemas():
+    return {
+        "source": [ColumnSchema(name="value", type="int")],
+        "transform": None,
+        "write": None,
+    }
+
+
+def test_dynamic_adhoc_transform_admits_runtime_schema_and_publishes_full_schema(
+        contract, monkeypatch):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: _dynamic_transform_schemas())
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-create")
+
+    assert admission.blocker is None and admission.intent is not None
+    assert admission.intent.schema_mode == "runtime"
+    assert admission.intent.expected_schema == []
+    assert admission.intent.schema_drift is None
+    assert admission.intent.provenance.publication.field_mappings == []
+    actual = [
+        ColumnSchema(name="value", type="int"),
+        ColumnSchema(name="stable_added", type="string"),
+    ]
+    receipt = write_managed_local_file(
+        storage=deps.storage,
+        catalog=deps.catalog,
+        intent=admission.intent,
+        actual_schema=actual,
+        write_artifact=lambda uri: pq.write_table(
+            pa.table({"value": [1], "stable_added": ["ok"]}), uri),
+    )
+
+    assert [(column.name, column.type) for column in receipt.schema] == [
+        ("value", "int"), ("stable_added", "string"),
+    ]
+    recovered = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-create", supplied=admission.intent)
+    assert recovered.recovered_receipt == receipt
+    assert recovered.intent == admission.intent
+
+
+def test_runtime_schema_requires_the_full_payload_to_match_and_publishes_nothing(
+        contract, monkeypatch):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: _dynamic_transform_schemas())
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-payload-mismatch")
+    assert admission.intent is not None
+    before = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(ValueError, match="runtime schema write output schema"):
+        write_managed_local_file(
+            storage=deps.storage,
+            catalog=deps.catalog,
+            intent=admission.intent,
+            actual_schema=[ColumnSchema(name="value", type="int")],
+            write_artifact=lambda uri: pq.write_table(pa.table({"other": [1]}), uri),
+        )
+
+    assert _managed_publication_counts() == before
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_runtime_schema_response_loss_recovers_the_same_frozen_intent_and_receipt(
+        contract, monkeypatch):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: _dynamic_transform_schemas())
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-response-loss")
+    assert admission.intent is not None
+    actual = [ColumnSchema(name="value", type="int")]
+    publish = metadb.catalog_publish_managed_local_file
+
+    def commit_then_lose_response(*args, **kwargs):
+        publish(*args, **kwargs)
+        raise OSError("write response lost")
+
+    monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", commit_then_lose_response)
+    first = write_managed_local_file(
+        storage=deps.storage, catalog=deps.catalog, intent=admission.intent,
+        actual_schema=actual,
+        write_artifact=lambda uri: pq.write_table(pa.table({"value": [7]}), uri),
+    )
+    monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", publish)
+    replayed = write_managed_local_file(
+        storage=deps.storage, catalog=deps.catalog, intent=admission.intent,
+        actual_schema=actual,
+        write_artifact=lambda uri: pq.write_table(pa.table({"value": [99]}), uri),
+    )
+
+    assert replayed == first
+    assert replayed.schema == first.schema
+    assert admission.intent.schema_mode == "runtime"
+
+
+@pytest.mark.parametrize("source, schemas", [
+    ("library", _dynamic_transform_schemas()),
+    ("adhoc", {"source": None, "transform": None, "write": None}),
+])
+def test_runtime_schema_does_not_bypass_library_or_unavailable_source(contract, monkeypatch, source, schemas):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph, source=source)
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: schemas)
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", f"runtime-reject-{source}")
+
+    assert admission.intent is None
+    assert admission.blocker is not None and "bounded output schema" in admission.blocker
+
+
+def test_runtime_schema_does_not_bypass_resolution_error(contract, monkeypatch):
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-resolution-error")
+
+    assert admission.intent is None
+    assert admission.blocker is not None and "bounded output schema" in admission.blocker
+
+
 def _admit_schema_change(contract, monkeypatch, before: list[dict], after: list[dict]):
     deps, graph = contract
     create = _write_admission_for_graph(
@@ -1467,6 +1616,93 @@ def test_local_runner_consumes_frozen_intent_and_publishes_receipt(
     assert second.revision_id != first.revision_id
     assert replaced.outputs[0].uri == second.publication.artifact_uri
     assert replaced.outputs[0].version == second.publication.catalog_version
+
+
+def test_local_runner_publishes_runtime_transform_schema_for_create_and_replace(contract):
+    from hub.compiler import compile_plan
+    from hub.plugins.runner import LocalRunner
+
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"]["code"] = (
+        "def fn(row):\n"
+        "    return {**row, 'stable_added': 'ready'}"
+    )
+    node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, deps.catalog, deps.workspace,
+        node_specs=node_specs, storage=deps.storage)
+
+    def execute(submission: str):
+        admission = _write_admission_for_graph(
+            deps, graph, "write", "researcher", submission)
+        assert admission.intent is not None and admission.intent.schema_mode == "runtime"
+        _inject_write_intent(graph, "write", admission.intent)
+        run_id = metadb.local_run_submission_id("researcher", graph.id, submission)
+        started = runner.run(
+            compile_plan(graph, "write", deps.registry, node_specs), graph, "write", "local", run_id=run_id)
+        deadline = time.monotonic() + 3
+        status = started
+        while status.status not in ("done", "failed", "cancelled"):
+            assert time.monotonic() < deadline, status
+            time.sleep(0.01)
+            status = runner.status(run_id)
+        assert runner.wait_for_worker(run_id, timeout=2)
+        assert status.status == "done", status.error
+        return admission, status.outputs[0].write_receipt
+
+    create, first = execute("runtime-runner-create")
+    assert first is not None and first.parent_head is None
+    assert [(column.name, column.type) for column in first.schema] == [
+        ("value", "int"), ("stable_added", "string"),
+    ]
+    replace, second = execute("runtime-runner-replace")
+    assert replace.intent is not None and replace.intent.schema_drift is None
+    assert second is not None and second.parent_head is not None
+    assert second.parent_head.revision_id == first.revision_id
+    assert [(column.name, column.type) for column in second.schema] == [
+        ("value", "int"), ("stable_added", "string"),
+    ]
+
+
+def test_runtime_transform_batch_schema_drift_fails_before_publication(contract, monkeypatch):
+    from hub.compiler import compile_plan
+    from hub.executors import engine as engine_mod
+    from hub.plugins.runner import LocalRunner
+
+    deps, graph = contract
+    graph = _dynamic_transform_graph(graph)
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"]["code"] = (
+        "def fn(row):\n"
+        "    return {'value': row['value'] if row['value'] == 1 else 'wrong'}"
+    )
+    monkeypatch.setattr(engine_mod, "_SPILL_FLUSH_ROWS", 1)
+    node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-schema-drift")
+    assert admission.intent is not None and admission.intent.schema_mode == "runtime"
+    _inject_write_intent(graph, "write", admission.intent)
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, deps.catalog, deps.workspace,
+        node_specs=node_specs, storage=deps.storage)
+    run_id = metadb.local_run_submission_id("researcher", graph.id, "runtime-schema-drift")
+    started = runner.run(
+        compile_plan(graph, "write", deps.registry, node_specs), graph, "write", "local", run_id=run_id)
+    deadline = time.monotonic() + 3
+    status = started
+    while status.status not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline, status
+        time.sleep(0.01)
+        status = runner.status(run_id)
+    assert runner.wait_for_worker(run_id, timeout=2)
+    assert status.status == "failed"
+    assert "schema drifted" in (status.error or "")
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
 def test_precise_library_integer_schema_matches_managed_write_runtime(contract):

@@ -757,6 +757,28 @@ def _missing_bounded_schema_blocker(graph: Graph, node_id: str) -> str:
     )
 
 
+def _runtime_schema_write_eligible(graph: Graph, node_id: str, schemas: dict[str, list | None]) -> bool:
+    """Recognize the one ordinary dynamic-output Write contract.
+
+    This is intentionally stricter than "the schema is unknown": the unknown must come from the
+    direct, editable ad-hoc Python Transform.  Source evidence must still be available, so an
+    unavailable exact input cannot be recast as runtime output discovery.
+    """
+    inbound = graph_mod.incoming(graph, node_id)
+    if len(inbound) != 1:
+        return False
+    nodes = graph_mod.node_map(graph)
+    transform = nodes.get(inbound[0].source)
+    if transform is None or transform.type != "transform" or declared_schema(transform) is not None:
+        return False
+    config = transform.data.get("config", {}) if isinstance(transform.data, dict) else {}
+    if not isinstance(config, dict) or config.get("source", "adhoc") != "adhoc":
+        return False
+    sources = [node for node in graph_mod.upstream_chain(graph, transform.id)
+               if node.type == "source"]
+    return bool(sources) and all(schemas.get(node.id) is not None for node in sources)
+
+
 def _managed_file_schema_drift(
         compared_head: ExactDatasetRef,
         before: list[ColumnSchema],
@@ -932,6 +954,7 @@ def _write_admission_for_graph(
             blocker=exact_run_readiness.message,
         )
     schemas: dict[str, list | None] = {}
+    schema_resolution_succeeded = True
     try:
         if direct_local:
             # Prefer an explicit declared upstream schema (external-wait fixtures). Fall back to the
@@ -959,8 +982,16 @@ def _write_admission_for_graph(
     except ManagedSourceReadError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception:
+        schema_resolution_succeeded = False
         schema = None
-    if schema is None:
+    runtime_schema = (
+        schema is None
+        and schema_resolution_succeeded
+        and managed_file
+        and not partitions
+        and _runtime_schema_write_eligible(graph, node_id, schemas)
+    )
+    if schema is None and not runtime_schema:
         return response(
             node_id=node_id,
             managed=True,
@@ -974,10 +1005,12 @@ def _write_admission_for_graph(
 
     run_id = run_id or metadb.local_run_submission_id(
         str(uid), str(getattr(graph, "id", "") or "") or None, str(submission_id))
-    normalized_schema = [ColumnSchema.model_validate(column) for column in schema]
+    schema_mode = "runtime" if runtime_schema else "declared"
+    normalized_schema = ([ColumnSchema.model_validate(column) for column in schema]
+                         if schema is not None else [])
     inbound = graph_mod.incoming(graph, node_id)
     reference_schema = schema
-    if len(inbound) == 1:
+    if not runtime_schema and len(inbound) == 1:
         upstream = graph_mod.node_map(graph).get(inbound[0].source)
         upstream_schema = schemas.get(inbound[0].source)
         if upstream_schema is None and upstream is not None:
@@ -986,9 +1019,11 @@ def _write_admission_for_graph(
             reference_schema = upstream_schema
     lineage = lineage_for_output(
         graph, run_id, node_id,
-        field_mappings=_durable_row_reference_mappings(
-            [ColumnSchema.model_validate(column) for column in reference_schema],
-            output_schema=normalized_schema))
+        field_mappings=(
+            _durable_row_reference_mappings(
+                [ColumnSchema.model_validate(column) for column in reference_schema],
+                output_schema=normalized_schema)
+            if not runtime_schema else []))
     parents = metadb.catalog_lineage_parent_tokens(
         graph_mod.all_upstream_publication_uris(graph, node_id))
     provenance = WriteProvenance(publication=lineage, parents=parents)
@@ -1000,6 +1035,7 @@ def _write_admission_for_graph(
                 or supplied.destination.provider != "managed-local-lance"
                 or supplied.destination.logical_uri != logical_uri
                 or supplied.destination.dataset_id != str(lance_binding["dataset_id"])
+                or supplied.schema_mode != "declared"
                 or supplied.destination.name != lance_table.name
                 or supplied.expected_schema != normalized_schema
                 or supplied.idempotency_key != lineage.idempotency_key
@@ -1093,6 +1129,7 @@ def _write_admission_for_graph(
     if supplied is not None:
         if (supplied.destination.logical_uri != logical_uri
                 or supplied.destination.name != spec.name
+                or supplied.schema_mode != schema_mode
                 or supplied.expected_schema != normalized_schema
                 or supplied.idempotency_key != lineage.idempotency_key
                 or supplied.provenance != provenance
@@ -1134,7 +1171,7 @@ def _write_admission_for_graph(
         revision_id=str(head["revision_id"]),
     ) if replacing else None)
     schema_drift = None
-    if expected_head is not None and not direct_local:
+    if expected_head is not None and not direct_local and not runtime_schema:
         try:
             previous_schema = metadb.catalog_managed_local_revision_schema(expected_head)
         except RuntimeError as exc:
@@ -1162,6 +1199,7 @@ def _write_admission_for_graph(
             dataset_id=(str(head["dataset_id"]) if replacing else None),
         ),
         mode=("replace" if replacing else "create"),
+        schema_mode=schema_mode,
         expected_schema=normalized_schema,
         expected_head=expected_head,
         idempotency_key=lineage.idempotency_key,
@@ -1172,6 +1210,7 @@ def _write_admission_for_graph(
     if supplied is not None and (
             intent.destination.logical_uri != logical_uri
             or intent.destination.name != spec.name
+            or intent.schema_mode != schema_mode
             or intent.expected_schema != normalized_schema):
         raise HTTPException(409, "write admission does not match the submitted graph")
     if supplied is not None and intent.expected_head != expected_head:

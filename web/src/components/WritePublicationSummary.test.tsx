@@ -54,6 +54,23 @@ describe('WritePublicationSummary exact receipt action', () => {
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Publishing this managed revision')
   })
 
+  it('explains runtime-schema publication without asking for an inferred contract', () => {
+    const admission = {
+      nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
+      destination: '/outputs/runtime.parquet', expectedSchema: [], partitions: [],
+      intent: { schemaMode: 'runtime', destination: { name: 'runtime' } },
+    } as any
+
+    render(<WritePublicationSummary outputName="runtime.parquet"
+      destination="Workspace outputs" admission={admission} />)
+
+    const summary = screen.getByLabelText('Write publication')
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
+      'Full output schema will be validated during this run before publication.')
+    expect(summary).not.toHaveTextContent('bounded output schema contract')
+    expect(summary).not.toHaveTextContent('Infer from sample')
+  })
+
   it('keeps the receipt name authoritative when a later admission targets another name', () => {
     const nextAdmission = {
       nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
