@@ -3939,6 +3939,7 @@ describe('graph store — core authority ops', () => {
     if (!created.ok) throw new Error('expected local draft')
     const draft = useStore.getState().localDrafts[0]
     apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: true })
+    useStore.setState({ toasts: [] })
 
     await useStore.getState().retryLocalDraft(draft.draftId)
 
@@ -3946,6 +3947,21 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().localDrafts).toEqual([])
     expect(useStore.getState().currentDraftId).toBeNull()
     expect(useStore.getState().serverVersion).toBe(1)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === `Synced “${draft.name}”`)).toBe(true)
+  })
+
+  it('keeps automatic draft synchronization out of toast notifications', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+    const created = await useStore.getState().newFile()
+    if (!created.ok) throw new Error('expected local draft')
+    const draft = useStore.getState().localDrafts[0]
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: true })
+    useStore.setState({ toasts: [] })
+
+    await useStore.getState().retryLocalDraft(draft.draftId, { notify: false })
+
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().toasts).toEqual([])
   })
 
   it('recovers a lost create response only after confirming owner and exact first content', async () => {
