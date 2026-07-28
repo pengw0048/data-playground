@@ -54,6 +54,15 @@ class _Seed:
     exact_ref: ExactDatasetRef | None = None
 
 
+def _page_candidates(page: RelatedDatasetPage) -> list[RelatedDatasetCandidate]:
+    """Return every reviewable candidate, including explicitly weak schema matches.
+
+    This is intentionally private to the service boundary: callers rendering the picker should
+    keep ``candidates`` and ``possible_matches`` separate.
+    """
+    return [*page.candidates, *page.possible_matches]
+
+
 def _local_identity(table: CatalogTable, *, revision_id: str | None = None) -> RelatedDatasetIdentity:
     if not table.registration_id:
         raise ValueError("catalog dataset has no stable registration identity")
@@ -141,7 +150,7 @@ def review_related_dataset_revision(
     page = related_datasets(
         catalog, resolve_adapter, storage, source_identity, q=q, folder=folder,
         limit=MAX_RELATED_DATASETS, _measure_cardinality=False)
-    base = next((item for item in page.candidates
+    base = next((item for item in _page_candidates(page)
                  if _stable_identity_matches(item.identity, candidate.identity)
                  and item.evidence == candidate.evidence
                  and item.left_columns == candidate.left_columns
@@ -182,7 +191,9 @@ def review_related_dataset_revision(
             "Fan-out was not measured because this join uses an exact revision; "
             "measuring it would require scanning the pinned dataset."
         ),
-        "confidence": "declared" if declared_cardinality != "unknown" else "inferred",
+        # Pinning a revision can make cardinality unknown, but it must not erase the relationship
+        # evidence established during the bounded review (nor can cardinality establish it).
+        "confidence": base.confidence,
         "warning": _fanout(declared_cardinality),
     })
 
@@ -534,6 +545,7 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
         item.rank, -item.score, item.table.name.casefold(), item.identity.registration_id or item.identity.source_binding_id or ""))
     visible = ranked[:bounded]
     candidates: list[RelatedDatasetCandidate] = []
+    possible_matches: list[RelatedDatasetCandidate] = []
     with source_read_scope(storage, [source.uri, *(item.table.uri for item in visible)],
                            owner=f"related-datasets:{source.dataset_id}"):
         for seed in visible:
@@ -558,19 +570,24 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                 except Exception:
                     cardinality = "unknown"
                 cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
-            candidates.append(RelatedDatasetCandidate(
+            candidate = RelatedDatasetCandidate(
                 identity=seed.identity, name=seed.table.name,
                 folder=seed.table.folder, reason=seed.reason, evidence=seed.evidence,
                 evidence_status=seed.evidence_status, left_columns=seed.left_columns,
                 right_columns=seed.right_columns, cardinality=cardinality,
                 cardinality_state=cardinality_state, cardinality_reason=cardinality_reason,
-                confidence=("declared" if seed.evidence == "declared_relationship"
-                            else "verified" if cardinality != "unknown" else "inferred"),
-                exact_ref=seed.exact_ref, warning=_fanout(cardinality)))
+                confidence=("declared" if seed.evidence_status == "declared"
+                            else "verified" if seed.evidence == "typed_reference" else "inferred"),
+                exact_ref=seed.exact_ref, warning=_fanout(cardinality))
+            if seed.evidence == "schema_match":
+                possible_matches.append(candidate)
+            else:
+                candidates.append(candidate)
     catalog_scope_truncated = scope.has_more if source.identity.kind == "local" else False
     truncated = catalog_scope_truncated or relationship_truncated or provider_folder_unavailable or references_seen > _REFERENCE_LIMIT \
         or len(ranked) > bounded or len(exclusions) == _EXCLUSION_LIMIT
     return RelatedDatasetPage(source=source.identity, source_name=source.name, candidates=candidates,
+                              possible_matches=possible_matches,
                               excluded=exclusions, limit=bounded, inspected=len(scoped),
                               truncated=truncated, refinement_required=truncated,
                               scope_note=("Provider folder scope cannot be proven from canonical dataset records; "

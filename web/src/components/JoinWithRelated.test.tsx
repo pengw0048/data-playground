@@ -40,13 +40,14 @@ const page = {
     leftColumns: ['user_id'], rightColumns: ['id'], cardinality: 'unknown',
     cardinalityState: 'unmeasured',
     confidence: 'verified',
-  }, {
+  }],
+  possibleMatches: [{
     identity: { kind: 'local', registrationId: 'reg-orders', revisionMode: 'current' },
     name: 'orders', folder: '', reason: 'matching key column(s) — cardinality not measurable here',
     evidence: 'schema_match', evidenceStatus: 'inferred',
     leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:N',
     cardinalityState: 'available',
-    confidence: 'verified', warning: 'This join is 1:N: right fans out, so rows may multiply.',
+    confidence: 'inferred', warning: 'This join is 1:N: right fans out, so rows may multiply.',
   }],
   excluded: [],
   limit: 12,
@@ -82,8 +83,10 @@ describe('JoinWithRelated', () => {
   it('separates evidence, keeps unknown explicit, and cancellation mutates nothing', async () => {
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
-    expect(screen.getByText('Inferred candidates')).toBeVisible()
+    await screen.findByText('Related data')
+    expect(screen.queryByText('Possible matches')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+    expect(screen.getByText('Possible matches')).toBeVisible()
     expect(screen.getByText(/Results are truncated/)).toBeVisible()
 
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
@@ -105,7 +108,7 @@ describe('JoinWithRelated', () => {
     })
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     fireEvent.click(screen.getByTestId('confirm-related-join'))
 
@@ -121,10 +124,10 @@ describe('JoinWithRelated', () => {
   })
 
   it('shows a healthy no-result state separately from provider failure', async () => {
-    mocks.related.mockResolvedValueOnce({ ...page, candidates: [], truncated: false, refinementRequired: false })
+    mocks.related.mockResolvedValueOnce({ ...page, candidates: [], possibleMatches: [], truncated: false, refinementRequired: false })
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    expect(await screen.findByTestId('related-no-results')).toHaveTextContent('No related datasets')
+    expect(await screen.findByTestId('related-no-results')).toHaveTextContent('No known relationships')
     expect(mocks.confirm).not.toHaveBeenCalled()
   })
 
@@ -139,7 +142,7 @@ describe('JoinWithRelated', () => {
     })
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
@@ -153,7 +156,7 @@ describe('JoinWithRelated', () => {
     mocks.reviewRevision.mockRejectedValueOnce(new Error('revision rev-2 is unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
@@ -169,7 +172,7 @@ describe('JoinWithRelated', () => {
   it('refreshes both the reviewed candidate and its revision base after a stale exact review', async () => {
     const refreshed = {
       ...page,
-      candidates: [{ ...page.candidates[0], reason: 'refreshed review base' }, page.candidates[1]],
+      candidates: [{ ...page.candidates[0], reason: 'refreshed review base' }], possibleMatches: page.possibleMatches,
     }
     mocks.reviewRevision
       .mockResolvedValueOnce({
@@ -181,7 +184,7 @@ describe('JoinWithRelated', () => {
     mocks.related.mockResolvedValueOnce(page).mockResolvedValueOnce(refreshed)
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
@@ -200,7 +203,7 @@ describe('JoinWithRelated', () => {
     mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByText('Version history is unavailable for this dataset.')
     expect(screen.getByTestId('confirm-related-join')).toBeEnabled()
@@ -210,7 +213,7 @@ describe('JoinWithRelated', () => {
     mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByText('Version history is unavailable for this dataset.')
     expect(screen.getByText(/Cardinality is unknown because it was not measured/)).toBeVisible()
@@ -238,7 +241,7 @@ describe('JoinWithRelated', () => {
     })
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     await screen.findByRole('option', { name: /Retained version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
@@ -254,7 +257,7 @@ describe('JoinWithRelated', () => {
     render(<JoinWithRelated nodeId="source-1" />)
     const opener = screen.getByRole('button', { name: 'Join with…' })
     fireEvent.click(opener)
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     await waitFor(() => expect(opener).toHaveFocus())
@@ -263,7 +266,7 @@ describe('JoinWithRelated', () => {
   it('uses the Canvas modal shortcut-isolation contract and ignores Delete', async () => {
     render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with related data' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     const dialog = screen.getByRole('dialog', { name: 'Join with related data' })
     expect(dialog.parentElement).toHaveClass('dp-modal-overlay')
     const cancel = screen.getByRole('button', { name: 'Cancel', exact: true })
@@ -352,7 +355,7 @@ describe('JoinWithRelated', () => {
 
     render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with related data on left input' }))
-    await screen.findByText('Declared and proven references')
+    await screen.findByText('Related data')
     expect(screen.getByText('a.id = b.user_id')).toBeVisible()
     expect(screen.getByText('N:1')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: /users/ }))

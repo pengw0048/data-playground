@@ -1284,7 +1284,7 @@ def join_with_related_dataset(
         else:
             reviewed = related_datasets(deps.catalog, deps.resolve_adapter, deps.storage, source_identity,
                                         q=body.q, folder=body.folder, limit=20)
-            candidate = next((item for item in reviewed.candidates
+            candidate = next((item for item in [*reviewed.candidates, *reviewed.possible_matches]
                               if item.identity == body.candidate.identity
                               and item.evidence == body.candidate.evidence
                               and item.left_columns == body.candidate.left_columns

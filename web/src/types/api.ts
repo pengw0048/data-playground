@@ -536,6 +536,7 @@ export interface RelatedDatasetPage {
   source: RelatedDatasetIdentity
   sourceName: string
   candidates: RelatedDatasetCandidate[]
+  possibleMatches: RelatedDatasetCandidate[]
   excluded: Array<{ identity: RelatedDatasetIdentity; name: string; reason: string }>
   limit: number
   inspected: number

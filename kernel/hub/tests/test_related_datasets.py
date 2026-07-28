@@ -80,6 +80,14 @@ def _table(name: str, columns: list[ColumnSchema], *, folder: str = "") -> Catal
     )
 
 
+def _reviewable_candidates(page):
+    return [*page.candidates, *page.possible_matches]
+
+
+def _reviewable_candidate_json(page: dict):
+    return [*page["candidates"], *page.get("possibleMatches", [])]
+
+
 def test_declared_then_typed_ranking_excludes_conflicting_reference_and_stays_bounded():
     source = _table("events", [ColumnSchema.model_validate({
         "name": "owner_id",
@@ -119,6 +127,50 @@ def test_declared_then_typed_ranking_excludes_conflicting_reference_and_stays_bo
     exclusion = next(item for item in page.excluded if item.name == "declared")
     assert "contradicts" in exclusion.reason
     assert page.truncated is True and page.refinement_required is True
+
+
+def test_relationship_evidence_is_primary_and_name_only_stays_a_possible_match(monkeypatch):
+    from hub import related_datasets as related
+
+    source = _table("events", [
+        ColumnSchema(name="id", type="int"),
+        ColumnSchema.model_validate({
+            "name": "owner_id", "type": "int",
+            "rowReference": {
+                "target": {"kind": "canonical", "datasetId": "reg_owners"},
+                "keyFields": ["id"], "provenance": "provider",
+            },
+        }),
+    ])
+    declared = _table("event_details", [ColumnSchema(name="event_id", type="int")])
+    owners = _table("owners", [ColumnSchema(name="id", type="int")])
+    images = _table("images", [ColumnSchema(name="id", type="int")])
+    unrelated = _table("notes", [ColumnSchema(name="body", type="string")])
+    monkeypatch.setattr(related.relationships, "measure_unique", lambda *_args: (True, 2))
+    page = related_datasets(_Catalog(
+        [source, declared, owners, images, unrelated],
+        [Relationship(
+            left_uri=source.uri, left_columns=["id"], right_uri=declared.uri,
+            right_columns=["event_id"], cardinality="1:N",
+        )],
+    ), lambda _uri: _UnavailableAdapter(), None, source.registration_id)
+
+    assert [(item.name, item.evidence) for item in page.candidates] == [
+        ("event_details", "declared_relationship"), ("owners", "typed_reference"),
+    ]
+    assert [(item.name, item.evidence, item.confidence, item.cardinality) for item in page.possible_matches] == [
+        ("images", "schema_match", "inferred", "1:1"),
+    ]
+    assert all(item.name != "notes" for item in _reviewable_candidates(page))
+
+
+def test_no_relationship_or_schema_candidate_is_honestly_empty():
+    source = _table("events", [ColumnSchema(name="event_key", type="int")])
+    unrelated = _table("notes", [ColumnSchema(name="body", type="string")])
+    page = related_datasets(_Catalog([source, unrelated]), lambda _uri: _UnavailableAdapter(), None,
+                            source.registration_id)
+    assert page.candidates == []
+    assert page.possible_matches == []
 
 
 def _parquet(path, values: list[int]) -> None:
@@ -166,7 +218,7 @@ def test_confirm_is_one_canvas_cas_and_stale_canvas_or_dataset_changes_nothing(t
     })
     assert page_response.status_code == 200, page_response.text
     page = page_response.json()
-    candidate = next(item for item in page["candidates"] if item["name"] == right["name"])
+    candidate = next(item for item in _reviewable_candidate_json(page) if item["name"] == right["name"])
     body = {
         "expectedCanvasVersion": 1,
         "sourceNodeId": "left-source",
@@ -337,7 +389,7 @@ def test_real_http_retained_revision_review_creates_an_exact_related_source(tmp_
         "source": source_identity, "q": right["name"], "limit": 10,
     })
     assert listed.status_code == 200, listed.text
-    current = next(item for item in listed.json()["candidates"] if item["name"] == right["name"])
+    current = next(item for item in _reviewable_candidate_json(listed.json()) if item["name"] == right["name"])
     history = client.post("/api/catalog/related-datasets/revisions", json={
         "identity": current["identity"], "limit": 20,
     })
@@ -395,7 +447,7 @@ def test_existing_join_with_selected_source_on_b_swaps_heterogeneous_condition(t
     page = client.post("/api/catalog/related-datasets", json={
         "source": source_identity, "q": right["name"], "limit": 10,
     }).json()
-    candidate = next(item for item in page["candidates"] if item["name"] == right["name"])
+    candidate = next(item for item in _reviewable_candidate_json(page) if item["name"] == right["name"])
     result = client.post(f"/api/canvas/{canvas_id}/join-with-related", json={
         "expectedCanvasVersion": 1, "sourceNodeId": "source", "joinNodeId": "join",
         "sourceIdentity": source_identity, "candidate": candidate, "q": right["name"], "how": "inner",
@@ -515,14 +567,14 @@ def test_provider_source_uses_bounded_mount_scope_not_a_local_catalog_fallback(m
     monkeypatch.setattr(related.workspace_providers, "provider_dataset_uri", uri_for)
     monkeypatch.setattr(related.workspace_providers, "provider_dataset_identity",
                         lambda uri: f"workspace-provider:{uri.rsplit('/', 1)[-1]}")
-    # There is intentionally no local catalog candidate. The provider candidate still flows through
-    # the same bounded schema/key and unknown-cardinality policy.
+    # There is intentionally no local catalog relationship evidence. The same-name provider
+    # candidate remains discoverable, but only as a possible schema/name match.
     page = related_datasets(_Catalog([]), lambda _uri: _UnavailableAdapter(), None,
                             related.RelatedDatasetIdentity(
                                 kind="provider", mount_id="mount-a", source_binding_id=source_binding),
                             limit=10)
     assert [(item.name, item.identity.kind, item.identity.source_binding_id, item.cardinality)
-            for item in page.candidates] == [("provider-related", "provider", candidate_binding, "unknown")]
+            for item in page.possible_matches] == [("provider-related", "provider", candidate_binding, "unknown")]
 
 
 def test_provider_typed_reference_is_ranked_before_its_inferred_match(monkeypatch):
@@ -718,7 +770,7 @@ def test_retained_revision_picker_uses_bounded_history_and_rechecks_exact_schema
                         lambda uri: {"dataset_id": "logical-users"} if uri == target.uri else None)
     catalog = _Catalog([source, target])
     page = related_datasets(catalog, lambda _uri: _UnavailableAdapter(), None, source.registration_id)
-    candidate = next(item for item in page.candidates if item.name == "users")
+    candidate = next(item for item in _reviewable_candidates(page) if item.name == "users")
     revisions = related.related_dataset_revisions(
         catalog, lambda _uri: _UnavailableAdapter(),
         RelatedDatasetIdentity(kind="local", registration_id=target.registration_id), limit=20)
@@ -772,7 +824,7 @@ def test_exact_review_keeps_declared_cardinality_without_measuring(monkeypatch):
         right_columns=["id"], cardinality="1:N",
     )])
     page = related_datasets(catalog, lambda _uri: _UnavailableAdapter(), None, source.registration_id)
-    candidate = next(item for item in page.candidates if item.name == "users")
+    candidate = next(item for item in _reviewable_candidates(page) if item.name == "users")
 
     def fail_if_measured(*_args, **_kwargs):
         raise AssertionError("exact revision review must not measure cardinality")
