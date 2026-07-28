@@ -712,7 +712,9 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" editorPreview={{ onRunUpstream }} />)
 
-    await user.click(screen.getByRole('button', { name: 'Run upstream →' }))
+    expect(screen.getByText('Run upstream to test this code')).toBeInTheDocument()
+    expect(screen.getByText(/upstream result is not available yet/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run upstream' }))
     expect(onRunUpstream).toHaveBeenCalledOnce()
     expect(screen.queryByText(/Run a full pass/)).not.toBeInTheDocument()
   })
@@ -980,11 +982,14 @@ describe('durable full results', () => {
     const user = userEvent.setup()
     render(<DataPanel nodeId="target" />)
 
-    expect(screen.getByText(/left requires a full pass/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
+    expect(screen.getByText('Run this step to see results')).toBeInTheDocument()
+    expect(screen.getByText(/bounded preview would be misleading/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
+    expect(screen.queryByText(/left requires a full pass/i)).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'right' }))
-    expect(await screen.findByText(/right requires a full pass/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Run a full pass/i })).toBeInTheDocument()
+    expect(await screen.findByText('Run this step to see results')).toBeInTheDocument()
+    expect(screen.queryByText(/right requires a full pass/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run this step' })).toBeInTheDocument()
     expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'right')
   })
 
@@ -1629,8 +1634,8 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
 
     await user.click(screen.getByRole('button', { name: 'Stats' }))
-    expect(await screen.findByText('Not sample-previewable')).toBeInTheDocument()
-    expect(screen.getByText(/switch to full dataset to estimate/i)).toBeInTheDocument()
+    expect(await screen.findByText('Use the full dataset for this profile')).toBeInTheDocument()
+    expect(screen.getByText(/sample-based statistics would be misleading/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /run a full pass/i })).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'full dataset' }))

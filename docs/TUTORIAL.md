@@ -41,7 +41,7 @@ That is the path for your own analysis. For the rest of this short tour, open th
 choose **Create example Canvas → Purchases per user**. It creates a separate, runnable Canvas whose
 Source is the same seeded dataset.
 
-## 3. Inspect the graph, then respect the full-pass boundary
+## 3. Inspect the graph, then run complete steps when needed
 
 The example is:
 
@@ -53,10 +53,11 @@ Select the `events` Source and choose **View data** in the Inspector. Canvas pre
 own bound: the source-read limit, returned rows, and the fact that an output prefix is not necessarily
 the first rows of a final result.
 
-Now select `aggregate` and choose **View data**. Its panel says **Not sample-previewable** and offers
-**Run a full pass →**. A grouped aggregate needs every relevant input row; presenting a prefix total
-as though it were the result would be misleading. This is deliberate: a preview is shown only when it
-can preserve the operation's meaning. The same rule applies to writes and other global operations.
+Now select `aggregate` and choose **View data**. Its panel explains that the step must run before it can
+show a result and offers **Run this step**. A grouped aggregate needs every relevant input row;
+presenting a prefix total as though it were the result would be misleading. This is deliberate: a
+preview is shown only when it can preserve the operation's meaning. The same rule applies to writes
+and other global operations.
 
 ### Python Transform cell boundary
 

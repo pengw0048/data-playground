@@ -2128,7 +2128,7 @@ export const useStore = create<Store>((set, get) => ({
               truncated: false,
               completeness: 'unknown',
               notPreviewable: true,
-              reason: `${spec.title} is not sample-previewable — run a full pass`,
+              reason: `${spec.title} needs a complete run before its result can be shown`,
               wire: 'dataset',
             },
           },

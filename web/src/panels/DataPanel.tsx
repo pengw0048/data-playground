@@ -185,14 +185,14 @@ export function DataPanel({ nodeId, editorPreview }: {
         modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
     return withOutputPorts(<NotPreviewable
-      title={editorPreview ? 'Run upstream' : undefined}
-      reason={res.reason ?? (editorPreview
-        ? 'No current retained upstream result is available.'
-        : 'needs a full pass')}
+      title={editorPreview ? 'Run upstream to test this code' : undefined}
+      reason={editorPreview
+        ? 'The upstream result is not available yet. Run the upstream step, then test again.'
+        : undefined}
       onRun={editorPreview
         ? editorPreview.onRunUpstream
         : () => requestRun(nodeId)}
-      runLabel={editorPreview ? 'Run upstream →' : undefined}
+      runLabel={editorPreview ? 'Run upstream' : undefined}
       modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
@@ -658,7 +658,8 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   const res = st.res!
   if (res.error) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={res.reason ?? 'profile failed'} onRetry={loadSample} /></div>
   if (res.notPreviewable) return <NotPreviewable
-    reason={`${res.reason ?? 'Sample statistics need a full pass.'} Switch to full dataset to estimate a whole-dataset profile.`}
+    title="Use the full dataset for this profile"
+    reason="Sample-based statistics would be misleading for this step."
     modeToggle={toggle} />
   return <ProfileTable res={res} toggle={toggle} />
 }
@@ -1366,9 +1367,15 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
   )
 }
 
-function NotPreviewable({ title = 'Not sample-previewable', reason, onRun, runLabel = 'Run a full pass →', modeToggle }: {
+function NotPreviewable({
+  title = 'Run this step to see results',
+  reason = 'A bounded preview would be misleading because this step needs all of its input.',
+  onRun,
+  runLabel = 'Run this step',
+  modeToggle,
+}: {
   title?: string
-  reason: string
+  reason?: string
   onRun?: () => void
   runLabel?: string
   modeToggle?: ReactNode

@@ -623,7 +623,7 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.preview).not.toHaveBeenCalled()
     expect(useStore.getState().previews.plugin?.result).toMatchObject({
-      notPreviewable: true, reason: 'Full-pass plugin is not sample-previewable — run a full pass',
+      notPreviewable: true, reason: 'Full-pass plugin needs a complete run before its result can be shown',
     })
   })
 
