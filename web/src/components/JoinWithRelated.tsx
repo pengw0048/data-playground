@@ -54,6 +54,15 @@ function cardinalityExplanation(cardinality: RelatedDatasetCandidate['cardinalit
   return 'Cardinality is unknown because it was not measured for this join.'
 }
 
+function cardinalityDescription(
+  cardinality: RelatedDatasetCandidate['cardinality'],
+  reason?: string | null,
+): string {
+  if (!reason) return cardinalityExplanation(cardinality)
+  if (cardinality === 'unknown') return `Cardinality is unknown. ${reason}`
+  return `${cardinalityExplanation(cardinality)} ${reason}`
+}
+
 function joinTypeMeaning(
   how: 'inner' | 'left' | 'right' | 'outer',
   leftName: string,
@@ -386,7 +395,9 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   } : null
   const leftReview = sourceOnRight ? relatedReview : sourceReview
   const rightReview = sourceOnRight ? sourceReview : relatedReview
-  const cardinalityCopy = oriented ? cardinalityExplanation(oriented.cardinality) : ''
+  const cardinalityCopy = oriented
+    ? cardinalityDescription(oriented.cardinality, candidate?.cardinalityReason)
+    : ''
   const triggerLabel = surface === 'canvas'
     ? context.joinNodeId
       ? `Join with related data on ${context.emptyPort === 'a' ? 'left' : 'right'} input`
@@ -575,7 +586,9 @@ function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
               {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
             </span>
             <span className="block text-[10px] text-muted-foreground">{EVIDENCE_LABEL[candidate.evidence]} · Inner join</span>
-            <span className="block text-[10px] text-muted-foreground">{cardinalityExplanation(oriented.cardinality)}</span>
+            <span className="block text-[10px] text-muted-foreground">
+              {cardinalityDescription(oriented.cardinality, candidate.cardinalityReason)}
+            </span>
           </span>
           <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
             CARDINALITY_TONE[oriented.cardinality])}>{oriented.cardinality}</span>
