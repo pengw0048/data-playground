@@ -522,11 +522,11 @@ function ExecutionSummary({ resourceRequirements, checkpointed, canEdit, onEdit 
     <div className="grid gap-1.5 text-[11px]">
       {resourceRequirements && <div className="flex items-center justify-between gap-2">
         <span><strong>Resources</strong> · {resourceRequirements}</span>
-        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit resources</Button>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit resources</Button>}
       </div>}
       {checkpointed && <div className="flex items-center justify-between gap-2">
         <span><strong>Materialization</strong> · Checkpointed output</span>
-        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>}
       </div>}
     </div>
   </Section>
@@ -542,7 +542,7 @@ function OutputSchemaSummary({ summary, stale, canEdit, onEdit }: {
     <div className="grid gap-1.5 text-[11px]">
       <div className="flex items-center justify-between gap-2">
         <span>{summary}{stale && <span className="text-amber-700 dark:text-amber-300"> · Needs review</span>}</span>
-        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">{stale ? 'Review output schema' : 'Edit output schema'}</Button>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">{stale ? 'Review output schema' : 'Edit output schema'}</Button>}
       </div>
     </div>
   </Section>

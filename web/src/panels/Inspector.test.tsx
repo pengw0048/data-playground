@@ -493,6 +493,25 @@ describe('Inspector — output schema disclosure', () => {
     expect(screen.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
     expect(screen.getByDisplayValue('clean_id')).toBeVisible()
   })
+
+  it('keeps configured summaries informative without offering viewer-only edit actions', () => {
+    selectTransform({
+      code: 'return current_input',
+      requires: { gpu: 8, gpuType: 'a100' },
+      checkpoint: true,
+      outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
+      outputSchemaCodeHash: 'outdated-contract-hash',
+    })
+    useStore.setState({ canvasRole: 'viewer' })
+    render(<Inspector />)
+
+    expect(screen.getByText(/8 GPUs · a100/)).toBeVisible()
+    expect(screen.getByText(/Checkpointed output/)).toBeVisible()
+    expect(screen.getByText(/Needs review/)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit materialization' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Review output schema' })).not.toBeInTheDocument()
+  })
 })
 
 describe('Inspector — linear checkpoint availability', () => {
