@@ -1266,7 +1266,7 @@ interface Store {
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
   openLocalDraft: (draftId: string, options?: CanvasNavigationOptions) => boolean
-  retryLocalDraft: (draftId: string) => Promise<void>
+  retryLocalDraft: (draftId: string, options?: { notify?: boolean }) => Promise<void>
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
   exportLocalDraft: (draftId: string) => void
@@ -3819,7 +3819,7 @@ export const useStore = create<Store>((set, get) => ({
     return true
   },
 
-  retryLocalDraft: async (draftId) => {
+  retryLocalDraft: async (draftId, options) => {
     if (!get().kernelUp) return
     const principalId = get().currentUser?.id
     const original = get().localDrafts.find((candidate) => (
@@ -3877,7 +3877,7 @@ export const useStore = create<Store>((set, get) => ({
           _acceptingServerVersion = false
         }
         if (!stored.ok) get().pushToast(stored.error!, 'error')
-        else window.setTimeout(() => { void get().retryLocalDraft(draftId) }, 0)
+        else window.setTimeout(() => { void get().retryLocalDraft(draftId, options) }, 0)
         _draftSyncInFlight.delete(syncKey)
         return
       }
@@ -3910,7 +3910,9 @@ export const useStore = create<Store>((set, get) => ({
         _acceptingServerVersion = false
       }
       await get().refreshFiles()
-      if (stillCurrentPrincipal()) get().pushToast(`Synced “${original.name}”`, 'success')
+      if (stillCurrentPrincipal() && options?.notify !== false) {
+        get().pushToast(`Synced “${original.name}”`, 'success')
+      }
       _draftSyncInFlight.delete(syncKey)
     }
 
@@ -4313,7 +4315,9 @@ useStore.subscribe((s) => {
     }
     // A new local-only Canvas is synchronized only through its explicit Retry control. Existing
     // online Canvases retain autosave, now protected by the persisted base-version CAS.
-    if (draft.baseVersion != null) void useStore.getState().retryLocalDraft(draft.draftId)
+    if (draft.baseVersion != null) {
+      void useStore.getState().retryLocalDraft(draft.draftId, { notify: false })
+    }
   }, 400)
 })
 

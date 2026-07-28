@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // the store module runs autosave side-effects at import; stub the network client so nothing escapes.
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
+  kernel: vi.fn(), nodes: vi.fn(), me: vi.fn(), users: vi.fn(),
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
@@ -14,8 +15,16 @@ const apiMocks = vi.hoisted(() => ({
 }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
-    get: (_target, property) => property === 'listCanvases'
-      ? apiMocks.listCanvases
+    get: (_target, property) => property === 'kernel'
+      ? apiMocks.kernel
+      : property === 'nodes'
+        ? apiMocks.nodes
+        : property === 'me'
+          ? apiMocks.me
+          : property === 'users'
+            ? apiMocks.users
+            : property === 'listCanvases'
+              ? apiMocks.listCanvases
       : property === 'listRuns'
         ? apiMocks.listRuns
       : property === 'retainedEditorPreview'
@@ -107,6 +116,10 @@ describe('graph store — core authority ops', () => {
   beforeEach(() => {
     // start each test from a known empty doc
     localStorage.clear()
+    apiMocks.kernel.mockReset().mockResolvedValue({})
+    apiMocks.nodes.mockReset().mockResolvedValue([])
+    apiMocks.me.mockReset().mockResolvedValue({ id: 'alice', name: 'Alice' })
+    apiMocks.users.mockReset().mockResolvedValue([{ id: 'alice', name: 'Alice' }])
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
     apiMocks.retainedEditorPreview.mockReset()
@@ -3939,6 +3952,7 @@ describe('graph store — core authority ops', () => {
     if (!created.ok) throw new Error('expected local draft')
     const draft = useStore.getState().localDrafts[0]
     apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: true })
+    useStore.setState({ toasts: [] })
 
     await useStore.getState().retryLocalDraft(draft.draftId)
 
@@ -3946,6 +3960,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().localDrafts).toEqual([])
     expect(useStore.getState().currentDraftId).toBeNull()
     expect(useStore.getState().serverVersion).toBe(1)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === `Synced “${draft.name}”`)).toBe(true)
   })
 
   it('recovers a lost create response only after confirming owner and exact first content', async () => {
@@ -4492,6 +4507,46 @@ describe('graph store — core authority ops', () => {
     ])
     expect(typeChange).toMatch(/source\.datasetRef requires dataset/)
     expect(useStore.getState().doc.parameters?.[0].type).toBe('dataset')
+  })
+
+  it('keeps debounced autosave and its newer-edit follow-up synchronization quiet', async () => {
+    const doc = { ...emptyTestDoc('c'), name: 'Initial name' }
+    apiMocks.listCanvases.mockResolvedValue([{ id: doc.id, name: doc.name, version: 1, role: 'owner' }])
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    await useStore.getState().bootstrap()
+    useStore.setState({ toasts: [] })
+
+    let resolveFirst!: (value: { ok: boolean; id: string; version: number }) => void
+    apiMocks.saveCanvas.mockReset()
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+      .mockResolvedValueOnce({ ok: true, id: doc.id, version: 3 })
+
+    useStore.getState().renameFile('First debounced edit')
+    await vi.waitFor(() => expect(apiMocks.saveCanvas).toHaveBeenCalledTimes(1), { timeout: 2_000 })
+
+    useStore.getState().renameFile('Newer edit while saving')
+    await vi.waitFor(() => expect(useStore.getState().localDrafts).toMatchObject([{
+      doc: { name: 'Newer edit while saving' },
+      syncState: 'dirty',
+    }]), { timeout: 2_000 })
+
+    resolveFirst({ ok: true, id: doc.id, version: 2 })
+    await vi.waitFor(() => {
+      expect(apiMocks.saveCanvas).toHaveBeenCalledTimes(2)
+      expect(useStore.getState().localDrafts).toEqual([])
+      expect(useStore.getState().serverVersion).toBe(3)
+      expect(useStore.getState().saved).toBe(true)
+    }, { timeout: 2_000 })
+
+    expect(apiMocks.saveCanvas.mock.calls.map(([saved, keepalive, expectedVersion]) => ({
+      name: (saved as { name: string }).name,
+      keepalive,
+      expectedVersion,
+    }))).toEqual([
+      { name: 'First debounced edit', keepalive: false, expectedVersion: 1 },
+      { name: 'Newer edit while saving', keepalive: false, expectedVersion: 2 },
+    ])
+    expect(useStore.getState().toasts.filter((toast) => toast.kind === 'success')).toEqual([])
   })
 })
 
