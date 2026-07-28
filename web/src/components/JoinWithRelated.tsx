@@ -407,11 +407,9 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const cardinalityCopy = oriented
     ? cardinalityDescription(oriented.cardinality, candidate?.cardinalityReason)
     : ''
-  const triggerLabel = surface === 'canvas'
-    ? context.joinNodeId
-      ? `Related / possible key matches · ${context.emptyPort === 'a' ? 'left' : 'right'}`
-      : 'Related data / possible key matches'
-    : 'Related data / possible key matches…'
+  const triggerLabel = context.joinNodeId
+    ? `Find join candidates · ${context.emptyPort === 'a' ? 'left' : 'right'}`
+    : 'Find join candidates'
 
   return (
     <>
@@ -434,11 +432,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
           if (event.target === event.currentTarget && !confirming) close()
         }}>
         <div ref={dialogRef} role="dialog" aria-modal="true"
-          aria-label="Find related data or possible key matches"
+          aria-label="Find join candidates"
           className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
           <div className="flex items-start justify-between border-b border-border px-4 py-3">
             <div>
-              <div className="text-sm font-semibold text-foreground">Find related data or possible key matches</div>
+              <div className="text-sm font-semibold text-foreground">Find join candidates</div>
               <div className="mt-0.5 text-[11px] text-muted-foreground">
                 Review the evidence before adding this Join to the Canvas.
               </div>

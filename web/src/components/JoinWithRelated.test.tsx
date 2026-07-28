@@ -30,10 +30,10 @@ vi.mock('../api/client', () => ({
 
 import { JoinWithRelated } from './JoinWithRelated'
 
-const inspectorTrigger = 'Related data / possible key matches…'
-const canvasTrigger = 'Related data / possible key matches'
-const leftInputTrigger = 'Related / possible key matches · left'
-const dialogName = 'Find related data or possible key matches'
+const inspectorTrigger = 'Find join candidates'
+const canvasTrigger = 'Find join candidates'
+const leftInputTrigger = 'Find join candidates · left'
+const dialogName = 'Find join candidates'
 
 const page = {
   source: { kind: 'local', registrationId: 'reg-events', revisionMode: 'current' },
@@ -84,6 +84,15 @@ describe('JoinWithRelated', () => {
       datasetId: 'reg-users', revisionId: 'rev-2', committedAt: '2026-07-24T12:00:00Z', retentionOwner: 'provider',
     }], nextCursor: null, hasMore: false })
     mocks.getCanvas.mockResolvedValue({ ...mocks.state.doc, version: 4 })
+  })
+
+  it('uses the same researcher task name on Source and Inspector entries and in the dialog', async () => {
+    const { rerender } = render(<JoinWithRelated nodeId="source-1" />)
+    expect(screen.getByRole('button', { name: inspectorTrigger })).toBeVisible()
+
+    rerender(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
+    expect(await screen.findByRole('dialog', { name: dialogName })).toBeVisible()
   })
 
   it('separates evidence, keeps unknown explicit, and cancellation mutates nothing', async () => {
