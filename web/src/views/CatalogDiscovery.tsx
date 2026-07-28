@@ -1166,7 +1166,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
               <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
               <span>· {displayColumns.length} cols</span>
+              <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
               {exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
+              {!exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
@@ -1256,7 +1258,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
 
           <details className="rounded-lg border border-border p-3">
-            <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Catalog maintenance</summary>
+            <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Edit catalog details</summary>
             <div className="mt-3 flex flex-col gap-2">
             <div className="text-[11px] text-muted-foreground">Organize this catalog entry and save its metadata separately from inspecting or using the dataset.</div>
             <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>

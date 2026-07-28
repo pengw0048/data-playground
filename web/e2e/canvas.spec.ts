@@ -1758,13 +1758,17 @@ test.describe('Data Playground canvas', () => {
 
       await page.goto(`/#/canvas/${configuredId}`)
       const inspector = page.getByTestId('inspector')
-      await page.getByTestId('rf__node-transform').getByText('TRANSFORM', { exact: true }).click()
+      const configuredNode = page.getByTestId('rf__node-transform')
+      await expect(configuredNode.getByRole('button', { name: 'return input', exact: true })).toBeVisible()
+      await configuredNode.getByText('TRANSFORM', { exact: true }).click()
       await expect(inspector.getByText('1 declared column')).toBeVisible()
       await inspector.getByRole('button', { name: 'Edit output schema' }).click()
       await expect(inspector.locator('input[value="clean_id"]')).toBeVisible()
 
       await page.goto(`/#/canvas/${staleId}`)
-      await page.getByTestId('rf__node-transform').getByText('TRANSFORM', { exact: true }).click()
+      const staleNode = page.getByTestId('rf__node-transform')
+      await expect(staleNode.getByRole('button', { name: 'return current_input', exact: true })).toBeVisible()
+      await staleNode.getByText('TRANSFORM', { exact: true }).click()
       await expect(inspector.getByText('Needs review')).toBeVisible()
       await inspector.getByRole('button', { name: 'Review output schema' }).click()
       await expect(inspector.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
@@ -2771,7 +2775,7 @@ test.describe('Data Playground canvas', () => {
       await goToWorkspace(page)
       await openWorkspaceDataset(page, original.name)
 
-      await page.getByText('Catalog maintenance', { exact: true }).click()
+      await page.getByText('Edit catalog details', { exact: true }).click()
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()
       const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {

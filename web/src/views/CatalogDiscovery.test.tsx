@@ -64,8 +64,8 @@ function CatalogDiscoveryFixture() {
     onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />
 }
 
-function openCatalogMaintenance() {
-  fireEvent.click(screen.getByText('Catalog maintenance'))
+function openCatalogDetails() {
+  fireEvent.click(screen.getByText('Edit catalog details'))
 }
 
 describe('Catalog discovery request and mutation truth', () => {
@@ -379,7 +379,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
     expect(screen.getByText('Showing 1 preview row.')).toBeInTheDocument()
 
-    openCatalogMaintenance()
+    openCatalogDetails()
     const folder = screen.getByTestId('detail-folder') as HTMLInputElement
     fireEvent.change(folder, { target: { value: 'curated/sales' } })
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -422,7 +422,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(details).toHaveAttribute('open')
     expect(screen.getByTestId('dataset-location')).toHaveTextContent(TABLE.uri)
     expect(screen.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
-    expect(screen.getByText('Catalog maintenance').parentElement).not.toHaveAttribute('open')
+    expect(screen.getByText('Edit catalog details').parentElement).not.toHaveAttribute('open')
     expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
     expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
@@ -621,7 +621,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   it('renames a dataset from the detail drawer', async () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    openCatalogMaintenance()
+    openCatalogDetails()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'daily orders' } })
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalledWith('t1',
@@ -631,7 +631,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   it('renders an unselected column as an available key action, not a key', async () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    openCatalogMaintenance()
+    openCatalogDetails()
 
     expect(screen.getByText('No saved key')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Mark order_id as a key' })).toBeVisible()
@@ -644,7 +644,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.saveTableEdit.mockResolvedValue(saved)
     render(<CatalogDetail table={TABLE} onClose={vi.fn()} onUse={vi.fn()} onChanged={onChanged} onFolder={vi.fn()}
       onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
-    openCatalogMaintenance()
+    openCatalogDetails()
 
     fireEvent.click(screen.getByRole('button', { name: 'Mark order_id as a key' }))
     expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Will be a key on Save')
@@ -662,7 +662,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
       keys: [{ columns: ['order_id', 'customer_id'], confidence: 'declared' as const }] }
     render(<CatalogDetail table={composite} onClose={vi.fn()} onUse={vi.fn()} onChanged={vi.fn()} onFolder={vi.fn()}
       onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
-    openCatalogMaintenance()
+    openCatalogDetails()
 
     expect(screen.getByText('Saved composite key')).toBeVisible()
     expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Composite key')
@@ -675,7 +675,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.table.mockResolvedValue({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    openCatalogMaintenance()
+    openCatalogDetails()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'reapplied' } })
     fireEvent.click(screen.getByTestId('detail-pk-order_id'))
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -694,7 +694,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    openCatalogMaintenance()
+    openCatalogDetails()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
 
     fireEvent.keyDown(window, { key: 'Escape' })
