@@ -5050,6 +5050,69 @@
         "title": "ExactRunReadiness",
         "type": "object"
       },
+      "ExampleRowsEditorPreviewRequest": {
+        "additionalProperties": false,
+        "description": "Editor-only Transform preview over one bounded, non-persisted JSON fixture.",
+        "properties": {
+          "exampleRowsJson": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "title": "Examplerowsjson",
+            "type": "string"
+          },
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "k": {
+            "default": 50,
+            "maximum": 50.0,
+            "minimum": 0.0,
+            "title": "K",
+            "type": "integer"
+          },
+          "nodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "exclusiveMaximum": 2000.0,
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "parameterBindings": {
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "maxItems": 128,
+            "title": "Parameterbindings",
+            "type": "array"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
+          }
+        },
+        "required": [
+          "graph",
+          "nodeId",
+          "exampleRowsJson"
+        ],
+        "title": "ExampleRowsEditorPreviewRequest",
+        "type": "object"
+      },
       "ExecutionManifestDetail": {
         "description": "One subject-authorized immutable execution-manifest read.",
         "properties": {
@@ -25726,6 +25789,89 @@
           }
         },
         "summary": "Preview Transform With Retained Upstream"
+      }
+    },
+    "/api/run/editor-preview/examples": {
+      "post": {
+        "description": "Test one ad-hoc Transform against a bounded, request-only JSON fixture.",
+        "operationId": "preview_transform_with_example_rows_api_run_editor_preview_examples_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExampleRowsEditorPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SampleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preview Transform With Example Rows"
       }
     },
     "/api/run/estimate": {

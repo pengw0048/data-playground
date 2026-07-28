@@ -635,7 +635,62 @@ describe('durable full results', () => {
 
     expect(screen.getByText(
       'Testing with Clean events result · 1,234 rows')).toBeInTheDocument()
+    expect(screen.getByText('Preview prefix')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Export this preview page' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()
+  })
+
+  it('uses the editor-supplied preview action for Example rows pagination', async () => {
+    const downloads: string[] = []
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true, value: vi.fn(() => 'blob:test-result-page'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push(this.download)
+    })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'adhoc', mode: 'flat_map', code: 'def fn(row): return [row, row]',
+      }, history: [] },
+    }] }
+    const onPreview = vi.fn()
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        ...sample(0, 2, true),
+        rowCount: undefined,
+        sampleProvenance: {
+          strategy: 'reservoir', seed: 7, requestedRows: 2, scannedRows: 2,
+          returnedRows: 2, totalRows: 2, identity: 'a'.repeat(64), limitations: [],
+        },
+      }) },
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" editorPreview={{
+      autoLoad: false,
+      allowStats: false,
+      resultContext: 'example-rows',
+      onPreview,
+    }} />)
+
+    expect(onPreview).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Stats' })).not.toBeInTheDocument()
+    expect(screen.getByRole('status', {
+      name: 'Test result: 2 output rows on this page from Example rows',
+    })).toHaveTextContent('Test result · 2 output rows on this page from Example rows')
+    expect(screen.queryByText('Preview prefix')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Full dataset not scanned/)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Export this test result page' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Download test result page as JSON' }))
+    expect(downloads).toEqual(['target-test-result-page-1-2.json'])
+    expect(useStore.getState().toasts.at(-1)).toMatchObject({
+      kind: 'success', msg: 'Exported test result page (rows 1–2) as JSON.',
+    })
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    expect(onPreview).toHaveBeenCalledWith(2, undefined)
   })
 
   it('offers only Run upstream when no current retained editor input exists', async () => {

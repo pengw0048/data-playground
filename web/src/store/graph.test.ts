@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  retainedEditorPreview: vi.fn(),
+  retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
@@ -20,6 +20,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.listRuns
       : property === 'retainedEditorPreview'
         ? apiMocks.retainedEditorPreview
+      : property === 'exampleRowsEditorPreview'
+        ? apiMocks.exampleRowsEditorPreview
       : property === 'getCanvas'
         ? apiMocks.getCanvas
         : property === 'canvasTransformReferences'
@@ -108,6 +110,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
     apiMocks.retainedEditorPreview.mockReset()
+    apiMocks.exampleRowsEditorPreview.mockReset()
     apiMocks.getCanvas.mockReset()
     apiMocks.canvasTransformReferences.mockReset().mockResolvedValue([])
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
@@ -682,6 +685,76 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().editorPreviews.transform?.result).toEqual(retained)
     expect(useStore.getState().previews).toBe(formalPreview)
     expect(useStore.getState().previewBindings).toBe(formalBindings)
+  })
+
+  it('tests editor-local Example rows without an upstream or durable Canvas state', async () => {
+    const transform = NODE('transform', 'transform')
+    transform.data.config = {
+      source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [transform], edges: [],
+    }
+    const formalPreviews = { other: { result: previewResult('formal') } }
+    const formalBindings = { other: { inputManifest: [{ node_id: 'source' }] } }
+    const runs = { transform: { phase: 'idle' as const } }
+    const structuredFailure = {
+      columns: [], rows: [], truncated: false, completeness: 'unknown' as const,
+      notPreviewable: false, error: true, failureCategory: 'user_code_exception' as const,
+      reason: 'ValueError: fixture boom',
+      userCodeException: {
+        nodeId: 'transform', exceptionType: 'ValueError', message: 'fixture boom',
+        availableColumns: ['value'],
+      },
+      wire: 'dataset',
+    }
+    apiMocks.exampleRowsEditorPreview.mockResolvedValue(structuredFailure)
+    useStore.setState({
+      doc, editorPreviews: {}, previews: formalPreviews,
+      previewBindings: formalBindings, runs,
+    } as any)
+
+    await useStore.getState().runEditorExamplePreview(
+      'transform', '[{"value":1}]',
+    )
+
+    expect(apiMocks.exampleRowsEditorPreview).toHaveBeenCalledWith(
+      doc, 'transform', '[{"value":1}]', 50, 0, undefined, [],
+    )
+    expect(useStore.getState().editorPreviews.transform?.result).toEqual(structuredFailure)
+    expect(useStore.getState().doc).toBe(doc)
+    expect(useStore.getState().previews).toBe(formalPreviews)
+    expect(useStore.getState().previewBindings).toBe(formalBindings)
+    expect(useStore.getState().runs).toBe(runs)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.listRuns).not.toHaveBeenCalled()
+  })
+
+  it('drops a late Example rows response after the editor fixture is cleared', async () => {
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.exampleRowsEditorPreview.mockImplementationOnce(
+      () => new Promise((resolve) => { finish = resolve }),
+    )
+    const transform = NODE('transform', 'transform')
+    transform.data.config = {
+      source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+    }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [transform], edges: [],
+      },
+      editorPreviews: {},
+    } as any)
+
+    const pending = useStore.getState().runEditorExamplePreview(
+      'transform', '[{"value":"old"}]',
+    )
+    useStore.getState().clearEditorPreview('transform')
+    finish(previewResult('old fixture'))
+    await pending
+
+    expect(useStore.getState().editorPreviews.transform).toBeUndefined()
   })
 
   it('turns an explicit retained-input miss into the editor-only Run upstream state', async () => {

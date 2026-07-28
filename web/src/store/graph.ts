@@ -1135,6 +1135,10 @@ interface Store {
   // -- execution --
   runPreview: (id: string, offset?: number, portId?: string, refreshLatest?: boolean) => Promise<void>
   runEditorPreview: (id: string, offset?: number, portId?: string) => Promise<void>
+  runEditorExamplePreview: (
+    id: string, exampleRowsJson: string, offset?: number, portId?: string,
+  ) => Promise<void>
+  clearEditorPreview: (id: string) => void
   refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
   setRunParameterBinding: (id: string, binding: CanvasParameterBinding) => void
@@ -2272,6 +2276,76 @@ export const useStore = create<Store>((set, get) => ({
       }))
     }
   },
+
+  runEditorExamplePreview: async (
+    id: string, exampleRowsJson: string, offset = 0, requestedPortId?: string,
+  ) => {
+    if (!hubExecutionAvailable(get)) return
+    const doc = get().doc
+    const node = doc.nodes.find((candidate) => candidate.id === id)
+    if (!node || node.type !== 'transform') return
+    const ports = nodeOutputs(node)
+    const previous = get().editorPreviews[id]
+    const defaultPortId = ports.find((port) => port.id === 'out')?.id ?? ports[0]?.id
+    const portId = requestedPortId ?? (ports.length > 1
+      ? ports.find((port) => port.id === previous?.portId)?.id ?? defaultPortId
+      : undefined)
+    const planIdentity = previewPlanIdentity(doc, id, portId)
+    const parameterBindings = get().runs[id]?.parameterBindings ?? []
+    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
+    const requestGeneration = ++_previewRequestGeneration
+    const current = () => {
+      const state = get()
+      const preview = state.editorPreviews[id]
+      return preview?.requestGeneration === requestGeneration
+        && previewIsCurrent(preview, state.doc, id, portId)
+        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
+    }
+    set((state) => ({
+      editorPreviews: {
+        ...state.editorPreviews,
+        [id]: {
+          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+          requestGeneration, loading: true, offset,
+        },
+      },
+    }))
+    try {
+      const result = await api.exampleRowsEditorPreview(
+        doc, id, exampleRowsJson, 50, offset, portId, parameterBindings,
+      )
+      if (!current()) return
+      set((state) => ({
+        editorPreviews: {
+          ...state.editorPreviews,
+          [id]: {
+            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+            requestGeneration, result, offset,
+          },
+        },
+      }))
+    } catch (error) {
+      if (!current()) return
+      set((state) => ({
+        editorPreviews: {
+          ...state.editorPreviews,
+          [id]: {
+            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+            requestGeneration,
+            error: (error as Error).message || 'Could not test Example rows',
+            offset,
+          },
+        },
+      }))
+    }
+  },
+
+  clearEditorPreview: (id: string) => set((state) => {
+    if (!(id in state.editorPreviews)) return {}
+    const editorPreviews = { ...state.editorPreviews }
+    delete editorPreviews[id]
+    return { editorPreviews }
+  }),
 
   refreshPreviewInputs: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return

@@ -481,6 +481,16 @@ export const api = {
       graph: toGraph(doc), nodeId, portId, k, offset, parameterBindings,
     }),
   }),
+  exampleRowsEditorPreview: (
+    doc: CanvasDoc, nodeId: string, exampleRowsJson: string,
+    k = 50, offset = 0, portId?: string,
+    parameterBindings?: CanvasParameterBinding[],
+  ) => req<SampleResult>('/run/editor-preview/examples', {
+    method: 'POST',
+    body: JSON.stringify({
+      graph: toGraph(doc), nodeId, exampleRowsJson, portId, k, offset, parameterBindings,
+    }),
+  }),
   fullResultExportUrl: (runId: string, nodeId: string, portId: string, filename?: string) =>
     `${BASE}${fullResultExportPath(runId, nodeId, portId, filename)}`,
   preflightFullResultExport: async (runId: string, nodeId: string, portId: string, filename?: string) => {

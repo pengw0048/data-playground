@@ -19,7 +19,7 @@ from collections.abc import Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
 from hub import auth, compiler, db, destinations, metadb, placement, workspace_providers
@@ -31,6 +31,11 @@ from hub.backends import (
     backend_supports_admitted_input_manifests, backend_supports_named_multi_output_runs,
 )
 from hub.deps import get_deps
+from hub.editor_examples import (
+    EDITOR_EXAMPLE_MAX_BYTES,
+    EditorExampleRowsAdapter,
+    parse_editor_example_rows,
+)
 from hub.executors.engine import canonical_type, declared_schema
 from hub.executors.preview import PREVIEW_SCAN, preview_node
 from hub.executors.profile import profile_node
@@ -1422,6 +1427,26 @@ class RetainedEditorPreviewRequest(BaseModel):
     k: int = Field(default=50, ge=0, le=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
     offset: int = Field(default=0, ge=0, lt=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
     parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
+
+
+class ExampleRowsEditorPreviewRequest(BaseModel):
+    """Editor-only Transform preview over one bounded, non-persisted JSON fixture."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+    node_id: str = Field(min_length=1, max_length=256)
+    example_rows_json: str = Field(min_length=1, max_length=EDITOR_EXAMPLE_MAX_BYTES)
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    k: int = Field(default=50, ge=0, le=50)
+    offset: int = Field(default=0, ge=0, lt=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+    parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
+
+    @field_validator("example_rows_json")
+    @classmethod
+    def _valid_example_rows(cls, value: str) -> str:
+        parse_editor_example_rows(value)
+        return value
 
 
 class _ExportNotAcceptable(RuntimeError):
@@ -3788,6 +3813,77 @@ def _redact_retained_editor_diagnostics(
         })
 
 
+def _example_rows_editor_graph(graph: Graph, transform_id: str, fixture_uri: str) -> Graph:
+    """Replace every Canvas input with one request-local Example rows Source."""
+    target = graph_mod.node_map(graph).get(transform_id)
+    if target is None or target.type != "transform":
+        raise APIError(
+            400, "Example rows require a Transform node",
+            code=APIErrorCode.INVALID_REQUEST, retryable=False)
+    config = target.data.get("config", {}) if isinstance(target.data, dict) else {}
+    if isinstance(config, dict) and config.get("source") == "library":
+        raise APIError(
+            400, "Example rows are available only for editable ad-hoc Transforms",
+            code=APIErrorCode.INVALID_REQUEST, retryable=False)
+    target = target.model_copy(deep=True)
+    target.parent_id = None
+    # "Test code" evaluates the editor contents even when the durable Canvas step is currently
+    # bypassed or disabled. These flags are cleared only on this request-owned synthetic graph.
+    target.data["bypassed"] = False
+    target.data["disabled"] = False
+    source_id = f"editor-example-{uuid.uuid4().hex}"
+    return Graph.model_validate({
+        "id": graph.id,
+        "version": graph.version,
+        "requirements": graph.requirements,
+        "parameters": [
+            parameter.model_dump(by_alias=True, mode="json")
+            for parameter in graph.parameters
+        ],
+        "nodes": [
+            {
+                "id": source_id,
+                "type": "source",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "title": "Example rows",
+                    "config": {"uri": fixture_uri},
+                },
+            },
+            target.model_dump(by_alias=True, mode="json"),
+        ],
+        "edges": [{
+            "id": f"editor-example-edge-{uuid.uuid4().hex}",
+            "source": source_id,
+            "target": target.id,
+            "sourceHandle": "out",
+            "targetHandle": "in",
+            "data": {"wire": "dataset"},
+        }],
+    })
+
+
+def _finalize_example_rows_result(result: SampleResult, *, offset: int) -> SampleResult:
+    """Remove input identity and describe the bounded fixture result without sampled-data claims."""
+    result.sample_provenance = None
+    result.input_manifest = None
+    result.editor_test_input = None
+    if result.error or result.not_previewable:
+        return result
+    result.row_limit = None
+    result.limit_reason = None
+    result.limit_scope = None
+    if offset == 0 and result.has_more is False:
+        result.row_count = len(result.rows)
+        result.completeness = "complete"
+        result.truncated = False
+    else:
+        result.row_count = None
+        result.completeness = "page"
+        result.truncated = True
+    return result
+
+
 def _retained_editor_target(
         graph: Graph, transform_id: str, deps) -> tuple[object, Graph, str, Graph]:
     """Resolve the current immediate-upstream target without touching any Source."""
@@ -3952,6 +4048,45 @@ def _retained_editor_graph(
             "data": {"wire": "dataset"},
         }],
     })
+
+
+@router.post("/run/editor-preview/examples", response_model=SampleResult)
+def preview_transform_with_example_rows(
+        req: ExampleRowsEditorPreviewRequest,
+        uid: str = Depends(current_user)) -> SampleResult:
+    """Test one ad-hoc Transform against a bounded, request-only JSON fixture."""
+    _require_graph_read_access(req.graph, uid)
+    deps = get_deps()
+    _rows, table = parse_editor_example_rows(req.example_rows_json)
+    fixture_uri = f"mem://editor-example-{uuid.uuid4().hex}"
+    graph = _example_rows_editor_graph(req.graph, req.node_id, fixture_uri)
+    graph = _resolve_parameters(
+        graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
+    _reject_invalid(graph, deps, req.node_id)
+    port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
+    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+        result = SampleResult(**kb.preview(
+            graph,
+            req.node_id,
+            req.k,
+            req.offset,
+            port_id,
+            example_rows_json=req.example_rows_json,
+            example_uri=fixture_uri,
+        ))
+    else:
+        adapter = EditorExampleRowsAdapter(
+            fixture_uri, table, req.example_rows_json)
+
+        def resolve_adapter(uri: str):
+            return adapter if uri == fixture_uri else deps.resolve_adapter(uri)
+
+        result = preview_node(
+            graph, req.node_id, req.k,
+            resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
+            offset=req.offset, storage=deps.storage, port_id=port_id,
+        )
+    return _finalize_example_rows_result(result, offset=req.offset)
 
 
 @router.post("/run/editor-preview", response_model=SampleResult)

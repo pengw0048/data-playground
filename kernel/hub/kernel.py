@@ -40,6 +40,10 @@ class PreviewBody(BaseModel):
     k: int = 50
     offset: int = 0
     full: bool = False   # profile only: whole-dataset stats (full pass) instead of the sample
+    # Optional token-authenticated transport for the public editor-only Example rows endpoint.
+    # The fixture remains request-local and is never written into the graph, catalog, or run state.
+    example_rows_json: str | None = None
+    example_uri: str | None = None
 
 
 class ProfileJobBody(BaseModel):
@@ -438,13 +442,32 @@ def main() -> None:
     @app.post("/preview")
     def preview(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
+        resolve_adapter = deps.resolve_adapter
+        preview_cache = warm
+        if body.example_rows_json is not None or body.example_uri is not None:
+            if body.example_rows_json is None or body.example_uri is None:
+                raise HTTPException(422, "Example rows preview transport is incomplete")
+            from hub.editor_examples import (
+                EditorExampleRowsAdapter,
+                parse_editor_example_rows,
+            )
+            try:
+                _rows, table = parse_editor_example_rows(body.example_rows_json)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            example_adapter = EditorExampleRowsAdapter(
+                body.example_uri, table, body.example_rows_json)
+            resolve_adapter = lambda uri: (
+                example_adapter if uri == body.example_uri else deps.resolve_adapter(uri))
+            # The fixture is one-request state, so it must not enter the long-lived kernel cache.
+            preview_cache = None
         from hub.executors.preview import preview_node
         graph = Graph(**body.graph)
         _ensure_deps(graph)
         with _inflight_work():
-            return preview_node(graph, body.node_id, body.k, deps.resolve_adapter,
+            return preview_node(graph, body.node_id, body.k, resolve_adapter,
                                 deps.registry, deps.node_builders, deps.node_specs, offset=body.offset,
-                                cache=warm, storage=deps.storage,
+                                cache=preview_cache, storage=deps.storage,
                                 port_id=body.port_id).model_dump()
 
     @app.post("/profile")

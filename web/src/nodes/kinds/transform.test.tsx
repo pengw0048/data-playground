@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -115,5 +115,54 @@ describe('Transform exact processor labels', () => {
 
     expect(await screen.findByTestId('code-editor')).toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: /runs over/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps Example rows local to one fullscreen editor session', async () => {
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      } },
+    }
+    const doc = {
+      id: 'canvas', name: 'canvas', version: 1, requirements: [],
+      nodes: [adhocNode], edges: [],
+    }
+    const runEditorExamplePreview = vi.fn()
+    useStore.setState({
+      doc,
+      kernelUp: true,
+      fullscreenCode: { nodeId: adhocNode.id, param: 'code', lang: 'python' },
+      runEditorExamplePreview,
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    expect(await screen.findByRole('button', { name: 'Upstream result' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Example rows' }))
+    expect(screen.getByText('Test only')).toBeInTheDocument()
+    const fixture = screen.getByRole('textbox', { name: 'Example rows JSON' })
+    expect(fixture).toHaveValue('[\n  {\n    "value": 1\n  }\n]')
+
+    fireEvent.change(fixture, { target: { value: '[1]' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('Every example row must be a JSON object')
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    expect(useStore.getState().doc).toBe(doc)
+
+    fireEvent.change(fixture, { target: { value: '[{"value":9}]' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Test code' }))
+    expect(runEditorExamplePreview).toHaveBeenCalledWith(
+      'transform', '[{"value":9}]', 0, undefined,
+    )
+    expect(useStore.getState().doc).toBe(doc)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    useStore.getState().openCodeFullscreen('transform', 'code', 'python')
+    await waitFor(() => expect(
+      screen.getByRole('button', { name: 'Upstream result' }),
+    ).toHaveAttribute('aria-pressed', 'true'))
+    fireEvent.click(screen.getByRole('button', { name: 'Example rows' }))
+    expect(screen.getByRole('textbox', { name: 'Example rows JSON' }))
+      .toHaveValue('[\n  {\n    "value": 1\n  }\n]')
   })
 })

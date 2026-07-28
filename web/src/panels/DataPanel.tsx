@@ -21,14 +21,25 @@ const CHART_DISPLAY_LIMIT = 2_000
 
 export function DataPanel({ nodeId, editorPreview }: {
   nodeId: string
-  editorPreview?: { onRunUpstream?: () => void }
+  editorPreview?: {
+    onRunUpstream?: () => void
+    onPreview?: (offset: number, portId?: string) => void | Promise<void>
+    autoLoad?: boolean
+    emptyState?: ReactNode
+    allowStats?: boolean
+    resultContext?: 'example-rows'
+  }
 }) {
   const preview = useStore((s) => (
     editorPreview ? s.editorPreviews[nodeId] : s.previews[nodeId]
   ))
   const runPreview = useStore((s) => s.runPreview)
   const runEditorPreview = useStore((s) => s.runEditorPreview)
-  const previewAction = editorPreview ? runEditorPreview : runPreview
+  const previewAction = editorPreview?.onPreview
+    ? (_nodeId: string, nextOffset = 0, portId?: string) => (
+        editorPreview.onPreview?.(nextOffset, portId)
+      )
+    : editorPreview ? runEditorPreview : runPreview
   const requestRun = useStore((s) => s.requestRun)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -64,9 +75,12 @@ export function DataPanel({ nodeId, editorPreview }: {
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
-    if (!preview || preview.portId !== requestPortId) previewAction(nodeId, 0, requestPortId)
+    if (editorPreview?.autoLoad !== false
+        && (!preview || preview.portId !== requestPortId)) {
+      previewAction(nodeId, 0, requestPortId)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId, requestPortId, preview?.portId])
+  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
@@ -112,7 +126,9 @@ export function DataPanel({ nodeId, editorPreview }: {
     </>
   )
 
-  if (!preview || preview.portId !== requestPortId) return withOutputPorts(<Skeleton />)
+  if (!preview || preview.portId !== requestPortId) {
+    return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
+  }
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
     return withOutputPorts(<StalePreview onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
@@ -192,9 +208,17 @@ export function DataPanel({ nodeId, editorPreview }: {
   // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
   // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
   const special = isMetric || isChart
-  const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label })), { id: 'stats', label: 'Stats' }]
+  const tabs = [
+    { id: 'rows', label: 'Rows' },
+    ...caps.map((c) => ({ id: c.id, label: c.label })),
+    ...(editorPreview?.allowStats === false ? [] : [{ id: 'stats', label: 'Stats' }]),
+  ]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
-  const activeTab = tab === 'rows' || tab === 'stats' || caps.some((c) => c.id === tab) ? tab : 'rows'
+  const activeTab = tab === 'rows'
+    || (tab === 'stats' && editorPreview?.allowStats !== false)
+    || caps.some((c) => c.id === tab)
+    ? tab
+    : 'rows'
   const canTryNext = res.hasMore === true || (res.hasMore == null && res.rows.length > 0)
 
   return withOutputPorts(
@@ -236,14 +260,22 @@ export function DataPanel({ nodeId, editorPreview }: {
             {activeTab === 'rows' && res.rows.length > 0 && (
               <ExportCluster columns={columns as ColumnSchema[]} rows={res.rows}
                 name={String(node?.data.title || node?.id || 'data')} offset={offset}
-                scope="preview" sampleProvenance={res.sampleProvenance} pushToast={pushToast} />
+                scope={editorPreview?.resultContext === 'example-rows' ? 'test-result' : 'preview'}
+                sampleProvenance={editorPreview?.resultContext === 'example-rows'
+                  ? undefined
+                  : res.sampleProvenance}
+                pushToast={pushToast} />
             )}
           </>
         )}
       </div>
 
-      <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
-        allowNextAttempt={!special} />
+      {editorPreview?.resultContext === 'example-rows' ? (
+        <ExampleRowsResultBanner data={res} offset={offset} />
+      ) : (
+        <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
+          allowNextAttempt={!special} />
+      )}
 
       {isChart ? (
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
@@ -379,6 +411,22 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
       )}>
       <Icon name={dir === 'prev' ? 'chevronLeft' : 'chevronRight'} size={13} />
     </button>
+  )
+}
+
+function ExampleRowsResultBanner({ data, offset }: { data: SampleResult; offset: number }) {
+  const complete = data.completeness === 'complete' && data.rowCount != null
+  const count = complete ? (data.rowCount ?? data.rows.length) : data.rows.length
+  const page = !complete && (offset > 0 || data.hasMore !== false)
+  const summary = `${count.toLocaleString()} output ${count === 1 ? 'row' : 'rows'}${
+    page ? ' on this page' : ''
+  } from Example rows`
+  return (
+    <div role="status" aria-label={`Test result: ${summary}`}
+      className="border-b border-border bg-primary/5 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+      <span className="font-semibold text-foreground">Test result</span>
+      {' · '}{summary}
+    </div>
   )
 }
 
@@ -803,7 +851,7 @@ function _download(name: string, text: string, mime: string): void {
 
 function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, pushToast }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; name: string; offset: number
-  scope: 'preview' | 'full-result' | 'published-dataset'
+  scope: 'preview' | 'test-result' | 'full-result' | 'published-dataset'
   sampleProvenance?: SampleProvenance | null
   pushToast: (m: string, k?: 'error' | 'info' | 'success') => void
 }) {
@@ -812,6 +860,7 @@ function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, p
   const range = `rows ${start}–${end}`
   const fileBase = `${_slug(name)}-${scope}-page-${start}-${end}`
   const scopeLabel = scope === 'preview' ? 'preview page'
+    : scope === 'test-result' ? 'test result page'
     : scope === 'published-dataset' ? 'published dataset page' : 'full-result page'
   const copy = () => {
     // navigator.clipboard is undefined in an insecure context (plain http on a LAN IP — a supported
