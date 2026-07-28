@@ -38,7 +38,6 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   const [operationFinderOpen, setOperationFinderOpen] = useState(false)
   const [locatorOpen, setLocatorOpen] = useState(false)
   const toolbarRef = useRef<HTMLDivElement>(null)
-  const labelsVisible = useToolbarLabels(toolbarRef)
 
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
@@ -79,6 +78,9 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
     ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind, doc.edges)).map((spec) => spec.kind)
     : [])
   const nextStepSource = nextStepKinds.size ? selectedNode : null
+  const toolbarDensity = useToolbarDensity(toolbarRef, !!nextStepSource)
+  const labelsVisible = toolbarDensity !== 'icons'
+  const compact = toolbarDensity === 'compact'
   const addNext = (kind: string, asNextStep?: boolean) => {
     if (!asNextStep) { add(kind); return }
     // Re-evaluate at activation time: a remote edit or a changed selection must never turn the
@@ -123,10 +125,13 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
           {canvasRole === 'viewer' ? 'View-only canvas' : 'Checking canvas access…'}
         </div>
       )}
-      <div ref={toolbarRef} data-testid="toolbar" className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
-        <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-2xl border border-border bg-card p-1.5 shadow-lg">
+      <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
+        <div className={cn(
+          'flex max-w-[calc(100vw-24px)] items-center rounded-2xl border border-border bg-card shadow-lg',
+          compact ? 'gap-0.5 p-1' : 'gap-1 p-1.5',
+        )}>
           {canEdit && (
-            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className="flex min-w-0 items-center gap-1">
+            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className={cn('flex min-w-0 items-center', compact ? 'gap-0.5' : 'gap-1')}>
               {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Add</span>}
               {cats.map((cat) => (
                 <CategoryButton
@@ -140,9 +145,9 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
                 />
               ))}
 
-              <div className="mx-1 h-[22px] w-px bg-border" />
+              <div className={cn('h-[22px] w-px bg-border', compact ? 'mx-0.5' : 'mx-1')} />
 
-              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
+              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" showLabel={!!nextStepSource} onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
@@ -150,7 +155,10 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
                   type="button"
                   aria-pressed={agentOpen}
                   onClick={() => setAgentOpen(!agentOpen)}
-                  className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
+                  className={cn(
+                    'inline-flex items-center gap-[7px] rounded-lg py-[7px] text-[12.5px] font-semibold',
+                    compact ? 'px-2.5' : 'px-3.5',
+                  )}
                   // Agent brand accent (violet) — no design token expresses it; matches the AgentDock it opens.
                   style={{ background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6' }}
                 >
@@ -160,7 +168,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
             </div>
           )}
 
-          {canEdit && <div aria-hidden className="mx-1 h-[22px] w-px bg-border" />}
+          {canEdit && <div aria-hidden className={cn('h-[22px] w-px bg-border', compact ? 'mx-0.5' : 'mx-1')} />}
           <CanvasViewControls
             inspectorCollapsed={inspectorCollapsed}
             onInspectorToggle={onInspectorToggle}
@@ -182,25 +190,35 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   )
 }
 
-// The labelled toolbar measures about 860px with the current registry; leave a little room for its
-// centered position and borders. The Canvas region changes width when the Inspector opens, so this
-// must be based on that region instead of the browser window.
+// The ordinary labelled toolbar measures about 860px with the current registry. A contextual
+// Add-next-step label needs a compact labelled density at the 980px Canvas region created by a
+// 1280px viewport with its Inspector open. The Canvas region changes with the Inspector, so these
+// thresholds must use that region, not the browser window.
 const LABELLED_TOOLBAR_MIN_WIDTH = 900
+const COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH = 1024
+type ToolbarDensity = 'icons' | 'compact' | 'comfortable'
 
-function useToolbarLabels(ref: RefObject<HTMLDivElement | null>) {
-  const [visible, setVisible] = useState(false)
+function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLabel: boolean) {
+  const [density, setDensity] = useState<ToolbarDensity>('icons')
 
   useEffect(() => {
     const region = ref.current?.parentElement
     if (!region) return
-    const update = () => setVisible(region.clientWidth >= LABELLED_TOOLBAR_MIN_WIDTH)
+    const update = () => {
+      const width = region.clientWidth
+      setDensity(width < LABELLED_TOOLBAR_MIN_WIDTH
+        ? 'icons'
+        : hasNextStepLabel && width < COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH
+          ? 'compact'
+          : 'comfortable')
+    }
     update()
     const observer = new ResizeObserver(update)
     observer.observe(region)
     return () => observer.disconnect()
-  }, [ref])
+  }, [ref, hasNextStepLabel])
 
-  return visible
+  return density
 }
 
 export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, hasNodes, labelsVisible = false }: {

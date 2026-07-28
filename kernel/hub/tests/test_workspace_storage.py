@@ -2070,7 +2070,10 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         })
         assert created.status_code == 200, created.text
         graph = client.get(f"/api/canvas/{created.json()['id']}").json()
+        assert len(graph["nodes"]) == 1
         source = graph["nodes"][0]
+        assert source["type"] == "source"
+        assert created.json()["nodeId"] == source["id"]
         config = source["data"]["config"]
         assert config["uri"].startswith("workspace-provider://")
         assert str(path) not in json.dumps(graph)
@@ -2725,6 +2728,8 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         assert created.status_code == 200, created.text
         assert provider.list_calls == reads_before_canvas_action
         created_document = created.json()
+        assert created_document["nodeId"] is None
+        assert client.get(f"/api/canvas/{created_document['id']}").json()["nodes"] == []
         metadb.workspace_delete_placement(
             created_document["resource"]["placementId"], expected_version=1)
         metadb.delete_canvas_cascade(created_document["id"])
@@ -3802,7 +3807,12 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                     "datasetIds": [workspace_scope["dataset_id"]],
                 })
                 assert response.status_code == 200, response.text
-                created_ids.append(response.json()["id"])
+                created = response.json()
+                created_ids.append(created["id"])
+                graph = client.get(f"/api/canvas/{created['id']}").json()
+                assert len(graph["nodes"]) == 1
+                assert graph["nodes"][0]["type"] == "source"
+                assert created["nodeId"] == graph["nodes"][0]["id"]
             assert len(set(created_ids)) == 2
 
             with metadb.session() as session:
@@ -3869,12 +3879,15 @@ def test_workspace_create_places_batch_sources_separately(workspace_scope):
                 "datasetIds": [workspace_scope["dataset_id"], second_dataset_id],
             })
             assert response.status_code == 200, response.text
-            created_id = response.json()["id"]
+            created = response.json()
+            created_id = created["id"]
+            assert created["nodeId"] is None
 
         with metadb.session() as session:
             canvas = session.get(metadb.Canvas, created_id)
             assert canvas is not None
             doc = json.loads(canvas.doc)
+            assert [node["type"] for node in doc["nodes"]] == ["source", "source"]
             assert [node["position"] for node in doc["nodes"]] == [
                 {"x": 160, "y": 160},
                 {"x": 440, "y": 160},

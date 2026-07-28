@@ -4,9 +4,11 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 
 const viewport = vi.hoisted(() => ({ zoomIn: vi.fn(), zoomOut: vi.fn(), fitView: vi.fn(), zoom: 1 }))
 const toolbarState = vi.hoisted(() => ({
-  doc: { nodes: [{ id: 'source-1' }] },
+  doc: { nodes: [{ id: 'source-1', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', config: {} } }], edges: [] },
   selectedIds: [],
+  specs: [] as Array<{ kind: string; title: string; category: string; inputs: []; outputs: []; canBypass: boolean; blurb: string }>,
   addNode: vi.fn(),
+  addConnectedNode: vi.fn(),
   select: vi.fn(),
   setAgentOpen: vi.fn(),
   agentOpen: false,
@@ -26,8 +28,15 @@ vi.mock('../store/graph', () => ({
   roleCanEdit: (role: string) => role === 'owner' || role === 'editor',
 }))
 
-vi.mock('../nodes', () => ({ allSpecs: () => [] }))
+vi.mock('../nodes', () => ({ allSpecs: () => toolbarState.specs }))
 vi.mock('../theme/tokens', () => ({ categoryOrder: [], color: {}, kindAccent: {} }))
+vi.mock('./nextStep', () => ({
+  uniqueNextStepConnection: (source: { id: string }, targetKind: string) => (
+    source.id === 'source-1' && targetKind === 'transform'
+      ? { sourceHandle: 'out', targetHandle: 'in', wire: 'dataset' }
+      : null
+  ),
+}))
 
 import { CanvasViewControls, Toolbar } from './Toolbar'
 
@@ -38,6 +47,8 @@ describe('CanvasViewControls', () => {
     viewport.zoomOut.mockReset()
     viewport.fitView.mockReset()
     toolbarState.canvasRole = 'viewer'
+    toolbarState.selectedIds = []
+    toolbarState.specs = []
   })
 
   it('keeps the existing viewport operations behind labelled controls', () => {
@@ -91,5 +102,29 @@ describe('CanvasViewControls', () => {
     expect(screen.getByTestId('toolbar-view-controls')).toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Hide Inspector' })).toBeEnabled()
+  })
+
+  it('shows a visible Add next step label only for an unambiguous selected source', () => {
+    toolbarState.canvasRole = 'owner'
+    toolbarState.selectedIds = ['source-1']
+    toolbarState.specs = [{
+      kind: 'transform', title: 'transform', category: 'compute', inputs: [], outputs: [], canBypass: true, blurb: '',
+    }]
+    const { rerender } = render(
+      <TooltipProvider delayDuration={0}>
+        <Toolbar inspectorCollapsed={false} onInspectorToggle={vi.fn()} />
+      </TooltipProvider>,
+    )
+
+    const contextualAdd = screen.getByRole('button', { name: 'Add next step' })
+    expect(contextualAdd).toHaveTextContent('Add next step')
+
+    toolbarState.selectedIds = []
+    rerender(
+      <TooltipProvider delayDuration={0}>
+        <Toolbar inspectorCollapsed={false} onInspectorToggle={vi.fn()} />
+      </TooltipProvider>,
+    )
+    expect(screen.getByRole('button', { name: 'Add operation' })).not.toHaveTextContent('Add operation')
   })
 })

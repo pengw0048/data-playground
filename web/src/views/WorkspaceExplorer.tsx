@@ -410,6 +410,7 @@ function WorkspaceMixedExplorer() {
   const searchQuery = useStore((s) => s.workspaceSearchQuery)
   const setWorkspaceSearchQuery = useStore((s) => s.setWorkspaceSearchQuery)
   const openFile = useStore((s) => s.openFile)
+  const select = useStore((s) => s.select)
   const files = useStore((s) => s.files)
   const currentCanvasId = useStore((s) => s.doc?.id ?? '')
   const refreshFiles = useStore((s) => s.refreshFiles)
@@ -418,6 +419,12 @@ function WorkspaceMixedExplorer() {
   const pushToast = useStore((s) => s.pushToast)
   const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
+
+  // A create response is the sole authority for this short-lived selection. Opening an existing
+  // Canvas remains selection-neutral, and a multi-dataset create intentionally has no node id.
+  const openCreatedSourceCanvas = async (canvasId: string, nodeId?: string | null) => {
+    if (await openFile(canvasId) && nodeId) select(nodeId)
+  }
   const [containerId, setContainerId] = useState(LOCAL_ROOT_ID)
   const [container, setContainer] = useState<WorkspaceResource | null>(null)
   const [crumbs, setCrumbs] = useState<WorkspaceResource[]>([])
@@ -863,12 +870,12 @@ function WorkspaceMixedExplorer() {
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
         files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
         onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openFile(canvasId) }} />}
+        onOpened={(canvasId, nodeId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
       {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
         container={container} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setProviderDatasetAction(null)}
         onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId) => {
-          setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
+        onOpened={(canvasId, nodeId) => {
+          setProviderDatasetAction(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId)
         }} />}
       {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
         onMoved={(result, destinationPath) => {
@@ -912,12 +919,19 @@ function WorkspaceDatasets() {
   const currentCanvasId = useStore((state) => state.doc?.id ?? '')
   const refreshFiles = useStore((state) => state.refreshFiles)
   const openFile = useStore((state) => state.openFile)
+  const select = useStore((state) => state.select)
   const pushToast = useStore((state) => state.pushToast)
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
   const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
+
+  // See the Workspace action path above: only the create response can identify one unambiguous
+  // Source. Ordinary opens and multi-dataset creates deliberately leave selection unchanged.
+  const openCreatedSourceCanvas = async (canvasId: string, nodeId?: string | null) => {
+    if (await openFile(canvasId) && nodeId) select(nodeId)
+  }
   const query = useMemo(() => parseWorkspaceDatasetQuery(encodedQuery), [encodedQuery])
   // An exact revision deep link is navigation state, not a Catalog filter. Keep it opaque here;
   // DatasetRevisionHistory verifies/read-opens the revision instead of substituting the current head.
@@ -1116,7 +1130,7 @@ function WorkspaceDatasets() {
     {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
       destinationError={destinationError} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
       onRetryDestination={() => setDestinationRevision((current) => current + 1)} onRefreshCanvases={refreshFiles}
-      onOpened={(canvasId) => { setDatasetAction(null); void openFile(canvasId) }} />}
+      onOpened={(canvasId, nodeId) => { setDatasetAction(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
   </div>
 }
 
@@ -1516,7 +1530,7 @@ type CanvasTargetState = 'loading' | 'ready' | 'unavailable'
 
 function DatasetActionDialog({ action, container, destinationError, files, currentCanvasId, targetState, onClose, onOpened, onRetryDestination, onRefreshCanvases }: {
   action: { tables: CatalogTable[] }; container: WorkspaceResource | null; destinationError?: string | null
-  files: CanvasFile[]; currentCanvasId: string; targetState: CanvasTargetState; onClose: () => void; onOpened: (canvasId: string) => void
+  files: CanvasFile[]; currentCanvasId: string; targetState: CanvasTargetState; onClose: () => void; onOpened: (canvasId: string, nodeId?: string | null) => void
   onRetryDestination?: () => void; onRefreshCanvases: () => Promise<boolean>
 }) {
   const editable = targetState === 'ready'
@@ -1550,7 +1564,7 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
           containerId: identity(container), expectedContainerVersion: container.version,
           name: name.trim(), datasetIds,
         })
-        onOpened(created.id)
+        onOpened(created.id, created.nodeId)
       } else {
         const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) { setError('Choose an editable target canvas'); return }
@@ -1846,7 +1860,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
 
 function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, targetState, onClose, onOpened, onRefreshCanvases }: {
   resource: WorkspaceResource; container: WorkspaceResource | null; files: CanvasFile[]; currentCanvasId: string; targetState: CanvasTargetState
-  onClose: () => void; onOpened: (canvasId: string) => void; onRefreshCanvases: () => Promise<boolean>
+  onClose: () => void; onOpened: (canvasId: string, nodeId?: string | null) => void; onRefreshCanvases: () => Promise<boolean>
 }) {
   const editable = targetState === 'ready'
     ? files.filter((file) => file.role === 'owner' || file.role === 'editor') : []
@@ -1881,7 +1895,7 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
           name: name.trim(), providerDatasetRefs: [resource.id],
           ...(destination.externalOverlay ? { requestId: replay.current!.requestId } : {}),
         })
-        onOpened(created.id)
+        onOpened(created.id, created.nodeId)
       } else {
         const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) throw new Error('Choose an editable target canvas')
