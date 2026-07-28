@@ -438,11 +438,19 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
               </div>}
               <div className="grid grid-cols-2 gap-2">
                 <Label className="text-[10.5px]">Search
-                  <Input autoFocus value={q} onChange={(event) => setQ(event.target.value)}
+                  <Input autoFocus value={q} onChange={(event) => {
+                    setQ(event.target.value)
+                    setShowPossibleMatches(false)
+                    setLoading(true)
+                  }}
                     placeholder="Dataset, column, tag…" className="mt-1 h-8" />
                 </Label>
                 <Label className="text-[10.5px]">Folder
-                  <Input value={folder} onChange={(event) => setFolder(event.target.value)}
+                  <Input value={folder} onChange={(event) => {
+                    setFolder(event.target.value)
+                    setShowPossibleMatches(false)
+                    setLoading(true)
+                  }}
                     placeholder="Optional folder subtree" className="mt-1 h-8" />
                 </Label>
               </div>
