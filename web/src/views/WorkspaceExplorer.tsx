@@ -377,20 +377,20 @@ function FirstRunCanvasChoice() {
   const newFromExample = useStore((state) => state.newFromExample)
   return (
     <section data-testid="first-run-canvas-choice" aria-labelledby="first-run-canvas-title"
-      className="border-b border-border bg-card px-7 py-5">
+      className="border-b border-border bg-card px-7 py-3">
       <div className="mx-auto max-w-5xl">
         <h2 id="first-run-canvas-title" className="text-[15px] font-semibold text-foreground">Create your first Canvas</h2>
-        <p className="mt-1 max-w-2xl text-[12.5px] leading-relaxed text-muted-foreground">
+        <p className="mt-0.5 max-w-2xl text-[12.5px] leading-snug text-muted-foreground">
           Start with an empty graph, or open a runnable example using the seeded sample data.
         </p>
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-2 flex flex-wrap gap-2">
           <button type="button" onClick={() => { void newFile() }}
             className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background">Start a blank Canvas</button>
         </div>
-        <div className="mt-4 grid max-w-4xl gap-2 sm:grid-cols-3" role="group" aria-label="Runnable examples">
+        <div className="mt-2 grid max-w-4xl gap-2 sm:grid-cols-3" role="group" aria-label="Runnable examples">
           {examples.map((example) => <button key={example.key} type="button"
             onClick={() => { void newFromExample(example.key) }} aria-label={`Open example ${example.name}`}
-            className="rounded-md border border-border bg-background px-3 py-2.5 text-left transition-colors hover:border-primary/50 hover:bg-accent">
+            className="rounded-md border border-border bg-background px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent">
             <span className="block text-[12px] font-semibold text-foreground">{example.name}</span>
             <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{example.blurb}</span>
           </button>)}

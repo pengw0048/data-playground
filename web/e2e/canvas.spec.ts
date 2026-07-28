@@ -318,6 +318,11 @@ test.describe('Data Playground canvas', () => {
     expect(await canvasesFor(page)).toEqual([])
     await expect(page.getByRole('button', { name: 'Start a blank Canvas' })).toBeVisible()
     await expect(page.getByRole('button', { name: /Open example/i }).first()).toBeVisible()
+    const firstDataset = await workspaceResource(page, 'dataset', 'events')
+    await expect(firstDataset).toBeVisible()
+    const firstDatasetBox = await firstDataset.boundingBox()
+    expect(firstDatasetBox).not.toBeNull()
+    expect(firstDatasetBox!.y + firstDatasetBox!.height).toBeLessThanOrEqual(720)
 
     // Explicit blank + no durable run history is the sole in-place replacement case.
     await page.getByRole('button', { name: 'Start a blank Canvas' }).click()

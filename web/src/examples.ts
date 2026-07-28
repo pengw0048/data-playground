@@ -10,7 +10,7 @@ const TEMPLATES: Tmpl[] = [
   {
     key: 'purchases',
     name: 'Purchases per user',
-    blurb: 'events → keep purchases → total per user → sort → save. The clean → summarize → export basics.',
+    blurb: 'Rank users by total purchase amount and save the result.',
     nodes: [
       { id: 'src', type: 'source', title: 'events', config: { uri: 'events' } },
       { id: 'flt', type: 'filter', config: { predicate: "event = 'purchase'" } },
@@ -23,7 +23,7 @@ const TEMPLATES: Tmpl[] = [
   {
     key: 'top3',
     name: 'Top 3 events per user',
-    blurb: 'A window function ranks each user’s events by amount and keeps the top 3. Shows the window node.',
+    blurb: 'Keep each user’s three highest-value events.',
     nodes: [
       { id: 'src', type: 'source', title: 'events', config: { uri: 'events' } },
       { id: 'win', type: 'window', config: { expr: 'row_number()', partitionBy: 'user_id', orderBy: 'amount DESC', as: 'rank' } },
@@ -35,7 +35,7 @@ const TEMPLATES: Tmpl[] = [
   {
     key: 'quality',
     name: 'Data-quality check',
-    blurb: 'An assert gate flags events whose amount is over 100 — preview the node to see the violating rows.',
+    blurb: 'Flag events with an amount above 100.',
     nodes: [
       { id: 'src', type: 'source', title: 'events', config: { uri: 'events' } },
       { id: 'chk', type: 'assert', title: 'amount ≤ 100?', config: { predicate: 'amount <= 100', severity: 'warn' } },

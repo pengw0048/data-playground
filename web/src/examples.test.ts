@@ -7,6 +7,17 @@ describe('example canvases — runnable starters', () => {
     for (const e of examples) expect(e.key && e.name && e.blurb).toBeTruthy()
   })
 
+  it('describes each example by its data outcome in one concise sentence', () => {
+    expect(Object.fromEntries(examples.map((example) => [example.key, example.blurb]))).toEqual({
+      purchases: 'Rank users by total purchase amount and save the result.',
+      top3: 'Keep each user’s three highest-value events.',
+      quality: 'Flag events with an amount above 100.',
+    })
+    expect(examples.map((example) => example.blurb).join(' ')).not.toMatch(
+      /\bbasics\b|shows the .* node|preview the node/i,
+    )
+  })
+
   it('each example builds a structurally valid, connected doc on the given id', () => {
     for (const e of examples) {
       const doc = exampleDoc(e.key, 'canvas_test')!
