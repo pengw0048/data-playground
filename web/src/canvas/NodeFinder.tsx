@@ -32,9 +32,9 @@ function haystack(spec: NodeSpec): string[] {
   ].map(normalized)
 }
 
-/** Stable operation-search ordering: title/kind matches lead secondary metadata matches; a connection
- * context promotes compatible specs but keeps every registered operation discoverable. */
-export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType): FinderResult[] {
+/** Stable operation-search ordering: title/kind matches lead secondary metadata matches. A connection
+ * context may restrict the same effective registry to specs with an accepting input port. */
+export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType, compatibleOnly = false): FinderResult[] {
   const q = normalized(query)
   return specs.flatMap((spec) => {
     const title = normalized(spec.title)
@@ -46,6 +46,7 @@ export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType)
             : haystack(spec).some((field) => field.includes(q)) ? 3 : -1
     if (match < 0) return []
     const compatible = !wire || spec.inputs.some((port) => (port.accepts ?? [port.wire]).includes(wire))
+    if (compatibleOnly && !compatible) return []
     return [{ spec, compatible, match }]
   }).sort((a, b) => (
     Number(b.compatible) - Number(a.compatible)
@@ -65,13 +66,13 @@ function sourceLabel(source?: string): string {
   return source?.startsWith('plugin:') ? `Plugin · ${source.slice('plugin:'.length)}` : 'Built-in'
 }
 
-export function NodeFinder({ specs, wire, onPick, onClose }: {
-  specs: NodeSpec[]; wire?: WireType; onPick: (kind: string) => void; onClose: () => void
+export function NodeFinder({ specs, wire, compatibleOnly = false, onPick, onClose }: {
+  specs: NodeSpec[]; wire?: WireType; compatibleOnly?: boolean; onPick: (kind: string) => void; onClose: () => void
 }) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const input = useRef<HTMLInputElement>(null)
-  const results = useMemo(() => findNodeSpecs(specs, query, wire), [specs, query, wire])
+  const results = useMemo(() => findNodeSpecs(specs, query, wire, compatibleOnly), [specs, query, wire, compatibleOnly])
   // Search and rank the complete effective registry. Rendering remains bounded for large plugin packs.
   const shownResults = results.slice(0, MAX_RENDERED_RESULTS)
   const truncated = results.length > shownResults.length
@@ -79,7 +80,7 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
   useEffect(() => { input.current?.focus() }, [])
   useEffect(() => { setActive(0) }, [query, wire])
 
-  const choose = (result?: FinderResult) => { if (result) onPick(result.spec.kind) }
+  const choose = (result?: FinderResult) => { if (result && (!compatibleOnly || result.compatible)) onPick(result.spec.kind) }
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Escape') { event.preventDefault(); onClose(); return }
     if (event.key === 'ArrowDown') { event.preventDefault(); setActive((index) => Math.min(index + 1, shownResults.length - 1)); return }
@@ -88,8 +89,8 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
   }
 
   return createPortal(
-    <div className="dp-modal-overlay fixed inset-0 z-[70] grid place-items-start bg-black/20 pt-[12vh]" onMouseDown={onClose}>
-      <section role="dialog" aria-modal="true" aria-label="Add an operation" className="w-[min(620px,calc(100vw-32px))] overflow-hidden rounded-xl border border-border bg-popover shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
+    <div className="dp-modal-overlay fixed inset-0 z-[70] grid justify-items-center content-start bg-black/20 pt-[12vh]" onMouseDown={onClose}>
+      <section role="dialog" aria-modal="true" aria-label={compatibleOnly ? 'Connect to an operation' : 'Add an operation'} className="w-[min(620px,calc(100vw-32px))] overflow-hidden rounded-xl border border-border bg-popover shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
           <Icon name="search" size={16} style={{ color: color.text3 }} />
           <input ref={input} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown}
@@ -114,7 +115,7 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
           {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching node.</div>}
           {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
         </div>
-        <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to add operation</div>
+        <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to {compatibleOnly ? 'connect' : 'add operation'}</div>
       </section>
     </div>,
     document.body,
