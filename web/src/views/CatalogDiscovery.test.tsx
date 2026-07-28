@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Suspense, startTransition, type ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
@@ -62,6 +62,10 @@ const tree = (prefix: string, paths: string[]) => ({ prefix, folders: paths.map(
 function CatalogDiscoveryFixture() {
   return <CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
     onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />
+}
+
+function openCatalogMaintenance() {
+  fireEvent.click(screen.getByText('Catalog maintenance'))
 }
 
 describe('Catalog discovery request and mutation truth', () => {
@@ -368,12 +372,12 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.click(screen.getByTestId('detail-lineage-retry'))
     expect(await screen.findByText('no upstream datasets')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByTestId('detail-preview'))
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
     expect(screen.getByText('rows 1–1')).toBeInTheDocument()
 
+    openCatalogMaintenance()
     const folder = screen.getByTestId('detail-folder') as HTMLInputElement
     fireEvent.change(folder, { target: { value: 'curated/sales' } })
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -388,7 +392,7 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
   })
 
-  it('renders every row counted by the catalog preview scope label', async () => {
+  it('shows a compact preview by default while retaining the full preview scope', async () => {
     const rows = Array.from({ length: 50 }, (_, order_id) => ({ order_id }))
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows, rowCount: 50,
@@ -397,10 +401,36 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    fireEvent.click(screen.getByTestId('detail-preview'))
-
     expect(await screen.findByText('rows 1–50')).toBeInTheDocument()
-    expect(screen.getAllByRole('cell')).toHaveLength(50)
+    expect(screen.getAllByRole('cell')).toHaveLength(4)
+    expect(screen.getByText('Showing the first 4 of 50 preview rows.')).toBeInTheDocument()
+  })
+
+  it('keeps default schema evidence and scrollable preview inspection keyboard reachable', async () => {
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
+    expect(screen.getByText('Dataset location & identity').parentElement).toHaveTextContent(TABLE.uri)
+    expect(screen.getByText('Catalog maintenance').parentElement).not.toHaveAttribute('open')
+    expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
+    expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
+  })
+
+  it('keeps every wide-schema field evidence action in the default Schema inspection', async () => {
+    const columns = Array.from({ length: 12 }, (_, index) => ({
+      name: `column_${index + 1}`, type: 'int64', capabilities: [],
+    }))
+    render(<CatalogDetail table={{ ...TABLE, columns }} onClose={vi.fn()} onUse={vi.fn()}
+      onChanged={vi.fn()} onFolder={vi.fn()} onDeleted={vi.fn()} onOpenTable={vi.fn()}
+      onColumn={vi.fn()} />)
+
+    const schema = screen.getByTestId('detail-schema-scroll')
+    expect(schema).toHaveAttribute('tabindex', '0')
+    expect(await within(schema).findByRole('button', { name: 'Inspect evidence for column_12' })).toBeInTheDocument()
+    expect(screen.queryByText(/more columns in Catalog maintenance/)).not.toBeInTheDocument()
+    await waitFor(() => expect(mocks.sample).toHaveBeenCalled())
   })
 
   it('labels a catalog prefix preview as non-random and exposes its input revision', async () => {
@@ -415,8 +445,6 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    fireEvent.click(screen.getByTestId('detail-preview'))
-
     expect(await screen.findByText('rows 1–1')).toBeInTheDocument()
     expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
@@ -433,8 +461,6 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    fireEvent.click(screen.getByTestId('detail-preview'))
-
     expect(await screen.findByText('No rows returned by this preview; dataset size is unknown.')).toBeInTheDocument()
     expect(screen.queryByText('No rows in this dataset')).not.toBeInTheDocument()
   })
@@ -447,8 +473,6 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    fireEvent.click(screen.getByTestId('detail-preview'))
-
     expect(await screen.findByText(
       'No rows returned by this preview; the dataset contains 120 rows.',
     )).toBeInTheDocument()
@@ -504,9 +528,8 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
-    expect(screen.getByText('legacy_code')).toBeInTheDocument()
+    expect(screen.getAllByText('legacy_code')).not.toHaveLength(0)
 
-    fireEvent.click(screen.getByTestId('detail-preview'))
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
     expect(await screen.findByText(/latest head is orders-dataset@4/i)).toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
@@ -588,6 +611,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   it('renames a dataset from the detail drawer', async () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
+    openCatalogMaintenance()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'daily orders' } })
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalledWith('t1',
@@ -597,6 +621,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   it('renders an unselected column as an available key action, not a key', async () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
+    openCatalogMaintenance()
 
     expect(screen.getByText('No saved key')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Mark order_id as a key' })).toBeVisible()
@@ -609,6 +634,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.saveTableEdit.mockResolvedValue(saved)
     render(<CatalogDetail table={TABLE} onClose={vi.fn()} onUse={vi.fn()} onChanged={onChanged} onFolder={vi.fn()}
       onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
+    openCatalogMaintenance()
 
     fireEvent.click(screen.getByRole('button', { name: 'Mark order_id as a key' }))
     expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Will be a key on Save')
@@ -626,6 +652,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
       keys: [{ columns: ['order_id', 'customer_id'], confidence: 'declared' as const }] }
     render(<CatalogDetail table={composite} onClose={vi.fn()} onUse={vi.fn()} onChanged={vi.fn()} onFolder={vi.fn()}
       onDeleted={vi.fn()} onOpenTable={vi.fn()} onColumn={vi.fn()} />)
+    openCatalogMaintenance()
 
     expect(screen.getByText('Saved composite key')).toBeVisible()
     expect(screen.getByTestId('detail-key-state-order_id')).toHaveTextContent('Composite key')
@@ -638,6 +665,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.table.mockResolvedValue({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
+    openCatalogMaintenance()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'reapplied' } })
     fireEvent.click(screen.getByTestId('detail-pk-order_id'))
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -656,6 +684,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
+    openCatalogMaintenance()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
 
     fireEvent.keyDown(window, { key: 'Escape' })

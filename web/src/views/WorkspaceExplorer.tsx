@@ -1789,14 +1789,14 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   ])
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
-      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      <div data-testid="provider-dataset-detail-content" className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px]">
-        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
-        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Workspace placement</div><div className="break-all font-mono text-[11px]">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-[11px] text-muted-foreground">{placementPath}</div>}</div>
-        {resource.providerDatasetId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Canonical dataset</div>
-          <div className="mt-1 grid grid-cols-[auto_1fr] gap-x-2 text-[11px]"><span className="text-muted-foreground">Mount</span><span className="break-all font-mono">{resource.mountId}</span>
-            <span className="text-muted-foreground">Dataset ID</span><span className="break-all font-mono">{resource.providerDatasetId}</span></div>
-        </div>}
+      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+        className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
+      <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
+        className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        <section><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Dataset</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div>
+          <div className="mt-1 text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
+            ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact revision · {canonicalContext.revisionId ?? 'identity unavailable'}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
+            : canonicalContext ? 'Current/latest provider state · not an exact revision' : 'Loading version and schema when available…'}</div></section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
           && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading canonical dataset context…</div>}
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
@@ -1804,12 +1804,8 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
             Canonical Source binding is unavailable.
             <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>
           </div>}
-        {canonicalContext && <div data-testid="canonical-provider-dataset-context" className="rounded-md border border-border p-2 text-[11px]">
-          <div><span className="text-muted-foreground">Source dataset identity</span><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div></div>
-          <div className="mt-1"><span className="text-muted-foreground">Read mode</span><div>{canonicalContext.readMode === 'exact'
-            ? <>Exact revision · <span className="font-mono">{canonicalContext.revisionId}</span>{canonicalContext.committedAt ? ` · committed ${new Date(canonicalContext.committedAt).toLocaleString()}` : ''}</>
-            : 'Current/latest provider state · not an exact revision'}</div></div>
-          <div className="mt-1"><span className="text-muted-foreground">Canonical columns</span>
+        {canonicalContext && <section data-testid="canonical-provider-dataset-context" className="rounded-md border border-border p-2 text-[11px]">
+          <div><span className="text-muted-foreground">Schema</span>
             {canonicalContext.columns.length
               ? <div className="mt-0.5 grid gap-0.5">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
                 {canonicalContext.columns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
@@ -1817,13 +1813,11 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
               </div>
               : <div>No canonical columns were reported.</div>}
           </div>
-        </div>}
+        </section>}
         {canonicalContextError && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           Canonical dataset context is unavailable. {canonicalContextError}
           <button type="button" onClick={() => setCanonicalContextRevision((current) => current + 1)} className="ml-2 font-semibold underline">Retry canonical detail</button>
         </div>}
-        <div className="text-[11px] text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
-        {resource.providerDatasetId && canonicalState && <div className="text-[11px] text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
         {placementState !== 'current' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           Placement state · {placementState.replace('_', ' ')}{canonicalState === 'current' ? ' · canonical dataset is current' : ''}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
           <div className="mt-2 flex gap-3"><button onClick={onRetry} className="font-semibold underline">Retry</button><button onClick={onRelink} className="font-semibold underline">Relink</button></div>
@@ -1832,13 +1826,19 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           {unavailable?.state !== 'unsupported' && <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>}
         </div>}
         {resource.lastKnown && placementState === 'current' && !canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Last-known placement metadata{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
-        {alternatePlacements.length > 0 && <div className="rounded-md border border-border bg-muted/25 p-2 text-[11px] text-muted-foreground"><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1">Only placements already loaded in this Workspace session are shown.</div></div>}
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
+        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
+          <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
+            {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
+            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div><div className="mt-1 text-muted-foreground">Revision</div><div className="break-all font-mono">{canonicalContext.revisionId}</div></div>}
+            <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
+            {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
+            {alternatePlacements.length > 0 && <div><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1 text-muted-foreground">Only placements already loaded in this Workspace session are shown.</div></div>}
+          </div>
+        </details>
       </div>
       <div className="mt-4 shrink-0 rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
         This provider placement is source-only. Using the dataset creates only a local Source; it never writes to the provider. Other Workspace placements use that same canonical Source.
-        <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
-          className="mt-3 block w-full rounded-md bg-foreground px-3 py-2 font-semibold text-background disabled:opacity-50">Use in canvas</button>
       </div>
     </div>
   </div>

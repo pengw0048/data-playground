@@ -286,6 +286,7 @@ test.describe('Join with related data', () => {
     const source = await catalogTable(page.request, 'events')
     const target = await catalogTable(page.request, 'images')
     const canvasId = `join-inferred-${Date.now()}`
+    let testError: unknown
     try {
       await seedSourceCanvas(page, canvasId, source)
       await page.getByTestId('join-with-related-canvas-selected-source').click()
@@ -300,9 +301,18 @@ test.describe('Join with related data', () => {
       expect(unchanged.version).toBe(1)
       expect(unchanged.nodes).toHaveLength(1)
       expect(unchanged.edges).toHaveLength(0)
+    } catch (error) {
+      testError = error
     } finally {
-      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      try {
+        const deleted = await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+        expect(deleted.ok(), await deleted.text()).toBeTruthy()
+      } catch (cleanupError) {
+        if (!testError) throw cleanupError
+        console.error('Possible-match test cleanup failed after the primary test error:', cleanupError)
+      }
     }
+    if (testError) throw testError
   })
 
   test('a real bounded candidate page asks for refinement, then search and folder scopes converge', async ({ page }) => {
