@@ -28,13 +28,20 @@ export function Popover({
       const w = width ?? r.width
       let left = align === 'right' ? r.right - w : r.left
       left = Math.max(8, Math.min(left, window.innerWidth - w - 8))
-      const availableHeight = placement === 'top'
-        ? r.top - 14
-        : window.innerHeight - r.bottom - 14
+      // Canvas' fixed toolbar is an interaction boundary just like the viewport edge. Prefer the
+      // opposite side when a bottom popover would run into it; outside Canvas there is no toolbar.
+      const toolbarTop = document.querySelector('[data-testid="toolbar"]')?.getBoundingClientRect().top
+      const bottomBoundary = toolbarTop == null ? window.innerHeight : Math.min(window.innerHeight, toolbarTop - 8)
+      const bottomSpace = bottomBoundary - r.bottom - 14
+      const topSpace = r.top - 14
+      const resolvedPlacement = placement === 'bottom' && bottomSpace < Math.min(maxHeight, 160) && topSpace > bottomSpace
+        ? 'top'
+        : placement
+      const availableHeight = resolvedPlacement === 'top' ? topSpace : bottomSpace
       const boundedMaxHeight = Math.max(0, Math.min(maxHeight, availableHeight))
       // 'top' placement grows UPWARD from just above the anchor (anchor its bottom edge), so it
       // sits flush regardless of content height — no guessed offset, no jump.
-      if (placement === 'top') setPos({ left, bottom: window.innerHeight - r.top + 6, width: w, maxHeight: boundedMaxHeight })
+      if (resolvedPlacement === 'top') setPos({ left, bottom: window.innerHeight - r.top + 6, width: w, maxHeight: boundedMaxHeight })
       else setPos({ left, top: r.bottom + 6, width: w, maxHeight: boundedMaxHeight })
     }
     update()

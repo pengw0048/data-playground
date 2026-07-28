@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
+import { useNodeTransientSurface } from '../nodeTransientSurface'
 import { roleCanEdit, useStore } from '../../store/graph'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
@@ -104,6 +105,7 @@ function Source({ id, data }: NodeComponentProps) {
   const [exactDetail, setExactDetail] = useState<DatasetRevisionDetail | null>(null)
   const [exactDetailState, setExactDetailState] = useState<ExactRevisionState>('idle')
   const [exactDetailRequest, setExactDetailRequest] = useState(0)
+  useNodeTransientSurface(`source-dataset-picker:${id}`, open, () => setOpen(false))
 
   // The selected exact revision is authoritative for a Source schema. In particular, a provider
   // binding may have no local CatalogTable at all, and a cached catalog row may have moved on.

@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { Port } from './Port'
+import { useNodeTransientSurface } from './nodeTransientSurface'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useInputColumns, useSchemaWarnings } from './fields'
@@ -319,6 +320,7 @@ function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string;
 
 function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind: string; canEdit: boolean; disabled: boolean; bypassed: boolean }) {
   const [open, setOpen] = useState(false)
+  useNodeTransientSurface(`node-more-menu:${id}`, open, () => setOpen(false))
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
   const canBypass = getSpec(kind)?.canBypass
 
@@ -362,6 +364,7 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
       </Tooltip>
       <DropdownMenuContent
         align="end"
+        side="top"
         className="dp-panel w-[184px]"
         // don't yank focus back to the trigger on close — the shelf/trigger may unmount, and the
         // "Rename" flow needs the freshly-mounted title input to keep focus (matches the old popover)

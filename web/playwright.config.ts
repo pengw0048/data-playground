@@ -62,7 +62,7 @@ export default defineConfig({
       // focused failure and prevents another project's dependency graph from rerunning fixed-id fixtures.
       name: 'chromium-ux-smoke',
       dependencies: ['chromium-first-run'],
-      testIgnore: '**/viewport-support.spec.ts',
+      testIgnore: ['**/viewport-support.spec.ts', '**/node-popover-lifecycle.spec.ts'],
       grep: /@ux-smoke/,
       use: {
         ...devices['Desktop Chrome'],
@@ -74,7 +74,7 @@ export default defineConfig({
       // pass first, and grepInvert makes the two projects a complete, non-overlapping partition.
       name: 'chromium',
       dependencies: ['chromium-ux-smoke'],
-      testIgnore: '**/viewport-support.spec.ts',
+      testIgnore: ['**/viewport-support.spec.ts', '**/node-popover-lifecycle.spec.ts'],
       grepInvert: /@ux-smoke|@first-run/,
       use: {
         ...devices['Desktop Chrome'],
@@ -87,7 +87,7 @@ export default defineConfig({
       // chromium so the shared e2e kernel DB is not mutated by both projects at once.
       name: 'chromium-min-viewport',
       dependencies: ['chromium'],
-      testMatch: '**/viewport-support.spec.ts',
+      testMatch: ['**/viewport-support.spec.ts', '**/node-popover-lifecycle.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
         viewport: { ...MIN_VIEWPORT },
@@ -99,7 +99,7 @@ export default defineConfig({
       // 1280px shell responsive cannot regress the established 1440px layout.
       name: 'chromium-reference-viewport',
       dependencies: ['chromium-min-viewport'],
-      testMatch: '**/viewport-support.spec.ts',
+      testMatch: ['**/viewport-support.spec.ts', '**/node-popover-lifecycle.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
         viewport: { ...REFERENCE_VIEWPORT },
