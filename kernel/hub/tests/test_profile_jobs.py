@@ -267,11 +267,11 @@ def test_profile_admission_keeps_unknown_sources_unknown_despite_stale_actuals(
 
     assert estimate.needs_confirm is True
     assert estimate.rows is None and estimate.bytes is None
-    assert "some cone sizes unknown" in (estimate.breakdown or "")
+    assert "some cone populations are unknown" in (estimate.breakdown or "")
     assert actual_reads == 0, "unbound historical actuals must not erase unknown source work"
 
 
-def test_profile_admission_preserves_known_rows_but_requires_confirmation_for_unknown_width(
+def test_profile_admission_allows_known_small_rows_with_unknown_width(
         monkeypatch):
     from hub.deps import get_deps
     from hub.models import Graph
@@ -281,7 +281,7 @@ def test_profile_admission_preserves_known_rows_but_requires_confirmation_for_un
 
     class KnownAdapter:
         def metadata_count(self, _uri):
-            return 10
+            return 2_000
 
         def fingerprint(self, _uri):
             return "known-revision"
@@ -299,10 +299,43 @@ def test_profile_admission_preserves_known_rows_but_requires_confirmation_for_un
 
     estimate = run_routes._profile_job_estimate(graph, "source", deps)
 
-    assert estimate.rows == 10
+    assert estimate.rows == 2_000
+    assert estimate.bytes is None
+    assert estimate.needs_confirm is False
+    assert estimate.confirmation_reasons == []
+
+
+def test_profile_admission_gates_known_rows_beyond_unknown_width_boundary(monkeypatch):
+    from hub.deps import get_deps
+    from hub.models import Graph
+    from hub.routers import runs as run_routes
+
+    deps = get_deps()
+
+    class KnownAdapter:
+        def metadata_count(self, _uri):
+            return 2_001
+
+        def fingerprint(self, _uri):
+            return "known-revision"
+
+    monkeypatch.setattr(deps, "resolve_adapter", lambda _uri: KnownAdapter())
+    monkeypatch.setattr(deps, "kernel_backend", lambda: None)
+    graph = Graph.model_validate({
+        "id": "known-wider-profile", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": "known://wider.parquet"}},
+        }],
+        "edges": [],
+    })
+
+    estimate = run_routes._profile_job_estimate(graph, "source", deps)
+
+    assert estimate.rows == 2_001
     assert estimate.bytes is None
     assert estimate.needs_confirm is True
-    assert "some cone sizes unknown" in (estimate.breakdown or "")
+    assert estimate.confirmation_reasons == ["unknown_byte_size"]
 
 
 def test_profile_metadata_count_does_not_fabricate_bytes_or_bypass_direct_api_admission(

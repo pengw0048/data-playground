@@ -332,7 +332,9 @@ def test_full_profile_uses_cancellable_job_lifecycle():
         "graph": g, "nodeId": "sel",
     })
     assert preflight.status_code == 200, preflight.text
-    assert preflight.json()["needsConfirm"] is True
+    # This seeded scalar profile has a known, small population. Missing byte-width metadata alone
+    # is not a material interruption; the durable profile lifecycle remains the same.
+    assert preflight.json()["needsConfirm"] is False
     plan_digest = preflight.json()["planDigest"]
     run_id = None
     try:
@@ -3394,10 +3396,14 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []})
     plan = compiler.compile_plan(g, "s", deps.registry, deps.node_specs)
     r = deps.runner
-    assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
+    unknown = r.estimate(plan, None)
+    assert unknown.rows is None and unknown.needs_confirm is True
+    assert unknown.confirmation_reasons == ["unknown_population"]
+    # A 100-row binary column can have no fixed-width byte estimate without becoming an interruption.
+    assert r.estimate(plan, 100, None).needs_confirm is False
     assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10  # bounded rows, unknown bytes
     assert r.estimate(plan, 2_000).needs_confirm is False                          # preview-sized envelope
-    assert r.estimate(plan, 2_001).needs_confirm is True                           # wider unknown pass → gate
+    assert r.estimate(plan, 2_001).confirmation_reasons == ["unknown_byte_size"]
     assert r.estimate(plan, 6_000_000).needs_confirm is True                              # big rows, no bytes → gate
     # The production isolated runner uses the same admission boundary as the in-process one.
     from hub.subprocess_runner import SubprocessRunner
@@ -4075,7 +4081,11 @@ def test_failed_run_does_not_wedge_later_previews(tmp_path):
     # a run against a missing file fails and aborts DuckDB's implicit transaction; if that's not
     # rolled back, EVERY later query on the shared connection errors ("transaction is aborted").
     bad = {"id": "c1", "version": 1, "nodes": [N("s", "source", {"uri": "does-not-exist.parquet"})], "edges": []}
-    r = client.post("/api/run", json={"graph": bad, "targetNodeId": "s"}).json()
+    # The missing source has no measurable population, so deliberately admit the unknown run to
+    # exercise the runner failure and its transaction cleanup.
+    r = client.post("/api/run", json={
+        "graph": bad, "targetNodeId": "s", "confirmed": True,
+    }).json()
     assert _poll(r["runId"])["status"] == "failed"
     # a subsequent preview of a GOOD source must still work (the aborted transaction was cleared)
     p = _seq_parquet(tmp_path)

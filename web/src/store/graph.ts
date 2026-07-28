@@ -2460,11 +2460,12 @@ export const useStore = create<Store>((set, get) => ({
       }
     }
     const schemaDriftConfirm = writeAdmission?.intent?.schemaDrift?.requiresConfirmation === true
+    const destructiveWriteConfirm = writeAdmission?.managed === false && writeAdmission.mode === 'overwrite'
     if (estimate.exactRunReadiness?.ready === false) {
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate, phase: 'estimated',
       } }, openPanels: { [id]: 'run' } }))
-    } else if (estimate.needsConfirm || schemaDriftConfirm) {
+    } else if (estimate.needsConfirm || schemaDriftConfirm || destructiveWriteConfirm) {
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate, phase: 'confirm',
       } }, openPanels: { [id]: 'run' } }))
@@ -2591,6 +2592,7 @@ export const useStore = create<Store>((set, get) => ({
         ...(s.runs[id] ?? {}), estimate,
         phase: estimate.needsConfirm
           || writeAdmission?.intent?.schemaDrift?.requiresConfirmation === true
+          || (writeAdmission?.managed === false && writeAdmission.mode === 'overwrite')
           ? 'confirm' : 'estimated',
       } } }))
     } catch (e) {

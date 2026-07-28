@@ -1548,17 +1548,17 @@ describe('durable full results', () => {
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
 
     await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
-    expect(await screen.findByText('Profile preflight')).toBeInTheDocument()
-    expect(screen.getByText(/Estimated 10 rows · 5 GiB · Large or unknown scan/i)).toBeInTheDocument()
+    expect(await screen.findByText('Profile 10 rows')).toBeInTheDocument()
+    expect(screen.getByText(/10 rows · about 5 GiB · This profile needs your explicit confirmation/i)).toBeInTheDocument()
     expect(screen.getByText(/distinct counts are approximate/i)).toBeInTheDocument()
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
 
-    await user.click(screen.getByRole('button', { name: 'Start whole-dataset profile' }))
+    await user.click(screen.getByRole('button', { name: 'Start profile' }))
     await waitFor(() => expect(apiMock.fullProfile).toHaveBeenCalledWith(
       doc, 'target', 'out', expect.any(String), expect.any(String), true,
     ))
     expect(screen.getByText('Full profile queued…')).toBeInTheDocument()
-    expect(screen.getByText(/Estimated 10 rows · 5 GiB · whole-dataset scan/i)).toBeInTheDocument()
+    expect(screen.getByText(/10 rows · about 5 GiB · whole-dataset scan/i)).toBeInTheDocument()
 
     finishProfile({
       runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',

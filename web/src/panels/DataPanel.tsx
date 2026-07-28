@@ -690,33 +690,47 @@ function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
 }
 
 function profileEstimateLabel(estimate?: { rows: number | null; bytes?: number | null }): string {
-  const rows = estimate?.rows == null ? 'rows unknown' : `${estimate.rows.toLocaleString()} rows`
-  if (estimate?.bytes == null) return `Estimated ${rows} · size unknown`
+  const rows = estimate?.rows == null ? 'row count unknown' : `${estimate.rows.toLocaleString()} rows`
+  if (estimate?.bytes == null) return rows
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
   const unit = estimate.bytes > 0
     ? Math.min(Math.floor(Math.log(estimate.bytes) / Math.log(1024)), units.length - 1)
     : 0
   const bytes = (estimate.bytes / 1024 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })
-  return `Estimated ${rows} · ${bytes} ${units[unit]}`
+  return `${rows} · about ${bytes} ${units[unit]}`
 }
 
 function FullProfilePreflight({ job, toggle, onStart }: {
-  job: { estimate?: { rows: number | null; bytes?: number | null; needsConfirm: boolean } }
+  job: { estimate?: { rows: number | null; bytes?: number | null; needsConfirm: boolean; confirmationReasons?: string[] } }
   toggle: ReactNode
   onStart: () => void
 }) {
-  const confirmation = job.estimate?.needsConfirm
-    ? 'Large or unknown scan — confirmation is required.'
-    : 'Known-small scan.'
+  const estimate = job.estimate
+  const reasons = new Set(estimate?.confirmationReasons ?? [])
+  const risk = reasons.has('unknown_population')
+    ? 'The total population is unknown.'
+    : reasons.has('large_bytes')
+      ? 'The estimated data volume is large.'
+      : reasons.has('large_rows')
+        ? 'The row count is above the automatic-run limit.'
+        : reasons.has('unknown_byte_size')
+          ? 'Data size is not available, and this input is above the small-run limit.'
+          : estimate?.needsConfirm
+            ? 'This profile needs your explicit confirmation.'
+            : null
   return (
     <div className="px-5 py-6 text-center">
-      <div className="mb-1 text-[12px] font-semibold text-foreground">Profile preflight</div>
-      <p className="mb-1 text-[11px] text-muted-foreground">{profileEstimateLabel(job.estimate)} · {confirmation}</p>
+      <div className="mb-1 text-[12px] font-semibold text-foreground">
+        {estimate?.rows == null ? 'Profile with unknown row count' : `Profile ${estimate.rows.toLocaleString()} rows`}
+      </div>
+      <p className="mb-1 text-[11px] text-muted-foreground">
+        {profileEstimateLabel(estimate)}{risk ? ` · ${risk}` : ''}
+      </p>
       <p className="mb-3 text-[11px] text-muted-foreground">The job will scan every row; distinct counts are approximate.</p>
       <div className="flex items-center justify-center gap-2">
         <button onClick={onStart}
           className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-semibold text-primary-foreground">
-          Start whole-dataset profile
+          Start profile
         </button>
         {toggle}
       </div>

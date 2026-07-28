@@ -1811,11 +1811,13 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
 def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
     """Estimate the whole-dataset scan and normalize its admission contract.
 
-    The normal local runner intentionally lets an entirely unknown job fail fast. A profile is different:
-    it will scan whatever relation the node resolves to, so unknown cost requires explicit confirmation.
-    Known-small requires every execution-cone size to be known and all known row/byte signals to remain
-    under their gates. Partial known values still drive large-cost admission internally, but are not
-    presented on the wire as if they described the complete scan.
+    A profile scans whatever relation the node resolves to, so an unknown population requires an
+    explicit confirmation rather than a fabricated cost.
+    Known-small requires a known population and all known row/byte signals to remain under their
+    gates. Missing byte-width metadata alone does not erase a known, small population: the normal
+    runner's conservative unknown-width row boundary still applies. Partial known values still drive
+    large-cost admission internally, but are not presented on the wire as if they described the
+    complete scan.
     """
     plan = compiler.compile_plan(graph, node_id, deps.registry, deps.node_specs, deps.node_ir)
     rows, byts, sizes = _metadata_only_cone_size(graph, node_id, deps)
@@ -1827,21 +1829,28 @@ def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
     rows_complete = bool(sizes) and all(
         size.rows is not None and size.confidence != "unknown" for size in sizes.values()
     )
-    bytes_complete = byts is not None
-    unknown = not rows_complete or not bytes_complete
+    # A full profile always scans its complete population.  That population is the material fact for
+    # admission; variable-width bytes are a separate, explicitly bounded uncertainty rather than a
+    # reason to relabel 2,000 known rows as an "unknown scan".
+    unknown_population = not rows_complete
     breakdown = estimate.breakdown or "size unknown"
-    if unknown and "some cone sizes unknown" not in breakdown:
-        breakdown = f"{breakdown} · some cone sizes unknown"
+    reasons = list(estimate.confirmation_reasons)
+    if unknown_population:
+        if "unknown_population" not in reasons:
+            reasons.append("unknown_population")
+        if "some cone populations are unknown" not in breakdown:
+            breakdown = f"{breakdown} · some cone populations are unknown"
     if "whole-dataset profile" not in breakdown:
         breakdown = f"{breakdown} · whole-dataset profile"
     updates = {
-        "needs_confirm": bool(estimate.needs_confirm or unknown),
+        "needs_confirm": bool(estimate.needs_confirm or unknown_population),
+        "confirmation_reasons": reasons,
         "breakdown": breakdown,
         # Partial known values still enter the backend's admission gate, but the response only exposes a
         # signal that describes the complete cone. In particular, unknown width must not erase an exact
         # metadata row count, nor may the estimator's internal default width become an asserted byte size.
         "rows": rows if rows_complete else None,
-        "bytes": byts if bytes_complete else None,
+        "bytes": byts if byts is not None and rows_complete else None,
     }
     return estimate.model_copy(update=updates)
 
@@ -2466,6 +2475,12 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
 
 def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimate:
     """Surface the first concrete missing-width fact when a known-row run needs confirmation."""
+    if estimate.rows is None:
+        # Plugins may supply their own estimate implementation.  Keep the public admission policy
+        # consistent even when one does not yet emit structured reasons.
+        estimate.needs_confirm = True
+        if "unknown_population" not in estimate.confirmation_reasons:
+            estimate.confirmation_reasons.append("unknown_population")
     if estimate.rows is None and estimate.bytes is None:
         reasons = list(dict.fromkeys(
             size.uncertainty for size in sizes.values()
@@ -2475,7 +2490,6 @@ def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimat
             # A prepared node is allowed to return no restriction, or another enabled branch may
             # still consume the Source normally. With no bounded row count at all, unknown
             # pre-admission cost still requires explicit confirmation.
-            estimate.needs_confirm = True
             estimate.breakdown = (
                 f"{estimate.breakdown} · confirmation required: {reasons[0]}"
             )
@@ -2487,6 +2501,8 @@ def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimat
         if size.rows is not None and size.bytes is None and size.uncertainty
     ))
     if estimate.needs_confirm:
+        if "unknown_byte_size" not in estimate.confirmation_reasons:
+            estimate.confirmation_reasons.append("unknown_byte_size")
         reason = reasons[0] if reasons else (
             "Byte size is unknown because bounded column-width evidence is unavailable."
         )
@@ -2985,6 +3001,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     unsubmitted_write_admission_id: str | None = None
     unsubmitted_write_run_id: str | None = None
     bound_unsubmitted_write = False
+    provider_overwrite_requires_confirmation = False
     if target is not None and target.type == "write" and submission_id is not None:
         write_admission = _write_admission_for_graph(
             deps, graph, target_node_id, uid, submission_id, supplied=write_intent)
@@ -3013,6 +3030,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             effective_write_intent = write_admission.intent
             _inject_write_intent(graph, target_node_id, write_admission.intent)
             _inject_write_intent(durable_graph, target_node_id, write_admission.intent)
+        elif write_admission.mode == "overwrite":
+            provider_overwrite_requires_confirmation = True
     elif submission_id is None:
         # Direct API, MCP, and CLI callers predate browser submission identities. Preserve that
         # execution lifecycle for ordinary writes, but do not let it bypass a structural-drift card.
@@ -3039,6 +3058,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             admission = _write_admission_for_graph(
                 deps, graph, unadmitted_write_target, uid,
                 unsubmitted_write_admission_id, run_id=unsubmitted_write_run_id)
+            if not admission.managed and admission.mode == "overwrite":
+                provider_overwrite_requires_confirmation = True
             managed_head = (
                 metadb.catalog_managed_local_write_head(admission.destination)
                 if admission.managed else None
@@ -3096,6 +3117,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             409, "the selected execution owner cannot consume the managed-local write admission; "
             "discard it and retry with an in-process local plan")
     est = _explain_unknown_byte_size(runner.estimate(plan, rows, byts), sizes)
+    # Managed local replacement publishes a new retained revision, so it is not destructive.  A
+    # provider-neutral overwrite can replace bytes in place; require the same explicit decision on
+    # the direct API path that the Canvas presents to a researcher.
+    if provider_overwrite_requires_confirmation:
+        est.needs_confirm = True
+        if "destructive_overwrite" not in est.confirmation_reasons:
+            est.confirmation_reasons.append("destructive_overwrite")
+        if est.breakdown and "provider output will be overwritten" not in est.breakdown:
+            est.breakdown = f"{est.breakdown} · provider output will be overwritten"
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
     durable_managed_write = effective_write_intent is not None and (

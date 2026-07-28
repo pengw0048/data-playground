@@ -49,6 +49,25 @@ _CONFIRM_BYTES = 2 << 30    # 2 GiB — the primary confirm signal: a full pass 
 _DIRECT_UNKNOWN_WIDTH_ROWS = 2_000  # the normal bounded-preview envelope may run without an extra prompt
 
 
+def confirmation_reasons(rows: int | None, byts: int | None) -> list[str]:
+    """Return the concrete, stable reasons a full pass needs an explicit decision.
+
+    A missing byte width is not the same thing as an unknown population.  Small, known
+    inputs are allowed through even when variable-width values prevent a byte estimate;
+    a larger known input remains gated at the documented conservative row boundary.
+    """
+    reasons: list[str] = []
+    if rows is None:
+        reasons.append("unknown_population")
+    if byts is not None and byts >= _CONFIRM_BYTES:
+        reasons.append("large_bytes")
+    if rows is not None and rows >= _CONFIRM_ROWS:
+        reasons.append("large_rows")
+    if rows is not None and byts is None and rows > _DIRECT_UNKNOWN_WIDTH_ROWS:
+        reasons.append("unknown_byte_size")
+    return reasons
+
+
 def _safe_abandon_attempt(uri: str) -> None:
     """Best-effort lifecycle cleanup after this process has proved the writer is stopped."""
     from hub import metadb
@@ -361,22 +380,13 @@ class LocalRunner:
         # int (~20 MB) is trivial while 200k wide rows can be gigabytes — the old pure row gate misfired on
         # both. Unknown byte width is not a reason to block a normal bounded-preview-sized pass by itself,
         # but beyond that small envelope the missing byte bound still requires an explicit decision.
-        # Unknown-and-uncountable keeps its existing fast-failure behavior and does not add a gate.
+        # An unknown population is a material decision: never call it a normal small run.
         placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
-        if rows is None and byts is None:
-            return RunEstimate(rows=None, bytes=None, placement=placement, needs_confirm=False,
-                               breakdown=f"size unknown · {len(plan.steps)} steps · out-of-core")
-        # EITHER signal trips the gate: large estimated bytes (catches few-but-WIDE rows the row count
-        # misses) OR a large row count (the width estimate can under-count variable-length strings, so
-        # the row threshold stays a floor). Neither subsumes the other.
-        needs = (
-            (rows is not None and byts is None and rows > _DIRECT_UNKNOWN_WIDTH_ROWS)
-            or (byts is not None and byts >= _CONFIRM_BYTES)
-            or (rows is not None and rows >= _CONFIRM_ROWS)
-        )
+        reasons = confirmation_reasons(rows, byts)
         size = _fmt_bytes(byts) if byts is not None else "size unknown"
         rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
-        return RunEstimate(rows=rows, bytes=byts, placement=placement, needs_confirm=needs,
+        return RunEstimate(rows=rows, bytes=byts, placement=placement, needs_confirm=bool(reasons),
+                           confirmation_reasons=reasons,
                            breakdown=f"{size} · {rowstr} · {len(plan.steps)} steps · out-of-core")
 
     # -- plan hash (content addressing) — shared logic in hub.plan_key ------ #

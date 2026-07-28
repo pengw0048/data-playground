@@ -1231,6 +1231,37 @@ def test_runner_without_typed_write_capability_is_not_mislabeled_managed(contrac
     assert admission.intent is None
 
 
+def test_provider_overwrite_requires_confirmation_before_dispatch(contract, monkeypatch):
+    """The Canvas warning is not a browser-only guard for an in-place provider overwrite."""
+    from types import SimpleNamespace
+
+    deps, graph = contract
+    deps.node_ir = {}
+    deps.pick_runner = lambda *_args: object()
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes,
+        "_write_admission_for_graph",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            managed=False, mode="overwrite", intent=None,
+        ),
+    )
+    runner = SimpleNamespace(estimate=lambda *_args: RunEstimate(
+        rows=2, bytes=16, placement="local", needs_confirm=False,
+    ))
+    monkeypatch.setattr(run_routes, "_route_by_capability", lambda *_args: runner)
+    monkeypatch.setattr(run_routes, "_require_backend_run_output_support", lambda *_args: None)
+    monkeypatch.setattr(run_routes, "_require_destination_credential_preflight", lambda *_args: None)
+
+    with pytest.raises(run_routes.RunNeedsConfirm) as blocked:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=False,
+        )
+
+    assert "destructive_overwrite" in blocked.value.estimate.confirmation_reasons
+
+
 def test_write_admission_api_returns_the_frozen_camel_case_contract(
         contract, monkeypatch):
     deps, graph = contract

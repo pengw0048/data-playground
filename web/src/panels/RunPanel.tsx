@@ -8,8 +8,8 @@ import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeCon
 import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
-import type { InputDrift, RunOutput } from '../types/api'
-import { isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
+import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -68,6 +68,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
   const exactRunReadiness = writeAdmission?.exactRunReadiness ?? est?.exactRunReadiness
   const exactRunReady = exactRunReadiness?.ready !== false
+  const confirmationActionLabel = isManagedWrite
+    ? 'Publish a new version'
+    : est?.rows == null ? 'Run with unknown row count' : `Run ${est.rows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
     ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
     : exactRunReady ? 'Run' : 'Exact input registration required'
@@ -123,21 +126,25 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 
       {(phase === 'estimated' || phase === 'confirm') && est && (
         <>
-          <Label>{phase === 'confirm' ? 'HEADS UP' : 'ESTIMATE'}</Label>
-          <div className="mt-0.5 flex items-baseline gap-2">
-            <span className="text-2xl font-bold text-foreground">
-              {est.rows != null ? `${est.rows.toLocaleString()} rows` : 'Size unknown'}
-            </span>
-          </div>
-          {phase === 'confirm'
-            ? <div className="mt-2 text-[11px] text-muted-foreground">{confirmationCopy(est)}</div>
-            : est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
-          {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
-          {pinnedInputs.length > 0 && (
-            <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-              Uses the pinned exact Source version{pinnedInputs.length === 1 ? '' : 's'} shown on this Canvas.
+          {phase === 'confirm' ? <>
+            <Label>CONFIRM RUN</Label>
+            <div className="mt-0.5 text-2xl font-bold text-foreground">{confirmationActionLabel}</div>
+            <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+              {confirmationCopy(est, writeAdmission)}
             </div>
-          )}
+            <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
+              isWrite={isWrite} outputName={outputName} destination={destination}
+              admission={writeAdmission} receipt={receipt ?? undefined} />
+          </> : <>
+            <Label>ESTIMATE</Label>
+            <div className="mt-0.5 flex items-baseline gap-2">
+              <span className="text-2xl font-bold text-foreground">
+                {est.rows != null ? `${est.rows.toLocaleString()} rows` : 'Size unknown'}
+              </span>
+            </div>
+            {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
+            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
+          </>}
           {!isWrite && exactRunReadiness?.ready === false && (
             <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
               <strong>Not exact-run-ready:</strong> {exactRunReadiness.message}
@@ -146,8 +153,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           {phase === 'confirm' ? (
             <div className="mt-3.5 flex gap-2">
               <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit || !exactRunReady}
-                title={!canEdit ? 'View-only canvas' : exactRunReady ? primaryActionLabel : exactRunReadiness?.message ?? undefined}
-                className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">{primaryActionLabel}</Button>
+                title={!canEdit ? 'View-only canvas' : exactRunReady ? confirmationActionLabel : exactRunReadiness?.message ?? undefined}
+                className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">{confirmationActionLabel}</Button>
               <Button size="sm" variant="outline" onClick={() => useStore.getState().closePanel(nodeId)} className="flex-1">Cancel</Button>
             </div>
           ) : (
@@ -415,16 +422,64 @@ function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: str
   })
 }
 
-function confirmationCopy(estimate: { rows?: number | null; bytes?: number | null; breakdown?: string | null }): string {
-  const rows = estimate.rows == null ? 'This full run has an unknown row count.' : `This full run will process ${estimate.rows.toLocaleString()} rows.`
-  if (estimate.bytes != null) {
-    return `${rows} It is estimated to read ${formatByteEstimate(estimate.bytes)}. Confirm before starting the full pass.`
-  }
-  const binaryColumn = estimate.breakdown?.match(/Binary column "([^"]+)"/)?.[1]
-  const reason = binaryColumn
-    ? `Byte size is unknown because "${binaryColumn}" contains variable-length binary data.`
-    : 'Byte size is unknown because this source has no reliable size estimate.'
-  return `${rows} ${reason} The actual read may be much larger than the row count suggests.`
+type ConfirmationReason = NonNullable<RunEstimate['confirmationReasons']>[number]
+
+function confirmationReasons(estimate: RunEstimate, admission?: WriteAdmission): ConfirmationReason[] {
+  const reasons = new Set<ConfirmationReason>(estimate.confirmationReasons ?? [])
+  if (admission?.intent?.schemaDrift?.requiresConfirmation) reasons.add('schema_drift')
+  if (admission?.managed === false && admission.mode === 'overwrite') reasons.add('destructive_overwrite')
+  return [...reasons]
+}
+
+function confirmationCopy(estimate: RunEstimate, admission?: WriteAdmission): string {
+  const reasons = confirmationReasons(estimate, admission)
+  const cost = estimate.rows == null
+    ? 'This full run will process an unknown number of rows.'
+    : `This full run will process ${estimate.rows.toLocaleString()} rows${estimate.bytes != null ? ` (about ${formatByteEstimate(estimate.bytes)})` : ''}.`
+  const risk = reasons.includes('destructive_overwrite')
+    ? 'It will overwrite the selected provider output.'
+    : reasons.includes('schema_drift')
+      ? 'The published version changes the destination schema.'
+      : reasons.includes('unknown_population')
+        ? 'The total population is unknown.'
+        : reasons.includes('large_bytes')
+          ? 'The estimated data volume is large.'
+          : reasons.includes('large_rows')
+            ? 'The row count is above the automatic-run limit.'
+            : reasons.includes('unknown_byte_size')
+              ? 'Data size is not available, and this input is above the small-run limit.'
+              : 'This run needs your explicit confirmation.'
+  return `${cost} ${risk}`
+}
+
+function ConfirmationTechnicalDetails({
+  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt,
+}: {
+  estimate: RunEstimate
+  pinnedInputs: { nodeId: string; title: string; ref: DatasetRef }[]
+  isWrite: boolean
+  outputName: string
+  destination: string
+  admission?: WriteAdmission
+  receipt?: WriteReceipt
+}) {
+  const reasons = confirmationReasons(estimate, admission)
+  return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+    <div className="mt-2 grid gap-1 break-all">
+      {estimate.breakdown && <div>{estimate.breakdown}</div>}
+      {reasons.length > 0 && <div>Confirmation reason{reasons.length === 1 ? '' : 's'}: {reasons.join(', ').replaceAll('_', ' ')}</div>}
+      {pinnedInputs.map((input) => {
+        const exact = datasetRefIdentity(input.ref)
+        return <div key={input.nodeId}>
+          {input.title} · dataset {exact.datasetId} · revision {exact.revisionId}
+          {input.ref.kind === 'as_of' ? ` · as of ${new Date(input.ref.asOf).toLocaleString()}` : ''}
+        </div>
+      })}
+      {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
+        admission={admission} receipt={receipt} />}
+    </div>
+  </details>
 }
 
 function formatByteEstimate(value: number): string {

@@ -1684,6 +1684,26 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ runs: {} })
   })
 
+  it('requires an explicit confirmation before overwriting provider output', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    useStore.setState({ doc, runs: {} })
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      nodeId: 'write', managed: false, destination: 's3://provider/output.parquet',
+      mode: 'overwrite', provider: 'provider-sink', expectedSchema: [], partitions: [],
+    })
+
+    await useStore.getState().requestRun('write')
+
+    expect(useStore.getState().runs.write).toMatchObject({ phase: 'confirm' })
+    expect(apiMocks.run).not.toHaveBeenCalled()
+  })
+
   it('shows exact drift admission before submitting that same confirmed write', async () => {
     const source = NODE('source')
     const write = NODE('write', 'write')

@@ -791,6 +791,7 @@ export interface RunEstimate {
   bytes?: number | null // estimated peak data volume — the confirm gate's cost signal
   placement: Placement
   needsConfirm: boolean
+  confirmationReasons?: Array<'unknown_population' | 'unknown_byte_size' | 'large_rows' | 'large_bytes' | 'schema_drift' | 'destructive_overwrite'>
   breakdown?: string | null
   exactRunReadiness?: ExactRunReadiness | null
 }
