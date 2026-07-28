@@ -11,6 +11,10 @@ import { Input } from '@/components/ui/input'
 import { miniInputClass, miniSelectClass } from '../ui/controls'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema } from '../types/graph'
+import {
+  FILTER_OPS, type FilterCondition, type FilterOp, filterBuilderConditions,
+  parseFilterConditions, serializeFilterConditions,
+} from './filterValidation'
 
 /** Columns available to a node's expression fields = its upstream output columns (typed ports).
  * Subscribes only to the things that affect columns (edges / schemas / previews / catalog) — NOT to
@@ -183,67 +187,27 @@ export function SortBuilder({ nodeId }: { nodeId: string }) {
 }
 
 // ---- filter: rows of {column, op, value} joined by AND ------------------- //
-const OPS = ['=', '!=', '>', '>=', '<', '<=', 'LIKE', 'IS NULL', 'IS NOT NULL'] as const
-type Op = typeof OPS[number]
-interface Cond { col: string; op: Op; val: string }
-
-// Parse a predicate into simple conditions; returns null if it isn't a plain "a op b AND c op d"
-// (compound OR, parentheses, functions) — then we stay in free-text ("advanced") mode.
-function parseFilter(pred: string): Cond[] | null {
-  const p = pred.trim()
-  if (!p) return []
-  if (/\bor\b|\(|\)/i.test(p)) return null
-  const parts = p.split(/\s+AND\s+/i)
-  const conds: Cond[] = []
-  for (const part of parts) {
-    const nul = part.match(/^(.+?)\s+(IS NOT NULL|IS NULL)$/i)
-    if (nul) { conds.push({ col: nul[1].trim(), op: nul[2].toUpperCase() as Op, val: '' }); continue }
-    // the column must be a bare identifier (or quoted), the operator EXACTLY one of OPS (negative
-    // lookahead so `>>>`/`>>` etc. don't parse as `>`), and the value must not start with an operator
-    // char — otherwise the predicate isn't faithfully representable as a builder row, so return null
-    // and let the card stay in raw-SQL mode instead of showing a condition the engine won't run (F43).
-    const m = part.match(/^([A-Za-z_][\w.]*|"[^"]+")\s*(!=|>=|<=|=|>|<|LIKE)(?![=<>!])\s*(.+)$/i)
-    if (!m || /^[=<>!]/.test(m[3].trim())) return null
-    conds.push({ col: m[1].trim(), op: m[2].toUpperCase() as Op, val: m[3].trim() })
-  }
-  return conds
-}
-function literal(val: string, colType: string | undefined): string {
-  // A filter VALUE is treated as a literal. Numbers / bool / null / already-quoted pass through;
-  // everything else is quoted as a string (so a value that happens to equal a column name isn't
-  // silently turned into a column reference). Column-vs-column comparisons use the raw-SQL toggle.
-  const v = val.trim()
-  if (v === '') return "''"
-  if (/^-?\d+(\.\d+)?$/.test(v) || /^(true|false|null)$/i.test(v) || /^'.*'$/.test(v)) return v
-  // date/time/timestamp values need quoting too (unquoted 2024-01-01 = integer arithmetic)
-  const stringy = !colType || /string|json|struct|list|bytes|date|time|timestamp/.test(colType)
-  return stringy ? `'${v.replace(/'/g, "''")}'` : v
-}
-function serializeFilter(conds: Cond[], columns: ColumnSchema[]): string {
-  return conds.filter((c) => c.col.trim()).map((c) => {
-    if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return `${c.col} ${c.op}`
-    const t = columns.find((x) => x.name === c.col)?.type
-    return `${c.col} ${c.op} ${literal(c.val, t)}`
-  }).join(' AND ')
-}
-
 export function FilterBuilder({ nodeId }: { nodeId: string }) {
-  const pred = String(useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config.predicate) ?? '')
+  const config = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config ?? {})
+  const pred = String(config.predicate ?? '')
   const updateConfig = useStore((s) => s.updateConfig)
   const columns = useInputColumns(nodeId)
-  const parsed = parseFilter(pred)
+  const saved = filterBuilderConditions(config)
+  const parsed = saved ?? parseFilterConditions(pred)
   // stick in advanced mode if the current predicate can't be represented as simple AND conditions
   const [advanced, setAdvanced] = useState(parsed === null)
   const conds = parsed ?? []
-  const commit = (next: Cond[]) => updateConfig(nodeId, { predicate: serializeFilter(next, columns) })
+  const commit = (next: FilterCondition[]) => updateConfig(nodeId, {
+    predicate: serializeFilterConditions(next, columns), filterBuilder: { conditions: next },
+  })
 
   if (advanced || parsed === null) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <ColumnCombo value={pred} columns={columns} placeholder="is_valid = true AND score > 0.5"
           onChange={(v) => updateConfig(nodeId, { predicate: v })} />
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); if (parseFilter(pred) !== null) setAdvanced(false) }}
-          style={{ ...addBtn, opacity: parseFilter(pred) === null ? 0.5 : 1 }} title={parseFilter(pred) === null ? 'Simplify the predicate to use the builder' : 'Switch to the builder'}>
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); if (parseFilterConditions(pred) !== null) setAdvanced(false) }}
+          style={{ ...addBtn, opacity: parseFilterConditions(pred) === null ? 0.5 : 1 }} title={parseFilterConditions(pred) === null ? 'Simplify the predicate to use the builder' : 'Switch to the builder'}>
           <Icon name="fx" size={11} /> builder
         </button>
       </div>
@@ -261,11 +225,11 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <ColumnCombo value={c.col} columns={columns} placeholder="column"
-                  onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, col: v } : x)))} />
+                  onChange={(v) => commit(conds.map((x, j) => (j === i ? { ...x, col: v, type: columns.find((column) => column.name === v)?.type } : x)))} />
               </div>
               <select className={cn('nodrag', miniSelectClass, 'w-auto flex-none')} value={c.op} onClick={(e) => e.stopPropagation()}
-                onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as Op } : x)))}>
-                {OPS.map((o) => <option key={o} value={o}>{o}</option>)}
+                onChange={(e) => commit(conds.map((x, j) => (j === i ? { ...x, op: e.target.value as FilterOp } : x)))}>
+                {FILTER_OPS.map((o) => <option key={o} value={o}>{o}</option>)}
               </select>
               <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit(conds.filter((_, j) => j !== i)) }}
                 title="Remove" style={xBtn}><Icon name="close" size={11} /></button>
@@ -279,9 +243,9 @@ export function FilterBuilder({ nodeId }: { nodeId: string }) {
         )
       })}
       <div style={{ display: 'flex', gap: 6 }}>
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...conds, { col: columns[0]?.name ?? '', op: '=', val: '' }]) }}
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...conds, { col: columns[0]?.name ?? '', op: '=', val: '', type: columns[0]?.type }]) }}
           style={addBtn}><Icon name="plus" size={11} /> add condition</button>
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); setAdvanced(true) }}
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); updateConfig(nodeId, { filterBuilder: undefined }); setAdvanced(true) }}
           style={addBtn} title="Edit the raw SQL predicate">raw SQL</button>
       </div>
     </div>

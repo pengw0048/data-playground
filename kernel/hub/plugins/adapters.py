@@ -291,13 +291,21 @@ def _copy_relation(rel: "Relation", path: str, options: str) -> int:
     view = db.unique_view("write")
     rel.create_view(view)
     escaped = path.replace("'", "''")
+    primary_error: BaseException | None = None
     try:
         row = db.conn().execute(
             f"COPY {quote_identifier(view)} TO '{escaped}' ({options})"
         ).fetchone()
         return int(row[0] if row else 0)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        db.conn().execute(f"DROP VIEW IF EXISTS {quote_identifier(view)}")
+        try:
+            db.conn().execute(f"DROP VIEW IF EXISTS {quote_identifier(view)}")
+        except Exception:
+            if primary_error is None:
+                raise
 
 
 def _csv_kwargs(options: dict | None) -> dict:

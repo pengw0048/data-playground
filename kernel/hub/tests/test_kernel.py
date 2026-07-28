@@ -105,6 +105,32 @@ def _poll(run_id, tries=150):
     return st
 
 
+def test_invalid_filter_predicate_keeps_its_original_error_and_next_run_recovers():
+    """A failed predicate must not let cleanup replace its error with transaction internals."""
+    source = N("source", "source", {"uri": _uri("events")})
+    invalid = {"id": "invalid-filter", "version": 1, "nodes": [
+        source,
+        N("filter", "filter", {"predicate": "id = ''"}),
+    ], "edges": [E("source", "filter")]}
+    bad = _poll(client.post("/api/run", json={
+        "graph": invalid, "targetNodeId": "filter", "confirmed": True,
+    }).json()["runId"])
+
+    assert bad["status"] == "failed"
+    assert "Conversion Error" in (bad.get("error") or "")
+    assert "TransactionContext Error" not in (bad.get("error") or "")
+    assert "ROLLBACK" not in (bad.get("error") or "")
+
+    valid = {**invalid, "id": "valid-filter", "nodes": [
+        source,
+        N("filter", "filter", {"predicate": "id = 1"}),
+    ]}
+    recovered = _poll(client.post("/api/run", json={
+        "graph": valid, "targetNodeId": "filter", "confirmed": True,
+    }).json()["runId"])
+    assert recovered["status"] == "done", recovered.get("error")
+
+
 def _sole_output(status, *, outcome: str | None = None):
     outputs = status.get("outputs") if isinstance(status, dict) else status.outputs
     assert len(outputs) == 1, outputs

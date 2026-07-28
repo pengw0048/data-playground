@@ -62,6 +62,7 @@ export interface NodeConfig {
   method?: string
   // filter
   predicate?: string
+  filterBuilder?: { conditions: Array<{ col: string; op: string; val: string; type?: string }> }
   // transform (two forms)
   source?: TransformSource
   processor?: string
