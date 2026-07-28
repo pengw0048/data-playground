@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetViewDefinition } from '../types/api'
+import { KernelError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
@@ -22,7 +23,13 @@ const store = vi.hoisted(() => ({
   refreshFiles: vi.fn(),
 }))
 
-vi.mock('../api/client', () => ({ api: mocks }))
+vi.mock('../api/client', () => ({
+  api: mocks,
+  KernelError: class KernelError extends Error {
+    status: number
+    constructor(status: number, message: string) { super(message); this.status = status }
+  },
+}))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
@@ -708,11 +715,12 @@ describe('WorkspaceExplorer', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
     expect(screen.getByRole('button', { name: /^Explore in a new Canvas/ })).toBeVisible()
-    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeVisible()
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeVisible()
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose another Canvas/ }))
     await waitFor(() => expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas'))
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
+    expect(screen.getByText('Source nodes will be added; your data is not copied or modified.')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', expect.objectContaining({
       datasetIds: ['dataset-1'], expectedCanvasVersion: 9, requestId: expect.any(String),
@@ -735,10 +743,10 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeDisabled()
     act(() => finishRefresh())
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-canvas', expect.objectContaining({
       datasetIds: ['dataset-1'], expectedCanvasVersion: 12, requestId: expect.any(String),
@@ -755,9 +763,46 @@ describe('WorkspaceExplorer', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
     await waitFor(() => expect(store.refreshFiles).toHaveBeenCalled())
-    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeDisabled()
-    expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeDisabled()
     expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
+  })
+
+  it('keeps a Canvas version conflict fail-closed and offers one refresh-and-retry path', async () => {
+    store.workspaceResourceId = DATASET.id
+    store.doc = { id: 'current-canvas', version: 12 }
+    store.files = [{ id: 'current-canvas', name: 'Current analysis', version: 12, role: 'editor' }]
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.workspaceAddDatasets.mockRejectedValueOnce(new KernelError(409, 'version changed'))
+    store.refreshFiles
+      .mockResolvedValueOnce(true)
+      .mockImplementationOnce(async () => {
+        store.files = [{ id: 'current-canvas', name: 'Current analysis', version: 13, role: 'editor' }]
+        return true
+      })
+    const { rerender } = render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('That Canvas changed')
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Canvases' }))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Canvases refreshed. Try adding the Source again.'))
+    expect(mocks.workspaceAddDatasets).toHaveBeenCalledTimes(1)
+    expect(store.openFile).not.toHaveBeenCalled()
+    rerender(<WorkspaceExplorer />)
+    mocks.workspaceAddDatasets.mockResolvedValueOnce({ ok: true, id: 'current-canvas', version: 14 })
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledTimes(2))
+    expect(mocks.workspaceAddDatasets).toHaveBeenLastCalledWith('current-canvas', expect.objectContaining({
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 13, requestId: expect.any(String),
+    }))
+    const firstRequest = mocks.workspaceAddDatasets.mock.calls[0]?.[1] as { requestId: string }
+    const retryRequest = mocks.workspaceAddDatasets.mock.calls[1]?.[1] as { requestId: string }
+    expect(retryRequest.requestId).not.toBe(firstRequest.requestId)
+    expect(store.openFile).toHaveBeenCalledTimes(1)
+    expect(store.openFile).toHaveBeenCalledWith('current-canvas')
   })
 
   it('labels the bounded local Catalog scope and preserves independent URL state', async () => {
@@ -989,15 +1034,16 @@ describe('WorkspaceExplorer', () => {
     expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
   })
 
-  it('uses a bounded dataset selection atomically in one exact new Canvas destination', async () => {
+  it('uses a multi-dataset selection in one exact new Canvas destination', async () => {
     store.workspaceScope = 'datasets'
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'batch-canvas', created: true, resource: CANVAS })
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use selected datasets' }))
     const dialog = await screen.findByRole('dialog', { name: 'Use 2 datasets' })
-    expect(dialog).toHaveTextContent('Bounded to 50 datasets')
-    expect(dialog).toHaveTextContent('applied atomically under one Canvas version precondition')
+    expect(dialog).toHaveTextContent('2 datasets')
+    expect(dialog).not.toHaveTextContent('Bounded to 50 datasets')
+    expect(dialog).not.toHaveTextContent('atomically')
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
       containerId: 'workspace-local-root', expectedContainerVersion: 1,
@@ -1197,8 +1243,8 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
     )
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose another Canvas/ }))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Add and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', expect.objectContaining({
@@ -1220,8 +1266,8 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-provider-canvas', expect.objectContaining({
       providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9, requestId: expect.any(String),
@@ -1246,8 +1292,8 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to a recent Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to a recent Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     expect(await screen.findByText('provider temporarily unavailable')).toBeVisible()
     const firstPayload = mocks.workspaceAddDatasets.mock.calls[0]?.[1] as {

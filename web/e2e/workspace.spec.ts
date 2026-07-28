@@ -106,7 +106,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await page.getByText('Back to Workspace').click()
       await (await workspaceResource(page, 'dataset', dataset.name)).click()
       await page.getByTestId('detail-use').click()
-      const chooseCanvas = page.getByRole('button', { name: /^Choose a Canvas/ })
+      const chooseCanvas = page.getByRole('button', { name: /^Choose another Canvas/ })
       await expect(chooseCanvas).toBeEnabled()
       await chooseCanvas.click()
       await page.getByLabel('Target canvas').selectOption({ label: `${emptyName} · ${emptyCanvasId}` })
@@ -118,6 +118,76 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     } finally {
       if (emptyCanvasId) await page.request.delete(`/api/canvas/${emptyCanvasId}`)
       if (exploreCanvasId) await page.request.delete(`/api/canvas/${exploreCanvasId}`)
+    }
+  })
+
+  test('keeps a stale Canvas add fail-closed, then refreshes and retries the same selection once', async ({ page }) => {
+    const catalog = await page.request.get('/api/catalog/tables?limit=2')
+    expect(catalog.ok()).toBe(true)
+    const datasets = (await catalog.json()).items as Array<{
+      name: string
+      registrationId: string
+    }>
+    expect(datasets).toHaveLength(2)
+    const [selected, concurrent] = datasets
+    const canvasId = `workspace-conflict-${Date.now()}`
+    const canvasName = `Workspace conflict ${Date.now()}`
+    const created = await page.request.post('/api/canvas', {
+      data: { id: canvasId, name: canvasName, version: 1, nodes: [], edges: [] },
+    })
+    expect(created.ok()).toBe(true)
+
+    try {
+      await page.goto('/#/workspace')
+      await (await workspaceResource(page, 'dataset', selected.name)).click()
+      await page.getByTestId('detail-use').click()
+      const chooseCanvas = page.getByRole('button', { name: /^Choose another Canvas/ })
+      await expect(chooseCanvas).toBeEnabled()
+      await chooseCanvas.click()
+      await page.getByLabel('Target canvas').selectOption({
+        label: `${canvasName} · ${canvasId}`,
+      })
+
+      const concurrentAdd = await page.request.post(
+        `/api/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`,
+        {
+          data: {
+            datasetIds: [concurrent.registrationId],
+            expectedCanvasVersion: 1,
+            requestId: `concurrent-${Date.now()}`,
+          },
+        },
+      )
+      expect(concurrentAdd.ok()).toBe(true)
+      expect(await concurrentAdd.json()).toEqual(expect.objectContaining({
+        changed: true,
+        version: 2,
+      }))
+
+      const conflictResponse = page.waitForResponse((response) =>
+        new URL(response.url()).pathname
+          === `/api/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`
+        && response.request().method() === 'POST'
+        && response.status() === 409)
+      await page.getByRole('button', { name: 'Add and open' }).click()
+      await conflictResponse
+      await expect(page.getByRole('alert')).toContainText('That Canvas changed')
+      await expect(page).toHaveURL(/#\/workspace/)
+
+      await page.getByRole('button', { name: 'Refresh Canvases' }).click()
+      await expect(page.getByRole('alert')).toContainText(
+        'Canvases refreshed. Try adding the Source again.',
+      )
+      await page.getByRole('button', { name: 'Add and open' }).click()
+      await expect(page).toHaveURL(new RegExp(`/#/canvas/${canvasId}$`))
+      await expect(page.locator('.react-flow__node-source').filter({
+        hasText: selected.name,
+      })).toHaveCount(1)
+      await expect(page.locator('.react-flow__node-source').filter({
+        hasText: concurrent.name,
+      })).toHaveCount(1)
+    } finally {
+      await page.request.delete(`/api/canvas/${canvasId}`)
     }
   })
 
