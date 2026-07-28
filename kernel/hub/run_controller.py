@@ -1165,10 +1165,10 @@ class RunController:
             self._untrack_sub(run_id, sub.run_id)
 
     def _subgraph(self, graph: Graph, region, ref_uri: dict[str, str]) -> Graph:
-        # Rebuild the region as a graph, preserving each node's ORIGINAL incoming-edge order (the engine
-        # feeds multi-input nodes like join positionally, so a swapped operand order silently corrupts
-        # results). A cut input (source outside the region = an upstream materialized region) is replaced
-        # IN PLACE by a ref-source reading that region's parquet.
+        # Rebuild the region as a graph without disturbing serialized edge order. Named target handles
+        # retain semantic multi-input bindings (notably Join ``a``/``b``) while a cut input (source
+        # outside the region = an upstream materialized region) is replaced IN PLACE by a ref-source
+        # reading that region's parquet.
         region_node_ids = set(region.node_ids)
         # Preserve the original graph order rather than iterating Region.node_ids (a set). Besides making
         # the serialized subgraph deterministic, this keeps plan/cache hashes stable across processes.

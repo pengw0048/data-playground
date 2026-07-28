@@ -9365,10 +9365,9 @@ def test_plan_not_cacheable_for_stale_prone_plans():
     assert r._plan_cacheable(ok, "f") is True  # plain local overwrite plan is still reusable
 
 
-def test_subgraph_preserves_join_operand_order():
-    # adversarial-review fix (#5): the region's reduced graph must keep a multi-input node's operands
-    # in ORIGINAL order — the engine feeds join positionally, so a swapped ref/intra edge silently
-    # joins the wrong sides. Here operand 'a' is a cut (ref), 'b' is intra; order must stay [a, b].
+def test_subgraph_preserves_join_port_bindings_when_replacing_a_cut_input():
+    # A region rebuild may replace one Join input with a ref Source, but it must retain the named a/b
+    # bindings even when the serialized edge array is in the opposite order.
     from hub import graph as gg
     from hub.models import Graph, ResourceSpec
     from hub.planner import Region
@@ -9377,13 +9376,14 @@ def test_subgraph_preserves_join_operand_order():
         N("upA", "source", {"uri": _uri("events")}), N("inB", "source", {"uri": _uri("events")}),
         {"id": "j", "type": "join", "position": {"x": 0, "y": 0}, "data": {"config": {}}},
     ], "edges": [
-        {"id": "ea", "source": "upA", "target": "j", "targetHandle": "a", "data": {"wire": "dataset"}},
         {"id": "eb", "source": "inB", "target": "j", "targetHandle": "b", "data": {"wire": "dataset"}},
+        {"id": "ea", "source": "upA", "target": "j", "targetHandle": "a", "data": {"wire": "dataset"}},
     ]})
     region = Region(id="r", node_ids={"inB", "j"}, output_node="j", backend="default", worker=None,
                     requires=ResourceSpec(), cut_inputs=[("upA", None, "j", "a")])
     sub = ctrl._subgraph(graph, region, {"upA": "/tmp/ref.parquet"})
-    assert [e.target_handle for e in gg.incoming(sub, "j")] == ["a", "b"]  # ref 'a' first, intra 'b' second
+    left, right = gg.join_input_edges(sub, "j")
+    assert left.target_handle == "a" and right.source == "inB"
 
 
 def test_region_ref_ids_are_deterministic_collision_safe_and_reused():
@@ -9413,9 +9413,9 @@ def test_region_ref_ids_are_deterministic_collision_safe_and_reused():
         {"id": "raw-x", "source": "raw", "target": "x"},
         {"id": "cut-right", "source": "x", "target": "z-right"},
         {"id": "cut-left", "source": "x", "target": "a-left"},
-        # Incoming join order is intentionally different from region-node order and must be preserved.
-        {"id": "left-join", "source": "a-left", "target": "join", "targetHandle": "a"},
+        # Serialized order is intentionally the opposite of the Join's semantic a/b port order.
         {"id": "right-join", "source": "z-right", "target": "join", "targetHandle": "b"},
+        {"id": "left-join", "source": "a-left", "target": "join", "targetHandle": "a"},
         {"id": "join-write", "source": "join", "target": "write"},
     ]})
     region = Region(
@@ -9438,7 +9438,8 @@ def test_region_ref_ids_are_deterministic_collision_safe_and_reused():
     assert {edge.source for edge in cut_edges} == {generated_source.id}
     assert next(edge for edge in cut_edges if edge.target == "z-right").id.startswith(
         first_edge_base + "_")
-    assert [edge.target_handle for edge in gg.incoming(sub, "join")] == ["a", "b"]
+    left, right = gg.join_input_edges(sub, "join")
+    assert left.source == "a-left" and right.source == "z-right"
     assert gg.execution_source_uris(sub, "write") == [real_ref]
     assert gg.all_upstream_publication_uris(sub, "write") == [real_source]
 
@@ -16108,7 +16109,12 @@ def test_ray_join_live_differential(tmp_path):
         return Graph(**{"id": "c", "version": 1, "nodes": [
             _ray_node("l", "source", {"uri": left_p}), _ray_node("r", "source", {"uri": right_p}),
             _ray_node("j", "join", {"on": "user_id", "how": how}),
-        ], "edges": [_ray_edge("l", "j"), _ray_edge("r", "j")]})
+        ], "edges": [
+            {"id": "right-j", "source": "r", "target": "j", "targetHandle": "b",
+             "data": {"wire": "dataset"}},
+            {"id": "left-j", "source": "l", "target": "j", "targetHandle": "a",
+             "data": {"wire": "dataset"}},
+        ]})
 
     con = duckdb.connect()
     for how, expect in (("inner", 3960), ("left", 4000)):        # 40 rows have user_id 99 (no dim match)

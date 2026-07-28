@@ -495,7 +495,14 @@ def _derive_graph_schemas(
         if node_ids is None else [node for node in graph.nodes if node.id in node_ids]
     )
     nodes = {node.id: node for node in selected}
-    incoming = {node_id: g.incoming(graph, node_id) for node_id in nodes}
+    incoming = {
+        node_id: (
+            list(g.join_input_edges(graph, node_id))
+            if node.type == "join"
+            else g.incoming(graph, node_id)
+        )
+        for node_id, node in nodes.items()
+    }
     children: dict[str, list[str]] = {node_id: [] for node_id in nodes}
     indegree = {node_id: 0 for node_id in nodes}
     for node_id, edges in incoming.items():

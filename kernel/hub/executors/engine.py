@@ -833,7 +833,12 @@ class BuildEngine:
             return [self.bound_inputs[node.id]]
         # route each incoming edge by its source port (multi-output nodes build {port -> Relation})
         relations = []
-        for edge in g.incoming(self.graph, node.id):
+        edges = (
+            g.join_input_edges(self.graph, node.id)
+            if node.type == "join"
+            else g.incoming(self.graph, node.id)
+        )
+        for edge in edges:
             restricted = self._prepared_edge_relations.get((node.id, edge.id))
             relations.append(
                 restricted if restricted is not None

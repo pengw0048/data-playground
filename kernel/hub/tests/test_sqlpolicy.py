@@ -39,13 +39,16 @@ def _node(node_id: str, kind: str, config: dict) -> dict:
     }
 
 
-def _edge(source: str, target: str) -> dict:
-    return {
+def _edge(source: str, target: str, target_handle: str | None = None) -> dict:
+    edge: dict = {
         "id": f"{source}-{target}",
         "source": source,
         "target": target,
         "data": {"wire": "dataset"},
     }
+    if target_handle is not None:
+        edge["targetHandle"] = target_handle
+    return edge
 
 
 def _bound_engine(kind: str, config: dict, rel) -> BuildEngine:
@@ -338,10 +341,10 @@ def test_chained_joins_increment_output_aliases_without_overwriting_name_2():
                 _node("third", "source", {"uri": "mock://third"}),
                 _node("join1", "join", {"on": "id", "how": "inner"}),
                 _node("join2", "join", {"on": "id", "how": "inner"}),
-            ],
-            "edges": [
-                _edge("left", "join1"), _edge("right", "join1"),
-                _edge("join1", "join2"), _edge("third", "join2"),
+                ],
+                "edges": [
+                    _edge("left", "join1", "a"), _edge("right", "join1", "b"),
+                    _edge("join1", "join2", "a"), _edge("third", "join2", "b"),
             ],
         })
         adapters = {uri: Adapter(relation) for uri, relation in relations.items()}
@@ -503,7 +506,7 @@ def test_identifier_quoting_prevents_join_and_dedup_schema_name_sql_escape(tmp_p
                 _node("right", "source", {"uri": "mock://right"}),
                 _node("join", "join", {"on": "id", "how": "inner"}),
             ],
-            "edges": [_edge("left", "join"), _edge("right", "join")],
+                "edges": [_edge("left", "join", "a"), _edge("right", "join", "b")],
         })
         adapters = {"mock://left": Adapter(left), "mock://right": Adapter(right)}
         joined = BuildEngine(

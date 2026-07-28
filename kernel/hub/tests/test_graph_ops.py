@@ -97,6 +97,15 @@ def test_connect_unknown_target_handle_raises():
         graph_ops.connect(g, SPECS, "e_1", "source_1", "join_1", target_handle="zzz")
 
 
+def test_connect_join_requires_an_explicit_semantic_input():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.add_node(g, SPECS, "join_1", "join")
+    with pytest.raises(graph_ops.GraphOpError, match="target_handle 'a' or 'b' is required"):
+        graph_ops.connect(g, SPECS, "e_1", "source_1", "join_1")
+    assert g["edges"] == []
+
+
 def test_connect_empty_target_handle_is_explicit_and_invalid():
     g = _empty()
     graph_ops.add_node(g, SPECS, "source_1", "source")

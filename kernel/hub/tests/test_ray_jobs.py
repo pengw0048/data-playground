@@ -3222,9 +3222,9 @@ def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
         ],
         "edges": [
             {"id": "left-join", "source": "left", "target": "join",
-             "data": {"wire": "dataset", "inputName": "left"}},
+             "targetHandle": "a", "data": {"wire": "dataset", "inputName": "left"}},
             {"id": "right-join", "source": "right", "target": "join",
-             "data": {"wire": "dataset", "inputName": "right"}},
+             "targetHandle": "b", "data": {"wire": "dataset", "inputName": "right"}},
             {"id": "a", "source": "join", "target": "write-a", "data": {"wire": "dataset"}},
             {"id": "b", "source": "join", "target": "write-b", "data": {"wire": "dataset"}},
         ],

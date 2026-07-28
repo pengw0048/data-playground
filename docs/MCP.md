@@ -110,7 +110,7 @@ Canvas CRUD and edits:
 - `create_canvas` — empty canvas; returns id + url
 - `get_canvas` — nodes, edges, url
 - `add_node` — `config` maps param → value; a `source` needs `config.uri`
-- `connect` — wire an output into an input (`targetHandle` for multi-input nodes such as `join`)
+- `connect` — wire an output into an input (`targetHandle: "a" | "b"` is required for `join`)
 - `set_node_config` — merge config values into a node
 - `remove_node` — delete a node and its edges
 - `set_transform` — write or update a `transform` node's Python and preview it in the same call

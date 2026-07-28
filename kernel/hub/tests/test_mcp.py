@@ -618,6 +618,22 @@ def test_connect_unknown_target_handle_is_rejected():
     assert res["isError"] is True and "no input handle" in res["content"][0]["text"]
 
 
+def test_connect_join_without_target_handle_is_rejected_without_mutation():
+    cid = data("create_canvas", {})["canvasId"]
+    source = data("add_node", {
+        "canvasId": cid, "kind": "source", "config": {"uri": _uri("images")},
+    })["nodeId"]
+    join = data("add_node", {
+        "canvasId": cid, "kind": "join", "config": {"on": "id"},
+    })["nodeId"]
+    response = call("connect", {
+        "canvasId": cid, "sourceId": source, "targetId": join,
+    })
+    assert response["isError"] is True
+    assert "target_handle 'a' or 'b' is required" in response["content"][0]["text"]
+    assert client.get(f"/api/canvas/{cid}").json()["edges"] == []
+
+
 # --------------------------------------------------------------------------- #
 # The headline feature: authoring transform code + verifying it
 # --------------------------------------------------------------------------- #

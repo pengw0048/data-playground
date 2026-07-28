@@ -1241,10 +1241,10 @@ def _tool_specs(pg: Playground) -> list[dict]:
                                  "title": _STR, "config": _OBJ}, ["canvasId", "kind"])},
         {"name": "connect", "handler": pg.connect,
          "description": "Wire one node's output into another's input. sourceHandle is required for a "
-                        "multi-output source; targetHandle selects a multi-input port (join 'a'/'b').",
+                        "multi-output source; targetHandle is required for a Join ('a' or 'b').",
          "inputSchema": _schema({**canvas, "sourceId": _STR, "targetId": _STR,
                                  "sourceHandle": {**_STR, "description": "output handle for a multi-output node"},
-                                 "targetHandle": {**_STR, "description": "input handle for a multi-input node"}},
+                                 "targetHandle": {**_STR, "description": "named input handle; required for Join ('a' or 'b')"}},
                                 ["canvasId", "sourceId", "targetId"])},
         {"name": "set_node_config", "handler": pg.set_node_config,
          "description": "Merge config values (param name→value) into an existing node.",

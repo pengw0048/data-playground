@@ -5192,7 +5192,7 @@ class RayRunner:
         import ray
 
         from hub.executors.engine import join_sql
-        left = datasets[step.inputs[0][0]]                     # incoming-edge order = engine's left, right
+        left = datasets[step.inputs[0][0]]                     # IR preserves Join port order: a, then b
         right_source = datasets[step.inputs[1][0]]
         declared_right_schema = _known_ray_schema(right_source)
         right_schema_unknown = _ray_schema_explicitly_unknown(right_source)

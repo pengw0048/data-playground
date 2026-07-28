@@ -47,6 +47,11 @@ export function getSpec(kind: string): NodeSpec | undefined {
   return specs.get(kind)
 }
 
+/** Resolve the concrete named input used when adding a node from an existing output wire. */
+export function firstCompatibleInput(kind: string, wire: WireType): PortSpec | undefined {
+  return specs.get(kind)?.inputs.find((port) => (port.accepts ?? [port.wire]).includes(wire))
+}
+
 export function getComponent(kind: string): ComponentType<NodeComponentProps> | undefined {
   return components.get(kind)
 }

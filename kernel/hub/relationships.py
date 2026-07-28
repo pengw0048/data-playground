@@ -428,13 +428,8 @@ def _analyze_join_unfenced(graph: Graph, node_id: str, columns_by_node: dict[str
                            catalog, resolve_adapter) -> JoinAnalysis:
     """Rank join keys for a join node's two inputs and warn if the join fans out (not 1:1).
     columns_by_node = per-node output columns (from executors.schema.schema_for_graph)."""
-    ins = g.incoming(graph, node_id)
-    if len(ins) < 2:
-        return JoinAnalysis(note="connect two inputs to see join suggestions")
-    # The engine binds the join's SQL aliases a/b by INCOMING-EDGE order (engine `a,b = view(ins[0]),
-    # view(ins[1])` over g.incoming), NOT by target_handle — so resolve left/right the same way, or a
-    # suggested `a.x = b.y` condition would reference the wrong physical input.
-    left, right = ins[0].source, ins[1].source
+    left_edge, right_edge = g.join_input_edges(graph, node_id)
+    left, right = left_edge.source, right_edge.source
     lcols_raw, rcols_raw = columns_by_node.get(left), columns_by_node.get(right)
     if not lcols_raw or not rcols_raw:
         return JoinAnalysis(note="input columns aren't known yet (run an upstream code op to type them)")

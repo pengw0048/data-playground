@@ -8,7 +8,7 @@ import {
 import { allSpecs, buildNodeTypes } from '../nodes'
 import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
-import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
+import { canConnect, firstCompatibleInput, getSpec, portWire, portMulti } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
 import {
   canvasViewportDocumentIdentity, currentPreviews, useStore, newId, freePosition, roleCanEdit,
@@ -559,11 +559,12 @@ export function Canvas() {
             // place to the right of the port, in a clear spot (never on top of the source)
             const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
             const node = useStore.getState().addNode(kind, { x: pos.x, y: pos.y })
-            if (node) {
+            const target = firstCompatibleInput(kind, menu.wire)
+            if (node && target) {
               const wire = menu.wire
               useStore.getState().connect({
                 id: newId('e'), source: menu.source.nodeId!, target: node.id,
-                sourceHandle: menu.source.handleId, targetHandle: null, data: { wire },
+                sourceHandle: menu.source.handleId, targetHandle: target.id, data: { wire },
               }, { history: 'current' })
             }
             setMenu(null)
@@ -580,8 +581,7 @@ export function Canvas() {
             const p = screenToFlowPosition({ x: finder.x, y: finder.y })
             const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
             const node = useStore.getState().addNode(kind, pos)
-            const spec = getSpec(kind)
-            const target = spec?.inputs.find((port) => (port.accepts ?? [port.wire]).includes(finder.wire))
+            const target = firstCompatibleInput(kind, finder.wire)
             if (node && target && finder.source.nodeId) {
               useStore.getState().connect({
                 id: newId('e'), source: finder.source.nodeId, target: node.id,
