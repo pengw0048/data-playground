@@ -217,6 +217,44 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes.map((n) => n.id)).toEqual(['z'])
   })
 
+  it('retains agent placement ownership through a second Join input until the user drags', () => {
+    const source = (id: string, y: number) => ({
+      ...NODE(id), position: { x: 80, y },
+    })
+    const agentJoin = {
+      ...NODE('agent-join', 'join'),
+      position: { x: 432, y: 120 },
+      data: { title: 'Agent join', config: {}, autoPlaced: true },
+    }
+    useStore.getState().applyAgentGraph({
+      nodes: [source('events', 120), source('images', 480), agentJoin],
+      edges: [{
+        id: 'events-to-join', source: 'events', target: agentJoin.id,
+        sourceHandle: 'out', targetHandle: 'a', data: { wire: 'dataset' },
+      }],
+    })
+
+    useStore.getState().connect({
+      id: 'images-to-join', source: 'images', target: agentJoin.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === agentJoin.id)!.position)
+      .toEqual({ x: 432, y: 300 })
+
+    useStore.getState().removeEdge('images-to-join')
+    useStore.getState().setNodes(useStore.getState().doc.nodes.map((node) => (
+      node.id === agentJoin.id ? { ...node, position: { x: 960, y: 40 } } : node
+    )))
+    useStore.getState().updateData(agentJoin.id, { autoPlaced: false })
+    useStore.getState().connect({
+      id: 'images-to-dragged-join', source: 'images', target: agentJoin.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    const dragged = useStore.getState().doc.nodes.find((node) => node.id === agentJoin.id)!
+    expect(dragged.data.autoPlaced).toBe(false)
+    expect(dragged.position).toEqual({ x: 960, y: 40 })
+  })
+
   it('clears display-only agent requests when switching canvases', () => {
     useStore.setState({ agentLog: [{ role: 'user', text: 'previous canvas request' }] })
 
@@ -371,6 +409,98 @@ describe('graph store — core authority ops', () => {
     useStore.getState().redo()
     expect(useStore.getState().doc.nodes).toHaveLength(2)
     expect(useStore.getState().doc.edges).toHaveLength(1)
+  })
+
+  it('places connected insertions rightward and only recenters an un-dragged Join', () => {
+    register({
+      kind: 'topology-source', title: 'Topology source', category: 'io',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Topology source', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    register({
+      kind: 'topology-join', title: 'Topology join', category: 'compute',
+      inputs: [{ id: 'a', wire: 'dataset' }, { id: 'b', wire: 'dataset' }],
+      outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Topology join', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    const source = (id: string, x: number, y: number) => ({
+      ...NODE(id, 'topology-source'), position: { x, y },
+    })
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [source('events', 80, 120), source('images', 80, 480)], edges: [] },
+    }))
+
+    const join = useStore.getState().addConnectedNode('topology-join', { x: -500, y: -500 }, {
+      source: 'events', sourceHandle: 'out', targetHandle: 'a', wire: 'dataset',
+    })!
+    expect(join.position).toEqual({ x: 432, y: 120 })
+
+    useStore.getState().connect({
+      id: 'images-to-join', source: 'images', target: join.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.position)
+      .toEqual({ x: 432, y: 300 })
+    expect(useStore.getState().doc.nodes.filter((node) => node.type === 'topology-source').map((node) => node.position))
+      .toEqual([{ x: 80, y: 120 }, { x: 80, y: 480 }])
+
+    // A settled drag opts out before a later wire is added; existing hand placement stays exact.
+    useStore.getState().setNodes(useStore.getState().doc.nodes.map((node) => (
+      node.id === join.id ? { ...node, position: { x: 960, y: 40 } } : node
+    )))
+    useStore.getState().updateData(join.id, { autoPlaced: false })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.data.autoPlaced).toBe(false)
+    useStore.getState().removeEdge('images-to-join')
+    useStore.getState().connect({
+      id: 'images-to-join-again', source: 'images', target: join.id,
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === join.id)!.position)
+      .toEqual({ x: 960, y: 40 })
+  })
+
+  it('separates only auto-placed same-lane Join inputs before centering the target', () => {
+    const source = (id: string, x: number, autoPlaced: boolean) => ({
+      ...NODE(id), position: { x, y: 120 }, data: { ...NODE(id).data, autoPlaced },
+    })
+    const join = {
+      ...NODE('join', 'join'), position: { x: 792, y: 120 },
+      data: { ...NODE('join', 'join').data, autoPlaced: true },
+    }
+    const firstEdge = {
+      id: 'first', source: 'left', target: 'join',
+      sourceHandle: 'out', targetHandle: 'a', data: { wire: 'dataset' as const },
+    }
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [source('left', 80, true), source('right', 440, true), join],
+        edges: [firstEdge],
+      },
+    }))
+    useStore.getState().connect({
+      id: 'second', source: 'right', target: 'join',
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.position])).toEqual([
+      ['left', { x: 80, y: 120 }],
+      ['right', { x: 440, y: 400 }],
+      ['join', { x: 792, y: 260 }],
+    ])
+
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [source('left', 80, true), source('right', 440, false), join],
+        edges: [firstEdge],
+      },
+    }))
+    useStore.getState().connect({
+      id: 'manual-second', source: 'right', target: 'join',
+      sourceHandle: 'out', targetHandle: 'b', data: { wire: 'dataset' },
+    })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'right')!.position)
+      .toEqual({ x: 440, y: 120 })
   })
 
   it('reconnects an edge as one undoable action while retaining its stable identity', () => {

@@ -11,7 +11,7 @@ import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
 import { uniqueNextStepConnection } from './nextStep'
 import { cn } from '@/lib/utils'
-import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
+import { toolbarRevealDelta, toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
   io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'code',
@@ -43,19 +43,23 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
 
-  const safeToolbarPosition = (
-    nodes: typeof doc.nodes,
-    base: { x: number; y: number },
-  ) => {
+  const toolbarBounds = (): ToolbarSafeBounds | null => {
     const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
     const toolbar = toolbarRef.current?.getBoundingClientRect()
-    const bounds: ToolbarSafeBounds | null = surface && toolbar ? {
+    return surface && toolbar ? {
       left: screenToFlowPosition({ x: surface.left, y: surface.top }).x,
       top: screenToFlowPosition({ x: surface.left, y: surface.top }).y,
       right: screenToFlowPosition({ x: surface.right, y: surface.top }).x,
       // The shelf is part of the node's interaction footprint, so the toolbar itself is excluded.
       bottom: screenToFlowPosition({ x: surface.left, y: toolbar.top }).y,
     } : null
+  }
+
+  const safeToolbarPosition = (
+    nodes: typeof doc.nodes,
+    base: { x: number; y: number },
+  ) => {
+    const bounds = toolbarBounds()
     return bounds ? toolbarSafePosition(nodes, base, bounds) : base
   }
 
@@ -86,11 +90,22 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
       : null
     const connection = source && uniqueNextStepConnection(source, kind, current.edges)
     if (!source || !connection) return
-    const pos = safeToolbarPosition(
+    const bounds = toolbarBounds()
+    const pos = bounds ? toolbarSafePosition(
       current.nodes,
       { x: source.position.x + 300, y: source.position.y },
-    )
-    addConnectedNode(kind, pos, { source: source.id, ...connection })
+      bounds,
+    ) : { x: source.position.x + 300, y: source.position.y }
+    const added = addConnectedNode(kind, pos, { source: source.id, ...connection })
+    const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
+    const reveal = added?.data.autoPlaced && bounds ? toolbarRevealDelta(added.position, bounds) : null
+    if (surface && reveal) {
+      const center = screenToFlowPosition({
+        x: surface.left + surface.width / 2,
+        y: surface.top + surface.height / 2,
+      })
+      void setCenter(center.x + reveal.x, center.y + reveal.y, { zoom: getZoom(), duration: 0 })
+    }
     setOperationFinderOpen(false)
   }
 

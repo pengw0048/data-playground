@@ -59,6 +59,61 @@ async function addNode(page: Page, category: string, kindTitle: string) {
   await menu.getByText(kindTitle, { exact: true }).click()
 }
 
+async function addFromOutput(page: Page, node: Locator, operation: string) {
+  await node.locator('.react-flow__handle-right').click()
+  const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
+  await finder.getByRole('textbox', { name: 'Search operations' }).fill(operation)
+  await finder.getByRole('option', { name: new RegExp(operation, 'i') }).first().click()
+  await expect(finder).toBeHidden()
+}
+
+async function connectHandles(page: Page, source: Locator, target: Locator) {
+  const from = await boxOf(source.locator('.react-flow__handle-right'))
+  const to = await boxOf(target)
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 12 })
+  await page.mouse.up()
+}
+
+async function edgeNodeCrossings(page: Page): Promise<string[]> {
+  return page.locator('.react-flow__edge').evaluateAll((edges) => {
+    const nodes = Array.from(document.querySelectorAll<HTMLElement>('.react-flow__node')).map((node) => ({
+      id: node.dataset.id ?? '',
+      rect: node.getBoundingClientRect(),
+    }))
+    const failures: string[] = []
+    for (const edge of edges) {
+      const label = edge.getAttribute('aria-label')
+        ?? edge.querySelector('[aria-label^="Edge from "]')?.getAttribute('aria-label')
+        ?? ''
+      const endpoints = /^Edge from (.+) to (.+)$/.exec(label)
+      const path = edge.querySelector<SVGPathElement>('.react-flow__edge-path')
+      const matrix = path?.getScreenCTM()
+      if (!endpoints || !path || !matrix) {
+        failures.push(`unmeasurable edge: ${label || edge.id}`)
+        continue
+      }
+      const length = path.getTotalLength()
+      for (const node of nodes) {
+        if (node.id === endpoints[1] || node.id === endpoints[2]) continue
+        let crossing = false
+        for (let distance = 2; distance < length - 2; distance += 3) {
+          const pathPoint = path.getPointAtLength(distance)
+          const point = new DOMPoint(pathPoint.x, pathPoint.y).matrixTransform(matrix)
+          if (point.x > node.rect.left + 2 && point.x < node.rect.right - 2
+              && point.y > node.rect.top + 2 && point.y < node.rect.bottom - 2) {
+            crossing = true
+            break
+          }
+        }
+        if (crossing) failures.push(`${endpoints[1]} -> ${endpoints[2]} crosses ${node.id}`)
+      }
+    }
+    return failures
+  })
+}
+
 // Start each node-touching test on a FRESH empty canvas — the metadata DB persists canvases, so
 // without this a prior test's nodes would leak in and break count assertions.
 async function fresh(page: Page) {
@@ -691,8 +746,99 @@ test.describe('Data Playground canvas', () => {
     await search.press('ArrowUp')
     await search.press('Enter')
     await expect(finder).toBeHidden()
-    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const nodes = page.locator('.react-flow__node')
+    await expect(nodes).toHaveCount(2)
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    const sourceBox = await boxOf(nodes.nth(0))
+    const targetBox = await boxOf(nodes.nth(1))
+    expect(targetBox.x, 'the connected target is downstream, not back through its source')
+      .toBeGreaterThan(sourceBox.x + sourceBox.width + 80)
+
+    await page.reload()
+    const reloadedNodes = page.locator('.react-flow__node')
+    await expect(reloadedNodes).toHaveCount(2)
+    const reloadedSource = await boxOf(reloadedNodes.nth(0))
+    const reloadedTarget = await boxOf(reloadedNodes.nth(1))
+    expect(reloadedTarget.x, 'reload preserves the readable downstream order')
+      .toBeGreaterThan(reloadedSource.x + reloadedSource.width + 80)
+  })
+
+  test('two Sources → Join → Sample → Transform stays readable at both supported desktop sizes', async ({ page }) => {
+    test.setTimeout(60_000)
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      const canvasId = `readable-topology-${viewport.width}-${Date.now()}`
+      const created = await page.request.post('/api/canvas', { data: {
+        id: canvasId, name: `Readable topology ${viewport.width}`, version: 1,
+        requirements: [], nodes: [], edges: [],
+      } })
+      expect(created.ok()).toBe(true)
+      await page.goto(`/#/canvas/${canvasId}`)
+
+      await addNode(page, 'Sources & sinks', 'source')
+      await addNode(page, 'Sources & sinks', 'source')
+      const sources = page.locator('.react-flow__node-source')
+      await expect(sources).toHaveCount(2)
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+
+      await addFromOutput(page, sources.nth(0), 'join')
+      const join = page.locator('.react-flow__node-join')
+      await expect(join).toHaveCount(1)
+      await connectHandles(page, sources.nth(1), join.locator('.react-flow__handle-left').nth(1))
+      await expect(page.locator('.react-flow__edge')).toHaveCount(2)
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+
+      await addFromOutput(page, join, 'sample')
+      const sample = page.locator('.react-flow__node-sample')
+      await expect(sample).toHaveCount(1)
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+      await addFromOutput(page, sample, 'transform')
+      const transform = page.locator('.react-flow__node-transform')
+      await expect(transform).toHaveCount(1)
+      await expect(page.locator('.react-flow__edge')).toHaveCount(4)
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+      await page.waitForTimeout(350) // fitView animates; measure one settled coordinate space
+
+      const sourceBoxes = [await boxOf(sources.nth(0)), await boxOf(sources.nth(1))]
+      const joinBox = await boxOf(join)
+      const sampleBox = await boxOf(sample)
+      const transformBox = await boxOf(transform)
+      expect(joinBox.x).toBeGreaterThan(Math.max(...sourceBoxes.map((box) => box.x + box.width)))
+      expect(sampleBox.x).toBeGreaterThan(joinBox.x + joinBox.width)
+      expect(transformBox.x).toBeGreaterThan(sampleBox.x + sampleBox.width)
+      expect(await edgeNodeCrossings(page)).toEqual([])
+
+      const transformId = await transform.getAttribute('data-id')
+      expect(transformId).toBeTruthy()
+      const beforeDrag = await page.request.get(`/api/canvas/${canvasId}`).then((response) => response.json())
+      const beforePosition = beforeDrag.nodes.find((node: { id: string }) => node.id === transformId).position
+      const dragBox = await boxOf(transform)
+      await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + 18)
+      await page.mouse.down()
+      await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + 78, { steps: 10 })
+      await page.mouse.up()
+      let draggedPosition: { x: number; y: number } | null = null
+      await expect.poll(async () => {
+        const response = await page.request.get(`/api/canvas/${canvasId}`)
+        const doc = await response.json()
+        const node = doc.nodes.find((candidate: { id: string }) => candidate.id === transformId)
+        draggedPosition = node.position
+        return node.data.autoPlaced === false && node.position.y !== beforePosition.y
+      }).toBe(true)
+
+      await page.reload()
+      await expect(page.locator(`[data-id="${transformId}"]`)).toBeVisible()
+      const reopened = await page.request.get(`/api/canvas/${canvasId}`).then((response) => response.json())
+      expect(reopened.nodes.find((node: { id: string }) => node.id === transformId).position)
+        .toEqual(draggedPosition)
+      await page.getByRole('button', { name: 'Fit view', exact: true }).click()
+      await page.waitForTimeout(350) // compare boxes after the fitted viewport settles
+      const reopenedJoin = await boxOf(page.locator('.react-flow__node-join'))
+      const reopenedSample = await boxOf(page.locator('.react-flow__node-sample'))
+      const reopenedTransform = await boxOf(page.locator('.react-flow__node-transform'))
+      expect(reopenedSample.x).toBeGreaterThan(reopenedJoin.x + reopenedJoin.width)
+      expect(reopenedTransform.x).toBeGreaterThan(reopenedSample.x + reopenedSample.width)
+    }
   })
 
   test('dragging from an output port and releasing shows no menu', async ({ page }) => {

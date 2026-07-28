@@ -113,6 +113,7 @@ export interface NodeData {
   title: string
   status: NodeStatus
   config: NodeConfig
+  autoPlaced?: boolean  // product owns presentation until the user deliberately drags the card
   meta?: string
   bypassed?: boolean   // skip this node — its input flows straight through to its output
   disabled?: boolean   // turn this node (and everything downstream of it) OFF — nothing runs

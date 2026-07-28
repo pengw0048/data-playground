@@ -170,7 +170,13 @@ export function Canvas() {
       if (!t) continue
       const g = useStore.getState()
       const pos = freePosition(g.doc.nodes, { x: base.x - 116, y: base.y - 40 })
-      g.addNode('source', pos, { uri: t.uri, tableId: t.id, registrationId: t.registrationId ?? undefined }, t.name)
+      g.addNode(
+        'source',
+        pos,
+        { uri: t.uri, tableId: t.id, registrationId: t.registrationId ?? undefined },
+        t.name,
+        { autoPlaced: false },
+      )
     }
   }, [canEdit, screenToFlowPosition])
 
@@ -373,6 +379,9 @@ export function Canvas() {
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
   const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
     if (!canEdit) return
+    // This callback is an actual pointer drag release; React Flow's generic position changes also
+    // cover initialization/reconciliation and cannot safely claim presentation ownership.
+    useStore.getState().updateData(dragged.id, { autoPlaced: false })
     // visual drag-containment is one level: section frames are a fixed size, so a same-size section
     // can't sit cleanly inside another. Nested logic is expressed in the driver script instead — a
     // section's script can run() another section (the engine carries the nested subtree; see

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { CanvasNode } from '../types/graph'
 import {
-  TOOLBAR_ACTION_SHELF_HEIGHT, TOOLBAR_NODE_HEIGHT, TOOLBAR_NODE_WIDTH, toolbarSafePosition,
+  TOOLBAR_ACTION_SHELF_HEIGHT, TOOLBAR_NODE_HEIGHT, TOOLBAR_NODE_WIDTH,
+  toolbarRevealDelta, toolbarSafePosition,
 } from './toolbarPlacement'
 
 const bounds = { left: 0, top: 0, right: 1280, bottom: 650 }
@@ -49,5 +50,13 @@ describe('toolbarSafePosition', () => {
 
     expect(position).toEqual({ x: 996, y: 1160.5 })
     expect(position.y + TOOLBAR_NODE_HEIGHT + 5 + TOOLBAR_ACTION_SHELF_HEIGHT).toBeLessThanOrEqual(panned.bottom - 12)
+  })
+
+  it('returns only the viewport shift needed to reveal a downstream node and its shelf', () => {
+    const narrowed = { left: 0, top: 0, right: 980, bottom: 650 }
+
+    expect(toolbarRevealDelta({ x: 1078, y: 304.5 }, narrowed)).toEqual({ x: 342, y: 0 })
+    expect(toolbarRevealDelta({ x: 736, y: 500 }, narrowed)).toEqual({ x: 0, y: 105 })
+    expect(toolbarRevealDelta({ x: 736, y: 395 }, narrowed)).toBeNull()
   })
 })
