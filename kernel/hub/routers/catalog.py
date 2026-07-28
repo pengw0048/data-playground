@@ -583,21 +583,31 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     """Return bounded facts and preview for one exact revision; never fall back to current head."""
     binding = _revision_binding_for_dataset_id(dataset_id)
     try:
+        deps = get_deps()
         adapter = _revision_adapter(binding["uri"])
-        with db.base_guard():
-            raw = adapter.revision_detail(
-                binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
-        table = raw["preview_table"]
-        if hasattr(table, "read_all"):
-            table = table.read_all()
-        preview_table = table.slice(0, DATASET_REVISION_PREVIEW_ROWS)
-        # Keep raw bounded values only until the schema detector has consumed them. The public
-        # presentation conversion below replaces byte values with a safe size placeholder.
-        raw_preview_rows = preview_table.to_pylist()
-        preview_columns = tag_columns(
-            normalize_column_schemas(raw["columns"]), sample_rows=raw_preview_rows,
+        artifact_uri = metadb.managed_local_file_revision_artifact(
+            binding["dataset_id"], revision_id)
+        source_scope = (
+            source_read_scope(
+                deps.storage, [artifact_uri],
+                owner=f"catalog-revision:{dataset_id}:{uuid.uuid4().hex}")
+            if artifact_uri is not None else contextlib.nullcontext()
         )
-        resolved_revision_id = str(raw["revision_id"])
+        with source_scope:
+            with db.base_guard():
+                raw = adapter.revision_detail(
+                    binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
+            table = raw["preview_table"]
+            if hasattr(table, "read_all"):
+                table = table.read_all()
+            preview_table = table.slice(0, DATASET_REVISION_PREVIEW_ROWS)
+            # Keep raw bounded values only until the schema detector has consumed them. The public
+            # presentation conversion below replaces byte values with a safe size placeholder.
+            raw_preview_rows = preview_table.to_pylist()
+            preview_columns = tag_columns(
+                normalize_column_schemas(raw["columns"]), sample_rows=raw_preview_rows,
+            )
+            resolved_revision_id = str(raw["revision_id"])
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)

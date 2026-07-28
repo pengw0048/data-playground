@@ -296,8 +296,6 @@ jobs:
           && uv run pytest -q -o faulthandler_timeout=60 hub/tests/test_row_identity.py
           && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_row_identity_certificates.py -k postgres_concurrent_first_standalone
-          && uv run pytest -q -o faulthandler_timeout=60
-          hub/tests/test_row_identity_certification_tasks.py -k postgres
       - name: Verify exact ordinary local input admission on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60

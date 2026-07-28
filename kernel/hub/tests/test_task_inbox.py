@@ -167,6 +167,86 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     assert cancel_items[0].get("completed_write") is None
 
 
+def test_retired_certification_rows_are_hidden_before_public_pagination():
+    uid, canvas_id = _user_canvas("retired-certification")
+    visible = _submit_local(uid, canvas_id)
+    visible_attempt = metadb.claim_durable_task(visible["id"], "visible-owner")["attempts"][-1]
+    assert metadb.finish_durable_task_attempt(
+        visible["id"], visible_attempt["id"], "visible-owner",
+        _done_status(visible["id"], visible["write_intent"]["idempotencyKey"]),
+    )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    task_id = f"retired-certification-{uuid.uuid4().hex}"
+    attempt_id = f"retired-certification-attempt-{uuid.uuid4().hex}"
+    item_id = f"retired-certification-item-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.DurableTask(
+            id=task_id,
+            owner_id=uid,
+            canvas_id=None,
+            dataset_view_id=None,
+            submission_id=str(uuid.uuid4()),
+            intent_sha256="a" * 64,
+            target_node_id="row-identity-certification",
+            task_kind="row_identity_certification",
+            execution_manifest_sha256=None,
+            backend_kind="local",
+            graph_doc=None,
+            input_manifest=json.dumps([{
+                "node_id": "row-identity-certification",
+                "dataset_id": "retired-dataset",
+                "revision_id": "retired-revision",
+                "provider": "managed-local-file",
+            }]),
+            write_intent=None,
+            status="done",
+            status_doc=json.dumps({"run_id": task_id, "status": "done"}),
+            completed_at=now,
+            created_at=now,
+            updated_at=now,
+        ))
+        session.flush()
+        session.add(metadb.DurableTaskAttempt(
+            id=attempt_id,
+            task_id=task_id,
+            attempt_number=1,
+            status="done",
+            created_at=now,
+            completed_at=now,
+        ))
+        session.flush()
+        session.add(metadb.DurableTaskInboxItem(
+            id=item_id,
+            owner_id=uid,
+            task_id=task_id,
+            task_attempt_id=attempt_id,
+            canvas_id=None,
+            dataset_view_id=None,
+            task_kind="row_identity_certification",
+            execution_manifest_sha256=None,
+            outcome="completed",
+            diagnostic_code=None,
+            terminal_at=now,
+            created_at=now,
+            read_at=None,
+        ))
+
+    jobs = metadb.list_workspace_runs(uid, limit=1, run_id=task_id)
+    assert jobs["items"] == []
+    assert jobs["hasMore"] is False
+
+    page = metadb.list_durable_task_inbox_items(uid, limit=1)
+    assert [item["task_id"] for item in page["items"]] == [visible["id"]]
+    assert page["has_more"] is False
+    assert page["next_cursor"] is None
+    unread = metadb.list_durable_task_inbox_items(uid, limit=1, unread_only=True)
+    assert [item["task_id"] for item in unread["items"]] == [visible["id"]]
+    assert metadb.count_durable_task_inbox_unread(uid) == 1
+    assert metadb.durable_task_inbox_item(uid, item_id) is None
+    assert metadb.mark_durable_task_inbox_item_read(uid, item_id) is None
+
+
 def test_stale_owner_and_progress_emit_nothing():
     uid, canvas_id = _user_canvas("stale")
     task = _submit_local(uid, canvas_id)

@@ -2006,7 +2006,11 @@ test.describe('Data Playground canvas', () => {
         await route.continue()
       })
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      await expect(page.getByText(/write admission is stale/i).last()).toBeVisible({ timeout: 15_000 })
+      const staleAdmission = page.getByText(/write admission is stale/i).last()
+      const confirmation = page.getByTestId('panel-run').getByText('CONFIRM RUN')
+      await expect(confirmation.or(staleAdmission).first()).toBeVisible({ timeout: 15_000 })
+      if (await confirmation.isVisible()) await confirmRun(page)
+      await expect(staleAdmission).toBeVisible({ timeout: 15_000 })
       await page.unroute('**/api/run')
 
       // Re-admission gets the new head. Lose every automatic POST response, then retry explicitly;

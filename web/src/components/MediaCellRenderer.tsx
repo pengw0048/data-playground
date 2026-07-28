@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { ColumnSchema } from '../types/graph'
 
 type MediaKind = NonNullable<ColumnSchema['mediaKind']>
@@ -66,10 +67,14 @@ function frameClass(viewport: Viewport) {
   return 'min-h-[132px] w-full text-[10.5px]'
 }
 
-function MediaElement({ media, viewport }: { media: DirectMedia; viewport: Viewport }) {
+function MediaElement({ media, viewport, onError }: {
+  media: DirectMedia
+  viewport: Viewport
+  onError: () => void
+}) {
   const fit = viewport === 'compact' ? 'h-10 w-[56px]' : 'h-full w-full'
-  if (media.kind === 'video') return <video aria-label="Media video" src={media.source} controls preload="metadata" playsInline className={`${fit} rounded object-cover`} />
-  return <img alt="Media image" src={media.source} loading="lazy" className={`${fit} rounded object-cover`} />
+  if (media.kind === 'video') return <video aria-label="Media video" src={media.source} controls preload="metadata" playsInline className={`${fit} rounded object-cover`} onError={onError} />
+  return <img alt="Media image" src={media.source} loading="lazy" className={`${fit} rounded object-cover`} onError={onError} />
 }
 
 function State({ children }: { children: string }) {
@@ -81,9 +86,13 @@ function State({ children }: { children: string }) {
 export function MediaCellRenderer({ value, column: _column, mediaKind, viewport = 'grid' }: MediaCellRendererProps) {
   void _column
   const direct = directMedia(value, mediaKind)
+  const [failedSource, setFailedSource] = useState<string | null>(null)
+  const loadFailed = direct?.source === failedSource
   return <div className={`grid overflow-hidden rounded-md border border-border/60 bg-muted/30 ${frameClass(viewport)}`}>
     {value == null ? <State>Media value is empty.</State>
-      : direct ? <MediaElement media={direct} viewport={viewport} />
+      : direct && !loadFailed
+        ? <MediaElement media={direct} viewport={viewport} onError={() => setFailedSource(direct.source)} />
+        : direct ? <State>The browser could not display this media.</State>
         : <State>Binary media preview is unavailable.</State>}
   </div>
 }

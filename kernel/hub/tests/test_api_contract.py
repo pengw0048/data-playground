@@ -143,12 +143,23 @@ def test_committed_openapi_snapshot_matches_the_app():
 
 
 def test_retired_row_identity_certification_is_not_a_public_or_executable_contract():
+    import importlib.util
+
     from hub import metadb
 
-    paths = app.openapi()["paths"]
+    contract = app.openapi()
+    paths = contract["paths"]
     assert not any("row-identity-certifications" in path for path in paths)
     assert "/api/catalog/revision-media-cell" not in paths
     assert not any(path.endswith("/media-cell") for path in paths)
+    schemas = contract["components"]["schemas"]
+    assert not any(
+        token in name.lower()
+        for name in schemas
+        for token in ("certification", "media_cell", "mediacell", "rowidentity")
+    )
+    error_codes = schemas["APIErrorCode"]["enum"]
+    assert not any(str(code).startswith("media_cell_") for code in error_codes)
     for name in (
         "submit_row_identity_certification_task",
         "claim_row_identity_certification_task",
@@ -158,6 +169,46 @@ def test_retired_row_identity_certification_is_not_a_public_or_executable_contra
         "finish_row_identity_certification_failure",
     ):
         assert not hasattr(metadb, name)
+    assert importlib.util.find_spec("hub.row_identity_tasks") is None
+
+
+def test_durable_recovery_fanout_has_no_retired_certification_worker(monkeypatch):
+    from hub import (
+        bounded_fanout_tasks,
+        distribution_report_tasks,
+        durable_tasks,
+        external_wait_tasks,
+        keyed_upsert_tasks,
+        linear_checkpoint_tasks,
+        merge_columns_tasks,
+        metadb,
+        restore_revision_tasks,
+    )
+
+    calls: list[str] = []
+    monkeypatch.setattr(metadb, "recoverable_durable_task_ids", lambda: [])
+    for name, module in (
+        ("external_wait", external_wait_tasks),
+        ("linear_checkpoint", linear_checkpoint_tasks),
+        ("merge_columns", merge_columns_tasks),
+        ("restore_revision", restore_revision_tasks),
+        ("keyed_upsert", keyed_upsert_tasks),
+        ("bounded_fanout", bounded_fanout_tasks),
+        ("distribution_report", distribution_report_tasks),
+    ):
+        monkeypatch.setattr(module, "recover", lambda *_args, name=name: calls.append(name))
+
+    durable_tasks.recover(object())
+
+    assert calls == [
+        "external_wait",
+        "linear_checkpoint",
+        "merge_columns",
+        "restore_revision",
+        "keyed_upsert",
+        "bounded_fanout",
+        "distribution_report",
+    ]
 
 
 def test_snapshot_check_returns_an_actionable_diff(tmp_path: Path):

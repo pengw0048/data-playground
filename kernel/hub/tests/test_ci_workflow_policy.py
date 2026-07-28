@@ -244,6 +244,8 @@ def test_every_admitted_durable_task_kind_has_a_postgres_ci_selector() -> None:
         step.get("run", "") for step in job["steps"] if step.get("run")
     )
     commands = " ".join(commands.split())
+    assert "row_identity_certification" not in commands
+    assert "test_row_identity_certification_tasks.py" not in commands
     for kind, selectors in _POSTGRES_DURABLE_TASK_SELECTORS.items():
         for selector in selectors:
             assert selector in commands, f"{kind} is missing PostgreSQL CI selector {selector!r}"
