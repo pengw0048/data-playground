@@ -19,7 +19,7 @@ describe('node finder', () => {
     expect(findNodeSpecs(specs, 'metric').map((result) => result.spec.kind)).toEqual(['same-plugin'])
   })
 
-  it('narrows prefixes to name matches and falls back to purpose metadata', () => {
+  it('narrows operation-name prefixes while keeping intentional category and port searches discoverable', () => {
     const specs = [
       node({ kind: 'sample', title: 'Sample', blurb: 'choose representative rows' }),
       node({ kind: 'sample-balanced', title: 'Balanced sample', blurb: 'choose by label' }),
@@ -30,6 +30,17 @@ describe('node finder', () => {
     expect(findNodeSpecs(specs, 'sam').map((result) => result.spec.kind)).toEqual(['sample', 'sample-balanced'])
     expect(findNodeSpecs(specs, 'representative').map((result) => result.spec.kind)).toEqual(['inspect', 'sample'])
     expect(findNodeSpecs(specs, 'not-present')).toEqual([])
+  })
+
+  it('prefers exact category matches over incidental internal-name substrings', () => {
+    const specs = [
+      node({ kind: 'source', title: 'Source', category: 'io', inputs: [], outputs: [{ id: 'out', wire: 'dataset' }] }),
+      node({ kind: 'write', title: 'Write', category: 'io' }),
+      node({ kind: 'union', title: 'Union', category: 'compute' }),
+      node({ kind: 'section', title: 'Section', category: 'compute' }),
+    ]
+
+    expect(findNodeSpecs(specs, 'io').map((result) => result.spec.kind)).toEqual(['source', 'write'])
   })
 
   it('uses case-normalized code-point ordering for title and kind ties', () => {
