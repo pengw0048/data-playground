@@ -812,7 +812,8 @@ def _exact_run_readiness(
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
         supplied: WriteIntent | None = None, *, direct_local: bool = False,
-        require_exact_run_ready: bool = False) -> WriteAdmission:
+        require_exact_run_ready: bool = False,
+        run_id: str | None = None) -> WriteAdmission:
     """Resolve one metadata-only Write card contract without allocating an artifact."""
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
@@ -846,6 +847,23 @@ def _write_admission_for_graph(
         # retain their provider-neutral sink contract and must not be labelled create/replace.
         runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
+        execution_resolve = getattr(runner, "resolve_adapter", None)
+        if managed and runner is getattr(deps, "runner", None) and callable(execution_resolve):
+            try:
+                adapter = execution_resolve(logical_uri)
+                managed_file = (
+                    is_core_managed_local_file_sink(
+                        spec, logical_uri, adapter, deps.storage)
+                    and type(deps.catalog) is InMemoryCatalog
+                )
+                lance_candidate = (
+                    is_core_managed_local_lance_append_sink(
+                        spec, logical_uri, adapter)
+                    and type(deps.catalog) is InMemoryCatalog
+                )
+                managed = managed_file or lance_candidate
+            except Exception:
+                managed = False
         controller = getattr(deps, "controller", None)
         plan_for_run = getattr(controller, "plan_for_run", None)
         if managed and callable(plan_for_run):
@@ -937,7 +955,7 @@ def _write_admission_for_graph(
             blocker=_missing_bounded_schema_blocker(graph, node_id),
         )
 
-    run_id = metadb.local_run_submission_id(
+    run_id = run_id or metadb.local_run_submission_id(
         str(uid), str(getattr(graph, "id", "") or "") or None, str(submission_id))
     normalized_schema = [ColumnSchema.model_validate(column) for column in schema]
     inbound = graph_mod.incoming(graph, node_id)
@@ -2914,6 +2932,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     _reject_invalid(graph, deps, target_node_id)
     write_admission = None
     effective_write_intent = write_intent
+    unsubmitted_write_admission_id: str | None = None
+    unsubmitted_write_run_id: str | None = None
+    bound_unsubmitted_write = False
     if target is not None and target.type == "write" and submission_id is not None:
         write_admission = _write_admission_for_graph(
             deps, graph, target_node_id, uid, submission_id, supplied=write_intent)
@@ -2962,13 +2983,36 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 if inferred_node is not None and inferred_node.type == "write":
                     unadmitted_write_target = inferred_node.id
         if unadmitted_write_target is not None:
+            unsubmitted_write_admission_id = str(uuid.uuid4())
+            unsubmitted_write_run_id = metadb.local_run_submission_id(
+                uid, operational_canvas, unsubmitted_write_admission_id)
             admission = _write_admission_for_graph(
-                deps, graph, unadmitted_write_target, uid, str(uuid.uuid4()))
+                deps, graph, unadmitted_write_target, uid,
+                unsubmitted_write_admission_id, run_id=unsubmitted_write_run_id)
+            managed_head = (
+                metadb.catalog_managed_local_write_head(admission.destination)
+                if admission.managed else None
+            )
+            managed_binding = (
+                metadb.catalog_revision_binding_for_uri(admission.destination)
+                if admission.managed else None
+            )
+            if ((managed_head is not None or managed_binding is not None)
+                    and (admission.blocker is not None or admission.intent is None)):
+                raise HTTPException(
+                    409,
+                    admission.blocker
+                    or "the existing managed destination has no complete write admission")
             drift = admission.intent.schema_drift if admission.intent is not None else None
             if admission.managed and drift is not None and drift.requires_confirmation:
                 raise HTTPException(
                     409,
                     "schema drift confirmation requires the displayed write admission")
+            if admission.managed and admission.intent is not None:
+                effective_write_intent = admission.intent
+                bound_unsubmitted_write = True
+                _inject_write_intent(graph, unadmitted_write_target, admission.intent)
+                _inject_write_intent(durable_graph, unadmitted_write_target, admission.intent)
             _preflight_write_target_destination(
                 deps, graph, unadmitted_write_target)
     intent_sha256 = _local_run_intent_sha256(
@@ -2981,7 +3025,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone
-    if (write_admission is not None and write_admission.managed
+    if ((write_admission is not None and write_admission.managed
+            or bound_unsubmitted_write)
             and not _runner_supports_managed_local_write_intents(deps, runner)):
         raise HTTPException(
             409, "the selected execution backend cannot consume the managed-local write admission; "
@@ -2996,7 +3041,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     controller_regions = (_controller_regions_for_run(
         deps, graph, target_node_id, output_target, sizes, multi_output=multi_output)
         if multi_output or managed_write else None)
-    if managed_write and controller_regions:
+    if (managed_write or bound_unsubmitted_write) and controller_regions:
         raise HTTPException(
             409, "the selected execution owner cannot consume the managed-local write admission; "
             "discard it and retry with an in-process local plan")
@@ -3087,12 +3132,13 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     auto_admittable_local_sources = bool(local_sources) and all(
         _source_supports_automatic_local_admission(node, deps)
         for node in local_sources)
+    local_submission_id = submission_id
     local_runner_admission = bool(
         runner is deps.runner
-        and (submission_id is not None or auto_admittable_local_sources))
+        and (local_submission_id is not None or auto_admittable_local_sources))
     built_in_local_transport = transport_requires_admission or local_runner_admission
-    if built_in_local_transport and not controller_regions and submission_id is None:
-        submission_id = str(uuid.uuid4())
+    if built_in_local_transport and not controller_regions and local_submission_id is None:
+        local_submission_id = unsubmitted_write_admission_id or str(uuid.uuid4())
     local_admission = bool(
         not controller_regions
         and built_in_local_transport
@@ -3101,14 +3147,14 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     dispatch_manifest: list[dict[str, str]] | None = None
     prebound_local_run_id: str | None = None
     if local_admission:
-        assert submission_id is not None
+        assert local_submission_id is not None
         graph_canvas = (str(getattr(graph, "id", "") or "") or None)
         operational_canvas = auth_canvas or (
             graph_canvas if graph_canvas is not None and metadb.canvas_exists(graph_canvas) else None)
         if isinstance(runner, KernelBackend) and operational_canvas is None:
             raise HTTPException(409, "kernel runs require a saved canvas")
         prebound_local_run_id = metadb.local_run_submission_id(
-            uid, operational_canvas, str(submission_id))
+            uid, operational_canvas, str(local_submission_id))
         retained_sha256 = (
             retained_local_admission.get("execution_manifest_sha256")
             if retained_local_admission is not None else None)
@@ -3145,7 +3191,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                     deps=deps,
                 )
                 prebound_local_run_id, _created = metadb.admit_local_run_inputs(
-                    uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                    uid=uid, canvas_id=operational_canvas,
+                    submission_id=str(local_submission_id),
                     target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
                     execution_manifest_sha256=execution_sha256,
                     execution_manifest_doc=execution_doc,
@@ -3222,6 +3269,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         dispatch_graph, target_node_id, uid, sizes=sizes, request_id=request_id,
         regions=controller_regions)
     identity_prebound = False
+    dispatch_run_id = (
+        prebound_local_run_id
+        or (unsubmitted_write_run_id if bound_unsubmitted_write else None)
+    )
     if overall is not None:
         status, owner = overall, deps.controller
     else:
@@ -3287,7 +3338,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             try:
                 status = invoke_backend_run(
                     runner, plan, dispatch_graph, target_node_id, est.placement,
-                    run_id=prebound_local_run_id, request_id=request_id,
+                    run_id=dispatch_run_id, request_id=request_id,
                     input_manifest=dispatch_manifest)
             except Exception as exc:
                 if prebound_local_run_id is None:
@@ -3306,7 +3357,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                     if deps.run_index.get(prebound_local_run_id) is runner:
                         deps.run_index.pop(prebound_local_run_id, None)
                     raise exc from None
-            if prebound_local_run_id is not None and status.run_id != prebound_local_run_id:
+            if dispatch_run_id is not None and status.run_id != dispatch_run_id:
                 raise RuntimeError("local execution backend did not preserve its admitted run id")
         owner = runner
     if request_id and not status.request_id:

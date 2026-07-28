@@ -139,13 +139,14 @@ def _publish(deps, admission, values):
     )
 
 
-def _managed_publication_counts() -> tuple[int, int, int]:
+def _managed_publication_counts() -> tuple[int, int, int, int]:
     with metadb.session() as session:
         return tuple(int(session.scalar(
             select(func.count()).select_from(model)) or 0) for model in (
                 metadb.CatalogEntry,
                 metadb.CatalogLogicalDataset,
                 metadb.ManagedLocalFileRevision,
+                metadb.LocalResultArtifact,
             ))
 
 
@@ -588,6 +589,107 @@ def test_direct_and_mcp_runs_cannot_bypass_drift_without_an_admission(
             "canvasId": graph.id, "nodeId": "write", "confirm": True,
         })
 
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_unsubmitted_replace_consumes_the_probed_head_and_loses_a_dispatch_race(
+        contract, monkeypatch):
+    from hub.plugins.runner import LocalRunner
+
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "dispatch-race-create")
+    _publish(deps, create, [0])
+    winner = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "dispatch-race-winner")
+
+    runner = LocalRunner(
+        deps.resolve_adapter,
+        deps.registry,
+        deps.catalog,
+        deps.workspace,
+        node_builders=deps.node_builders,
+        node_specs=deps.node_specs,
+        storage=deps.storage,
+    )
+
+    class Controller:
+        @staticmethod
+        def plan_for_run(_graph, _target_node_id, *, sizes):
+            assert isinstance(sizes, dict)
+            return []
+
+        @staticmethod
+        def run(*_args, **_kwargs):
+            return None
+
+    deps.runner = runner
+    deps.runners = []
+    deps.node_ir = {}
+    deps.pick_runner = lambda _plan, _uid: runner
+    deps.controller = Controller()
+    deps.run_index = {}
+    deps.run_owner = {}
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+
+    original_admission = run_routes._write_admission_for_graph
+    winner_receipt = None
+    raced_publications = None
+    raced_artifacts = None
+
+    def move_head_after_probe(*args, **kwargs):
+        nonlocal winner_receipt, raced_publications, raced_artifacts
+        admission = original_admission(*args, **kwargs)
+        assert admission.intent is not None
+        winner_receipt = _publish(deps, winner, [1])
+        raced_publications = _managed_publication_counts()
+        raced_artifacts = set(os.listdir(deps.storage.result_root))
+        return admission
+
+    monkeypatch.setattr(
+        run_routes, "_write_admission_for_graph", move_head_after_probe)
+
+    status, owner = run_routes.start_run(
+        deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+    assert owner is runner
+    for _ in range(200):
+        status = owner.status(status.run_id)
+        if status.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.01)
+
+    assert winner_receipt is not None
+    assert raced_publications is not None and raced_artifacts is not None
+    assert status.status == "failed"
+    assert "replace expected head is stale" in (status.error or "")
+    assert metadb.catalog_managed_local_write_head(
+        winner_receipt.publication.logical_uri)["revision_id"] == winner_receipt.revision_id
+    assert _managed_publication_counts() == raced_publications
+    assert set(os.listdir(deps.storage.result_root)) == raced_artifacts
+
+
+def test_unsubmitted_replace_fails_closed_when_existing_head_schema_is_unbounded(
+        contract, monkeypatch):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "unbounded-replace-create")
+    receipt = _publish(deps, create, [0])
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(HTTPException, match="bounded output schema") as caught:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+
+    assert caught.value.status_code == 409
+    assert metadb.catalog_managed_local_write_head(
+        receipt.publication.logical_uri)["revision_id"] == receipt.revision_id
     assert _run_allocation_counts() == before_runs
     assert _managed_publication_counts() == before_publications
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
