@@ -64,6 +64,29 @@ describe('JobsView', () => {
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
   })
 
+  it('keeps the differentiating suffix and full tooltip for long shared-prefix canvas names', async () => {
+    const prefix = 'Robotics preprocessing experiment with shared discovery and filtering context — '
+    const left = `${prefix}left-camera-pass`
+    const right = `${prefix}right-camera-pass`
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [
+        job({ id: 'history-left', runId: 'run-left', canvasName: left }),
+        job({ id: 'history-right', runId: 'run-right', canvasName: right }),
+      ],
+      hasMore: false, nextCursor: null,
+    })
+
+    render(<JobsView />)
+
+    const leftSubject = await screen.findByTitle(left)
+    const rightSubject = await screen.findByTitle(right)
+    expect(leftSubject).toHaveTextContent(left)
+    expect(rightSubject).toHaveTextContent(right)
+    expect(leftSubject.lastElementChild?.textContent).not.toBe(rightSubject.lastElementChild?.textContent)
+    expect(leftSubject.lastElementChild?.textContent).toContain('left-camera-pass')
+    expect(rightSubject.lastElementChild?.textContent).toContain('right-camera-pass')
+  })
+
   it('uses the history identity when a legacy row has no logical run id', async () => {
     mocks.workspaceJobs.mockResolvedValue({
       items: [job({ runId: null })], hasMore: false, nextCursor: null,

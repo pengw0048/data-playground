@@ -172,6 +172,46 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   await expect(page.getByText(/Result 1 · transform:clean, Result 2 · transform:rejected/)).toBeVisible()
 })
 
+test('long shared-prefix Canvas names keep their suffixes visible without widening Jobs @ux-smoke', async ({ page }) => {
+  const prefix = 'Robotics preprocessing experiment with shared discovery and filtering context — '
+  const leftName = `${prefix}left-camera-pass`
+  const rightName = `${prefix}right-camera-pass`
+  const jobs = [
+    { ...failedJob, id: 'history-left', runId: 'run-left', canvasId: 'canvas-left', canvasName: leftName },
+    { ...failedJob, id: 'history-right', runId: 'run-right', canvasId: 'canvas-right', canvasName: rightName },
+  ]
+  await page.route('**/api/canvas', async (route) => route.fulfill({
+    json: jobs.map((job) => ({
+      id: job.canvasId, name: job.canvasName, version: 1, role: 'viewer',
+    })),
+  }))
+  await page.route('**/api/jobs?*', async (route) => route.fulfill({
+    json: { items: jobs, nextCursor: null, hasMore: false },
+  }))
+
+  await page.goto('/#/jobs')
+  const left = page.getByTitle(leftName)
+  const right = page.getByTitle(rightName)
+  await expect(left).toHaveText(leftName)
+  await expect(right).toHaveText(rightName)
+  for (const [width, height] of [[1280, 720], [1440, 900]] as const) {
+    await page.setViewportSize({ width, height })
+    for (const subject of [left, right]) {
+      await expect(subject).toBeVisible()
+      const row = subject.locator('xpath=ancestor::button')
+      expect(await row.evaluate((element) => element.scrollWidth <= element.clientWidth),
+        `Jobs row should not overflow at ${width}px`).toBe(true)
+      const [subjectBox, rowBox] = await Promise.all([subject.boundingBox(), row.boundingBox()])
+      if (!subjectBox || !rowBox) throw new Error('Jobs subject has no bounding box')
+      expect(subjectBox.x + subjectBox.width).toBeLessThanOrEqual(rowBox.x + rowBox.width + 0.5)
+    }
+    await expect(left.locator('span').last()).toContainText('left-camera-pass')
+    await expect(right.locator('span').last()).toContainText('right-camera-pass')
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      `Jobs should not create page overflow at ${width}px`).toBe(true)
+  }
+})
+
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
   const mergeJob = {
     id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
