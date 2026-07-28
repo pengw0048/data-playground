@@ -9086,6 +9086,25 @@ def test_plan_hash_includes_requirements():
     assert r._plan_hash(graph_with(["a", "b"]), "wr") == r._plan_hash(graph_with(["b", "a"]), "wr")  # order-free
 
 
+def test_plan_hash_ignores_legacy_transform_scope():
+    from hub.models import Graph
+    r = get_deps().runner
+
+    def graph_with(scope, code="def fn(row): return row"):
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            N("xf", "transform", {
+                "source": "adhoc", "mode": "map", "scope": scope, "code": code,
+            }),
+        ], "edges": [E("src", "xf")]})
+
+    sample = r._plan_hash(graph_with("sample"), "xf")
+    dataset = r._plan_hash(graph_with("dataset"), "xf")
+    assert sample == dataset
+    assert sample != r._plan_hash(
+        graph_with("dataset", "def fn(row): return {**row, 'changed': True}"), "xf")
+
+
 def test_completed_run_result_is_db_cached(tmp_path):
     # A2: a finished run persists its result pointer to the shared DB (result_cache), so it's reused
     # across a kernel restart / another stateless instance — not just the accepting process's dict.
