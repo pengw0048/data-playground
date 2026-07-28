@@ -22,6 +22,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expect(panel.getByText('rows 1–50', { exact: true })).toBeVisible()
     await expect(panel.getByText('Preview prefix', { exact: true })).toHaveCount(0)
     await expect(panel.getByText(/Full dataset not scanned/)).toHaveCount(0)
+    await expect(panel.getByText(/Preview uses up to .* rows from each input/)).toHaveCount(0)
     const exportPage = panel.getByRole('button', { name: 'Export this preview page' })
     await expect(exportPage).toBeVisible()
     const downloaded = page.waitForEvent('download')

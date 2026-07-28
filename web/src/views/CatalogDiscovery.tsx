@@ -1311,7 +1311,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 function CatalogPreviewScope({ preview, stale }: { preview: SampleResult; stale: boolean }) {
   return (
     <div className="rounded-md bg-muted/50 px-2 py-1">
-      <PreviewSummary data={preview} />
+      <PreviewSummary data={preview} surface="catalog" />
       <PreviewDetails provenance={preview.sampleProvenance} stale={stale} />
     </div>
   )

@@ -1,13 +1,18 @@
 import type { SampleProvenance, SampleResult } from '../types/api'
 
 type PreviewUnit = 'rows' | 'points' | 'groups'
+type PreviewSurface = 'canvas' | 'catalog'
 
 export function previewRangeLabel(unit: PreviewUnit, offset: number, count: number) {
   if (count === 0) return offset === 0 ? `No ${unit} returned` : `No ${unit} at offset ${offset.toLocaleString()}`
   return `${unit} ${(offset + 1).toLocaleString()}–${(offset + count).toLocaleString()}`
 }
 
-export function previewWarning(data: SampleResult, unit: PreviewUnit): string | null {
+export function previewWarning(
+  data: SampleResult,
+  unit: PreviewUnit,
+  surface: PreviewSurface = 'canvas',
+): string | null {
   const end = data.rows.length
   const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
   if (sourceCapped) {
@@ -17,6 +22,9 @@ export function previewWarning(data: SampleResult, unit: PreviewUnit): string | 
     || data.limitReason === 'interactive-row-budget'
     || (data.completeness === 'capped' && !sourceCapped)
   if (!resultCapped) return null
+  if (surface === 'catalog') {
+    return `Preview is limited to ${(data.rowLimit ?? end).toLocaleString()} ${unit}; the dataset may contain more.`
+  }
   return `Showing up to ${(data.rowLimit ?? end).toLocaleString()} ${unit}; run the node to inspect the full result.`
 }
 
@@ -25,14 +33,23 @@ function samplingSummary(provenance: SampleProvenance) {
   return `Random sample · ${provenance.returnedRows.toLocaleString()} rows · seed ${provenance.seed ?? 'unknown'}`
 }
 
-export function PreviewSummary({ data, offset = 0, unit = 'rows', showRange = true }: {
+export function PreviewSummary({
+  data,
+  offset = 0,
+  unit = 'rows',
+  showRange = true,
+  showWarning = true,
+  surface = 'canvas',
+}: {
   data: SampleResult
   offset?: number
   unit?: PreviewUnit
   showRange?: boolean
+  showWarning?: boolean
+  surface?: PreviewSurface
 }) {
   const summary = data.sampleProvenance ? samplingSummary(data.sampleProvenance) : null
-  const warning = previewWarning(data, unit)
+  const warning = showWarning ? previewWarning(data, unit, surface) : null
   if (!showRange && !summary && !warning) return null
   return (
     <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
@@ -42,6 +59,20 @@ export function PreviewSummary({ data, offset = 0, unit = 'rows', showRange = tr
       </div>
       {warning && <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">{warning}</div>}
     </div>
+  )
+}
+
+export function PreviewProvenance({ provenance, stale = false }: {
+  provenance?: SampleProvenance | null
+  stale?: boolean
+}) {
+  if (!provenance) return null
+  const summary = samplingSummary(provenance)
+  return (
+    <>
+      {summary && <div className="text-[10.5px] text-muted-foreground">{summary}</div>}
+      <PreviewDetails provenance={provenance} stale={stale} />
+    </>
   )
 }
 

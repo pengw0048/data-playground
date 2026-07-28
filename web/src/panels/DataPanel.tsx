@@ -13,7 +13,9 @@ import {
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCellRenderer'
-import { PreviewDetails, PreviewSummary, previewRangeLabel } from '../components/PreviewPresentation'
+import {
+  PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
+} from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
@@ -284,7 +286,7 @@ export function DataPanel({ nodeId, editorPreview }: {
         <ExampleRowsResultBanner data={res} offset={offset} />
       ) : (
         <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
-          allowNextAttempt={!special} showDetails={activeTab !== 'stats'} />
+          showDetails={activeTab !== 'stats'} showWarning={node?.type !== 'source'} />
       )}
 
       {isChart ? (
@@ -445,13 +447,13 @@ function ExampleRowsResultBanner({ data, offset }: { data: SampleResult; offset:
   )
 }
 
-function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true, showDetails = true }: {
+function DataScopeBanner({ data, offset, unit, scope, showDetails = true, showWarning = true }: {
   data: SampleResult
   offset: number
   unit: 'rows' | 'points' | 'groups'
   scope: 'preview' | 'full-result' | 'published-dataset'
-  allowNextAttempt?: boolean
   showDetails?: boolean
+  showWarning?: boolean
 }) {
   const end = offset + data.rows.length
   const total = data.rowCount ?? null
@@ -463,7 +465,8 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true, s
   if (scope === 'preview') {
     return (
       <>
-        <PreviewSummary data={data} offset={offset} unit={unit} showRange={false} />
+        <PreviewSummary data={data} offset={offset} unit={unit} showRange={false}
+          showWarning={showWarning} />
         {showDetails && <PreviewDetails provenance={provenance} />}
       </>
     )
@@ -494,11 +497,6 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true, s
         </div>
       )}
       {provenance && <PreviewDetails provenance={provenance} />}
-      {data.hasMore == null && (
-        <div className="mt-1 font-medium text-muted-foreground">
-          Next page availability unknown{allowNextAttempt && data.rows.length > 0 ? ' · You can try the next offset.' : '.'}
-        </div>
-      )}
     </div>
   )
 }
@@ -793,7 +791,7 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
 }
 
 export function SampleProvenanceSummary({ provenance }: { provenance: SampleProvenance }) {
-  return <PreviewDetails provenance={provenance} />
+  return <PreviewProvenance provenance={provenance} />
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
@@ -1273,7 +1271,7 @@ export function FullResult({
       </div>
       <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
         unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
-        scope={pageScope} allowNextAttempt={presentation?.kind !== 'chart'} />
+        scope={pageScope} />
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}

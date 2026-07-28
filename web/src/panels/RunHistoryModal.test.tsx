@@ -326,7 +326,8 @@ describe('durable full results', () => {
 
     render(<RunHistoryModal onClose={() => {}} />)
 
-    expect(await screen.findByText('Preview details')).toBeInTheDocument()
+    expect(await screen.findByText('Random sample · 4 rows · seed 7')).toBeInTheDocument()
+    expect(screen.getByText('Preview details')).toBeInTheDocument()
     expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
     expect(screen.getByText(/Requested 4 rows.*scanned 12.*returned 4.*total 12/i)).toBeInTheDocument()
@@ -370,15 +371,15 @@ describe('durable full results', () => {
     const user = userEvent.setup()
     render(<FullResult uri="/outputs/unknown-pages.parquet" total={null} {...fullIdentity} />)
 
-    expect(await screen.findByText('Next page availability unknown · You can try the next offset.')).toBeInTheDocument()
-    const next = screen.getByRole('button', { name: 'Next page' })
+    const next = await screen.findByRole('button', { name: 'Next page' })
+    expect(screen.queryByText(/Next page availability unknown/)).not.toBeInTheDocument()
     expect(next).toBeEnabled()
     await user.click(next)
 
-    expect(await screen.findByText('Next page availability unknown.')).toBeInTheDocument()
+    expect(await screen.findByText(/No rows at offset 1/)).toBeInTheDocument()
+    expect(screen.queryByText(/Next page availability unknown/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
-    expect(screen.getByText(/No rows at offset 1/)).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 1)
     await user.click(screen.getByRole('button', { name: 'Previous page' }))
     expect(await screen.findByText(/rows 1–1/)).toBeInTheDocument()
