@@ -439,6 +439,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
               <div className="grid grid-cols-2 gap-2">
                 <Label className="text-[10.5px]">Search
                   <Input autoFocus value={q} onChange={(event) => {
+                    request.current += 1
                     setQ(event.target.value)
                     setShowPossibleMatches(false)
                     setLoading(true)
@@ -447,6 +448,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                 </Label>
                 <Label className="text-[10.5px]">Folder
                   <Input value={folder} onChange={(event) => {
+                    request.current += 1
                     setFolder(event.target.value)
                     setShowPossibleMatches(false)
                     setLoading(true)
