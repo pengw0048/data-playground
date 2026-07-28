@@ -1,11 +1,13 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
 import type { ColumnSchema } from '../types/graph'
+import type { CatalogTable } from '../types/api'
 import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
+import { registerGenericNodes } from '../nodes/generic'
 import '../nodes/kinds/source'
 import '../nodes/kinds/transform'
 
@@ -670,9 +672,22 @@ describe('Inspector — Source connection details', () => {
 })
 
 describe('Inspector — draft Source entry', () => {
-  const selectSource = (config: Record<string, unknown>) => {
+  beforeEach(() => {
+    registerGenericNodes([{
+      kind: 'source', title: 'source', category: 'io', tag: 'dataset',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+      params: [
+        { name: 'uri', type: 'string', label: 'dataset uri' },
+        { name: 'delimiter', type: 'string', label: 'CSV delimiter (blank=auto)' },
+        { name: 'header', type: 'select', options: ['auto', 'yes', 'no'], default: 'auto', label: 'CSV header row' },
+      ],
+      canBypass: false, previewable: true, blurb: 'Choose a registered dataset',
+    }])
+  })
+
+  const selectSource = (config: Record<string, unknown>, catalog: CatalogTable[] = []) => {
     useStore.setState({
-      selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {}, catalog: [],
+      selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {}, catalog,
       doc: { id: 'source-entry', name: 'Source entry', version: 1, requirements: [], edges: [],
         nodes: [{ id: 'source', type: 'source', position: { x: 0, y: 0 }, data: {
           title: 'Source', status: 'draft', history: [], config,
@@ -708,16 +723,21 @@ describe('Inspector — draft Source entry', () => {
     window.removeEventListener('dataplay:source-entry:source', receive)
   })
 
-  it('keeps manual URI and CSV settings behind a non-mutating advanced disclosure', () => {
+  it('reveals CSV parsing only after a draft becomes a manual delimited-text URI', () => {
     selectSource({})
     render(<Inspector />)
     const before = JSON.stringify(useStore.getState().doc.nodes[0].data.config)
     expect(screen.getByLabelText('Dataset URI')).not.toBeVisible()
     fireEvent.click(screen.getByText('Advanced source configuration'))
     expect(screen.getByLabelText('Dataset URI')).toBeVisible()
+    expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
+    expect(JSON.stringify(useStore.getState().doc.nodes[0].data.config)).toBe(before)
+    fireEvent.change(screen.getByLabelText('Dataset URI'), {
+      target: { value: 'file:///data/manual-input.csv' },
+    })
     expect(screen.getByLabelText('CSV delimiter')).toBeVisible()
     expect(screen.getByLabelText('CSV header row')).toBeVisible()
-    expect(JSON.stringify(useStore.getState().doc.nodes[0].data.config)).toBe(before)
   })
 
   it('keeps focus while entering a manual URI, then restores the configured Source Inspector', async () => {
@@ -734,21 +754,178 @@ describe('Inspector — draft Source entry', () => {
     fireEvent.blur(uri)
     await waitFor(() => expect(screen.getByText('Properties')).toBeInTheDocument())
     expect(screen.getByText('Data source')).toBeInTheDocument()
+    expect(screen.queryByText(/CSV delimiter/)).not.toBeInTheDocument()
+    expect(screen.queryByText('CSV header row')).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.uri).toBe('events.parquet')
   })
 
-  it.each([
-    ['a local binding', { tableId: 'events', uri: 'events.parquet' }],
-    ['a provider binding', { providerResourceRef: 'provider://datasets/events', providerName: 'Provider' }],
-    ['a manual URI', { uri: 'events.parquet' }],
-  ])('preserves the normal Inspector for %s', (_case, config) => {
-    selectSource(config)
+  it('shows the real Workspace local Source as bound without raw URI or CSV controls', () => {
+    const table: CatalogTable = {
+      id: 'events', registrationId: 'dataset:events', name: 'events',
+      uri: 'file:///workspace/events.parquet', rowCount: 2000, columns: cols,
+    }
+    selectSource({
+      uri: table.uri, tableId: table.id, registrationId: table.registrationId,
+    }, [table])
     render(<Inspector />)
-    expect(screen.getByText('Properties')).toBeInTheDocument()
+    expect(screen.getByTitle('Local catalog · Current version · 2,000 rows · 2 columns')).toBeInTheDocument()
+    expect(screen.queryByTitle('Choose a registered dataset')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
     expect(screen.getByText('Data source')).toBeInTheDocument()
     expect(screen.getByText('Related data')).toBeInTheDocument()
-    expect(screen.getByText('Ports')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Count rows' })).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Connection details'))
+    expect(screen.getByLabelText('Source connection details')).toHaveTextContent('dataset:events')
+  })
+
+  it('shows the real Workspace provider exact Source as bound without manual parsing controls', () => {
+    selectSource({
+      uri: 'provider+dataset://mount/source-binding',
+      providerResourceRef: 'dataset:external/orders',
+      providerMountId: 'mount',
+      providerSourceBindingId: 'source-binding',
+      providerName: 'Luma Data API',
+      providerReadMode: 'exact',
+      datasetRef: {
+        kind: 'exact',
+        datasetId: 'provider-dataset-identity',
+        revisionId: 'provider-revision-7',
+      },
+    })
+    render(<Inspector />)
+    expect(screen.getByTitle('Luma Data API · Exact version provider-revision-7')).toBeInTheDocument()
+    expect(screen.queryByTitle('Choose a registered dataset')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Connection details'))
+    const details = screen.getByLabelText('Source connection details')
+    expect(details).toHaveTextContent('provider-dataset-identity')
+    expect(details).toHaveTextContent('provider-revision-7')
+  })
+
+  it.each([
+    ['exact', {
+      uri: 'file:///data/exact.csv',
+      datasetRef: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-3' },
+    }, 'Selected dataset · Exact version revision-3'],
+    ['as-of', {
+      uri: 'file:///data/as-of.csv',
+      datasetRef: {
+        kind: 'as_of', asOf: '2026-07-24T00:00:00Z',
+        resolved: {
+          datasetId: 'dataset-as-of', revisionId: 'revision-4',
+          committedAt: '2026-07-23T23:00:00Z', retentionOwner: 'provider', selector: 'as_of',
+        },
+      },
+    }, 'Selected dataset · Exact version revision-4'],
+    ['run-time parameter', {
+      uri: 'file:///data/runtime.csv',
+      datasetRef: { parameterRef: 'runtime_dataset' },
+    }, 'Run-time dataset parameter'],
+  ])('recognizes a legal %s dataset binding without transient catalog hints', (_case, config, summary) => {
+    selectSource(config)
+    render(<Inspector />)
+    expect(screen.getByTitle(summary)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['tableId only', { tableId: 'events', uri: 'file:///data/manual-input.csv' }],
+    ['stale transient hints', {
+      tableId: 'events', providerResourceRef: 'dataset:stale-placement', providerMountId: 'stale-mount',
+      uri: 'file:///data/manual-input.csv',
+    }],
+    ['providerResourceRef only', {
+      providerResourceRef: 'dataset:display-placement',
+      uri: 'file:///data/manual-input.csv',
+    }],
+  ])('does not treat %s as a bound Source identity', (_case, config) => {
+    const table: CatalogTable = {
+      id: 'events', registrationId: 'dataset:events', name: 'events',
+      uri: 'file:///workspace/events.parquet', rowCount: 2000, columns: cols,
+    }
+    selectSource(config, [table])
+    render(<Inspector />)
+    expect(screen.getByTitle('Manual URI · Delimited text')).toBeInTheDocument()
+    expect(screen.getByText('dataset uri')).toBeInTheDocument()
+    expect(screen.getByText(/CSV delimiter/)).toBeInTheDocument()
+    expect(screen.getByText('CSV header row')).toBeInTheDocument()
+    expect(screen.queryByTitle(/Current version/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Connection details'))
+    const details = screen.getByLabelText('Source connection details')
+    expect(details).toHaveTextContent('Manual URI')
+    expect(details).not.toHaveTextContent('Catalog registration')
+    expect(details).not.toHaveTextContent('Provider resource')
+  })
+
+  it('keeps URI and CSV parsing controls for a manual CSV Source', () => {
+    selectSource({ uri: 'file:///data/manual-input.csv', delimiter: ';', header: 'yes' })
+    render(<Inspector />)
+    expect(screen.getByTitle('Manual URI · Delimited text')).toBeInTheDocument()
+    expect(screen.getByText('Properties')).toBeInTheDocument()
+    expect(screen.getByText('dataset uri')).toBeInTheDocument()
+    expect(screen.getByText(/CSV delimiter/)).toBeInTheDocument()
+    expect(screen.getByText('CSV header row')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Connection details'))
+    expect(screen.getByLabelText('Source connection details')).toHaveTextContent('Manual URI')
+  })
+
+  it('keeps a changed Workspace Source bound, then returns a cleared Source to draft entry', () => {
+    const table: CatalogTable = {
+      id: 'events', registrationId: 'dataset:events', name: 'events',
+      uri: 'file:///workspace/events.parquet', rowCount: 2000, columns: cols,
+    }
+    selectSource({
+      uri: table.uri, tableId: table.id, registrationId: table.registrationId,
+    }, [table])
+    render(<Inspector />)
+    expect(screen.getByTitle(/Local catalog · Current version/)).toBeInTheDocument()
+
+    act(() => {
+      useStore.setState((state) => ({
+        doc: {
+          ...state.doc,
+          nodes: state.doc.nodes.map((node) => (
+            node.id === 'source'
+              ? { ...node, data: { ...node.data, config: {
+                uri: 'provider+dataset://mount/source-binding',
+                providerResourceRef: 'dataset:external/orders',
+                providerMountId: 'mount',
+                providerSourceBindingId: 'source-binding',
+                providerName: 'Luma Data API',
+                providerReadMode: 'exact',
+                datasetRef: {
+                  kind: 'exact',
+                  datasetId: 'provider-dataset-identity',
+                  revisionId: 'provider-revision-7',
+                },
+              } } }
+              : node
+          )),
+        },
+      }))
+    })
+    expect(screen.getByTitle('Luma Data API · Exact version provider-revision-7')).toBeInTheDocument()
+    expect(screen.queryByText('Choose data')).not.toBeInTheDocument()
+
+    act(() => {
+      useStore.setState((state) => ({
+        doc: {
+          ...state.doc,
+          nodes: state.doc.nodes.map((node) => (
+            node.id === 'source'
+              ? { ...node, data: { ...node.data, config: {} } }
+              : node
+          )),
+        },
+      }))
+    })
+    expect(screen.getByTitle('Choose a registered dataset')).toBeInTheDocument()
+    expect(screen.getByText('Choose data')).toBeInTheDocument()
   })
 })
 
