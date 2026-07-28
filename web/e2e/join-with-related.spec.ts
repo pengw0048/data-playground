@@ -3,8 +3,8 @@ import { resolve } from 'node:path'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
-const dialogName = 'Find related data or possible key matches'
-const leftInputTrigger = 'Related / possible key matches · left'
+const dialogName = 'Find join candidates'
+const leftInputTrigger = 'Find join candidates · left'
 
 type Table = {
   id: string
@@ -64,7 +64,8 @@ async function seedSourceCanvas(
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
   await expect(page.locator('.react-flow__node')).toHaveCount(includeBystander ? 2 : 1)
   await expect(page.getByTestId('join-with-related-selected-source')).toHaveCount(0)
-  await expect(page.getByTestId('join-with-related-canvas-selected-source')).toBeVisible()
+  await expect(page.getByTestId('join-with-related-canvas-selected-source'))
+    .toHaveAccessibleName('Find join candidates')
 }
 
 async function seedOneSidedJoinCanvas(page: Page, canvasId: string, table: Table) {
