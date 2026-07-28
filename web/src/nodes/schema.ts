@@ -4,6 +4,7 @@
 import type { CanvasDoc, CanvasNode, ColumnSchema } from '../types/graph'
 import type { CatalogTable, SampleResult } from '../types/api'
 import { nodeOutputs } from './registry'
+import { parseJoinKeys } from './joinKeys'
 
 /** Metadata schemas by node and named output port. ``null`` means that port is untyped. */
 export type SchemaMap = Record<string, Record<string, ColumnSchema[] | null>>
@@ -55,6 +56,20 @@ export function inputColumns(
   for (const edge of sources) {
     for (const c of nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)) {
       if (!seen.has(c.name)) { seen.add(c.name); out.push(c) }
+    }
+  }
+  return out
+}
+
+/** INPUT columns from exactly one named target port (rather than the legacy all-input union). */
+export function inputColumnsForPort(
+  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string, portId: string,
+): ColumnSchema[] {
+  const out: ColumnSchema[] = []
+  const seen = new Set<string>()
+  for (const edge of doc.edges.filter((edge) => edge.target === id && edge.targetHandle === portId)) {
+    for (const column of nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)) {
+      if (!seen.has(column.name)) { seen.add(column.name); out.push(column) }
     }
   }
   return out
@@ -171,6 +186,23 @@ function knownInputColumnSet(
   return set
 }
 
+function knownInputColumnSetForPort(
+  doc: CanvasDoc, schemas: SchemaMap, previews: PreviewMap, catalog: CatalogTable[], id: string, portId: string,
+): Set<string> | null {
+  const srcs = doc.edges.filter((edge) => edge.target === id && edge.targetHandle === portId)
+  if (!srcs.length) return null
+  const set = new Set<string>()
+  for (const edge of srcs) {
+    const sourcePortId = outputPortId(doc, edge.source, edge.sourceHandle)
+    const schema = sourcePortId === undefined ? undefined : schemas[edge.source]?.[sourcePortId]
+    if (schema === null) return null
+    const columns = nodeColumns(doc, schemas, previews, catalog, edge.source, edge.sourceHandle)
+    if (!columns.length) return null
+    for (const column of columns) set.add(column.name.toLowerCase())
+  }
+  return set
+}
+
 /** Warnings for a node whose config references columns absent from its (known) input — [] when the
  * input is unknown or nothing reliably resolves as missing. Non-blocking: a soft cue, not an error. */
 export function schemaWarnings(
@@ -181,6 +213,22 @@ export function schemaWarnings(
   // a disabled node doesn't run and a bypassed node passes its input through, so its config isn't
   // applied — no warning applies (keeps the card/inspector/wire cues consistent with "won't run").
   if (node.data?.disabled || node.data?.bypassed) return []
+  if (node.type === 'join') {
+    const config = node.data.config as Record<string, unknown>
+    const pairs = parseJoinKeys(String(config.on ?? ''), String(config.condition ?? ''))
+    if (pairs === null || !pairs.length) return []
+    const left = knownInputColumnSetForPort(doc, schemas, previews, catalog, id, 'a')
+    const right = knownInputColumnSetForPort(doc, schemas, previews, catalog, id, 'b')
+    const missing = (side: 'left' | 'right', available: Set<string> | null, columns: string[]) => {
+      if (!available) return []
+      const absent = [...new Set(columns.filter((column) => !available.has(column.toLowerCase())))]
+      return absent.length ? [`unknown ${side} column${absent.length > 1 ? 's' : ''}: ${absent.join(', ')}`] : []
+    }
+    return [
+      ...missing('left', left, pairs.map((pair) => pair.left)),
+      ...missing('right', right, pairs.map((pair) => pair.right)),
+    ]
+  }
   const refs = referencedColumns(node)
   if (!refs.length) return []
   const avail = knownInputColumnSet(doc, schemas, previews, catalog, id)

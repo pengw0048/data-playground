@@ -4,7 +4,7 @@
 // free-text fallback stays available for anything the builder can't express.
 import { useState } from 'react'
 import { currentPreviews, useStore } from '../store/graph'
-import { inputColumns, schemaWarnings } from './schema'
+import { inputColumns, inputColumnsForPort, schemaWarnings } from './schema'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Input } from '@/components/ui/input'
@@ -23,6 +23,16 @@ export function useInputColumns(nodeId: string): ColumnSchema[] {
   const catalog = useStore((s) => s.catalog)
   const doc = useStore.getState().doc
   return inputColumns({ nodes: doc.nodes, edges } as never, schemas, currentPreviews(doc, previews), catalog, nodeId)
+}
+
+/** Columns from one named input port. Join's `a` and `b` deliberately never share suggestions. */
+export function useInputColumnsForPort(nodeId: string, portId: string): ColumnSchema[] {
+  const edges = useStore((s) => s.doc.edges)
+  const schemas = useStore((s) => s.schemas)
+  const previews = useStore((s) => s.previews)
+  const catalog = useStore((s) => s.catalog)
+  const doc = useStore.getState().doc
+  return inputColumnsForPort({ nodes: doc.nodes, edges } as never, schemas, currentPreviews(doc, previews), catalog, nodeId, portId)
 }
 
 /** Soft, non-blocking warnings for a node whose config references a column not in its (known) input —
