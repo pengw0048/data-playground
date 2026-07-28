@@ -18,7 +18,7 @@ import {
 } from '../components/PreviewPresentation'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
-  ProfileResult, RetainedResultIdentity, RunOutput, RunState, SampleProvenance, SampleResult,
+  ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
 } from '../types/api'
 
 const PAGE = 50
@@ -188,7 +188,7 @@ export function DataPanel({ nodeId, editorPreview }: {
       <OutputPortSelector ports={outputPorts} outputs={displayedRunOutputs}
         selectedPortId={selectedPortId} onSelect={choosePort} />
       {!editorPreview && (
-        <SelectedOutputOutcome runStatus={run?.status?.status} output={displayedSelectedOutput} />
+        <SelectedOutputOutcome output={displayedSelectedOutput} />
       )}
       {retainedBindingsUnavailable && (
         <div role="status" aria-label="Retained result parameters unavailable"
@@ -460,35 +460,12 @@ function OutputPortSelector({ ports, outputs, selectedPortId, onSelect }: {
   )
 }
 
-function SelectedOutputOutcome({ runStatus, output }: { runStatus?: RunState; output?: RunOutput }) {
-  if (!runStatus && !output) return null
-  const label = output?.portLabel || output?.portId
+function SelectedOutputOutcome({ output }: { output?: RunOutput }) {
+  if (!output?.error) return null
   return (
     <div aria-label="Selected output status"
       className="dp-dark border-b border-border px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span>Latest run</span>
-        <span className={cn(
-          'rounded px-1 py-px text-[9px] font-semibold uppercase tracking-[0.3px]',
-          runStatus === 'done' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-            : runStatus === 'failed' ? 'bg-destructive/10 text-destructive'
-              : 'bg-muted text-muted-foreground',
-        )}>{runStatus}</span>
-        {output && (
-          <>
-            <span>·</span>
-            <span className="dp-mono font-semibold text-foreground">{label}</span>
-            <OutputOutcomeBadge outcome={output.outcome} />
-            {output.rows != null && (
-              <span>
-                {output.rows.toLocaleString()} {output.rows === 1 ? 'row' : 'rows'}
-                {output.publicationKind === 'catalog' ? ' written' : ''}
-              </span>
-            )}
-          </>
-        )}
-      </div>
-      {output?.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+      <div className="dp-mono whitespace-pre-wrap text-destructive">{output.error}</div>
     </div>
   )
 }
@@ -578,24 +555,11 @@ function DataScopeBanner({
       </>
     )
   }
-  const label = scope === 'published-dataset' ? 'Published dataset' : 'Full result artifact'
-  const range = pageRangeLabel(unit, offset, data.rows.length)
-  let detail: string
-  if (total == null) {
-    detail = `Current page · ${range} · Total ${unit} unknown.`
-  } else if (data.completeness === 'complete') {
-    detail = `Complete artifact · ${total.toLocaleString()} ${unit}.`
-  } else {
-    detail = `Current page · ${range} of ${total.toLocaleString()}.`
-  }
+  if (!resultCapped && !provenance) return null
   return (
-    <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="rounded bg-muted px-1.5 py-px font-semibold text-foreground">{label}</span>
-        <span>{detail}</span>
-      </div>
+    <div className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
       {resultCapped && (
-        <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">
+        <div role="status" className="font-medium text-amber-700 dark:text-amber-300">
           Interactive view stopped at {(data.rowLimit ?? end).toLocaleString()} {unit}
           {total != null ? ` of ${total.toLocaleString()}` : '; total is unknown'}.
           {' '}{scope === 'published-dataset'
@@ -1004,7 +968,7 @@ function ExportCluster({ columns, rows, name, offset, scope, sampleProvenance, p
       <DropdownMenuTrigger asChild>
         <button aria-label={`Export this ${scopeLabel}`}
           className="ml-1.5 inline-flex items-center gap-1 rounded border-l border-border px-1.5 py-1 text-[10.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
-          Export this page <Icon name="chevronDown" size={11} />
+          {scope === 'full-result' || scope === 'published-dataset' ? 'Export page' : 'Export this page'} <Icon name="chevronDown" size={11} />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-[220px]">
@@ -1333,7 +1297,7 @@ export function FullResult({
   const exportAction = canExportFull ? (
     <Button variant="outline" size="sm" className="h-6 px-2 text-[10.5px]"
       disabled={exporting} onClick={exportFull}>
-      {exporting ? 'Preparing export…' : 'Export full result'}
+      {exporting ? 'Preparing export…' : 'Export all rows'}
     </Button>
   ) : undefined
 
@@ -1351,7 +1315,6 @@ export function FullResult({
     onRetry={() => setRetry((n) => n + 1)} />
   if (!data) return <div className="dp-dark text-foreground">
     <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-      <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
       {modeToggle}
     </div>
     <Skeleton />
@@ -1381,8 +1344,14 @@ export function FullResult({
   return (
     <div className="dp-dark text-foreground">
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
-        <span className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">{viewLabel}</span>
+        <span data-testid="full-result-status" role="status"
+          className="rounded bg-emerald-100 px-1.5 py-px text-[10.5px] font-semibold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">
+          {publishedDataset ? 'Published dataset' : 'Complete'}
+          {' · '}{reportedTotal == null ? 'row count unknown' : `${reportedTotal.toLocaleString()} ${reportedTotal === 1 ? 'row' : 'rows'}`}
+        </span>
         {modeToggle}
+        <FullResultEvidence runId={runId} nodeId={nodeId} portId={portId}
+          state={publishedDataset ? 'published' : 'committed'} />
         {detail != null && (
           <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
             <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
@@ -1391,6 +1360,11 @@ export function FullResult({
         <span className="flex-1" />
         {detail == null && canExportFull && (
           exportAction
+        )}
+        {detail == null && presentation?.kind !== 'chart' && (
+          <span className="text-[10.5px] text-muted-foreground">
+            {pageRangeLabel('rows', offset, rows.length)}
+          </span>
         )}
         {detail == null && presentation?.kind !== 'chart' && (
           <span className="inline-flex gap-0.5">
@@ -1403,9 +1377,11 @@ export function FullResult({
             scope={pageScope} pushToast={pushToast} />
         )}
       </div>
-      <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
-        unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
-        scope={pageScope} />
+      {(data.completeness === 'capped' || data.limitScope || data.limitReason || data.sampleProvenance) && (
+        <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
+          unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
+          scope={pageScope} />
+      )}
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}
@@ -1416,6 +1392,24 @@ export function FullResult({
             ? <RowDetail columns={cols} row={rows[detail]} />
             : <RowsTable columns={cols} rows={rows} onRowClick={setDetail} />}
     </div>
+  )
+}
+
+function FullResultEvidence({ runId, nodeId, portId, state }: {
+  runId: string
+  nodeId: string
+  portId: string
+  state: 'committed' | 'published'
+}) {
+  return (
+    <details className="relative text-[10.5px] text-muted-foreground">
+      <summary className="cursor-pointer font-medium">Technical details</summary>
+      <div className="absolute left-0 top-full z-20 mt-1 w-max max-w-[360px] rounded-md border border-border bg-card p-2 shadow-md">
+        <div>Run <span className="dp-mono break-all">{runId}</span></div>
+        <div>Output <span className="dp-mono break-all">{nodeId}:{portId}</span></div>
+        <div>State {state}</div>
+      </div>
+    </details>
   )
 }
 

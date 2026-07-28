@@ -3,6 +3,36 @@ import { readFileSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
+async function expectCompactFullResult(
+  surface: import('@playwright/test').Locator,
+  minimumVisibleTableHeight: number,
+) {
+  await expect(surface.getByTestId('full-result-status')).toHaveCount(1)
+  await expect(surface.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
+  await expect(surface.getByText('Full result artifact')).toHaveCount(0)
+  await expect(surface.getByText(/Complete artifact/)).toHaveCount(0)
+  await expect(surface.getByRole('button', { name: 'Export all rows' })).toBeVisible()
+  await expect(surface.getByRole('button', { name: 'Export this full-result page' })).toHaveText('Export page')
+  const geometry = await surface.evaluate((element) => {
+    const status = element.querySelector<HTMLElement>('[data-testid="full-result-status"]')
+    const table = element.querySelector<HTMLTableElement>('table')
+    const toolbar = status?.parentElement
+    if (!status || !table || !toolbar) return null
+    const surfaceBox = element.getBoundingClientRect()
+    const toolbarBox = toolbar.getBoundingClientRect()
+    const tableBox = table.getBoundingClientRect()
+    return {
+      gapBelowToolbar: Math.round(tableBox.top - toolbarBox.bottom),
+      visibleTableHeight: Math.round(
+        Math.max(0, Math.min(tableBox.bottom, surfaceBox.bottom, window.innerHeight) - tableBox.top),
+      ),
+    }
+  })
+  expect(geometry).not.toBeNull()
+  expect(geometry!.gapBelowToolbar).toBeLessThanOrEqual(1)
+  expect(geometry!.visibleTableHeight).toBeGreaterThanOrEqual(minimumVisibleTableHeight)
+}
+
 test.describe('researcher golden workflow @ux-smoke', () => {
   test('targets the chosen canvas and labels/downloads only the visible preview page', async ({ page }) => {
     const primary = goldenCanvas('ux-golden-primary', 'UX primary canvas', 'UX primary source')
@@ -102,10 +132,10 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history').click()
     await page.getByRole('button', { name: 'Open full result' }).click()
-    await expect(page.getByText('Full result artifact')).toBeVisible()
+    await expect(page.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
 
     const downloaded = page.waitForEvent('download')
-    await page.getByRole('button', { name: 'Export full result' }).click()
+    await page.getByRole('button', { name: 'Export all rows' }).click()
     const download = await downloaded
     expect(download.suggestedFilename()).toMatch(/-full-result\.parquet$/)
     const file = await download.path()
@@ -167,7 +197,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
 
       const panel = freshPage.getByTestId('panel-data')
-      await expect(panel.getByText('Full result artifact')).toBeVisible()
+      await expect(panel.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
       await expect(panel.getByRole('button', { name: 'Full result', exact: true }))
         .toHaveAttribute('aria-pressed', 'true')
       const historyAfterOpen = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
@@ -175,11 +205,68 @@ test.describe('researcher golden workflow @ux-smoke', () => {
 
       await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup'")
       await expect(filter.getByTitle('stale')).toBeVisible()
-      await expect(panel.getByText('Full result artifact')).toHaveCount(0)
+      await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
       await expect(panel.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(0)
     } finally {
       await freshContext.close()
       await page.request.delete(`/api/canvas/${doc.id}`)
+    }
+  })
+
+  test('keeps one complete-result header and table space from Canvas through Jobs', async ({ page }) => {
+    const doc = goldenCanvas('ux-full-result-header', 'UX full result header', 'UX full result source')
+    await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const started = await page.request.post('/api/run', {
+      data: { graph, targetNodeId: 'filter', confirmed: true },
+    })
+    expect(started.ok(), started.ok() ? '' : await started.text()).toBe(true)
+    const runId = (await started.json()).runId as string
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+      return (await response.json()).status
+    }, { timeout: 30_000 }).toBe('done')
+
+    await page.goto(`/#/canvas/${doc.id}`)
+    const filter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await filter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const canvasResult = page.getByTestId('panel-data')
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expect(canvasResult.getByRole('button', { name: 'Full result', exact: true }))
+        .toHaveAttribute('aria-pressed', 'true')
+      await expect(canvasResult.getByRole('button', { name: 'Preview sample' })).toHaveCount(1)
+      await expect(canvasResult.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(1)
+      await expectCompactFullResult(canvasResult, 430)
+    }
+
+    await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
+    const job = page.getByRole('button', { name: new RegExp(`Open run ${runId}`) })
+    await expect(job).toHaveAttribute('aria-expanded', 'true')
+    await page.getByRole('button', { name: 'Open result' }).click()
+    const jobsResult = page.getByRole('complementary', { name: 'Retained result' })
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expectCompactFullResult(jobsResult, viewport.height === 720 ? 190 : 250)
     }
   })
 
@@ -269,7 +356,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
         name: 'Retained result parameters unavailable',
       })).toBeVisible()
       await expect(panel.getByRole('button', { name: 'Run this step' })).toBeVisible()
-      await expect(panel.getByText('Full result artifact')).toHaveCount(0)
+      await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
       const historyAfter = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
       expect(await historyAfter.json()).toEqual(runsBefore)
     } finally {
