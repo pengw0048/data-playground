@@ -176,6 +176,7 @@ export function CodeFullscreen() {
                       ? {
                           autoLoad: false,
                           allowStats: false,
+                          resultContext: 'example-rows',
                           onPreview: (offset, portId) => testExampleRows(offset, portId),
                         }
                       : {

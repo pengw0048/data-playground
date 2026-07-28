@@ -27,6 +27,7 @@ export function DataPanel({ nodeId, editorPreview }: {
     autoLoad?: boolean
     emptyState?: ReactNode
     allowStats?: boolean
+    resultContext?: 'example-rows'
   }
 }) {
   const preview = useStore((s) => (
@@ -265,8 +266,12 @@ export function DataPanel({ nodeId, editorPreview }: {
         )}
       </div>
 
-      <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
-        allowNextAttempt={!special} />
+      {editorPreview?.resultContext === 'example-rows' ? (
+        <ExampleRowsResultBanner data={res} offset={offset} />
+      ) : (
+        <DataScopeBanner data={res} offset={offset} unit={isChart ? 'points' : 'rows'} scope="preview"
+          allowNextAttempt={!special} />
+      )}
 
       {isChart ? (
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
@@ -402,6 +407,22 @@ function PageBtn({ dir, disabled, onClick }: { dir: 'prev' | 'next'; disabled: b
       )}>
       <Icon name={dir === 'prev' ? 'chevronLeft' : 'chevronRight'} size={13} />
     </button>
+  )
+}
+
+function ExampleRowsResultBanner({ data, offset }: { data: SampleResult; offset: number }) {
+  const complete = data.completeness === 'complete' && data.rowCount != null
+  const count = complete ? (data.rowCount ?? data.rows.length) : data.rows.length
+  const page = !complete && (offset > 0 || data.hasMore !== false)
+  const summary = `${count.toLocaleString()} output ${count === 1 ? 'row' : 'rows'}${
+    page ? ' on this page' : ''
+  } from Example rows`
+  return (
+    <div role="status" aria-label={`Test result: ${summary}`}
+      className="border-b border-border bg-primary/5 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
+      <span className="font-semibold text-foreground">Test result</span>
+      {' · '}{summary}
+    </div>
   )
 }
 

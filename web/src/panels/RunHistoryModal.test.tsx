@@ -635,6 +635,7 @@ describe('durable full results', () => {
 
     expect(screen.getByText(
       'Testing with Clean events result · 1,234 rows')).toBeInTheDocument()
+    expect(screen.getByText('Preview prefix')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()
   })
 
@@ -648,18 +649,27 @@ describe('durable full results', () => {
     const onPreview = vi.fn()
     useStore.setState({
       doc,
-      editorPreviews: { target: boundPreview(doc, 'target', sample(0, 2, true)) },
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        ...sample(0, 2, true),
+        rowCount: undefined,
+      }) },
     } as any)
     const user = userEvent.setup()
 
     render(<DataPanel nodeId="target" editorPreview={{
       autoLoad: false,
       allowStats: false,
+      resultContext: 'example-rows',
       onPreview,
     }} />)
 
     expect(onPreview).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Stats' })).not.toBeInTheDocument()
+    expect(screen.getByRole('status', {
+      name: 'Test result: 2 output rows on this page from Example rows',
+    })).toHaveTextContent('Test result · 2 output rows on this page from Example rows')
+    expect(screen.queryByText('Preview prefix')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Full dataset not scanned/)).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Next page' }))
     expect(onPreview).toHaveBeenCalledWith(2, undefined)
   })

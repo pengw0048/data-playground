@@ -62,6 +62,11 @@ test('Example rows stay local to the fullscreen Transform editor', async ({ page
     await expect(page.getByText('sentinel', { exact: true })).toBeVisible()
     await expect(page.getByText('true', { exact: true }).first()).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stats' })).toHaveCount(0)
+    await expect(page.getByRole('status', {
+      name: 'Test result: 1 output row from Example rows',
+    })).toHaveText('Test result · 1 output row from Example rows')
+    await expect(page.getByText('Preview prefix', { exact: true })).toHaveCount(0)
+    await expect(page.getByText(/Full dataset not scanned/)).toHaveCount(0)
 
     const after = await (await page.request.get(
       `/api/canvas/${encodeURIComponent(canvasId)}`)).json()
