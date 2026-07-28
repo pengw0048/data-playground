@@ -40,17 +40,18 @@ function qualifiedColumns(side: 'a' | 'b', columns: string[]) {
   return columns.map((column) => `${side}.${column}`).join(' + ')
 }
 
-function fanoutWarning(cardinality: RelatedDatasetCandidate['cardinality']): string | null {
+function cardinalityExplanation(cardinality: RelatedDatasetCandidate['cardinality']): string {
   if (cardinality === '1:N') {
-    return 'This join is 1:N: right input (b) fans out, so joined rows may multiply.'
+    return 'A left input (a) row can match multiple right input (b) rows, so joined rows may multiply.'
   }
   if (cardinality === 'N:1') {
-    return 'This join is N:1: left input (a) fans out, so joined rows may multiply.'
+    return 'A right input (b) row can match multiple left input (a) rows, so joined rows may multiply.'
   }
   if (cardinality === 'N:M') {
-    return 'This join is N:M: both inputs fan out, so joined rows may multiply.'
+    return 'Rows on either input can match multiple rows on the other, so joined rows may multiply.'
   }
-  return null
+  if (cardinality === '1:1') return 'Each input row matches at most one row on the other input.'
+  return 'Cardinality is unknown because it was not measured for this join.'
 }
 
 function joinTypeMeaning(
@@ -64,10 +65,31 @@ function joinTypeMeaning(
   return 'Keeps only rows that match across left input (a) and right input (b).'
 }
 
-function exactLabel(ref: DatasetRef | undefined, fallback: string) {
-  if (!ref) return fallback
-  const exact = ref.kind === 'as_of' ? ref.resolved : ref
-  return `${exact.datasetId}@${exact.revisionId}`
+function revisionLabel(index: number, committedAt?: string | null) {
+  return `Retained version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
+}
+
+function friendlyRevisionError(error: string) {
+  if (error.includes('related_dataset_revision_history_unavailable')) {
+    return 'Version history is unavailable for this dataset.'
+  }
+  return 'Version history could not be loaded. You can still join the current version.'
+}
+
+function friendlyActionError(error: string) {
+  const lowered = error.toLowerCase()
+  if (lowered.includes('canvas')) return 'The Canvas changed while you were reviewing. Refresh it and try again.'
+  if (lowered.includes('dataset') || lowered.includes('evidence') || lowered.includes('revision')) {
+    return 'The selected dataset changed. Refresh the review before trying again.'
+  }
+  return 'The Join could not be added. Try again.'
+}
+
+function relationshipEvidence(candidate: RelatedDatasetCandidate) {
+  if (candidate.cardinality === 'unknown' || candidate.reason.includes('cardinality not measurable')) {
+    return 'Matching key columns.'
+  }
+  return candidate.reason
 }
 
 export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
@@ -343,7 +365,6 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     || error.toLowerCase().includes('evidence')
     || error.toLowerCase().includes('revision')
   )
-  const selectedRef = context.source.data.config.datasetRef as DatasetRef | undefined
   const sourceFallback = page
     ? `${page.source.registrationId ?? page.source.sourceBindingId}@${page.source.revisionMode}`
     : sourceIdentity.kind === 'local' ? sourceIdentity.registrationId
@@ -362,19 +383,15 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const oriented = candidate ? orientedJoinFacts(candidate, sourceOnRight) : null
   const sourceReview = {
     name: page?.sourceName ?? context.source.data.title,
-    identity: exactLabel(selectedRef, sourceFallback),
     role: 'Selected dataset',
   }
   const relatedReview = candidate ? {
     name: candidate.name,
-    identity: candidateIdentity,
     role: 'Related dataset',
   } : null
   const leftReview = sourceOnRight ? relatedReview : sourceReview
   const rightReview = sourceOnRight ? sourceReview : relatedReview
-  const reviewWarning = oriented
-    ? fanoutWarning(oriented.cardinality) ?? candidate?.warning ?? candidate?.cardinalityReason
-    : null
+  const cardinalityCopy = oriented ? cardinalityExplanation(oriented.cardinality) : ''
   const triggerLabel = surface === 'canvas'
     ? context.joinNodeId
       ? `Join with related data on ${context.emptyPort === 'a' ? 'left' : 'right'} input`
@@ -402,7 +419,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
             <div>
               <div className="text-sm font-semibold text-foreground">Join with related data</div>
               <div className="mt-0.5 text-[11px] text-muted-foreground">
-                Nothing changes until the final confirmation.
+                Review the relationship before adding this Join to the Canvas.
               </div>
             </div>
             <button type="button" aria-label="Cancel Join with related data" disabled={confirming}
@@ -410,6 +427,9 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
           </div>
           <div className="overflow-y-auto p-4">
             {!candidate ? <>
+              {page && <div className="mb-3 text-xs text-muted-foreground">
+                Join <strong className="text-foreground">{page.sourceName}</strong> with a related dataset.
+              </div>}
               <div className="grid grid-cols-2 gap-2">
                 <Label className="text-[10.5px]">Search
                   <Input autoFocus value={q} onChange={(event) => setQ(event.target.value)}
@@ -463,7 +483,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                   <span className="text-muted-foreground">Cardinality</span>
                   <span><span className={cn('rounded px-1.5 py-0.5 font-semibold', CARDINALITY_TONE[oriented!.cardinality])}>
                     {oriented!.cardinality}
-                  </span>{oriented!.cardinality === 'unknown' && ' — not verified; selectable with caution'}</span>
+                  </span> — {cardinalityCopy}</span>
                   <span className="text-muted-foreground">Version</span>
                   <span>
                     <select aria-label="Related dataset version"
@@ -472,8 +492,8 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                       onChange={(event) => { void selectRevision(event.target.value) }}
                       className="h-7 max-w-full rounded border border-border bg-background px-2">
                       <option value="">Current version</option>
-                      {revisions?.items.map((revision) => <option key={revision.revisionId} value={revision.revisionId}>
-                        {revision.revisionId}{revision.committedAt ? ` · ${new Date(revision.committedAt).toLocaleString()}` : ''}
+                      {revisions?.items.map((revision, index) => <option key={revision.revisionId} value={revision.revisionId}>
+                        {revisionLabel(index, revision.committedAt)}
                       </option>)}
                     </select>
                     {loadingRevisions && <span className="ml-2 text-muted-foreground">Loading retained versions…</span>}
@@ -484,7 +504,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                       {loadingMoreRevisions ? 'Loading…' : 'Load more versions'}
                     </Button>}
                     {revisionError && <span role="status" className="ml-2 text-muted-foreground">
-                      Retained versions unavailable: {revisionError}
+                      {friendlyRevisionError(revisionError)}
                       {requestedRevisionId && <Button type="button" size="sm" variant="outline"
                         className="ml-2 h-7" disabled={revising}
                         onClick={() => void selectRevision(requestedRevisionId)}>Retry selected version</Button>}
@@ -500,12 +520,18 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                     {joinTypeMeaning(how, leftReview!.name, rightReview!.name)}
                   </span>
                 </div>
+                <details className="text-[10px] text-muted-foreground">
+                  <summary>Details</summary>
+                  <div className="mt-1 break-all font-mono">
+                    Selected binding: {sourceFallback}<br />
+                    Related binding: {candidateIdentity}
+                  </div>
+                  {revisionError && <div className="mt-1 break-all font-mono">Diagnostic: {revisionError}</div>}
+                  {error && <div className="mt-1 break-all font-mono">Diagnostic: {error}</div>}
+                </details>
               </div>
-              {reviewWarning && <div className="mt-3 rounded border border-amber-300/60 bg-amber-50 p-2 text-[11px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                ⚠ {reviewWarning}
-              </div>}
               {error && <div role="alert" className="mt-3 rounded border border-destructive/30 p-2 text-[11px] text-destructive">
-                {error}
+                {friendlyActionError(error)}
                 <div className="mt-2 flex gap-2">
                   {conflict && <Button size="sm" variant="outline" disabled={confirming}
                     onClick={() => void reapplyLatestCanvas()}>Reapply to latest Canvas</Button>}
@@ -545,10 +571,12 @@ function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
           className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border p-2.5 text-left hover:bg-accent">
           <span className="min-w-0">
             <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
-            <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
+            <span className="block text-[10.5px] text-muted-foreground">{relationshipEvidence(candidate)}</span>
             <span className="block truncate font-mono text-[10px] text-muted-foreground">
               {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
             </span>
+            <span className="block text-[10px] text-muted-foreground">{EVIDENCE_LABEL[candidate.evidence]} · Inner join</span>
+            <span className="block text-[10px] text-muted-foreground">{cardinalityExplanation(oriented.cardinality)}</span>
           </span>
           <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
             CARDINALITY_TONE[oriented.cardinality])}>{oriented.cardinality}</span>
@@ -558,10 +586,9 @@ function CandidateGroup({ title, candidates, swapInputs, onSelect }: {
   </section>
 }
 
-function ReviewIdentity({ label, name, identity, role }: {
+function ReviewIdentity({ label, name, role }: {
   label: string
   name: string
-  identity: string
   role: string
 }) {
   return <div className="grid grid-cols-[120px_1fr] gap-2">
@@ -569,7 +596,6 @@ function ReviewIdentity({ label, name, identity, role }: {
     <span>
       <strong>{name}</strong>
       <span className="ml-1.5 text-[9.5px] text-muted-foreground">{role}</span>
-      <span className="mt-0.5 block break-all font-mono text-[10px] text-muted-foreground">{identity}</span>
     </span>
   </div>
 }
