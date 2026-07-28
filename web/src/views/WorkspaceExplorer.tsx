@@ -1504,7 +1504,11 @@ function CanvasDeleteDialog({ resource, onClose, onDeleted }: {
     finally { setBusy(false) }
   }
   return <Modal label={`Delete ${resource.name}`} onClose={onClose}>
-    <p className="text-[12px] text-muted-foreground">Delete this local Canvas? This cannot be undone.</p>
+    <div className="space-y-2 text-[12px] text-muted-foreground">
+      <p>Delete this local Canvas? This cannot be undone.</p>
+      <p>This permanently deletes its version history, run and Job history, Inbox outcomes, and retained intermediate results.</p>
+      <p>Published or managed datasets remain available.</p>
+    </div>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={busy} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button></div>

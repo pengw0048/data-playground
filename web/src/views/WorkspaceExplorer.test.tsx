@@ -372,6 +372,10 @@ describe('WorkspaceExplorer', () => {
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    expect(screen.getByRole('dialog', { name: 'Delete Analysis' })).toHaveTextContent(
+      'This permanently deletes its version history, run and Job history, Inbox outcomes, and retained intermediate results.')
+    expect(screen.getByRole('dialog', { name: 'Delete Analysis' })).toHaveTextContent(
+      'Published or managed datasets remain available.')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(mocks.deleteCanvas).not.toHaveBeenCalled()
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
