@@ -62,15 +62,20 @@ export function validateEditorExampleRows(value: string): EditorExampleRowsValid
 }
 
 function starterValue(column: ColumnSchema): unknown {
-  const type = String(column.physicalType || column.type || '').toLowerCase()
+  // The logical schema is the contract shown to the researcher. Prefer it to an
+  // implementation-specific physical spelling when preparing a test fixture.
+  const type = String(column.type || column.physicalType || '').toLowerCase()
   if (type.includes('bool')) return true
-  if (/(^|[^a-z])(u?int|integer|hugeint|smallint|tinyint)/.test(type)) return 1
-  if (/(float|double|real|decimal|numeric)/.test(type)) return 1.5
+  if (/(^|[^a-z])(?:u?int(?:8|16|32|64|128)?|u?(?:big|huge|small|tiny)int|integer)(?:[^a-z]|$)/.test(type)) return 1
+  if (/(float|double|real|decimal|numeric|number)/.test(type)) return 1.5
   if (/(list|array)/.test(type)) return []
   if (/(struct|map|json)/.test(type)) return { example: 'value' }
   if (type.includes('timestamp') || type.includes('datetime')) return '2026-01-01T00:00:00Z'
   if (type.includes('date')) return '2026-01-01'
-  return 'example'
+  if (/(char|text|string|varchar|uuid)/.test(type)) return 'example'
+  // Do not invent a string for an unrecognized type: `null` stays JSON-native
+  // without claiming that the field is text.
+  return null
 }
 
 export function editorExampleRowsStarter(columns: ColumnSchema[]): string {

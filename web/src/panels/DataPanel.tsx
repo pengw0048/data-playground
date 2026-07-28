@@ -130,10 +130,15 @@ export function DataPanel({ nodeId, editorPreview }: {
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
-    return withOutputPorts(<StalePreview onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
+    return withOutputPorts(<StalePreview
+      exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
+      onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
-  if (preview.error) return withOutputPorts(<ErrorState reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
+  if (preview.error) return withOutputPorts(<ErrorState
+    title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
+    retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
+    reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
   const res = preview.result!
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
@@ -141,11 +146,15 @@ export function DataPanel({ nodeId, editorPreview }: {
     const canEditFailure = canEdit && failureNode?.type === 'transform'
       && failureNode.data.config.source !== 'library'
     return withOutputPorts(<UserCodeFailure failure={res.userCodeException}
+      exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
       onEdit={canEditFailure
         ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
         : undefined} />)
   }
-  if (res.error) return withOutputPorts(<ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
+  if (res.error) return withOutputPorts(<ErrorState
+    title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
+    retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
+    reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
   const isMetric = node?.type === 'metric'
   const isChart = node?.type === 'chart'
   const artifactPresentation: ArtifactPresentation | undefined = isChart
@@ -392,12 +401,17 @@ function OutputOutcomeBadge({ outcome }: { outcome: RunOutput['outcome'] }) {
   )
 }
 
-function StalePreview({ onRefresh }: { onRefresh: () => void }) {
+function StalePreview({ onRefresh, exampleRowsTest = false }: {
+  onRefresh: () => void
+  exampleRowsTest?: boolean
+}) {
   return (
     <div role="status" className="flex flex-col items-start gap-2 px-4 py-5 text-[12px] text-muted-foreground">
-      <span className="font-medium text-foreground">Preview out of date</span>
-      <span>The graph changed after these rows were fetched. Refresh to inspect the current result.</span>
-      <Button size="sm" onClick={onRefresh}><Icon name="refresh" size={13} /> Refresh preview</Button>
+      <span className="font-medium text-foreground">{exampleRowsTest ? 'Example rows test out of date' : 'Preview out of date'}</span>
+      <span>{exampleRowsTest
+        ? 'The code or example rows changed after this test. Test code again to inspect the current result.'
+        : 'The graph changed after these rows were fetched. Refresh to inspect the current result.'}</span>
+      <Button size="sm" onClick={onRefresh}><Icon name="refresh" size={13} /> {exampleRowsTest ? 'Test code' : 'Refresh preview'}</Button>
     </div>
   )
 }
@@ -1072,8 +1086,8 @@ function Skeleton() {
   )
 }
 
-function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
-  title?: string; reason: string; onRetry?: () => void; onCancel?: () => void
+function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel, retryLabel = 'Retry' }: {
+  title?: string; reason: string; onRetry?: () => void; onCancel?: () => void; retryLabel?: string
 }) {
   return (
     <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
@@ -1084,7 +1098,7 @@ function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
       <div className="dp-mono mx-auto mt-2 max-w-[380px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">{reason}</div>
       {(onRetry || onCancel) && <div className="mt-3.5 flex items-center justify-center gap-2">
         {onCancel && <Button variant="outline" size="sm" onClick={onCancel}>Cancel run</Button>}
-        {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}
+        {onRetry && <Button variant="outline" size="sm" onClick={onRetry}>{retryLabel}</Button>}
       </div>}
     </div>
   )
@@ -1092,10 +1106,11 @@ function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
 
 
 function UserCodeFailure({
-  failure, onEdit,
+  failure, onEdit, exampleRowsTest = false,
 }: {
   failure: NonNullable<SampleResult['userCodeException']>
   onEdit?: () => void
+  exampleRowsTest?: boolean
 }) {
   const location = failure.nodeTitle || failure.nodeId
   return (
@@ -1124,7 +1139,9 @@ function UserCodeFailure({
         </div>
       )}
       <div className="mx-auto mt-2 max-w-[380px] text-[11px]">
-        Edit the transform code or handle this input value before previewing again.
+        {exampleRowsTest
+          ? 'Edit the transform code or example rows, then test again.'
+          : 'Edit the transform code or handle this input value before previewing again.'}
       </div>
       {onEdit && (
         <Button variant="outline" size="sm" onClick={onEdit} className="mt-3.5">Edit code</Button>
