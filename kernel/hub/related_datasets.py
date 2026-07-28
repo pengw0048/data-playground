@@ -400,6 +400,13 @@ def _fanout(cardinality: str) -> str | None:
     return "This join may multiply rows; inspect the resulting Join analysis before running."
 
 
+def _reason_with_measured_cardinality(seed: _Seed, cardinality: str) -> str:
+    """Keep relationship evidence and the later bounded measurement in one coherent explanation."""
+    evidence = ("matching key column(s)"
+                if seed.evidence == "schema_match" else seed.reason)
+    return f"{evidence}; {cardinality} measured from both current dataset versions"
+
+
 def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDatasetIdentity, *,
                      q: str | None = None, folder: str | None = None, limit: int = 10,
                      _measure_cardinality: bool = True) -> RelatedDatasetPage:
@@ -552,6 +559,7 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
             cardinality = seed.declared_cardinality
             cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
             cardinality_reason = None
+            reason = seed.reason
             # A current-head measurement must never be presented as evidence for an exact review.
             # Keep an owner-declared cardinality, but do not scan an exact revision merely to fill
             # a missing value. The explicit state makes that intentional omission visible.
@@ -570,9 +578,11 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                 except Exception:
                     cardinality = "unknown"
                 cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
+                if cardinality_state == "available":
+                    reason = _reason_with_measured_cardinality(seed, cardinality)
             candidate = RelatedDatasetCandidate(
                 identity=seed.identity, name=seed.table.name,
-                folder=seed.table.folder, reason=seed.reason, evidence=seed.evidence,
+                folder=seed.table.folder, reason=reason, evidence=seed.evidence,
                 evidence_status=seed.evidence_status, left_columns=seed.left_columns,
                 right_columns=seed.right_columns, cardinality=cardinality,
                 cardinality_state=cardinality_state, cardinality_reason=cardinality_reason,

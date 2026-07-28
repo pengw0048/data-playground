@@ -164,6 +164,58 @@ def test_relationship_evidence_is_primary_and_name_only_stays_a_possible_match(m
     assert all(item.name != "notes" for item in _reviewable_candidates(page))
 
 
+@pytest.mark.parametrize(("left_unique", "right_unique", "expected"), [
+    (True, True, "1:1"),
+    (True, False, "1:N"),
+    (False, True, "N:1"),
+    (False, False, "N:M"),
+])
+def test_schema_match_reason_tracks_current_version_measurement(
+        monkeypatch, left_unique, right_unique, expected):
+    from hub import related_datasets as related
+
+    source = _table("events", [ColumnSchema(name="id", type="int")])
+    peer = _table("images", [ColumnSchema(name="id", type="int")])
+    measured = {source.uri: left_unique, peer.uri: right_unique}
+    monkeypatch.setattr(
+        related.relationships, "measure_unique",
+        lambda uri, *_args: (measured[uri], 2),
+    )
+
+    candidate = related_datasets(
+        _Catalog([source, peer]), lambda _uri: _UnavailableAdapter(), None,
+        source.registration_id,
+    ).possible_matches[0]
+
+    assert candidate.cardinality == expected
+    assert candidate.cardinality_state == "available"
+    assert "not measurable" not in candidate.reason
+    assert candidate.reason == (
+        f"matching key column(s); {expected} measured from both current dataset versions"
+    )
+
+
+def test_schema_match_keeps_unmeasured_reason_when_one_side_is_unknown(monkeypatch):
+    from hub import related_datasets as related
+
+    source = _table("events", [ColumnSchema(name="id", type="int")])
+    peer = _table("images", [ColumnSchema(name="id", type="int")])
+    measured = {source.uri: None, peer.uri: True}
+    monkeypatch.setattr(
+        related.relationships, "measure_unique",
+        lambda uri, *_args: (measured[uri], 2),
+    )
+
+    candidate = related_datasets(
+        _Catalog([source, peer]), lambda _uri: _UnavailableAdapter(), None,
+        source.registration_id,
+    ).possible_matches[0]
+
+    assert candidate.cardinality == "unknown"
+    assert candidate.cardinality_state == "unmeasured"
+    assert candidate.reason == "matching key column(s) — cardinality not measurable here"
+
+
 def test_no_relationship_or_schema_candidate_is_honestly_empty():
     source = _table("events", [ColumnSchema(name="event_key", type="int")])
     unrelated = _table("notes", [ColumnSchema(name="body", type="string")])

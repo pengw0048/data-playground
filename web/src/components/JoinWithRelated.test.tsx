@@ -43,7 +43,7 @@ const page = {
   }],
   possibleMatches: [{
     identity: { kind: 'local', registrationId: 'reg-orders', revisionMode: 'current' },
-    name: 'orders', folder: '', reason: 'matching key column(s) — cardinality not measurable here',
+    name: 'orders', folder: '', reason: 'matching key column(s); 1:N measured from both current dataset versions',
     evidence: 'schema_match', evidenceStatus: 'inferred',
     leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:N',
     cardinalityState: 'available',
@@ -95,6 +95,17 @@ describe('JoinWithRelated', () => {
 
     expect(mocks.confirm).not.toHaveBeenCalled()
     expect(mocks.loadDoc).not.toHaveBeenCalled()
+  })
+
+  it('shows measured cardinality evidence without stale unmeasured copy', async () => {
+    render(<JoinWithRelated nodeId="source-1" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
+    await screen.findByText('Related data')
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+
+    expect(screen.getByText(/1:N measured from both current dataset versions/)).toBeVisible()
+    expect(screen.queryByText(/cardinality not measurable here/)).toBeNull()
+    expect(screen.getByText(/joined rows may multiply/)).toBeVisible()
   })
 
   it('keeps the review after a conflict and installs only a confirmed server document', async () => {
