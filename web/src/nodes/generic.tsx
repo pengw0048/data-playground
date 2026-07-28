@@ -183,13 +183,17 @@ function NumberField({ param, value, draft, onDraft, onCommit }: {
   const text = draft ?? (value == null ? '' : String(value))
   const reason = draft !== undefined
     ? numericParamReason(param, draft)
-    : value != null && (typeof value !== 'number'
+    : value != null && value !== '' && (typeof value !== 'number'
       || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value)))
       ? numericTypeReason(param)
       : null
-  const clearHint = param.default != null
-    ? `Clear to use the declared default (${String(param.default)}).`
-    : !param.required ? 'Clear to leave this value unset.' : null
+  const parsedText = parseNumericParam(text, param.type as 'int' | 'float')
+  const clearHint = parsedText.kind !== 'valid' ? null
+    : param.default != null && parsedText.value !== Number(param.default)
+      ? `Clear to reset to the default (${String(param.default)}).`
+      : param.default == null && !param.required
+        ? 'Clear to leave this value unset.'
+        : null
   return (
     <>
       <MiniInput mono value={text} onChange={(v) => onDraft(v)} onBlur={() => {

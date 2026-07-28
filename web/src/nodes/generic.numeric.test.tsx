@@ -24,13 +24,14 @@ describe('generic numeric plugin fields', () => {
       params: [
         { name: 'count', label: 'Count', type: 'int', required: true },
         { name: 'ratio', label: 'Ratio', type: 'float', default: 0.5 },
+        { name: 'limit', label: 'Limit', type: 'int', required: false },
       ], canBypass: false, previewable: true, blurb: '',
     }])
     useStore.setState({
       canvasRole: 'owner', numericParamDrafts: {}, saved: true,
       doc: { id: 'numeric', name: 'numeric', version: 1, edges: [], nodes: [{
         id: 'plugin', type: 'plugin-numeric-field-contract', position: { x: 0, y: 0 },
-        data: { title: 'numeric', status: 'draft', config: { count: 7 } },
+        data: { title: 'numeric', status: 'draft', config: { count: 7, limit: 10 } },
       }] },
     })
   })
@@ -70,13 +71,25 @@ describe('generic numeric plugin fields', () => {
 
   it('uses the declared default when cleared and keeps a required unset field invalid', () => {
     render(<NodeParamFields nodeId="plugin" />)
-    const [count, ratio] = screen.getAllByRole('textbox') as HTMLInputElement[]
+    const [count, ratio, limit] = screen.getAllByRole('textbox') as HTMLInputElement[]
 
-    expect(screen.getByText('Clear to use the declared default (0.5).')).toBeVisible()
+    expect(screen.queryByText('Clear to reset to the default (0.5).')).toBeNull()
+    expect(screen.getByText('Clear to leave this value unset.')).toBeVisible()
+
+    fireEvent.change(ratio, { target: { value: '0.75' } })
+    fireEvent.blur(ratio)
+    expect(screen.getByText('Clear to reset to the default (0.5).')).toBeVisible()
     fireEvent.change(ratio, { target: { value: '' } })
     fireEvent.blur(ratio)
     expect(ratio).toHaveValue('0.5')
     expect(useStore.getState().doc.nodes[0].data.config.ratio).toBe(0.5)
+    expect(screen.queryByText('Clear to reset to the default (0.5).')).toBeNull()
+
+    fireEvent.change(limit, { target: { value: '' } })
+    fireEvent.blur(limit)
+    expect(limit).toHaveValue('')
+    expect(useStore.getState().doc.nodes[0].data.config.limit).toBeUndefined()
+    expect(screen.queryByText('Clear to leave this value unset.')).toBeNull()
 
     fireEvent.change(count, { target: { value: '' } })
     fireEvent.blur(count)
