@@ -8,14 +8,26 @@ export interface Route { view: DpView; canvasId?: string; nodeId?: string; works
 
 const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match', 'revision', 'revisionDataset'] as const
 
+function decodeRouteSegment(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    // A malformed bookmarked hash is not an application failure. Treat its dynamic identifier as
+    // absent so routing remains on a safe shell/default surface rather than escaping render.
+    return undefined
+  }
+}
+
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
   const [path, rawQuery = ''] = h.split('?', 2)
   const [seg, id] = path.split('/')
   const params = new URLSearchParams(rawQuery)
   const workspaceQuery = params.get('q')?.trim() || undefined
-  if (seg === 'canvas' && id) return {
-    view: 'canvas', canvasId: decodeURIComponent(id),
+  const decodedId = decodeRouteSegment(id)
+  if (seg === 'canvas' && decodedId) return {
+    view: 'canvas', canvasId: decodedId,
     nodeId: params.get('node') || undefined,
   }
   if (seg === 'workspace') {
@@ -28,7 +40,7 @@ export function parseHash(): Route {
     const workspaceDatasetQuery = datasetParams.toString() || undefined
     return {
       view: 'workspace',
-      workspaceResourceId: id ? decodeURIComponent(id) : undefined,
+      workspaceResourceId: decodedId,
       ...(workspaceScope === 'datasets' ? { workspaceScope } : {}),
       ...(workspaceScope === 'datasets' && workspaceDatasetQuery ? { workspaceDatasetQuery } : {}),
       ...(workspaceScope === 'all' && workspaceQuery ? { workspaceQuery } : {}),
@@ -39,7 +51,7 @@ export function parseHash(): Route {
   // Distribution reports are a Jobs detail, not a second navigation system. Preserve the exact
   // report identity in the Jobs route so browser reopen/back follows the same authorized surface.
   if (seg === 'distribution-reports') {
-    const report = id ? decodeURIComponent(id) : params.get('report')
+    const report = decodedId ?? params.get('report')
     if (report) {
       const query = new URLSearchParams({ report })
       const compare = params.get('compare')
@@ -58,7 +70,7 @@ export function parseHash(): Route {
     params.delete('node')
     return {
       view: 'transforms',
-      ...(id ? { transformId: decodeURIComponent(id) } : {}),
+      ...(decodedId ? { transformId: decodedId } : {}),
       ...(transformVersion ? { transformVersion } : {}),
       ...(transformCanvasId && transformNodeId ? { transformCanvasId, transformNodeId } : {}),
       ...(params.size ? { transformQuery: params.toString() } : {}),
