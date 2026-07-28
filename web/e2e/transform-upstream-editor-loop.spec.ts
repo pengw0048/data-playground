@@ -13,6 +13,7 @@ async function seededEvents(page: import('@playwright/test').Page): Promise<Cata
 }
 
 async function openUnprimedEditor(page: import('@playwright/test').Page, suffix: string): Promise<string> {
+  await page.setViewportSize({ width: 1280, height: 720 })
   const events = await seededEvents(page)
   const canvasId = `upstream-editor-${suffix}-${Date.now()}`
   const graph = {
@@ -44,6 +45,7 @@ async function openUnprimedEditor(page: import('@playwright/test').Page, suffix:
   await expect(page.locator('.react-flow__node')).toHaveCount(3)
   await page.getByRole('button', { name: 'Edit code' }).last().click()
   await expect(page.getByRole('button', { name: 'Run upstream' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Test code' })).toBeDisabled()
   return canvasId
 }
 
@@ -55,9 +57,9 @@ test('Run upstream stays in the fullscreen Transform editor and selects its fres
   test.setTimeout(45_000)
   const canvasId = await openUnprimedEditor(page, 'success')
   try {
-    await page.setViewportSize({ width: 1280, height: 720 })
     await page.getByRole('button', { name: 'Run upstream' }).click()
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
+    await expect(page.getByRole('status', { name: 'Upstream run cancelled' })).toHaveCount(0)
     await expect(page.getByRole('status', { name: 'Upstream result ready' })).toBeVisible({ timeout: 20_000 })
     await expect(page.getByRole('button', { name: 'Test code' })).toBeEnabled()
     await expect(page.getByText('true', { exact: true }).first()).toBeVisible({ timeout: 20_000 })
@@ -70,6 +72,13 @@ test('fullscreen Transform confirms an upstream run without leaving the code-tes
   test.setTimeout(45_000)
   const canvasId = await openUnprimedEditor(page, 'confirmation')
   try {
+    const editor = page.locator('.monaco-editor').first()
+    await expect(editor).toContainText('tested_in_editor')
+    await page.getByRole('button', { name: 'Example rows', exact: true }).click()
+    const fixture = page.getByRole('textbox', { name: 'Example rows JSON' })
+    await fixture.fill('[{"event":"confirmation-sentinel"}]')
+    await page.getByRole('button', { name: 'Upstream result' }).click()
+
     await page.route('**/api/run/estimate', async (route) => {
       await route.fulfill({ json: {
         rows: 2_001, bytes: null, placement: 'local', needsConfirm: true,
@@ -81,9 +90,24 @@ test('fullscreen Transform confirms an upstream run without leaving the code-tes
     await expect(confirmation).toBeVisible()
     await expect(confirmation).toContainText('2,001 rows')
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
-    await confirmation.getByRole('button', { name: 'Run upstream' }).click()
+    await expect(page.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    await confirmation.getByRole('button', { name: 'Cancel' }).click()
+    await expect(page.getByRole('status', { name: 'Upstream run cancelled' })).toBeVisible()
+    await expect(editor).toContainText('tested_in_editor')
+    await page.getByRole('button', { name: 'Example rows', exact: true }).click()
+    await expect(fixture).toHaveValue('[{"event":"confirmation-sentinel"}]')
+    await page.getByRole('button', { name: 'Upstream result' }).click()
+
+    await page.getByRole('button', { name: 'Run upstream' }).click()
+    const retriedConfirmation = page.getByRole('region', { name: 'Confirm upstream run' })
+    await expect(retriedConfirmation).toBeVisible()
+    await retriedConfirmation.getByRole('button', { name: 'Run upstream' }).click()
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
     await expect(page.getByRole('status', { name: 'Upstream result ready' })).toBeVisible({ timeout: 20_000 })
+    await expect(page.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    await expect(editor).toContainText('tested_in_editor')
+    await page.getByRole('button', { name: 'Example rows', exact: true }).click()
+    await expect(fixture).toHaveValue('[{"event":"confirmation-sentinel"}]')
   } finally {
     await removeCanvas(page, canvasId)
   }
@@ -98,7 +122,8 @@ test('fullscreen Transform reports an upstream failure without closing the edito
     await page.getByRole('button', { name: 'Run upstream' }).click()
     await expect(page.getByRole('alert', { name: 'Upstream run failed' })).toContainText('forced upstream estimate failure')
     await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    await expect(page.locator('.monaco-editor').first()).toContainText('tested_in_editor')
   } finally {
     await removeCanvas(page, canvasId)
   }
