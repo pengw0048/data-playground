@@ -134,7 +134,7 @@ export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; om
                 {val ? 'true' : 'false'}
               </button>
             ) : p.type === 'int' || p.type === 'float' ? (
-              <NumberField param={p} value={val} draft={numericDrafts?.[p.name]}
+              <NumberField param={p} value={configured} draft={numericDrafts?.[p.name]}
                 onDraft={(text) => setNumericDraft(nodeId, p.name, text)}
                 onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
             ) : (
@@ -180,10 +180,11 @@ function NumberField({ param, value, draft, onDraft, onCommit }: {
   param: BackendParam; value: unknown; draft?: string
   onDraft: (text: string | undefined) => void; onCommit: (n: number | undefined) => void
 }) {
-  const text = draft ?? (value == null ? '' : String(value))
+  const settled = value ?? param.default
+  const text = draft ?? (settled == null ? '' : String(settled))
   const reason = draft !== undefined
     ? numericParamReason(param, draft)
-    : value == null || value === ''
+    : value == null
       ? numericParamReason(param, text)
       : typeof value !== 'number'
         || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value))
