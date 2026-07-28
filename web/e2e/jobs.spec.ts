@@ -176,9 +176,14 @@ test('long shared-prefix Canvas names keep their suffixes visible without wideni
   const prefix = 'Robotics preprocessing experiment with shared discovery and filtering context — '
   const leftName = `${prefix}left-camera-pass`
   const rightName = `${prefix}right-camera-pass`
+  const unicodePrefix = '多语言研究画布😀共享前缀数据清洗实验阶段一二三四五六七八九十—'
+  const unicodeLeftName = `${unicodePrefix}左侧相机`
+  const unicodeRightName = `${unicodePrefix}右侧相机`
   const jobs = [
     { ...failedJob, id: 'history-left', runId: 'run-left', canvasId: 'canvas-left', canvasName: leftName },
     { ...failedJob, id: 'history-right', runId: 'run-right', canvasId: 'canvas-right', canvasName: rightName },
+    { ...failedJob, id: 'history-unicode-left', runId: 'run-unicode-left', canvasId: 'canvas-unicode-left', canvasName: unicodeLeftName },
+    { ...failedJob, id: 'history-unicode-right', runId: 'run-unicode-right', canvasId: 'canvas-unicode-right', canvasName: unicodeRightName },
   ]
   await page.route('**/api/canvas', async (route) => route.fulfill({
     json: jobs.map((job) => ({
@@ -192,11 +197,16 @@ test('long shared-prefix Canvas names keep their suffixes visible without wideni
   await page.goto('/#/jobs')
   const left = page.getByTitle(leftName)
   const right = page.getByTitle(rightName)
+  const unicodeLeft = page.getByTitle(unicodeLeftName)
+  const unicodeRight = page.getByTitle(unicodeRightName)
   await expect(left).toHaveText(leftName)
   await expect(right).toHaveText(rightName)
+  expect(Array.from(unicodeLeftName)).toHaveLength(35)
+  await expect(unicodeLeft).toHaveText(unicodeLeftName)
+  await expect(unicodeRight).toHaveText(unicodeRightName)
   for (const [width, height] of [[1280, 720], [1440, 900]] as const) {
     await page.setViewportSize({ width, height })
-    for (const subject of [left, right]) {
+    for (const subject of [left, right, unicodeLeft, unicodeRight]) {
       await expect(subject).toBeVisible()
       const row = subject.locator('xpath=ancestor::button')
       expect(await row.evaluate((element) => element.scrollWidth <= element.clientWidth),
@@ -207,6 +217,21 @@ test('long shared-prefix Canvas names keep their suffixes visible without wideni
     }
     await expect(left.locator('span').last()).toContainText('left-camera-pass')
     await expect(right.locator('span').last()).toContainText('right-camera-pass')
+    await expect(unicodeLeft.locator('span').last()).toContainText('左侧相机')
+    await expect(unicodeRight.locator('span').last()).toContainText('右侧相机')
+    for (const subject of [unicodeLeft, unicodeRight]) {
+      expect(await subject.evaluate((element) => {
+        const suffix = element.lastElementChild?.lastElementChild
+        const text = suffix?.firstChild
+        if (!(suffix instanceof HTMLElement) || !(text instanceof Text) || text.length === 0) return false
+        const finalCharacter = document.createRange()
+        finalCharacter.setStart(text, text.length - 1)
+        finalCharacter.setEnd(text, text.length)
+        const characterBox = finalCharacter.getBoundingClientRect()
+        const subjectBox = element.getBoundingClientRect()
+        return characterBox.left >= subjectBox.left && characterBox.right <= subjectBox.right
+      }), `Canvas suffix ending should remain visible at ${width}px`).toBe(true)
+    }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
       `Jobs should not create page overflow at ${width}px`).toBe(true)
   }

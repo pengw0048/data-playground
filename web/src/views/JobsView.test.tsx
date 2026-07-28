@@ -68,10 +68,15 @@ describe('JobsView', () => {
     const prefix = 'Robotics preprocessing experiment with shared discovery and filtering context — '
     const left = `${prefix}left-camera-pass`
     const right = `${prefix}right-camera-pass`
+    const unicodePrefix = '多语言研究画布😀共享前缀数据清洗实验阶段一二三四五六七八九十—'
+    const unicodeLeft = `${unicodePrefix}左侧相机`
+    const unicodeRight = `${unicodePrefix}右侧相机`
     mocks.workspaceJobs.mockResolvedValue({
       items: [
         job({ id: 'history-left', runId: 'run-left', canvasName: left }),
         job({ id: 'history-right', runId: 'run-right', canvasName: right }),
+        job({ id: 'history-unicode-left', runId: 'run-unicode-left', canvasName: unicodeLeft }),
+        job({ id: 'history-unicode-right', runId: 'run-unicode-right', canvasName: unicodeRight }),
       ],
       hasMore: false, nextCursor: null,
     })
@@ -80,11 +85,18 @@ describe('JobsView', () => {
 
     const leftSubject = await screen.findByTitle(left)
     const rightSubject = await screen.findByTitle(right)
+    const unicodeLeftSubject = await screen.findByTitle(unicodeLeft)
+    const unicodeRightSubject = await screen.findByTitle(unicodeRight)
     expect(leftSubject).toHaveTextContent(left)
     expect(rightSubject).toHaveTextContent(right)
     expect(leftSubject.lastElementChild?.textContent).not.toBe(rightSubject.lastElementChild?.textContent)
     expect(leftSubject.lastElementChild?.textContent).toContain('left-camera-pass')
     expect(rightSubject.lastElementChild?.textContent).toContain('right-camera-pass')
+    expect(Array.from(unicodeLeft)).toHaveLength(35)
+    expect(unicodeLeftSubject.lastElementChild?.textContent).toContain('左侧相机')
+    expect(unicodeRightSubject.lastElementChild?.textContent).toContain('右侧相机')
+    expect(unicodeLeftSubject.lastElementChild?.textContent)
+      .not.toBe(unicodeRightSubject.lastElementChild?.textContent)
   })
 
   it('uses the history identity when a legacy row has no logical run id', async () => {

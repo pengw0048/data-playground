@@ -459,14 +459,16 @@ const JOB_SUBJECT_SUFFIX_LENGTH = 18
 
 function JobSubject({ name }: { name: string }) {
   const characters = Array.from(name)
-  if (characters.length <= JOB_SUBJECT_SUFFIX_LENGTH * 2) {
+  if (characters.length <= JOB_SUBJECT_SUFFIX_LENGTH) {
     return <span className="block truncate font-semibold text-foreground" title={name}>{name}</span>
   }
   const split = characters.length - JOB_SUBJECT_SUFFIX_LENGTH
   return (
     <span className="flex min-w-0 font-semibold text-foreground" title={name}>
       <span className="min-w-0 truncate">{characters.slice(0, split).join('')}</span>
-      <span className="shrink-0">{characters.slice(split).join('')}</span>
+      <span className="flex max-w-full shrink-0 justify-end overflow-hidden whitespace-nowrap">
+        <span className="shrink-0">{characters.slice(split).join('')}</span>
+      </span>
     </span>
   )
 }
