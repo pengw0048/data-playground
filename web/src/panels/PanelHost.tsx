@@ -41,7 +41,7 @@ function AnchoredPanel({ nodeId, kind }: { nodeId: string; kind: PanelKind }) {
   const content = (
     <>
       <PanelTitle nodeId={nodeId} title={title} kind={kind} maximized={max} onToggleMax={() => setMax((m) => !m)} onClose={() => close(nodeId)} />
-      <div style={{ overflow: 'auto', flex: 1 }}>
+      <div style={{ overflow: 'auto', flex: 1, minHeight: 0 }}>
         <ErrorBoundary compact>
           {kind === 'data' && <DataPanel nodeId={nodeId} />}
           {kind === 'run' && <RunPanel nodeId={nodeId} />}
