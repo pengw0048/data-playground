@@ -1601,7 +1601,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings Execution explains built-in runners without exposing local worker ids', async ({ page }) => {
-    await page.goto('/')
+    await goToWorkspace(page)
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Execution' }).click()
