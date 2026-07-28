@@ -3954,29 +3954,48 @@ def _retained_editor_output(
         if item["node_id"] in retained_source_ids
     ]
     retained_by_node = {item["node_id"]: item for item in retained_inputs}
-    current_sources = [node for node in current_cone.nodes if node.type == "source"]
-    try:
-        exact_current = {
-            node.id: dataset_ref_identity(node.data.get("config", {}).get("datasetRef"))
-            for node in current_sources
-        }
-    except (TypeError, ValueError) as exc:
-        raise _retained_editor_error(
-            409, "current upstream Source is not pinned to an exact revision",
-            APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    current_sources = {node.id: node for node in current_cone.nodes if node.type == "source"}
+    retained_sources = {node.id: node for node in retained_cone.nodes if node.type == "source"}
+
+    def current_source_matches_admission(node_id: str, admitted: dict[str, str]) -> bool:
+        """Prove current Source intent still names this retained admission.
+
+        Workspace Sources normally retain their immutable catalog registration, not a caller-owned
+        exact DatasetRef.  The admitted manifest remains the exact historical input; matching that
+        registration permits a catalog head to advance without recasting this retained result as
+        latest data.  An explicit DatasetRef remains the stricter legacy/exact form.
+        """
+        current = current_sources.get(node_id)
+        retained_source = retained_sources.get(node_id)
+        if current is None or retained_source is None:
+            return False
+        current_config = current.data.get("config", {})
+        retained_config = retained_source.data.get("config", {})
+        if not isinstance(current_config, dict) or not isinstance(retained_config, dict):
+            return False
+        dataset_ref = current_config.get("datasetRef")
+        if isinstance(dataset_ref, dict):
+            try:
+                return dataset_ref_identity(dataset_ref) == (
+                    admitted["dataset_id"], admitted["revision_id"])
+            except (TypeError, ValueError):
+                return False
+        registration_id = current_config.get("registrationId")
+        return (
+            isinstance(registration_id, str)
+            and bool(registration_id)
+            and registration_id == admitted["dataset_id"]
+            and retained_config.get("registrationId") == registration_id
+        )
+
     if (
         len(retained_by_node) != len(retained_source_ids)
-        or set(exact_current) != set(retained_by_node)
-        or any(
-            exact_current[node_id] != (
-                retained_by_node[node_id]["dataset_id"],
-                retained_by_node[node_id]["revision_id"],
-            )
-            for node_id in exact_current
-        )
+        or set(current_sources) != set(retained_by_node)
+        or any(not current_source_matches_admission(node_id, admitted)
+               for node_id, admitted in retained_by_node.items())
     ):
         raise _retained_editor_error(
-            409, "the immediate upstream exact Source binding changed",
+            409, "the immediate upstream Source registration changed",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
     retained_graph._parameter_bindings = copy.deepcopy(admission.get("parameters") or [])
     retained_cone._parameter_bindings = copy.deepcopy(retained_graph._parameter_bindings)

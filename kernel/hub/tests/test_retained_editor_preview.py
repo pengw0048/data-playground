@@ -94,7 +94,7 @@ def _wait(run_id: str) -> dict:
 
 
 @contextmanager
-def _retained_sample(tmp_path, configure_graph=None):
+def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     lance = pytest.importorskip("lance")
     canvas_id = f"retained-editor-{uuid.uuid4().hex}"
     source_uri = str(tmp_path / f"{canvas_id}.lance")
@@ -107,14 +107,17 @@ def _retained_sample(tmp_path, configure_graph=None):
     })
     assert registered.status_code == 200, registered.text
     graph = _graph(canvas_id)
-    graph["nodes"][0]["data"]["config"] = {
-        "uri": source_uri,
-        "datasetRef": {
-            "kind": "exact",
-            "datasetId": registered.json()["registrationId"],
-            "revisionId": "1",
-        },
-    }
+    graph["nodes"][0]["data"]["config"] = (
+        {"uri": source_uri, "registrationId": registered.json()["registrationId"]}
+        if logical_source else {
+            "uri": source_uri,
+            "datasetRef": {
+                "kind": "exact",
+                "datasetId": registered.json()["registrationId"],
+                "revisionId": "1",
+            },
+        }
+    )
     if configure_graph is not None:
         configure_graph(graph)
     with metadb.session() as session:
@@ -443,6 +446,35 @@ def test_exact_source_reuses_retained_rows_without_reopening_provider(
     response = _preview(graph)
     assert response.status_code == 200, response.text
     assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_logical_workspace_source_reuses_retained_rows_after_head_advances(
+        tmp_path, monkeypatch):
+    """Workspace Use Sources carry registrationId, while the run owns its exact revision."""
+    lance = pytest.importorskip("lance")
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        source_uri = graph["nodes"][0]["data"]["config"]["uri"]
+        lance.write_dataset(pa.table({
+            "event": ["new-head"], "amount": [999],
+        }), source_uri, mode="append")
+
+        def forbidden_revision_read(*_args, **_kwargs):
+            raise AssertionError("editor reuse must read only the retained upstream result")
+
+        monkeypatch.setattr(LanceAdapter, "open_revision", forbidden_revision_read)
+        monkeypatch.setattr(LanceAdapter, "preview_revision", forbidden_revision_read)
+        response = _preview(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_logical_workspace_source_registration_change_invalidates_reuse(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, _run_id, _output):
+        changed = copy.deepcopy(graph)
+        changed["nodes"][0]["data"]["config"]["registrationId"] = "replaced-registration"
+        response = _preview(changed)
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "retained_upstream_stale"
 
 
 def test_official_transform_run_does_not_depend_on_editor_retained_input(retained_sample):
