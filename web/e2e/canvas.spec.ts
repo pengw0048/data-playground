@@ -1344,8 +1344,8 @@ test.describe('Data Playground canvas', () => {
           { id: 'write', type: 'write', position: { x: 560, y: 80 }, data: { title: 'Write', status: 'draft', config: {} } },
         ],
         edges: [
-          { id: 'source-select', source: 'source', target: 'select' },
-          { id: 'select-write', source: 'select', target: 'write' },
+          { id: 'source-select', source: 'source', sourceHandle: 'out', target: 'select', targetHandle: 'in' },
+          { id: 'select-write', source: 'select', sourceHandle: 'out', target: 'write', targetHandle: 'in' },
         ],
       }]) {
         const created = await page.request.post('/api/canvas', { data: { ...canvas, version: 1, requirements: [] } })

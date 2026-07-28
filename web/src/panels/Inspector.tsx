@@ -442,6 +442,9 @@ function CodeBtn({ icon, label, onClick, disabled }: { icon: IconName; label: st
 export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boolean {
   const checkpoint = doc.nodes.find((node) => node.id === nodeId)
   if (!checkpoint || checkpoint.type !== 'select' || doc.nodes.length !== 3 || doc.edges.length !== 2) return false
+  const otherCheckpoint = doc.nodes.some((node) =>
+    node.id !== nodeId && (node.data.config as Record<string, unknown>)?.checkpoint === true)
+  if (otherCheckpoint) return false
   const source = doc.nodes.find((node) => node.type === 'source')
   const write = doc.nodes.find((node) => node.type === 'write')
   if (!source || !write || [source, checkpoint, write].some((node) => node.data.bypassed || node.data.disabled)) return false
@@ -449,8 +452,10 @@ export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boole
   const writeIn = doc.edges.find((edge) => edge.target === write.id)
   return selectIn?.source === source.id
     && writeIn?.source === checkpoint.id
-    && selectIn.sourceHandle == null && selectIn.targetHandle == null
-    && writeIn.sourceHandle == null && writeIn.targetHandle == null
+    && (selectIn.sourceHandle == null || selectIn.sourceHandle === 'out')
+    && (selectIn.targetHandle == null || selectIn.targetHandle === 'in')
+    && (writeIn.sourceHandle == null || writeIn.sourceHandle === 'out')
+    && (writeIn.targetHandle == null || writeIn.targetHandle === 'in')
 }
 
 function CheckpointToggle({ nodeId }: { nodeId: string }) {
