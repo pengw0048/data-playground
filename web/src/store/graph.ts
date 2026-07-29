@@ -1140,6 +1140,7 @@ interface Store {
   // remote Canvas nor a recoverable local draft.  The Workspace consumes it as the first-run choice.
   firstRunChoice: boolean
   numericParamDrafts: Record<string, Record<string, string>>  // invalid/pending text; never persisted
+  renameDraft: { id: string; value: string } | null // transient text survives a React Flow node refresh
 
   agentOpen: boolean
   agentLog: AgentMsg[]
@@ -1182,6 +1183,10 @@ interface Store {
   bypass: (id: string) => void
   disable: (id: string) => void
   rename: (id: string, title: string) => void
+  startRename: (id: string, title: string) => void
+  updateRenameDraft: (id: string, value: string) => void
+  commitRename: (id: string) => void
+  cancelRename: (id: string) => void
   duplicate: (id: string) => void
 
   commit: () => void
@@ -1756,6 +1761,7 @@ export const useStore = create<Store>((set, get) => ({
   draftStorageErrors: [],
   firstRunChoice: false,
   numericParamDrafts: {},
+  renameDraft: null,
   agentOpen: false,
   agentLog: [],
 
@@ -2209,6 +2215,25 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     get().updateData(id, { title })
   },
+
+  startRename: (id, title) => {
+    if (roleCanEdit(get().canvasRole)) set({ renameDraft: { id, value: title } })
+  },
+
+  updateRenameDraft: (id, value) => set((state) => (
+    state.renameDraft?.id === id ? { renameDraft: { id, value } } : state
+  )),
+
+  commitRename: (id) => {
+    const draft = get().renameDraft
+    if (draft?.id !== id) return
+    set({ renameDraft: null })
+    if (draft.value.trim()) get().rename(id, draft.value.trim())
+  },
+
+  cancelRename: (id) => set((state) => (
+    state.renameDraft?.id === id ? { renameDraft: null } : state
+  )),
 
   duplicate: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
@@ -4303,7 +4328,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {
