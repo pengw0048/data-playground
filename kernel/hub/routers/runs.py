@@ -762,8 +762,8 @@ def _runtime_schema_write_eligible(graph: Graph, node_id: str, schemas: dict[str
     """Recognize the one ordinary dynamic-output Write contract.
 
     This is intentionally stricter than "the schema is unknown": the unknown must come from the
-    direct, editable ad-hoc Python Transform.  Source evidence must still be available, so an
-    unavailable exact input cannot be recast as runtime output discovery.
+    direct, editable ad-hoc Python Transform.  Its one input must still have a resolved schema, so
+    an unavailable input cannot be recast as runtime output discovery.
     """
     inbound = graph_mod.incoming(graph, node_id)
     if len(inbound) != 1:
@@ -778,12 +778,8 @@ def _runtime_schema_write_eligible(graph: Graph, node_id: str, schemas: dict[str
     transform_inputs = graph_mod.incoming(graph, transform.id)
     if len(transform_inputs) != 1:
         return False
-    source = nodes.get(transform_inputs[0].source)
-    return (
-        source is not None
-        and source.type == "source"
-        and schemas.get(source.id) is not None
-    )
+    transform_input = nodes.get(transform_inputs[0].source)
+    return transform_input is not None and schemas.get(transform_input.id) is not None
 
 
 def _managed_file_schema_drift(

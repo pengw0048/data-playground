@@ -345,16 +345,14 @@ def test_runtime_schema_does_not_bypass_resolution_error(contract, monkeypatch):
     assert admission.blocker is not None and "bounded output schema" in admission.blocker
 
 
-@pytest.mark.parametrize("intermediate", ["library-transform", "select"])
-def test_runtime_schema_requires_a_direct_source_input(
+@pytest.mark.parametrize("intermediate", ["sample", "select"])
+def test_runtime_schema_accepts_a_resolved_single_transform_input(
         contract, monkeypatch, intermediate):
     deps, base = contract
     source, write = base.nodes
     middle = (
-        {"id": "middle", "type": "transform", "data": {"config": {
-            "source": "library", "processor": "missing", "version": "v1",
-        }}}
-        if intermediate == "library-transform"
+        {"id": "middle", "type": "sample", "data": {"config": {"n": 1000, "seed": 42}}}
+        if intermediate == "sample"
         else {"id": "middle", "type": "select", "data": {"config": {"select": "value"}}}
     )
     graph = Graph.model_validate({
@@ -377,13 +375,54 @@ def test_runtime_schema_requires_a_direct_source_input(
     known = [ColumnSchema(name="value", type="int")]
     monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {
         "source": known,
-        "middle": known if intermediate == "select" else None,
+        "middle": known,
         "transform": None,
         "write": None,
     })
 
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", f"runtime-indirect-{intermediate}")
+
+    assert admission.blocker is None
+    assert admission.intent is not None
+    assert admission.intent.schema_mode == "runtime"
+    assert admission.intent.expected_schema == []
+
+
+def test_runtime_schema_rejects_an_unresolved_single_transform_input(
+        contract, monkeypatch):
+    deps, base = contract
+    source, write = base.nodes
+    graph = Graph.model_validate({
+        **base.model_dump(by_alias=True),
+        "nodes": [
+            source.model_dump(by_alias=True),
+            {"id": "sample", "type": "sample", "data": {"config": {
+                "n": 1000,
+                "seed": 42,
+            }}},
+            {"id": "transform", "type": "transform", "data": {"config": {
+                "source": "adhoc",
+                "code": "def fn(row):\n    return row",
+            }}},
+            write.model_dump(by_alias=True),
+        ],
+        "edges": [
+            {"id": "source-sample", "source": "source", "target": "sample"},
+            {"id": "sample-transform", "source": "sample", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+    known = [ColumnSchema(name="value", type="int")]
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {
+        "source": known,
+        "sample": None,
+        "transform": None,
+        "write": None,
+    })
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "runtime-unresolved-input")
 
     assert admission.intent is None
     assert admission.blocker is not None and "bounded output schema" in admission.blocker
