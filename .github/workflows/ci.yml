@@ -138,19 +138,34 @@ jobs:
           set -euo pipefail
           cd kernel
           export DP_DATA_DIR="$RUNNER_TEMP/dp-test-data-${{ matrix.shard }}"
-          explicit="$KERNEL_FILES $LIFECYCLE_FILES $GROUP_0_FILES $GROUP_1_FILES"
-          case "${{ matrix.shard }}" in
-            kernel)      names="$KERNEL_FILES" ;;
-            lifecycle)   names="$LIFECYCLE_FILES" ;;
-            remainder-0) names="$GROUP_0_FILES" ;;
-            remainder-1) names="$GROUP_1_FILES" ;;
-            remainder-2) names=$(comm -23 \
-                          <(find hub/tests -name 'test_*.py' -exec basename {} \; | sort) \
-                          <(printf '%s\n' $explicit | sort)) ;;
-          esac
+          names=$(uv run python ../scripts/kernel_shard_selection.py \
+            --shard "${{ matrix.shard }}")
           files=$(printf 'hub/tests/%s ' $names)
           test -n "$names"  # a shard that selected nothing is a bug, not an empty pass
-          uv run pytest -q -o faulthandler_timeout=60 --durations=25 $files
+          uv run pytest -q -o faulthandler_timeout=60 --durations=25 \
+            --junitxml="$RUNNER_TEMP/kernel-junit-${{ matrix.shard }}.xml" $files
+      - name: Summarize complete testcase durations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit="$RUNNER_TEMP/kernel-junit-${{ matrix.shard }}.xml"
+          summary="$RUNNER_TEMP/kernel-junit-${{ matrix.shard }}.summary.txt"
+          if [ ! -f "$junit" ]; then
+            echo "JUnit report was not written; pytest did not reach collection."
+            exit 0
+          fi
+          cd kernel
+          uv run python ../scripts/summarize_junit_durations.py "$junit" | tee "$summary"
+      - name: Upload shard JUnit measurement
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernel-junit-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/kernel-junit-${{ matrix.shard }}.xml
+            ${{ runner.temp }}/kernel-junit-${{ matrix.shard }}.summary.txt
+          if-no-files-found: warn
 
   kernel-tests:
     # Aggregates the sharded pytest matrix into the one required status check named in branch
