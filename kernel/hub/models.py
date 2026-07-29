@@ -1935,7 +1935,8 @@ class ExactRunReadiness(Wire):
 
 
 class RunEstimate(Wire):
-    rows: int | None = None   # real source-row count; None when no source is countable (size unknown)
+    # Largest proven row population in the execution cone; unknown fan-out keeps this None.
+    rows: int | None = None
     bytes: int | None = None  # estimated peak data volume (rows × row width); the confirm gate's cost signal
     placement: Placement
     needs_confirm: bool

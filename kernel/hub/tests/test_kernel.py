@@ -2475,6 +2475,19 @@ def test_map_batches_skip_isolates_bad_rows_not_the_whole_batch():
     assert _apply_batch(arrow_fn, pa.table({"x": [0]}), "arrow", "skip", None) is None  # all-bad → nothing
 
 
+def test_map_requires_a_non_empty_row_mapping_to_preserve_one_to_one_cardinality():
+    import pyarrow as pa
+
+    from hub.executors.engine import UserCodeError, _apply_fn
+
+    batch = pa.RecordBatch.from_pylist([{"x": 1}, {"x": 2}])
+    mapped = _apply_fn(lambda row: {"y": row["x"] * 2}, batch, "map", "raise", None)
+    assert mapped == [{"y": 2}, {"y": 4}]
+    with pytest.raises(UserCodeError, match="non-empty row mapping"):
+        _apply_fn(lambda _row: {}, batch, "map", "raise", None)
+    assert _apply_fn(lambda _row: {}, batch, "map", "skip", None) == []
+
+
 def test_batch_schema_drift_widens_safely_and_fails_loudly_not_silently():
     # across batches a transform's output dtype can drift. The old code cast to the first batch with
     # safe=False, SILENTLY corrupting values (e.g. an out-of-range int64 wrapped into an int32). It now
@@ -10569,9 +10582,14 @@ def test_estimate_sizes_is_conservative_and_honest():
     assert e2["f"].rows == 42 and e2["f"].confidence == "exact"
     assert e2["p"].rows == 42  # min(100, 42)
 
-    # a code op is honestly unknown (not a fabricated passthrough); a bypassed node passes input through
-    e3 = est([N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"})], [E("s", "t")])
-    assert e3["t"].rows is None and e3["t"].confidence == "unknown"
+    # fail-fast map execution emits one output per input; cardinality-changing code stays covered by
+    # the focused mode tests below. A bypassed node passes its input through.
+    e3 = est([
+        N("s", "source", {"uri": ev}),
+        N("t", "transform", {
+            "mode": "map", "onError": "raise", "code": "def fn(r): return r"}),
+    ], [E("s", "t")])
+    assert e3["t"].rows == e3["s"].rows and e3["t"].confidence == "exact"
     byp = {"id": "b", "type": "filter", "position": {"x": 0, "y": 0}, "data": {"title": "b", "config": {"predicate": "x"}, "bypassed": True}}
     e4 = est([N("s", "source", {"uri": ev}), byp], [E("s", "b")])
     assert e4["b"].rows == e4["s"].rows  # bypassed → passthrough
@@ -10701,6 +10719,307 @@ def test_source_metadata_count_is_memoized_by_fingerprint():
     assert estimate._counted(lambda uri: Flaky(), "x.csv") == 7  # retried, not stuck on a cached None
 
 
+def test_exact_dataset_ref_count_flows_through_registered_map_without_latest_fallback(
+        monkeypatch):
+    from hub import estimate
+    from hub.models import Graph
+
+    estimate._COUNT_CACHE.clear()
+    calls: list[str] = []
+    latest_calls = {"n": 0}
+    canonical_dataset_id = "workspace-provider:exact-estimate"
+    monkeypatch.setattr(
+        "hub.workspace_providers.provider_dataset_identity",
+        lambda uri: canonical_dataset_id
+        if uri == "workspace-provider://exact-estimate" else None,
+    )
+
+    class ExactOnly:
+        def revision_detail(self, _uri, revision_id, *, preview_limit):
+            assert preview_limit == 1
+            calls.append(revision_id)
+            if revision_id == "stale":
+                raise FileNotFoundError("exact revision was removed")
+            returned_revision = "other" if revision_id == "mismatched" else revision_id
+            rows = {"r1": 100, "r2": 125}.get(revision_id)
+            return {"revision_id": returned_revision, "row_count": rows}
+
+        def fingerprint(self, _uri):
+            latest_calls["n"] += 1
+            return "mutable-head"
+
+        def metadata_count(self, _uri):
+            latest_calls["n"] += 1
+            return 999
+
+        def preview_scan(self, _uri, *, limit):
+            latest_calls["n"] += 1
+            raise AssertionError("exact estimate must not preview the mutable head")
+
+    def graph(revision_id: str, *, dataset_id: str = canonical_dataset_id) -> Graph:
+        return Graph(**{
+            "id": "exact-map-estimate",
+            "version": 1,
+            "nodes": [
+                N("source", "source", {
+                    "uri": "workspace-provider://exact-estimate",
+                    "datasetRef": {
+                        "kind": "exact",
+                        "datasetId": dataset_id,
+                        "revisionId": revision_id,
+                    },
+                }),
+                N("map", "transform", {
+                    "source": "library",
+                    "processor": "fixture.exact-map",
+                    "version": "v1",
+                    "mode": "map",
+                    "onError": "raise",
+                }),
+            ],
+            "edges": [E("source", "map")],
+        })
+
+    resolve_adapter = lambda _uri: ExactOnly()  # noqa: E731
+    resolve_map = lambda _processor, _version: SimpleNamespace(mode="map")  # noqa: E731
+
+    protected = estimate.estimate_sizes(
+        graph("r1"), resolve_adapter,
+        schemas={"source": [{"name": "embedding", "type": "float[]"}]},
+        resolve_processor=resolve_map,
+        no_row_probe_source_ids={"source"})
+    assert protected["source"].rows is None
+    assert calls == [] and latest_calls["n"] == 0
+
+    first = estimate.estimate_sizes(
+        graph("r1"), resolve_adapter,
+        schemas={"source": [{"name": "embedding", "type": "float[]"}]},
+        resolve_processor=resolve_map)
+    assert (first["source"].rows, first["source"].confidence) == (100, "exact")
+    assert (first["map"].rows, first["map"].confidence) == (100, "exact")
+
+    # The exact revision is part of the cache identity: an upstream revision edit recounts and
+    # immediately invalidates the downstream estimate.
+    second = estimate.estimate_sizes(
+        graph("r2"), resolve_adapter, resolve_processor=resolve_map)
+    assert (second["source"].rows, second["map"].rows) == (125, 125)
+    assert calls == ["r1", "r2"]
+
+    mismatched_identity = estimate.estimate_sizes(
+        graph("r1", dataset_id="workspace-provider:different"),
+        resolve_adapter,
+        resolve_processor=resolve_map,
+    )
+    assert mismatched_identity["source"].rows is None
+    assert mismatched_identity["map"].rows is None
+    assert calls == ["r1", "r2"]
+
+    # Absent count evidence, an unavailable revision, or a mismatched detail stays unknown. None
+    # may silently substitute the provider's current-head count.
+    for revision_id in ("missing-count", "stale", "mismatched"):
+        result = estimate.estimate_sizes(
+            graph(revision_id), resolve_adapter, resolve_processor=resolve_map)
+        assert result["source"].rows is None
+        assert result["map"].rows is None
+    assert latest_calls["n"] == 0
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_rows", "expected_confidence"),
+    [
+        ({"mode": "map", "onError": "raise", "code": "def fn(r): return r"}, 100, "exact"),
+        ({"mode": "map", "onError": "skip", "code": "def fn(r): return r"}, 100, "bounded"),
+        ({"mode": "filter", "onError": "raise", "code": "def fn(r): return True"}, 100, "bounded"),
+        ({"mode": "flat_map", "onError": "raise", "code": "def fn(r): return [r]"}, None, "unknown"),
+        ({"mode": "map_batches", "onError": "raise", "code": "def fn(rows): return rows"}, None, "unknown"),
+    ],
+)
+def test_transform_estimate_uses_only_proven_row_semantics(
+        config, expected_rows, expected_confidence):
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+
+    graph = Graph(**{
+        "id": "transform-cardinality",
+        "version": 1,
+        "nodes": [
+            N("source", "source", {"uri": "unused://actual-backed-source"}),
+            N("transform", "transform", config),
+        ],
+        "edges": [E("source", "transform")],
+    })
+    result = estimate_sizes(
+        graph, lambda _uri: None, actuals={"source": 100})
+    assert result["transform"].rows == expected_rows
+    assert result["transform"].confidence == expected_confidence
+    assert result["transform"].may_expand is (expected_rows is None)
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_rows", "expected_confidence", "may_expand"),
+    [
+        (
+            {"mode": "map", "onError": "skip", "code": "def fn(row): return row"},
+            100, "bounded", False,
+        ),
+        (
+            {"mode": "filter", "onError": "raise", "code": "def fn(row): return True"},
+            100, "bounded", False,
+        ),
+        (
+            {"mode": "flat_map", "onError": "raise", "code": "def fn(row): return [row, row]"},
+            None, "unknown", True,
+        ),
+        (
+            {"mode": "map_batches", "onError": "raise", "code": "def fn(rows): return rows"},
+            None, "unknown", True,
+        ),
+    ],
+)
+def test_transform_estimate_does_not_treat_warm_actual_as_a_next_run_bound(
+        config, expected_rows, expected_confidence, may_expand):
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+
+    graph = Graph(**{
+        "id": f"warm-{config['mode']}-estimate",
+        "version": 1,
+        "nodes": [
+            N("source", "source", {"uri": "unused://actual-backed-source"}),
+            N("transform", "transform", config),
+        ],
+        "edges": [E("source", "transform")],
+    })
+    result = estimate_sizes(
+        graph, lambda _uri: None,
+        actuals={"source": 100, "transform": 17})
+    assert result["transform"].rows == expected_rows
+    assert result["transform"].confidence == expected_confidence
+    assert result["transform"].may_expand is may_expand
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"mode": "map", "onError": "skip", "code": "def fn(row): return row"},
+        {"mode": "filter", "onError": "raise", "code": "def fn(row): return True"},
+    ],
+)
+def test_warm_reducing_transform_uses_current_source_bound_for_downstream_working_set(
+        config):
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+
+    current_rows = 1_000_000
+
+    class CurrentSource:
+        def fingerprint(self, _uri):
+            return "current-source"
+
+        def metadata_count(self, _uri):
+            return current_rows
+
+    graph = Graph(**{
+        "id": f"warm-{config['mode']}-working-set",
+        "version": 1,
+        "nodes": [
+            N("source", "source", {"uri": "counted://current-source"}),
+            N("transform", "transform", config),
+            N("sort", "sort", {"by": "value"}),
+        ],
+        "edges": [E("source", "transform"), E("transform", "sort")],
+    })
+    sizes = estimate_sizes(
+        graph, lambda _uri: CurrentSource(),
+        schemas={
+            "source": [{"name": "value", "type": "int"}],
+            "transform": [{"name": "value", "type": "int"}],
+            "sort": [{"name": "value", "type": "int"}],
+        },
+        actuals={"transform": 1},
+    )
+    assert (sizes["source"].rows, sizes["source"].confidence) == (
+        current_rows, "exact")
+    assert (sizes["transform"].rows, sizes["transform"].confidence) == (
+        current_rows, "bounded")
+    assert sizes["sort"].rows == current_rows
+    assert get_deps().controller._working_set_bytes(graph, "sort", sizes) == (
+        current_rows * 8)
+
+
+@pytest.mark.parametrize(
+    ("mode", "code"),
+    [
+        ("flat_map", "def fn(row): return [row, row]"),
+        ("map_batches", "def fn(rows): return rows"),
+    ],
+)
+def test_run_estimate_keeps_unknown_transform_fanout_in_confirmation_gate(
+        tmp_path, monkeypatch, mode, code):
+    source = _seq_parquet(tmp_path, n=3)
+    graph = {
+        "id": f"unknown-{mode}-estimate",
+        "version": 1,
+        "nodes": [
+            N("source", "source", {"uri": source}),
+            N("transform", "transform", {
+                "mode": mode,
+                "onError": "raise",
+                "code": code,
+            }),
+        ],
+        "edges": [E("source", "transform")],
+    }
+    monkeypatch.setattr(
+        "hub.routers.runs._actuals_for",
+        lambda _graph, _deps: {"source": 3, "transform": 6},
+    )
+    response = client.post("/api/run/estimate", json={
+        "graph": graph,
+        "targetNodeId": "transform",
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["rows"] is None
+    assert response.json()["bytes"] is None
+    assert response.json()["needsConfirm"] is True
+    assert response.json()["confirmationReasons"] == ["unknown_population"]
+
+
+def test_library_transform_estimate_trusts_exact_registered_mode_not_canvas_copy():
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+
+    graph = Graph(**{
+        "id": "library-cardinality",
+        "version": 1,
+        "nodes": [
+            N("source", "source", {"uri": "unused://actual-backed-source"}),
+            N("transform", "transform", {
+                "source": "library",
+                "processor": "fixture.cardinality",
+                "version": "v1",
+                "mode": "map",
+                "onError": "raise",
+            }),
+        ],
+        "edges": [E("source", "transform")],
+    })
+    unknown = estimate_sizes(
+        graph, lambda _uri: None, actuals={"source": 100, "transform": 17},
+        resolve_processor=lambda _processor, _version: SimpleNamespace(mode="flat_map"))
+    assert unknown["transform"].rows is None
+    assert unknown["transform"].confidence == "unknown"
+
+    exact = estimate_sizes(
+        graph, lambda _uri: None, actuals={"source": 100},
+        resolve_processor=lambda _processor, _version: SimpleNamespace(mode="map"))
+    assert (exact["transform"].rows, exact["transform"].confidence) == (100, "exact")
+
+    unavailable = estimate_sizes(
+        graph, lambda _uri: None, actuals={"source": 100, "transform": 17})
+    assert unavailable["transform"].rows is None
+
+
 def test_source_width_probes_wide_list_columns(tmp_path):
     # Parquet stores a fixed-size embedding as a VARIABLE list, so DuckDB reads it as bare 'float[]'
     # (dimension lost on disk). The flat _col_width assumes 16 elems → a 512-wide embedding is undercounted
@@ -10818,8 +11137,12 @@ def test_cost_based_placement_routes_a_heavy_region_and_is_a_noop_without_a_back
     from hub.placement import satisfies
     d = get_deps()
     ev = _uri("events")
-    nodes = [N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"}),
-             N("a", "aggregate", {"groupBy": "user_id", "aggs": "count(*) AS n"})]
+    nodes = [
+        N("s", "source", {"uri": ev}),
+        N("t", "transform", {
+            "mode": "flat_map", "code": "def fn(r): return [r]"}),
+        N("a", "aggregate", {"groupBy": "user_id", "aggs": "count(*) AS n"}),
+    ]
     graph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "t"), E("t", "a")]})
 
     # (1) no cluster backend → everything on the default → single fused region → base runner (unchanged)
@@ -10848,7 +11171,12 @@ def test_cost_placement_respects_a_manual_mem_pin():
     ev = _uri("events")
     agg = {"id": "a", "type": "aggregate", "position": {"x": 0, "y": 0},
            "data": {"title": "a", "config": {"groupBy": "user_id", "aggs": "count(*) AS n", "requires": {"mem": "2GB"}}}}
-    nodes = [N("s", "source", {"uri": ev}), N("t", "transform", {"code": "def fn(r): return r"}), agg]
+    nodes = [
+        N("s", "source", {"uri": ev}),
+        N("t", "transform", {
+            "mode": "flat_map", "code": "def fn(r): return [r]"}),
+        agg,
+    ]
     graph = Graph(**{"id": "c", "version": 1, "nodes": nodes, "edges": [E("s", "t"), E("t", "a")]})
     assert "a" not in d.controller._cost_requires(graph, "a")  # pinned mem → estimator adds nothing
     agg["data"]["config"].pop("requires")                       # without the pin it WOULD add a mem floor

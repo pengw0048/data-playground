@@ -138,7 +138,8 @@ class RunController:
                 schemas = None
             sizes = est_mod.estimate_sizes(
                 graph, self.deps.resolve_adapter, target=target, schemas=schemas,
-                storage=self.deps.storage)  # once — reused by plan()
+                storage=self.deps.storage,
+                resolve_processor=self.deps.registry.get)  # once — reused by plan()
         except ManagedSourceReadError:
             raise
         except Exception:  # noqa: BLE001
@@ -255,7 +256,8 @@ class RunController:
         if sizes is None:  # reuse a caller-computed estimate (plan_summary) to avoid a second source-count pass
             try:
                 sizes = est_mod.estimate_sizes(
-                    graph, self.deps.resolve_adapter, target=target, storage=self.deps.storage)
+                    graph, self.deps.resolve_adapter, target=target, storage=self.deps.storage,
+                    resolve_processor=self.deps.registry.get)
             except ManagedSourceReadError:
                 raise
             except Exception:  # noqa: BLE001 — placement is best-effort; a bad estimate must not block the run

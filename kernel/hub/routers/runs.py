@@ -2406,7 +2406,7 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
                        if node_id not in draft_cone}
         sizes = estimate_sizes(
             graph, deps.resolve_adapter, actuals=actuals,
-            storage=deps.storage)
+            storage=deps.storage, resolve_processor=deps.registry.get)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — a hint must never 500
@@ -2592,17 +2592,25 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
             req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
             actuals=_actuals_for(req_graph, deps), storage=deps.storage,
             no_row_probe_source_ids=prepared_sources,
+            resolve_processor=deps.registry.get,
         )
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None, {}
+    unbounded_population = any(
+        size.rows is None and size.may_expand for size in sizes.values())
     rows = [s.rows for s in sizes.values() if s.rows is not None]
     known_row_sizes = [size for size in sizes.values() if size.rows is not None]
     byts = [size.bytes for size in known_row_sizes if size.bytes is not None]
-    byte_size = None if any(size.bytes is None for size in known_row_sizes) \
+    byte_size = None if unbounded_population or any(
+        size.bytes is None for size in known_row_sizes) \
         else (max(byts) if byts else None)
-    return (max(rows) if rows else None), byte_size, sizes
+    return (
+        None if unbounded_population else max(rows) if rows else None,
+        byte_size,
+        sizes,
+    )
 
 
 def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimate:
@@ -2659,13 +2667,16 @@ def _metadata_only_cone_size(
         sizes = estimate_sizes(
             req_graph, deps.resolve_adapter, target=target_node_id, schemas=None,
             storage=deps.storage,
+            resolve_processor=deps.registry.get,
         )
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — metadata uncertainty is an explicit unknown admission cost
         return None, None, {}
     rows = [size.rows for size in sizes.values() if size.rows is not None]
-    return (max(rows) if rows else None), None, sizes
+    unbounded_population = any(
+        size.rows is None and size.may_expand for size in sizes.values())
+    return (None if unbounded_population else max(rows) if rows else None), None, sizes
 
 
 def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None):
