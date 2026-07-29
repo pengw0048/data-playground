@@ -2266,8 +2266,10 @@ test.describe('Data Playground canvas', () => {
     const source = page.locator('.react-flow__node-source')
     await expect(source).toHaveCount(1) // the events source landed
     await expect(source.getByRole('button', { name: 'Change dataset' })).toHaveAttribute('title', /Click to change dataset/)
-    // Source preview is a persistent header action; opening rows does not require hover.
-    await source.getByRole('button', { name: 'Preview data' }).click()
+    // Source uses the same hover/selection action shelf as downstream nodes, without gaining Run.
+    await source.hover()
+    await expect(source.getByRole('button', { name: 'Run up to here' })).toHaveCount(0)
+    await source.getByRole('button', { name: 'View data' }).click()
     // the data viewer shows rows, then Next paginates, then clicking a row opens its detail
     const panel = page.getByTestId('panel-data')
     await expect(panel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })

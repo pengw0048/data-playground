@@ -124,25 +124,64 @@ describe('NodeCard result summary', () => {
     expect(screen.getByText('≤ 25 rows')).toBeInTheDocument()
   })
 
-  it('keeps Source preview in the header for an unselected viewer', () => {
-    useStore.setState({ canvasRole: 'viewer' })
+  it('puts selected Source preview in the shared action shelf without adding a run action', () => {
+    useStore.setState({ selectedIds: ['target'] })
     const data: NodeData = {
       title: 'target', status: 'latest', config: { uri: 'input.csv' },
     }
 
-    render(<ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>)
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
 
-    const preview = screen.getByRole('button', { name: 'Preview data' })
+    expect(screen.queryByRole('button', { name: 'Preview data' })).not.toBeInTheDocument()
+    const preview = screen.getByRole('button', { name: 'View data' })
     expect(preview).toBeVisible()
     expect(preview).toBeEnabled()
-    expect(preview).toHaveAttribute('title', 'Preview data')
     fireEvent.click(preview)
     expect(runPreview).toHaveBeenCalledWith('target')
+    expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
 
     act(() => useStore.setState({ openPanels: { target: 'data' } }))
-    const hide = screen.getByRole('button', { name: 'Hide preview' })
-    expect(hide).toHaveAttribute('title', 'Hide preview')
+    const hide = screen.getByRole('button', { name: 'Hide data' })
     fireEvent.click(hide)
     expect(closePanel).toHaveBeenCalledWith('target')
+  })
+
+  it('reveals Source preview from the shared shelf on hover', () => {
+    const data: NodeData = {
+      title: 'target', status: 'latest', config: { uri: 'input.csv' },
+    }
+
+    const { container } = render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    expect(screen.queryByRole('button', { name: 'View data' })).not.toBeInTheDocument()
+    fireEvent.mouseEnter(container.firstElementChild!)
+    expect(screen.getByRole('button', { name: 'View data' })).toBeVisible()
+  })
+
+  it('keeps Source shelf preview available in a view-only Canvas', () => {
+    useStore.setState({ canvasRole: 'viewer', selectedIds: ['target'] })
+    const data: NodeData = {
+      title: 'target', status: 'latest', config: { uri: 'input.csv' },
+    }
+
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    const preview = screen.getByRole('button', { name: 'View data' })
+    expect(preview).toBeEnabled()
+    fireEvent.click(preview)
+    expect(runPreview).toHaveBeenCalledWith('target')
+    expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
   })
 })
