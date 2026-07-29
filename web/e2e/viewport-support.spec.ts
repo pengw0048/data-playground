@@ -164,6 +164,11 @@ test.describe('minimum viewport support', () => {
     const addControls = page.getByTestId('toolbar-add-controls')
     const viewControls = page.getByTestId('toolbar-view-controls')
     await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
+    await node.click()
+    await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
+    if (testInfo.project.name === 'chromium-reference-viewport') {
+      await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'comfortable')
+    }
     await expect(viewControls.getByText('Fit view', { exact: true })).toBeVisible()
     await expect(viewControls.getByRole('group', { name: 'Viewport controls' })).toBeVisible()
     await expect(viewControls.getByRole('group', { name: 'Panel controls' })).toBeVisible()
@@ -443,6 +448,9 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('settings-modal'), '1024px settings')
 
     await openCanvasWithSource(page)
+    await page.locator('.react-flow__node').first().click()
+    await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
+    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'icons')
     const viewControls = page.getByTestId('toolbar-view-controls')
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector collapsed)')
     for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Show Inspector']) {

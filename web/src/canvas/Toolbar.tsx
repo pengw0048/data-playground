@@ -191,11 +191,11 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   )
 }
 
-// The ordinary labelled toolbar measures about 860px with the current registry. A contextual
-// Add-next-step label needs a compact labelled density at the 980px Canvas region created by a
-// 1280px viewport with its Inspector open. The Canvas region changes with the Inspector, so these
-// thresholds must use that region, not the browser window.
-const LABELLED_TOOLBAR_MIN_WIDTH = 900
+// The compact labelled toolbar measures a little over 1,050px with the current registry and the
+// contextual Add-next-step action. The Canvas region changes with the Inspector, so choose its
+// density from that region rather than the browser window. Keeping a small buffer avoids a
+// half-pixel overflow at the 1024px viewport once the collapsed navigation is accounted for.
+const LABELLED_TOOLBAR_MIN_WIDTH = 1100
 const COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH = 1024
 type ToolbarDensity = 'icons' | 'compact' | 'comfortable'
 
