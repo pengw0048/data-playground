@@ -242,14 +242,21 @@ describe('graph store — core authority ops', () => {
       }
     })
 
-    await expect(useStore.getState().promote('first')).rejects.toThrow('response lost')
-    await useStore.getState().promote('first')
-    await useStore.getState().promote('second')
+    await expect(useStore.getState().promote(
+      'first', 'Normalize each row for reuse.',
+    )).rejects.toThrow('response lost')
+    await useStore.getState().promote('first', 'Normalize each row for reuse.')
+    await useStore.getState().promote('second', 'Normalize the second input.')
 
     const keys = apiMocks.promote.mock.calls.map(([body]) => body.id)
     expect(keys[0]).toBe(keys[1])
     expect(keys[2]).not.toBe(keys[1])
     expect(keys.every((key) => key.length <= 256)).toBe(true)
+    expect(apiMocks.promote.mock.calls.map(([body]) => body.blurb)).toEqual([
+      'Normalize each row for reuse.',
+      'Normalize each row for reuse.',
+      'Normalize the second input.',
+    ])
   })
 
   it('applyAgentGraph REPLACES nodes/edges and marks them stale (undoable)', () => {

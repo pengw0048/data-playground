@@ -26,6 +26,7 @@ import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { requestSourceEntryAction } from '../nodes/kinds/source'
+import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
 
 export const INSPECTOR_W = 300
 export const INSPECTOR_COLLAPSED_W = 44
@@ -198,6 +199,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const inputColumns = useInputColumns(nodeId)
   const catalog = useStore((s) => s.catalog)
+  const processors = useStore((s) => s.processors)
+  const transformReferences = useStore((s) => s.canvasTransformReferences)
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const kernelUp = useStore((s) => s.kernelUp)
@@ -214,10 +217,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 
   const kind = node.type
   const spec = getSpec(kind)
+  const cfg = node.data.config as Record<string, unknown>
   const bspec = getBackendSpec(kind)
   const st = statusTok[node.data.status] ?? statusTok.draft
-  const codeParams = (bspec?.params ?? []).filter((p) => p.type === 'code')
-  const cfg = node.data.config as Record<string, unknown>
+  const libraryTransform = kind === 'transform' && cfg.source === 'library'
+  const codeParams = (bspec?.params ?? []).filter((p) => (
+    p.type === 'code' && !libraryTransform
+  ))
   const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
   const unboundSource = kind === 'source' && isUnboundSource(cfg)
@@ -226,7 +232,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const manualDelimitedSource = manualSource && isDelimitedTextUri(sourceUri(cfg))
   const showDraftSourceEntry = unboundSource || (kind === 'source' && editingDraftSourceUri)
   const sourceSummary = kind === 'source' ? sourceInspectorSummary(catalog, cfg) : null
-  const inspectorBlurb = sourceSummary ?? spec?.blurb
+  const libraryProcessor = kind === 'transform' && cfg.source === 'library'
+    ? exactProcessor(processors, cfg.processor, cfg.version)
+      ?? transformReferences.find((reference) => (
+        reference.id === cfg.processor && reference.version === cfg.version
+      ))?.descriptor
+    : undefined
+  const inspectorBlurb = sourceSummary ?? (libraryProcessor?.blurb || spec?.blurb)
   const omittedParamNames = kind === 'write'
     ? ['writeMode']
     : kind === 'source' && !manualDelimitedSource
@@ -360,6 +372,23 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           </Section>
         )
       })}
+
+      {libraryTransform && (
+        <Section title="Processor definition">
+          <div className="rounded-lg border border-border bg-muted/20 p-2.5">
+            <div className="text-[11.5px] font-semibold text-foreground">
+              {libraryProcessor?.title ?? 'Exact Library processor'}
+            </div>
+            <div className="mt-1 break-all font-mono text-[10.5px] text-muted-foreground">
+              {configuredProcessorRef(cfg.processor, cfg.version) ?? 'No exact processor selected'}
+            </div>
+          </div>
+          <div className="mt-1.5">
+            <CodeBtn icon="external" label="Open processor definition"
+              onClick={() => openCodeFullscreen(nodeId, 'code', 'python')} />
+          </div>
+        </Section>
+      )}
 
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
       {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}

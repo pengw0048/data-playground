@@ -633,6 +633,41 @@ describe('durable full results', () => {
     })
   })
 
+  it('does not tell users to edit unpublished Library processor source', () => {
+    const doc = {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'target', type: 'transform', position: { x: 0, y: 0 },
+        data: {
+          title: 'Add Height/Width', status: 'failed',
+          config: {
+            source: 'library', processor: 'luma.lax.add-height-width',
+            version: 'v2', mode: 'map',
+          },
+          history: [],
+        },
+      }],
+    }
+    useStore.setState({
+      doc, canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        error: true, notPreviewable: false, failureCategory: 'user_code_exception',
+        userCodeException: {
+          nodeId: 'target', nodeTitle: 'Add Height/Width',
+          exceptionType: 'MappingError', message: "Missing required image column 'image'.",
+          availableColumns: ['image_url'],
+        },
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Library processor raised an exception')).toBeInTheDocument()
+    expect(screen.getByText(/Review the processor requirements and Canvas parameters/)).toBeInTheDocument()
+    expect(screen.queryByText(/Edit the transform code/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
+  })
+
   it('does not classify a preview failure by parsing its message', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },
@@ -764,6 +799,31 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Run upstream' }))
     expect(onRunUpstream).toHaveBeenCalledOnce()
     expect(screen.queryByText(/Run a full pass/)).not.toBeInTheDocument()
+  })
+
+  it('names a Library processor test without implying its source code is visible', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'library', processor: 'processor', version: 'v1', mode: 'map',
+      }, history: [] },
+    }] }
+    const onRunUpstream = vi.fn()
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, reason: 'No current retained Source result is available.',
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{
+      onRunUpstream,
+      testTarget: 'transform',
+    }} />)
+
+    expect(screen.getByText('Run upstream to test this transform')).toBeInTheDocument()
+    expect(screen.queryByText(/test this code/)).not.toBeInTheDocument()
   })
 
   it('preserves connect-one-upstream guidance when the editor cannot identify an input', () => {

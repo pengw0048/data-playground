@@ -15,10 +15,15 @@ vi.mock('../../ui/CodeSnippet', () => ({
   CodeSnippet: () => <div data-testid="code-snippet" />,
 }))
 vi.mock('../../panels/DataPanel', () => ({
-  DataPanel: ({ editorPreview }: { editorPreview?: { onRunUpstream?: () => void } }) => (
-    editorPreview?.onRunUpstream
-      ? <button type="button" onClick={editorPreview.onRunUpstream}>Run upstream</button>
-      : null
+  DataPanel: ({ editorPreview }: {
+    editorPreview?: { onRunUpstream?: () => void; testTarget?: string }
+  }) => (
+    <>
+      {editorPreview?.testTarget && <span>test target: {editorPreview.testTarget}</span>}
+      {editorPreview?.onRunUpstream
+        ? <button type="button" onClick={editorPreview.onRunUpstream}>Run upstream</button>
+        : null}
+    </>
   ),
 }))
 
@@ -40,6 +45,7 @@ describe('Transform exact processor labels', () => {
     useStore.setState({
       canvasRole: 'owner', fullscreenCode: null, previews: {},
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [node], edges: [] },
+      canvasTransformReferences: [],
       processors: [{
         id: PROCESSOR_ID, version: 'v2', title: 'Latest version', mode: 'map',
         category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
@@ -76,6 +82,19 @@ describe('Transform exact processor labels', () => {
     })
   })
 
+  it('opens a Library definition instead of advertising editable source code', () => {
+    const Transform = getComponent('transform')!
+    useStore.setState({ selectedIds: [node.id] })
+    render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={node.id} data={node.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    expect(screen.getByRole('button', { name: 'View processor definition' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
+  })
+
   it('shows an unlisted shared exact ref in the fullscreen read-only label', async () => {
     useStore.setState({
       canvasRole: 'viewer', processors: [],
@@ -84,8 +103,199 @@ describe('Transform exact processor labels', () => {
 
     render(<CodeFullscreen />)
 
-    expect(await screen.findByText(new RegExp(`${PROCESSOR_ID}@v1`))).toBeInTheDocument()
+    expect((await screen.findAllByText(new RegExp(`${PROCESSOR_ID}@v1`))).length).toBeGreaterThan(0)
     expect(screen.queryByText(/Latest version/)).not.toBeInTheDocument()
+    await screen.findByText(/bounded testing cannot be enabled safely/i)
+    expect(screen.queryByText(/Use Test transform to run/i)).not.toBeInTheDocument()
+  })
+
+  it('uses the Canvas-authorized exact descriptor for a shared Canvas viewer', async () => {
+    const source = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Shared source', status: 'latest' as const, config: { uri: 'shared.parquet' } },
+    }
+    const descriptor = {
+      id: PROCESSOR_ID, version: 'v1', title: 'Owner promoted processor', mode: 'map',
+      category: 'compute', inputColumns: [], inputSchema: [],
+      outputSchema: [{ name: 'normalized', type: 'string', nullable: false, capabilities: [] }],
+      requirements: [], paramsSchema: {}, previewable: true,
+      blurb: 'Normalizes rows for the shared research workflow.',
+      provenance: 'promoted' as const,
+    }
+    const sharedDoc = {
+      id: 'shared-canvas', name: 'Shared', version: 1, requirements: [],
+      nodes: [source, node],
+      edges: [{
+        id: 'source-transform', source: 'source', sourceHandle: 'out',
+        target: 'transform', targetHandle: 'in', data: { wire: 'dataset' as const },
+      }],
+    }
+    useStore.setState({
+      canvasRole: 'viewer',
+      doc: sharedDoc,
+      processors: [],
+      canvasTransformReferences: [{
+        id: PROCESSOR_ID,
+        version: 'v1',
+        availability: 'available',
+        descriptor,
+      }],
+      fullscreenCode: { nodeId: node.id, param: 'code', lang: 'python' },
+      editorPreviews: { transform: {
+        canvasId: sharedDoc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(sharedDoc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: 1,
+        offset: 0,
+        result: {
+          columns: descriptor.outputSchema,
+          rows: [{ normalized: 'ready' }],
+          truncated: false,
+          editorTestInput: {
+            runId: 'shared-source-run', nodeId: 'source', portId: 'out',
+            label: 'Shared source', rows: 1,
+          },
+        },
+      } },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    const definition = await screen.findByRole('region', { name: 'Library processor definition' })
+    expect(definition).toHaveTextContent('Owner promoted processor')
+    expect(definition).toHaveTextContent('Normalizes rows for the shared research workflow.')
+    expect(screen.getByRole('button', { name: 'Test transform' })).toBeEnabled()
+    expect(screen.queryByText(/bounded testing cannot be enabled safely/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the exact Library definition and tests a previewable processor on retained upstream rows', async () => {
+    const source = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Image source', status: 'latest' as const, config: { uri: 'images.parquet' } },
+    }
+    const descriptor = {
+      id: PROCESSOR_ID, version: 'v1', title: 'Add Height/Width', mode: 'map',
+      category: 'compute', inputColumns: ['_rowid'],
+      inputSchema: [{ name: '_rowid', type: 'uint64', nullable: false, capabilities: [] }],
+      outputSchema: [
+        { name: 'height', type: 'int32', nullable: true, capabilities: [] },
+        { name: 'width', type: 'int32', nullable: true, capabilities: [] },
+      ],
+      requirements: [], paramsSchema: {
+        image_key: { type: 'string', default: 'image' },
+        max_decoded_image_pixels: { type: 'integer', default: 50_000_000 },
+      },
+      previewable: true,
+      blurb: 'Adds decoded image height and width while preserving row identity.',
+      provenance: 'plugin' as const,
+    }
+    const doc = {
+      id: 'canvas', name: 'canvas', version: 1, requirements: [],
+      nodes: [source, node],
+      edges: [{
+        id: 'source-transform', source: 'source', sourceHandle: 'out',
+        target: 'transform', targetHandle: 'in', data: { wire: 'dataset' as const },
+      }],
+    }
+    const runEditorPreview = vi.fn()
+    useStore.setState({
+      doc,
+      processors: [descriptor],
+      kernelUp: true,
+      fullscreenCode: { nodeId: node.id, param: 'code', lang: 'python' },
+      runEditorPreview,
+      editorPreviews: { transform: {
+        canvasId: doc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(doc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: 1,
+        offset: 0,
+        result: {
+          columns: descriptor.outputSchema,
+          rows: [{ height: 16, width: 32 }],
+          truncated: false,
+          editorTestInput: {
+            runId: 'source-run', nodeId: 'source', portId: 'out',
+            label: 'Image source', rows: 1,
+          },
+        },
+      } },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    const definition = await screen.findByRole('region', { name: 'Library processor definition' })
+    expect(definition).toHaveTextContent(`${PROCESSOR_ID}@v1`)
+    expect(definition).toHaveTextContent('Adds decoded image height and width while preserving row identity.')
+    expect(definition).toHaveTextContent('Plugin')
+    expect(definition).toHaveTextContent('Bounded testSupported')
+    expect(definition).toHaveTextContent('_rowid')
+    expect(definition).toHaveTextContent('height')
+    expect(definition).toHaveTextContent('width')
+    expect(definition).toHaveTextContent('image_key')
+    expect(definition).toHaveTextContent('default "image"')
+    expect(definition).toHaveTextContent('Implementation source unavailable')
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument()
+
+    const test = screen.getByRole('button', { name: 'Test transform' })
+    expect(test).toBeEnabled()
+    expect(screen.getByText('test target: transform')).toBeInTheDocument()
+    fireEvent.click(test)
+    expect(runEditorPreview).toHaveBeenCalledWith('transform')
+    expect(screen.queryByRole('button', { name: 'Example rows' })).not.toBeInTheDocument()
+  })
+
+  it('explains why a non-previewable Library processor cannot be tested', async () => {
+    useStore.setState({
+      processors: [{
+        id: PROCESSOR_ID, version: 'v1', title: 'Whole table optimizer', mode: 'map_batches',
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+        paramsSchema: {}, previewable: false, blurb: 'Optimizes a complete table.',
+        provenance: 'plugin',
+      }],
+      fullscreenCode: { nodeId: node.id, param: 'code', lang: 'python' },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    expect(await screen.findByText(/does not support bounded preview tests/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Test transform' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument()
+  })
+
+  it('requires and preserves a description when promoting an ad-hoc Transform', async () => {
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      } },
+    }
+    const promote = vi.fn().mockResolvedValue(undefined)
+    useStore.setState({
+      doc: {
+        id: 'canvas', name: 'canvas', version: 1, requirements: [],
+        nodes: [adhocNode], edges: [],
+      },
+      fullscreenCode: { nodeId: adhocNode.id, param: 'code', lang: 'python' },
+      promote,
+    } as any)
+
+    render(<CodeFullscreen />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Promote to library' }))
+    const dialog = screen.getByRole('dialog', { name: /Promote transform to the Library/i })
+    const submit = within(dialog).getByRole('button', { name: 'Promote' })
+    expect(submit).toBeDisabled()
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Description' }), {
+      target: { value: '  Normalizes each row for downstream training.  ' },
+    })
+    expect(submit).toBeEnabled()
+    fireEvent.click(submit)
+
+    await waitFor(() => expect(promote).toHaveBeenCalledWith(
+      'transform', 'Normalizes each row for downstream training.',
+    ))
   })
 
   it('labels ad-hoc transforms with their actual operator semantics', () => {

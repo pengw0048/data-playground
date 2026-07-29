@@ -209,6 +209,41 @@ describe('Inspector — effective named outputs', () => {
     } as any)
   }
 
+  it('uses the exact Library processor description instead of the generic Transform blurb', () => {
+    const processorId = `tr_${'b'.repeat(29)}`
+    selectNode('transform', undefined)
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: state.doc.nodes.map((candidate) => ({
+          ...candidate,
+          data: {
+            ...candidate.data,
+            config: {
+              source: 'library', processor: processorId, version: 'v1', mode: 'map',
+            },
+          },
+        })),
+      },
+      processors: [{
+        id: processorId, version: 'v1', title: 'Normalize events', mode: 'map',
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [],
+        requirements: [], paramsSchema: {}, previewable: true,
+        blurb: 'Normalizes event locations for downstream training.',
+        provenance: 'promoted',
+      }],
+      canvasTransformReferences: [],
+    } as any))
+
+    render(<Inspector />)
+
+    expect(screen.getByTitle('Normalizes event locations for downstream training.')).toBeInTheDocument()
+    expect(screen.queryByText('Apply a Python transform to rows')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Open processor definition' })).toBeVisible()
+    expect(screen.getByText(`${processorId}@v1`)).toBeInTheDocument()
+    expect(screen.queryByText('(empty)')).not.toBeInTheDocument()
+  })
+
   it('shows Section instance ports instead of the static out port', () => {
     register({
       kind: 'section', title: 'section', category: 'compute', inputs: [],

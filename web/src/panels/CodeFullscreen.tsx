@@ -7,7 +7,9 @@ import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
 import type { ProcessorMode } from '../types/graph'
+import type { ProcessorDescriptor } from '../types/api'
 import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
+import { api } from '../api/client'
 import {
   EDITOR_EXAMPLE_MAX_BYTES,
   editorExampleRowsStarter,
@@ -37,12 +39,17 @@ export function CodeFullscreen() {
   const editorPreviews = useStore((s) => s.editorPreviews)
   const runs = useStore((s) => s.runs)
   const processors = useStore((s) => s.processors)
+  const transformReferences = useStore((s) => s.canvasTransformReferences)
   const kernelUp = useStore((s) => s.kernelUp)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const inputCols = useInputColumns(fs?.nodeId ?? '')  // THIS node's input schema — the precise completions
   const [testInput, setTestInput] = useState<'upstream' | 'example'>('upstream')
   const [exampleRowsJson, setExampleRowsJson] = useState('')
   const [testedExampleRowsJson, setTestedExampleRowsJson] = useState<string | null>(null)
+  const [promotionOpen, setPromotionOpen] = useState(false)
+  const [promotionDescription, setPromotionDescription] = useState('')
+  const [promotionBusy, setPromotionBusy] = useState(false)
+  const [promotionError, setPromotionError] = useState('')
   // This is deliberately request-local. The authoritative run lifecycle stays in the graph store;
   // the editor only remembers that this surface initiated it so an unrelated Canvas run is not
   // presented as its test input.
@@ -60,14 +67,22 @@ export function CodeFullscreen() {
     runEditorExamplePreview, clearEditorPreview, requestRun, promote,
   } = useStore.getState()
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (promotionOpen && !promotionBusy) setPromotionOpen(false)
+      else if (!promotionOpen) close()
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [close])
+  }, [close, promotionBusy, promotionOpen])
   useEffect(() => {
     setTestInput('upstream')
     setExampleRowsJson('')
     setTestedExampleRowsJson(null)
+    setPromotionOpen(false)
+    setPromotionDescription('')
+    setPromotionBusy(false)
+    setPromotionError('')
     setUpstreamRequest(undefined)
     refreshedUpstreamRunId.current = null
     upstreamDispatching.current = false
@@ -105,17 +120,35 @@ export function CodeFullscreen() {
     refreshedUpstreamRunId.current = upstreamRunId
     void runEditorPreview(fs.nodeId)
   }, [editorUpstreamNodeId, freshUpstreamRunDone, fs, runEditorPreview, testInput, upstreamRunId])
+  const candidateCfg = (node?.data.config ?? {}) as Record<string, unknown>
+  const candidateIsTransform = node?.type === 'transform'
+  const candidateIsLibrary = candidateIsTransform && candidateCfg.source === 'library'
+  const configuredRef = configuredProcessorRef(candidateCfg.processor, candidateCfg.version)
+  const listedProcessor = exactProcessor(
+    processors, candidateCfg.processor, candidateCfg.version,
+  ) ?? transformReferences.find((reference) => (
+    reference.id === candidateCfg.processor && reference.version === candidateCfg.version
+  ))?.descriptor ?? undefined
+  const {
+    descriptor: libraryDescriptor,
+    loading: libraryDescriptorLoading,
+    error: libraryDescriptorError,
+  } = useExactLibraryDescriptor(
+    candidateIsLibrary ? candidateCfg.processor : undefined,
+    candidateIsLibrary ? candidateCfg.version : undefined,
+    listedProcessor,
+  )
   if (!fs || !node) return null
 
-  const cfg = node.data.config as Record<string, unknown>
+  const cfg = candidateCfg
   const language = fs.lang === 'sql' ? 'sql' : 'python'
   const value = String(cfg[fs.param] ?? '')
-  const isTransform = node.type === 'transform'
-  const isLibrary = isTransform && cfg.source === 'library'
-  const proc = exactProcessor(processors, cfg.processor, cfg.version)
-  const configuredRef = configuredProcessorRef(cfg.processor, cfg.version)
-  // annotation `code` nodes and library transforms don't run/preview here
-  const canPreview = runnable && node.type !== 'code' && !isLibrary
+  const isTransform = candidateIsTransform
+  const isLibrary = candidateIsLibrary
+  // Annotation `code` nodes don't run here. A Library Transform can use the same bounded retained-
+  // upstream test as an ad-hoc Transform only when its exact registry descriptor allows preview.
+  const canPreview = runnable && node.type !== 'code'
+    && (!isLibrary || libraryDescriptor?.previewable === true)
   // Example rows deliberately do not depend on a runnable upstream graph.
   const canUseExampleRows = isTransform && !isLibrary
   const canTest = canPreview || canUseExampleRows
@@ -220,6 +253,20 @@ export function CodeFullscreen() {
       upstreamCancelling.current = false
     })
   }
+  const submitPromotion = async () => {
+    const description = promotionDescription.trim()
+    if (!description || promotionBusy) return
+    setPromotionBusy(true)
+    setPromotionError('')
+    try {
+      await promote(fs.nodeId, description)
+      setPromotionOpen(false)
+    } catch (error) {
+      setPromotionError((error as Error).message || 'Could not promote this Transform')
+    } finally {
+      setPromotionBusy(false)
+    }
+  }
   return (
     <div className="fixed inset-0 z-[60] flex flex-col bg-[#10141e]/45 p-7" onClick={close}>
       <div onClick={(e) => e.stopPropagation()}
@@ -227,8 +274,10 @@ export function CodeFullscreen() {
         <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">
           <span className="flex items-center text-muted-foreground"><Icon name="code" size={14} /></span>
           <span className="text-[13px] font-semibold text-foreground">{node.data.title}</span>
-          <span className="text-[12.5px] text-muted-foreground">· {fs.param} · {language}</span>
-          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${proc ? `${proc.title} ${proc.version} (registry)` : `${configuredRef ?? 'unconfigured library transform'} (exact reference)`}` : ''}</span>}
+          <span className="text-[12.5px] text-muted-foreground">
+            {isLibrary ? '· Library processor' : `· ${fs.param} · ${language}`}
+          </span>
+          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${libraryDescriptor ? `${libraryDescriptor.title} ${libraryDescriptor.version}` : `${configuredRef ?? 'unconfigured library transform'} (exact reference)`}` : ''}</span>}
           <span className="flex-1" />
           <button onClick={close} aria-label="Close" title="Close (Esc)"
             className="grid h-[26px] w-7 place-items-center rounded-md border-0 bg-transparent text-muted-foreground hover:text-foreground">
@@ -236,13 +285,23 @@ export function CodeFullscreen() {
           </button>
         </div>
         <div className="flex min-h-0 flex-1">
-          <div className="min-h-0 flex-1">
-            <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
-              <CodeEditor language={language} height="100%" value={value} readOnly={isLibrary || !canEdit} completions={completions}
-                errorLine={syntaxErrorLine}
-                onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
-            </Suspense>
-          </div>
+          {isLibrary ? (
+            <LibraryProcessorDefinition
+              configuredRef={configuredRef}
+              descriptor={libraryDescriptor}
+              loading={libraryDescriptorLoading}
+              error={libraryDescriptorError}
+              runnable={runnable}
+            />
+          ) : (
+            <div className="min-h-0 flex-1">
+              <Suspense fallback={<div className="grid h-full place-items-center text-xs text-muted-foreground">loading editor…</div>}>
+                <CodeEditor language={language} height="100%" value={value} readOnly={!canEdit} completions={completions}
+                  errorLine={syntaxErrorLine}
+                  onChange={(v) => updateConfig(fs.nodeId, { [fs.param]: v })} />
+              </Suspense>
+            </div>
+          )}
           {/* run + see results without leaving the editor — the node runs on its current input */}
           {canTest && (
             <div className="flex min-h-0 w-[42%] max-w-[640px] flex-col overflow-hidden border-l border-border">
@@ -323,6 +382,7 @@ export function CodeFullscreen() {
                           onRunUpstream: canRunUpstream && !upstreamAttemptBusy
                             ? runUpstream
                             : undefined,
+                          testTarget: isLibrary ? 'transform' : 'code',
                         }
                     ) : undefined} />
                   </>
@@ -351,7 +411,11 @@ export function CodeFullscreen() {
             )}
             <span className="flex-1" />
             {canEdit && isTransform && !isLibrary && (
-              <button onClick={() => promote(fs.nodeId)}
+              <button onClick={() => {
+                setPromotionDescription('')
+                setPromotionError('')
+                setPromotionOpen(true)
+              }}
                 className="inline-flex items-center gap-[5px] rounded-md border border-border bg-background px-3.5 py-2 text-xs font-semibold text-primary hover:bg-accent">
                 Promote to library <Icon name="external" size={12} />
               </button>
@@ -365,12 +429,357 @@ export function CodeFullscreen() {
                     : isTransform ? runEditorPreview(fs.nodeId) : runPreview(fs.nodeId)
                 )}
                 className="inline-flex items-center gap-[5px] rounded-md bg-primary px-4 py-2 text-[12.5px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50">
-                <Icon name="eye" size={12} /> {isTransform ? 'Test code' : 'Preview'}
+                <Icon name="eye" size={12} /> {isLibrary ? 'Test transform' : isTransform ? 'Test code' : 'Preview'}
               </button>
             )}
           </div>
         ) : null}
       </div>
+      {promotionOpen && (
+        <PromotionDescriptionDialog
+          title={String(node.data.title || 'Transform')}
+          description={promotionDescription}
+          busy={promotionBusy}
+          error={promotionError}
+          onChange={setPromotionDescription}
+          onCancel={() => {
+            if (!promotionBusy) setPromotionOpen(false)
+          }}
+          onSubmit={() => void submitPromotion()}
+        />
+      )}
+    </div>
+  )
+}
+
+function useExactLibraryDescriptor(
+  processor: unknown,
+  version: unknown,
+  listed: ProcessorDescriptor | undefined,
+): { descriptor?: ProcessorDescriptor; loading: boolean; error: string } {
+  const id = typeof processor === 'string' && processor ? processor : undefined
+  const exactVersion = typeof version === 'string' && version ? version : undefined
+  const [state, setState] = useState<{
+    descriptor?: ProcessorDescriptor
+    loading: boolean
+    error: string
+  }>({ descriptor: listed, loading: Boolean(id && exactVersion && !listed), error: '' })
+
+  useEffect(() => {
+    if (!id || !exactVersion) {
+      setState({ descriptor: undefined, loading: false, error: '' })
+      return
+    }
+    if (listed) {
+      setState({ descriptor: listed, loading: false, error: '' })
+      return
+    }
+    let current = true
+    setState({ descriptor: undefined, loading: true, error: '' })
+    void api.transformLibraryDetail(id, exactVersion).then((detail) => {
+      if (!current) return
+      const descriptor = Array.isArray(detail.versions)
+        ? detail.versions.find((candidate) => candidate.version === exactVersion)
+        : undefined
+      setState(descriptor
+        ? { descriptor, loading: false, error: '' }
+        : {
+            descriptor: undefined,
+            loading: false,
+            error: `Registry metadata for ${id}@${exactVersion} is unavailable.`,
+          })
+    }).catch((error) => {
+      if (!current) return
+      setState({
+        descriptor: undefined,
+        loading: false,
+        error: (error as Error).message || `Could not load ${id}@${exactVersion}.`,
+      })
+    })
+    return () => { current = false }
+  }, [exactVersion, id, listed])
+
+  return state
+}
+
+function LibraryProcessorDefinition({
+  configuredRef,
+  descriptor,
+  loading,
+  error,
+  runnable,
+}: {
+  configuredRef?: string
+  descriptor?: ProcessorDescriptor
+  loading: boolean
+  error: string
+  runnable: boolean
+}) {
+  const parameters = descriptor ? processorParameterEntries(descriptor.paramsSchema) : []
+  const status = loading
+    ? 'Loading the exact processor definition before enabling a bounded test.'
+    : error || !descriptor
+      ? 'The exact processor definition is unavailable, so bounded testing cannot be enabled safely.'
+      : descriptor.previewable === false
+        ? 'This processor does not support bounded preview tests. Run it from the Canvas to produce a result.'
+        : !runnable
+      ? 'Connect one dataset input before testing this processor.'
+      : 'Use Test transform to run this exact processor against a bounded upstream result.'
+
+  return (
+    <section aria-label="Library processor definition"
+      className="min-h-0 flex-1 overflow-auto bg-background/30 px-7 py-6">
+      <div className="mx-auto max-w-[760px]">
+        <div className="text-[10px] font-bold uppercase tracking-[0.7px] text-muted-foreground">
+          Exact registry processor
+        </div>
+        <div className="mt-1 break-all font-mono text-[13px] font-semibold text-foreground">
+          {configuredRef ?? 'No exact processor selected'}
+        </div>
+
+        {loading && (
+          <div role="status" className="mt-5 rounded-md border border-border bg-card px-4 py-3 text-xs text-muted-foreground">
+            Loading the exact registry definition…
+          </div>
+        )}
+        {error && (
+          <div role="alert" className="mt-5 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-xs text-destructive">
+            {error}
+          </div>
+        )}
+
+        {descriptor && (
+          <>
+            <h2 className="mt-5 text-xl font-semibold text-foreground">{descriptor.title}</h2>
+            <p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">
+              {descriptor.blurb || 'No registry description was supplied for this processor.'}
+            </p>
+
+            <dl className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <DefinitionFact label="Registry source" value={descriptor.provenance === 'plugin' ? 'Plugin' : 'Promoted'} />
+              <DefinitionFact label="Mode" value={descriptor.mode} />
+              <DefinitionFact label="Category" value={descriptor.category} />
+              <DefinitionFact label="Bounded test" value={descriptor.previewable ? 'Supported' : 'Unavailable'} />
+            </dl>
+
+            <div className="mt-6 grid gap-5 lg:grid-cols-2">
+              <ProcessorSchema
+                title="Input contract"
+                columns={descriptor.inputSchema}
+                fallbackNames={descriptor.inputColumns}
+              />
+              <ProcessorSchema
+                title="Output contract"
+                columns={descriptor.outputSchema}
+                fallbackNames={[]}
+              />
+            </div>
+
+            <section className="mt-6">
+              <h3 className="text-[10px] font-bold uppercase tracking-[0.6px] text-muted-foreground">
+                Parameters
+              </h3>
+              {parameters.length ? (
+                <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
+                  {parameters.map(([name, definition], index) => (
+                    <div key={name}
+                      className={`grid grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2.5 text-[11.5px] ${
+                        index ? 'border-t border-border' : ''
+                      }`}>
+                      <div className="min-w-0">
+                        <div className="break-all font-mono font-semibold text-foreground">{name}</div>
+                        {typeof definition.description === 'string' && definition.description && (
+                          <div className="mt-0.5 leading-relaxed text-muted-foreground">
+                            {definition.description}
+                          </div>
+                        )}
+                      </div>
+                      <div className="text-right text-muted-foreground">
+                        <div>{parameterType(definition)}</div>
+                        {Object.prototype.hasOwnProperty.call(definition, 'default') && (
+                          <div className="mt-0.5 font-mono text-[10.5px]">
+                            default {formatDefinitionValue(definition.default)}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="mt-2 text-xs text-muted-foreground">No configurable parameters declared.</div>
+              )}
+            </section>
+
+            {descriptor.requirements.length > 0 && (
+              <section className="mt-6">
+                <h3 className="text-[10px] font-bold uppercase tracking-[0.6px] text-muted-foreground">
+                  Requirements
+                </h3>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {descriptor.requirements.map((requirement) => (
+                    <span key={requirement}
+                      className="rounded border border-border bg-card px-2 py-1 font-mono text-[10.5px] text-foreground">
+                      {requirement}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
+        )}
+
+        <div className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
+          <div className="font-semibold text-foreground">Implementation source unavailable</div>
+          <div className="mt-1">
+            This registry entry does not publish executable source. Canvas execution uses the exact
+            registered processor shown above; the blank editor previously shown here was not source code.
+          </div>
+        </div>
+        <div className={`mt-3 rounded-md px-4 py-3 text-[11.5px] leading-relaxed ${
+          error || !descriptor || descriptor.previewable === false
+            ? 'border border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+            : 'border border-primary/20 bg-primary/5 text-muted-foreground'
+        }`}>
+          {status}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function DefinitionFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-border bg-card px-3 py-2">
+      <dt className="text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd className="mt-1 break-words text-[11.5px] font-medium text-foreground">{value}</dd>
+    </div>
+  )
+}
+
+function ProcessorSchema({
+  title,
+  columns,
+  fallbackNames,
+}: {
+  title: string
+  columns: ProcessorDescriptor['inputSchema']
+  fallbackNames: string[]
+}) {
+  return (
+    <section>
+      <h3 className="text-[10px] font-bold uppercase tracking-[0.6px] text-muted-foreground">{title}</h3>
+      <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
+        {columns.length ? columns.map((column, index) => (
+          <div key={`${column.name}-${index}`}
+            className={`flex items-baseline gap-3 px-3 py-2 text-[11.5px] ${index ? 'border-t border-border' : ''}`}>
+            <span className="min-w-0 flex-1 break-all font-mono font-semibold text-foreground">{column.name}</span>
+            <span className="font-mono text-[10.5px] text-muted-foreground">{column.type}</span>
+            <span className="text-[10px] text-muted-foreground">{column.nullable === false ? 'required' : 'nullable'}</span>
+          </div>
+        )) : fallbackNames.length ? fallbackNames.map((name, index) => (
+          <div key={name}
+            className={`break-all px-3 py-2 font-mono text-[11.5px] text-foreground ${index ? 'border-t border-border' : ''}`}>
+            {name}
+          </div>
+        )) : (
+          <div className="px-3 py-2 text-[11.5px] text-muted-foreground">Not declared.</div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function processorParameterEntries(schema: Record<string, unknown>) {
+  const nested = schema.properties
+  const source = nested && typeof nested === 'object' && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : schema
+  return Object.entries(source).flatMap(([name, value]) => (
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? [[name, value as Record<string, unknown>] as const]
+      : []
+  ))
+}
+
+function parameterType(definition: Record<string, unknown>) {
+  if (Array.isArray(definition.enum) && definition.enum.length) {
+    return definition.enum.map(formatDefinitionValue).join(' | ')
+  }
+  return typeof definition.type === 'string' ? definition.type : 'value'
+}
+
+function formatDefinitionValue(value: unknown) {
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (value === undefined) return 'undefined'
+  try { return JSON.stringify(value) }
+  catch { return String(value) }
+}
+
+function PromotionDescriptionDialog({
+  title,
+  description,
+  busy,
+  error,
+  onChange,
+  onCancel,
+  onSubmit,
+}: {
+  title: string
+  description: string
+  busy: boolean
+  error: string
+  onChange: (value: string) => void
+  onCancel: () => void
+  onSubmit: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center bg-black/35 p-5"
+      onMouseDown={(event) => {
+        event.stopPropagation()
+        if (event.target === event.currentTarget) onCancel()
+      }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="promote-transform-title"
+        className="w-full max-w-[520px] rounded-lg border border-border bg-card p-5 shadow-2xl"
+        onMouseDown={(event) => event.stopPropagation()}>
+        <h2 id="promote-transform-title" className="text-[15px] font-semibold text-foreground">
+          Promote {title} to the Library
+        </h2>
+        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+          Describe what the processor does and what a researcher should expect. This description is
+          stored with the immutable Library version.
+        </p>
+        <label htmlFor="promotion-description"
+          className="mt-4 block text-[11px] font-semibold text-foreground">
+          Description
+        </label>
+        <textarea
+          id="promotion-description"
+          autoFocus
+          maxLength={2000}
+          value={description}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="For example: Adds normalized country and region fields from the event location."
+          className="mt-1.5 h-28 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-[12px] leading-relaxed text-foreground outline-none focus:border-primary"
+        />
+        <div className="mt-1 text-right text-[10px] text-muted-foreground">
+          {description.length.toLocaleString()} / 2,000
+        </div>
+        {error && (
+          <div role="alert" className="mt-3 rounded border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11.5px] text-destructive">
+            {error}
+          </div>
+        )}
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button" onClick={onCancel} disabled={busy}
+            className="rounded-md border border-border bg-background px-3 py-2 text-xs font-semibold text-foreground hover:bg-accent disabled:opacity-50">
+            Cancel
+          </button>
+          <button type="button" onClick={onSubmit} disabled={busy || !description.trim()}
+            className="rounded-md bg-primary px-3.5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+            {busy ? 'Promoting…' : 'Promote'}
+          </button>
+        </div>
+      </section>
     </div>
   )
 }

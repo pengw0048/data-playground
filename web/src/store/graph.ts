@@ -1284,7 +1284,7 @@ interface Store {
   prepareFullProfile: (id: string, portId?: string) => Promise<void>
   startFullProfile: (id: string, portId?: string) => Promise<void>
   cancelFullProfile: (id: string, portId?: string) => Promise<void>
-  promote: (id: string) => Promise<void>
+  promote: (id: string, description: string) => Promise<void>
   restoreVersion: (id: string, versionId: string) => void
 
   // -- kernel + catalog --
@@ -2484,7 +2484,7 @@ export const useStore = create<Store>((set, get) => ({
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (!node || node.type !== 'transform') return
     if (hasInvalidUpstream(doc, id, get().numericParamDrafts)) {
-      get().pushToast('Fix invalid upstream parameters before testing this code.', 'error')
+      get().pushToast('Fix invalid upstream parameters before testing this Transform.', 'error')
       return
     }
     const incoming = doc.edges.filter((edge) => edge.target === id)
@@ -3505,7 +3505,7 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  promote: async (id) => {
+  promote: async (id, description) => {
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
     const n = doc.nodes.find((x) => x.id === id)
@@ -3519,7 +3519,7 @@ export const useStore = create<Store>((set, get) => ({
       inputColumns: [],
       outputSchema: Array.isArray(cfg.outputSchema) ? (cfg.outputSchema as any) : [],  // a {ref} contract doesn't inline here
       requirements: doc.requirements ?? [],
-      blurb: 'promoted from an ad-hoc cell',
+      blurb: description.trim(),
     })
     // The durable exact reference is now the execution definition. Inline code remains an ad-hoc
     // representation only and must not silently become a fallback for an unavailable library version.
