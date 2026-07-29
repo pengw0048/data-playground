@@ -113,7 +113,7 @@ export function TopBar() {
         <div className="flex min-w-0 items-center gap-2 overflow-hidden">
           <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
           {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
-          <span className="shrink-0 text-[13.5px] text-muted-foreground">/</span>
+          <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
           <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
@@ -179,7 +179,7 @@ export function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistor
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <button data-testid="app-menu" title="Menu" aria-label="App menu"
+        <button data-testid="app-menu" title="Data Playground menu" aria-label="Data Playground menu"
           className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-bold text-foreground">
           <span className="grid h-5 w-5 place-items-center rounded-[5px] bg-foreground text-xs font-bold text-background" aria-hidden>D</span>
           <span className="text-muted-foreground" aria-hidden><Icon name="chevronDown" size={12} /></span>
@@ -213,14 +213,17 @@ function MenuDestination({ label, detail }: { label: string; detail: string }) {
   </span>
 }
 
-function CanvasInboxIndicator({ count }: { count: number }) {
+export function CanvasInboxIndicator({ count }: { count: number }) {
   const setInboxQuery = useStore((s) => s.setInboxQuery)
   const inboxQuery = useStore((s) => s.inboxQuery)
   const bounded = count > 99 ? '99+' : String(count)
   return <button type="button" data-testid="canvas-inbox-unread-badge" onClick={() => setInboxQuery(inboxQuery)}
     aria-label={`Inbox, ${count} unread outcomes`} title={`${count} Inbox outcome${count === 1 ? '' : 's'} need attention`}
-    className="relative grid h-6 min-w-6 place-items-center rounded-full bg-foreground px-1 text-[10px] font-bold text-background hover:bg-foreground/85">
-    {bounded}
+    className="relative grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+    <Icon name="note" size={16} />
+    <span aria-hidden className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-foreground px-1 text-[9px] font-bold leading-none text-background">
+      {bounded}
+    </span>
   </button>
 }
 

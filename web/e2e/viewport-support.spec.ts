@@ -457,7 +457,7 @@ test.describe('minimum viewport support', () => {
       await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `1024px Canvas ${name}`)
     }
     await page.getByTestId('app-menu').click()
-    const appMenu = page.getByRole('menu', { name: 'App menu' })
+    const appMenu = page.getByRole('menu', { name: 'Data Playground menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
     for (const detail of ['runs and background tasks', 'my background task results', 'runs from this Canvas']) {
       await expect(appMenu.getByText(detail, { exact: true })).toBeVisible()

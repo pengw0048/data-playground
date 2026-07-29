@@ -6,7 +6,7 @@ import { useStore } from '../store/graph'
 type LocationState =
   | { kind: 'hidden' }
   | { kind: 'unavailable' }
-  | { kind: 'resolved'; resource: WorkspaceResource; ancestors: WorkspaceResource[] }
+  | { kind: 'resolved'; ancestors: WorkspaceResource[] }
 
 type Props = {
   onReturnDestination: (resourceId: string | null | undefined) => void
@@ -60,7 +60,7 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
         return
       }
       setState({
-        kind: 'resolved', resource: resolved.resource, ancestors: resolved.ancestors,
+        kind: 'resolved', ancestors: resolved.ancestors,
       })
     }).catch(() => {
       if (!current) return
@@ -85,8 +85,6 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
         <span aria-hidden>/</span>
         <button type="button" onClick={() => onNavigate(ancestor.id)} className="truncate hover:text-foreground">{ancestor.name}</button>
       </span>)}
-      <span aria-hidden>/</span>
-      <span aria-current="page" className="truncate text-foreground">{state.resource.name}</span>
     </nav>
   )
 }

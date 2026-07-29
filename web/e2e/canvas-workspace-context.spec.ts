@@ -34,7 +34,8 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
 
     const location = page.getByRole('navigation', { name: 'Canvas Workspace location' })
-    await expect(location).toContainText(`Workspace/${parent}/${child}/${canvas}`)
+    await expect(location).toContainText(`Workspace/${parent}/${child}`)
+    await expect(location).not.toContainText(canvas)
     for (const width of [1024, 1280]) {
       await page.setViewportSize({ width, height: 720 })
       const [locationBox, menuBox] = await Promise.all([
@@ -50,7 +51,8 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
         && response.request().method() === 'GET')
     await page.reload()
     expect((await reloadedResolution).ok()).toBeTruthy()
-    await expect(location).toContainText(`Workspace/${parent}/${child}/${canvas}`)
+    await expect(location).toContainText(`Workspace/${parent}/${child}`)
+    await expect(location).not.toContainText(canvas)
 
     // A Datasets filter cannot prove the Canvas is visible in this folder. Returning must reset
     // it atomically to All Workspace at the exact opaque parent location.
@@ -74,7 +76,8 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(renamedParent)
     await page.getByRole('button', { name: `Open folder ${child}` }).click()
     await page.getByRole('button', { name: `Open canvas ${canvas}` }).click()
-    await expect(location).toContainText(`Workspace/${renamedParent}/${child}/${canvas}`)
+    await expect(location).toContainText(`Workspace/${renamedParent}/${child}`)
+    await expect(location).not.toContainText(canvas)
 
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace', { exact: true }).click()
@@ -85,6 +88,7 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await page.getByRole('navigation', { name: 'Workspace path' }).getByRole('button', { name: 'Workspace', exact: true }).click()
     await page.getByRole('button', { name: `Open folder ${destination}` }).click()
     await page.getByRole('button', { name: `Open canvas ${canvas}` }).click()
-    await expect(location).toContainText(`Workspace/${destination}/${canvas}`)
+    await expect(location).toContainText(`Workspace/${destination}`)
+    await expect(location).not.toContainText(canvas)
   })
 })

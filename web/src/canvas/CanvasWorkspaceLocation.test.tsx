@@ -42,7 +42,8 @@ describe('CanvasWorkspaceLocation', () => {
     render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
 
     const location = await screen.findByRole('navigation', { name: 'Canvas Workspace location' })
-    expect(location).toHaveTextContent('Workspace/Research/Robotics/Purchases per user')
+    expect(location).toHaveTextContent('Workspace/Research/Robotics')
+    expect(location).not.toHaveTextContent('Purchases per user')
     expect(onReturnDestination).toHaveBeenLastCalledWith(ROBOTICS.id)
     fireEvent.click(screen.getByRole('button', { name: 'Research' }))
     expect(onNavigate).toHaveBeenCalledWith(RESEARCH.id)
@@ -115,12 +116,17 @@ describe('CanvasWorkspaceLocation', () => {
     const { rerender } = render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
     mocks.state.doc.id = 'canvas-2'
     const fresh = { ...CANVAS, id: 'canvas:canvas-2', name: 'Fresh Canvas' }
-    mocks.workspaceResource.mockResolvedValueOnce({ resource: fresh, ancestors: [ROOT, RESEARCH, ROBOTICS], source: COMPLETE })
+    const freshParent = {
+      ...ROBOTICS, id: 'container:fresh-robotics', name: 'Fresh Robotics',
+    }
+    mocks.workspaceResource.mockResolvedValueOnce({
+      resource: fresh, ancestors: [ROOT, RESEARCH, freshParent], source: COMPLETE,
+    })
     rerender(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
 
-    await screen.findByText('Fresh Canvas')
+    await screen.findByText('Fresh Robotics')
     resolveOld({ resource: CANVAS, ancestors: [ROOT], source: COMPLETE })
-    await waitFor(() => expect(screen.getByText('Fresh Canvas')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('Fresh Robotics')).toBeInTheDocument())
     expect(screen.queryByText('Purchases per user')).not.toBeInTheDocument()
   })
 
