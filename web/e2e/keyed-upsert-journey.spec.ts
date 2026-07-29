@@ -136,7 +136,8 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
 
     try {
       await page.goto(`/#/canvas/${canvasId}`)
-      await page.locator('.react-flow__node[data-id="write"]').click()
+      const writeCard = page.locator('.react-flow__node[data-id="write"]')
+      await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
       const control = page.getByTestId('inspector').getByLabel('Certified keyed upsert')
       await expect(control).toBeVisible()
       await control.getByRole('button', { name: 'Check eligibility' }).click()
@@ -181,7 +182,7 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
       const darkStart = consoleErrors.length
       await page.goto(`/#/canvas/${canvasId}`)
       await setTheme(page, 'dark')
-      await page.locator('.react-flow__node[data-id="write"]').click()
+      await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
       await expect(control.getByText('Published exact revision')).toBeVisible({ timeout: 30_000 })
       await shoot(page, 'dark', 'canvas')
       await control.getByRole('button', { name: 'Open exact revision' }).click()

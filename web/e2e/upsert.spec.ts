@@ -110,7 +110,8 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
     saved.push(canvasId)
 
     await page.goto(`/#/canvas/${canvasId}`)
-    await page.locator('.react-flow__node[data-id="write"]').click()
+    const writeCard = page.locator('.react-flow__node[data-id="write"]')
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
     const control = inspector.getByLabel('Certified keyed upsert')
     await expect(control).toBeVisible()
