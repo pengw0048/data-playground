@@ -95,7 +95,7 @@ test('summary separates nested phases and escapes Markdown table cells', () => {
       },
       {
         kind: 'test-attempt',
-        project: 'chromium|smoke',
+        project: String.raw`chromium\|smoke`,
         file: 'e2e/canvas\r\nname|.spec.ts',
         testId: 'canvas',
         title: 'canvas',
@@ -126,7 +126,7 @@ test('summary separates nested phases and escapes Markdown table cells', () => {
   assert.match(nested, /playwright\\\|run/)
   assert.match(nested, /nested<br>line\\\|detail/)
   assert.match(nested, /Do not add their durations to the parent duration/)
-  assert.match(summary, /chromium\\\|smoke/)
+  assert.ok(summary.includes(String.raw`chromium\\\|smoke`))
   assert.match(summary, /e2e\/canvas<br>name\\\|\.spec\.ts/)
 })
 

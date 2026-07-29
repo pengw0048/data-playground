@@ -16,6 +16,7 @@ function outputFileFromEnvironment() {
 
 function markdownCell(value) {
   return String(value ?? '')
+    .replace(/\\/g, '\\\\')
     .replace(/\r\n|\r|\n/g, '<br>')
     .replace(/\|/g, '\\|')
 }
