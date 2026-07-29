@@ -80,7 +80,7 @@ describe('App auth bootstrap', () => {
     render(<App />)
 
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
-    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(useStore.getState().authEnabled).toBe(false)
   })
 
@@ -179,7 +179,7 @@ describe('App auth bootstrap', () => {
     render(<App />)
 
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
-    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(screen.queryByTestId('login')).not.toBeInTheDocument()
     expect(useStore.getState().authEnabled).toBe(true)
   })
@@ -210,7 +210,7 @@ describe('App auth bootstrap', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }))
 
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
-    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(status).toHaveBeenCalledTimes(4)
   })
 
@@ -221,7 +221,7 @@ describe('App auth bootstrap', () => {
     render(<App />)
 
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
-    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(status).toHaveBeenCalledTimes(3)
   })
