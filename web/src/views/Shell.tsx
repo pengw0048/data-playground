@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useStore, type DpView } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
@@ -23,6 +23,7 @@ export function Shell() {
   const view = useStore((s) => s.view)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [unreadCount, setUnreadCount] = useState(0)
+  const unreadRequest = useRef(0)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
@@ -32,12 +33,18 @@ export function Shell() {
     setSettingsOpen(false)
     requestAnimationFrame(() => settingsTrigger.current?.focus())
   }
-  const refreshUnread = () => {
+  const refreshUnread = useCallback(() => {
+    const request = ++unreadRequest.current
     void api.inboxUnreadCount()
-      .then((result) => setUnreadCount(result.count))
+      .then((result) => {
+        if (request === unreadRequest.current) setUnreadCount(result.count)
+      })
       .catch(() => { /* badge stays at last known truthful count */ })
-  }
-  useEffect(() => { refreshUnread() }, [view])
+  }, [])
+  useEffect(() => {
+    refreshUnread()
+    return () => { unreadRequest.current += 1 }
+  }, [refreshUnread, view])
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
       <Rail onSettings={openSettings} unreadCount={unreadCount} />

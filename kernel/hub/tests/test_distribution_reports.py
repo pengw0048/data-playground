@@ -337,6 +337,7 @@ def test_db_time_duplicate_owner_fencing_terminal_atomicity_and_response_loss(
     assert metadb.durable_task_inbox_item(metadb.DEFAULT_USER_ID, inbox_id) is None
     assert metadb.mark_durable_task_inbox_item_read(
         metadb.DEFAULT_USER_ID, inbox_id) is None
+    metadb.mark_all_durable_task_inbox_items_read(metadb.DEFAULT_USER_ID)
     job = metadb.list_workspace_runs(
         metadb.DEFAULT_USER_ID, run_id=task_id)["items"][0]
     assert job["jobType"] == "distribution_report"

@@ -28,6 +28,7 @@ from hub.models import (
     CredUpsert,
     DurableTaskInboxItemView,
     DurableTaskInboxPage,
+    DurableTaskInboxReadAllResult,
     DurableTaskInboxUnreadCount,
     ExecutionManifestDetail,
     Graph,
@@ -1599,6 +1600,14 @@ def workspace_inbox(
 def workspace_inbox_unread_count(
         uid: str = Depends(current_user)) -> DurableTaskInboxUnreadCount:
     return DurableTaskInboxUnreadCount(count=metadb.count_durable_task_inbox_unread(uid))
+
+
+@router.post("/inbox/read-all", response_model=DurableTaskInboxReadAllResult)
+def workspace_inbox_mark_all_read(
+        uid: str = Depends(current_user)) -> DurableTaskInboxReadAllResult:
+    """Atomically mark every currently unread visible item for the current owner."""
+    result = metadb.mark_all_durable_task_inbox_items_read(uid)
+    return DurableTaskInboxReadAllResult.model_validate(result)
 
 
 @router.post("/inbox/{item_id}/read", response_model=DurableTaskInboxItemView)

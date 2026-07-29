@@ -4644,6 +4644,26 @@
         "title": "DurableTaskInboxPage",
         "type": "object"
       },
+      "DurableTaskInboxReadAllResult": {
+        "properties": {
+          "markedCount": {
+            "minimum": 0.0,
+            "title": "Markedcount",
+            "type": "integer"
+          },
+          "readAt": {
+            "format": "date-time",
+            "title": "Readat",
+            "type": "string"
+          }
+        },
+        "required": [
+          "markedCount",
+          "readAt"
+        ],
+        "title": "DurableTaskInboxReadAllResult",
+        "type": "object"
+      },
       "DurableTaskInboxUnreadCount": {
         "properties": {
           "count": {
@@ -22298,6 +22318,79 @@
           }
         },
         "summary": "Workspace Inbox"
+      }
+    },
+    "/api/inbox/read-all": {
+      "post": {
+        "description": "Atomically mark every currently unread visible item for the current owner.",
+        "operationId": "workspace_inbox_mark_all_read_api_inbox_read_all_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DurableTaskInboxReadAllResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Workspace Inbox Mark All Read"
       }
     },
     "/api/inbox/unread-count": {

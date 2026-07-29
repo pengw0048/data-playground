@@ -7259,6 +7259,24 @@ def count_durable_task_inbox_unread(owner_id: str) -> int:
         )) or 0)
 
 
+def mark_all_durable_task_inbox_items_read(owner_id: str) -> dict:
+    """Mark the owner's unread visible items in one statement-snapshot fence."""
+    owner_id = str(owner_id)
+    with session() as s:
+        marked = list(s.execute(
+            update(DurableTaskInboxItem).where(
+                DurableTaskInboxItem.owner_id == owner_id,
+                DurableTaskInboxItem.task_kind.notin_(_INBOX_HIDDEN_TASK_KINDS),
+                DurableTaskInboxItem.read_at.is_(None),
+            ).values(read_at=func.now()).returning(
+                DurableTaskInboxItem.id,
+                DurableTaskInboxItem.read_at,
+            )
+        ))
+        stamp = marked[0][1] if marked else _durable_task_db_now(s)
+        return {"marked_count": len(marked), "read_at": _inbox_stamp(stamp)}
+
+
 def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | None:
     """Idempotent owner-scoped mark-read using DB time; replay returns the original timestamp."""
     owner_id, item_id = str(owner_id), str(item_id)

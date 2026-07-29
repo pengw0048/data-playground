@@ -11,6 +11,22 @@ afterEach(() => {
 })
 
 describe('API error recovery contract', () => {
+  it('marks the current owner’s visible Inbox items read with one batch request', async () => {
+    const payload = { markedCount: 3, readAt: '2026-07-29T12:00:00Z' }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await expect(api.inboxMarkAllRead()).resolves.toEqual(payload)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/inbox/read-all',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
   it('asks the server to resolve a current retained result without accepting result identity', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       runId: 'retained-run',
