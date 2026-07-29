@@ -732,6 +732,13 @@ const CARD_TONE: Record<string, string> = {
   unknown: 'bg-muted text-muted-foreground',
 }
 
+function hasCompleteJoinInputs(doc: CanvasDoc, nodeId: string): boolean {
+  const incoming = doc.edges.filter((edge) => edge.target === nodeId)
+  return incoming.length === 2
+    && incoming.filter((edge) => edge.targetHandle === 'a').length === 1
+    && incoming.filter((edge) => edge.targetHandle === 'b').length === 1
+}
+
 // Join hints (catalog-driven): the backend suggests key columns for the two inputs, with the join
 // cardinality MEASURED from the data. Clicking a suggestion fills the same key-pair contract the card uses. A
 // non-1:1 join gets a fan-out warning (the result lands at the finer grain — rows multiply).
@@ -740,26 +747,33 @@ function JoinHints({ nodeId }: { nodeId: string }) {
   const parameterBindings = useStore((s) => s.runs[nodeId]?.parameterBindings)
   const updateConfig = useStore((s) => s.updateConfig)
   const [analysis, setAnalysis] = useState<JoinAnalysis | null>(null)
+  const [analysisFailed, setAnalysisFailed] = useState(false)
   const [loading, setLoading] = useState(true)  // first analysis is pending → show 'Analyzing…', not 'no matches'
+  const inputsComplete = hasCompleteJoinInputs(doc, nodeId)
   // re-analyze when the graph shape or any node's config changes (debounced); positions don't matter
   const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
     doc.nodes.map((n) => [n.id, n.type, n.data.config]), parameterBindings ?? []])
   useEffect(() => {
     let off = false
+    setAnalysis(null)
+    setAnalysisFailed(false)
+    setLoading(true)
+    if (!inputsComplete) return
     const t = setTimeout(() => {
-      setLoading(true)
       api.joinAnalysis(doc, nodeId, parameterBindings)
         .then((a) => { if (!off) setAnalysis(a) })
-        .catch(() => { if (!off) setAnalysis(null) })
+        .catch(() => { if (!off) setAnalysisFailed(true) })
         .finally(() => { if (!off) setLoading(false) })
     }, 300)
     return () => { off = true; clearTimeout(t) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId, sig])
+  }, [nodeId, sig, inputsComplete])
 
   const apply = (s: JoinSuggestion) => {
     updateConfig(nodeId, serializeJoinKeys(s.leftColumns.map((left, index) => ({ left, right: s.rightColumns[index] ?? '' }))))
   }
+
+  if (!inputsComplete) return null
 
   const suggestions = analysis?.suggestions ?? []
   return (
@@ -776,7 +790,9 @@ function JoinHints({ nodeId }: { nodeId: string }) {
       )}
       {suggestions.length === 0 ? (
         <div className="text-[10.5px] leading-relaxed text-muted-foreground">
-          {loading ? 'Analyzing keys…' : (analysis?.note ?? 'No matching key columns between the two inputs.')}
+          {loading ? 'Analyzing keys…'
+            : analysisFailed || !analysis ? 'Key suggestions are unavailable. Choose join keys manually.'
+              : (analysis.note ?? 'No matching key columns between the two inputs.')}
         </div>
       ) : (
         <div className="flex flex-col gap-1">
