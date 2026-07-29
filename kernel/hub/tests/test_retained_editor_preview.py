@@ -217,23 +217,33 @@ def test_retained_binding_subsets_merge_by_name_and_conflicting_values_fail_clos
 
 def test_current_retained_transform_result_propagates_schema_and_invalidates():
     canvas_id = f"retained-transform-schema-{uuid.uuid4().hex}"
+    # This is the product ordering from #1137: run Source -> Transform first, then add a
+    # downstream Source + Join.  The later downstream graph must not stale Transform's result.
     graph = _transform_join_graph(canvas_id)
-    created = client.post("/api/canvas", json=graph)
+    run_graph = copy.deepcopy(graph)
+    run_graph["nodes"] = run_graph["nodes"][:2]
+    run_graph["edges"] = run_graph["edges"][:1]
+    created = client.post("/api/canvas", json=run_graph)
     assert created.status_code == 200, created.text
     try:
-        before = client.post("/api/graph/schema", json={"graph": graph})
+        before = client.post("/api/graph/schema", json={"graph": run_graph})
         assert before.status_code == 200, before.text
         assert before.json()["transform"]["out"] is None
-        assert before.json()["join"]["out"] is None
 
         started = client.post("/api/run", json={
-            "graph": graph, "targetNodeId": "transform", "confirmed": True,
+            "graph": run_graph, "targetNodeId": "transform", "confirmed": True,
             "submissionId": str(uuid.uuid4()),
         })
         assert started.status_code == 200, started.text
         status = _wait(started.json()["runId"])
         assert status["status"] == "done", status
         _wait_for_history_projection(status["runId"])
+
+        saved = client.get(f"/api/canvas/{canvas_id}")
+        assert saved.status_code == 200, saved.text
+        updated = client.put(
+            f"/api/canvas/{canvas_id}?expectedVersion={saved.json()['version']}", json=graph)
+        assert updated.status_code == 200, updated.text
 
         current = client.post("/api/graph/schema", json={"graph": graph})
         assert current.status_code == 200, current.text

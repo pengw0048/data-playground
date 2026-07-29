@@ -475,6 +475,23 @@ def execution_manifest_accepts_graph_replay(
             "revision_id": item["revisionId"],
             "provider": item["provider"],
         })
+    return bool(
+        doc.get("graph") == _canonical_graph(graph, source_inputs)
+        and doc.get("target") == {
+            "nodeId": target_node_id, "portId": target_port_id,
+        }
+        and execution_manifest_parameter_intent_matches(
+            doc.get("parameters"), graph._parameter_bindings or None)
+    )
+
+
+def execution_manifest_parameter_intent_matches(retained: Any, current: Any) -> bool:
+    """Compare canonical parameter intent while ignoring a mutable latest revision freeze.
+
+    The resolved revision is admission evidence, rather than caller intent.  Keeping this small
+    comparison separate lets retained-result consumers validate a target execution cone without
+    accepting edits to its declarations or bound values.
+    """
     def parameter_intent(value):
         if not isinstance(value, list):
             return value
@@ -492,11 +509,4 @@ def execution_manifest_accepts_graph_replay(
             result.append(copied)
         return result
 
-    return bool(
-        doc.get("graph") == _canonical_graph(graph, source_inputs)
-        and doc.get("target") == {
-            "nodeId": target_node_id, "portId": target_port_id,
-        }
-        and parameter_intent(doc.get("parameters"))
-        == parameter_intent(graph._parameter_bindings or None)
-    )
+    return parameter_intent(retained) == parameter_intent(current)

@@ -45,6 +45,7 @@ from hub.execution_manifest import (
     build_execution_manifest,
     execution_manifest_accepts_graph_replay,
     execution_manifest_admission,
+    execution_manifest_parameter_intent_matches,
 )
 from hub.plugins.adapters import (
     RevisionPermissionLost,
@@ -4199,8 +4200,20 @@ def _retained_current_output(
         raise _retained_editor_error(
             409, "the immediate upstream Source registration changed",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
-    retained_graph._parameter_bindings = copy.deepcopy(admission.get("parameters") or [])
+    retained_parameters = admission.get("parameters")
+    if not execution_manifest_parameter_intent_matches(
+            retained_parameters, current_cone._parameter_bindings or None):
+        raise _retained_editor_error(
+            409, "the immediate upstream parameter bindings changed",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    retained_canonical = retained_parameters or []
+    retained_graph._parameter_bindings = copy.deepcopy(retained_canonical)
     retained_cone._parameter_bindings = copy.deepcopy(retained_graph._parameter_bindings)
+    # The retained latest resolution is exact admission evidence.  It is restored only after the
+    # public parameter intent above has matched, so the cone digest can compare immutable inputs
+    # without treating a moved latest head as an edit to this result.
+    current_for_digest = current_cone.model_copy(deep=True)
+    current_for_digest._parameter_bindings = copy.deepcopy(retained_canonical)
     try:
         rebuilt_retained_digest, _ = build_execution_manifest(
             retained_graph,
@@ -4211,7 +4224,7 @@ def _retained_current_output(
             deps=deps,
         )
         current_digest, _ = build_execution_manifest(
-            current_cone,
+            current_for_digest,
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
@@ -4278,10 +4291,6 @@ def _current_retained_result(
                 retained_canonical)
             current = _resolve_parameters(
                 graph, parameter_bindings, node_id, deps, freeze_latest=False)
-            if not execution_manifest_accepts_graph_replay(
-                    manifest_sha256, payload, current,
-                    target_node_id=node_id, target_port_id=None):
-                continue
             current_cone = _target_execution_graph(current, node_id)
             graph_mod.resolve_source_refs(current_cone, deps.catalog.resolve_ref)
             _reject_invalid(current_cone, deps, node_id)
@@ -4296,10 +4305,6 @@ def _current_retained_result(
                 raise _retained_editor_error(
                     409, "current result targets a different output",
                     APIErrorCode.RETAINED_UPSTREAM_STALE)
-            # Replay already proved the public intent. Restore its admission-only latest freeze for
-            # the existing exact digest check while preserving current Source config for identity
-            # validation inside `_retained_current_output`.
-            current_cone._parameter_bindings = copy.deepcopy(retained_canonical)
             output = _retained_current_output(
                 candidate, target, current_cone, deps)
         except (APIError, ExecutionManifestError, ValueError):
@@ -4307,9 +4312,12 @@ def _current_retained_result(
         if requested_bindings is not None:
             requested = _resolve_parameters(
                 graph, requested_bindings, node_id, deps, freeze_latest=False)
-            if not execution_manifest_accepts_graph_replay(
-                    manifest_sha256, payload, requested,
-                    target_node_id=node_id, target_port_id=None):
+            requested_cone = _target_execution_graph(requested, node_id)
+            graph_mod.resolve_source_refs(requested_cone, deps.catalog.resolve_ref)
+            _reject_invalid(requested_cone, deps, node_id)
+            try:
+                _retained_current_output(candidate, target, requested_cone, deps)
+            except (APIError, ExecutionManifestError, ValueError):
                 raise _retained_editor_error(
                     409, "current result parameter bindings changed",
                     APIErrorCode.RETAINED_UPSTREAM_STALE)

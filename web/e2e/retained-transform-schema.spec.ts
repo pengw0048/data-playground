@@ -32,19 +32,9 @@ test('a parameterized retained Transform result types Join keys across reload an
           code: { parameterRef: 'transform_code' },
         },
       } },
-      { id: 'right', type: 'source', position: { x: 310, y: 290 }, data: {
-        title: 'Right events', status: 'draft', config: {
-          uri: events.uri, tableId: events.id, registrationId: events.registrationId,
-        },
-      } },
-      { id: 'join', type: 'join', position: { x: 590, y: 150 }, data: {
-        title: 'Compare amounts', status: 'draft', config: { how: 'inner', on: '' },
-      } },
     ],
     edges: [
       { id: 'left-transform', source: 'left', sourceHandle: 'out', target: 'transform', targetHandle: 'in', data: { wire: 'dataset' } },
-      { id: 'transform-join', source: 'transform', sourceHandle: 'out', target: 'join', targetHandle: 'a', data: { wire: 'dataset' } },
-      { id: 'right-join', source: 'right', sourceHandle: 'out', target: 'join', targetHandle: 'b', data: { wire: 'dataset' } },
     ],
   }
   const created = await page.request.post('/api/canvas', { data: graph })
@@ -58,6 +48,29 @@ test('a parameterized retained Transform result types Join keys across reload an
     const { runId } = await started.json() as { runId: string }
     await expect.poll(async () => (await (await page.request.get(`/api/run/${runId}`)).json()).status,
       { timeout: 20_000 }).toBe('done')
+
+    // Reproduce the real canvas sequence: the full Transform run precedes adding its downstream
+    // Join.  Loading and configuring that Join must still see the retained Transform schema.
+    const savedBeforeJoin = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
+    const withJoin = structuredClone(savedBeforeJoin)
+    withJoin.nodes.push(
+      { id: 'right', type: 'source', position: { x: 310, y: 290 }, data: {
+        title: 'Right events', status: 'draft', config: {
+          uri: events.uri, tableId: events.id, registrationId: events.registrationId,
+        },
+      } },
+      { id: 'join', type: 'join', position: { x: 590, y: 150 }, data: {
+        title: 'Compare amounts', status: 'draft', config: { how: 'inner', on: '' },
+      } },
+    )
+    withJoin.edges.push(
+      { id: 'transform-join', source: 'transform', sourceHandle: 'out', target: 'join', targetHandle: 'a', data: { wire: 'dataset' } },
+      { id: 'right-join', source: 'right', sourceHandle: 'out', target: 'join', targetHandle: 'b', data: { wire: 'dataset' } },
+    )
+    const addedJoin = await page.request.put(
+      `/api/canvas/${encodeURIComponent(canvasId)}?expectedVersion=${savedBeforeJoin.version}`,
+      { data: withJoin })
+    expect(addedJoin.ok(), await addedJoin.text()).toBeTruthy()
 
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.locator('.react-flow__node')).toHaveCount(4)
