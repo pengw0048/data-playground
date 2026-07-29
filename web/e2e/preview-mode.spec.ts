@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 
-test('keeps a retried Preview sample separate from a later Full result', async ({ page }) => {
+test('starts a Full run from an actionable Preview response', async ({ page }) => {
   const doc = goldenCanvas(`preview-mode-${Date.now()}`, 'Preview mode', 'Preview mode source')
   doc.nodes = doc.nodes.map((node) => node.id === 'filter'
     ? { ...node, data: { ...node.data, status: 'stale' } }
@@ -40,17 +40,27 @@ test('keeps a retried Preview sample separate from a later Full result', async (
     await expect(panel.getByText('Run this step to see results')).toBeVisible()
 
     await panel.getByRole('button', { name: 'Run this step' }).click()
-    await expect(panel.getByText('rows 1–50', { exact: true })).toBeVisible()
-    expect(previewRequests).toBe(2)
+    expect(previewRequests).toBe(1)
     expect(fullRunRequests).toBe(0)
-    await expect(panel.getByRole('button', { name: 'Preview sample' })).toHaveCount(0)
 
+    const runPanel = page.getByTestId('panel-run')
+    await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
     const runResponse = page.waitForResponse((response) => (
-      response.url().endsWith('/api/run') && response.request().method() === 'POST'
+      response.url().endsWith('/api/run')
+      && response.request().method() === 'POST'
+      && response.ok()
     ))
-    await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-    await runResponse
+    await runPanel.getByRole('button', {
+      name: /^(?:Run with unknown row count|Run [\d,]+ rows)$/,
+    }).click()
+    const { runId } = await (await runResponse).json() as { runId: string }
+    await expect.poll(() => fullRunRequests).toBe(1)
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${runId}`)
+      return (await response.json() as { status: string }).status
+    }, { timeout: 30_000 }).toBe('done')
 
+    await inspector.getByRole('button', { name: 'View data' }).click()
     const fullResult = panel.getByRole('button', { name: 'Full result', exact: true })
     await expect(fullResult).toBeVisible({ timeout: 30_000 })
     await fullResult.click()

@@ -1038,13 +1038,12 @@ describe('durable full results', () => {
     expect(requestRun).toHaveBeenCalledWith('target')
   })
 
-  it('retries an actionable Preview sample in the bounded preview slot without starting a full run', async () => {
+  it('starts a full run for an actionable Preview sample without retrying the preview', async () => {
     const requestRun = vi.fn()
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'stale', config: { uri: 'events' }, history: [] },
     }] }
-    apiMock.preview.mockResolvedValueOnce(sample(0, 2, false))
     useStore.setState({
       doc,
       previews: { target: boundPreview(doc, 'target', {
@@ -1059,9 +1058,8 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Run this step' }))
 
-    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledWith(doc, 'target', 50, 0, undefined))
-    expect(await screen.findByText('rows 1–2')).toBeInTheDocument()
-    expect(requestRun).not.toHaveBeenCalled()
+    expect(requestRun).toHaveBeenCalledWith('target')
+    expect(apiMock.preview).not.toHaveBeenCalled()
     expect(useStore.getState().runs.target).toBeUndefined()
   })
 
