@@ -91,6 +91,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
   const [loadMoreError, setLoadMoreError] = useState('')
   const [markError, setMarkError] = useState('')
   const [marking, setMarking] = useState('')
+  const [markingAll, setMarkingAll] = useState(false)
   const request = useRef(0)
   const knownRead = useRef(new Map<string, string>())
 
@@ -136,7 +137,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
   }
 
   const markRead = async (item: InboxItemDto) => {
-    if (item.readAt) return
+    if (item.readAt || markingAll) return
     setMarking(item.id)
     setMarkError('')
     try {
@@ -152,7 +153,9 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       })
       onUnreadChange?.()
     } catch (caught) {
-      setMarkError(caught instanceof Error ? caught.message : String(caught))
+      setMarkError(`Couldn’t mark read: ${
+        caught instanceof Error ? caught.message : String(caught)
+      }`)
       await load()
       onUnreadChange?.()
     } finally {
@@ -160,8 +163,35 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
     }
   }
 
+  const markAllRead = async () => {
+    setMarkingAll(true)
+    setMarkError('')
+    try {
+      const result = await api.inboxMarkAllRead()
+      for (const row of items) {
+        if (!row.readAt) knownRead.current.set(row.id, result.readAt)
+      }
+      setItems((current) => {
+        const next = current.map((row) => (
+          row.readAt ? row : { ...row, readAt: result.readAt }
+        ))
+        return filter === 'unread' ? [] : next
+      })
+      await load()
+      onUnreadChange?.()
+    } catch (caught) {
+      setMarkError(`Couldn’t mark all as read: ${
+        caught instanceof Error ? caught.message : String(caught)
+      }`)
+      await load()
+      onUnreadChange?.()
+    } finally {
+      setMarkingAll(false)
+    }
+  }
+
   const openJob = (item: InboxItemDto) => {
-    if (!item.jobAvailable) return
+    if (!item.jobAvailable || markingAll) return
     void markRead(item)
     setJobsQuery(new URLSearchParams({ run: item.taskId }).toString())
   }
@@ -178,13 +208,28 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
             aria-label="Filter inbox items"
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
+            disabled={markingAll}
             className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground"
           >
             <option value="all">All</option>
             <option value="unread">Unread</option>
           </select>
         </label>
-        <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading || loadingMore}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void markAllRead()}
+          disabled={loading || loadingMore || markingAll || Boolean(marking)}
+        >
+          <Icon name="check" size={13} />
+          {markingAll ? 'Marking…' : 'Mark all as read'}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void load()}
+          disabled={loading || loadingMore || markingAll}
+        >
           <Icon name="refresh" size={13} /> Refresh
         </Button>
       </header>
@@ -192,7 +237,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
         {markError && (
           <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">
-            Couldn’t mark read: {markError}
+            {markError}
           </div>
         )}
         {loading && <div className="p-5 text-[12.5px] text-muted-foreground">Loading Inbox…</div>}
@@ -245,7 +290,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                       <Button
                         variant="outline"
                         size="sm"
-                        disabled={marking === item.id}
+                        disabled={marking === item.id || markingAll}
                         onClick={() => void markRead(item)}
                       >
                         Mark read
@@ -266,7 +311,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={!item.jobAvailable}
+                      disabled={!item.jobAvailable || markingAll}
                       title={item.jobAvailable ? undefined : 'Job is unavailable with current authorization'}
                       onClick={() => openJob(item)}
                     >

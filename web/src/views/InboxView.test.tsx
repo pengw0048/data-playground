@@ -6,12 +6,14 @@ import { useStore } from '../store/graph'
 
 const mocks = vi.hoisted(() => ({
   inboxList: vi.fn(),
+  inboxMarkAllRead: vi.fn(),
   inboxMarkRead: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({
   api: {
     inboxList: mocks.inboxList,
+    inboxMarkAllRead: mocks.inboxMarkAllRead,
     inboxMarkRead: mocks.inboxMarkRead,
   },
 }))
@@ -35,8 +37,12 @@ function item(overrides: Record<string, unknown> = {}) {
 describe('InboxView', () => {
   beforeEach(() => {
     mocks.inboxList.mockReset()
+    mocks.inboxMarkAllRead.mockReset()
     mocks.inboxMarkRead.mockReset()
     mocks.inboxList.mockResolvedValue({ items: [item()], hasMore: false, nextCursor: null })
+    mocks.inboxMarkAllRead.mockResolvedValue({
+      markedCount: 1, readAt: '2026-07-17T12:05:00Z',
+    })
     useStore.setState({ view: 'inbox', inboxQuery: '', jobsQuery: '', toasts: [] } as never)
   })
 
@@ -183,6 +189,75 @@ describe('InboxView', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Mark read' }))
     await waitFor(() => expect(mocks.inboxList).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull())
+    expect(onUnreadChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('marks every visible item read with one request and preserves All history', async () => {
+    const onUnreadChange = vi.fn()
+    const rows = [
+      item(),
+      item({ id: 'item-2', taskId: 'task-2', canvasName: 'Archive analysis' }),
+    ]
+    mocks.inboxList
+      .mockResolvedValueOnce({ items: rows, hasMore: true, nextCursor: 'older-page' })
+      .mockResolvedValueOnce({ items: rows, hasMore: true, nextCursor: 'older-page' })
+    mocks.inboxMarkAllRead.mockResolvedValueOnce({
+      markedCount: 8, readAt: '2026-07-17T12:10:00Z',
+    })
+    render(<InboxView onUnreadChange={onUnreadChange} />)
+    await screen.findByText('Archive analysis')
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Mark all as read' }))
+
+    await waitFor(() => expect(mocks.inboxList).toHaveBeenCalledTimes(2))
+    expect(mocks.inboxMarkAllRead).toHaveBeenCalledTimes(1)
+    expect(mocks.inboxMarkRead).not.toHaveBeenCalled()
+    expect(screen.getByText('Climate analysis')).toBeInTheDocument()
+    expect(screen.getByText('Archive analysis')).toBeInTheDocument()
+    expect(screen.queryByText('Unread', { selector: 'span' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull()
+    expect(onUnreadChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('empties the Unread filter after a confirmed mark-all response', async () => {
+    const onUnreadChange = vi.fn()
+    useStore.setState({ inboxQuery: 'filter=unread' } as never)
+    mocks.inboxList
+      .mockResolvedValueOnce({ items: [item()], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [], hasMore: false, nextCursor: null })
+    render(<InboxView onUnreadChange={onUnreadChange} />)
+    await screen.findByText('Climate analysis')
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Mark all as read' }))
+
+    expect(await screen.findByText('You’re all caught up.')).toBeInTheDocument()
+    expect(screen.queryByText('Climate analysis')).toBeNull()
+    expect(mocks.inboxMarkAllRead).toHaveBeenCalledTimes(1)
+    expect(onUnreadChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps rows unread and refreshes server truth when mark-all fails', async () => {
+    const onUnreadChange = vi.fn()
+    mocks.inboxList
+      .mockResolvedValueOnce({
+        items: [item()], hasMore: false, nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [item()], hasMore: false, nextCursor: null,
+      })
+    mocks.inboxMarkAllRead.mockRejectedValueOnce(new Error('network lost'))
+    render(<InboxView onUnreadChange={onUnreadChange} />)
+    await screen.findByText('Climate analysis')
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Mark all as read' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Couldn’t mark all as read: network lost',
+    )
+    expect(screen.getByText('Unread', { selector: 'span' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Mark read' })).toBeInTheDocument()
+    expect(mocks.inboxMarkAllRead).toHaveBeenCalledTimes(1)
+    expect(mocks.inboxMarkRead).not.toHaveBeenCalled()
     expect(onUnreadChange).toHaveBeenCalledTimes(1)
   })
 

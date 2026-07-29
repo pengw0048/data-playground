@@ -761,6 +761,8 @@ export const api = {
     return req<InboxPage>(`/inbox?${query}`)
   },
   inboxUnreadCount: () => req<InboxUnreadCount>('/inbox/unread-count'),
+  inboxMarkAllRead: () =>
+    req<InboxReadAllResult>('/inbox/read-all', { method: 'POST' }),
   inboxMarkRead: (itemId: string) =>
     req<InboxItemDto>(`/inbox/${encodeURIComponent(itemId)}/read`, { method: 'POST' }),
   // named/versioned schema contracts (workspace artifacts a node can reference by name)
@@ -862,6 +864,7 @@ export type InboxTaskKind =
   | 'keyed_upsert_write'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface InboxUnreadCount { count: number }
+export interface InboxReadAllResult { markedCount: number; readAt: string }
 export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }

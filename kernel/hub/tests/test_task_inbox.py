@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import json
 import os
+import queue
+import threading
 import uuid
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from hub import metadb
 from hub.models import (
@@ -401,6 +406,146 @@ def test_owner_list_count_mark_read_and_cross_owner_isolation():
     assert metadb.count_durable_task_inbox_unread(owner_a) == 0
     unread = metadb.list_durable_task_inbox_items(owner_a, unread_only=True)
     assert unread["items"] == []
+
+
+def test_mark_all_read_is_atomic_owner_scoped_idempotent_and_preserves_history():
+    owner_a, canvas_a = _user_canvas("read-all-a")
+    owner_b, canvas_b = _user_canvas("read-all-b")
+    tasks_a = [_submit_local(owner_a, canvas_a) for _ in range(2)]
+    task_b = _submit_local(owner_b, canvas_b)
+    for index, task in enumerate([*tasks_a, task_b]):
+        claimed = metadb.claim_durable_task(task["id"], f"read-all-{index}")
+        failed = RunStatus(
+            run_id=task["id"], status="failed", target_node_id="write", error="x")
+        assert metadb.finish_durable_task_attempt(
+            task["id"], claimed["attempts"][-1]["id"], f"read-all-{index}",
+            failed.model_dump())
+
+    result = metadb.mark_all_durable_task_inbox_items_read(owner_a)
+    assert result["marked_count"] == 2
+    assert result["read_at"].tzinfo is not None
+
+    with metadb.session() as session:
+        rows_a = list(session.scalars(metadb.select(
+            metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.owner_id == owner_a)))
+        row_b = session.scalar(metadb.select(metadb.DurableTaskInboxItem).where(
+            metadb.DurableTaskInboxItem.owner_id == owner_b))
+        assert len(rows_a) == 2
+        assert {
+            metadb._inbox_stamp(row.read_at) for row in rows_a
+        } == {result["read_at"]}
+        assert row_b is not None and row_b.read_at is None
+
+    all_items = metadb.list_durable_task_inbox_items(owner_a)["items"]
+    assert {item["task_id"] for item in all_items} == {task["id"] for task in tasks_a}
+    assert all(item["read_at"] == result["read_at"] for item in all_items)
+    assert metadb.list_durable_task_inbox_items(
+        owner_a, unread_only=True)["items"] == []
+    assert metadb.count_durable_task_inbox_unread(owner_a) == 0
+    assert metadb.count_durable_task_inbox_unread(owner_b) == 1
+
+    replay = metadb.mark_all_durable_task_inbox_items_read(owner_a)
+    assert replay["marked_count"] == 0
+    with metadb.session() as session:
+        persisted = list(session.scalars(metadb.select(
+            metadb.DurableTaskInboxItem.read_at).where(
+                metadb.DurableTaskInboxItem.owner_id == owner_a)))
+    assert {metadb._inbox_stamp(stamp) for stamp in persisted} == {result["read_at"]}
+
+    later = _submit_local(owner_a, canvas_a)
+    claimed = metadb.claim_durable_task(later["id"], "read-all-later")
+    failed = RunStatus(
+        run_id=later["id"], status="failed", target_node_id="write", error="x")
+    assert metadb.finish_durable_task_attempt(
+        later["id"], claimed["attempts"][-1]["id"], "read-all-later",
+        failed.model_dump())
+    unread = metadb.list_durable_task_inbox_items(owner_a, unread_only=True)["items"]
+    assert [item["task_id"] for item in unread] == [later["id"]]
+    assert unread[0]["read_at"] is None
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires dedicated Postgres",
+)
+def test_postgres_mark_all_read_fences_later_commits_with_one_statement():
+    owner, canvas_id = _user_canvas("read-all-postgres")
+    current = _submit_local(owner, canvas_id)
+    current_claim = metadb.claim_durable_task(current["id"], "read-all-current")
+    current_failed = RunStatus(
+        run_id=current["id"], status="failed", target_node_id="write", error="x")
+    assert metadb.finish_durable_task_attempt(
+        current["id"], current_claim["attempts"][-1]["id"], "read-all-current",
+        current_failed.model_dump())
+
+    later = _submit_local(owner, canvas_id)
+    later_claim = metadb.claim_durable_task(later["id"], "read-all-later")
+    later_attempt_id = later_claim["attempts"][-1]["id"]
+    writer = Session(metadb.engine(), expire_on_commit=False)
+    writer_stamp = metadb._durable_task_db_now(writer)
+    later_item_id = uuid.uuid4().hex[:12]
+    writer.add(metadb.DurableTaskInboxItem(
+        id=later_item_id,
+        owner_id=owner,
+        task_id=later["id"],
+        task_attempt_id=later_attempt_id,
+        canvas_id=canvas_id,
+        task_kind="managed_local_write",
+        outcome="failed",
+        terminal_at=writer_stamp,
+        created_at=writer_stamp,
+        read_at=None,
+    ))
+    writer.flush()
+
+    observed: queue.Queue[str] = queue.Queue()
+    release_clock = threading.Event()
+    worker_id: list[int] = []
+
+    def observe_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if not worker_id or threading.get_ident() != worker_id[0]:
+            return
+        normalized = " ".join(str(statement).lower().split())
+        if normalized.startswith("select") and "now()" in normalized:
+            observed.put("clock")
+            assert release_clock.wait(timeout=5), "mark-all clock query was not released"
+        elif normalized.startswith("update") and "durable_task_inbox_items" in normalized:
+            observed.put("update")
+
+    def mark_all() -> dict:
+        worker_id.append(threading.get_ident())
+        return metadb.mark_all_durable_task_inbox_items_read(owner)
+
+    event.listen(metadb.engine(), "after_cursor_execute", observe_statement)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(mark_all)
+            first_statement = observed.get(timeout=5)
+            if first_statement == "clock":
+                # Reproduce the old two-statement race: a transaction whose older
+                # transaction-clock row commits between SELECT now() and UPDATE.
+                writer.commit()
+                release_clock.set()
+            result = future.result(timeout=5)
+            if writer.in_transaction():
+                writer.commit()
+    finally:
+        release_clock.set()
+        event.remove(metadb.engine(), "after_cursor_execute", observe_statement)
+        if writer.in_transaction():
+            writer.rollback()
+        writer.close()
+
+    assert first_statement == "update"
+    assert result["marked_count"] == 1
+    with metadb.session() as session:
+        current_item = session.scalar(metadb.select(
+            metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.task_id == current["id"]))
+        later_item = session.get(metadb.DurableTaskInboxItem, later_item_id)
+        assert current_item is not None and current_item.read_at == result["read_at"]
+        assert later_item is not None and later_item.read_at is None
 
 
 def test_inbox_keyset_cursor_filter_and_role_revocation():

@@ -2433,6 +2433,11 @@ class DurableTaskInboxUnreadCount(Wire):
     count: int = Field(ge=0)
 
 
+class DurableTaskInboxReadAllResult(Wire):
+    marked_count: int = Field(ge=0)
+    read_at: datetime.datetime
+
+
 class WorkspaceRunRecord(Wire):
     """One visible run in the workspace-wide, read-only Jobs projection."""
 

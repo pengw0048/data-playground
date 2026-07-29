@@ -13,6 +13,7 @@ from hub.main import app
 from hub.models import (
     DurableTaskInboxItemView,
     DurableTaskInboxPage,
+    DurableTaskInboxReadAllResult,
     DurableTaskInboxUnreadCount,
     RunStatus,
 )
@@ -123,6 +124,47 @@ def test_inbox_routes_owner_isolation_cursor_and_mark_read():
     missing = client.post(
         f"/api/inbox/{uuid.uuid4().hex}/read", headers={"X-DP-User": owner_a})
     assert missing.status_code == 404
+
+
+def test_inbox_mark_all_read_is_owner_scoped_idempotent_and_keeps_history():
+    owner_a, canvas_a = _user_canvas("api-read-all-a")
+    owner_b, canvas_b = _user_canvas("api-read-all-b")
+    tasks_a = [_submit_local(owner_a, canvas_a) for _ in range(2)]
+    task_b = _submit_local(owner_b, canvas_b)
+    for index, task in enumerate([*tasks_a, task_b]):
+        _fail_task(task, f"read-all-{index}")
+
+    marked = client.post("/api/inbox/read-all", headers={"X-DP-User": owner_a})
+    assert marked.status_code == 200, marked.text
+    result = DurableTaskInboxReadAllResult.model_validate(marked.json())
+    assert result.marked_count == 2
+    assert result.read_at.tzinfo is not None
+
+    unread = client.get(
+        "/api/inbox", params={"filter": "unread"}, headers={"X-DP-User": owner_a})
+    assert unread.json()["items"] == []
+    all_items = client.get(
+        "/api/inbox", headers={"X-DP-User": owner_a}).json()["items"]
+    assert {item["taskId"] for item in all_items} == {task["id"] for task in tasks_a}
+    assert {item["readAt"] for item in all_items} == {marked.json()["readAt"]}
+    assert client.get(
+        "/api/inbox/unread-count",
+        headers={"X-DP-User": owner_a}).json()["count"] == 0
+    assert client.get(
+        "/api/inbox/unread-count",
+        headers={"X-DP-User": owner_b}).json()["count"] == 1
+
+    replay = client.post("/api/inbox/read-all", headers={"X-DP-User": owner_a})
+    assert replay.status_code == 200
+    assert replay.json()["markedCount"] == 0
+    assert client.get(
+        "/api/inbox", headers={"X-DP-User": owner_a}).json()["items"] == all_items
+
+    later = _submit_local(owner_a, canvas_a)
+    _fail_task(later, "read-all-later")
+    unread_later = client.get(
+        "/api/inbox", params={"filter": "unread"}, headers={"X-DP-User": owner_a})
+    assert [item["taskId"] for item in unread_later.json()["items"]] == [later["id"]]
 
 
 def test_inbox_route_keyset_and_deleted_item_unavailable():
