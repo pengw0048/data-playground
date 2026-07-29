@@ -64,7 +64,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const writeConfig = (target?.data.config ?? {}) as Record<string, unknown>
   const outputName = String(writeConfig.filename ?? writeConfig.name ?? target?.data.title ?? 'output')
   const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
-  const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
+  const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt
+    ?? run?.writeOutcome?.receipt
+    ?? writeAdmission?.recoveredReceipt
   const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
   const exactRunReadiness = writeAdmission?.exactRunReadiness ?? est?.exactRunReadiness
   const exactRunReady = exactRunReadiness?.ready !== false

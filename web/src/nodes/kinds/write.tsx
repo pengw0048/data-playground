@@ -25,7 +25,8 @@ function Write({ id, data }: NodeComponentProps) {
   )
   const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
-    .find((output) => output.writeReceipt)?.writeReceipt)
+    .find((output) => output.writeReceipt)?.writeReceipt
+    ?? s.runs[id]?.writeOutcome?.receipt)
   const destinationLabel = dest
   const merge = data.config.mergeColumns as { taskId?: string; rules?: unknown[] } | undefined
   const upsert = data.config.keyedUpsert as { taskId?: string; keys?: unknown[] } | undefined

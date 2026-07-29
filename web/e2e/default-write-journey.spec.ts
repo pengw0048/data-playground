@@ -156,6 +156,42 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     // The inspector receipt names the same durable revision the Jobs surface published.
     await expect(publicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
 
+    // A real browser reload clears the Zustand run store. Wait until the exact pointer is saved in
+    // Canvas, then prove the reloaded UI resolves that run rather than guessing from latest history.
+    await expect.poll(async () => {
+      const saved = await ok<{ nodes: Array<{
+        id: string
+        data: { lastRun?: { writeReceiptRunId?: string } }
+      }> }>(
+        await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`),
+        'read saved Write receipt pointer',
+      )
+      return saved.nodes.find((node) => node.id === 'write')?.data.lastRun?.writeReceiptRunId
+    }, { timeout: 15_000 }).toBe(runId)
+    const exactRecovery = page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname.endsWith('/api/jobs')
+        && url.searchParams.get('canvas_id') === canvasId
+        && url.searchParams.get('node_id') === 'write'
+        && url.searchParams.get('run_id') === runId
+        && url.searchParams.get('status') === 'done'
+        && url.searchParams.get('limit') === '2'
+    })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    expect((await exactRecovery).ok(), 'exact Write receipt recovery succeeds').toBeTruthy()
+    const reloadedWriteCard = page.locator('.react-flow__node[data-id="write"]')
+    await expect(reloadedWriteCard).toContainText(`published · version ${dataset!.revisionId}`)
+    await reloadedWriteCard.locator('[title="Click (when selected) or double-click to rename"]').click()
+    const recoveredPublication = page.getByTestId('inspector').getByLabel('Write publication')
+    const recoveredResult = recoveredPublication.getByLabel('Published result')
+    await expect(recoveredResult).toContainText('Output published')
+    await expect(recoveredResult).toContainText(`version ${dataset!.revisionId}`)
+    await expect(recoveredResult).toContainText(`${dataset!.rows.toLocaleString()} rows`)
+    await expect(recoveredPublication.getByRole('button', { name: 'View published version' })).toBeVisible()
+    const recoveredDetails = recoveredPublication.locator('details')
+    await recoveredDetails.locator('summary').click()
+    await expect(recoveredDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
+
     // Run History must mirror the same immutable admission as the durable Task; it must not label
     // this current managed write as a pre-manifest legacy run.
     const historyRows = await ok<Array<{

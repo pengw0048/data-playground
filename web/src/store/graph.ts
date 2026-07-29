@@ -6,7 +6,7 @@ import type {
 } from '../types/graph'
 import type {
   CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
-  RunInputManifestItem, RunStatus, SampleResult, WriteAdmission,
+  RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteReceipt,
 } from '../types/api'
 import { canConnect, getSpec, nodeOutputs, portWire } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
@@ -569,12 +569,49 @@ interface RunState {
   // Read-only evidence for the completed output. Unlike writeAdmission, this snapshot is never
   // reused for dispatch; the next run must obtain a fresh exact-head admission and submission id.
   writeOutcomeAdmission?: WriteAdmission
+  // A durable publication recovered by exact run/canvas/node identity. This is display-only and
+  // deliberately independent from the admission and submission identity for the next run.
+  writeOutcome?: { runId: string; receipt: WriteReceipt; outputs: RunOutput[] }
   writeSubmissionId?: string
   writeAdmissionFingerprint?: string
   parameterBindings?: CanvasParameterBinding[]
   parametersReady?: boolean
   parameterContractFingerprint?: string
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
+}
+
+function managedWriteReceiptOutput(
+  outputs: RunOutput[],
+  nodeId: string,
+): { receipt: WriteReceipt; outputs: RunOutput[] } | undefined {
+  const matches = outputs.filter((output) => (
+    output.nodeId === nodeId
+    && output.publicationKind === 'catalog'
+    && output.outcome === 'committed'
+    && output.writeReceipt?.durable === true
+    && (
+      output.writeReceipt.publication.provider === 'managed-local-file'
+      || output.writeReceipt.publication.provider === 'managed-local-lance'
+    )
+  ))
+  if (matches.length !== 1 || !matches[0].writeReceipt) return undefined
+  return { receipt: matches[0].writeReceipt, outputs }
+}
+
+function sameWriteReceiptIdentity(left: WriteReceipt, right: WriteReceipt): boolean {
+  return left.datasetId === right.datasetId
+    && left.revisionId === right.revisionId
+    && left.name === right.name
+    && left.rows === right.rows
+    && left.bytes === right.bytes
+    && left.durable === right.durable
+    && left.head.datasetId === right.head.datasetId
+    && left.head.revisionId === right.head.revisionId
+    && left.publication.provider === right.publication.provider
+    && left.publication.logicalUri === right.publication.logicalUri
+    && left.publication.artifactUri === right.publication.artifactUri
+    && left.publication.publishSequence === right.publication.publishSequence
+    && left.publication.idempotencyKey === right.publication.idempotencyKey
 }
 
 function currentSchemaParameterBindings(
@@ -4984,7 +5021,9 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       if (!current() || !nodeId || !get().doc.nodes.some((node) => node.id === nodeId)) continue
       set((s: Store) => {
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
-        return { runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }
+        return { runs: { ...s.runs, [nodeId]: {
+          ...(s.runs[nodeId] ?? {}), phase: 'running' as const, status: st,
+        } } }
       })
       // active-runs is already the backend's current per-node execution authority. Apply it now
       // rather than waiting for the first poll, so a real reattached run replaces the settled
@@ -5006,6 +5045,40 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     }
     for (const st of statuses) void installProfile(st).catch(() => {})
   }).catch(() => { /* active profiles remain the provisional in-flight fallback */ })
+
+  // A completed managed Write is intentionally absent from active-runs. Canvas stores only its
+  // exact run pointer; recover the immutable receipt from the durable Jobs projection without
+  // copying any admission, submission, task, or idempotency identity into the next run.
+  for (const node of get().doc.nodes) {
+    const runId = node.type === 'write' ? node.data.lastRun?.writeReceiptRunId : undefined
+    if (!runId) continue
+    void api.workspaceJobs({
+      limit: 2, status: 'done', canvasId, nodeId: node.id, runId,
+    }).then((page) => {
+      if (!current() || page.items.length !== 1) return
+      const [job] = page.items
+      if (job.runId !== runId || job.canvasId !== canvasId || job.targetNodeId !== node.id
+          || job.jobType !== 'run' || job.status !== 'done') return
+      const outcome = managedWriteReceiptOutput(job.outputs, node.id)
+      if (!outcome) return
+      if (job.outputReceipt && !sameWriteReceiptIdentity(job.outputReceipt, outcome.receipt)) return
+      set((s: Store) => {
+        const currentNode = s.doc.nodes.find((candidate) => candidate.id === node.id)
+        const existing = s.runs[node.id]
+        if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId
+            || s.currentUser?.id !== reattachUserId || currentNode?.type !== 'write'
+            || currentNode.data.lastRun?.writeReceiptRunId !== runId
+            || (existing?.writeOutcome && existing.writeOutcome.runId !== runId)) return {}
+        return { runs: { ...s.runs, [node.id]: {
+          ...(existing ?? { phase: 'idle' as const }),
+          writeOutcome: { runId, receipt: outcome.receipt, outputs: outcome.outputs },
+        } } }
+      })
+    }).catch(() => {
+      // Missing, revoked, pruned, duplicated, or temporarily unavailable evidence stays unknown.
+      // Never guess from a newer history row or the dataset's current head.
+    })
+  }
 }
 
 const _profilePolling = new Map<string, {
@@ -5236,14 +5309,24 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       const resultRows = status.totalRows
         ?? (status.outputs.length === 1 ? status.outputs[0]?.rows ?? undefined : undefined)
       const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
+      const target = get().doc.nodes.find((node) => node.id === nodeId)
+      const publishedWrite = status.status === 'done' && target?.type === 'write'
+        ? managedWriteReceiptOutput(status.outputs, nodeId)
+        : undefined
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
         ...(s.runs[nodeId] ?? { phase } as any), status, phase,
         writeOutcomeAdmission: status.status === 'done' ? writeOutcomeAdmission : undefined,
+        writeOutcome: status.status === 'done'
+          ? publishedWrite
+            ? { runId: status.runId, receipt: publishedWrite.receipt, outputs: publishedWrite.outputs }
+            : undefined
+          : s.runs[nodeId]?.writeOutcome,
         writeAdmission: undefined, writeSubmissionId: undefined,
         writeAdmissionFingerprint: undefined,
       } } }))
       if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
       const g = get()
+      const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
       g.updateData(nodeId, {
         status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',
         lastRun: status.status === 'done'
@@ -5252,8 +5335,11 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
               ...(resultOutputCount !== undefined ? { outputCount: resultOutputCount } : {}),
               ms: status.ms,
               placement: status.placement,
+              ...(publishedWrite ? { writeReceiptRunId: status.runId } : {}),
             }
-          : undefined,
+          : target?.type === 'write' && previousLastRun?.writeReceiptRunId
+            ? previousLastRun
+            : undefined,
       })
       if (status.status === 'done') {
         // snapshot a version (time-travel, FR-C5)
