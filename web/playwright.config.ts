@@ -7,26 +7,22 @@ import { MIN_VIEWPORT } from './support/min-viewport'
 const PORT = process.env.DP_E2E_PORT ?? '8899'
 const fixtureProfile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
 const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
-const providerAcceptanceDependency = process.env.DP_E2E_PROVIDER_ACCEPTANCE
-  ? ' --with "$REPO_ROOT/examples/plugins/dp_file_catalog_provider"'
-  : ''
-// Metadata DB for the shared kernel. Defaults to the throwaway SQLite file; the Postgres acceptance
-// variant points it at a live server, which needs the psycopg extra and an explicit up-front migrate
-// (SQLite auto-migrates on first run; a production Postgres DB does not).
-const databaseUrl = process.env.DP_E2E_DATABASE_URL ?? 'sqlite:///e2e-test.db'
-const kernelPackage = databaseUrl.startsWith('postgres') ? "'.[postgres]'" : '.'
-// The smoke fixture intentionally converts events.parquet to Lance, so the packaged runner must
-// install the same Lance adapter it exercises rather than treating its source as unavailable.
-const kernelWheelExtras = databaseUrl.startsWith('postgres')
-  ? '[lance,postgres]'
-  : '[lance]'
-const migrateStep = databaseUrl.startsWith('postgres')
-  ? `DP_DATABASE_URL=${databaseUrl} uv run --with ${kernelPackage} dataplay migrate && `
-  : ''
 
 const chromiumLaunch = process.env.DP_E2E_CHROME
   ? { launchOptions: { executablePath: process.env.DP_E2E_CHROME } }
   : {}
+const ciReporters = [['list'], ['html', { open: 'never' }]]
+const reporter = process.env.DP_E2E_TIMINGS_FILE
+  ? [
+      ...ciReporters,
+      [
+        './scripts/e2e-timing-reporter.mjs',
+        { outputFile: process.env.DP_E2E_TIMINGS_FILE },
+      ],
+    ]
+  : process.env.CI
+    ? ciReporters
+    : 'list'
 
 export default defineConfig({
   testDir: './e2e',
@@ -37,7 +33,7 @@ export default defineConfig({
   // kernel and bleed route/catalog state across specs. Serialize in CI (and for the mutating full
   // profile); local smoke runs may still parallelize for iteration speed.
   workers: process.env.CI || fixtureProfile === 'full' ? 1 : undefined,
-  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
+  reporter,
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     trace: 'on-first-retry',
@@ -112,7 +108,7 @@ export default defineConfig({
     // `web/dist` is force-included in the kernel wheel, but its gitignored contents do not
     // invalidate uv's cached local build. Build one disposable wheel inside this fresh E2E
     // workspace and run that exact artifact: dependencies stay cached while the served SPA cannot be stale.
-    command: `cd ../kernel && REPO_ROOT="$(cd .. && pwd)" && WORKSPACE="$REPO_ROOT/web/.e2e-workspace" && rm -rf "$WORKSPACE" && uv run python "$REPO_ROOT/scripts/build_ux_fixtures.py" --profile ${fixtureProfile} --output "$WORKSPACE/data" && ${migrateStep}WHEEL_DIR="$WORKSPACE/kernel-wheel" && uv build --wheel --clear --no-create-gitignore --out-dir "$WHEEL_DIR" . && WHEEL=$(find "$WHEEL_DIR" -maxdepth 1 -name 'data_playground-*.whl' -print -quit) && test -n "$WHEEL" && cd "$WORKSPACE" && DP_DATABASE_URL=${databaseUrl} uv run --with "\${WHEEL}${kernelWheelExtras}" --with "$REPO_ROOT/examples/plugins/dp_descriptor_contract" --with "$REPO_ROOT/examples/plugins/dp_sidecar_fixture"${providerAcceptanceDependency} dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
+    command: 'node ./scripts/e2e-server.mjs',
     url: `http://127.0.0.1:${PORT}/api/livez`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

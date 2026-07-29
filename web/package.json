@@ -11,6 +11,7 @@
     "typecheck": "tsc -b --noEmit",
     "e2e": "playwright test",
     "e2e:install": "playwright install --with-deps chromium",
+    "test:e2e-timing": "node --test scripts/e2e-timing.test.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
