@@ -550,6 +550,9 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
 function WriteDestination({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
+  const canManageDestinations = useStore(
+    (s) => s.currentUser?.capabilities?.includes('global_settings') === true,
+  )
   const [dlg, setDlg] = useState(false)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   const filename = String(cfg.filename ?? cfg.name ?? 'output')
@@ -578,6 +581,17 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
       </div>
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
+          onManageDestinations={canManageDestinations
+            ? () => {
+                setDlg(false)
+                window.dispatchEvent(new CustomEvent('dp-open-settings', {
+                  detail: {
+                    category: 'destinations',
+                    trigger: document.querySelector<HTMLElement>('[data-testid="app-menu"]'),
+                  },
+                }))
+              }
+            : undefined}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
       )}
     </Section>

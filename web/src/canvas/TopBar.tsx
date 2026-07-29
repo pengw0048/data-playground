@@ -42,6 +42,7 @@ export function TopBar() {
   const canUndo = useStore((s) => s.past.length > 0) || crdtUndoActive()
   const canRedo = useStore((s) => s.future.length > 0) || crdtUndoActive()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsCategory, setSettingsCategory] = useState<string | undefined>()
   const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
   const [versionsOpen, setVersionsOpen] = useState(false)
@@ -69,7 +70,14 @@ export function TopBar() {
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
   useEffect(() => {
     const onOpen = (event: Event) => {
-      settingsTrigger.current = (event as CustomEvent<HTMLElement>).detail ?? document.querySelector('[data-testid="app-menu"]')
+      const detail = (event as CustomEvent<HTMLElement | { category?: string; trigger?: HTMLElement | null }>).detail
+      if (detail instanceof HTMLElement) {
+        settingsTrigger.current = detail
+        setSettingsCategory(undefined)
+      } else {
+        settingsTrigger.current = detail?.trigger ?? document.querySelector('[data-testid="app-menu"]')
+        setSettingsCategory(detail?.category)
+      }
       setSettingsOpen(true)
     }
     window.addEventListener('dp-open-settings', onOpen)
@@ -88,6 +96,7 @@ export function TopBar() {
 
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
+    setSettingsCategory(undefined)
     setSettingsOpen(true)
   }
   const closeSettings = () => {
@@ -137,7 +146,7 @@ export function TopBar() {
         style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
         <CanvasWorkspaceLocation onReturnDestination={setWorkspaceReturnDestination} onNavigate={navigateToWorkspace} />
       </div>
-      {settingsOpen && <SettingsModal onClose={closeSettings} />}
+      {settingsOpen && <SettingsModal onClose={closeSettings} initialCategory={settingsCategory} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
       {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}

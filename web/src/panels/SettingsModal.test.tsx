@@ -82,6 +82,15 @@ describe('SettingsModal — plugin config form', () => {
     state.currentUser.capabilities = ['global_settings']
   })
 
+  it('opens directly to a requested settings category', async () => {
+    render(<SettingsModal onClose={vi.fn()} initialCategory="destinations" />)
+
+    expect(await screen.findByText(/Named places to save outputs/i)).toBeInTheDocument()
+    const destinations = screen.getByRole('button', { name: 'Destinations' })
+    expect(destinations).toHaveClass('bg-accent')
+    expect(destinations).toHaveFocus()
+  })
+
   it('renders declared fields, saves them as plugin.<pack>.<key>, and skips a blank secret', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
 

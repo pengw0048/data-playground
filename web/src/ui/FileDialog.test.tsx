@@ -78,8 +78,12 @@ describe('FileDialog request and open-mutation truth', () => {
     expect(await screen.findByText('Destinations')).toBeVisible()
     expect(screen.getByText('Choose output destination')).toBeVisible()
     expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Workspace outputs')
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Local')
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('/outputs')
     fireEvent.click(screen.getByRole('button', { name: 'External provider' }))
     expect(screen.getByLabelText('Selected destination')).toHaveTextContent('External provider')
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('plugin')
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('provider://exports')
     expect(screen.queryByText(/managed revision|versioned revision/i)).not.toBeInTheDocument()
     expect(screen.getByText('Output name')).toBeVisible()
     expect(screen.queryByText('orders.csv')).not.toBeInTheDocument()
@@ -91,5 +95,28 @@ describe('FileDialog request and open-mutation truth', () => {
     expect(pick).toHaveBeenCalledWith({
       destId: 'external', destName: 'External provider', path: '', filename: 'results',
     })
+  })
+
+  it('explains object-store presets and hands destination management to Settings', async () => {
+    mocks.destinations.mockResolvedValueOnce({
+      destinations: [
+        { id: 's3-results', name: 'Research outputs', backend: 's3', root: 's3://ml-results/daily' },
+      ],
+      backends: ['local', 's3', 'gs'],
+    })
+    const manage = vi.fn()
+    render(
+      <FileDialog mode="save" defaultName="embeddings.parquet" onClose={vi.fn()}
+        onPick={vi.fn()} onManageDestinations={manage} />,
+    )
+
+    const selected = await screen.findByLabelText('Selected destination')
+    expect(selected).toHaveTextContent('Research outputs')
+    expect(selected).toHaveTextContent('S3')
+    expect(selected).toHaveTextContent('s3://ml-results/daily')
+    expect(selected).toHaveTextContent(/Add local, S3, or GCS locations as named destinations in Settings/i)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage destinations' }))
+    expect(manage).toHaveBeenCalledTimes(1)
   })
 })

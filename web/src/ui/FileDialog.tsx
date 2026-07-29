@@ -14,7 +14,14 @@ export interface SaveResult { destId: string; destName: string; path: string; fi
 
 export function FileDialog(props:
   | { mode: 'open'; onPick: (r: OpenResult) => void | Promise<void>; onClose: () => void; title?: string }
-  | { mode: 'save'; defaultName?: string; onPick: (r: SaveResult) => void; onClose: () => void; title?: string },
+  | {
+      mode: 'save'
+      defaultName?: string
+      onPick: (r: SaveResult) => void
+      onClose: () => void
+      onManageDestinations?: () => void
+      title?: string
+    },
 ) {
   const { mode, onClose } = props
   const [dests, setDests] = useState<DestinationPreset[]>([])
@@ -151,15 +158,34 @@ export function FileDialog(props:
             <div className="flex min-w-0 flex-1 items-center justify-center p-6">
               {dest ? (
                 <div aria-label="Selected destination"
-                  className="max-w-sm rounded-md border border-border bg-muted/30 p-4">
+                  className="w-full max-w-sm rounded-md border border-border bg-muted/30 p-4">
                   <div className="text-[10px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
                     Selected destination
                   </div>
-                  <div className="mt-1 text-sm font-semibold text-foreground">{dest.name}</div>
-                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                    The execution backend writes the output name below to this configured destination.
-                    Publication semantics are confirmed after the selection is admitted.
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">{dest.name}</span>
+                    <span className="rounded border border-border bg-background px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {destinationBackendLabel(dest.backend)}
+                    </span>
+                  </div>
+                  <div className="mt-3 text-[10px] font-medium text-muted-foreground">Root or prefix</div>
+                  <div className="dp-mono mt-1 break-all rounded border border-border bg-background px-2 py-1.5 text-[11px] text-foreground">
+                    {dest.root}
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+                    The next run will request the output name below inside this configured location.
+                    The server confirms access before writing.
                   </p>
+                  <div className="mt-3 border-t border-border pt-3 text-[11px] leading-relaxed text-muted-foreground">
+                    {props.onManageDestinations
+                      ? 'Add local, S3, or GCS locations as named destinations in Settings, then select one here.'
+                      : 'Destinations are configured by an administrator. Ask an administrator to add or change a local, S3, or GCS location.'}
+                  </div>
+                  {props.onManageDestinations && (
+                    <Button variant="outline" size="sm" className="mt-2" onClick={props.onManageDestinations}>
+                      <Icon name="settings" size={12} /> Manage destinations
+                    </Button>
+                  )}
                 </div>
               ) : (
                 <div className="text-xs text-muted-foreground">
@@ -238,3 +264,9 @@ export function FileDialog(props:
 
 const crumbBtn = 'inline-flex items-center gap-[3px] rounded px-1 py-0.5 text-[11.5px] font-semibold text-primary transition-colors hover:bg-accent/60'
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
+const destinationBackendLabel = (backend: string) => {
+  if (backend === 'local') return 'Local'
+  if (backend === 's3') return 'S3'
+  if (backend === 'gs') return 'GCS'
+  return backend
+}
