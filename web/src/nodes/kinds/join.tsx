@@ -72,6 +72,11 @@ function Join({ id, data }: NodeComponentProps) {
           Right dataset connected. Connect a left dataset to continue.
         </p>
       )}
+      {parsed?.length === 0 && (
+        <p data-testid="join-missing-condition" className="text-[10.5px] leading-snug text-amber-700 dark:text-amber-300">
+          Choose at least one left and right column.
+        </p>
+      )}
       <Field label="join type">
         <select aria-label="Join type" value={how} onClick={(event) => event.stopPropagation()}
           onChange={(event) => updateConfig(id, { how: event.target.value as NodeConfig['how'] })} className={cn('nodrag', miniSelectClass)}>

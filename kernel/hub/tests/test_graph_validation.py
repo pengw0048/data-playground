@@ -95,6 +95,64 @@ def test_join_input_edges_use_named_ports_not_serialized_edge_order():
     assert graph_mod.join_input_edges(graph, "join") == (left, right)
 
 
+@pytest.mark.parametrize("config", [
+    {}, {"on": ""}, {"on": "  ", "condition": "\t"},
+])
+def test_join_requires_keys_or_an_explicit_advanced_condition(config: dict):
+    graph = _graph(
+        [_node("left", "source"), _node("right", "source"), _node("join", "join", config)],
+        [_edge("left", "left", "join", target_handle="a"),
+         _edge("right", "right", "join", target_handle="b")],
+    )
+    assert graph_mod.join_condition_errors(graph, "join") == [
+        "Join node 'join' needs at least one left and right column or an advanced condition"
+    ]
+    invalid = graph_mod.validation_error(graph, SPECS, target_node_id="join")
+    assert invalid is not None
+    assert "needs at least one left and right column" in invalid[0]
+
+
+@pytest.mark.parametrize("config", [
+    {"on": "id"},
+    {"on": "id, region"},
+    {"condition": "a.id = b.account_id OR a.email = b.email"},
+])
+def test_join_keys_and_explicit_advanced_condition_remain_valid(config: dict):
+    graph = _graph(
+        [_node("left", "source"), _node("right", "source"), _node("join", "join", config)],
+        [_edge("left", "left", "join", target_handle="a"),
+         _edge("right", "right", "join", target_handle="b")],
+    )
+    assert graph_mod.join_condition_errors(graph, "join") == []
+
+
+def test_every_execution_ingress_rejects_a_join_without_a_match_condition():
+    graph = {
+        "id": "join-condition-validation", "version": 1,
+        "nodes": [_wire("left", "source"), _wire("right", "source"), _wire("join", "join")],
+        "edges": [
+            {"id": "left", "source": "left", "target": "join", "targetHandle": "a"},
+            {"id": "right", "source": "right", "target": "join", "targetHandle": "b"},
+        ],
+    }
+    compiled = client.post("/api/graph/compile", json={"graph": graph, "targetNodeId": "join"})
+    assert compiled.status_code == 200
+    assert "needs at least one left and right column" in compiled.json()["error"]
+
+    requests = [
+        ("/api/run/preview", {"graph": graph, "nodeId": "join"}),
+        ("/api/graph/schema", {"graph": graph, "targetNodeId": "join"}),
+        ("/api/graph/estimate", {"graph": graph, "targetNodeId": "join"}),
+        ("/api/graph/plan", {"graph": graph, "targetNodeId": "join"}),
+        ("/api/run/estimate", {"graph": graph, "targetNodeId": "join"}),
+        ("/api/run", {"graph": graph, "targetNodeId": "join", "confirmed": True}),
+    ]
+    for path, body in requests:
+        response = client.post(path, json=body)
+        assert response.status_code == 400, (path, response.status_code, response.text)
+        assert "needs at least one left and right column" in response.text
+
+
 @pytest.mark.parametrize(("config", "message"), [
     ({"count": "12abc"}, "complete safe integer"),
     ({"count": True}, "complete safe integer"),

@@ -11,6 +11,7 @@ import { color } from '../theme/tokens'
 import type { BackendNodeSpec, BackendParam } from '../api/client'
 import type { WireType } from '../theme/tokens'
 import { filterBuilderConditions, filterBuilderReason } from './filterValidation'
+import { parseJoinKeys } from './joinKeys'
 
 let backendSpecs: Record<string, BackendNodeSpec> = {}
 
@@ -25,6 +26,10 @@ export function nodeInvalidReason(
   node: { type: string; data: { config: Record<string, unknown> } }, inputColumns?: { name: string; type?: string }[],
   numericDrafts?: Record<string, string>,
 ): string | null {
+  if (node.type === 'join') {
+    const pairs = parseJoinKeys(String(node.data.config.on ?? ''), String(node.data.config.condition ?? ''))
+    if (pairs?.length === 0) return 'Choose at least one left and right column.'
+  }
   const spec = backendSpecs[node.type]
   if (!spec) return null
   for (const p of spec.params) {
