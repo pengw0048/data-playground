@@ -16,7 +16,10 @@ export function Segmented<T extends string>({ options, value, onChange, accent =
         return (
           <button
             key={o.value}
-            onClick={(e) => { e.stopPropagation(); onChange(o.value) }}
+            onClick={(e) => {
+              e.stopPropagation()
+              if (!active) onChange(o.value)
+            }}
             style={{
               fontSize: 11, fontWeight: 600, padding: '3px 9px', border: 'none', borderRadius: 6,
               background: active ? accent : 'transparent',
