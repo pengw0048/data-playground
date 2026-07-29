@@ -6,11 +6,12 @@ import type { CatalogTable } from '../types/api'
 import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
 import { previewPlanIdentity, useStore } from '../store/graph'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { registerGenericNodes } from '../nodes/generic'
 import '../nodes/kinds/source'
 import '../nodes/kinds/transform'
 import '../nodes/kinds/join'
+import '../nodes/kinds/sql'
 
 const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
@@ -514,6 +515,156 @@ describe('Inspector — output schema disclosure', () => {
     expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Edit materialization' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Review output schema' })).not.toBeInTheDocument()
+  })
+})
+
+describe('Inspector — output schema inference input', () => {
+  const bindings = [{ name: 'threshold', value: 10 }]
+  const inferred = {
+    columns: cols, rows: [[1, 12.5]], truncated: false, completeness: 'page',
+  }
+
+  const selectNode = (type: 'transform' | 'sql') => {
+    const nodeId = type
+    const doc = {
+      id: `schema-infer-${type}`, version: 1, requirements: [],
+      nodes: [
+        {
+          id: 'source', type: 'source', position: { x: 0, y: 0 },
+          data: {
+            title: 'events', status: 'latest', history: [],
+            config: { uri: 'events.parquet' },
+          },
+        },
+        {
+          id: nodeId, type, position: { x: 0, y: 0 },
+          data: {
+            title: type, status: 'draft', history: [],
+            config: type === 'transform'
+              ? { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' }
+              : { sql: 'SELECT * FROM input' },
+          },
+        },
+      ],
+      edges: [{
+        id: `source-${nodeId}`, source: 'source', sourceHandle: 'out',
+        target: nodeId, targetHandle: 'in', data: { wire: 'dataset' as const },
+      }],
+    }
+    useStore.setState({
+      selectedIds: [nodeId], canvasRole: 'owner', schemas: {}, previews: {},
+      runs: { [nodeId]: { phase: 'idle', parameterBindings: bindings } }, doc,
+    } as any)
+    return doc as any
+  }
+
+  const openAndInfer = () => {
+    render(<Inspector />)
+    fireEvent.click(screen.getByText('Advanced output schema'))
+    fireEvent.click(screen.getByRole('button', { name: 'Infer from sample' }))
+  }
+
+  beforeEach(() => {
+    vi.spyOn(api, 'listSchemas').mockResolvedValue([])
+    vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] })
+  })
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('infers a Transform schema from the server-owned retained editor preview', async () => {
+    const doc = selectNode('transform')
+    const retained = vi.spyOn(api, 'retainedEditorPreview').mockResolvedValue(inferred as any)
+    const ordinary = vi.spyOn(api, 'preview')
+
+    openAndInfer()
+
+    await waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'transform')?.data.config.outputSchema,
+    ).toEqual(cols))
+    expect(retained).toHaveBeenCalledWith(
+      doc, 'transform', 50, 0, undefined, bindings,
+    )
+    expect(ordinary).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    'retained_upstream_unavailable',
+    'retained_upstream_stale',
+    'retained_upstream_expired',
+  ])('falls back to ordinary preview for %s', async (code) => {
+    const doc = selectNode('transform')
+    vi.spyOn(api, 'retainedEditorPreview').mockRejectedValue(
+      new KernelError(409, 'retained input unavailable', code),
+    )
+    const ordinary = vi.spyOn(api, 'preview').mockResolvedValue(inferred as any)
+
+    openAndInfer()
+
+    await waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'transform')?.data.config.outputSchema,
+    ).toEqual(cols))
+    expect(ordinary).toHaveBeenCalledWith(
+      doc, 'transform', 50, 0, undefined, undefined, bindings,
+    )
+  })
+
+  it('does not hide a non-retained error behind ordinary preview', async () => {
+    selectNode('transform')
+    vi.spyOn(api, 'retainedEditorPreview').mockRejectedValue(
+      new KernelError(403, 'retained input access denied', 'permission_denied'),
+    )
+    const ordinary = vi.spyOn(api, 'preview')
+
+    openAndInfer()
+
+    expect(await screen.findByText(/retained input access denied/)).toBeVisible()
+    expect(ordinary).not.toHaveBeenCalled()
+    expect(useStore.getState().doc.nodes.find(
+      (node) => node.id === 'transform',
+    )?.data.config.outputSchema).toBeUndefined()
+  })
+
+  it('keeps non-Transform inference on ordinary preview', async () => {
+    const doc = selectNode('sql')
+    const retained = vi.spyOn(api, 'retainedEditorPreview')
+    const ordinary = vi.spyOn(api, 'preview').mockResolvedValue(inferred as any)
+
+    openAndInfer()
+
+    await waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'sql')?.data.config.outputSchema,
+    ).toEqual(cols))
+    expect(retained).not.toHaveBeenCalled()
+    expect(ordinary).toHaveBeenCalledWith(
+      doc, 'sql', 50, 0, undefined, undefined, bindings,
+    )
+  })
+
+  it('does not install a retained result after parameter bindings change', async () => {
+    selectNode('transform')
+    let finish!: (result: typeof inferred) => void
+    const retained = vi.spyOn(api, 'retainedEditorPreview').mockImplementation(
+      () => new Promise((resolve) => { finish = resolve }),
+    )
+    vi.spyOn(api, 'preview')
+
+    openAndInfer()
+    await waitFor(() => expect(retained).toHaveBeenCalled())
+    act(() => useStore.setState((state) => ({
+      runs: {
+        ...state.runs,
+        transform: {
+          ...state.runs.transform,
+          parameterBindings: [{ name: 'threshold', value: 11 }],
+        },
+      },
+    })))
+    await act(async () => { finish(inferred); await Promise.resolve() })
+
+    expect(await screen.findByText(/parameter bindings changed while the sample was loading/i)).toBeVisible()
+    expect(useStore.getState().doc.nodes.find(
+      (node) => node.id === 'transform',
+    )?.data.config.outputSchema).toBeUndefined()
   })
 })
 
