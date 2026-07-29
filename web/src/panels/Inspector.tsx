@@ -246,7 +246,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const currentPreview = currentPreviews(doc, previews)[nodeId]
   const observedOutFor = (portId: string): ColumnSchema[] | undefined => {
     const columns = currentPreview?.result?.columns
-    if (!columns?.length
+    if (currentPreview?.result?.error || currentPreview?.result?.notPreviewable || !columns?.length
       || outputPortId(doc, nodeId, currentPreview.portId) !== outputPortId(doc, nodeId, portId)) {
       return undefined
     }

@@ -533,9 +533,12 @@ describe('Inspector — observed output schema', () => {
     return doc as any
   }
 
-  const observedPreview = (doc: any, portId = 'out', planIdentity = previewPlanIdentity(doc, 'transform', portId)) => ({
+  const observedPreview = (
+    doc: any, portId = 'out', planIdentity = previewPlanIdentity(doc, 'transform', portId),
+    result: { columns: ColumnSchema[]; error?: string; notPreviewable?: boolean } = { columns: cols },
+  ) => ({
     canvasId: doc.id, nodeId: 'transform', portId, planIdentity, requestGeneration: 1,
-    result: { columns: cols },
+    result,
   })
 
   it('keeps a dynamic Transform output untyped before a current result exists', () => {
@@ -570,6 +573,28 @@ describe('Inspector — observed output schema', () => {
     render(<Inspector />)
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('server_only')).toBeVisible()
+    expect(screen.queryByText('amount')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['errored', { error: 'preview failed' }, [{ name: 'server_only', type: 'string', capabilities: [] }], 'server_only'],
+    ['refused', { notPreviewable: true }, null, 'untyped'],
+  ] as const)('does not use columns attached to a %s result', (_label, resultState, fallback, expected) => {
+    const doc = selectTransform({}, fallback)
+    useStore.setState({ previews: {
+      transform: observedPreview(
+        doc, 'out', previewPlanIdentity(doc, 'transform', 'out'),
+        { columns: cols, ...resultState },
+      ),
+    } } as any)
+    render(<Inspector />)
+
+    if (expected === 'untyped') {
+      expect(screen.getByText('untyped')).toBeVisible()
+    } else {
+      fireEvent.click(screen.getByTitle('Show columns'))
+      expect(screen.getByText(expected)).toBeVisible()
+    }
     expect(screen.queryByText('amount')).not.toBeInTheDocument()
   })
 

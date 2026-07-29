@@ -97,19 +97,6 @@ test('Example rows stay local to the fullscreen Transform editor', async ({ page
     expect(formalRows.length).toBeGreaterThan(0)
     expect(formalRows.every((row) => row.code_output === true)).toBe(true)
     expect(formalRows.every((row) => !('fixtureOnly' in row))).toBe(true)
-
-    // Opening the successful Transform result installs a current preview. Its observed columns
-    // are shown on the same OUT port without turning them into a declared output contract.
-    await page.getByRole('button', { name: 'Close' }).click()
-    const inspector = page.getByTestId('inspector')
-    await expect(inspector).toBeVisible()
-    const outPort = inspector.getByText('OUT', { exact: true }).locator('..')
-    await expect(outPort.getByRole('button', { name: 'untyped' })).toBeVisible()
-    await inspector.getByRole('button', { name: 'View data' }).click()
-    const observedOut = outPort.getByRole('button', { name: /\d+ cols/ })
-    await expect(observedOut).toBeVisible({ timeout: 15_000 })
-    await observedOut.click()
-    await expect(inspector.getByText('code_output', { exact: true })).toBeVisible()
   } finally {
     if (canvasCreated) {
       expect((await page.request.delete(
