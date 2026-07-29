@@ -573,8 +573,8 @@ export function Canvas() {
         deleteKeyCode={null}
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
-        {/* The Toolbar owns product-labelled view controls. Keep the minimap only once there's something
-            to navigate — on an empty canvas it would just be a stray box over the first-run prompt. */}
+        {/* Keep the minimap only once there's something to navigate — on an empty canvas it would
+            just be a stray box over the first-run prompt. */}
         {doc.nodes.length > 0 && (
           <>
             {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
@@ -582,9 +582,8 @@ export function Canvas() {
             <MiniMap
               pannable
               position="bottom-left"
-              // Keep the minimap above the centered toolbar at the supported 1024px viewport, where
-              // the labelled Add group reaches the left edge even though the View group does not.
-              style={{ marginBottom: 84, marginLeft: 12, width: 168, height: 108 }}
+              // Leave room for the icon-only viewport controls directly below the minimap.
+              style={{ marginBottom: 132, marginLeft: 12, width: 168, height: 108 }}
               maskColor="rgba(128,128,128,0.2)"
               nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
               nodeStrokeWidth={0}

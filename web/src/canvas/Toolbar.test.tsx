@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
 
@@ -38,7 +38,7 @@ vi.mock('./nextStep', () => ({
   ),
 }))
 
-import { CanvasViewControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
+import { CanvasViewportControls, CanvasViewControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
 
 describe('toolbarDensityForWidth', () => {
   it('keeps all three densities reachable from the actual Canvas width', () => {
@@ -49,7 +49,7 @@ describe('toolbarDensityForWidth', () => {
   })
 })
 
-describe('CanvasViewControls', () => {
+describe('Canvas controls', () => {
   beforeEach(() => {
     viewport.zoom = 1
     viewport.zoomIn.mockReset()
@@ -60,43 +60,64 @@ describe('CanvasViewControls', () => {
     toolbarState.specs = []
   })
 
-  it('keeps the existing viewport operations behind labelled controls', () => {
-    const toggleInspector = vi.fn()
+  it('keeps viewport operations accessible while rendering icons only', () => {
     render(
       <TooltipProvider delayDuration={0}>
-        <CanvasViewControls hasNodes labelsVisible inspectorCollapsed={false} onInspectorToggle={toggleInspector} />
+        <CanvasViewportControls />
       </TooltipProvider>,
     )
 
-    const controls = screen.getByRole('group', { name: 'View controls' })
-    expect(screen.getByRole('group', { name: 'Viewport controls' })).toBeInTheDocument()
-    expect(screen.getByRole('group', { name: 'Panel controls' })).toBeInTheDocument()
-    expect(controls).toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
-    expect(controls).toContainElement(screen.getByRole('button', { name: 'Zoom out' }))
-    expect(controls).toContainElement(screen.getByRole('button', { name: 'Fit view' }))
-    expect(screen.getByRole('button', { name: 'Hide Inspector' })).toHaveAttribute('aria-pressed', 'true')
+    const controls = screen.getByRole('group', { name: 'Viewport controls' })
+    for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
+      expect(controls).toContainElement(screen.getByRole('button', { name }))
+      expect(within(controls).queryByText(name, { exact: true })).not.toBeInTheDocument()
+    }
 
     fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
     fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }))
     fireEvent.click(screen.getByRole('button', { name: 'Fit view' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Hide Inspector' }))
 
     expect(viewport.zoomIn).toHaveBeenCalledOnce()
     expect(viewport.zoomOut).toHaveBeenCalledOnce()
     expect(viewport.fitView).toHaveBeenCalledWith({ padding: 0.3, maxZoom: 1 })
-    expect(toggleInspector).toHaveBeenCalledOnce()
   })
 
-  it('reports the Inspector state and preserves zoom boundaries', () => {
+  it('preserves both zoom boundaries', () => {
     viewport.zoom = 2.5
-    render(
+    const { rerender } = render(
       <TooltipProvider delayDuration={0}>
-        <CanvasViewControls hasNodes inspectorCollapsed onInspectorToggle={vi.fn()} />
+        <CanvasViewportControls />
       </TooltipProvider>,
     )
 
     expect(screen.getByRole('button', { name: 'Zoom in' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Zoom out' })).toBeEnabled()
+
+    viewport.zoom = 0.2
+    rerender(
+      <TooltipProvider delayDuration={0}>
+        <CanvasViewportControls />
+      </TooltipProvider>,
+    )
+    expect(screen.getByRole('button', { name: 'Zoom in' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Zoom out' })).toBeDisabled()
+  })
+
+  it('keeps the Inspector in the centred toolbar group', () => {
+    const toggleInspector = vi.fn()
+    render(
+      <TooltipProvider delayDuration={0}>
+        <CanvasViewControls labelsVisible inspectorCollapsed onInspectorToggle={toggleInspector} />
+      </TooltipProvider>,
+    )
+
+    const controls = screen.getByRole('group', { name: 'View controls' })
+    expect(controls).toContainElement(screen.getByRole('group', { name: 'Panel controls' }))
+    expect(within(controls).queryByRole('group', { name: 'Viewport controls' })).not.toBeInTheDocument()
+    expect(within(controls).getByText('View', { exact: true })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Show Inspector' })).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(screen.getByRole('button', { name: 'Show Inspector' }))
+    expect(toggleInspector).toHaveBeenCalledOnce()
   })
 
   it('keeps viewport and Inspector controls available to a view-only canvas', () => {
@@ -108,7 +129,8 @@ describe('CanvasViewControls', () => {
 
     expect(screen.getByTestId('view-only-badge')).toHaveTextContent('View-only canvas')
     expect(screen.queryByTestId('toolbar-add-controls')).not.toBeInTheDocument()
-    expect(screen.getByTestId('toolbar-view-controls')).toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
+    expect(screen.getByTestId('canvas-viewport-controls')).toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
+    expect(screen.getByTestId('toolbar-view-controls')).not.toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Hide Inspector' })).toBeEnabled()
   })
