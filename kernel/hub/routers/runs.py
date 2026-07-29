@@ -2382,8 +2382,34 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
     _reject_invalid(
         graph, deps, req.target_node_id, enforce_join_condition=False)
     try:
+        from hub.ir import resolve_config
+        actuals = _actuals_for(graph, deps)
+        incomplete_join_ids: set[str] = set()
+        for node in graph.nodes:
+            if node.type != "join":
+                continue
+            config = resolve_config(node)
+            if not str(config.get("on") or "").strip() \
+                    and not str(config.get("condition") or "").strip():
+                incomplete_join_ids.add(node.id)
+        if incomplete_join_ids:
+            # This endpoint intentionally remains available while a built-in Join is being
+            # configured.  Prior-run counts for that Join and its downstream cone describe the old,
+            # complete graph, not the current draft, so they must not become "exact" estimates.
+            downstream: dict[str, list[str]] = {}
+            for edge in graph.edges:
+                downstream.setdefault(edge.source, []).append(edge.target)
+            draft_cone = set(incomplete_join_ids)
+            pending = list(incomplete_join_ids)
+            while pending:
+                for node_id in downstream.get(pending.pop(), []):
+                    if node_id not in draft_cone:
+                        draft_cone.add(node_id)
+                        pending.append(node_id)
+            actuals = {node_id: rows for node_id, rows in actuals.items()
+                       if node_id not in draft_cone}
         sizes = estimate_sizes(
-            graph, deps.resolve_adapter, actuals=_actuals_for(graph, deps),
+            graph, deps.resolve_adapter, actuals=actuals,
             storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
