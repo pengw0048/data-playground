@@ -43,6 +43,7 @@ describe('WritePublicationSummary task-first output states', () => {
 
     expect(screen.getByText('Output name')).toBeVisible()
     expect(screen.getByText('family cost')).toBeVisible()
+    expect(screen.queryByText('Mode')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Checking output…')
 
     rerender(<WritePublicationSummary outputName="family cost" destination="Workspace outputs"
@@ -147,8 +148,8 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.queryByLabelText('Write readiness')).not.toBeInTheDocument()
 
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    expect(within(screen.getByText('Mode').parentElement!)
-      .getByText('Revision mode is not available yet')).toBeVisible()
+    expect(screen.queryByText('Mode')).not.toBeInTheDocument()
+    expect(screen.queryByText('Revision mode is not available yet')).not.toBeInTheDocument()
   })
 
   it('opens only the receipt-backed exact revision and fails closed when it is unavailable', async () => {

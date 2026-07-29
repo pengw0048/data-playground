@@ -155,6 +155,9 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const summaryAdmission = completed ? outcomeAdmission : admission
   const managed = receipt != null || summaryAdmission?.managed === true
   const providerNeutral = summaryAdmission?.managed === false
+  // A receipt can outlive its in-memory admission. Omit an unproven mode instead
+  // of filling the primary summary with an "unavailable" implementation state.
+  const showMode = summaryAdmission?.mode != null
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
@@ -171,10 +174,10 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
         <span className="font-semibold text-foreground">Destination</span>
         <div className="text-muted-foreground">{destination}</div>
       </div>
-      <div>
-        <span className="font-semibold text-foreground">Mode</span>
-        <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
-      </div>
+      {showMode && <div>
+          <span className="font-semibold text-foreground">Mode</span>
+          <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
+        </div>}
       {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Exact run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Fix before running:</strong> {summaryAdmission.exactRunReadiness.message}
       </div> : summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">

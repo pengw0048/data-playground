@@ -77,7 +77,7 @@ function Write({ id, data }: NodeComponentProps) {
         </Field>
         <Field label="write mode">
           <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[
-            { value: 'overwrite', label: admission?.provider === 'managed-local-file' ? 'create / replace automatically' : 'replace output' },
+            { value: 'overwrite', label: admission?.provider === 'managed-local-file' ? 'Create or replace' : 'replace output' },
             { value: 'append', label: admission?.provider === 'managed-local-lance' ? 'append (exact head)' : 'append' },
           ]} />
         </Field>
