@@ -518,7 +518,9 @@ describe('Inspector — output schema disclosure', () => {
 })
 
 describe('Inspector — observed output schema', () => {
-  const selectTransform = (config: Record<string, unknown> = {}) => {
+  const selectTransform = (
+    config: Record<string, unknown> = {}, schema: ColumnSchema[] | null = null,
+  ) => {
     const doc = {
       id: 'observed-output', version: 1, requirements: [], edges: [], nodes: [{
         id: 'transform', type: 'transform', position: { x: 0, y: 0 },
@@ -526,7 +528,7 @@ describe('Inspector — observed output schema', () => {
       }],
     }
     useStore.setState({
-      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: { transform: { out: null } }, previews: {}, doc,
+      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: { transform: { out: schema } }, previews: {}, doc,
     } as any)
     return doc as any
   }
@@ -543,36 +545,46 @@ describe('Inspector — observed output schema', () => {
   })
 
   it('shows columns observed from a current matching result', () => {
-    const doc = selectTransform()
+    const doc = selectTransform({}, [{ name: 'server_only', type: 'string', capabilities: [] }])
     useStore.setState({ previews: { transform: observedPreview(doc) } } as any)
     render(<Inspector />)
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('id')).toBeVisible()
     expect(screen.getByText('amount')).toBeVisible()
+    expect(screen.queryByText('server_only')).not.toBeInTheDocument()
     expect(screen.getByText('2 cols')).toBeVisible()
   })
 
   it('does not use stale or mismatched-port results as output schema evidence', () => {
-    const staleDoc = selectTransform()
+    const fallback = [{ name: 'server_only', type: 'string', capabilities: [] }]
+    const staleDoc = selectTransform({}, fallback)
     useStore.setState({ previews: { transform: observedPreview(staleDoc, 'out', 'stale-plan') } } as any)
     const staleView = render(<Inspector />)
-    expect(screen.getByText('untyped')).toBeVisible()
+    fireEvent.click(screen.getByTitle('Show columns'))
+    expect(screen.getByText('server_only')).toBeVisible()
+    expect(screen.queryByText('amount')).not.toBeInTheDocument()
     staleView.unmount()
 
-    const mismatchedDoc = selectTransform()
+    const mismatchedDoc = selectTransform({}, fallback)
     useStore.setState({ previews: { transform: observedPreview(mismatchedDoc, 'other') } } as any)
     render(<Inspector />)
-    expect(screen.getByText('untyped')).toBeVisible()
+    fireEvent.click(screen.getByTitle('Show columns'))
+    expect(screen.getByText('server_only')).toBeVisible()
+    expect(screen.queryByText('amount')).not.toBeInTheDocument()
   })
 
   it('keeps a current explicit declared contract ahead of observed columns', () => {
     const declared = [{ name: 'declared_id', type: 'string', capabilities: [] }]
-    const doc = selectTransform({ code: 'return current_input', outputSchema: declared, outputSchemaCodeHash: codeHash('return current_input') })
+    const doc = selectTransform(
+      { code: 'return current_input', outputSchema: declared, outputSchemaCodeHash: codeHash('return current_input') },
+      [{ name: 'server_only', type: 'string', capabilities: [] }],
+    )
     useStore.setState({ previews: { transform: observedPreview(doc) } } as any)
     render(<Inspector />)
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('declared_id')).toBeVisible()
     expect(screen.queryByText('amount')).not.toBeInTheDocument()
+    expect(screen.queryByText('server_only')).not.toBeInTheDocument()
     expect(screen.getByText('1 cols')).toBeVisible()
   })
 })

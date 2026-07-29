@@ -5,7 +5,7 @@ import {
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useInputColumns, useSchemaWarnings } from '../nodes/fields'
-import { codeHash, nodeColumns, outputPortId } from '../nodes/schema'
+import { codeHash, outputPortId } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
@@ -241,19 +241,23 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
   const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
-  // Runtime columns are display-only evidence. Reuse the current-preview filter used by editor
-  // completions, then route through nodeColumns so an observation cannot cross named output ports.
-  const observedOut = canDeclareSchema && outputPorts.length === 1
-    ? nodeColumns(doc, allSchemas, currentPreviews(doc, previews), catalog, nodeId, outputPorts[0]?.id)
-    : []
+  // Runtime columns are display-only evidence. Filter stale previews first, then require the
+  // observed result's effective port to match the port being rendered.
+  const currentPreview = currentPreviews(doc, previews)[nodeId]
+  const observedOutFor = (portId: string): ColumnSchema[] | undefined => {
+    const columns = currentPreview?.result?.columns
+    if (!columns?.length
+      || outputPortId(doc, nodeId, currentPreview.portId) !== outputPortId(doc, nodeId, portId)) {
+      return undefined
+    }
+    return columns as ColumnSchema[]
+  }
   const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
     kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(kind, cfg)
       && !node.data.bypassed && outputPorts.length === 1
       ? declaredOut
       : canDeclareSchema && outputPorts.length === 1
-        ? observedOut.length
-          ? observedOut
-          : allSchemas[nodeId]?.[portId]
+        ? observedOutFor(portId) ?? allSchemas[nodeId]?.[portId]
         : allSchemas[nodeId]?.[portId]
   )
   // INPUT port schema = the OUTPUT schema of whatever is wired into that port (routed by targetHandle).
