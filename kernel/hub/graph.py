@@ -391,7 +391,8 @@ def unknown_kinds(graph: Graph, known) -> list[tuple[str, str]]:
 
 def validation_error(
         graph: Graph, node_specs: dict, known_kinds=(),
-        target_node_id: str | None = None) -> tuple[str, bool] | None:
+        target_node_id: str | None = None, *,
+        enforce_join_condition: bool = True) -> tuple[str, bool] | None:
     """One authoritative, side-effect-free graph validity decision for every ingress.
 
     Returns ``(message, acyclic)`` so compile can keep its error-plan response while execution,
@@ -416,9 +417,10 @@ def validation_error(
         return "incompatible connection: " + "; ".join(incompatible[:5]), True
     if not is_acyclic(graph):
         return "graph has a cycle — control flow must be encapsulated (§5.7)", False
-    join_condition = join_condition_errors(graph, target_node_id)
-    if join_condition:
-        return "invalid graph: " + "; ".join(join_condition[:5]), True
+    if enforce_join_condition:
+        join_condition = join_condition_errors(graph, target_node_id)
+        if join_condition:
+            return "invalid graph: " + "; ".join(join_condition[:5]), True
     return None
 
 

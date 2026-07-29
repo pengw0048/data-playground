@@ -1602,15 +1602,21 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
     return cid, role
 
 
-def _invalid_graph(graph, deps, target_node_id: str | None = None) -> tuple[str, bool] | None:
+def _invalid_graph(
+        graph, deps, target_node_id: str | None = None, *,
+        enforce_join_condition: bool = True) -> tuple[str, bool] | None:
     """Compatibility wrapper around the shared graph-ingress validator."""
     return graph_mod.validation_error(
-        graph, getattr(deps, "node_specs", {}), getattr(deps, "node_builders", {}), target_node_id)
+        graph, getattr(deps, "node_specs", {}), getattr(deps, "node_builders", {}), target_node_id,
+        enforce_join_condition=enforce_join_condition)
 
 
-def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
+def _reject_invalid(
+        graph, deps, target_node_id: str | None = None, *,
+        enforce_join_condition: bool = True) -> None:
     """400 on any graph that compile would reject."""
-    invalid = _invalid_graph(graph, deps, target_node_id)
+    invalid = _invalid_graph(
+        graph, deps, target_node_id, enforce_join_condition=enforce_join_condition)
     if invalid:
         raise APIError(
             400,
@@ -2390,10 +2396,10 @@ def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> Join
     deps = get_deps()
     req.graph = _resolve_parameters(
         req.graph, req.parameter_bindings, req.target_node_id, deps)
-    _reject_invalid(req.graph, deps, req.target_node_id)
+    _reject_invalid(req.graph, deps, req.target_node_id, enforce_join_condition=False)
     graph = _target_execution_graph(req.graph, req.target_node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
-    _reject_invalid(graph, deps, req.target_node_id)
+    _reject_invalid(graph, deps, req.target_node_id, enforce_join_condition=False)
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
     try:

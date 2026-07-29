@@ -110,6 +110,8 @@ def test_join_requires_keys_or_an_explicit_advanced_condition(config: dict):
     invalid = graph_mod.validation_error(graph, SPECS, target_node_id="join")
     assert invalid is not None
     assert "needs at least one left and right column" in invalid[0]
+    assert graph_mod.validation_error(
+        graph, SPECS, target_node_id="join", enforce_join_condition=False) is None
 
 
 @pytest.mark.parametrize("config", [

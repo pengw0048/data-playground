@@ -44,12 +44,15 @@ test.describe('Join key builder', () => {
 
       await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
       await expect(page.getByTestId('join-missing-condition')).toHaveText('Choose at least one left and right column.')
-      let runRequests = 0
-      page.on('request', (request) => {
-        if (request.method() === 'POST' && /\/api\/(?:run|run\/estimate)$/.test(new URL(request.url()).pathname)) runRequests += 1
-      })
+      const dispatched = page.waitForRequest((request) => {
+        const path = new URL(request.url()).pathname
+        return request.method() === 'POST' && (path === '/api/run' || path === '/api/run/estimate')
+      }, { timeout: 750 }).then(() => true).catch(() => false)
+      const feedback = page.getByTestId('toast').filter({ hasText: 'Choose at least one left and right column.' })
+      const feedbackBeforeClick = await feedback.count()
       await page.getByRole('button', { name: 'Rerun all' }).click()
-      await expect.poll(() => runRequests).toBe(0)
+      await expect(feedback).toHaveCount(feedbackBeforeClick + 1)
+      expect(await dispatched).toBe(false)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }

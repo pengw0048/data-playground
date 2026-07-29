@@ -1413,19 +1413,30 @@ function downloadDraft(draft: LocalCanvasDraft): void {
   URL.revokeObjectURL(href)
 }
 
-// true if the node, or anything feeding it, has an unmet required param — so running the pipeline
-// through it would fail. Keeps rerun-all consistent with the disabled ▶ on the cards.
-function hasInvalidUpstream(doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts']): boolean {
+// The first reason the node, or anything feeding it, cannot run. Keeping the reason lets bulk
+// actions explain the same invalid state that disables the individual card action.
+function invalidUpstreamReason(
+  doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts'],
+): string | null {
   const seen = new Set<string>()
-  const walk = (nid: string): boolean => {
-    if (seen.has(nid)) return false
+  const walk = (nid: string): string | null => {
+    if (seen.has(nid)) return null
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
-    if (!n) return false
-    if (nodeInvalidReason(n, undefined, numericDrafts[n.id])) return true
-    return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
+    if (!n) return null
+    const ownReason = nodeInvalidReason(n, undefined, numericDrafts[n.id])
+    if (ownReason) return ownReason
+    for (const source of doc.edges.filter((e) => e.target === nid).map((e) => e.source)) {
+      const reason = walk(source)
+      if (reason) return reason
+    }
+    return null
   }
   return walk(id)
+}
+
+function hasInvalidUpstream(doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts']): boolean {
+  return invalidUpstreamReason(doc, id, numericDrafts) !== null
 }
 
 // downstream node ids (BFS over edges)
@@ -3045,10 +3056,19 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
-    const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id, numericParamDrafts))
-    valid.forEach((n) => get().requestRun(n.id))
+    const candidates = sinks.map((node) => ({
+      node, invalidReason: invalidUpstreamReason(doc, node.id, numericParamDrafts),
+    }))
+    const valid = candidates.filter(({ invalidReason }) => !invalidReason)
+    valid.forEach(({ node }) => get().requestRun(node.id))
     const invalidSkipped = sinks.length - valid.length
-    if (invalidSkipped) get().pushToast(`Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with invalid node parameters`, 'info')
+    if (invalidSkipped) {
+      get().pushToast(
+        candidates.find(({ invalidReason }) => invalidReason)?.invalidReason
+          ?? `Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with invalid node parameters`,
+        'error',
+      )
+    }
   },
 
   cancelRun: async (id) => {

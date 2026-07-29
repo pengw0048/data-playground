@@ -1186,6 +1186,33 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
+  it('explains the actionable Join condition error when rerun all refuses dispatch', () => {
+    const left = NODE('left', 'source')
+    const right = NODE('right', 'source')
+    const join = NODE('join', 'join')
+    left.data.config = { uri: 'events' }
+    right.data.config = { uri: 'images' }
+    join.data.config = { how: 'inner', on: '', condition: '' }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [left, right, join],
+        edges: [
+          { id: 'left-join', source: 'left', target: 'join', targetHandle: 'a' },
+          { id: 'right-join', source: 'right', target: 'join', targetHandle: 'b' },
+        ],
+      },
+      toasts: [],
+    })
+
+    useStore.getState().rerunAll()
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'Choose at least one left and right column.',
+    }])
+  })
+
   it('surfaces invalid_graph refusals from execution and graph-metadata endpoints', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }
