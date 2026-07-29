@@ -207,7 +207,10 @@ export function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistor
 }
 
 function MenuDestination({ label, detail }: { label: string; detail: string }) {
-  return <span className="flex min-w-0 flex-1 items-baseline justify-between gap-3"><span>{label}</span><span aria-hidden className="truncate text-[10px] text-muted-foreground">{detail}</span></span>
+  return <span className="flex min-w-0 flex-1 flex-col items-start leading-tight">
+    <span>{label}</span>
+    <span aria-hidden className="mt-0.5 whitespace-normal text-[10px] leading-tight text-muted-foreground">{detail}</span>
+  </span>
 }
 
 function CanvasInboxIndicator({ count }: { count: number }) {

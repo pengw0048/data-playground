@@ -48,9 +48,17 @@ describe('AppMenu', () => {
 
     await user.click(screen.getByRole('button', { name: 'App menu' }))
 
-    expect(screen.getByText('runs and background tasks')).toBeInTheDocument()
-    expect(screen.getByText('my background task results')).toBeInTheDocument()
-    expect(screen.getByText('runs from this Canvas')).toBeInTheDocument()
+    for (const [label, detail] of [
+      ['Jobs', 'runs and background tasks'],
+      ['Inbox', 'my background task results'],
+      ['Run history', 'runs from this Canvas'],
+    ] as const) {
+      expect(screen.getByRole('menuitem', { name: label })).toBeInTheDocument()
+      const explanation = screen.getByText(detail)
+      expect(explanation).toHaveAttribute('aria-hidden', 'true')
+      expect(explanation).toHaveClass('whitespace-normal')
+      expect(explanation).not.toHaveClass('truncate')
+    }
     expect(screen.queryByText(/terminal outcomes/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/audit trail/i)).not.toBeInTheDocument()
   })
