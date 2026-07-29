@@ -89,7 +89,7 @@ test('fullscreen Transform reuses a retained full-run result after bounded remot
       await expect(page.locator('.react-flow__node')).toHaveCount(3)
       await page.getByRole('button', { name: 'Edit code' }).last().click()
       await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
-      await expect(page.getByText('Using Remote sample · 8 rows')).toBeVisible({
+      await expect(page.getByText('Test result · using Remote sample · 8 input rows')).toBeVisible({
         timeout: 15_000,
       })
       await expect(page.getByText('true', { exact: true }).first()).toBeVisible()
@@ -168,7 +168,7 @@ test('Workspace-style local Sources retain a Join result when the Transform edit
       await expect(page.locator('.react-flow__node')).toHaveCount(4)
       await page.getByRole('button', { name: 'Edit code' }).last().click()
       await expect(page.getByRole('button', { name: 'Test code' })).toBeVisible()
-      await expect(page.getByText('Using events with images · 500 rows')).toBeVisible()
+      await expect(page.getByText('Test result · using events with images · 500 input rows')).toBeVisible()
       await expect(page.getByText('true', { exact: true }).first()).toBeVisible()
     }
     await openEditor()

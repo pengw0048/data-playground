@@ -654,7 +654,7 @@ describe('durable full results', () => {
     expect(screen.queryByText('Your Python transform raised an exception')).not.toBeInTheDocument()
   })
 
-  it('labels the selected test input without exposing the formal full-result surface', () => {
+  it('labels retained-upstream test output separately from its input without exposing the formal full-result surface', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'latest', config: {
@@ -679,7 +679,9 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" editorPreview={{}} />)
 
-    expect(screen.getByText('Using Clean events · 1,234 rows')).toBeInTheDocument()
+    expect(screen.getByRole('status', {
+      name: 'Test result: using Clean events · 1,234 input rows',
+    })).toHaveTextContent('Test result · using Clean events · 1,234 input rows')
     expect(screen.getByText('rows 1–1')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Export this preview page' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()

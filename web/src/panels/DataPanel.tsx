@@ -208,11 +208,23 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       {!editorPreview && (
         <SelectedOutputOutcome output={displayedSelectedOutput} />
       )}
-      {editorPreview && preview?.result?.editorTestInput && (
-        <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
-          Using {preview.result.editorTestInput.label}
+      {editorPreview?.resultContext !== 'example-rows'
+        && preview?.result?.editorTestInput
+        && previewIsCurrent(preview, doc, nodeId, requestPortId)
+        && !preview.loading
+        && !preview.error
+        && !preview.result.notPreviewable
+        && !preview.result.error
+        && !preview.result.failureCategory && (
+        <div role="status" aria-label={`Test result: using ${preview.result.editorTestInput.label}${
+          preview.result.editorTestInput.rows != null
+            ? ` · ${preview.result.editorTestInput.rows.toLocaleString()} input rows`
+            : ''
+        }`} className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">
+          <span className="font-semibold">Test result</span>
+          {' · '}using {preview.result.editorTestInput.label}
           {preview.result.editorTestInput.rows != null
-            ? ` · ${preview.result.editorTestInput.rows.toLocaleString()} rows`
+            ? ` · ${preview.result.editorTestInput.rows.toLocaleString()} input rows`
             : ''}
         </div>
       )}
