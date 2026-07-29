@@ -105,7 +105,8 @@ describe('JoinWithRelated', () => {
     expect(screen.getByText(/Results are truncated/)).toBeVisible()
 
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    expect(screen.getByText(/Cardinality is unknown because it was not measured/)).toBeVisible()
+    expect(screen.getByText('Not measured')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Add Join' })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
 
     expect(mocks.confirm).not.toHaveBeenCalled()
@@ -135,7 +136,7 @@ describe('JoinWithRelated', () => {
       .toBeVisible()
 
     const declaredCard = within(dialog).getByRole('button', { name: /accounts/ })
-    expect(within(declaredCard).getByText(/Persisted catalog relationship/)).toBeVisible()
+    expect(within(declaredCard).getByText(/Declared catalog relationship/)).toBeVisible()
     expect(within(declaredCard).queryByText(/No relationship is declared/)).toBeNull()
     const referenceCard = within(dialog).getByRole('button', { name: /users/ })
     expect(within(referenceCard).getByText(/Declared key\/reference/)).toBeVisible()
@@ -147,21 +148,21 @@ describe('JoinWithRelated', () => {
       .toBeVisible()
     const possibleCard = within(dialog).getByRole('button', { name: /orders/ })
     expect(possibleCard).toHaveClass('border-dashed', 'bg-muted/20')
-    expect(within(possibleCard).getByText('Possible key match', { exact: true })).toBeVisible()
-    expect(within(possibleCard).getByText('No relationship is declared.')).toBeVisible()
-    expect(within(possibleCard).getByText(/Matching key names only/)).toBeVisible()
+    expect(within(possibleCard).getByText('Suggested', { exact: true })).toBeVisible()
+    expect(within(possibleCard).getByText('Matching column names', { exact: true })).toBeVisible()
+    expect(within(possibleCard).queryByText(/No relationship is declared/)).toBeNull()
     const possibleCardinality = within(possibleCard).getByText('1:1', { exact: true })
     expect(possibleCardinality).toHaveClass('bg-muted', 'text-muted-foreground')
     expect(possibleCardinality).not.toHaveClass('bg-green-100')
 
     fireEvent.click(possibleCard)
     const review = screen.getByTestId('possible-key-match-review')
-    expect(review).toHaveTextContent('No relationship is declared')
-    expect(review).toHaveTextContent('Cardinality describes row matching, not relationship confidence')
-    expect(within(dialog).getByText('Possible key match', { exact: true })).toBeVisible()
+    expect(review).toHaveTextContent('Suggested from matching column names')
+    expect(review).toHaveTextContent('no catalog relationship is declared')
     const reviewedCardinality = within(dialog).getByText('1:1', { exact: true })
     expect(reviewedCardinality).toHaveClass('bg-muted', 'text-muted-foreground')
     expect(reviewedCardinality).not.toHaveClass('bg-green-100')
+    expect(within(dialog).queryByText(/Cardinality describes row matching/)).toBeNull()
   })
 
   it('removes stale possible matches while a scoped search is pending', async () => {
@@ -191,7 +192,7 @@ describe('JoinWithRelated', () => {
     const disclosure = await screen.findByRole('button', { name: 'Show possible key matches (1)' })
     fireEvent.click(disclosure)
     fireEvent.click(screen.getByRole('button', { name: /images/ }))
-    expect(screen.getByText('Possible key match', { exact: true })).toBeVisible()
+    expect(screen.getByTestId('possible-key-match-review')).toHaveTextContent('Suggested')
   })
 
   it('does not disclose stale possible matches while a filtered search is still debouncing', async () => {
@@ -218,7 +219,7 @@ describe('JoinWithRelated', () => {
     })
     fireEvent.click(await screen.findByRole('button', { name: 'Show possible key matches (1)' }))
     fireEvent.click(screen.getByRole('button', { name: /images/ }))
-    expect(screen.getByText('Possible key match', { exact: true })).toBeVisible()
+    expect(screen.getByTestId('possible-key-match-review')).toHaveTextContent('Suggested')
   })
 
   it('shows measured cardinality evidence without stale unmeasured copy', async () => {
@@ -227,10 +228,13 @@ describe('JoinWithRelated', () => {
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
 
-    expect(screen.getByText('Matching key columns')).toBeVisible()
-    expect(screen.getByText(/Measured across both current dataset versions/)).toBeVisible()
+    const card = screen.getByRole('button', { name: /orders/ })
+    expect(within(card).getByText('Matching column names')).toBeVisible()
+    expect(within(card).getByText('1:N')).toHaveAttribute(
+      'title', 'Measured across both current dataset versions.',
+    )
     expect(screen.queryByText(/cardinality not measurable here/)).toBeNull()
-    expect(screen.getByText(/joined rows may multiply/)).toBeVisible()
+    expect(screen.queryByText(/joined rows may multiply/)).toBeNull()
   })
 
   it('orients measured cardinality without embedding the opposite direction in its evidence', async () => {
@@ -256,8 +260,9 @@ describe('JoinWithRelated', () => {
 
     const candidate = screen.getByRole('button', { name: /orders/ })
     expect(within(candidate).getByText('N:1', { exact: true })).toBeVisible()
-    expect(within(candidate).getByText('Matching key columns')).toBeVisible()
-    expect(within(candidate).getByText(/Measured across both current dataset versions/)).toBeVisible()
+    expect(within(candidate).getByText('Matching column names')).toBeVisible()
+    expect(within(candidate).getByText('N:1', { exact: true }))
+      .toHaveAttribute('title', 'Measured across both current dataset versions.')
     expect(within(candidate).queryByText('1:N', { exact: true })).toBeNull()
   })
 
@@ -277,7 +282,7 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByTestId('confirm-related-join'))
 
     await screen.findByText('Reapply to latest Canvas')
-    expect(screen.getByText('Related dataset')).toBeVisible()
+    expect(screen.getByText('Right input (b)').parentElement).toHaveTextContent('users')
     expect(mocks.loadDoc).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Reapply to latest Canvas' }))
 
@@ -314,7 +319,7 @@ describe('JoinWithRelated', () => {
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenCalledWith(
       page.source, page.candidates[0], 'rev-2', expect.any(Object),
     ))
-    expect(screen.getByText(/Cardinality is unknown.*exact revision/)).toBeVisible()
+    expect(screen.getByText(/Fan-out was not measured.*exact revision/)).toBeVisible()
   })
 
   it('keeps a failed exact choice selected and cannot confirm the current candidate by mistake', async () => {
@@ -370,7 +375,9 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByText('Version history is unavailable for this dataset.')
+    await waitFor(() => expect(mocks.relatedRevisions).toHaveBeenCalled())
+    expect(screen.queryByLabelText('Related dataset version')).toBeNull()
+    expect(screen.queryByText('Version history is unavailable for this dataset.')).toBeNull()
     expect(screen.getByTestId('confirm-related-join')).toBeEnabled()
   })
 
@@ -380,8 +387,9 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByText('Version history is unavailable for this dataset.')
-    expect(screen.getByText(/Cardinality is unknown because it was not measured/)).toBeVisible()
+    await waitFor(() => expect(mocks.relatedRevisions).toHaveBeenCalled())
+    expect(screen.getByText('Not measured')).toBeVisible()
+    expect(screen.queryByText('Version history is unavailable for this dataset.')).toBeNull()
     const details = screen.getByText('Details').parentElement!
     expect(details).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Details'))
@@ -526,18 +534,13 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
 
     expect(screen.getByText('Left input (a)').parentElement).toHaveTextContent('users')
-    expect(screen.getByText('Left input (a)').parentElement).toHaveTextContent('Related dataset')
     expect(screen.getByText('Right input (b)').parentElement).toHaveTextContent('events')
-    expect(screen.getByText('Right input (b)').parentElement).toHaveTextContent('Selected dataset')
     expect(screen.getByText('a.id = b.user_id')).toBeVisible()
     expect(screen.getByText('N:1')).toBeVisible()
-    expect(screen.getByText(/right input \(b\) row can match multiple left input \(a\) rows/)).toBeVisible()
 
     fireEvent.change(screen.getByLabelText('Join type'), { target: { value: 'left' } })
-    expect(screen.getByTestId('related-join-behavior'))
-      .toHaveTextContent('Keeps every row from left input (a): users.')
+    expect(screen.getByLabelText('Join type')).toHaveValue('left')
     fireEvent.change(screen.getByLabelText('Join type'), { target: { value: 'right' } })
-    expect(screen.getByTestId('related-join-behavior'))
-      .toHaveTextContent('Keeps every row from right input (b): events.')
+    expect(screen.getByLabelText('Join type')).toHaveValue('right')
   })
 })

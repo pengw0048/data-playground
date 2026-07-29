@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 
 const EVIDENCE_LABEL = {
-  declared_relationship: 'Persisted catalog relationship',
+  declared_relationship: 'Declared catalog relationship',
   typed_reference: 'Declared key/reference',
   schema_match: 'Matching key names only',
 } as const
@@ -49,38 +49,10 @@ function qualifiedColumns(side: 'a' | 'b', columns: string[]) {
   return columns.map((column) => `${side}.${column}`).join(' + ')
 }
 
-function cardinalityExplanation(cardinality: RelatedDatasetCandidate['cardinality']): string {
-  if (cardinality === '1:N') {
-    return 'A left input (a) row can match multiple right input (b) rows, so joined rows may multiply.'
-  }
-  if (cardinality === 'N:1') {
-    return 'A right input (b) row can match multiple left input (a) rows, so joined rows may multiply.'
-  }
-  if (cardinality === 'N:M') {
-    return 'Rows on either input can match multiple rows on the other, so joined rows may multiply.'
-  }
-  if (cardinality === '1:1') return 'Each input row matches at most one row on the other input.'
-  return 'Cardinality is unknown because it was not measured for this join.'
-}
-
-function cardinalityDescription(
-  cardinality: RelatedDatasetCandidate['cardinality'],
-  reason?: string | null,
-): string {
-  if (!reason) return cardinalityExplanation(cardinality)
-  if (cardinality === 'unknown') return `Cardinality is unknown. ${reason}`
-  return `${cardinalityExplanation(cardinality)} ${reason}`
-}
-
-function joinTypeMeaning(
-  how: 'inner' | 'left' | 'right' | 'outer',
-  leftName: string,
-  rightName: string,
-) {
-  if (how === 'left') return `Keeps every row from left input (a): ${leftName}.`
-  if (how === 'right') return `Keeps every row from right input (b): ${rightName}.`
-  if (how === 'outer') return 'Keeps rows from both inputs, including unmatched rows.'
-  return 'Keeps only rows that match across left input (a) and right input (b).'
+function relationshipSummary(candidate: RelatedDatasetCandidate): string {
+  if (candidate.evidence === 'declared_relationship') return 'Declared catalog relationship'
+  if (candidate.evidence === 'typed_reference') return 'Declared key/reference'
+  return 'Suggested from matching column names; no catalog relationship is declared.'
 }
 
 function revisionLabel(index: number, committedAt?: string | null) {
@@ -395,19 +367,13 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const possibleMatches = page?.possibleMatches ?? []
   const sourceOnRight = context.emptyPort === 'a'
   const oriented = candidate ? orientedJoinFacts(candidate, sourceOnRight) : null
-  const sourceReview = {
-    name: page?.sourceName ?? context.source.data.title,
-    role: 'Selected dataset',
-  }
-  const relatedReview = candidate ? {
-    name: candidate.name,
-    role: candidate.evidence === 'schema_match' ? 'Possible key match' : 'Related dataset',
-  } : null
+  const sourceReview = { name: page?.sourceName ?? context.source.data.title }
+  const relatedReview = candidate ? { name: candidate.name } : null
   const leftReview = sourceOnRight ? relatedReview : sourceReview
   const rightReview = sourceOnRight ? sourceReview : relatedReview
-  const cardinalityCopy = oriented
-    ? cardinalityDescription(oriented.cardinality, candidate?.cardinalityReason)
-    : ''
+  const showVersionChoice = Boolean(
+    requestedRevisionId || revisions?.items.length || revisions?.hasMore,
+  )
   const triggerLabel = context.joinNodeId
     ? `Find join candidates · ${context.emptyPort === 'a' ? 'left' : 'right'}`
     : 'Find join candidates'
@@ -510,14 +476,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
               <div className="grid gap-2 rounded-md border border-border bg-muted/20 p-3 text-[11px]">
                 {leftReview && <ReviewIdentity label="Left input (a)" {...leftReview} />}
                 {rightReview && <ReviewIdentity label="Right input (b)" {...rightReview} />}
-                {candidate.evidence === 'schema_match' && <div data-testid="possible-key-match-review"
-                  className="rounded border border-dashed border-border bg-background p-2 text-muted-foreground">
-                  <strong className="text-foreground">Possible key match.</strong>{' '}
-                  No relationship is declared. Cardinality describes row matching, not relationship confidence.
-                </div>}
                 <div className="grid grid-cols-[120px_1fr] gap-2">
-                  <span className="text-muted-foreground">Evidence</span>
-                  <span>{EVIDENCE_LABEL[candidate.evidence]} · {candidate.reason}</span>
+                  <span className="text-muted-foreground">Relationship</span>
+                  <span data-testid={candidate.evidence === 'schema_match' ? 'possible-key-match-review' : undefined}>
+                    {relationshipSummary(candidate)}
+                  </span>
                   <span className="text-muted-foreground">Keys</span>
                   <span className="font-mono">
                     {qualifiedColumns('a', oriented!.leftColumns)} = {qualifiedColumns('b', oriented!.rightColumns)}
@@ -526,9 +489,14 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                   <span><span className={cn('rounded px-1.5 py-0.5 font-semibold',
                     cardinalityTone(candidate, oriented!.cardinality))}>
                     {oriented!.cardinality}
-                  </span> — {cardinalityCopy}</span>
-                  <span className="text-muted-foreground">Version</span>
-                  <span>
+                  </span>{candidate.cardinalityReason
+                    ? <span className="ml-1.5 text-muted-foreground">{candidate.cardinalityReason}</span>
+                    : oriented!.cardinality === 'unknown'
+                      ? <span className="ml-1.5 text-muted-foreground">Not measured</span>
+                      : null}</span>
+                  {showVersionChoice && <>
+                    <span className="text-muted-foreground">Version</span>
+                    <span>
                     <select aria-label="Related dataset version"
                       value={requestedRevisionId}
                       disabled={loadingRevisions || revising || !revisions}
@@ -552,19 +520,17 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                         className="ml-2 h-7" disabled={revising}
                         onClick={() => void selectRevision(requestedRevisionId)}>Retry selected version</Button>}
                     </span>}
-                  </span>
+                    </span>
+                  </>}
                   <span className="text-muted-foreground">Join type</span>
                   <select aria-label="Join type" value={how} onChange={(event) => setHow(event.target.value as typeof how)}
                     className="h-7 rounded border border-border bg-background px-2">
                     {['inner', 'left', 'right', 'outer'].map((item) => <option key={item}>{item}</option>)}
                   </select>
-                  <span className="text-muted-foreground">Join behavior</span>
-                  <span data-testid="related-join-behavior">
-                    {joinTypeMeaning(how, leftReview!.name, rightReview!.name)}
-                  </span>
                 </div>
                 <details className="text-[10px] text-muted-foreground">
                   <summary>Details</summary>
+                  <div className="mt-1">Evidence detail: {candidate.reason}</div>
                   <div className="mt-1 break-all font-mono">
                     Selected binding: {sourceFallback}<br />
                     Related binding: {candidateIdentity}
@@ -588,7 +554,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
             <Button type="button" variant="ghost" disabled={confirming} onClick={close}>Cancel</Button>
             {candidate && <Button type="button" data-testid="confirm-related-join" disabled={confirming || revising || exactRevisionPending}
               onClick={() => void confirm()}>
-              {confirming ? 'Confirming…' : 'Confirm graph edit'}
+              {confirming ? 'Adding…' : 'Add Join'}
             </Button>}
           </div>
         </div>
@@ -620,39 +586,31 @@ function CandidateGroup({ title, description, candidates, swapInputs, onSelect }
           )}>
           <span className="min-w-0">
             {possibleKeyMatch && <span className="mb-1 inline-block rounded bg-muted px-1.5 py-0.5 text-[9.5px] font-semibold text-muted-foreground">
-              Possible key match
+              Suggested
             </span>}
             <span className="block truncate text-xs font-semibold text-foreground">{candidate.name}</span>
-            <span className="block text-[10.5px] text-muted-foreground">{candidate.reason}</span>
             <span className="block truncate font-mono text-[10px] text-muted-foreground">
               {qualifiedColumns('a', oriented.leftColumns)} = {qualifiedColumns('b', oriented.rightColumns)}
             </span>
-            <span className="block text-[10px] text-muted-foreground">{EVIDENCE_LABEL[candidate.evidence]} · Inner join</span>
-            {possibleKeyMatch && <span className="block text-[10px] font-medium text-muted-foreground">
-              No relationship is declared.
-            </span>}
             <span className="block text-[10px] text-muted-foreground">
-              {cardinalityDescription(oriented.cardinality, candidate.cardinalityReason)}
+              {possibleKeyMatch ? 'Matching column names' : EVIDENCE_LABEL[candidate.evidence]}
             </span>
           </span>
           <span className={cn('self-center rounded px-1.5 py-0.5 text-[9.5px] font-semibold',
-            cardinalityTone(candidate, oriented.cardinality))}>{oriented.cardinality}</span>
+            cardinalityTone(candidate, oriented.cardinality))}
+            title={candidate.cardinalityReason ?? undefined}>{oriented.cardinality}</span>
         </button>
       })}
     </div>
   </section>
 }
 
-function ReviewIdentity({ label, name, role }: {
+function ReviewIdentity({ label, name }: {
   label: string
   name: string
-  role: string
 }) {
   return <div className="grid grid-cols-[120px_1fr] gap-2">
     <span className="text-muted-foreground">{label}</span>
-    <span>
-      <strong>{name}</strong>
-      <span className="ml-1.5 text-[9.5px] text-muted-foreground">{role}</span>
-    </span>
+    <strong>{name}</strong>
   </div>
 }
