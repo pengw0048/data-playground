@@ -175,6 +175,14 @@ def test_kernel_pytest_shards_form_an_exact_complement_partition() -> None:
         shard: tuple(step["env"][variable].split())
         for shard, variable in _KERNEL_SHARD_ENV.items()
     }
+    # The measured rebalance in #1033 deliberately moves only these independent files into the
+    # short lifecycle shard. Keep their placement explicit so a later list edit cannot silently
+    # undo the experiment while the catch-all complement still looks complete.
+    assert {
+        "test_local_result_lifecycle.py",
+        "test_distribution_reports.py",
+    } <= set(explicit_groups["lifecycle"])
+    assert "test_local_result_lifecycle.py" not in set(explicit_groups["remainder-1"])
     explicit_names = [
         name for group in explicit_groups.values() for name in group
     ]

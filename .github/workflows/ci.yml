@@ -73,6 +73,8 @@ jobs:
             test_ray_jobs.py
             test_object_lifecycle.py
             test_catalog_scale.py
+            test_local_result_lifecycle.py
+            test_distribution_reports.py
           GROUP_0_FILES: >-
             test_api_contract.py
             test_backend_source_pins.py
@@ -115,7 +117,6 @@ jobs:
             test_lineage_execution.py
             test_linear_checkpoint_admission.py
             test_linear_checkpoint_tasks.py
-            test_local_result_lifecycle.py
             test_managed_local_file_revisions.py
             test_managed_source_e2e.py
             test_managed_source_lifecycle.py
