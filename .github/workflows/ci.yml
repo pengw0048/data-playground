@@ -382,6 +382,9 @@ jobs:
     timeout-minutes: 25  # cap billed minutes (the ~17-min job) so a hang can't drain the budget
     env:
       CI: "true"
+      # The reporter and webServer wrapper append durable, machine-readable events here. The
+      # summary step runs even when Playwright fails, so a failed/retried run remains attributable.
+      DP_E2E_TIMINGS_FILE: ${{ github.workspace }}/web/e2e-timings/events.jsonl
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -390,15 +393,23 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
+      - name: Initialize E2E timing artifact
+        run: node web/scripts/e2e-timing.mjs init
       # web FIRST: the kernel wheel force-includes ../web/dist as kernel/_web, so the SPA must be
       # built before `uv sync` or hatchling errors ("Forced include not found").
       - name: Install web deps
-        run: cd web && npm install
+        run: >-
+          node web/scripts/e2e-timing.mjs phase install-web-deps --
+          bash -c 'cd web && npm install'
       - name: Build SPA
-        run: cd web && npm run build
+        run: >-
+          node web/scripts/e2e-timing.mjs phase build-spa --
+          bash -c 'cd web && npm run build'
       # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
       - name: Install kernel
-        run: cd kernel && uv sync --extra dev
+        run: >-
+          node web/scripts/e2e-timing.mjs phase install-kernel --
+          bash -c 'cd kernel && uv sync --extra dev'
       # Cache the browser binary and skip --with-deps: the ubuntu-latest image already ships
       # Chromium's shared libraries, so only the ~120MB download is worth avoiding on a cache hit.
       - name: Resolve Playwright version
@@ -410,11 +421,29 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
       - name: Install Playwright browser
-        run: cd web && npx playwright install chromium
+        run: >-
+          node web/scripts/e2e-timing.mjs phase install-playwright-browser --
+          bash -c 'cd web && npx playwright install chromium'
+      - name: Test E2E timing aggregation
+        run: cd web && npm run test:e2e-timing
       # The Playwright project DAG runs the tagged researcher smoke first, the remaining Chromium
       # suite second, and the minimum-viewport project last, without executing smoke fixtures twice.
       - name: Run E2E (UX smoke first)
-        run: cd web && npm run e2e
+        run: >-
+          node web/scripts/e2e-timing.mjs phase playwright-run --
+          bash -c 'cd web && npm run e2e'
+      - name: Summarize E2E timings
+        if: always()
+        run: |
+          node web/scripts/e2e-timing.mjs render web/e2e-timings/summary.md
+          cat web/e2e-timings/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload E2E timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-timings
+          path: web/e2e-timings/
+          retention-days: 30
       - name: Upload report on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
