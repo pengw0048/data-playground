@@ -1033,6 +1033,33 @@ describe('durable full results', () => {
     expect(requestRun).toHaveBeenCalledWith('target')
   })
 
+  it('retries an actionable Preview sample in the bounded preview slot without starting a full run', async () => {
+    const requestRun = vi.fn()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { uri: 'events' }, history: [] },
+    }] }
+    apiMock.preview.mockResolvedValueOnce(sample(0, 2, false))
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        notPreviewable: true, suggestedAction: 'run',
+        reason: 'Preview input needs to be retried.',
+      }) },
+      runs: {}, canvasRole: 'owner', requestRun,
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Run this step' }))
+
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledWith(doc, 'target', 50, 0, undefined))
+    expect(await screen.findByText('rows 1–2')).toBeInTheDocument()
+    expect(requestRun).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.target).toBeUndefined()
+  })
+
   it('does not treat a retained-result transport failure as definitive absence', async () => {
     apiMock.retainedResult.mockRejectedValueOnce(new TypeError('network unavailable'))
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
