@@ -71,6 +71,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   useEffect(() => { updateNodeInternals(id) }, [id, outSig, updateNodeInternals])
 
   const kind = node?.type ?? 'transform'
+  const libraryTransform = kind === 'transform' && data.config.source === 'library'
   const accent = kindAccent[kind] ?? '#8a8f98'
   const st = statusTok[data.status] ?? statusTok.draft
   const bypassed = !!data.bypassed
@@ -230,7 +231,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
             />
           )}
           <ActionIcon name="clock" label="Output versions" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
-          {hasCode && <ActionIcon name="code" label={canEdit ? 'Edit code' : 'View code'} onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')} />}
+          {hasCode && <ActionIcon
+            name={libraryTransform ? 'fx' : 'code'}
+            label={libraryTransform ? 'View processor definition' : canEdit ? 'Edit code' : 'View code'}
+            onClick={() => openCodeFullscreen(id, kind === 'sql' ? 'sql' : 'code', kind === 'sql' ? 'sql' : 'python')}
+          />}
           <MoreMenu id={id} kind={kind} canEdit={canEdit} disabled={disabled} bypassed={bypassed} />
         </div>
       )}

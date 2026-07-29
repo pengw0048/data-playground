@@ -40,6 +40,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     emptyState?: ReactNode
     allowStats?: boolean
     resultContext?: 'example-rows'
+    testTarget?: 'code' | 'transform'
   }
 }) {
   const preview = useStore((s) => (
@@ -256,10 +257,13 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
     const failureNode = doc.nodes.find((candidate) => candidate.id === failureNodeId)
+    const immutableProcessor = failureNode?.type === 'transform'
+      && failureNode.data.config.source === 'library'
     const canEditFailure = canEdit && failureNode?.type === 'transform'
-      && failureNode.data.config.source !== 'library'
+      && !immutableProcessor
     return withOutputPorts(<UserCodeFailure failure={res.userCodeException}
       exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
+      immutableProcessor={immutableProcessor}
       onEdit={canEditFailure
         ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
         : undefined} />)
@@ -300,10 +304,11 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
     }
     if (editorPreview) {
+      const testTarget = editorPreview.testTarget ?? 'code'
       return withOutputPorts(<NotPreviewable
         title={editorPreview.onRunUpstream
-          ? 'Run upstream to test this code'
-          : 'Input needed to test this code'}
+          ? `Run upstream to test this ${testTarget}`
+          : `Input needed to test this ${testTarget}`}
         reason={res.reason ?? 'A current upstream result is not available.'}
         onRun={editorPreview.onRunUpstream}
         runLabel="Run upstream"
@@ -1237,11 +1242,12 @@ function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel, retry
 
 
 function UserCodeFailure({
-  failure, onEdit, exampleRowsTest = false,
+  failure, onEdit, exampleRowsTest = false, immutableProcessor = false,
 }: {
   failure: NonNullable<SampleResult['userCodeException']>
   onEdit?: () => void
   exampleRowsTest?: boolean
+  immutableProcessor?: boolean
 }) {
   const location = failure.nodeTitle || failure.nodeId
   return (
@@ -1250,7 +1256,9 @@ function UserCodeFailure({
         <Icon name="code" size={18} />
       </div>
       <div className="text-[13px] font-semibold text-destructive">
-        Your Python transform raised an exception
+        {immutableProcessor
+          ? 'Library processor raised an exception'
+          : 'Your Python transform raised an exception'}
       </div>
       {location && <div className="mt-1 text-[11px]">Transform: {location}</div>}
       <div className="dp-mono mx-auto mt-2 max-w-[420px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">
@@ -1270,7 +1278,9 @@ function UserCodeFailure({
         </div>
       )}
       <div className="mx-auto mt-2 max-w-[380px] text-[11px]">
-        {exampleRowsTest
+        {immutableProcessor
+          ? 'Review the processor requirements and Canvas parameters, then adjust its input or configuration before testing again.'
+          : exampleRowsTest
           ? 'Edit the transform code or example rows, then test again.'
           : 'Edit the transform code or handle this input value before previewing again.'}
       </div>
