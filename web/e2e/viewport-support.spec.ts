@@ -456,6 +456,13 @@ test.describe('minimum viewport support', () => {
     for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Show Inspector']) {
       await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `1024px Canvas ${name}`)
     }
+    await page.getByTestId('app-menu').click()
+    const appMenu = page.getByRole('menu', { name: 'App menu' })
+    await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
+    for (const detail of ['runs and background tasks', 'my background task results', 'runs from this Canvas']) {
+      await expect(appMenu.getByText(detail, { exact: true })).toBeVisible()
+    }
+    await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Show Inspector', exact: true }).click()
     await expect.poll(() => viewControls.getByText('Fit view', { exact: true }).count()).toBe(0)
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector expanded)')
