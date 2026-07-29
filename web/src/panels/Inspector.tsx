@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  currentPreviews, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
+  currentPreviews, parameterBindingsIdentity, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -10,7 +10,7 @@ import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
 import { UpsertControl } from '../components/UpsertControl'
@@ -34,6 +34,11 @@ export const INSPECTOR_COLLAPSED_W = 44
 // physically typeable without one, but its row-reference provenance is unknown unless declared.
 // Other contract-capable kinds must be backend-registered plugins, not merely unknown node names.
 const CONTRACT_KINDS = new Set(['transform', 'vector-search', 'sql'])
+const RETAINED_PREVIEW_FALLBACK_CODES = new Set([
+  'retained_upstream_unavailable',
+  'retained_upstream_stale',
+  'retained_upstream_expired',
+])
 export const canDeclareSchemaKind = (kind: string) => (
   CONTRACT_KINDS.has(kind) || getSpec(kind)?.source?.startsWith('plugin:') === true
 )
@@ -1186,20 +1191,50 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
     setBusy(true); setErr(null)
     const doc = useStore.getState().doc
     const planIdentity = previewPlanIdentity(doc, nodeId)
+    const parameterBindings = useStore.getState().runs[nodeId]?.parameterBindings ?? []
+    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
     const requestGeneration = ++inferRequestGeneration.current
+    const current = () => (
+      inferRequestGeneration.current === requestGeneration
+      && previewPlanIdentity(useStore.getState().doc, nodeId) === planIdentity
+      && parameterBindingsIdentity(useStore.getState().runs[nodeId]?.parameterBindings) === parameterIdentity
+    )
+    const changedMessage = 'The graph or parameter bindings changed while the sample was loading. Infer again for the current inputs.'
     try {
-      const res = await api.preview(doc, nodeId, 50, 0)
-      if (inferRequestGeneration.current !== requestGeneration
-          || previewPlanIdentity(useStore.getState().doc, nodeId) !== planIdentity) {
-        setErr('The graph changed while the sample was loading. Infer again for the current graph.')
+      let res: Awaited<ReturnType<typeof api.preview>>
+      if (doc.nodes.find((candidate) => candidate.id === nodeId)?.type === 'transform') {
+        try {
+          res = await api.retainedEditorPreview(
+            doc, nodeId, 50, 0, undefined, parameterBindings,
+          )
+        } catch (e) {
+          if (!(e instanceof KernelError) || !e.code
+              || !RETAINED_PREVIEW_FALLBACK_CODES.has(e.code)) throw e
+          if (inferRequestGeneration.current !== requestGeneration) return
+          if (!current()) {
+            setErr(changedMessage)
+            return
+          }
+          res = await api.preview(
+            doc, nodeId, 50, 0, undefined, undefined, parameterBindings,
+          )
+        }
+      } else {
+        res = await api.preview(
+          doc, nodeId, 50, 0, undefined, undefined, parameterBindings,
+        )
+      }
+      if (inferRequestGeneration.current !== requestGeneration) return
+      if (!current()) {
+        setErr(changedMessage)
       } else if (res.error || res.notPreviewable) setErr(res.reason || 'could not infer — run needs a full pass')
       else if (res.columns?.length) commit(res.columns as ColumnSchema[], 'inferred')
       else setErr('no columns produced on the sample')
     } catch (e) {
       if (inferRequestGeneration.current === requestGeneration) {
-        setErr(previewPlanIdentity(useStore.getState().doc, nodeId) === planIdentity
+        setErr(current()
           ? e instanceof Error ? e.message : 'infer failed'
-          : 'The graph changed while the sample was loading. Infer again for the current graph.')
+          : changedMessage)
       }
     } finally {
       if (inferRequestGeneration.current === requestGeneration) setBusy(false)
