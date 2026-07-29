@@ -1430,7 +1430,7 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
-  it('surfaces invalid_graph refusals from execution and graph-metadata endpoints', async () => {
+  it('surfaces invalid_graph refusals from execution and size-metadata endpoints', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }
     const target = NODE('target', 'filter')
@@ -1446,7 +1446,6 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
 
     useStore.setState({ toasts: [] })
-    apiMocks.schema.mockRejectedValue(refusal)
     apiMocks.graphSizes.mockRejectedValue(refusal)
     await useStore.getState().refreshSchemas()
     expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
@@ -1491,7 +1490,6 @@ describe('graph store — core authority ops', () => {
   it('preserves an aggregated refusal when another structural error is present', async () => {
     const message = "invalid graph: edge 'e' references missing source node 'gone'; Join node 'j' requires exactly one incoming edge on input 'b'"
     const refusal = new KernelError(400, message, 'invalid_graph')
-    apiMocks.schema.mockRejectedValue(refusal)
     apiMocks.graphSizes.mockRejectedValue(refusal)
 
     await useStore.getState().refreshSchemas()
@@ -1502,7 +1500,6 @@ describe('graph store — core authority ops', () => {
   it('does not reinterpret a CustomJoin refusal as the built-in Join contract', async () => {
     const message = "invalid graph: CustomJoin node 'custom-1' requires exactly one incoming edge on input 'b'"
     const refusal = new KernelError(400, message, 'invalid_graph')
-    apiMocks.schema.mockRejectedValue(refusal)
     apiMocks.graphSizes.mockRejectedValue(refusal)
 
     await useStore.getState().refreshSchemas()

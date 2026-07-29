@@ -128,7 +128,7 @@ def test_join_keys_and_explicit_advanced_condition_remain_valid(config: dict):
     assert graph_mod.join_condition_errors(graph, "join") == []
 
 
-def test_execution_ingresses_reject_a_join_without_a_match_condition():
+def test_execution_and_plan_ingresses_reject_a_join_without_a_match_condition():
     graph = {
         "id": "join-condition-validation", "version": 1,
         "nodes": [
@@ -147,7 +147,6 @@ def test_execution_ingresses_reject_a_join_without_a_match_condition():
 
     requests = [
         ("/api/run/preview", {"graph": graph, "nodeId": "join"}),
-        ("/api/graph/estimate", {"graph": graph, "targetNodeId": "join"}),
         ("/api/graph/plan", {"graph": graph, "targetNodeId": "join"}),
         ("/api/run/estimate", {"graph": graph, "targetNodeId": "join"}),
         ("/api/run", {"graph": graph, "targetNodeId": "join", "confirmed": True}),
@@ -158,7 +157,7 @@ def test_execution_ingresses_reject_a_join_without_a_match_condition():
         assert "needs at least one left and right column" in response.text
 
 
-def test_schema_inspection_allows_finishing_an_incomplete_join():
+def test_background_graph_metadata_allows_finishing_an_incomplete_join():
     graph = {
         "id": "join-condition-schema", "version": 1,
         "nodes": [
@@ -172,11 +171,18 @@ def test_schema_inspection_allows_finishing_an_incomplete_join():
         ],
     }
 
-    response = client.post("/api/graph/schema", json={"graph": graph})
+    schema = client.post("/api/graph/schema", json={"graph": graph})
+    sizes = client.post("/api/graph/estimate", json={"graph": graph})
 
-    assert response.status_code == 200, response.text
-    assert response.json()["left"]["out"]
-    assert response.json()["right"]["out"]
+    assert schema.status_code == 200, schema.text
+    assert schema.json()["left"]["out"]
+    assert schema.json()["right"]["out"]
+    assert sizes.status_code == 200, sizes.text
+    assert sizes.json()["left"]["rows"] > 0
+    assert sizes.json()["left"]["confidence"] == "exact"
+    assert sizes.json()["right"]["rows"] > 0
+    assert sizes.json()["right"]["confidence"] == "exact"
+    assert sizes.json()["join"] == {"rows": None, "confidence": "unknown"}
 
 
 @pytest.mark.parametrize(("config", "message"), [

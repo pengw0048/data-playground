@@ -25,7 +25,7 @@ async function unregister(request: APIRequestContext, table: Table) {
 }
 
 test.describe('Join key builder', () => {
-  test('rerun all refuses a Join with no configured match condition', async ({ page }) => {
+  test('reopens an unconfigured Join quietly while rerun all still refuses it', async ({ page }) => {
     const canvasId = `join-missing-condition-${Date.now()}`
     try {
       const created = await page.request.post('/api/canvas', { data: {
@@ -42,16 +42,36 @@ test.describe('Join key builder', () => {
       } })
       expect(created.ok()).toBeTruthy()
 
+      const graphEstimate = () => page.waitForResponse((response) => (
+        new URL(response.url()).pathname === '/api/graph/estimate'
+        && response.request().method() === 'POST'
+        && response.request().postData()?.includes(canvasId) === true
+      ))
+      const firstEstimate = graphEstimate()
       await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      const firstEstimateResponse = await firstEstimate
+      expect(firstEstimateResponse.ok(), await firstEstimateResponse.text()).toBeTruthy()
       await expect(page.getByTestId('join-missing-condition')).toHaveText('Choose at least one left and right column.')
+      const rawRefusal = page.getByTestId('toast').filter({
+        hasText: 'needs at least one left and right column or an advanced condition',
+      })
+      await expect(rawRefusal).toHaveCount(0)
+
+      const reloadEstimate = graphEstimate()
+      await page.reload()
+      const reloadEstimateResponse = await reloadEstimate
+      expect(reloadEstimateResponse.ok(), await reloadEstimateResponse.text()).toBeTruthy()
+      await expect(page.getByTestId('join-missing-condition')).toHaveText('Choose at least one left and right column.')
+      await expect(rawRefusal).toHaveCount(0)
+
       const dispatched = page.waitForRequest((request) => {
         const path = new URL(request.url()).pathname
         return request.method() === 'POST' && (path === '/api/run' || path === '/api/run/estimate')
       }, { timeout: 750 }).then(() => true).catch(() => false)
       const feedback = page.getByTestId('toast').filter({ hasText: 'Choose at least one left and right column.' })
-      const feedbackBeforeClick = await feedback.count()
+      await expect(feedback).toHaveCount(0)
       await page.getByRole('button', { name: 'Rerun all' }).click()
-      await expect(feedback).toHaveCount(feedbackBeforeClick + 1)
+      await expect(feedback).toHaveCount(1)
       expect(await dispatched).toBe(false)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)

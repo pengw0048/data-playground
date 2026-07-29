@@ -2375,10 +2375,12 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
     deps = get_deps()
     req.graph = _resolve_parameters(
         req.graph, req.parameter_bindings, req.target_node_id, deps)
-    _reject_invalid(req.graph, deps, req.target_node_id)
+    _reject_invalid(
+        req.graph, deps, req.target_node_id, enforce_join_condition=False)
     graph = _target_execution_graph(req.graph, req.target_node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
-    _reject_invalid(graph, deps, req.target_node_id)
+    _reject_invalid(
+        graph, deps, req.target_node_id, enforce_join_condition=False)
     try:
         sizes = estimate_sizes(
             graph, deps.resolve_adapter, actuals=_actuals_for(graph, deps),
