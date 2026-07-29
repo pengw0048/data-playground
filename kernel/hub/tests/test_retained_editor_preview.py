@@ -107,6 +107,116 @@ def _wait_for_history_projection(run_id: str) -> None:
     pytest.fail(f"run {run_id} did not reach projected history")
 
 
+def _transform_join_graph(canvas_id: str) -> dict:
+    events = get_deps().catalog.get_table("tbl_events")
+    events_uri = events.uri
+    return {
+        "id": canvas_id,
+        "name": "Retained Transform schema",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "left",
+                "type": "source",
+                "position": {"x": 0, "y": 0},
+                "data": {"title": "Left events", "config": {
+                    "uri": events_uri, "registrationId": events.registration_id,
+                }},
+            },
+            {
+                "id": "transform",
+                "type": "transform",
+                "position": {"x": 200, "y": 0},
+                "data": {"title": "Derived amount", "config": {
+                    "source": "adhoc", "mode": "map", "onError": "raise",
+                    "code": "def fn(row):\n    return {**row, 'amount_doubled': row['amount'] * 2}",
+                }},
+            },
+            {
+                "id": "right",
+                "type": "source",
+                "position": {"x": 200, "y": 220},
+                "data": {"title": "Right events", "config": {
+                    "uri": events_uri, "registrationId": events.registration_id,
+                }},
+            },
+            {
+                "id": "join",
+                "type": "join",
+                "position": {"x": 440, "y": 80},
+                "data": {"title": "Join", "config": {"how": "inner", "on": "user_id"}},
+            },
+        ],
+        "edges": [
+            {"id": "left-transform", "source": "left", "sourceHandle": "out",
+             "target": "transform", "targetHandle": "in", "data": {"wire": "dataset"}},
+            {"id": "transform-join", "source": "transform", "sourceHandle": "out",
+             "target": "join", "targetHandle": "a", "data": {"wire": "dataset"}},
+            {"id": "right-join", "source": "right", "sourceHandle": "out",
+             "target": "join", "targetHandle": "b", "data": {"wire": "dataset"}},
+        ],
+    }
+
+
+def test_current_retained_transform_result_propagates_schema_and_invalidates():
+    canvas_id = f"retained-transform-schema-{uuid.uuid4().hex}"
+    graph = _transform_join_graph(canvas_id)
+    created = client.post("/api/canvas", json=graph)
+    assert created.status_code == 200, created.text
+    try:
+        before = client.post("/api/graph/schema", json={"graph": graph})
+        assert before.status_code == 200, before.text
+        assert before.json()["transform"]["out"] is None
+        assert before.json()["join"]["out"] is None
+
+        started = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": "transform", "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done", status
+        _wait_for_history_projection(status["runId"])
+
+        current = client.post("/api/graph/schema", json={"graph": graph})
+        assert current.status_code == 200, current.text
+        current_schema = current.json()
+        transform_columns = [column["name"] for column in current_schema["transform"]["out"]]
+        assert transform_columns == ["id", "user_id", "event", "amount", "amount_doubled"]
+        assert "amount_doubled" in [column["name"] for column in current_schema["join"]["out"]]
+
+        # A fresh schema request models Canvas reload: evidence is retained in the run/result
+        # contract, not in a client preview or a mutation of the saved graph.
+        reloaded = client.post("/api/graph/schema", json={"graph": graph})
+        assert reloaded.status_code == 200, reloaded.text
+        assert reloaded.json()["transform"]["out"] == current_schema["transform"]["out"]
+
+        for field, value in (
+            ("code", "def fn(row):\n    return {**row, 'amount_tripled': row['amount'] * 3}"),
+            ("mode", "filter"),
+            ("onError", "drop"),
+        ):
+            changed = copy.deepcopy(graph)
+            changed["nodes"][1]["data"]["config"][field] = value
+            response = client.post("/api/graph/schema", json={"graph": changed})
+            assert response.status_code == 200, response.text
+            assert response.json()["transform"]["out"] is None
+            assert response.json()["join"]["out"] is None
+
+        changed_source = copy.deepcopy(graph)
+        images = get_deps().catalog.get_table("tbl_images")
+        changed_source["nodes"][0]["data"]["config"] = {
+            "uri": images.uri, "registrationId": images.registration_id,
+        }
+        response = client.post("/api/graph/schema", json={"graph": changed_source})
+        assert response.status_code == 200, response.text
+        assert response.json()["transform"]["out"] is None
+        assert response.json()["join"]["out"] is None
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+
+
 @contextmanager
 def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     lance = pytest.importorskip("lance")

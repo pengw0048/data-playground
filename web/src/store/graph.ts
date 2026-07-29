@@ -5183,6 +5183,10 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
             currentOutputVersionId: version.id,
           })
         }
+        // A successful full run may have just created retained Transform output evidence. Its
+        // schema is server-owned and current-plan verified, so refresh the ordinary propagation
+        // map rather than trying to infer columns from a UI preview.
+        void g.refreshSchemas()
         void g.refreshCatalog()
       }
       stopPolling()

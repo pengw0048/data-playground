@@ -2309,7 +2309,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
 @router.post("/graph/schema", response_model=GraphSchema)
 def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> GraphSchema:
     """Per-node, per-output-port metadata columns for editor inspection and suggestions."""
-    _require_graph_read_access(req.graph, uid)
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     req.graph = _resolve_parameters(
         req.graph, req.parameter_bindings, req.target_node_id, deps)
@@ -2324,7 +2324,15 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> Graph
             graph, req.target_node_id, req.input_manifest, deps)
         _reject_invalid(graph, deps, req.target_node_id)
     try:
-        return schema_for_graph_ports(graph, deps.resolve_adapter, deps.registry,
+        # Dynamic Python output stays unknown until a committed full run proves it.  Reuse the
+        # retained-result contract to attach that proof only while the exact current target cone
+        # still matches; the transient declaration then flows through the ordinary schema engine.
+        # It is deliberately not written back to the Canvas config (a run result is evidence, not a
+        # user-declared contract), and Join consumes no special endpoint or client-side guess.
+        canvas_id = authorized_canvas or str(getattr(graph, "id", "") or "")
+        schema_graph = _graph_with_current_retained_transform_schemas(
+            graph, canvas_id, uid, deps)
+        return schema_for_graph_ports(schema_graph, deps.resolve_adapter, deps.registry,
                                       deps.node_builders, deps.node_specs, storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
@@ -4170,6 +4178,62 @@ def _retained_editor_output(
         candidate: dict, upstream, current_cone: Graph, deps) -> RunOutput:
     """Prove one server-selected retained candidate matches the current upstream cone."""
     return _retained_current_output(candidate, upstream, current_cone, deps)
+
+
+def _graph_with_current_retained_transform_schemas(
+        graph: Graph, canvas_id: str, uid: str, deps) -> Graph:
+    """Overlay current retained Python-result schemas for one metadata-only graph inspection.
+
+    A retained artifact is evidence only after ``_retained_current_output`` proves the exact
+    execution manifest still matches the node's present target cone.  This covers code, mode,
+    upstream identity, and every schema-relevant config field without copying a second freshness
+    rule into schema propagation.  Failed, missing, stale, or unreadable artifacts remain unknown.
+    """
+    if not canvas_id:
+        return graph
+    enriched = graph.model_copy(deep=True)
+    for node in enriched.nodes:
+        if node.type != "transform":
+            continue
+        candidates = metadb.retained_run_output_candidates(canvas_id, node.id, "out")
+        if not candidates:
+            continue
+        current_cone = _target_execution_graph(graph, node.id)
+        for candidate in candidates:
+            run_id = str(candidate["run_id"])
+            if not _run_read_access(run_id, uid):
+                continue
+            try:
+                output = _retained_current_output(candidate, node, current_cone, deps)
+                uri = output.uri or ""
+                with source_read_scope(
+                        deps.storage, [uri],
+                        owner=f"schema-retained:{run_id}:{uuid.uuid4().hex}"):
+                    member = _object_attempt_member(uri)
+                    target_uri = member[0] if member is not None else uri
+                    if member is not None and output.rows is not None and member[2] != output.rows:
+                        continue
+                    raw_schema = deps.resolve_adapter(target_uri).schema(target_uri)
+                    columns = [ColumnSchema.model_validate(column) for column in raw_schema]
+            except (APIError, FileNotFoundError, ManagedSourceReadError, PermissionError, ValueError):
+                continue
+            except Exception:  # noqa: BLE001 - retained evidence must fail closed to unknown
+                continue
+            if not columns:
+                # An empty output still has an Arrow/Parquet schema. Treat a provider that cannot
+                # supply it as unknown instead of asserting a zero-column contract.
+                continue
+            config = node.data.get("config", {}) if isinstance(node.data, dict) else None
+            if not isinstance(config, dict):
+                continue
+            config["outputSchema"] = [
+                column.model_dump(by_alias=True, mode="json") for column in columns
+            ]
+            # This is observed output, not a manually pinned declaration. A stale declaration hash
+            # must not weaken the exact retained-result proof above.
+            config.pop("outputSchemaCodeHash", None)
+            break
+    return enriched
 
 
 def _retained_editor_graph(
