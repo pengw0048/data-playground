@@ -1160,6 +1160,7 @@ interface Store {
   }) => CanvasNode | null
   setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
+  replaceSourceBinding: (id: string, title: string, config: NodeConfig) => void
   setNumericParamDraft: (id: string, param: string, text: string | undefined) => void
   updateData: (id: string, patch: Partial<NodeData>) => void
   removeNode: (id: string) => void
@@ -1595,6 +1596,93 @@ async function superviseTrackedProfileCancellation(
   })
 }
 
+function mutateNodeConfig(
+  get: () => Store,
+  set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
+  id: string,
+  config: NodeConfig,
+  replacementTitle?: string,
+) {
+  if (!roleCanEdit(get().canvasRole)) return
+  // A metadata request launched for the previous configuration must not repopulate the size or
+  // schema we clear below while the debounced refresh for this edit is still waiting to start.
+  _schemaSeq += 1
+  if (replacementTitle !== undefined) {
+    // Choosing a dataset is one user action. Keep the binding and visible title in one history
+    // checkpoint so Undo can never expose a new binding under the previous dataset name.
+    get().commit()
+    _cfgEdit = { id: '', t: 0 }
+  } else {
+    // Coalesced undo checkpoint: one per editing burst (new node, or >700ms idle) so a param
+    // edit is its own undo step instead of discarding an unrelated earlier change.
+    const now = performance.now()
+    if (_cfgEdit.id !== id || now - _cfgEdit.t > 700) get().commit()
+    _cfgEdit = { id, t: now }
+  }
+  set((s) => {
+    const stale = downstream(s.doc, id)
+    const nodes: CanvasNode[] = s.doc.nodes.map((n) => {
+      if (n.id === id) {
+        const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
+        return {
+          ...n,
+          data: {
+            ...n.data,
+            ...(replacementTitle !== undefined ? { title: replacementTitle } : {}),
+            config: replacementTitle !== undefined ? { ...config } : { ...n.data.config, ...config },
+            status,
+          },
+        }
+      }
+      if (stale.has(n.id) && n.data.status === 'latest') {
+        return { ...n, data: { ...n.data, status: 'stale' } }
+      }
+      return n
+    })
+    // If this edit shrinks/renames the node's declared output ports, drop edges leaving a port
+    // that no longer exists. When a previously single-output Section becomes multi-output, bind an
+    // old implicit edge to that exact former port; never leave a missing sourceHandle that the new
+    // graph contract would reject or guess on the backend.
+    let edges = s.doc.edges
+    const previousNode = s.doc.nodes.find((node) => node.id === id)
+    const editedNode = nodes.find((node) => node.id === id)
+    if (editedNode?.type === 'section' && Array.isArray(config.outputs)) {
+      const ports = new Set(nodeOutputs(editedNode).map((port) => port.id))
+      const previousPorts = previousNode ? nodeOutputs(previousNode) : []
+      edges = edges.flatMap((edge) => {
+        if (edge.source !== id) return [edge]
+        const priorPortId = edge.sourceHandle
+          ?? (previousPorts.length === 1 ? previousPorts[0].id : undefined)
+        return priorPortId && ports.has(priorPortId)
+          ? [{ ...edge, sourceHandle: priorPortId }]
+          : []
+      })
+    }
+    const runs = invalidateWriteAdmissions(
+      s.doc, s.runs, [id, ...stale],
+    )
+    const sizes = Object.fromEntries(
+      Object.entries(s.sizes).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
+    )
+    // A Source picker registration changes the durable catalog identity even when its URI stays
+    // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
+    // the next Run re-estimates against the new registration instead of caching the old refusal.
+    for (const nodeId of [id, ...stale]) {
+      const current = runs[nodeId]
+      if (current?.phase !== 'running'
+          && current?.estimate?.exactRunReadiness?.ready === false) {
+        runs[nodeId] = {
+          ...current,
+          phase: 'idle',
+          estimate: undefined,
+          error: undefined,
+        }
+      }
+    }
+    return { doc: { ...s.doc, nodes, edges }, runs, sizes }
+  })
+}
+
 export const useStore = create<Store>((set, get) => ({
   doc: emptyDoc(),
   canvasRole: null,
@@ -1868,71 +1956,11 @@ export const useStore = create<Store>((set, get) => ({
     return node
   },
 
-  updateConfig: (id, patch) => {
-    if (!roleCanEdit(get().canvasRole)) return
-    // A metadata request launched for the previous configuration must not repopulate the size or
-    // schema we clear below while the debounced refresh for this edit is still waiting to start.
-    _schemaSeq += 1
-    // coalesced undo checkpoint: one per editing burst (new node, or >700ms idle) so a param
-    // edit is its own undo step instead of discarding an unrelated earlier change.
-    const now = performance.now()
-    if (_cfgEdit.id !== id || now - _cfgEdit.t > 700) get().commit()
-    _cfgEdit = { id, t: now }
-    set((s) => {
-      const stale = downstream(s.doc, id)
-      const nodes: CanvasNode[] = s.doc.nodes.map((n) => {
-        if (n.id === id) {
-          const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
-          return { ...n, data: { ...n.data, config: { ...n.data.config, ...patch }, status } }
-        }
-        if (stale.has(n.id) && n.data.status === 'latest') {
-          return { ...n, data: { ...n.data, status: 'stale' } }
-        }
-        return n
-      })
-      // If this edit shrinks/renames the node's declared output ports, drop edges leaving a port
-      // that no longer exists. When a previously single-output Section becomes multi-output, bind an
-      // old implicit edge to that exact former port; never leave a missing sourceHandle that the new
-      // graph contract would reject or guess on the backend.
-      let edges = s.doc.edges
-      const previousNode = s.doc.nodes.find((node) => node.id === id)
-      const editedNode = nodes.find((node) => node.id === id)
-      if (editedNode?.type === 'section' && Array.isArray(patch.outputs)) {
-        const ports = new Set(nodeOutputs(editedNode).map((port) => port.id))
-        const previousPorts = previousNode ? nodeOutputs(previousNode) : []
-        edges = edges.flatMap((edge) => {
-          if (edge.source !== id) return [edge]
-          const priorPortId = edge.sourceHandle
-            ?? (previousPorts.length === 1 ? previousPorts[0].id : undefined)
-          return priorPortId && ports.has(priorPortId)
-            ? [{ ...edge, sourceHandle: priorPortId }]
-            : []
-        })
-      }
-      const runs = invalidateWriteAdmissions(
-        s.doc, s.runs, [id, ...stale],
-      )
-      const sizes = Object.fromEntries(
-        Object.entries(s.sizes).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
-      )
-      // A Source picker registration changes the durable catalog identity even when its URI stays
-      // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
-      // the next Run re-estimates against the new registration instead of caching the old refusal.
-      for (const nodeId of [id, ...stale]) {
-        const current = runs[nodeId]
-        if (current?.phase !== 'running'
-            && current?.estimate?.exactRunReadiness?.ready === false) {
-          runs[nodeId] = {
-            ...current,
-            phase: 'idle',
-            estimate: undefined,
-            error: undefined,
-          }
-        }
-      }
-      return { doc: { ...s.doc, nodes, edges }, runs, sizes }
-    })
-  },
+  updateConfig: (id, patch) => mutateNodeConfig(get, set, id, patch),
+
+  replaceSourceBinding: (id, title, config) => (
+    mutateNodeConfig(get, set, id, config, title)
+  ),
 
   setNumericParamDraft: (id, param, text) => {
     if (!roleCanEdit(get().canvasRole)) return

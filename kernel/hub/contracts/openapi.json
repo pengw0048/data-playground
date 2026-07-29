@@ -12516,6 +12516,28 @@
         "title": "WorkspaceProviderRelinkResult",
         "type": "object"
       },
+      "WorkspaceProviderSource": {
+        "description": "One Source replacement admitted from an opaque Workspace provider resource.",
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "config"
+        ],
+        "title": "WorkspaceProviderSource",
+        "type": "object"
+      },
       "WorkspaceRenameFolderBody": {
         "additionalProperties": false,
         "properties": {
@@ -28254,6 +28276,88 @@
           }
         },
         "summary": "Relink Workspace Resource"
+      }
+    },
+    "/api/workspace/resources/{resource_id}/source": {
+      "get": {
+        "description": "Admit one selected provider dataset as the canonical Source replacement config.",
+        "operationId": "workspace_provider_source_api_workspace_resources__resource_id__source_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "title": "Resource Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceProviderSource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Workspace Provider Source"
       }
     },
     "/api/workspace/search": {

@@ -2598,7 +2598,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source')
     await page.locator('.react-flow__node').getByRole('button', { name: /Select dataset/ }).click()
-    await page.getByText('Browse files…').click()
+    await page.getByText('Register accessible path / URI…').click()
     await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
     await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
   })
@@ -2707,7 +2707,7 @@ test.describe('Data Playground canvas', () => {
       await runPanel.getByRole('button', { name: 'Close' }).click()
 
       await source.getByRole('button', { name: 'Select dataset' }).click()
-      await page.getByText('Browse files…', { exact: true }).click()
+      await page.getByText('Register accessible path / URI…', { exact: true }).click()
       await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
       const registrationPromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === '/api/catalog/register'

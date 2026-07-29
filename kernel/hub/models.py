@@ -1333,6 +1333,12 @@ class WorkspaceCanonicalDatasetContext(Wire):
         return self
 
 
+class WorkspaceProviderSource(Wire):
+    """One Source replacement admitted from an opaque Workspace provider resource."""
+    name: str = Field(min_length=1, max_length=512)
+    config: dict[str, object]
+
+
 class WorkspaceResourceResolution(Wire):
     resource: WorkspaceResource | None
     ancestors: list[WorkspaceResource] = []

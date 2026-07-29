@@ -708,6 +708,16 @@ with TestClient(app) as client:
     serialized_context = json.dumps(canonical_context, sort_keys=True)
     for forbidden in ("reference.csv", str(Path(os.environ["DP_WORKSPACE"]).parent)):
         assert forbidden not in serialized_context
+    replacement = client.get(f"/api/workspace/resources/{nested_resource['id']}/source")
+    assert replacement.status_code == 200, replacement.text
+    replacement_config = replacement.json()["config"]
+    assert replacement.json()["name"] == "nested"
+    assert replacement_config["uri"].startswith("workspace-provider://")
+    assert replacement_config["providerSourceBindingId"] == source_binding["sourceBindingId"]
+    assert replacement_config["datasetRef"]["datasetId"] == canonical_context["datasetIdentity"]
+    assert replacement_config["datasetRef"]["revisionId"] == canonical_context["revisionId"]
+    assert replacement_config["providerReadMode"] == "exact"
+    assert "reference.csv" not in json.dumps(replacement_config)
     body = {
         "requestId": "00000000-0000-4000-8000-000000000791",
         "containerId": remote["localPlacement"]["containerId"],
@@ -869,6 +879,15 @@ with TestClient(app) as client:
 
     mutable = next(item for item in page["items"]
                    if item.get("mountId") == "wheel-b" and item.get("resourceId") == "dataset-a")
+    mutable_replacement = client.get(
+        f"/api/workspace/resources/{mutable['id']}/source")
+    assert mutable_replacement.status_code == 409, mutable_replacement.text
+    mutable_replacement_error = mutable_replacement.json()
+    assert mutable_replacement_error["detail"] == (
+        "This dataset cannot be pinned to a version, so it cannot replace a runnable Source."
+    )
+    assert mutable_replacement_error["code"] == "local_run_input_binding_failed"
+    assert mutable_replacement_error["retryable"] is False
     mutable_canvas = client.post("/api/workspace/canvases", json={
         "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
         "expectedContainerVersion": page["container"]["version"],
