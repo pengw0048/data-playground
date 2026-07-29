@@ -1890,11 +1890,13 @@ def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
             select(func.count()).select_from(metadb.CatalogPublicationEvent)) or 0)
         wait = session.get(metadb.DurableExternalWait, external_id, with_for_update=True)
         assert wait is not None
+        offline_poll_count = wait.poll_count
         wait.next_poll_at = metadb._now() - datetime.timedelta(seconds=1)
     offline_deps = SimpleNamespace(_external_wait_adapter=lambda _kind: None)
     external_wait_tasks.recover(offline_deps)
     offline = _wait_for(lambda: (
         task if (task := metadb.durable_task(external_id))
+        and task["external_wait"]["poll_count"] > offline_poll_count
         and task["external_wait"]["diagnostic_code"] == "adapter_unavailable" else None
     ))
     assert offline["status"] == "running"
