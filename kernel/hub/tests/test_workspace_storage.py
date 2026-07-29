@@ -2646,13 +2646,12 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         folder["id"], f"workspace-{token}-local-child")
     provider = _WorkspaceFixtureProvider()
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
-    bounded = workspace_providers.bounded_list_children
 
     def deterministic_list_children(_provider, mount, *args, **kwargs):
         kwargs.pop("timeout", None)
         if mount.id == "a-slow":
             return ProviderPage(state="unavailable", reason="deadline exceeded")
-        return bounded(_provider, mount, *args, **kwargs, timeout=0.001)
+        return _provider.list_children(mount, *args, **kwargs)
 
     monkeypatch.setattr(
         workspace_providers, "bounded_list_children",
@@ -2733,9 +2732,6 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         metadb.workspace_delete_placement(
             created_document["resource"]["placementId"], expected_version=1)
         metadb.delete_canvas_cascade(created_document["id"])
-    # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
-    # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
-    time.sleep(0.03)
 
 
 def test_workspace_configured_mount_point_cannot_be_deleted(workspace_scope, monkeypatch):
