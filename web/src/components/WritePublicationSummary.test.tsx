@@ -15,8 +15,8 @@ const receipt = {
   }, executionManifestSha256: 'a'.repeat(64),
 } as any
 
-describe('WritePublicationSummary exact receipt action', () => {
-  it('shows the server-admitted logical name instead of the editable filename interpretation', () => {
+describe('WritePublicationSummary task-first output states', () => {
+  it('shows the server-admitted dataset name instead of the editable filename interpretation', () => {
     const admission = {
       nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
       destination: '/outputs/family_cost.parquet', expectedSchema: [], partitions: [],
@@ -26,13 +26,13 @@ describe('WritePublicationSummary exact receipt action', () => {
     render(<WritePublicationSummary outputName="family_cost.parquet"
       destination="Workspace outputs" admission={admission} />)
 
-    expect(screen.getByText('Accepted dataset name')).toBeVisible()
+    expect(screen.getByText('Dataset name')).toBeVisible()
     expect(screen.getByText('family_cost')).toBeVisible()
-    expect(screen.getByText('Default managed storage')).toBeVisible()
+    expect(screen.getByText('Workspace outputs')).toBeVisible()
     expect(screen.queryByText('family_cost.parquet')).not.toBeInTheDocument()
   })
 
-  it('waits for managed admission before promising a revision and then shows publication in progress', () => {
+  it('keeps an unchecked output quiet and then shows writing progress in direct language', () => {
     const admission = {
       nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
       destination: '/outputs/family_cost.parquet', expectedSchema: [], partitions: [],
@@ -43,18 +43,17 @@ describe('WritePublicationSummary exact receipt action', () => {
 
     expect(screen.getByText('Output name')).toBeVisible()
     expect(screen.getByText('family cost')).toBeVisible()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
-      'Admission has not determined whether this execution can publish a managed dataset revision.')
-    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Readiness has not been checked yet')
+    expect(screen.queryByText('Mode')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Checking output…')
 
     rerender(<WritePublicationSummary outputName="family cost" destination="Workspace outputs"
       admission={admission} publishing />)
-    expect(screen.getByText('Accepted dataset name')).toBeVisible()
+    expect(screen.getByText('Dataset name')).toBeVisible()
     expect(screen.getByText('family_cost')).toBeVisible()
-    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Publishing this managed revision')
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Writing output…')
   })
 
-  it('explains runtime-schema publication without asking for an inferred contract', () => {
+  it('explains runtime-schema output checking without asking for an inferred contract', () => {
     const admission = {
       nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
       destination: '/outputs/runtime.parquet', expectedSchema: [], partitions: [],
@@ -66,7 +65,7 @@ describe('WritePublicationSummary exact receipt action', () => {
 
     const summary = screen.getByLabelText('Write publication')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
-      'Full output schema will be validated during this run before publication.')
+      'Ready to run. Output columns will be checked during the run.')
     expect(summary).not.toHaveTextContent('bounded output schema contract')
     expect(summary).not.toHaveTextContent('Infer from sample')
   })
@@ -84,8 +83,8 @@ describe('WritePublicationSummary exact receipt action', () => {
 
     expect(screen.getAllByText('published')).toHaveLength(2)
     expect(screen.queryByText('next')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Published result')).toHaveTextContent('Managed dataset published')
-    expect(screen.getByLabelText('Published result')).toHaveTextContent('published · revision revision-7 · 2 rows')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('Output published')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('published · version revision-7 · 2 rows')
   })
 
   it('reloads exact schema comparison evidence from the receipt alone', () => {
@@ -106,13 +105,16 @@ describe('WritePublicationSummary exact receipt action', () => {
     render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
       receipt={withDrift} completed />)
 
+    const details = screen.getByText('Technical details').closest('details')!
+    expect(details).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Technical details'))
     const comparisons = screen.getAllByLabelText('Schema comparison')
     expect(comparisons[0]).toHaveTextContent('dataset-1@revision-6')
     expect(comparisons[0]).toHaveTextContent('changed · unknown')
     expect(comparisons[0]).toHaveTextContent('Structural schema drift requires explicit confirmation')
   })
 
-  it('does not promise a managed revision for provider-neutral admission', () => {
+  it('does not promise a dataset for provider-neutral output', () => {
     const admission = {
       nodeId: 'write', managed: false, provider: 'plugin-sink', mode: 'overwrite',
       destination: 's3://example/output.parquet', expectedSchema: [], partitions: [],
@@ -123,9 +125,8 @@ describe('WritePublicationSummary exact receipt action', () => {
     const summary = screen.getByLabelText('Write publication')
     expect(summary).toHaveTextContent('Output name')
     expect(summary).toHaveTextContent('Overwrite provider output')
-    expect(summary).toHaveTextContent('Provider output completed without a managed revision receipt.')
-    expect(summary).not.toHaveTextContent('Data Playground manages the physical storage layout')
-    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
+    expect(summary).toHaveTextContent('Run finished. The selected backend wrote the output.')
+    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission in the task-first summary after active admission cleanup or replacement', () => {
@@ -137,25 +138,25 @@ describe('WritePublicationSummary exact receipt action', () => {
     const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
       outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
 
-    const summaryMode = screen.getByText('Revision mode').parentElement!
+    const summaryMode = screen.getByText('Mode').parentElement!
     expect(within(summaryMode).getByText('Create a new dataset')).toBeVisible()
 
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
       admission={nextAdmission} outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
-    expect(within(screen.getByText('Revision mode').parentElement!).getByText('Create a new dataset')).toBeVisible()
+    expect(within(screen.getByText('Mode').parentElement!).getByText('Create a new dataset')).toBeVisible()
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Exact publication receipt recorded')
+    expect(screen.queryByLabelText('Write readiness')).not.toBeInTheDocument()
 
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    expect(within(screen.getByText('Revision mode').parentElement!)
-      .getByText('Revision mode is not available yet')).toBeVisible()
+    expect(screen.queryByText('Mode')).not.toBeInTheDocument()
+    expect(screen.queryByText('Revision mode is not available yet')).not.toBeInTheDocument()
   })
 
   it('opens only the receipt-backed exact revision and fails closed when it is unavailable', async () => {
     mocks.datasetRevision.mockRejectedValueOnce(new Error('revision compacted'))
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Latest was not substituted')
+    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('A newer version was not substituted')
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-1', 'revision-7')
   })
@@ -167,8 +168,8 @@ describe('WritePublicationSummary exact receipt action', () => {
       preview: { columns: [{ name: 'id' }] },
     })
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
-    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('dataset-1@revision-7'))
+    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
+    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-7'))
     expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('2 rows · 1 schema field')
     expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Name published')
     expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Parent revision-6')
@@ -178,11 +179,11 @@ describe('WritePublicationSummary exact receipt action', () => {
     mocks.datasetRevision.mockResolvedValueOnce({ datasetId: 'dataset-1', revisionId: 'revision-7', summary: {}, preview: { columns: [] } })
       .mockRejectedValueOnce(new Error('permission lost'))
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    const action = screen.getByRole('button', { name: 'Open exact revision' })
+    const action = screen.getByRole('button', { name: 'View published version' })
     fireEvent.click(action)
     await screen.findByLabelText('Exact revision detail')
     fireEvent.click(action)
-    expect(await screen.findByRole('alert')).toHaveTextContent('Latest was not substituted')
+    expect(await screen.findByRole('alert')).toHaveTextContent('A newer version was not substituted')
     expect(screen.queryByLabelText('Exact revision detail')).not.toBeInTheDocument()
   })
 
@@ -193,17 +194,17 @@ describe('WritePublicationSummary exact receipt action', () => {
         datasetId: 'dataset-1', revisionId: 'revision-8', summary: { rowCount: 3 }, preview: { columns: [] },
       })
     const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
 
     const nextReceipt = { ...receipt, revisionId: 'revision-8', head: { ...receipt.head, revisionId: 'revision-8' } }
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={nextReceipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
-    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('dataset-1@revision-8'))
+    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
+    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-8'))
 
     await act(async () => resolveFirst({
       datasetId: 'dataset-1', revisionId: 'revision-7', summary: { rowCount: 2 }, preview: { columns: [] },
     }))
-    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('dataset-1@revision-8')
+    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-8')
     expect(screen.getByLabelText('Exact revision detail')).not.toHaveTextContent('revision-7')
   })
 })

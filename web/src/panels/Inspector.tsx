@@ -563,7 +563,7 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
     || (phase === 'done' && outcomeAdmission?.managed === true)
   const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
-    <Section title={managed ? 'Managed publication' : 'Write output'}>
+    <Section title="Output">
       <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
         outcomeAdmission={outcomeAdmission} receipt={publicationReceipt}
         outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'} />

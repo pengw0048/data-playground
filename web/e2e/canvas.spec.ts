@@ -2319,10 +2319,10 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Choose output destination', { exact: true })).toHaveCount(0)
     const publication = inspector.getByLabel('Write publication')
     await expect(publication).toContainText('my_output.parquet')
-    await expect(publication).toContainText('Default managed storage')
+    await expect(publication).toContainText('Workspace outputs')
   })
 
-  test('a default-local Write keeps task-first publication and an exact receipt @ux-smoke', async ({ page }) => {
+  test('a default-local Write keeps task-first output and an exact receipt @ux-smoke', async ({ page }) => {
     const settings = await page.request.get('/api/settings')
     const previousBackend = (await settings.json()).global?.backend ?? ''
     await page.request.put('/api/settings', { data: {
@@ -2338,10 +2338,23 @@ test.describe('Data Playground canvas', () => {
       } })
       expect(created.ok()).toBeTruthy()
       await page.goto(`/#/canvas/${canvasId}`)
-      await page.locator('.react-flow__node[data-id="write"]').click()
+      await page.setViewportSize({ width: 1280, height: 720 })
+      const writeCard = page.locator('.react-flow__node[data-id="write"]')
+      const outputInput = writeCard.locator('input[placeholder="output"]')
+      const modeSelect = writeCard.locator('select')
+      await expect(outputInput).toHaveValue('output.parquet')
+      await expect(modeSelect.locator('option:checked')).toHaveText('Create or replace')
+      const [outputBox, modeBox] = await Promise.all([outputInput.boundingBox(), modeSelect.boundingBox()])
+      expect(outputBox).not.toBeNull()
+      expect(modeBox).not.toBeNull()
+      expect(modeBox!.y).toBeGreaterThan(outputBox!.y + outputBox!.height)
+      expect(modeBox!.width).toBeGreaterThan(190)
+      await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
       const inspector = page.getByTestId('inspector')
       const filename = `issue399-${Date.now()}.parquet`
-      await inspector.getByRole('button', { name: 'Choose destination…' }).click()
+      const chooseDestination = inspector.getByRole('button', { name: 'Choose destination…' })
+      await expect(chooseDestination).toBeVisible()
+      await chooseDestination.click()
       const dialog = page.locator('.dp-modal-overlay')
       await dialog.locator('input').fill(filename)
       await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
@@ -2349,30 +2362,30 @@ test.describe('Data Playground canvas', () => {
       const publication = inspector.getByLabel('Write publication')
       await expect(publication).toContainText(filename)
       await expect(publication).toContainText('Create a new dataset')
-      await expect(publication).toContainText('Ready to publish')
+      await expect(publication).toContainText('Ready to run')
       await expect(publication.locator('details')).not.toHaveAttribute('open')
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await confirmRun(page)
-      const firstReceipt = publication.getByRole('button', { name: 'Open exact revision' })
+      const firstReceipt = publication.getByRole('button', { name: 'View published version' })
       await expect(firstReceipt).toBeVisible({ timeout: 20_000 })
       await firstReceipt.click()
-      const firstRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
+      const firstRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/version\s+(\S+)/)?.[1]
       expect(firstRevision).toBeTruthy()
       await expect(publication).toContainText(/published.*rows/)
 
       const publicationDetails = publication.locator('details')
       const firstReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
       expect(firstReceiptId).toBeTruthy()
-      const summaryMode = publication.getByText('Revision mode').locator('..')
+      const summaryMode = publication.getByText('Mode', { exact: true }).locator('..')
       await expect(summaryMode).toContainText('Create a new dataset')
       await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
       await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await expect(publicationDetails).not.toContainText(firstReceiptId!, { timeout: 20_000 })
-      const secondReceipt = publication.getByRole('button', { name: 'Open exact revision' })
+      const secondReceipt = publication.getByRole('button', { name: 'View published version' })
       await secondReceipt.click()
-      const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
+      const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/version\s+(\S+)/)?.[1]
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
       await expect(summaryMode).toContainText('Replace the selected dataset')
@@ -2431,7 +2444,7 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      await expect(inspector.getByLabel('Write publication').getByRole('button', { name: 'Open exact revision' })).toBeVisible({ timeout: 20_000 })
+      await expect(inspector.getByLabel('Write publication').getByRole('button', { name: 'View published version' })).toBeVisible({ timeout: 20_000 })
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
     } finally {
@@ -2469,10 +2482,10 @@ test.describe('Data Playground canvas', () => {
       // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
       // destination for the typed append journey below.
       const providerPublication = inspector.getByLabel('Write publication')
-      await expect(providerPublication.getByText('Write mode').locator('..'))
+      await expect(providerPublication.getByText('Mode', { exact: true }).locator('..'))
         .toContainText('Overwrite provider output')
       await expect(providerPublication.getByLabel('Write readiness'))
-        .toContainText('Ready to run with provider output')
+        .toContainText('Ready to run')
       let fixtureRunId: string | undefined
       page.on('response', async (response) => {
         if (!response.url().endsWith('/api/run') || response.request().method() !== 'POST') return
@@ -2499,12 +2512,12 @@ test.describe('Data Playground canvas', () => {
         }
         await route.fulfill({ response, json: body })
       })
-      await page.getByRole('combobox', { name: 'mode' }).selectOption('append')
+      await page.getByRole('combobox', { name: 'write mode' }).selectOption('append')
       const appendPublication = inspector.getByLabel('Write publication')
-      await expect(appendPublication.getByText('Write mode').locator('..'))
+      await expect(appendPublication.getByText('Mode', { exact: true }).locator('..'))
         .toContainText('Overwrite provider output')
       await expect(appendPublication.getByLabel('Write readiness'))
-        .toContainText('Provider output completed without a managed revision receipt.')
+        .toContainText('Run finished. The selected backend wrote the output.')
       const appendDetails = appendPublication.locator('details')
       await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
       await expect(appendDetails).toContainText(/Next admission:.*mode append/)
@@ -2571,10 +2584,10 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      const receipt = inspector.getByLabel('Write publication').getByRole('button', { name: 'Open exact revision' })
+      const receipt = inspector.getByLabel('Write publication').getByRole('button', { name: 'View published version' })
       await expect(receipt).toBeVisible({ timeout: 20_000 })
       await receipt.click()
-      await expect(inspector.getByLabel('Exact revision detail')).toContainText('@3')
+      await expect(inspector.getByLabel('Exact revision detail')).toContainText('version 3')
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
 

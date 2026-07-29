@@ -54,13 +54,13 @@ describe('Write card — typed local mode truth', () => {
     } as any)
   })
 
-  it('labels only the admitted append as exact-head and keeps Lance overwrite provider-neutral', () => {
+  it('keeps the admitted append label and uses direct language for a provider-neutral overwrite', () => {
     const Write = getComponent('write')!
     const data = useStore.getState().doc.nodes[0].data
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
 
     expect(screen.getByRole('option', { name: 'append (exact head)' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'overwrite' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'replace output' })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /create \/ replace/ })).not.toBeInTheDocument()
   })
 
@@ -179,14 +179,14 @@ describe('Write card — typed local mode truth', () => {
     } as any)
     const Write = getComponent('write')!
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
-    expect(screen.getByText(/Old source is unavailable/)).toBeInTheDocument()
+    expect(screen.getByText(/needs attention/)).toBeInTheDocument()
 
     await act(async () => {
       useStore.getState().setEdges([{ id: 'replacement', source: 'source-b', target: 'write' }])
     })
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
-    expect(screen.queryByText(/Old source is unavailable/)).not.toBeInTheDocument()
-    expect(screen.getByText(/checking destination/)).toBeInTheDocument()
+    expect(screen.queryByText(/needs attention/)).not.toBeInTheDocument()
+    expect(screen.getByText(/checking output/)).toBeInTheDocument()
 
     await act(async () => { resolveFresh(fresh) })
 
@@ -227,7 +227,7 @@ describe('Write card — typed local mode truth', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByText(/revision committed-7/)).toBeInTheDocument()
+    expect(screen.getByText(/version committed-7/)).toBeInTheDocument()
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
     expect(useStore.getState().runs.write.writeSubmissionId).not.toBe('completed-submission')
     await Promise.resolve()

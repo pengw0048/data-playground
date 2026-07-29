@@ -47,17 +47,20 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await expect(page).toHaveURL(/#\/inbox$/)
     await page.goto(`/#/canvas/${canvasId}`)
 
-    await page.locator('.react-flow__node[data-id="write"]').click()
+    const writeCard = page.locator('.react-flow__node[data-id="write"]')
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
     const expandInspector = inspector.getByRole('button', { name: 'Expand Inspector' })
     if (await expandInspector.isVisible()) await expandInspector.click()
-    await inspector.getByRole('button', { name: 'Choose destination…' }).click()
+    const chooseDestination = inspector.getByRole('button', { name: 'Choose destination…' })
+    await expect(chooseDestination).toBeVisible()
+    await chooseDestination.click()
     const dialog = page.locator('.dp-modal-overlay')
     await dialog.locator('input').fill(filename)
     await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
     const publication = inspector.getByLabel('Write publication')
-    await expect(publication.getByText('Revision mode').locator('..')).toContainText('Create a new dataset')
-    await expect(publication.getByLabel('Write readiness')).toContainText('Ready to publish')
+    await expect(publication).toContainText('Create a new dataset')
+    await expect(publication.getByLabel('Write readiness')).toContainText('Ready to run')
     const publicationDetails = publication.locator('details')
     await expect(publicationDetails).not.toHaveAttribute('open')
     await publicationDetails.locator('summary').click()
@@ -93,8 +96,8 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     const [admittedInput] = job!.inputManifest
     expect(admittedInput).toBeTruthy()
 
-    await page.locator('.react-flow__node[data-id="write"]').click()
-    await page.locator('.react-flow__node[data-id="write"]').getByRole('button', { name: 'More' }).click()
+    await expect(writeCard).toHaveClass(/(?:^|\s)selected(?:\s|$)/)
+    await writeCard.getByRole('button', { name: 'More' }).click()
     await page.getByText('Run details', { exact: true }).click()
     await expect(page.getByTestId('panel-run').getByRole('button', { name: 'View in Jobs' })).toBeVisible()
     await page.getByTestId('panel-run').getByRole('button', { name: 'View in Jobs' }).click()
@@ -174,7 +177,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     await page.getByText('Managed Write', { exact: true }).click()
     const publication = inspector.getByLabel('Write publication')
     await expect(publication.getByLabel('Write readiness')).toContainText(
-      'Full output schema will be validated during this run',
+      'Ready to run. Output columns will be checked during the run.',
     )
     await expect(publication.getByLabel('Write blocker')).toHaveCount(0)
     const runResponse = page.waitForResponse((response) => response.url().endsWith('/api/run')
@@ -182,7 +185,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const started = await json<{ runId: string }>(await runResponse, 'start runtime-schema Write')
     await expect(publication.getByLabel('Published result')).toContainText(
-      'Managed dataset published', { timeout: 30_000 })
+      'Output published', { timeout: 30_000 })
     let job: { runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null } | undefined
     await expect.poll(async () => {
       const jobs = await json<{ items: Array<{ runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null }> }>(

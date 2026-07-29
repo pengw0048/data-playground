@@ -108,11 +108,12 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(dataPanel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
     await dataPanel.getByTitle('Close').click()
     await expect(dataPanel).toHaveCount(0)
-    await page.locator('.react-flow__node[data-id="write"]').click()
+    const writeCard = page.locator('.react-flow__node[data-id="write"]')
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
     const publication = inspector.getByLabel('Write publication')
-    await expect(publication.getByText('Revision mode').locator('..')).toContainText('Create a new dataset')
-    await expect(publication.getByLabel('Write readiness')).toContainText('Ready to publish')
+    await expect(publication).toContainText('Create a new dataset')
+    await expect(publication.getByLabel('Write readiness')).toContainText('Ready to run')
     const publicationDetails = publication.locator('details')
     await expect(publicationDetails).not.toHaveAttribute('open')
     await publicationDetails.locator('summary').click()
@@ -121,11 +122,14 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const runResponse = page.waitForResponse((response) =>
       response.url().endsWith('/api/run') && response.request().method() === 'POST')
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+    const runPanel = page.getByTestId('panel-run')
+    await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
+    await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
     const started = await ok<{ runId: string }>(await runResponse, 'submit default-kernel write')
     const runId = started.runId
-    await expect(publication.getByLabel('Published result')).toContainText('Managed dataset published', { timeout: 30_000 })
+    await expect(publication.getByLabel('Published result')).toContainText('Output published', { timeout: 30_000 })
     await expect(publication.getByLabel('Published result').getByText(outputName, { exact: true })).toBeVisible()
-    await expect(publication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    await expect(publication.getByRole('button', { name: 'View published version' })).toBeVisible()
     await expect(publicationDetails).toContainText('Durable: yes')
     type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
     type Receipt = { datasetId: string; revisionId: string; name: string; rows: number }
@@ -233,11 +237,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const darkStart = consoleErrors.length
     await page.goto(`/#/canvas/${canvasId}`)
     await setTheme(page, 'dark')
-    await page.locator('.react-flow__node[data-id="write"]').click()
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const darkPublication = inspector.getByLabel('Write publication')
-    await expect(darkPublication.getByLabel('Published result')).toContainText('Managed dataset published')
+    await expect(darkPublication.getByLabel('Published result')).toContainText('Output published')
     await expect(darkPublication.getByLabel('Published result').getByText(dataset!.name, { exact: true })).toBeVisible()
-    await expect(darkPublication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    await expect(darkPublication.getByRole('button', { name: 'View published version' })).toBeVisible()
     const darkPublicationDetails = darkPublication.locator('details')
     await darkPublicationDetails.locator('summary').click()
     await expect(darkPublicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
@@ -286,9 +290,10 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       // The shipped UI contains the failure without crashing: the app shell stays alive and the Write
       // card never certifies a destination it could not resolve.
       await page.goto(`/#/canvas/${canvasId}`)
-      await page.locator('.react-flow__node[data-id="write"]').click()
+      const writeCard = page.locator('.react-flow__node[data-id="write"]')
+      await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
       await expect(page.getByTestId('app-menu')).toBeVisible()
-      await expect(page.locator('.react-flow__node[data-id="write"]')).toContainText('checking destination…')
+      await expect(writeCard).toContainText('checking output…')
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }

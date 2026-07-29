@@ -265,7 +265,7 @@ describe('RunPanel typed parameter gate', () => {
     await waitFor(() => expect(mocks.state.estimate).toHaveBeenCalledWith('target'))
   })
 
-  it('frames an ordinary Write as publishing a managed revision before and during execution', () => {
+  it('frames an ordinary Write as a direct output task before and during execution', () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },
       data: { title: 'Write', status: 'draft', config: { filename: 'results' } },
@@ -283,7 +283,7 @@ describe('RunPanel typed parameter gate', () => {
     const { rerender } = render(<RunPanel nodeId="target" />)
 
     expect(screen.getByRole('button', { name: 'Publish revision' })).toBeVisible()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to publish a managed revision')
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
       phase: 'running', writeAdmission: admission,
@@ -294,7 +294,7 @@ describe('RunPanel typed parameter gate', () => {
     }
     rerender(<RunPanel nodeId="target" />)
     expect(screen.getByText('publishing managed revision')).toBeVisible()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Publishing this managed revision')
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Writing output…')
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
   })
 
@@ -322,7 +322,7 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Exact input registration required' })).toBeDisabled()
     expect(screen.getByLabelText('Exact run readiness')).toHaveTextContent(
-      'Not exact-run-ready: Register this local input',
+      'Fix before running: Register this local input',
     )
   })
 
@@ -383,7 +383,7 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.getByLabelText('Schema comparison')).toHaveTextContent(
       'Structural schema drift requires explicit confirmation')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
-      'Confirm this exact schema comparison before publishing')
+      'Review schema changes before running.')
     fireEvent.click(screen.getByRole('button', { name: 'Publish a new version' }))
     expect(mocks.state.run).toHaveBeenCalledWith('target', true)
   })
@@ -406,8 +406,7 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
-      'This execution backend writes provider output and does not create a managed dataset revision.')
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
       phase: 'running', writeAdmission: admission,
@@ -460,14 +459,14 @@ describe('RunPanel typed parameter gate', () => {
     render(<RunPanel nodeId="target" />)
     const publication = screen.getByLabelText('Write publication')
     expect(publication).toHaveTextContent('Append to the selected dataset')
-    expect(publication).toHaveTextContent('Managed dataset published')
-    expect(publication).toHaveTextContent('results · revision revision-9 · 2 rows')
+    expect(publication).toHaveTextContent('Output published')
+    expect(publication).toHaveTextContent('results · version revision-9 · 2 rows')
     expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'View published version' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
-    const details = screen.getByText('Publication details').closest('details')!
+    const details = screen.getByText('Technical details').closest('details')!
     expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Publication details'))
+    fireEvent.click(screen.getByText('Technical details'))
     expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('committed · catalog · dataset')
     expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('managed://dataset-1')
     expect(publication).toHaveTextContent('file:///revision-9.parquet')

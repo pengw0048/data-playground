@@ -125,7 +125,8 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     mergeCanvasSaved = true
 
     await page.goto(`/#/canvas/${canvasId}`)
-    await page.locator('.react-flow__node[data-id="write"]').click()
+    const writeCard = page.locator('.react-flow__node[data-id="write"]')
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
     await expect(inspector.getByLabel('Certified column merge')).toBeVisible()
     await inspector.getByRole('button', { name: 'Check eligibility' }).click()
