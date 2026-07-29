@@ -128,7 +128,7 @@ def test_join_keys_and_explicit_advanced_condition_remain_valid(config: dict):
     assert graph_mod.join_condition_errors(graph, "join") == []
 
 
-def test_execution_ingresses_reject_a_join_without_a_match_condition():
+def test_execution_and_plan_ingresses_reject_a_join_without_a_match_condition():
     graph = {
         "id": "join-condition-validation", "version": 1,
         "nodes": [
@@ -147,7 +147,6 @@ def test_execution_ingresses_reject_a_join_without_a_match_condition():
 
     requests = [
         ("/api/run/preview", {"graph": graph, "nodeId": "join"}),
-        ("/api/graph/estimate", {"graph": graph, "targetNodeId": "join"}),
         ("/api/graph/plan", {"graph": graph, "targetNodeId": "join"}),
         ("/api/run/estimate", {"graph": graph, "targetNodeId": "join"}),
         ("/api/run", {"graph": graph, "targetNodeId": "join", "confirmed": True}),
@@ -158,25 +157,70 @@ def test_execution_ingresses_reject_a_join_without_a_match_condition():
         assert "needs at least one left and right column" in response.text
 
 
-def test_schema_inspection_allows_finishing_an_incomplete_join():
+def test_background_graph_metadata_allows_finishing_an_incomplete_join(monkeypatch):
+    from hub.routers import runs as run_routes
+
     graph = {
         "id": "join-condition-schema", "version": 1,
         "nodes": [
             _node("left", "source", {"uri": "events"}).model_dump(by_alias=True),
             _node("right", "source", {"uri": "events"}).model_dump(by_alias=True),
             _wire("join", "join"),
+            _node("after", "filter", {"predicate": "true"}).model_dump(by_alias=True),
+        ],
+        "edges": [
+            {"id": "left", "source": "left", "target": "join", "targetHandle": "a"},
+            {"id": "right", "source": "right", "target": "join", "targetHandle": "b"},
+            {"id": "after", "source": "join", "target": "after"},
+        ],
+    }
+    graph["nodes"][2]["data"]["status"] = "latest"
+    graph["nodes"][3]["data"]["status"] = "latest"
+    graph["nodes"][0]["data"]["status"] = "latest"
+    monkeypatch.setattr(
+        run_routes, "_actuals_for",
+        lambda *_args: {"left": 12_345, "join": 98_765, "after": 87_654},
+    )
+
+    schema = client.post("/api/graph/schema", json={"graph": graph})
+    sizes = client.post("/api/graph/estimate", json={"graph": graph})
+
+    assert schema.status_code == 200, schema.text
+    assert schema.json()["left"]["out"]
+    assert schema.json()["right"]["out"]
+    assert sizes.status_code == 200, sizes.text
+    assert sizes.json()["left"] == {"rows": 12_345, "confidence": "exact"}
+    assert sizes.json()["right"]["rows"] > 0
+    assert sizes.json()["right"]["confidence"] == "exact"
+    assert sizes.json()["join"] == {"rows": None, "confidence": "unknown"}
+    assert sizes.json()["after"] == {"rows": None, "confidence": "unknown"}
+
+
+def test_background_graph_metadata_keeps_actual_for_a_configured_join(monkeypatch):
+    from hub.routers import runs as run_routes
+
+    graph = {
+        "id": "join-condition-configured-actual", "version": 1,
+        "nodes": [
+            _node("left", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("right", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("join", "join", {"on": "user_id"}).model_dump(by_alias=True),
         ],
         "edges": [
             {"id": "left", "source": "left", "target": "join", "targetHandle": "a"},
             {"id": "right", "source": "right", "target": "join", "targetHandle": "b"},
         ],
     }
+    graph["nodes"][2]["data"]["status"] = "latest"
+    monkeypatch.setattr(
+        run_routes, "_actuals_for",
+        lambda *_args: {"join": 98_765},
+    )
 
-    response = client.post("/api/graph/schema", json={"graph": graph})
+    sizes = client.post("/api/graph/estimate", json={"graph": graph})
 
-    assert response.status_code == 200, response.text
-    assert response.json()["left"]["out"]
-    assert response.json()["right"]["out"]
+    assert sizes.status_code == 200, sizes.text
+    assert sizes.json()["join"] == {"rows": 98_765, "confidence": "exact"}
 
 
 @pytest.mark.parametrize(("config", "message"), [
