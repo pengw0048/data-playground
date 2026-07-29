@@ -793,10 +793,14 @@ function JoinHints({ nodeId }: { nodeId: string }) {
   )
 }
 
-// Run-plan preview: the regions this node's run splits into, each with its backend, boundary tier, and
-// estimated size. Self-hides for the trivial case (one local region) — it lights up only when placement
-// did something (a cluster backend, an engine=ray label, or a checkpoint), so the scheduler is legible.
+// Keep the ordinary Inspector focused on the execution path and actionable warnings. Scheduler
+// identities and handoff mechanics remain available in the disclosure when somebody needs them.
 type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean; available?: string; preflight?: string[] }
+function backendLabel(backend: string) {
+  if (backend === 'default') return 'local'
+  return backend.toLowerCase().startsWith('ray') ? 'Ray' : backend
+}
+
 function RunPlan({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
   const parameterBindings = useStore((s) => s.runs[nodeId]?.parameterBindings)
@@ -820,39 +824,46 @@ function RunPlan({ nodeId }: { nodeId: string }) {
   if (!regions || (regions.length <= 1 && regions.every((r) => r.backend === 'default' && !r.unsatisfied && !(r.preflight && r.preflight.length)))) return null
   const fmt = (n: number | null) => (n == null ? '?' : n.toLocaleString())
   const multi = regions.length > 1
+  const backends = Array.from(new Set(regions.map((region) => backendLabel(region.backend))))
+  const warnings = Array.from(new Set(regions.flatMap((region) => [
+    ...(region.unsatisfied
+      ? [`Needs ${region.requires || 'resources'} — ${region.available || 'no configured backend provides it'}.`]
+      : []),
+    ...(region.preflight ?? []),
+  ])))
   return (
-    <Section title="Run plan">
-      <div className="mb-1 text-[10.5px] leading-relaxed text-muted-foreground">
-        {multi ? `This run splits into ${regions.length} regions — each runs on its backend, handing off via a tier.`
-          : 'Placement for this run.'}
+    <Section title="Execution path">
+      <div data-testid="run-plan-summary" className="text-[11px] text-foreground">
+        {multi ? `${regions.length} execution groups · ` : ''}{backends.join(' + ')}
       </div>
-      <div className="flex flex-col gap-1">
-        {regions.map((r, i) => (
-          <div key={r.id} className={cn('flex flex-wrap items-center gap-2 rounded-md border px-2 py-1 text-[10.5px]',
-            r.unsatisfied ? 'border-amber-300 dark:border-amber-500/40' : 'border-border')}>
-            <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold',
-              r.backend === 'default' ? 'bg-muted text-muted-foreground' : 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300')}>
-              {r.backend === 'default' ? 'local' : r.backend}
-            </span>
-            <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
-            <span className="tabular-nums text-muted-foreground" title={r.confidence === 'bounded' ? 'Estimated upper bound' : undefined}>{r.confidence === 'unknown' ? '' : `${r.confidence === 'bounded' ? '≤ ' : ''}${fmt(r.rows)}`}</span>
-            {r.requires && !r.unsatisfied && (
-              <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="declared resource requirement">needs {r.requires}</span>
-            )}
-            {multi && i < regions.length - 1 && r.tier && (
-              <span className="rounded bg-muted px-1.5 py-px text-[9px] text-muted-foreground" title="materialization tier for the handoff">→ {r.tier}</span>
-            )}
-            {r.unsatisfied && (
-              <span className="w-full text-[10px] text-amber-700 dark:text-amber-300" title="no registered backend satisfies this — it will run locally, which may lack the resource">
-                ⚠ needs {r.requires || 'resources'} — {r.available || 'no backend provides it'}
+      {warnings.map((warning) => (
+        <div key={warning} role="alert"
+          className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
+          {warning}
+        </div>
+      ))}
+      <details data-testid="run-plan-details" className="text-[10.5px] text-muted-foreground">
+        <summary className="cursor-pointer font-semibold text-foreground">Run plan</summary>
+        <div className="mt-2 flex flex-col gap-1">
+          {regions.map((r, i) => (
+            <div key={r.id} className={cn('flex flex-wrap items-center gap-2 rounded-md border px-2 py-1',
+              r.unsatisfied ? 'border-amber-300 dark:border-amber-500/40' : 'border-border')}>
+              <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold',
+                r.backend === 'default' ? 'bg-muted text-muted-foreground' : 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300')}>
+                {r.backend === 'default' ? 'local' : r.backend}
               </span>
-            )}
-            {(r.preflight ?? []).map((w, j) => (
-              <span key={j} className="w-full text-[10px] text-amber-700 dark:text-amber-300" title="source pre-flight — checked before the full run">⚠ {w}</span>
-            ))}
-          </div>
-        ))}
-      </div>
+              <span className="dp-mono flex-1 truncate text-foreground">{r.outputNode}</span>
+              <span className="tabular-nums" title={r.confidence === 'bounded' ? 'Estimated upper bound' : undefined}>{r.confidence === 'unknown' ? '' : `${r.confidence === 'bounded' ? '≤ ' : ''}${fmt(r.rows)}`}</span>
+              {r.requires && (
+                <span className="rounded bg-muted px-1.5 py-px text-[9px]" title="declared resource requirement">needs {r.requires}</span>
+              )}
+              {multi && i < regions.length - 1 && r.tier && (
+                <span className="rounded bg-muted px-1.5 py-px text-[9px]" title="materialization tier for the handoff">→ {r.tier}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </details>
     </Section>
   )
 }
