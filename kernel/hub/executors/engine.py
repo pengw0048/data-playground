@@ -389,6 +389,49 @@ def _duck_type(t: object) -> str:
     return _canon_to_duck(canonical_type(t))
 
 
+def _duck_physical_type(t: object) -> str | None:
+    """Map proven provider physical evidence without reinterpreting it as a coarse logical type."""
+    physical = str(t or "").strip()
+    low = physical.lower()
+    if physical.endswith("[]"):
+        inner = _duck_physical_type(physical[:-2])
+        return f"{inner}[]" if inner is not None else None
+    if "<" in physical or ">" in physical:
+        return None  # Arrow complex spellings are not losslessly mapped by the DuckDB dialect parser.
+    lb = physical.find("(")
+    if lb >= 0 and physical.endswith(")"):
+        head = low[:lb].strip()
+        inner = physical[lb + 1:-1].strip()
+        if head in ("list", "array"):
+            item = _duck_physical_type(inner)
+            return f"{item}[]" if item is not None else None
+        if head == "map":
+            parts = _split_top(inner)
+            if len(parts) != 2:
+                return None
+            key = _duck_physical_type(parts[0])
+            value = _duck_physical_type(parts[1])
+            return f"MAP({key}, {value})" if key is not None and value is not None else None
+        if head in ("struct", "row"):
+            fields = []
+            for field in _split_top(inner):
+                name, field_type = _split_field(field)
+                mapped = _duck_physical_type(field_type)
+                if not name or mapped is None:
+                    return None
+                fields.append(f"{quote_identifier(name)} {mapped}")
+            return f"STRUCT({', '.join(fields)})" if fields else None
+    if low == "float":
+        return "FLOAT"  # Arrow `float` is float32; the logical `float` contract remains coarse/DOUBLE.
+    if low == "double":
+        return "DOUBLE"
+    actual = canonical_type(physical)
+    if actual == ("float",):
+        return None  # `real` / `number` / `float4` are logical aliases, not exact physical evidence.
+    physical_duck = _duck_type(physical)
+    return physical_duck if canonical_type(physical_duck) == actual else None
+
+
 def normalize_how(how: str) -> str:
     """A join's `how` → the canonical DuckDB keyword (outer→full; unknown→inner)."""
     h = (how or "inner").lower()
@@ -888,15 +931,37 @@ class BuildEngine:
         def _name(c) -> str:
             return str((c.get("name") if isinstance(c, dict) else getattr(c, "name", "")) or "col")
 
-        def _type(c):
-            return c.get("type") if isinstance(c, dict) else getattr(c, "type", None)
+        def _column_duck_type(c):
+            logical = c.get("type") if isinstance(c, dict) else getattr(c, "type", None)
+            physical = (
+                c.get("physicalType") or c.get("physical_type")
+                if isinstance(c, dict)
+                else getattr(c, "physical_type", None)
+            )
+            if physical:
+                want = canonical_type(logical)
+                actual = canonical_type(physical)
+                physical_duck = _duck_physical_type(physical)
+                # Retained inference may prove a physical refinement (for example float backed by
+                # decimal128). Trust it only while it still satisfies the editable logical contract
+                # and our DuckDB mapping can preserve its canonical meaning.
+                if (
+                    physical_duck is not None
+                    and canonical_type(physical_duck) == actual
+                    and type_satisfies(want, actual)
+                ):
+                    return physical_duck
+            return _duck_type(logical)
 
         def _q(n: str) -> str:  # a safely-quoted SQL identifier — double any embedded quote
             return '"' + n.replace('"', '""') + '"'
 
         names = [_name(c) for c in cols] or ["col"]
         try:
-            parts = [f'CAST(NULL AS {_duck_type(_type(c))}) AS {_q(_name(c))}' for c in cols] or ["NULL AS col"]
+            parts = [
+                f'CAST(NULL AS {_column_duck_type(c)}) AS {_q(_name(c))}'
+                for c in cols
+            ] or ["NULL AS col"]
             return db.conn().sql(f"SELECT {', '.join(parts)} LIMIT 0")
         except Exception:  # noqa: BLE001 — a declared type didn't parse → all-VARCHAR (names still propagate)
             parts = [f'CAST(NULL AS VARCHAR) AS {_q(n)}' for n in names]

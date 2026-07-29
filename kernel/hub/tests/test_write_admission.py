@@ -1911,6 +1911,265 @@ def test_declared_transform_schema_can_publish_an_empty_result(contract):
     ]
 
 
+def test_inferred_numeric_transform_preserves_physical_schema_through_managed_write(
+        contract):
+    deps, graph = contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    decimal_type = pa.decimal128(4, 1)
+    pq.write_table(
+        pa.table({
+            "amount": pa.array(
+                [Decimal("12.3"), Decimal("123.4")],
+                type=decimal_type,
+            ),
+        }),
+        source.data["config"]["uri"],
+    )
+    graph = _dynamic_transform_graph(graph)
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"].update({
+        "code": (
+            "def fn(row):\n"
+            "    return {**row, 'amount_double': row['amount'] * 2}"
+        ),
+        "outputSchema": [
+            {"name": "amount", "type": "float", "physicalType": "decimal128(4, 1)"},
+            {"name": "amount_double", "type": "float", "physicalType": "decimal128(4, 1)"},
+        ],
+    })
+    submission = "declared-inferred-decimal"
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+
+    assert admission.intent is not None
+    assert admission.intent.schema_mode == "declared"
+    assert [column.physical_type for column in admission.expected_schema] == [
+        "DECIMAL(4,1)", "DECIMAL(4,1)",
+    ]
+    status = _execute_managed_write(deps, graph, admission, submission)
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None and receipt.rows == 2
+    assert [column.physical_type for column in receipt.schema] == [
+        "DECIMAL(4,1)", "DECIMAL(4,1)",
+    ]
+    assert pq.read_table(receipt.publication.artifact_uri).to_pylist() == [
+        {"amount": Decimal("12.3"), "amount_double": Decimal("24.6")},
+        {"amount": Decimal("123.4"), "amount_double": Decimal("246.8")},
+    ]
+
+
+def test_inferred_float32_transform_preserves_physical_schema_through_managed_write(
+        contract):
+    deps, graph = contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    pq.write_table(
+        pa.table({"value": pa.array([1.25, 2.5], type=pa.float32())}),
+        source.data["config"]["uri"],
+    )
+
+    def processor_factory(_params):
+        def preserve_float32(row):
+            return {"value": pa.scalar(row["value"], type=pa.float32())}
+
+        return preserve_float32
+
+    deps.registry.register(RegisteredProcessor(
+        id="test.inferred-float32",
+        version="v1",
+        title="Inferred float32",
+        mode="map",
+        input_schema=[ColumnSchema(name="value", type="float", physical_type="float")],
+        output_schema=[ColumnSchema(name="value", type="float", physical_type="float")],
+        fn_factory=processor_factory,
+    ))
+    graph = _dynamic_transform_graph(graph, source="library")
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"].update({
+        "processor": "test.inferred-float32",
+        "version": "v1",
+        "outputSchema": [{
+            "name": "value",
+            "type": "float",
+            "physicalType": "float",
+        }],
+    })
+    submission = "declared-inferred-float32"
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+
+    assert admission.intent is not None
+    assert admission.intent.schema_mode == "declared"
+    assert admission.expected_schema == [
+        ColumnSchema(
+            name="value",
+            type="float",
+            physical_type="FLOAT",
+            provenance="inferred",
+        ),
+    ]
+    status = _execute_managed_write(deps, graph, admission, submission)
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None and receipt.rows == 2
+    assert receipt.schema == admission.expected_schema
+    published = pq.read_table(receipt.publication.artifact_uri)
+    assert published.schema.types == [pa.float32()]
+    assert published.to_pylist() == [{"value": 1.25}, {"value": 2.5}]
+
+
+@pytest.mark.parametrize(
+    ("column", "expected"),
+    [
+        pytest.param(
+            {"name": "value", "type": "float"},
+            "DOUBLE",
+            id="logical-default",
+        ),
+        pytest.param(
+            {"name": "value", "type": "float", "physicalType": "float"},
+            "FLOAT",
+            id="camel-physical",
+        ),
+        pytest.param(
+            {"name": "value", "type": "float", "physical_type": "double"},
+            "DOUBLE",
+            id="snake-physical",
+        ),
+        pytest.param(
+            ColumnSchema(name="value", type="float", physical_type="float"),
+            "FLOAT",
+            id="column-schema-physical",
+        ),
+    ],
+)
+def test_schema_only_stand_in_maps_proven_float_physical_type(column, expected):
+    from hub.executors.engine import BuildEngine
+
+    relation = object.__new__(BuildEngine)._stand_in([column])
+
+    assert list(map(str, relation.types)) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("logical_type", "physical_type", "expected"),
+    [
+        pytest.param("list", "FLOAT[]", "FLOAT[]", id="float-list"),
+        pytest.param("list", "LIST(FLOAT)", "FLOAT[]", id="duckdb-list"),
+        pytest.param("list", "ARRAY(DOUBLE)", "DOUBLE[]", id="duckdb-array"),
+        pytest.param(
+            "struct",
+            'STRUCT("x name" FLOAT, nested STRUCT(y DOUBLE[]))',
+            'STRUCT("x name" FLOAT, nested STRUCT(y DOUBLE[]))',
+            id="nested-struct",
+        ),
+        pytest.param(
+            "map",
+            "MAP(VARCHAR, FLOAT[])",
+            "MAP(VARCHAR, FLOAT[])",
+            id="float-map",
+        ),
+    ],
+)
+def test_schema_only_stand_in_preserves_nested_duckdb_float_physical_type(
+        logical_type, physical_type, expected):
+    from hub.executors.engine import BuildEngine
+
+    relation = object.__new__(BuildEngine)._stand_in([{
+        "name": "value",
+        "type": logical_type,
+        "physicalType": physical_type,
+    }])
+
+    assert list(map(str, relation.types)) == [expected]
+
+
+@pytest.mark.parametrize("physical_type", ["real", "number", "float4"])
+def test_schema_only_stand_in_rejects_ambiguous_float_physical_alias(physical_type):
+    from hub.executors.engine import BuildEngine
+
+    relation = object.__new__(BuildEngine)._stand_in([{
+        "name": "value",
+        "type": "float",
+        "physicalType": physical_type,
+    }])
+
+    assert list(map(str, relation.types)) == ["DOUBLE"]
+
+
+def test_schema_only_stand_in_ignores_non_round_trippable_physical_type(monkeypatch):
+    from hub.executors import engine as engine_mod
+
+    original_duck_type = engine_mod._duck_type
+    mapped: list[object] = []
+
+    def tracked_duck_type(value):
+        mapped.append(value)
+        return original_duck_type(value)
+
+    monkeypatch.setattr(engine_mod, "_duck_type", tracked_duck_type)
+    relation = object.__new__(engine_mod.BuildEngine)._stand_in([{
+        "name": "value",
+        "type": "list",
+        "physicalType": "list<item: int64>",
+    }])
+
+    assert mapped == ["list"]
+    assert list(map(str, relation.types)) == ["VARCHAR[]"]
+
+
+@pytest.mark.parametrize(
+    ("logical_type", "physical_field", "source_values", "expected_physical"),
+    [
+        pytest.param(
+            "int32",
+            {"physical_type": "BIGINT"},
+            pa.array([1, 2], type=pa.int64()),
+            "INTEGER",
+            id="precise-integer-width",
+        ),
+        pytest.param(
+            "decimal(5,1)",
+            {"physicalType": "decimal128(4, 1)"},
+            pa.array([Decimal("12.3"), Decimal("123.4")], type=pa.decimal128(4, 1)),
+            "DECIMAL(5,1)",
+            id="precise-decimal",
+        ),
+    ],
+)
+def test_declared_precise_schema_rejects_incompatible_stale_physical_evidence(
+        contract, logical_type, physical_field, source_values, expected_physical):
+    deps, graph = contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    pq.write_table(pa.table({"value": source_values}), source.data["config"]["uri"])
+    graph = _dynamic_transform_graph(graph)
+    transform = next(node for node in graph.nodes if node.id == "transform")
+    transform.data["config"]["outputSchema"] = [{
+        "name": "value",
+        "type": logical_type,
+        **physical_field,
+    }]
+    submission = f"declared-incompatible-{logical_type}"
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+
+    assert admission.intent is not None
+    assert admission.expected_schema[0].physical_type == expected_physical
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    status = _execute_managed_write(deps, graph, admission, submission)
+    assert status.status == "failed"
+    assert (
+        "managed local write output schema does not match its declared admission"
+        in (status.error or "")
+    )
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
 def test_precise_library_integer_schema_matches_managed_write_runtime(contract):
     from hub.compiler import compile_plan
     from hub.plugins.runner import LocalRunner
