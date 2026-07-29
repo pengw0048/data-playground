@@ -99,6 +99,9 @@ export interface LastRun {
   outputCount?: number
   ms: number
   placement: 'local' | 'distributed'
+  // Exact durable authority for restoring a managed Write receipt after reload.
+  // The receipt itself remains server-owned and is resolved from Jobs by this run identity.
+  writeReceiptRunId?: string
 }
 
 export interface NodeVersion {

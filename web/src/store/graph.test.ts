@@ -10,7 +10,7 @@ const apiMocks = vi.hoisted(() => ({
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   executionManifest: vi.fn(),
-  activeRuns: vi.fn(), profileJobs: vi.fn(), schema: vi.fn(), graphSizes: vi.fn(),
+  activeRuns: vi.fn(), profileJobs: vi.fn(), workspaceJobs: vi.fn(), schema: vi.fn(), graphSizes: vi.fn(),
   promote: vi.fn(), processors: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -66,9 +66,11 @@ vi.mock('../api/client', () => ({
                   : property === 'cancelRun'
                     ? apiMocks.cancelRun
                     : property === 'activeRuns'
-                      ? apiMocks.activeRuns
+                    ? apiMocks.activeRuns
                     : property === 'profileJobs'
                       ? apiMocks.profileJobs
+                      : property === 'workspaceJobs'
+                        ? apiMocks.workspaceJobs
                       : property === 'promote'
                         ? apiMocks.promote
               : property === 'processors'
@@ -112,6 +114,51 @@ Object.defineProperty(globalThis, 'localStorage', {
 const NODE = (id: string, type = 'source') => ({
   id, type, position: { x: 0, y: 0 },
   data: { title: id, config: {}, status: 'draft' as const, history: [] },
+})
+
+const WRITE_RECEIPT = (revisionId: string, rows = 2) => ({
+  datasetId: 'dataset-1',
+  revisionId,
+  name: 'output',
+  parentHead: null,
+  head: { datasetId: 'dataset-1', revisionId, retentionOwner: 'core' },
+  rows,
+  bytes: rows * 16,
+  schema: [{ name: 'value', type: 'int64' }],
+  partitions: [],
+  publication: {
+    provider: 'managed-local-file',
+    logicalUri: 'managed://dataset-1',
+    artifactUri: `/outputs/${revisionId}.parquet`,
+    publishSequence: revisionId === 'revision-1' ? 1 : 2,
+    idempotencyKey: `publish-${revisionId}`,
+  },
+  durable: true as const,
+})
+
+const WRITE_OUTPUT = (revisionId: string, rows = 2) => ({
+  nodeId: 'write',
+  portId: 'out',
+  wire: 'dataset' as const,
+  publicationKind: 'catalog' as const,
+  outcome: 'committed' as const,
+  rows,
+  writeReceipt: WRITE_RECEIPT(revisionId, rows),
+})
+
+const WRITE_JOB = (canvasId: string, runId: string, revisionId = 'revision-1') => ({
+  id: `t:${runId}`,
+  runId,
+  jobType: 'run' as const,
+  status: 'done' as const,
+  targetNodeId: 'write',
+  outputs: [WRITE_OUTPUT(revisionId)],
+  canvasId,
+  canvasName: 'test',
+  backend: 'local',
+  placement: 'local' as const,
+  attempt: runId,
+  outputReceipt: WRITE_RECEIPT(revisionId),
 })
 
 describe('graph store — core authority ops', () => {
@@ -160,6 +207,7 @@ describe('graph store — core authority ops', () => {
     }))
     apiMocks.activeRuns.mockReset().mockResolvedValue([])
     apiMocks.profileJobs.mockReset().mockResolvedValue([])
+    apiMocks.workspaceJobs.mockReset().mockResolvedValue({ items: [], hasMore: false })
     apiMocks.schema.mockReset().mockResolvedValue({})
     apiMocks.graphSizes.mockReset().mockResolvedValue({})
     apiMocks.promote.mockReset()
@@ -2143,6 +2191,235 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().prepareWrite('write')
     expect(useStore.getState().runs.write.writeOutcomeAdmission).toMatchObject({ mode: 'create' })
     expect(useStore.getState().runs.write.writeAdmission).toMatchObject({ mode: 'replace' })
+  })
+
+  it('persists the exact managed receipt run and keeps it until another successful Write replaces it', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/source.parquet' }
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: {},
+    })
+    const admission = {
+      nodeId: 'write', managed: true, destination: 'managed://dataset-1', mode: 'create' as const,
+      provider: 'managed-local-file', expectedSchema: [], partitions: [],
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(admission)
+    apiMocks.run.mockResolvedValueOnce({
+      runId: 'published-run', status: 'running', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'published-run', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 2, totalRows: 2, ms: 5, placement: 'local', perNode: [],
+      outputs: [WRITE_OUTPUT('revision-1')],
+    })
+
+    await useStore.getState().run('write')
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')?.data.lastRun)
+      .toMatchObject({ writeReceiptRunId: 'published-run', rows: 2 })
+    expect(useStore.getState().runs.write.writeOutcome).toMatchObject({
+      runId: 'published-run', receipt: { datasetId: 'dataset-1', revisionId: 'revision-1' },
+    })
+
+    apiMocks.writeAdmission.mockResolvedValueOnce({ ...admission, mode: 'replace' })
+    apiMocks.run.mockResolvedValueOnce({
+      runId: 'failed-run', status: 'running', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'failed-run', status: 'failed', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, ms: 3, placement: 'local', perNode: [], outputs: [], error: 'write failed',
+    })
+
+    await useStore.getState().run('write')
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('failed'))
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')?.data.lastRun)
+      .toMatchObject({ writeReceiptRunId: 'published-run' })
+    expect(useStore.getState().runs.write.writeOutcome?.runId).toBe('published-run')
+
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      ...admission, managed: false, destination: '/tmp/output.parquet',
+      provider: 'local-file', mode: 'overwrite',
+    })
+    apiMocks.run.mockResolvedValueOnce({
+      runId: 'provider-run', status: 'running', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'provider-run', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 2, totalRows: 2, ms: 4, placement: 'local', perNode: [], outputs: [{
+        nodeId: 'write', portId: 'out', wire: 'dataset', publicationKind: 'result',
+        outcome: 'committed', rows: 2,
+      }],
+    })
+
+    await useStore.getState().run('write')
+    await vi.waitFor(() => expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'done', status: { runId: 'provider-run', status: 'done' },
+    }))
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')?.data.lastRun)
+      .not.toHaveProperty('writeReceiptRunId')
+    expect(useStore.getState().runs.write.writeOutcome).toBeUndefined()
+  })
+
+  it('recovers one exact durable Write receipt without restoring its admission identity', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/source.parquet' }
+    const write = NODE('write', 'write')
+    write.data.status = 'latest'
+    ;(write.data as any).lastRun = {
+      rows: 2, ms: 5, placement: 'local', writeReceiptRunId: 'published-run',
+    }
+    const doc = {
+      id: 'c', version: 2, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    apiMocks.workspaceJobs.mockResolvedValueOnce({
+      items: [WRITE_JOB('c', 'published-run')], hasMore: false,
+    })
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    await vi.waitFor(() => expect(useStore.getState().runs.write?.writeOutcome?.runId)
+      .toBe('published-run'))
+    expect(apiMocks.workspaceJobs).toHaveBeenCalledWith({
+      limit: 2, status: 'done', canvasId: 'c', nodeId: 'write', runId: 'published-run',
+    })
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'idle',
+      writeOutcome: {
+        runId: 'published-run',
+        receipt: { datasetId: 'dataset-1', revisionId: 'revision-1' },
+      },
+    })
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeOutcomeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+
+    useStore.getState().updateConfig('source', { uri: '/data/replaced.parquet' })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')?.data.status)
+      .toBe('stale')
+    expect(useStore.getState().runs.write.writeOutcome?.runId).toBe('published-run')
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')
+      ?.data.lastRun?.writeReceiptRunId).toBe('published-run')
+  })
+
+  it('fails closed on ambiguous or mismatched exact Write receipt projections', async () => {
+    const cases = [
+      [],
+      [WRITE_JOB('c', 'published-run'), WRITE_JOB('c', 'published-run')],
+      [{ ...WRITE_JOB('other-canvas', 'published-run') }],
+      [{ ...WRITE_JOB('c', 'other-run') }],
+      [{ ...WRITE_JOB('c', 'published-run'), targetNodeId: 'other-node' }],
+      [{ ...WRITE_JOB('c', 'published-run'), outputReceipt: WRITE_RECEIPT('other-revision') }],
+    ]
+    for (const items of cases) {
+      const write = NODE('write', 'write')
+      write.data.status = 'latest'
+      ;(write.data as any).lastRun = {
+        rows: 2, ms: 5, placement: 'local', writeReceiptRunId: 'published-run',
+      }
+      apiMocks.workspaceJobs.mockResolvedValueOnce({ items, hasMore: false })
+      useStore.getState().loadDoc({
+        id: 'c', version: 2, name: 'test', requirements: [], nodes: [write], edges: [],
+      }, 'owner')
+      await vi.waitFor(() => expect(apiMocks.workspaceJobs).toHaveBeenCalledTimes(
+        cases.indexOf(items) + 1,
+      ))
+      await Promise.resolve()
+      expect(useStore.getState().runs.write?.writeOutcome).toBeUndefined()
+    }
+  })
+
+  it('keeps fresh local Write state and rejects a delayed receipt after navigation', async () => {
+    const write = NODE('write', 'write')
+    write.data.status = 'latest'
+    ;(write.data as any).lastRun = {
+      rows: 2, ms: 5, placement: 'local', writeReceiptRunId: 'published-run',
+    }
+    let finishFirst!: (page: any) => void
+    let finishSecond!: (page: any) => void
+    apiMocks.workspaceJobs
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = resolve }))
+
+    useStore.getState().loadDoc({
+      id: 'c', version: 2, name: 'test', requirements: [], nodes: [write], edges: [],
+    }, 'owner')
+    useStore.setState((state) => ({
+      runs: { ...state.runs, write: {
+        phase: 'running',
+        status: {
+          runId: 'new-running', status: 'running', jobType: 'run', targetNodeId: 'write',
+          rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+        },
+        writeAdmission: {
+          nodeId: 'write', managed: true, destination: 'managed://dataset-1', mode: 'replace',
+          provider: 'managed-local-file', expectedSchema: [], partitions: [],
+        },
+        writeSubmissionId: 'new-submission',
+      } },
+    }))
+    finishFirst({ items: [WRITE_JOB('c', 'published-run')], hasMore: false })
+    await vi.waitFor(() => expect(useStore.getState().runs.write.writeOutcome?.runId)
+      .toBe('published-run'))
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'running', status: { runId: 'new-running' },
+      writeSubmissionId: 'new-submission', writeAdmission: { mode: 'replace' },
+    })
+
+    useStore.getState().loadDoc({
+      id: 'c', version: 3, name: 'test', requirements: [], nodes: [{
+        ...write,
+        data: { ...write.data, lastRun: {
+          rows: 3, ms: 7, placement: 'local' as const, writeReceiptRunId: 'new-published-run',
+        } },
+      }], edges: [],
+    }, 'owner')
+    useStore.getState().loadDoc({
+      id: 'other', version: 1, name: 'other', requirements: [], nodes: [], edges: [],
+    }, 'owner')
+    finishSecond({ items: [WRITE_JOB('c', 'new-published-run', 'revision-2')], hasMore: false })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().doc.id).toBe('other')
+    expect(useStore.getState().runs.write).toBeUndefined()
+  })
+
+  it('rejects a delayed Write receipt after a newer success replaces its same-canvas pointer', async () => {
+    const write = NODE('write', 'write')
+    write.data.status = 'latest'
+    ;(write.data as any).lastRun = {
+      rows: 2, ms: 5, placement: 'local', writeReceiptRunId: 'old-published-run',
+    }
+    let finish!: (page: any) => void
+    apiMocks.workspaceJobs.mockImplementationOnce(
+      () => new Promise((resolve) => { finish = resolve }),
+    )
+    useStore.getState().loadDoc({
+      id: 'c', version: 2, name: 'test', requirements: [], nodes: [write], edges: [],
+    }, 'owner')
+    useStore.getState().updateData('write', {
+      lastRun: {
+        rows: 3, ms: 7, placement: 'local', writeReceiptRunId: 'new-published-run',
+      },
+    })
+
+    finish({ items: [WRITE_JOB('c', 'old-published-run')], hasMore: false })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useStore.getState().doc.nodes[0].data.lastRun?.writeReceiptRunId)
+      .toBe('new-published-run')
+    expect(useStore.getState().runs.write?.writeOutcome).toBeUndefined()
   })
 
   it('keeps unchanged replace admission on the automatic fast path', async () => {

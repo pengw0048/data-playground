@@ -234,6 +234,35 @@ describe('Write card — typed local mode truth', () => {
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps a recovered publication visible while preparing an independent next admission', async () => {
+    const doc = useStore.getState().doc
+    const data = doc.nodes[0].data
+    useStore.setState({
+      runs: { write: {
+        phase: 'idle',
+        writeOutcome: {
+          runId: 'published-run',
+          receipt: { revisionId: 'recovered-8', datasetId: 'dataset-1' },
+          outputs: [],
+        },
+      } },
+    } as any)
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
+      mode: 'replace', provider: 'managed-local-lance', expectedSchema: [], partitions: [],
+    })
+
+    const Write = getComponent('write')!
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
+
+    expect(screen.getByText(/published · version recovered-8/)).toBeInTheDocument()
+    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toMatchObject({
+      mode: 'replace',
+    }))
+    expect(screen.getByText(/published · version recovered-8/)).toBeInTheDocument()
+    expect(useStore.getState().runs.write.writeOutcome?.runId).toBe('published-run')
+  })
+
   it('shows the typed managed-name reason beside the filename field', async () => {
     useStore.setState({
       runs: { write: { phase: 'idle' } },

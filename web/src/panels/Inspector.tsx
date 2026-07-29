@@ -560,9 +560,10 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const outcomeAdmission = useStore((s) => s.runs[nodeId]?.writeOutcomeAdmission)
   const phase = useStore((s) => s.runs[nodeId]?.phase)
   const statusOutputs = useStore((s) => s.runs[nodeId]?.status?.outputs)
-  const outputs = statusOutputs ?? []
+  const recoveredOutcome = useStore((s) => s.runs[nodeId]?.writeOutcome)
+  const outputs = statusOutputs ?? recoveredOutcome?.outputs ?? []
   const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
-  const publicationReceipt = receipt ?? admission?.recoveredReceipt
+  const publicationReceipt = receipt ?? recoveredOutcome?.receipt ?? admission?.recoveredReceipt
   const managed = publicationReceipt != null
     || admission?.managed === true
     || (phase === 'done' && outcomeAdmission?.managed === true)
