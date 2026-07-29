@@ -55,13 +55,7 @@ function countSummary(rowCount: number | null | undefined, columnCount: number |
 const localDatasetBinding = (table: CatalogTable) => ({
   uri: table.uri,
   tableId: table.id,
-  registrationId: table.registrationId ?? undefined,
-  datasetRef: undefined,
-  providerResourceRef: undefined,
-  providerMountId: undefined,
-  providerSourceBindingId: undefined,
-  providerName: undefined,
-  providerReadMode: undefined,
+  ...(table.registrationId ? { registrationId: table.registrationId } : {}),
 })
 
 export type SourceEntryAction = 'select' | 'upload' | 'browse'
@@ -88,7 +82,7 @@ function Source({ id, data }: NodeComponentProps) {
   const uploadDataset = useStore((s) => s.uploadDataset)
   const rememberTables = useStore((s) => s.rememberTables)
   const updateConfig = useStore((s) => s.updateConfig)
-  const rename = useStore((s) => s.rename)
+  const replaceSourceBinding = useStore((s) => s.replaceSourceBinding)
   const select = useStore((s) => s.select)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
@@ -169,8 +163,7 @@ function Source({ id, data }: NodeComponentProps) {
   const pick = (t: CatalogTable) => {
     if (!canEdit) return
     rememberTables([t])  // warm the cache so the card resolves this immediately
-    updateConfig(id, localDatasetBinding(t))
-    rename(id, t.name)
+    replaceSourceBinding(id, t.name, localDatasetBinding(t))
     setOpen(false); setQ('')
   }
 
@@ -179,8 +172,7 @@ function Source({ id, data }: NodeComponentProps) {
     const source = await api.workspaceProviderSource(resourceId)
     // This endpoint is the only source of provider binding, URI, and exact-revision facts. A
     // Workspace occurrence is navigation context, never a client-side recipe for Source config.
-    updateConfig(id, source.config)
-    rename(id, source.name)
+    replaceSourceBinding(id, source.name, source.config)
     setWorkspaceDialog(false)
   }
 
@@ -190,14 +182,14 @@ function Source({ id, data }: NodeComponentProps) {
     setOpen(false); setUploading(true)
     const t = await uploadDataset(f)  // uploads + refreshes catalog; toasts on failure
     setUploading(false)
-    if (t) { updateConfig(id, localDatasetBinding(t)); rename(id, t.name) }
+    if (t) replaceSourceBinding(id, t.name, localDatasetBinding(t))
   }
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
   const pickFile = async (uri: string) => {
     if (!canEdit) return
     const t = await api.registerFile(uri)
-    rememberTables([t]); updateConfig(id, localDatasetBinding(t)); rename(id, t.name)
+    rememberTables([t]); replaceSourceBinding(id, t.name, localDatasetBinding(t))
     setDialog(false); setOpen(false)
   }
 
@@ -400,7 +392,7 @@ function WorkspaceProviderPicker({ onClose, onPick }: {
     <div role="dialog" aria-modal="true" aria-label="Browse Workspace catalog" onMouseDown={(event) => event.stopPropagation()}
       className="flex max-h-[calc(100vh-2rem)] w-full max-w-[560px] flex-col rounded-lg border border-border bg-card p-4 shadow-xl">
       <div className="flex items-center gap-2"><div className="min-w-0 flex-1 text-sm font-semibold">Browse Workspace catalog</div><button type="button" aria-label="Close Workspace catalog" onClick={onClose}><Icon name="close" size={15} /></button></div>
-      <p className="mt-1 text-[11px] text-muted-foreground">Search mounted provider datasets. Selecting one preserves its canonical binding and exact revision admission.</p>
+      <p className="mt-1 text-[11px] text-muted-foreground">Search datasets from connected catalogs.</p>
       <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} data-testid="workspace-source-search"
         placeholder="Search mounted datasets…" className="mt-3 w-full rounded-md border border-border bg-background px-2 py-2 text-sm outline-none focus:border-primary" />
       <div className="mt-2 min-h-0 overflow-y-auto rounded-md border border-border p-1" data-testid="workspace-source-results">
@@ -412,7 +404,7 @@ function WorkspaceProviderPicker({ onClose, onPick }: {
           className="flex w-full flex-col rounded-md px-2 py-2 text-left hover:bg-accent disabled:opacity-50">
           <span className="truncate text-xs font-semibold text-foreground">{item.name}</span><span className="truncate text-[10.5px] text-muted-foreground">{provider}{item.providerDatasetId ? ` · ${item.providerDatasetId}` : ''}</span>
         </button>)}
-        {query.trim() && groups !== null && !error && datasets.length === 0 && <div className="p-2 text-[12px] text-muted-foreground">No mounted provider datasets match this search.</div>}
+        {query.trim() && groups !== null && !error && datasets.length === 0 && unavailable.length === 0 && <div className="p-2 text-[12px] text-muted-foreground">No mounted provider datasets match this search.</div>}
         {hasMore && <button type="button" disabled={loadingMore} onClick={() => void loadMore()} className="w-full rounded-md px-2 py-2 text-xs font-semibold text-primary hover:bg-accent disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry loading more provider datasets' : 'Load more provider datasets'}</button>}
       </div>
       {selectionError && <div role="alert" className="mt-2 text-[12px] text-destructive">Couldn't select provider dataset: {selectionError}</div>}

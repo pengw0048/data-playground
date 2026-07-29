@@ -879,6 +879,15 @@ with TestClient(app) as client:
 
     mutable = next(item for item in page["items"]
                    if item.get("mountId") == "wheel-b" and item.get("resourceId") == "dataset-a")
+    mutable_replacement = client.get(
+        f"/api/workspace/resources/{mutable['id']}/source")
+    assert mutable_replacement.status_code == 409, mutable_replacement.text
+    mutable_replacement_error = mutable_replacement.json()
+    assert mutable_replacement_error["detail"] == (
+        "This dataset cannot be pinned to a version, so it cannot replace a runnable Source."
+    )
+    assert mutable_replacement_error["code"] == "local_run_input_binding_failed"
+    assert mutable_replacement_error["retryable"] is False
     mutable_canvas = client.post("/api/workspace/canvases", json={
         "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
         "expectedContainerVersion": page["container"]["version"],

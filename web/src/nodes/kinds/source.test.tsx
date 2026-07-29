@@ -34,7 +34,8 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetId: 'dataset-1', revisionId: '1', retentionOwner: 'provider', summary: { rowCount: 1 },
       preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
     })
-    mocks.workspaceSearch.mockResolvedValue({ query: 'remote', groups: [], nextCursor: null, hasMore: false })
+    mocks.workspaceSearch.mockReset().mockResolvedValue({ query: 'remote', groups: [], nextCursor: null, hasMore: false })
+    mocks.workspaceProviderSource.mockReset()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
       kernelUp: true,
@@ -222,6 +223,8 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       providerMountId: 'mount-a', providerSourceBindingId: 'a'.repeat(32),
       providerName: 'fixture', providerReadMode: 'exact' as const,
       datasetRef: { kind: 'exact' as const, datasetId: 'workspace-provider:old', revisionId: 'old-revision' },
+      tableId: 'stale-local-table', registrationId: 'stale-registration',
+      providerLegacyOption: 'must not survive replacement',
     }
     mocks.workspaceSearch.mockResolvedValue({
       query: 'remote', nextCursor: null, hasMore: false,
@@ -255,17 +258,117 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     await waitFor(() => expect(mocks.workspaceProviderSource).toHaveBeenCalledWith('dataset:provider-placement-b'))
     const config = useStore.getState().doc.nodes[0].data.config
     expect(config).toEqual(canonicalConfig)
+    expect(config).not.toHaveProperty('tableId')
+    expect(config).not.toHaveProperty('registrationId')
+    expect(config).not.toHaveProperty('providerLegacyOption')
     expect(config.uri).toBe('workspace-provider://canonical-binding')
     expect(config.providerSourceBindingId).toBe('b'.repeat(32))
     expect(config.datasetRef).toEqual({ kind: 'exact', datasetId: 'workspace-provider:canonical', revisionId: 'provider-r2' })
     expect(useStore.getState().doc.nodes[0].data.title).toBe('remote orders')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
+    expect(useStore.getState().past).toHaveLength(1)
+
+    act(() => useStore.getState().undo())
+    expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+      title: 'old orders', config: oldConfig,
+    })
+    act(() => useStore.getState().redo())
+    expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+      title: 'remote orders', config: canonicalConfig,
+    })
+  })
+
+  it('keeps the original Source when a provider dataset cannot supply an exact replacement', async () => {
+    const oldConfig = {
+      uri: 'workspace-provider://old-binding',
+      providerResourceRef: 'dataset:old-placement',
+      providerMountId: 'mount-a',
+      providerSourceBindingId: 'a'.repeat(32),
+      providerName: 'fixture',
+      providerReadMode: 'exact' as const,
+      datasetRef: {
+        kind: 'exact' as const,
+        datasetId: 'workspace-provider:old',
+        revisionId: 'old-revision',
+      },
+    }
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'mutable', nextCursor: null, hasMore: false,
+      groups: [{
+        source: {
+          id: 'mount-b', kind: 'provider', completeness: 'complete', provider: 'fixture-b',
+        },
+        items: [{
+          id: 'dataset:mutable-placement', kind: 'dataset', name: 'mutable observations',
+          detached: false, source: 'provider', mountId: 'mount-b', provider: 'fixture-b',
+          providerDatasetId: 'observations', referenceState: 'current',
+          canonicalReferenceState: 'current', lastKnown: false,
+        }],
+      }],
+    })
+    mocks.workspaceProviderSource.mockRejectedValue(new Error(
+      'This dataset cannot be pinned to a version, so it cannot replace a runnable Source.',
+    ))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, edges: [], nodes: [{
+      id: 's1', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'old observations', status: 'latest', config: oldConfig },
+    }] } } as any)
+    render1({ title: 'old observations', status: 'latest', config: oldConfig })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Change dataset' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Browse Workspace catalog…' }))
+    fireEvent.change(await screen.findByTestId('workspace-source-search'), {
+      target: { value: 'mutable' },
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /mutable observations/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This dataset cannot be pinned to a version, so it cannot replace a runnable Source.',
+    )
+    expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+      title: 'old observations', config: oldConfig,
+    })
+    expect(useStore.getState().past).toHaveLength(0)
+  })
+
+  it('shows an unavailable provider without also claiming that the search had no matches', async () => {
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'remote', nextCursor: null, hasMore: false,
+      groups: [{
+        source: {
+          id: 'mount-offline', kind: 'provider', completeness: 'unavailable',
+          provider: 'fixture', error: 'catalog offline',
+        },
+        items: [],
+      }],
+    })
+    render1({ title: 'source', status: 'draft', config: {} })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select dataset' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Browse Workspace catalog…' }))
+    expect(screen.getByText('Search datasets from connected catalogs.')).toBeInTheDocument()
+    expect(screen.queryByText(/canonical binding and exact revision admission/i)).toBeNull()
+    fireEvent.change(await screen.findByTestId('workspace-source-search'), {
+      target: { value: 'remote' },
+    })
+
+    expect(await screen.findByText('fixture unavailable: catalog offline')).toBeInTheDocument()
+    expect(screen.queryByText(/No mounted provider datasets match/i)).toBeNull()
   })
 
   it('does not change the source until a browsed file has been registered successfully', async () => {
     const oldConfig = {
       uri: 'workspace-provider://binding', tableId: 't1',
       providerResourceRef: 'dataset:external.binding', providerMountId: 'mount-a',
+      providerSourceBindingId: 'a'.repeat(32),
       providerName: 'fixture', providerReadMode: 'exact' as const,
+      registrationId: 'old-registration',
+      datasetRef: {
+        kind: 'exact' as const,
+        datasetId: 'workspace-provider:old',
+        revisionId: 'old-revision',
+      },
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
@@ -284,11 +387,14 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().doc.nodes[0].data.title).toBe('orders source')
 
     fireEvent.click(screen.getByText('new.csv'))
-    await waitFor(() => expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ uri: 'file:///data/new.csv', tableId: 't2' }))
-    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({
-      providerResourceRef: undefined, providerMountId: undefined,
-      providerName: undefined, providerReadMode: undefined,
-    })
+    await waitFor(() => expect(useStore.getState().doc.nodes[0].data.config).toEqual({
+      uri: 'file:///data/new.csv', tableId: 't2',
+    }))
+    const config = useStore.getState().doc.nodes[0].data.config
+    for (const field of [
+      'registrationId', 'datasetRef', 'providerResourceRef', 'providerMountId',
+      'providerSourceBindingId', 'providerName', 'providerReadMode',
+    ]) expect(config).not.toHaveProperty(field)
     expect(useStore.getState().doc.nodes[0].data.title).toBe('new')
     expect(screen.queryByText(/Couldn't open file/i)).toBeNull()
   })

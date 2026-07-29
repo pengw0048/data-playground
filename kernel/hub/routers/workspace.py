@@ -780,7 +780,18 @@ def workspace_provider_source(
         source = workspace_providers.provider_dataset_source(
             resource_id, uid=uid, resolve_physical=get_deps().resolve_physical_adapter)
         data = source["data"]
-        return {"name": data["title"], "config": data["config"]}
+        config = data["config"]
+        dataset_ref = config.get("datasetRef")
+        if (config.get("providerReadMode") != "exact"
+                or not isinstance(dataset_ref, dict)
+                or dataset_ref.get("kind") != "exact"):
+            raise APIError(
+                409,
+                "This dataset cannot be pinned to a version, so it cannot replace a runnable Source.",
+                code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
+                retryable=False,
+            )
+        return {"name": data["title"], "config": config}
     except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
         _provider_dataset_action_error(exc)
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
