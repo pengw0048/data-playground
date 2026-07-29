@@ -2337,14 +2337,20 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> Graph
         req.graph, effective_bindings, req.target_node_id, deps)
     if req.input_manifest is not None and req.target_node_id is None:
         raise HTTPException(400, "schema inputManifest requires targetNodeId")
-    _reject_invalid(req.graph, deps, req.target_node_id)
+    # Schema inspection is what lets the editor offer the columns needed to finish configuring a
+    # Join.  Keep every other structural check, but do not make a missing Join condition prevent
+    # the user from discovering those columns; execution endpoints remain fail-closed.
+    _reject_invalid(
+        req.graph, deps, req.target_node_id, enforce_join_condition=False)
     graph = _target_execution_graph(req.graph, req.target_node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(graph, deps, req.target_node_id)
+    _reject_invalid(
+        graph, deps, req.target_node_id, enforce_join_condition=False)
     if req.input_manifest is not None:
         graph, _manifest = _inspection_manifest_graph(
             graph, req.target_node_id, req.input_manifest, deps)
-        _reject_invalid(graph, deps, req.target_node_id)
+        _reject_invalid(
+            graph, deps, req.target_node_id, enforce_join_condition=False)
     try:
         # Dynamic Python output stays unknown until a committed full run proves it.  Reuse the
         # retained-result contract to attach that proof only while the exact current target cone

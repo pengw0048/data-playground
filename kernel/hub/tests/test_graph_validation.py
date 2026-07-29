@@ -128,10 +128,14 @@ def test_join_keys_and_explicit_advanced_condition_remain_valid(config: dict):
     assert graph_mod.join_condition_errors(graph, "join") == []
 
 
-def test_every_execution_ingress_rejects_a_join_without_a_match_condition():
+def test_execution_ingresses_reject_a_join_without_a_match_condition():
     graph = {
         "id": "join-condition-validation", "version": 1,
-        "nodes": [_wire("left", "source"), _wire("right", "source"), _wire("join", "join")],
+        "nodes": [
+            _node("left", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("right", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _wire("join", "join"),
+        ],
         "edges": [
             {"id": "left", "source": "left", "target": "join", "targetHandle": "a"},
             {"id": "right", "source": "right", "target": "join", "targetHandle": "b"},
@@ -143,7 +147,6 @@ def test_every_execution_ingress_rejects_a_join_without_a_match_condition():
 
     requests = [
         ("/api/run/preview", {"graph": graph, "nodeId": "join"}),
-        ("/api/graph/schema", {"graph": graph, "targetNodeId": "join"}),
         ("/api/graph/estimate", {"graph": graph, "targetNodeId": "join"}),
         ("/api/graph/plan", {"graph": graph, "targetNodeId": "join"}),
         ("/api/run/estimate", {"graph": graph, "targetNodeId": "join"}),
@@ -153,6 +156,27 @@ def test_every_execution_ingress_rejects_a_join_without_a_match_condition():
         response = client.post(path, json=body)
         assert response.status_code == 400, (path, response.status_code, response.text)
         assert "needs at least one left and right column" in response.text
+
+
+def test_schema_inspection_allows_finishing_an_incomplete_join():
+    graph = {
+        "id": "join-condition-schema", "version": 1,
+        "nodes": [
+            _node("left", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("right", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _wire("join", "join"),
+        ],
+        "edges": [
+            {"id": "left", "source": "left", "target": "join", "targetHandle": "a"},
+            {"id": "right", "source": "right", "target": "join", "targetHandle": "b"},
+        ],
+    }
+
+    response = client.post("/api/graph/schema", json={"graph": graph})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["left"]["out"]
+    assert response.json()["right"]["out"]
 
 
 @pytest.mark.parametrize(("config", "message"), [
