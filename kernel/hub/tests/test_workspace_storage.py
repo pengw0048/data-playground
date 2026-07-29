@@ -2019,7 +2019,13 @@ class _ExactFixtureAdapter:
     def revision_detail(self, _uri, revision_id, *, preview_limit):
         del preview_limit
         relation = self.open_revision(_uri, revision_id)
-        return {"revision_id": revision_id, "columns": [], "preview_table": relation.limit(1).arrow()}
+        rows = int(relation.aggregate("count(*) AS n").fetchone()[0])
+        return {
+            "revision_id": revision_id,
+            "columns": [],
+            "row_count": rows,
+            "preview_table": relation.limit(1).arrow(),
+        }
 
 
 def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
@@ -2086,8 +2092,73 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert history.status_code == 200 and history.json()["items"][0]["datasetId"] == dataset_id
         detail = client.get(f"/api/catalog/revisions/{dataset_id}/fixture-revision-1")
         assert detail.status_code == 200, detail.text
+        assert detail.json()["summary"]["rowCount"] == 2
         missing_detail = client.get(f"/api/catalog/revisions/{dataset_id}/missing-revision")
         assert missing_detail.status_code == 410, missing_detail.text
+
+        # The Canvas persists only the exact DatasetRef, not the private dispatch revision field.
+        # Both card and run estimates must reuse that exact detail count through a registered
+        # one-to-one map without consulting a mutable provider head.
+        from hub import estimate as estimate_mod
+        from hub.models import ColumnSchema
+        from hub.plugins.processors import RegisteredProcessor
+
+        processor_id = "fixture.provider-exact-estimate-map"
+        deps.registry.register(RegisteredProcessor(
+            id=processor_id,
+            version="v1",
+            title="Exact estimate map",
+            mode="map",
+            input_schema=[ColumnSchema(name="value", type="int")],
+            output_schema=[ColumnSchema(name="value", type="int")],
+            fn_factory=lambda _params: lambda row: row,
+        ))
+        estimate_graph = json.loads(json.dumps(graph))
+        estimate_graph["nodes"].append({
+            "id": "exact-estimate-map",
+            "type": "transform",
+            "position": {"x": 360, "y": 160},
+            "data": {
+                "title": "Exact estimate map",
+                "status": "draft",
+                "config": {
+                    "source": "library",
+                    "processor": processor_id,
+                    "version": "v1",
+                    "mode": "map",
+                    "onError": "raise",
+                },
+            },
+        })
+        estimate_graph["edges"].append({
+            "id": "source-exact-estimate-map",
+            "source": source["id"],
+            "target": "exact-estimate-map",
+            "data": {"wire": "dataset"},
+        })
+        try:
+            estimate_mod._COUNT_CACHE.clear()
+            graph_estimate = client.post("/api/graph/estimate", json={
+                "graph": estimate_graph,
+                "targetNodeId": "exact-estimate-map",
+            })
+            assert graph_estimate.status_code == 200, graph_estimate.text
+            assert graph_estimate.json()[source["id"]] == {
+                "rows": 2, "confidence": "exact"}
+            assert graph_estimate.json()["exact-estimate-map"] == {
+                "rows": 2, "confidence": "exact"}
+
+            estimate_mod._COUNT_CACHE.clear()
+            run_estimate = client.post("/api/run/estimate", json={
+                "graph": estimate_graph,
+                "targetNodeId": "exact-estimate-map",
+            })
+            assert run_estimate.status_code == 200, run_estimate.text
+            assert run_estimate.json()["rows"] == 2
+            assert "unknown_population" not in run_estimate.json()["confirmationReasons"]
+        finally:
+            deps.registry._procs.pop(processor_id, None)
+
         view = client.post("/api/dataset-views", json={
             "submissionId": uuid.uuid4().hex, "name": "Provider exact view",
             "datasetRef": config["datasetRef"], "selectedColumns": ["value"],

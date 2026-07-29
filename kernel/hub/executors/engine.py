@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Literal
 
@@ -1881,7 +1881,10 @@ def _iter_fn(
     for row_index, r in enumerate(rows, start=row_offset):
         try:
             if mode == "map":
-                yield fn(dict(r))
+                mapped = fn(dict(r))
+                if not isinstance(mapped, Mapping) or not mapped:
+                    raise ValueError("map must return a non-empty row mapping")
+                yield dict(mapped)
             elif mode == "filter":
                 if fn(dict(r)):
                     yield r

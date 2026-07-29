@@ -22,13 +22,14 @@ from dataclasses import dataclass
 
 from hub import graph as g
 from hub.ir import resolve_config
-from hub.models import Graph
+from hub.models import Graph, dataset_ref_identity
 
 # ops whose result needs ~O(input) memory (a hash/sort build) → they set a region's working-set need;
 # streaming ops (scan/filter/select/map/sample/limit/write) need ~O(1) and don't.
 _BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "window", "pivot"}
-# code ops: output cardinality can't be known without running them.
-_CODE = {"transform", "section"}
+# opaque code containers: output cardinality can't be known without running them. Transform row modes
+# are handled separately below because some have a cardinality contract independent of their code.
+_CODE = {"section"}
 
 # A coarse per-column byte width by display type. Variable binary values are deliberately absent:
 # their payloads can vary from bytes to megabytes, so no fixed estimate is defensible.
@@ -74,6 +75,7 @@ class SizeEst:
     confidence: str             # "exact" (measured/counted) · "bounded" (an upper bound) · "unknown"
     blocking: bool = False      # this node's OWN op needs ~O(input) memory (drives region placement)
     uncertainty: str | None = None
+    may_expand: bool = False    # unknown output may exceed every known upstream population
 
 
 @dataclass(frozen=True)
@@ -189,15 +191,19 @@ def _probed_list_len(resolve_adapter, uri: str, col: str) -> int | None:
     return n
 
 
-_COUNT_CACHE: dict[tuple[str, str], int] = {}
+_COUNT_CACHE: dict[tuple[str, ...], int] = {}
 _COUNT_CACHE_MAX = 256
 
 
-def _counted(resolve_adapter, uri: str, revision_id: str | None = None) -> int | None:
-    """Read an exact metadata-only count when the adapter explicitly provides that capability.
+def _counted(
+        resolve_adapter, uri: str, revision_id: str | None = None, *,
+        dataset_id: str | None = None,
+) -> int | None:
+    """Read a bounded count when the adapter explicitly provides the matching capability.
 
     Preflight must never call the ordinary `count`, which may parse/scan an entire CSV, JSON, remote
-    table, or plugin source before the user has admitted a cancellable full job.
+    table, or plugin source before the user has admitted a cancellable full job. An exact revision
+    never falls back to current-head metadata.
     """
     try:
         adapter = resolve_adapter(uri)
@@ -205,21 +211,23 @@ def _counted(resolve_adapter, uri: str, revision_id: str | None = None) -> int |
             revision_detail = getattr(adapter, "revision_detail", None)
             if not callable(revision_detail):
                 return None
-            identity = f"revision:{revision_id}"
+            key = ("revision", uri, str(dataset_id or ""), revision_id)
         else:
             metadata_count = getattr(adapter, "metadata_count", None)
             if not callable(metadata_count):
                 return None
-            identity = str(adapter.fingerprint(uri))
+            key = ("head", uri, str(adapter.fingerprint(uri)))
     except Exception:  # noqa: BLE001 — unknown metadata is safer than a fallback scan
         return None
-    key = (uri, identity)
     if key in _COUNT_CACHE:
         return _COUNT_CACHE[key]
     try:
         if revision_id is not None:
             detail = revision_detail(uri, revision_id, preview_limit=1)
-            value = detail.get("row_count") if isinstance(detail, dict) else None
+            if (not isinstance(detail, dict)
+                    or str(detail.get("revision_id") or "") != revision_id):
+                return None
+            value = detail.get("row_count")
             n = int(value) if value is not None and int(value) >= 0 else None
         else:
             n = metadata_count(uri)
@@ -232,19 +240,95 @@ def _counted(resolve_adapter, uri: str, revision_id: str | None = None) -> int |
     return n
 
 
-def _sized(rows: int | None, conf: str, width: WidthEst, blocking: bool = False) -> SizeEst:
+def _registered_source_dataset_id(uri: str) -> str | None:
+    """Return the dataset authority already bound to one logical Source URI."""
+    from hub import metadb, workspace_providers
+
+    try:
+        provider_id = workspace_providers.provider_dataset_identity(uri)
+    except Exception:  # malformed/unavailable provider identity cannot authorize an exact claim
+        return None
+    if isinstance(provider_id, str) and provider_id:
+        return provider_id
+    try:
+        binding = metadb.catalog_revision_binding_for_uri(uri)
+    except Exception:  # noqa: BLE001 — missing metadata leaves exact identity unproven
+        return None
+    dataset_id = binding.get("dataset_id") if isinstance(binding, dict) else None
+    return dataset_id if isinstance(dataset_id, str) and dataset_id else None
+
+
+def _source_revision_identity(
+        config: dict, uri: str,
+) -> tuple[str | None, str | None, bool]:
+    """Return ``(dataset_id, revision_id, pinned)`` without resolving a mutable head.
+
+    ``pinned`` remains true for an invalid/unresolved DatasetRef so callers fail closed instead of
+    treating exact intent as permission to consult ``metadata_count``.
+    """
+    if "datasetRef" in config:
+        dataset_ref = config.get("datasetRef")
+        if not isinstance(dataset_ref, dict):
+            return None, None, True
+        try:
+            dataset_id, revision_id = dataset_ref_identity(dataset_ref)
+        except ValueError:
+            return None, None, True
+        if _registered_source_dataset_id(uri) != dataset_id:
+            return dataset_id, None, True
+        return dataset_id, revision_id, True
+    revision_id = config.get("_input_revision_id")
+    if isinstance(revision_id, str) and revision_id:
+        dataset_id = config.get("_input_dataset_id")
+        if (isinstance(dataset_id, str) and dataset_id
+                and _registered_source_dataset_id(uri) != dataset_id):
+            return dataset_id, None, True
+        return (
+            dataset_id if isinstance(dataset_id, str) and dataset_id else None,
+            revision_id,
+            True,
+        )
+    return None, None, False
+
+
+def _transform_semantics(node, resolve_processor) -> tuple[str | None, str]:
+    """Return execution-owned row semantics, resolving exact Library versions when necessary."""
+    config = resolve_config(node)
+    mode = config.get("mode", "map")
+    if config.get("source") == "library":
+        processor = config.get("processor")
+        version = config.get("version")
+        if (not callable(resolve_processor) or not isinstance(processor, str) or not processor
+                or not isinstance(version, str) or not version):
+            return None, str(config.get("onError", "raise"))
+        try:
+            mode = getattr(resolve_processor(processor, version), "mode", None)
+        except Exception:  # noqa: BLE001 — unavailable exact code has unknown semantics
+            return None, str(config.get("onError", "raise"))
+    return (
+        str(mode) if isinstance(mode, str) and mode else None,
+        str(config.get("onError", "raise")),
+    )
+
+
+def _sized(
+        rows: int | None, conf: str, width: WidthEst, blocking: bool = False, *,
+        may_expand: bool = False,
+) -> SizeEst:
     byts = rows * width.bytes_per_row \
         if rows is not None and width.bytes_per_row is not None else None
     return SizeEst(
         rows=rows, bytes=byts, confidence=conf, blocking=blocking,
         uncertainty=width.uncertainty if rows is not None and byts is None else None,
+        may_expand=may_expand,
     )
 
 
 def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
                    schemas: dict | None = None, actuals: dict[str, int | None] | None = None,
                    storage=None,
-                   no_row_probe_source_ids: set[str] | None = None) -> dict[str, SizeEst]:
+                   no_row_probe_source_ids: set[str] | None = None,
+                   resolve_processor=None) -> dict[str, SizeEst]:
     """Fence managed sources for the entire fingerprint/count estimation pass."""
     import uuid
     from hub.storage import source_read_scope
@@ -254,13 +338,15 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             owner=f"estimate:{uuid.uuid4().hex}"):
         return _estimate_sizes_unfenced(
             graph, resolve_adapter, target=target, schemas=schemas, actuals=actuals,
-            no_row_probe_source_ids=no_row_probe_source_ids)
+            no_row_probe_source_ids=no_row_probe_source_ids,
+            resolve_processor=resolve_processor)
 
 
 def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | None = None,
                              schemas: dict | None = None,
                              actuals: dict[str, int | None] | None = None,
                              no_row_probe_source_ids: set[str] | None = None,
+                             resolve_processor=None,
                              ) -> dict[str, SizeEst]:
     """Estimate node output sizes in topological order. `target` restricts the pass to that node's
     upstream cone (bounds how many sources we count); None estimates the whole graph (for the UI hint).
@@ -300,6 +386,15 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         w = width(nid)  # coarse display-derived width; SHARPENED per node type just below
         uri = resolve_config(node).get("uri") if t == "source" else None
         bypassed = node.data.get("bypassed") if isinstance(node.data, dict) else False
+        source_config: dict = {}
+        source_dataset_id: str | None = None
+        source_revision_id: str | None = None
+        source_pinned = False
+        if t == "source":
+            raw_config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+            source_config = raw_config if isinstance(raw_config, dict) else {}
+            source_dataset_id, source_revision_id, source_pinned = (
+                _source_revision_identity(source_config, str(uri or "")))
 
         # a row-preserving/reducing op keeps its columns' widths — PROPAGATE the input's measured width
         # (max, conservative: never under-estimate) rather than re-derive from coarse display types, which
@@ -317,7 +412,7 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
             w = in_width(nid) or w
         elif t == "source" and uri:
             # MEASURE list/vector-column widths (embeddings) from the real schema so the byte gate sees the
-            # true per-row size — a float[1024] scored as base `float`=8B mis-sizes a region ~1000x small.
+            # true per-row size — but never combine a pinned revision's rows with a mutable-head value probe.
             if nid in no_row_probe_source_ids:
                 columns = schemas.get(nid)
                 w = (
@@ -329,6 +424,10 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
                         "sizing did not read source rows.",
                     )
                 )
+            elif source_pinned:
+                # Exact schema evidence may still carry a fixed vector dimension. A variable list has
+                # only the established coarse width until an exact-revision width SPI exists.
+                w = _estimated_row_width(schemas.get(nid))
             else:
                 w = _source_width(resolve_adapter, uri, schemas.get(nid))
         elif pass_through:
@@ -340,8 +439,19 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
                     w = upstream
         widths[nid] = w
 
+        transform_semantics = (
+            _transform_semantics(node, resolve_processor)
+            if t == "transform" and not bypassed
+            else None
+        )
+        transform_actual_is_reusable = (
+            t != "transform" or transform_semantics == ("map", "raise")
+        )
+
         # 1) a measured actual always wins (the canvas is iterative — the 2nd run has ground truth)
-        if actuals.get(nid) is not None:
+        # except for transforms without a strict 1:1 contract. A prior filter/map-skip output is not
+        # an upper bound for the next run, and variable fan-out must retain the unknown-population gate.
+        if actuals.get(nid) is not None and transform_actual_is_reusable:
             out[nid] = _sized(int(actuals[nid]), "exact", w, is_blocking(t))
             continue
 
@@ -354,26 +464,26 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
             continue
 
         if t == "source":
-            config = resolve_config(node)
-            revision_id = config.get("_input_revision_id")
             protected = nid in no_row_probe_source_ids
             if not uri:
                 n = None
             elif protected:
                 # ``metadata_count`` is an explicit bounded current-head capability and is safe
-                # before admission freezes that head. Once a revision is already pinned, using the
+                # before admission freezes that head. Once a revision is pinned, using the
                 # current count would describe the wrong input; revision_detail is not a metadata-
                 # only contract because it may read preview rows.
                 n = (
                     _counted(resolve_adapter, uri)
-                    if not isinstance(revision_id, str) or not revision_id
+                    if not source_pinned
                     else None
                 )
+            elif source_pinned and source_revision_id is None:
+                n = None
             else:
                 n = _counted(
                     resolve_adapter, uri,
-                    str(revision_id)
-                    if isinstance(revision_id, str) and revision_id else None,
+                    source_revision_id,
+                    dataset_id=source_dataset_id,
                 )
             size = _sized(n, "exact" if n is not None else "unknown", w)
             if protected and n is None:
@@ -419,6 +529,29 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         if t in ("select", "sort", "write", "chart", "window", "fill"):  # row-preserving
             base = first.rows if first else None
             out[nid] = _sized(base, first.confidence if first else "unknown", w, is_blocking(t))
+            continue
+
+        if t == "transform":
+            mode, on_error = transform_semantics or (None, "raise")
+            base = first.rows if first else None
+            if mode == "map" and on_error == "raise":
+                # The executor emits exactly one value per input row or fails the whole step.
+                out[nid] = _sized(
+                    base, first.confidence if first else "unknown", w)
+            elif mode == "map" and on_error == "skip":
+                # A failed input row is omitted; every successful input still emits exactly one row.
+                confidence = (
+                    "unknown" if not first or first.confidence == "unknown" else "bounded")
+                out[nid] = _sized(base, confidence, w)
+            elif mode == "filter":
+                # Predicate false and skip-on-error can only remove rows.
+                confidence = (
+                    "unknown" if not first or first.confidence == "unknown" else "bounded")
+                out[nid] = _sized(base, confidence, w)
+            else:
+                # flat-map and batch transforms may emit any number of rows. Unavailable exact
+                # Library descriptors are equally opaque; never trust the client-copied mode.
+                out[nid] = _sized(None, "unknown", w, may_expand=True)
             continue
 
         if t == "metric":  # collapses to a single value
