@@ -126,6 +126,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
           {canvasRole === 'viewer' ? 'View-only canvas' : 'Checking canvas access…'}
         </div>
       )}
+      {doc.nodes.length > 0 && <CanvasViewportControls />}
       <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
         <div className={cn(
           'flex max-w-[calc(100vw-24px)] items-center rounded-2xl border border-border bg-card shadow-lg',
@@ -173,7 +174,6 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
           <CanvasViewControls
             inspectorCollapsed={inspectorCollapsed}
             onInspectorToggle={onInspectorToggle}
-            hasNodes={doc.nodes.length > 0}
             labelsVisible={labelsVisible}
           />
         </div>
@@ -223,25 +223,33 @@ function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLab
   return toolbarDensityForWidth(regionWidth, hasNextStepLabel)
 }
 
-export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, hasNodes, labelsVisible = false }: {
-  inspectorCollapsed: boolean
-  onInspectorToggle: () => void
-  hasNodes: boolean
-  labelsVisible?: boolean
-}) {
+export function CanvasViewportControls() {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const { zoom } = useViewport()
   const nodeCount = useStore((s) => s.doc.nodes.length)
 
   return (
+    <div
+      data-testid="canvas-viewport-controls"
+      role="group"
+      aria-label="Viewport controls"
+      className="absolute bottom-[80px] left-3 z-[16] flex items-center gap-1 rounded-xl border border-border bg-card p-1 shadow-sm"
+    >
+      <ToolbarIconButton label="Zoom in" icon="plus" onClick={() => { void zoomIn() }} disabled={zoom >= 2.5} />
+      <ToolbarIconButton label="Zoom out" icon="minus" onClick={() => { void zoomOut() }} disabled={zoom <= 0.2} />
+      <ToolbarIconButton label="Fit view" icon="maximize" onClick={() => { void fitView(canvasFitOptions(nodeCount)) }} />
+    </div>
+  )
+}
+
+export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, labelsVisible = false }: {
+  inspectorCollapsed: boolean
+  onInspectorToggle: () => void
+  labelsVisible?: boolean
+}) {
+  return (
     <div data-testid="toolbar-view-controls" role="group" aria-label="View controls" className="flex items-center gap-1">
       {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">View</span>}
-      {hasNodes && <div role="group" aria-label="Viewport controls" className="flex items-center gap-1">
-        <ToolbarIconButton label="Zoom in" icon="plus" onClick={() => { void zoomIn() }} disabled={zoom >= 2.5} showLabel={labelsVisible} />
-        <ToolbarIconButton label="Zoom out" icon="minus" onClick={() => { void zoomOut() }} disabled={zoom <= 0.2} showLabel={labelsVisible} />
-        <ToolbarIconButton label="Fit view" icon="maximize" onClick={() => { void fitView(canvasFitOptions(nodeCount)) }} showLabel={labelsVisible} />
-      </div>}
-      {hasNodes && <div aria-hidden className="mx-1 h-[22px] w-px bg-border" />}
       <div role="group" aria-label="Panel controls" className="flex items-center gap-1">
         <ToolbarIconButton
           label={inspectorCollapsed ? 'Show Inspector' : 'Hide Inspector'}

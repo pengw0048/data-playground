@@ -1050,35 +1050,55 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
   })
 
-  test('minimap and the labelled toolbar do not overlap in either Inspector state', async ({ page }) => {
+  test('icon-only viewport controls stay below the minimap without overlapping the toolbar', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter') // minimap + viewport controls only mount once the canvas has a node to navigate
     const minimap = page.locator('.react-flow__minimap')
     const toolbar = page.getByTestId('toolbar')
-    const controls = page.getByTestId('toolbar-view-controls')
+    const viewportControls = page.getByTestId('canvas-viewport-controls')
+    const viewControls = page.getByTestId('toolbar-view-controls')
     await expect(minimap).toBeVisible()
     await expect(toolbar).toBeVisible()
-    await expect(controls).toBeVisible()
-    await expect(controls.getByRole('button', { name: 'Fit view' })).toBeVisible()
-    await expect(controls.getByText('Fit view', { exact: true })).toBeVisible()
-    expect(overlaps(await boxOf(minimap), await boxOf(toolbar)), 'minimap overlaps toolbar with Inspector expanded').toBe(false)
+    await expect(viewportControls).toBeVisible()
+    await expect(viewportControls.getByRole('button', { name: 'Fit view' })).toBeVisible()
+    await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
 
-    await controls.getByRole('button', { name: 'Hide Inspector' }).click()
-    await expect(controls.getByRole('button', { name: 'Show Inspector' })).toBeVisible()
-    expect(overlaps(await boxOf(minimap), await boxOf(toolbar)), 'minimap overlaps toolbar with Inspector collapsed').toBe(false)
+    const expectLayout = async (inspectorState: string) => {
+      const minimapBox = await boxOf(minimap)
+      const viewportControlsBox = await boxOf(viewportControls)
+      const toolbarBox = await boxOf(toolbar)
+      expect(overlaps(minimapBox, viewportControlsBox), `minimap overlaps viewport controls with Inspector ${inspectorState}`).toBe(false)
+      expect(overlaps(minimapBox, toolbarBox), `minimap overlaps toolbar with Inspector ${inspectorState}`).toBe(false)
+      expect(overlaps(viewportControlsBox, toolbarBox), `viewport controls overlap toolbar with Inspector ${inspectorState}`).toBe(false)
+      expect(viewportControlsBox.x).toBeGreaterThanOrEqual(minimapBox.x)
+      expect(viewportControlsBox.x + viewportControlsBox.width).toBeLessThanOrEqual(minimapBox.x + minimapBox.width)
+      expect(viewportControlsBox.y).toBeGreaterThanOrEqual(minimapBox.y + minimapBox.height)
+    }
+    await expectLayout('expanded')
+
+    await viewControls.getByRole('button', { name: 'Hide Inspector' }).click()
+    await expect(viewControls.getByRole('button', { name: 'Show Inspector' })).toBeVisible()
+    await expectLayout('collapsed')
+    await viewportControls.getByRole('button', { name: 'Fit view' }).hover()
+    await expect(page.getByRole('tooltip')).toHaveText('Fit view')
   })
 
-  test('toolbar groups view controls and exposes current toggle state', async ({ page }) => {
+  test('toolbar keeps Inspector separate from icon-only viewport controls', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
 
     const addControls = page.getByTestId('toolbar-add-controls')
     const viewControls = page.getByTestId('toolbar-view-controls')
+    const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expect(addControls).toHaveAttribute('role', 'group')
     await expect(viewControls).toHaveAttribute('role', 'group')
+    await expect(viewportControls).toHaveAttribute('role', 'group')
     await expect(addControls.getByText('Add', { exact: true })).toBeVisible()
     await expect(viewControls.getByText('View', { exact: true })).toBeVisible()
-    await expect(viewControls.getByRole('button', { name: 'Fit view' })).toBeVisible()
+    await expect(viewControls.getByRole('group', { name: 'Viewport controls' })).toHaveCount(0)
+    const fitView = viewportControls.getByRole('button', { name: 'Fit view' })
+    await expect(fitView).toBeVisible()
+    await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
 
     const inspector = viewControls.getByRole('button', { name: 'Hide Inspector' })
     await expect(inspector).toHaveAttribute('aria-pressed', 'true')

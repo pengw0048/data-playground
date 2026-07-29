@@ -15,6 +15,10 @@ async function boxOf(loc: Locator) {
   return b
 }
 
+function overlaps(a: { x: number; y: number; width: number; height: number }, b: typeof a) {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
+}
+
 async function expectFullyInViewport(page: Page, loc: Locator, label: string) {
   await expect(loc, `${label} should be visible`).toBeVisible()
   const box = await boxOf(loc)
@@ -32,21 +36,31 @@ async function expectToolbarGroupsDoNotOverlap(page: Page, label: string) {
   const toolbar = page.getByTestId('toolbar')
   const addControls = page.getByTestId('toolbar-add-controls')
   const viewControls = page.getByTestId('toolbar-view-controls')
+  const viewportControls = page.getByTestId('canvas-viewport-controls')
   const minimap = page.locator('.react-flow__minimap')
   await expectFullyInViewport(page, toolbar, `${label} toolbar`)
   await expectFullyInViewport(page, addControls, `${label} add controls`)
   await expectFullyInViewport(page, viewControls, `${label} view controls`)
+  await expectFullyInViewport(page, viewportControls, `${label} viewport controls`)
   await expectFullyInViewport(page, minimap, `${label} minimap`)
   const addBox = await boxOf(addControls)
   const viewBox = await boxOf(viewControls)
   expect(addBox.x + addBox.width, `${label} add and view controls overlap`).toBeLessThanOrEqual(viewBox.x + 0.5)
   const toolbarBox = await boxOf(toolbar)
+  const viewportControlsBox = await boxOf(viewportControls)
   const minimapBox = await boxOf(minimap)
-  const overlaps = toolbarBox.x < minimapBox.x + minimapBox.width
-    && toolbarBox.x + toolbarBox.width > minimapBox.x
-    && toolbarBox.y < minimapBox.y + minimapBox.height
-    && toolbarBox.y + toolbarBox.height > minimapBox.y
-  expect(overlaps, `${label} toolbar overlaps minimap`).toBe(false)
+  expect(overlaps(toolbarBox, minimapBox), `${label} toolbar overlaps minimap`).toBe(false)
+  expect(overlaps(toolbarBox, viewportControlsBox), `${label} toolbar overlaps viewport controls`).toBe(false)
+  expect(overlaps(minimapBox, viewportControlsBox), `${label} minimap overlaps viewport controls`).toBe(false)
+  expect(viewportControlsBox.x, `${label} viewport controls start outside minimap`).toBeGreaterThanOrEqual(minimapBox.x - 0.5)
+  expect(
+    viewportControlsBox.x + viewportControlsBox.width,
+    `${label} viewport controls extend past minimap`,
+  ).toBeLessThanOrEqual(minimapBox.x + minimapBox.width + 0.5)
+  expect(
+    viewportControlsBox.y,
+    `${label} viewport controls are not below minimap`,
+  ).toBeGreaterThanOrEqual(minimapBox.y + minimapBox.height - 0.5)
 }
 
 async function goToWorkspaceShell(page: Page) {
@@ -161,20 +175,20 @@ test.describe('minimum viewport support', () => {
     await openCanvasWithSource(page)
     const node = page.locator('.react-flow__node').first()
     await expectFullyInViewport(page, node, 'canvas node')
-    const addControls = page.getByTestId('toolbar-add-controls')
     const viewControls = page.getByTestId('toolbar-view-controls')
+    const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
     await node.click()
     await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
     if (testInfo.project.name === 'chromium-reference-viewport') {
       await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'comfortable')
     }
-    await expect(viewControls.getByText('Fit view', { exact: true })).toBeVisible()
-    await expect(viewControls.getByRole('group', { name: 'Viewport controls' })).toBeVisible()
+    await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
     await expect(viewControls.getByRole('group', { name: 'Panel controls' })).toBeVisible()
-    for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Hide Inspector']) {
-      await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `Canvas ${name}`)
+    for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
+      await expectFullyInViewport(page, viewportControls.getByRole('button', { name }), `Canvas ${name}`)
     }
+    await expectFullyInViewport(page, viewControls.getByRole('button', { name: 'Hide Inspector' }), 'Canvas Hide Inspector')
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
     // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
@@ -452,10 +466,13 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
     await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'compact')
     const viewControls = page.getByTestId('toolbar-view-controls')
+    const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector collapsed)')
-    for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Show Inspector']) {
-      await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `1024px Canvas ${name}`)
+    await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
+    for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
+      await expectFullyInViewport(page, viewportControls.getByRole('button', { name }), `1024px Canvas ${name}`)
     }
+    await expectFullyInViewport(page, viewControls.getByRole('button', { name: 'Show Inspector' }), '1024px Canvas Show Inspector')
     await page.getByTestId('app-menu').click()
     const appMenu = page.getByRole('menu', { name: 'App menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
@@ -464,7 +481,7 @@ test.describe('minimum viewport support', () => {
     }
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Show Inspector', exact: true }).click()
-    await expect.poll(() => viewControls.getByText('Fit view', { exact: true }).count()).toBe(0)
+    await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector expanded)')
   })
 })

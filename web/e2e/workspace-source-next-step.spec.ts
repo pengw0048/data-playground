@@ -32,19 +32,20 @@ test.describe('Workspace Source next-step flow @ux-smoke', () => {
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
 
     const toolbar = page.getByTestId('toolbar')
+    const viewportControls = page.getByTestId('canvas-viewport-controls')
     const nextStep = page.getByRole('button', { name: 'Add next step', exact: true })
     await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
     await expect(nextStep).toBeVisible()
     await expect(nextStep).toContainText('Add next step')
     await expect(toolbar).toHaveAttribute('data-density', 'compact')
     await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
-    await expect(toolbar.getByRole('button', { name: 'Fit view' })).toContainText('Fit view')
+    await expect(viewportControls.getByRole('button', { name: 'Fit view', exact: true })).toBeVisible()
     await expectToolbarInsideCanvas(page, 1280)
 
     await page.setViewportSize({ width: 1440, height: 900 })
     await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
     await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
-    await expect(toolbar.getByRole('button', { name: 'Fit view' })).toContainText('Fit view')
+    await expect(viewportControls.getByRole('button', { name: 'Fit view', exact: true })).toBeVisible()
     await expect(nextStep).toContainText('Add next step')
     await expectToolbarInsideCanvas(page, 1440)
 
