@@ -1,5 +1,5 @@
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { beforeEach, describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
 import type { ColumnSchema } from '../types/graph'
 import type { CatalogTable } from '../types/api'
@@ -1120,6 +1120,104 @@ describe('Inspector — row-reference join diagnosis', () => {
     expect(screen.getByText('reference unknown')).toBeInTheDocument()
     expect(screen.queryByText(/reference safe/i)).not.toBeInTheDocument()
     joinAnalysis.mockRestore()
+  })
+})
+
+describe('Inspector — execution-plan hierarchy', () => {
+  const selectTransform = () => {
+    useStore.setState({
+      selectedIds: ['transform'],
+      canvasRole: 'owner',
+      runs: {},
+      doc: {
+        id: 'execution-plan', name: 'Execution plan', version: 1, requirements: [], edges: [],
+        nodes: [{
+          id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+          data: {
+            title: 'transform', status: 'draft', history: [],
+            config: { mode: 'map', code: 'def fn(row):\n    return row' },
+          },
+        }],
+      },
+      schemas: { transform: { out: cols } },
+    } as any)
+  }
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('keeps scheduler identities behind one Run plan disclosure', async () => {
+    const plan = vi.spyOn(api, 'plan').mockResolvedValue({
+      regions: [
+        { id: 'source-internal', outputNode: 'source-9342868352a9', backend: 'default', tier: 'object', rows: 2_000, confidence: 'exact' },
+        { id: 'join-internal', outputNode: 'join-5-33741', backend: 'ray-data', tier: null, rows: 500, confidence: 'bounded', requires: '8GB' },
+      ],
+    } as any)
+    selectTransform()
+    render(<Inspector />)
+
+    await waitFor(() => expect(plan).toHaveBeenCalled())
+    expect(screen.getByTestId('run-plan-summary')).toHaveTextContent('2 execution groups · local + Ray')
+    expect(screen.getByTestId('run-plan-summary')).not.toHaveTextContent('source-9342868352a9')
+    const details = screen.getByTestId('run-plan-details')
+    expect(details).not.toHaveAttribute('open')
+    expect(screen.getByText('source-9342868352a9')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Run plan'))
+    expect(details).toHaveAttribute('open')
+    expect(screen.getByText('source-9342868352a9')).toBeVisible()
+    expect(screen.getByText('join-5-33741')).toBeVisible()
+    expect(screen.getByText('ray-data')).toBeVisible()
+    expect(screen.getByTitle('materialization tier for the handoff')).toHaveTextContent('object')
+  })
+
+  it('does not present parallel branches as a serial backend path', async () => {
+    const plan = vi.spyOn(api, 'plan').mockResolvedValue({
+      regions: [
+        { id: 'left', outputNode: 'left-branch', backend: 'default', tier: 'object', rows: 100, confidence: 'exact' },
+        { id: 'right', outputNode: 'right-branch', backend: 'ray-data', tier: 'object', rows: 100, confidence: 'exact' },
+        { id: 'join', outputNode: 'join-output', backend: 'default', tier: null, rows: 100, confidence: 'bounded' },
+      ],
+    } as any)
+    selectTransform()
+    render(<Inspector />)
+
+    await waitFor(() => expect(plan).toHaveBeenCalled())
+    const summary = screen.getByTestId('run-plan-summary')
+    expect(summary).toHaveTextContent('3 execution groups · local + Ray')
+    expect(summary).not.toHaveTextContent('→')
+    expect(summary).not.toHaveTextContent('local + Ray + local')
+  })
+
+  it('keeps unsatisfied resources and source preflight warnings visible', async () => {
+    const plan = vi.spyOn(api, 'plan').mockResolvedValue({
+      regions: [{
+        id: 'blocked-internal', outputNode: 'transform-generated-id', backend: 'default',
+        tier: null, rows: null, confidence: 'unknown', requires: '8GB', unsatisfied: true,
+        available: 'local has 4GB', preflight: ['Pinned source revision is unavailable.'],
+      }],
+    } as any)
+    selectTransform()
+    render(<Inspector />)
+
+    await waitFor(() => expect(plan).toHaveBeenCalled())
+    const alerts = screen.getAllByRole('alert')
+    expect(alerts.some((alert) => alert.textContent?.includes('Needs 8GB — local has 4GB.'))).toBe(true)
+    expect(alerts.some((alert) => alert.textContent?.includes('Pinned source revision is unavailable.'))).toBe(true)
+    expect(screen.getByText('transform-generated-id')).not.toBeVisible()
+  })
+
+  it('still hides a trivial local plan', async () => {
+    const plan = vi.spyOn(api, 'plan').mockResolvedValue({
+      regions: [{
+        id: 'local-only', outputNode: 'transform', backend: 'default',
+        tier: null, rows: 10, confidence: 'exact',
+      }],
+    } as any)
+    selectTransform()
+    render(<Inspector />)
+
+    await waitFor(() => expect(plan).toHaveBeenCalled())
+    expect(screen.queryByText('Execution path')).not.toBeInTheDocument()
+    expect(screen.queryByText('Run plan')).not.toBeInTheDocument()
   })
 })
 
