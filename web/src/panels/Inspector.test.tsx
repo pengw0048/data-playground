@@ -324,12 +324,12 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
 
     const publication = screen.getByLabelText('Write publication')
-    expect(publication).toHaveTextContent('Proposed dataset name')
-    expect(publication).toHaveTextContent('Default managed storage')
+    expect(publication).toHaveTextContent('Dataset name')
+    expect(publication).toHaveTextContent('Workspace outputs')
     expect(publication).toHaveTextContent(label)
-    expect(publication).toHaveTextContent('Ready to publish a managed revision')
-    expect(screen.getByText('Publication details').closest('details')).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Publication details'))
+    expect(publication).toHaveTextContent('Ready to run')
+    expect(screen.getByText('Technical details').closest('details')).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Technical details'))
     expect(publication).toHaveTextContent('managed-local-file')
     expect(publication).toHaveTextContent('dataset-1@rev-1')
   })
@@ -350,8 +350,8 @@ describe('Inspector — effective named outputs', () => {
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Publication is blocked: the upstream transform “Normalize purchases” does not have a bounded output schema contract. Select the upstream transform “Normalize purchases”, then in the Inspector choose Output schema (contract) → Infer from sample.')
-    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Fix before running: the upstream transform “Normalize purchases” does not have a bounded output schema contract. Select the upstream transform “Normalize purchases”, then in the Inspector choose Output schema (contract) → Infer from sample.')
+    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission and exact receipt above a blocked next admission', () => {
@@ -379,9 +379,9 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
 
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
-    expect(screen.getByText('Revision mode').parentElement).toHaveTextContent('Append to the selected dataset')
-    expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
-    fireEvent.click(screen.getByText('Publication details'))
+    expect(screen.getByText('Mode').parentElement).toHaveTextContent('Append to the selected dataset')
+    expect(screen.getByRole('button', { name: 'View published version' })).toBeVisible()
+    fireEvent.click(screen.getByText('Technical details'))
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@7')
   })
@@ -395,8 +395,8 @@ describe('Inspector — effective named outputs', () => {
       }, status: { outputs: [] },
     } } } as any)
     render(<Inspector />)
-    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Publication outcome is unknown; no exact receipt was recorded.')
+    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Run finished, but the published dataset could not be confirmed.')
   })
 
   it('keeps merge and upsert controls out of the ordinary Write flow until Advanced opens', () => {

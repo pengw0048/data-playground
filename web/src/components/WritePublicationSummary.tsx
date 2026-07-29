@@ -35,16 +35,16 @@ function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
     <button type="button"
       className="mt-2 inline-flex rounded-md bg-primary px-2.5 py-1.5 text-[10.5px] font-semibold text-primary-foreground shadow-sm disabled:opacity-60"
       onClick={() => void open()} disabled={loading}>
-      {loading ? 'Opening exact revision…' : 'Open exact revision'}
+      {loading ? 'Loading published version…' : 'View published version'}
     </button>
     {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-background p-2 text-muted-foreground">
-      <div className="font-semibold text-foreground">Exact revision {detail.datasetId}@{detail.revisionId}</div>
+      <div className="font-semibold text-foreground">Published dataset · version {detail.revisionId}</div>
       {detail.name && <div>Name <span className="font-mono">{detail.name}</span></div>}
       <div>Committed {detail.committedAt ?? 'unknown'}</div>
       <div>{detail.summary?.rowCount?.toLocaleString?.() ?? 'unknown'} rows · {schemaFieldCount} schema {schemaFieldCount === 1 ? 'field' : 'fields'}</div>
       <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'}</div>
     </div>}
-    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}. Latest was not substituted.</div>}
+    {error && <div role="alert" className="mt-1 text-destructive">Could not load this published version: {error}. A newer version was not substituted.</div>}
   </>
 }
 
@@ -105,13 +105,15 @@ function sameAdmission(left: WriteAdmission | null | undefined, right: WriteAdmi
     && left.intent?.idempotencyKey === right.intent?.idempotencyKey
 }
 
-function PublicationDetails({ admission, outcomeAdmission, receipt, outputs = [] }: {
-  admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]
+function PublicationDetails({ admission, outcomeAdmission, receipt, schemaDrift, outputs = [] }: {
+  admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null
+  schemaDrift?: WriteSchemaDrift | null; outputs?: RunOutput[]
 }) {
   if (!admission && !outcomeAdmission && !receipt && outputs.length === 0) return null
   return <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Publication details</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
     <div className="mt-2 grid gap-1 break-all">
+      {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
       {outcomeAdmission && <AdmissionDetails label="Completed admission" admission={outcomeAdmission} />}
       {admission && !sameAdmission(admission, outcomeAdmission)
         && <AdmissionDetails label={outcomeAdmission ? 'Next admission' : 'Admission'} admission={admission} />}
@@ -146,14 +148,6 @@ function PublicationDetails({ admission, outcomeAdmission, receipt, outputs = []
   </details>
 }
 
-function managedDestinationLabel(destination: string): string {
-  if (destination === 'Workspace outputs') return 'Default managed storage'
-  if (destination.startsWith('Workspace outputs/')) {
-    return `Default managed storage · ${destination.slice('Workspace outputs/'.length)}`
-  }
-  return destination
-}
-
 export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false, publishing = false }: {
   outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean; publishing?: boolean
 }) {
@@ -169,50 +163,43 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
     <div className="grid gap-1.5">
       <div>
         <span className="font-semibold text-foreground">
-          {managed ? acceptedName ? 'Accepted dataset name' : 'Proposed dataset name' : 'Output name'}
+          {managed ? 'Dataset name' : 'Output name'}
         </span>
         <div className="font-mono text-foreground">{displayedName}</div>
       </div>
       <div>
-        <span className="font-semibold text-foreground">{managed ? 'Managed destination' : 'Destination'}</span>
-        <div className="text-muted-foreground">{managed ? managedDestinationLabel(destination) : destination}</div>
-      </div>
-      <div className="text-muted-foreground">
-        {managed
-          ? 'Data Playground manages the physical storage layout and records each publication as a versioned revision.'
-          : providerNeutral
-            ? 'This execution backend writes provider output and does not create a managed dataset revision.'
-            : 'Admission has not determined whether this execution can publish a managed dataset revision.'}
+        <span className="font-semibold text-foreground">Destination</span>
+        <div className="text-muted-foreground">{destination}</div>
       </div>
       <div>
-        <span className="font-semibold text-foreground">{managed ? 'Revision mode' : 'Write mode'}</span>
+        <span className="font-semibold text-foreground">Mode</span>
         <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
       </div>
-      {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
       {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Exact run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
-        <strong>Not exact-run-ready:</strong> {summaryAdmission.exactRunReadiness.message}
+        <strong>Fix before running:</strong> {summaryAdmission.exactRunReadiness.message}
       </div> : summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
-        <strong>Publication is blocked:</strong> {summaryAdmission.blocker}
-      </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
+        <strong>Fix before running:</strong> {summaryAdmission.blocker}
+      </div> : receipt ? null
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
-            {providerNeutral ? 'Provider output completed without a managed revision receipt.' : 'Publication outcome is unknown; no exact receipt was recorded.'}
+            {providerNeutral ? 'Run finished. The selected backend wrote the output.' : 'Run finished, but the published dataset could not be confirmed.'}
           </div>
-        : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Publishing this managed revision…</div>
+        : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Writing output…</div>
         : schemaDrift?.requiresConfirmation ? <div aria-label="Write readiness" className="text-amber-700 dark:text-amber-300">
-            Confirm this exact schema comparison before publishing.
+            Review schema changes before running.
           </div>
         : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">
             {runtimeSchema
-              ? 'Full output schema will be validated during this run before publication.'
-              : managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
+              ? 'Ready to run. Output columns will be checked during the run.'
+              : 'Ready to run'}
           </div>
-        : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
+        : <div aria-label="Write readiness" className="text-muted-foreground">Checking output…</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <div><strong>Managed dataset published</strong></div>
-        <div><span className="font-mono">{displayedName}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows</div>
+        <div><strong>Output published</strong></div>
+        <div><span className="font-mono">{displayedName}</span> · version <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows</div>
         <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
       </div>}
     </div>
-    <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt} outputs={outputs} />
+    <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt}
+      schemaDrift={schemaDrift} outputs={outputs} />
   </section>
 }

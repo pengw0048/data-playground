@@ -26,8 +26,7 @@ function Write({ id, data }: NodeComponentProps) {
   const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
-  const managed = receipt != null || admission?.managed === true
-  const destinationLabel = managed && dest === 'Workspace outputs' ? 'default managed storage' : dest
+  const destinationLabel = dest
   const merge = data.config.mergeColumns as { taskId?: string; rules?: unknown[] } | undefined
   const upsert = data.config.keyedUpsert as { taskId?: string; keys?: unknown[] } | undefined
   useEffect(() => {
@@ -60,25 +59,25 @@ function Write({ id, data }: NodeComponentProps) {
   const displayName = admission?.intent?.destination.name ?? name
   const runtimeSchema = admission?.intent?.schemaMode === 'runtime'
   const semantics = receipt
-    ? `published revision ${receipt.revisionId}`
+    ? `published · version ${receipt.revisionId}`
     : admission?.managed
-      ? admission.blocker ? `blocked · ${admission.blocker}` : runtimeSchema
-        ? `${admission.mode} · full schema validated during run`
-        : `${admission.mode} · ${admission.expectedSchema.length} cols`
-      : admission ? `${admission.mode} · ${admission.provider}` : 'checking destination…'
+      ? admission.blocker ? 'needs attention' : runtimeSchema
+        ? 'ready to run · columns checked during run'
+        : 'ready to run'
+      : admission ? 'ready to run' : 'checking output…'
   const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   const upsertSemantics = upsert?.taskId ? 'keyed upsert tracked' : upsert?.keys?.length ? 'keyed upsert configured' : null
   return (
-    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${destinationLabel} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : `${managed ? 'name a managed dataset' : 'name an output'} → (destination in the panel)`}>
-      <div className="flex gap-2">
-        <Field label={managed ? 'dataset name' : 'output name'} style={{ flex: 1.6 }}>
+    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${destinationLabel} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : 'name an output → choose a destination in the panel'}>
+      <div className="grid gap-2">
+        <Field label="output name">
           <MiniInput value={name} placeholder="output" invalid={nameError != null}
             onChange={(v) => updateConfig(id, { filename: v })} />
           {nameError && <span role="alert" className="text-[10px] leading-snug text-destructive">{nameError}</span>}
         </Field>
-        <Field label="mode" style={{ flex: 1 }}>
+        <Field label="write mode">
           <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[
-            { value: 'overwrite', label: admission?.provider === 'managed-local-file' ? 'create / replace (auto)' : 'overwrite' },
+            { value: 'overwrite', label: admission?.provider === 'managed-local-file' ? 'create / replace automatically' : 'replace output' },
             { value: 'append', label: admission?.provider === 'managed-local-lance' ? 'append (exact head)' : 'append' },
           ]} />
         </Field>
