@@ -180,7 +180,7 @@ function editableGlobal(snapshot: SettingsSnapshot): Record<string, unknown> {
 
 const settingLabel = (change: SettingChange) => `${change.scope}: ${change.key}`
 
-export function SettingsModal({ onClose }: { onClose: () => void }) {
+export function SettingsModal({ onClose, initialCategory }: { onClose: () => void; initialCategory?: string }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
   const users = useStore((s) => s.users)
   const currentUser = useStore((s) => s.currentUser)
@@ -214,7 +214,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [pluginSecretTarget, setPluginSecretTarget] = useState<PluginSecretTarget | null>(null)
   const [pluginSecretClearingKey, setPluginSecretClearingKey] = useState<string | null>(null)
   const [pluginSecretNotices, setPluginSecretNotices] = useState<Record<string, ActionNotice>>({})
-  const [active, setActive] = useState('agent')
+  const [active, setActive] = useState(
+    CATS.some((category) => category.id === initialCategory) ? initialCategory! : 'agent',
+  )
   const [confirmDiscard, setConfirmDiscard] = useState(false)
   const lastEditingControl = useRef<HTMLElement | null>(null)
   // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
@@ -647,7 +649,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           {/* left category nav */}
           <nav className="flex w-[190px] shrink-0 flex-col gap-0.5 border-r border-border p-3">
             {categories.map((c) => (
-              <button key={c.id} onClick={() => go(c.id)}
+              <button key={c.id} autoFocus={active === c.id} onClick={() => go(c.id)}
                 className={cn('flex items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors',
                   active === c.id ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50')}>
                 <Icon name={c.icon} size={14} /> {c.label}

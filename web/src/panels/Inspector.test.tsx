@@ -19,7 +19,7 @@ const cols: ColumnSchema[] = [
 ]
 
 beforeEach(() => {
-  useStore.setState({ kernelUp: true })
+  useStore.setState({ kernelUp: true, currentUser: null })
 })
 
 function registerSpec(kind: string, source?: string) {
@@ -368,6 +368,51 @@ describe('Inspector — effective named outputs', () => {
     fireEvent.click(screen.getByText('Technical details'))
     expect(publication).toHaveTextContent('managed-local-file')
     expect(publication).toHaveTextContent('dataset-1@rev-1')
+  })
+
+  it('hands destination management to the Canvas Settings destinations pane', async () => {
+    selectNode('write', undefined)
+    useStore.setState({
+      currentUser: { id: 'admin', name: 'Admin', capabilities: ['global_settings'] },
+    })
+    vi.spyOn(api, 'destinations').mockResolvedValue({
+      destinations: [{ id: 'outputs', name: 'Workspace outputs', backend: 'local', root: '/workspace/outputs' }],
+      backends: ['local', 's3', 'gs'],
+    })
+    const onOpenSettings = vi.fn()
+    window.addEventListener('dp-open-settings', onOpenSettings)
+
+    render(<Inspector />)
+    fireEvent.click(screen.getByRole('button', { name: 'Choose destination…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage destinations' }))
+
+    expect(onOpenSettings).toHaveBeenCalledTimes(1)
+    const event = onOpenSettings.mock.calls[0][0] as CustomEvent<{ category: string }>
+    expect(event.detail.category).toBe('destinations')
+    await waitFor(() => expect(screen.queryByText('Choose output destination')).not.toBeInTheDocument())
+    window.removeEventListener('dp-open-settings', onOpenSettings)
+  })
+
+  it('explains administrator-managed destinations without exposing Settings to an editor', async () => {
+    selectNode('write', undefined)
+    useStore.setState({
+      currentUser: { id: 'editor', name: 'Editor', capabilities: [] },
+    })
+    vi.spyOn(api, 'destinations').mockResolvedValue({
+      destinations: [{ id: 'outputs', name: 'Workspace outputs', backend: 'local', root: '/workspace/outputs' }],
+      backends: ['local', 's3', 'gs'],
+    })
+    const onOpenSettings = vi.fn()
+    window.addEventListener('dp-open-settings', onOpenSettings)
+
+    render(<Inspector />)
+    fireEvent.click(screen.getByRole('button', { name: 'Choose destination…' }))
+
+    expect(await screen.findByText(/Destinations are configured by an administrator/i)).toBeVisible()
+    expect(screen.getByText(/Ask an administrator to add or change a local, S3, or GCS location/i)).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Manage destinations' })).not.toBeInTheDocument()
+    expect(onOpenSettings).not.toHaveBeenCalled()
+    window.removeEventListener('dp-open-settings', onOpenSettings)
   })
 
   it('keeps current admission blockers visible before publication', () => {
