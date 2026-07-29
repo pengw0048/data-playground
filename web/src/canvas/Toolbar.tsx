@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from 'react'
+import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { useReactFlow, useViewport } from '@xyflow/react'
 import { allSpecs } from '../nodes'
 import { useStore, roleCanEdit } from '../store/graph'
@@ -191,35 +191,36 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
   )
 }
 
-// The compact labelled toolbar measures a little over 1,050px with the current registry and the
-// contextual Add-next-step action. The Canvas region changes with the Inspector, so choose its
-// density from that region rather than the browser window. Keeping a small buffer avoids a
-// half-pixel overflow at the 1024px viewport once the collapsed navigation is accounted for.
-const LABELLED_TOOLBAR_MIN_WIDTH = 1100
+// The ordinary labelled toolbar measures about 860px with the current registry. A contextual
+// Add-next-step label needs a compact labelled density at the 980px Canvas region created by either
+// a 1280px viewport with its Inspector open or a 1024px viewport with it collapsed. The Canvas
+// region changes with the Inspector, so these thresholds use that region, not the browser window.
+const LABELLED_TOOLBAR_MIN_WIDTH = 900
 const COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH = 1024
 type ToolbarDensity = 'icons' | 'compact' | 'comfortable'
 
-function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLabel: boolean) {
-  const [density, setDensity] = useState<ToolbarDensity>('icons')
+export function toolbarDensityForWidth(width: number, hasNextStepLabel: boolean): ToolbarDensity {
+  if (width < LABELLED_TOOLBAR_MIN_WIDTH) return 'icons'
+  if (hasNextStepLabel && width < COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH) return 'compact'
+  return 'comfortable'
+}
 
-  useEffect(() => {
+function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLabel: boolean) {
+  const [regionWidth, setRegionWidth] = useState(0)
+
+  useLayoutEffect(() => {
     const region = ref.current?.parentElement
     if (!region) return
-    const update = () => {
-      const width = region.clientWidth
-      setDensity(width < LABELLED_TOOLBAR_MIN_WIDTH
-        ? 'icons'
-        : hasNextStepLabel && width < COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH
-          ? 'compact'
-          : 'comfortable')
-    }
+    const update = () => setRegionWidth(region.clientWidth)
     update()
     const observer = new ResizeObserver(update)
     observer.observe(region)
     return () => observer.disconnect()
-  }, [ref, hasNextStepLabel])
+  }, [ref])
 
-  return density
+  // Selection can expose Add next step without changing the region width. Deriving here prevents
+  // one paint with the previous (wider) density before an effect catches up.
+  return toolbarDensityForWidth(regionWidth, hasNextStepLabel)
 }
 
 export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, hasNodes, labelsVisible = false }: {

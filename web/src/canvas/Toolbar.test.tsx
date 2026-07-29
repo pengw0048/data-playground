@@ -38,7 +38,16 @@ vi.mock('./nextStep', () => ({
   ),
 }))
 
-import { CanvasViewControls, Toolbar } from './Toolbar'
+import { CanvasViewControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
+
+describe('toolbarDensityForWidth', () => {
+  it('keeps all three densities reachable from the actual Canvas width', () => {
+    expect(toolbarDensityForWidth(899, false)).toBe('icons')
+    expect(toolbarDensityForWidth(980, false)).toBe('comfortable')
+    expect(toolbarDensityForWidth(980, true)).toBe('compact')
+    expect(toolbarDensityForWidth(1024, true)).toBe('comfortable')
+  })
+})
 
 describe('CanvasViewControls', () => {
   beforeEach(() => {

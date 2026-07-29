@@ -450,7 +450,7 @@ test.describe('minimum viewport support', () => {
     await openCanvasWithSource(page)
     await page.locator('.react-flow__node').first().click()
     await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
-    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'icons')
+    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'compact')
     const viewControls = page.getByTestId('toolbar-view-controls')
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector collapsed)')
     for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Show Inspector']) {
