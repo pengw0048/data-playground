@@ -1,8 +1,12 @@
 """Regression tests for the repository's fast-PR / heavy-release workflow boundary."""
 
 import re
+import os
 from collections import Counter
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
 import yaml
 
@@ -210,22 +214,68 @@ def test_kernel_pytest_shards_form_an_exact_complement_partition() -> None:
     selected_counts.update(complement)
     assert selected_counts == basename_counts
 
-    command = step["run"]
-    normalized_command = " ".join(command.split())
-    assert "set -euo pipefail" in normalized_command
-    assert (
-        'explicit="$KERNEL_FILES $LIFECYCLE_FILES $GROUP_0_FILES $GROUP_1_FILES"'
-        in normalized_command
-    )
-    for shard, variable in _KERNEL_SHARD_ENV.items():
-        assert f'{shard}) names="${variable}" ;;' in normalized_command
-    assert "remainder-2) names=$(comm -23" in normalized_command
-    assert (
-        "find hub/tests -name 'test_*.py' -exec basename {} \\; | sort"
-        in normalized_command
-    )
-    assert "<(printf '%s\\n' $explicit | sort)" in normalized_command
-    assert 'test -n "$names"' in normalized_command
+    command = " ".join(step["run"].split())
+    assert "set -euo pipefail" in command
+    assert "../scripts/kernel_shard_selection.py" in command
+    assert '--shard "${{ matrix.shard }}"' in command
+    assert "--junitxml=" in command
+    assert 'test -n "$names"' in command
+
+    steps = job["steps"]
+    summary = next(step for step in steps if step.get("name") == "Summarize complete testcase durations")
+    assert summary["if"] == "always()"
+    assert "summarize_junit_durations.py" in summary["run"]
+    artifact = next(step for step in steps if step.get("name") == "Upload shard JUnit measurement")
+    assert artifact["if"] == "always()"
+    assert artifact["with"]["name"] == "kernel-junit-${{ matrix.shard }}"
+
+
+def test_kernel_shard_selector_proves_the_workflow_partition_at_runtime() -> None:
+    step = _kernel_shard_step()
+    environment = {
+        variable: value
+        for variable, value in step["env"].items()
+        if variable in _KERNEL_SHARD_ENV.values()
+    }
+    selector = _ROOT / "scripts" / "kernel_shard_selection.py"
+    selected: list[str] = []
+    for shard in [*_KERNEL_SHARD_ENV, "remainder-2"]:
+        result = subprocess.run(
+            [sys.executable, str(selector), "--test-root", str(_ROOT / "kernel" / "hub" / "tests"), "--shard", shard],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ | environment,
+        )
+        selected.extend(result.stdout.split())
+
+    expected = sorted(path.name for path in (_ROOT / "kernel" / "hub" / "tests").glob("test_*.py"))
+    assert sorted(selected) == expected
+    assert not [name for name, count in Counter(selected).items() if count != 1]
+
+
+def test_junit_duration_summary_groups_complete_testcase_times() -> None:
+    report = """<testsuites><testsuite>
+      <testcase classname=\"hub.tests.test_fast\" name=\"one\" time=\"0.25\" />
+      <testcase classname=\"hub.tests.test_slow\" name=\"two\" time=\"2.0\" />
+      <testcase classname=\"hub.tests.test_fast\" name=\"three\" time=\"0.75\" />
+    </testsuite></testsuites>"""
+    with tempfile.TemporaryDirectory() as directory:
+        junit = Path(directory) / "report.xml"
+        junit.write_text(report, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(_ROOT / "scripts" / "summarize_junit_durations.py"), str(junit)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.stdout.splitlines() == [
+        "Complete testcase duration by file/module:",
+        "    2.00s     1 tests  hub.tests.test_slow",
+        "    1.00s     2 tests  hub.tests.test_fast",
+        "Total: 3.00s across 3 testcases.",
+    ]
 
 
 def test_every_admitted_durable_task_kind_has_a_postgres_ci_selector() -> None:
