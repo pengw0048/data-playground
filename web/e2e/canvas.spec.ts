@@ -2482,7 +2482,7 @@ test.describe('Data Playground canvas', () => {
       // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
       // destination for the typed append journey below.
       const providerPublication = inspector.getByLabel('Write publication')
-      await expect(providerPublication.getByText('Mode').locator('..'))
+      await expect(providerPublication.getByText('Mode', { exact: true }).locator('..'))
         .toContainText('Overwrite provider output')
       await expect(providerPublication.getByLabel('Write readiness'))
         .toContainText('Ready to run')
@@ -2514,7 +2514,7 @@ test.describe('Data Playground canvas', () => {
       })
       await page.getByRole('combobox', { name: 'write mode' }).selectOption('append')
       const appendPublication = inspector.getByLabel('Write publication')
-      await expect(appendPublication.getByText('Mode').locator('..'))
+      await expect(appendPublication.getByText('Mode', { exact: true }).locator('..'))
         .toContainText('Overwrite provider output')
       await expect(appendPublication.getByLabel('Write readiness'))
         .toContainText('Run finished. The selected backend wrote the output.')

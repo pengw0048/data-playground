@@ -177,7 +177,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     await page.getByText('Managed Write', { exact: true }).click()
     const publication = inspector.getByLabel('Write publication')
     await expect(publication.getByLabel('Write readiness')).toContainText(
-      'Full output schema will be validated during this run',
+      'Ready to run. Output columns will be checked during the run.',
     )
     await expect(publication.getByLabel('Write blocker')).toHaveCount(0)
     const runResponse = page.waitForResponse((response) => response.url().endsWith('/api/run')
@@ -185,7 +185,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const started = await json<{ runId: string }>(await runResponse, 'start runtime-schema Write')
     await expect(publication.getByLabel('Published result')).toContainText(
-      'Managed dataset published', { timeout: 30_000 })
+      'Output published', { timeout: 30_000 })
     let job: { runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null } | undefined
     await expect.poll(async () => {
       const jobs = await json<{ items: Array<{ runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null }> }>(
