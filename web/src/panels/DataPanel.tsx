@@ -318,7 +318,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     if (res.suggestedAction === 'run') {
       return withOutputPorts(<NotPreviewable
         reason={res.reason ?? undefined}
-        onRun={() => requestRun(nodeId)}
+        onRun={() => previewAction(nodeId, 0, requestPortId)}
         modeToggle={resultModeToggle} />)
     }
     return withOutputPorts(<NotPreviewable
