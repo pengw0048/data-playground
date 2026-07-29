@@ -332,6 +332,49 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.retainedResult).not.toHaveBeenCalled()
   })
 
+  it('keeps an empty default preview binding authoritative over an older override after reload', () => {
+    const transform = {
+      ...NODE('transform', 'transform'),
+      data: { ...NODE('transform', 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: 'transform_code' },
+      } },
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'reopen defaults', requirements: [],
+      parameters: [{
+        name: 'transform_code', type: 'string' as const,
+        default: "def fn(row): return {**row, 'from_default': 1}",
+      }],
+      nodes: [transform], edges: [],
+    }
+    localStorage.setItem('dp-preview-bindings-alice-c', JSON.stringify({
+      transform: {
+        canvasId: 'c', nodeId: 'transform', portId: 'out',
+        planIdentity: previewPlanIdentity(doc, 'transform', 'out'),
+        // The user returned from an override full run to the Canvas default preview.
+        parameterBindings: [], inputManifest: [],
+      },
+    }))
+    apiMocks.retainedResult.mockResolvedValueOnce({
+      runId: 'older-override-run',
+      executionManifestSha256: 'a'.repeat(64),
+      parameterBindings: [{
+        name: 'transform_code',
+        value: "def fn(row): return {**row, 'from_override': 1}",
+      }],
+      output: {
+        nodeId: 'transform', portId: 'out', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: '/results/override.parquet',
+      },
+    })
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    expect(useStore.getState().runs.transform?.parameterBindings).toEqual([])
+    expect(useStore.getState().previewBindings.transform.parameterBindings).toEqual([])
+    expect(apiMocks.retainedResult).not.toHaveBeenCalled()
+  })
+
   it('does not overwrite a binding entered while retained-result recovery is in flight', async () => {
     const transform = {
       ...NODE('transform', 'transform'),

@@ -4407,7 +4407,7 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const previewBindings = readPreviewBindings(get().currentUser?.id, d)
       const retainedRuns = Object.fromEntries(Object.entries(previewBindings).flatMap(([nodeId, binding]) => (
-        binding.parameterBindings?.length
+        binding.parameterBindings !== undefined
           ? [[nodeId, { phase: 'idle' as const, parameterBindings: binding.parameterBindings }]]
           : []
       )))
