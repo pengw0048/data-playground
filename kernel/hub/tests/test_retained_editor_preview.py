@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from hub import execution_manifest, metadb
 from hub.deps import get_deps
 from hub.main import app
-from hub.models import SampleResult
+from hub.models import ParameterBinding, SampleResult
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.routers import runs as runs_router
 
@@ -107,6 +107,279 @@ def _wait_for_history_projection(run_id: str) -> None:
     pytest.fail(f"run {run_id} did not reach projected history")
 
 
+def _transform_join_graph(canvas_id: str) -> dict:
+    events = get_deps().catalog.get_table("tbl_events")
+    events_uri = events.uri
+    return {
+        "id": canvas_id,
+        "name": "Retained Transform schema",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "left",
+                "type": "source",
+                "position": {"x": 0, "y": 0},
+                "data": {"title": "Left events", "config": {
+                    "uri": events_uri, "registrationId": events.registration_id,
+                }},
+            },
+            {
+                "id": "transform",
+                "type": "transform",
+                "position": {"x": 200, "y": 0},
+                "data": {"title": "Derived amount", "config": {
+                    "source": "adhoc", "mode": "map", "onError": "raise",
+                    "code": "def fn(row):\n    return {**row, 'amount_doubled': row['amount'] * 2}",
+                }},
+            },
+            {
+                "id": "right",
+                "type": "source",
+                "position": {"x": 200, "y": 220},
+                "data": {"title": "Right events", "config": {
+                    "uri": events_uri, "registrationId": events.registration_id,
+                }},
+            },
+            {
+                "id": "join",
+                "type": "join",
+                "position": {"x": 440, "y": 80},
+                "data": {"title": "Join", "config": {"how": "inner", "on": "user_id"}},
+            },
+        ],
+        "edges": [
+            {"id": "left-transform", "source": "left", "sourceHandle": "out",
+             "target": "transform", "targetHandle": "in", "data": {"wire": "dataset"}},
+            {"id": "transform-join", "source": "transform", "sourceHandle": "out",
+             "target": "join", "targetHandle": "a", "data": {"wire": "dataset"}},
+            {"id": "right-join", "source": "right", "sourceHandle": "out",
+             "target": "join", "targetHandle": "b", "data": {"wire": "dataset"}},
+        ],
+    }
+
+
+def _parameterized_transform_join_graph(
+        canvas_id: str, *, default_code: str | None = None) -> dict:
+    graph = _transform_join_graph(canvas_id)
+    declaration = {
+        "name": "transform_code",
+        "type": "string",
+        "required": default_code is None,
+    }
+    if default_code is not None:
+        declaration["default"] = default_code
+    graph["parameters"] = [declaration]
+    graph["nodes"][1]["data"]["config"]["code"] = {
+        "parameterRef": "transform_code",
+    }
+    return graph
+
+
+def _run_transform(graph: dict, code: str | None = None) -> dict:
+    request = {
+        "graph": graph,
+        "targetNodeId": "transform",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+    }
+    if code is not None:
+        request["parameterBindings"] = [{
+            "name": "transform_code",
+            "value": code,
+        }]
+    started = client.post("/api/run", json=request)
+    assert started.status_code == 200, started.text
+    status = _wait(started.json()["runId"])
+    assert status["status"] == "done", status
+    _wait_for_history_projection(status["runId"])
+    return status
+
+
+def test_retained_binding_subsets_merge_by_name_and_conflicting_values_fail_closed():
+    merged = runs_router._merge_retained_parameter_bindings([
+        [ParameterBinding(name="p", value="same")],
+        [
+            ParameterBinding(name="p", value="same"),
+            ParameterBinding(name="q", value=2),
+        ],
+    ])
+    assert merged is not None
+    assert [binding.model_dump(mode="json") for binding in merged] == [
+        {"name": "p", "value": "same"},
+        {"name": "q", "value": 2},
+    ]
+    assert runs_router._merge_retained_parameter_bindings([
+        [ParameterBinding(name="p", value="first")],
+        [ParameterBinding(name="p", value="second")],
+    ]) is None
+
+
+def test_current_retained_transform_result_propagates_schema_and_invalidates():
+    canvas_id = f"retained-transform-schema-{uuid.uuid4().hex}"
+    # This is the product ordering from #1137: run Source -> Transform first, then add a
+    # downstream Source + Join.  The later downstream graph must not stale Transform's result.
+    graph = _transform_join_graph(canvas_id)
+    run_graph = copy.deepcopy(graph)
+    run_graph["nodes"] = run_graph["nodes"][:2]
+    run_graph["edges"] = run_graph["edges"][:1]
+    created = client.post("/api/canvas", json=run_graph)
+    assert created.status_code == 200, created.text
+    try:
+        before = client.post("/api/graph/schema", json={"graph": run_graph})
+        assert before.status_code == 200, before.text
+        assert before.json()["transform"]["out"] is None
+
+        started = client.post("/api/run", json={
+            "graph": run_graph, "targetNodeId": "transform", "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done", status
+        _wait_for_history_projection(status["runId"])
+
+        saved = client.get(f"/api/canvas/{canvas_id}")
+        assert saved.status_code == 200, saved.text
+        updated = client.put(
+            f"/api/canvas/{canvas_id}?expectedVersion={saved.json()['version']}", json=graph)
+        assert updated.status_code == 200, updated.text
+
+        current = client.post("/api/graph/schema", json={"graph": graph})
+        assert current.status_code == 200, current.text
+        current_schema = current.json()
+        transform_columns = [column["name"] for column in current_schema["transform"]["out"]]
+        assert transform_columns == ["id", "user_id", "event", "amount", "amount_doubled"]
+        assert "amount_doubled" in [column["name"] for column in current_schema["join"]["out"]]
+
+        # A fresh schema request models Canvas reload: evidence is retained in the run/result
+        # contract, not in a client preview or a mutation of the saved graph.
+        reloaded = client.post("/api/graph/schema", json={"graph": graph})
+        assert reloaded.status_code == 200, reloaded.text
+        assert reloaded.json()["transform"]["out"] == current_schema["transform"]["out"]
+
+        for field, value in (
+            ("code", "def fn(row):\n    return {**row, 'amount_tripled': row['amount'] * 3}"),
+            ("mode", "filter"),
+            ("onError", "drop"),
+        ):
+            changed = copy.deepcopy(graph)
+            changed["nodes"][1]["data"]["config"][field] = value
+            response = client.post("/api/graph/schema", json={"graph": changed})
+            assert response.status_code == 200, response.text
+            assert response.json()["transform"]["out"] is None
+            assert response.json()["join"]["out"] is None
+
+        changed_source = copy.deepcopy(graph)
+        images = get_deps().catalog.get_table("tbl_images")
+        changed_source["nodes"][0]["data"]["config"] = {
+            "uri": images.uri, "registrationId": images.registration_id,
+        }
+        response = client.post("/api/graph/schema", json={"graph": changed_source})
+        assert response.status_code == 200, response.text
+        assert response.json()["transform"]["out"] is None
+        assert response.json()["join"]["out"] is None
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_parameterized_transform_schema_uses_exact_current_full_run_bindings():
+    canvas_id = f"retained-required-transform-schema-{uuid.uuid4().hex}"
+    graph = _parameterized_transform_join_graph(canvas_id)
+    doubled = "def fn(row):\n    return {**row, 'required_doubled': row['amount'] * 2}"
+    tripled = "def fn(row):\n    return {**row, 'changed_tripled': row['amount'] * 3}"
+    created = client.post("/api/canvas", json=graph)
+    assert created.status_code == 200, created.text
+    try:
+        status = _run_transform(graph, doubled)
+        bindings = [{"name": "transform_code", "value": doubled}]
+
+        immediate = client.post("/api/graph/schema", json={
+            "graph": graph,
+            "parameterBindings": bindings,
+        })
+        assert immediate.status_code == 200, immediate.text
+        assert "required_doubled" in [
+            column["name"] for column in immediate.json()["join"]["out"]]
+
+        identity = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "transform",
+            "portId": "out",
+        })
+        assert identity.status_code == 200, identity.text
+        assert identity.json()["runId"] == status["runId"]
+        assert identity.json()["parameterBindings"] == bindings
+
+        # Omission models a reload. The server recovers the full-run binding from the exact
+        # persisted manifest rather than resolving the required parameter from Canvas config.
+        reloaded = client.post("/api/graph/schema", json={"graph": graph})
+        assert reloaded.status_code == 200, reloaded.text
+        assert reloaded.json()["transform"]["out"] == immediate.json()["transform"]["out"]
+
+        changed = client.post("/api/graph/schema", json={
+            "graph": graph,
+            "parameterBindings": [{"name": "transform_code", "value": tripled}],
+        })
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["transform"]["out"] is None
+        assert changed.json()["join"]["out"] is None
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_newest_parameterized_transform_result_does_not_fall_back_to_stale_default():
+    canvas_id = f"retained-default-transform-schema-{uuid.uuid4().hex}"
+    default_code = "def fn(row):\n    return {**row, 'from_default': row['amount'] * 2}"
+    override_code = "def fn(row):\n    return {**row, 'from_override': row['amount'] * 3}"
+    graph = _parameterized_transform_join_graph(
+        canvas_id, default_code=default_code)
+    created = client.post("/api/canvas", json=graph)
+    assert created.status_code == 200, created.text
+    try:
+        default_run = _run_transform(graph)
+        override_run = _run_transform(graph, override_code)
+        assert override_run["runId"] != default_run["runId"]
+
+        identity = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "transform",
+            "portId": "out",
+        })
+        assert identity.status_code == 200, identity.text
+        assert identity.json()["runId"] == override_run["runId"]
+        assert identity.json()["parameterBindings"] == [{
+            "name": "transform_code",
+            "value": override_code,
+        }]
+
+        reloaded = client.post("/api/graph/schema", json={"graph": graph})
+        assert reloaded.status_code == 200, reloaded.text
+        names = [
+            column["name"] for column in reloaded.json()["transform"]["out"]]
+        assert "from_override" in names
+        assert "from_default" not in names
+
+        changed_to_default = client.post("/api/graph/schema", json={
+            "graph": graph,
+            "parameterBindings": [],
+        })
+        assert changed_to_default.status_code == 200, changed_to_default.text
+        assert changed_to_default.json()["transform"]["out"] is None
+        assert changed_to_default.json()["join"]["out"] is None
+
+        stale_default = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "transform",
+            "portId": "out",
+            "parameterBindings": [],
+        })
+        assert stale_default.status_code == 409, stale_default.text
+        assert stale_default.json()["code"] == "retained_upstream_stale"
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+
+
 @contextmanager
 def _retained_sample(tmp_path, configure_graph=None, *, logical_source=False):
     lance = pytest.importorskip("lance")
@@ -191,6 +464,7 @@ def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_s
     assert response.json() == {
         "runId": run_id,
         "executionManifestSha256": history_before[0]["executionManifestSha256"],
+        "parameterBindings": [],
         "output": output,
     }
     page = client.post(f"/api/run/{run_id}/sample", json={
@@ -205,6 +479,12 @@ def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_s
     stale = _retained_result(changed)
     assert stale.status_code == 409, stale.text
     assert stale.json()["code"] == "retained_upstream_stale"
+
+    changed_source = copy.deepcopy(graph)
+    changed_source["nodes"][0]["data"]["config"]["datasetRef"]["revisionId"] = "other-revision"
+    stale_source = _retained_result(changed_source)
+    assert stale_source.status_code == 409, stale_source.text
+    assert stale_source.json()["code"] == "retained_upstream_stale"
 
     os.unlink(output["uri"])
     retained_identity = _retained_result(graph)
@@ -227,7 +507,34 @@ def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_pat
         assert response.json()["runId"] == run_id
 
 
-def test_canvas_does_not_treat_missing_bindings_as_defaults_or_fall_back(tmp_path):
+def test_canvas_recovers_public_latest_dataset_binding_without_admission_freeze(tmp_path):
+    dataset_id = ""
+
+    def configure(graph):
+        nonlocal dataset_id
+        dataset_id = graph["nodes"][0]["data"]["config"]["datasetRef"]["datasetId"]
+        graph["parameters"] = [{
+            "name": "input_dataset",
+            "type": "dataset",
+            "default": {"kind": "latest", "datasetId": dataset_id},
+        }]
+        graph["nodes"][0]["data"]["config"]["datasetRef"] = {
+            "parameterRef": "input_dataset",
+        }
+
+    with _retained_sample(tmp_path, configure) as (graph, run_id, _output):
+        response = _retained_result(graph)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["runId"] == run_id
+        assert response.json()["parameterBindings"] == [{
+            "name": "input_dataset",
+            "value": {"kind": "latest", "datasetId": dataset_id},
+        }]
+        assert "resolvedRevisionId" not in response.text
+
+
+def test_canvas_recovers_manifest_bindings_without_falling_back_to_an_older_default(tmp_path):
     def configure(graph):
         graph["parameters"] = [{
             "name": "sample_size",
@@ -253,10 +560,13 @@ def test_canvas_does_not_treat_missing_bindings_as_defaults_or_fall_back(tmp_pat
         assert bound["runId"] != default_run_id
         history_before = metadb.list_runs(graph["id"])
 
-        unknown = _retained_result(graph)
-        assert unknown.status_code == 409, unknown.text
-        assert unknown.json()["code"] == "retained_upstream_stale"
-        assert "parameter bindings" in unknown.json()["detail"]
+        recovered = _retained_result(graph)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["runId"] == bound["runId"]
+        assert recovered.json()["parameterBindings"] == [{
+            "name": "sample_size",
+            "value": 2,
+        }]
 
         exact = client.post("/api/run/retained-result", json={
             "graph": graph,
@@ -273,8 +583,8 @@ def test_canvas_does_not_treat_missing_bindings_as_defaults_or_fall_back(tmp_pat
             "portId": "out",
             "parameterBindings": [],
         })
-        assert defaults.status_code == 200, defaults.text
-        assert defaults.json()["runId"] == default_run_id
+        assert defaults.status_code == 409, defaults.text
+        assert defaults.json()["code"] == "retained_upstream_stale"
         assert metadb.list_runs(graph["id"]) == history_before
 
 

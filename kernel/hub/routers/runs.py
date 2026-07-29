@@ -45,6 +45,7 @@ from hub.execution_manifest import (
     build_execution_manifest,
     execution_manifest_accepts_graph_replay,
     execution_manifest_admission,
+    execution_manifest_parameter_intent_matches,
 )
 from hub.plugins.adapters import (
     RevisionPermissionLost,
@@ -1492,6 +1493,7 @@ class RetainedResultIdentity(BaseModel):
 
     run_id: str
     execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parameter_bindings: list[ParameterBinding]
     output: RunOutput
 
 
@@ -2309,22 +2311,56 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
 @router.post("/graph/schema", response_model=GraphSchema)
 def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> GraphSchema:
     """Per-node, per-output-port metadata columns for editor inspection and suggestions."""
-    _require_graph_read_access(req.graph, uid)
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    bindings_explicit = "parameter_bindings" in req.model_fields_set
+    retained_results = _current_retained_transform_results(
+        _target_execution_graph(req.graph, req.target_node_id), canvas_id, uid, deps,
+        requested_bindings=req.parameter_bindings if bindings_explicit else None)
+    effective_bindings = req.parameter_bindings
+    if "parameter_bindings" not in req.model_fields_set:
+        # A reload has no trusted in-memory parameter form. Recover one unambiguous binding intent
+        # from the same persisted current-result identities used for schema evidence. Manifests
+        # retain only target-cone parameters, so compatible subsets merge by name; only two
+        # different values for the same parameter are ambiguous.
+        merged_bindings = _merge_retained_parameter_bindings([
+            identity.parameter_bindings for identity in retained_results.values()])
+        if merged_bindings is None:
+            retained_results = {
+                node_id: identity
+                for node_id, identity in retained_results.items()
+                if not identity.parameter_bindings
+            }
+        elif merged_bindings:
+            effective_bindings = merged_bindings
     req.graph = _resolve_parameters(
-        req.graph, req.parameter_bindings, req.target_node_id, deps)
+        req.graph, effective_bindings, req.target_node_id, deps)
     if req.input_manifest is not None and req.target_node_id is None:
         raise HTTPException(400, "schema inputManifest requires targetNodeId")
-    _reject_invalid(req.graph, deps, req.target_node_id)
+    # Schema inspection is what lets the editor offer the columns needed to finish configuring a
+    # Join.  Keep every other structural check, but do not make a missing Join condition prevent
+    # the user from discovering those columns; execution endpoints remain fail-closed.
+    _reject_invalid(
+        req.graph, deps, req.target_node_id, enforce_join_condition=False)
     graph = _target_execution_graph(req.graph, req.target_node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(graph, deps, req.target_node_id)
+    _reject_invalid(
+        graph, deps, req.target_node_id, enforce_join_condition=False)
     if req.input_manifest is not None:
         graph, _manifest = _inspection_manifest_graph(
             graph, req.target_node_id, req.input_manifest, deps)
-        _reject_invalid(graph, deps, req.target_node_id)
+        _reject_invalid(
+            graph, deps, req.target_node_id, enforce_join_condition=False)
     try:
-        return schema_for_graph_ports(graph, deps.resolve_adapter, deps.registry,
+        # Dynamic Python output stays unknown until a committed full run proves it.  Reuse the
+        # retained-result contract to attach that proof only while the exact current target cone
+        # still matches; the transient declaration then flows through the ordinary schema engine.
+        # It is deliberately not written back to the Canvas config (a run result is evidence, not a
+        # user-declared contract), and Join consumes no special endpoint or client-side guess.
+        schema_graph = _graph_with_current_retained_transform_schemas(
+            graph, retained_results, deps)
+        return schema_for_graph_ports(schema_graph, deps.resolve_adapter, deps.registry,
                                       deps.node_builders, deps.node_specs, storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
@@ -4019,6 +4055,34 @@ def _retained_editor_target(
     return edge, upstream, upstream_port, _target_execution_graph(graph, upstream.id)
 
 
+def _public_retained_parameter_bindings(
+        canonical_bindings: list[dict]) -> list[ParameterBinding]:
+    """Expose persisted binding intent without the admission-only latest revision freeze."""
+    bindings = []
+    for item in canonical_bindings:
+        value = copy.deepcopy(item["value"])
+        if isinstance(value, dict) and value.get("kind") == "latest":
+            value.pop("resolvedRevisionId", None)
+        bindings.append(ParameterBinding(name=str(item["name"]), value=value))
+    return bindings
+
+
+def _merge_retained_parameter_bindings(
+        binding_sets: list[list[ParameterBinding]]) -> list[ParameterBinding] | None:
+    """Merge compatible target-cone binding subsets; reject only one name with two values."""
+    merged: dict[str, tuple[str, ParameterBinding]] = {}
+    for bindings in binding_sets:
+        for binding in bindings:
+            binding_json = binding.model_dump(by_alias=True, mode="json")
+            value_identity = json.dumps(
+                binding_json["value"], sort_keys=True, separators=(",", ":"))
+            existing = merged.get(binding.name)
+            if existing is not None and existing[0] != value_identity:
+                return None
+            merged[binding.name] = (value_identity, binding)
+    return [merged[name][1] for name in sorted(merged)]
+
+
 def _retained_current_output(
         candidate: dict, target, current_cone: Graph, deps) -> RunOutput:
     """Prove one server-selected retained candidate matches the current target cone."""
@@ -4082,6 +4146,17 @@ def _retained_current_output(
             return False
         dataset_ref = current_config.get("datasetRef")
         if isinstance(dataset_ref, dict):
+            if dataset_ref.get("kind") == "latest":
+                retained_ref = retained_config.get("datasetRef")
+                try:
+                    retained_identity = dataset_ref_identity(retained_ref)
+                except (TypeError, ValueError):
+                    return False
+                return (
+                    dataset_ref.get("datasetId") == admitted["dataset_id"]
+                    and retained_identity == (
+                        admitted["dataset_id"], admitted["revision_id"])
+                )
             try:
                 return dataset_ref_identity(dataset_ref) == (
                     admitted["dataset_id"], admitted["revision_id"])
@@ -4125,8 +4200,20 @@ def _retained_current_output(
         raise _retained_editor_error(
             409, "the immediate upstream Source registration changed",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
-    retained_graph._parameter_bindings = copy.deepcopy(admission.get("parameters") or [])
+    retained_parameters = admission.get("parameters")
+    if not execution_manifest_parameter_intent_matches(
+            retained_parameters, current_cone._parameter_bindings or None):
+        raise _retained_editor_error(
+            409, "the immediate upstream parameter bindings changed",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    retained_canonical = retained_parameters or []
+    retained_graph._parameter_bindings = copy.deepcopy(retained_canonical)
     retained_cone._parameter_bindings = copy.deepcopy(retained_graph._parameter_bindings)
+    # The retained latest resolution is exact admission evidence.  It is restored only after the
+    # public parameter intent above has matched, so the cone digest can compare immutable inputs
+    # without treating a moved latest head as an edit to this result.
+    current_for_digest = current_cone.model_copy(deep=True)
+    current_for_digest._parameter_bindings = copy.deepcopy(retained_canonical)
     try:
         rebuilt_retained_digest, _ = build_execution_manifest(
             retained_graph,
@@ -4137,7 +4224,7 @@ def _retained_current_output(
             deps=deps,
         )
         current_digest, _ = build_execution_manifest(
-            current_cone,
+            current_for_digest,
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
@@ -4166,10 +4253,162 @@ def _retained_current_output(
     return output
 
 
+def _current_retained_result(
+        graph: Graph, canvas_id: str, node_id: str, port_id: str,
+        uid: str, deps, *,
+        requested_bindings: list[ParameterBinding] | None = None,
+        ) -> RetainedResultIdentity:
+    """Select the newest retained result current under its own persisted bindings.
+
+    Selection is deliberately independent of a caller's current binding form.  Once this function
+    establishes the one current result identity, callers may check their requested bindings against
+    that same candidate, but must never fall through to an older result for a different binding.
+    """
+    candidates = metadb.retained_run_output_candidates(canvas_id, node_id, port_id)
+    if not candidates:
+        raise _retained_editor_error(
+            404, "retained current result not found",
+            APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    for candidate in candidates:
+        run_id = str(candidate["run_id"])
+        if not _run_read_access(run_id, uid):
+            continue
+        try:
+            manifest_sha256 = str(candidate.get("execution_manifest_sha256") or "")
+            retained = (
+                metadb.execution_manifest(manifest_sha256)
+                if manifest_sha256 else None)
+            if retained is None:
+                raise _retained_editor_error(
+                    409, "retained upstream execution plan is unavailable",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+            payload = json.dumps(
+                retained["document"], sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True)
+            admission = execution_manifest_admission(manifest_sha256, payload)
+            retained_canonical = retained["document"].get("parameters") or []
+            parameter_bindings = _public_retained_parameter_bindings(
+                retained_canonical)
+            current = _resolve_parameters(
+                graph, parameter_bindings, node_id, deps, freeze_latest=False)
+            current_cone = _target_execution_graph(current, node_id)
+            graph_mod.resolve_source_refs(current_cone, deps.catalog.resolve_ref)
+            _reject_invalid(current_cone, deps, node_id)
+            retained_graph = Graph.model_validate(admission["graph_doc"])
+            retained_graph._parameter_bindings = copy.deepcopy(retained_canonical)
+            target = graph_mod.node_map(retained_graph).get(node_id)
+            if target is None:
+                raise _retained_editor_error(
+                    409, "current result target is missing",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+            if _inspection_port(retained_graph, node_id, port_id, deps) != port_id:
+                raise _retained_editor_error(
+                    409, "current result targets a different output",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+            output = _retained_current_output(
+                candidate, target, current_cone, deps)
+        except (APIError, ExecutionManifestError, ValueError):
+            continue
+        if requested_bindings is not None:
+            requested = _resolve_parameters(
+                graph, requested_bindings, node_id, deps, freeze_latest=False)
+            requested_cone = _target_execution_graph(requested, node_id)
+            graph_mod.resolve_source_refs(requested_cone, deps.catalog.resolve_ref)
+            _reject_invalid(requested_cone, deps, node_id)
+            try:
+                _retained_current_output(candidate, target, requested_cone, deps)
+            except (APIError, ExecutionManifestError, ValueError):
+                raise _retained_editor_error(
+                    409, "current result parameter bindings changed",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+        return RetainedResultIdentity(
+            run_id=run_id,
+            execution_manifest_sha256=manifest_sha256,
+            parameter_bindings=parameter_bindings,
+            output=output,
+        )
+    raise _retained_editor_error(
+        409, "no retained result matches the current execution plan",
+        APIErrorCode.RETAINED_UPSTREAM_STALE)
+
+
 def _retained_editor_output(
         candidate: dict, upstream, current_cone: Graph, deps) -> RunOutput:
     """Prove one server-selected retained candidate matches the current upstream cone."""
     return _retained_current_output(candidate, upstream, current_cone, deps)
+
+
+def _current_retained_transform_results(
+        graph: Graph, canvas_id: str, uid: str, deps, *,
+        requested_bindings: list[ParameterBinding] | None = None,
+        ) -> dict[str, RetainedResultIdentity]:
+    """Recover each Transform's current full-result identity from durable run facts."""
+    if not canvas_id:
+        return {}
+    current: dict[str, RetainedResultIdentity] = {}
+    for node in graph.nodes:
+        if node.type != "transform":
+            continue
+        try:
+            current[node.id] = _current_retained_result(
+                graph, canvas_id, node.id, "out", uid, deps,
+                requested_bindings=requested_bindings)
+        except APIError:
+            continue
+    return current
+
+
+def _graph_with_current_retained_transform_schemas(
+        graph: Graph,
+        retained_results: dict[str, RetainedResultIdentity],
+        deps) -> Graph:
+    """Overlay current retained Python-result schemas for one metadata-only graph inspection.
+
+    A retained artifact is evidence only after ``_retained_current_output`` proves the exact
+    execution manifest still matches the node's present target cone.  This covers code, mode,
+    upstream identity, and every schema-relevant config field without copying a second freshness
+    rule into schema propagation.  Failed, missing, stale, or unreadable artifacts remain unknown.
+    """
+    if not retained_results:
+        return graph
+    enriched = graph.model_copy(deep=True)
+    for node in enriched.nodes:
+        if node.type != "transform":
+            continue
+        retained = retained_results.get(node.id)
+        if retained is None:
+            continue
+        identity = retained
+        try:
+            output = identity.output
+            uri = output.uri or ""
+            with source_read_scope(
+                    deps.storage, [uri],
+                    owner=f"schema-retained:{identity.run_id}:{uuid.uuid4().hex}"):
+                member = _object_attempt_member(uri)
+                target_uri = member[0] if member is not None else uri
+                if member is not None and output.rows is not None and member[2] != output.rows:
+                    continue
+                raw_schema = deps.resolve_adapter(target_uri).schema(target_uri)
+                columns = [ColumnSchema.model_validate(column) for column in raw_schema]
+        except (APIError, FileNotFoundError, ManagedSourceReadError, PermissionError, ValueError):
+            continue
+        except Exception:  # noqa: BLE001 - retained evidence must fail closed to unknown
+            continue
+        if not columns:
+            # An empty output still has an Arrow/Parquet schema. Treat a provider that cannot
+            # supply it as unknown instead of asserting a zero-column contract.
+            continue
+        config = node.data.get("config", {}) if isinstance(node.data, dict) else None
+        if not isinstance(config, dict):
+            continue
+        config["outputSchema"] = [
+            column.model_dump(by_alias=True, mode="json") for column in columns
+        ]
+        # This is observed output, not a manually pinned declaration. A stale declaration hash
+        # must not weaken the exact retained-result proof above.
+        config.pop("outputSchemaCodeHash", None)
+    return enriched
 
 
 def _retained_editor_graph(
@@ -4341,42 +4580,17 @@ def retained_canvas_result(
         raise _retained_editor_error(
             404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
     deps = get_deps()
-    graph = _resolve_parameters(
-        req.graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
-    if "parameter_bindings" not in req.model_fields_set and graph._parameter_bindings:
-        raise _retained_editor_error(
-            409, "current result parameter bindings are unavailable",
-            APIErrorCode.RETAINED_UPSTREAM_STALE)
-    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
-    _reject_invalid(graph, deps, req.node_id)
-    target = graph_mod.node_map(graph).get(req.node_id)
+    target = graph_mod.node_map(req.graph).get(req.node_id)
     if target is None:
         raise _retained_editor_error(
             409, "current result target is missing", APIErrorCode.RETAINED_UPSTREAM_STALE)
-    port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    current_cone = _target_execution_graph(graph, req.node_id)
-    candidates = metadb.retained_run_output_candidates(
-        canvas_id, req.node_id, port_id)
-    if not candidates:
-        raise _retained_editor_error(
-            404, "retained current result not found",
-            APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
-    for candidate in candidates:
-        run_id = str(candidate["run_id"])
-        if not _run_read_access(run_id, uid):
-            continue
-        try:
-            output = _retained_current_output(candidate, target, current_cone, deps)
-        except APIError:
-            continue
-        return RetainedResultIdentity(
-            run_id=run_id,
-            execution_manifest_sha256=str(candidate["execution_manifest_sha256"]),
-            output=output,
-        )
-    raise _retained_editor_error(
-        409, "no retained result matches the current execution plan",
-        APIErrorCode.RETAINED_UPSTREAM_STALE)
+    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
+    return _current_retained_result(
+        req.graph, canvas_id, req.node_id, port_id, uid, deps,
+        requested_bindings=(
+            req.parameter_bindings
+            if "parameter_bindings" in req.model_fields_set else None),
+    )
 
 
 @router.post("/run/{run_id}/sample", response_model=SampleResult)

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   parameterBindingsIdentity, previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey,
-  roleCanEdit, targetParameterDeclarations, useStore,
+  roleCanEdit, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api, KernelError } from '../api/client'
@@ -80,9 +80,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const committedRunOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
     ? selectedRunOutput
     : undefined
-  const retainedBindingsUnavailable = !editorPreview && node?.data.status === 'latest'
-    && !committedRunOutput && !parameterBindingsKnown
-    && targetParameterDeclarations(doc, nodeId).length > 0
   const retainedRequestGeneration = useRef(0)
   const [retainedResult, setRetainedResult] = useState<{
     nodeId: string
@@ -123,7 +120,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     setRetainedResult(null)
     setRetainedResultUnavailable(false)
     if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
-        || retainedBindingsUnavailable
         || retainedPortId === undefined) return
     const requestDoc = doc
     const requestPlanIdentity = planIdentity
@@ -167,7 +163,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     editorPreview, nodeId, retainedPortId, node?.data.status, committedRunOutput?.uri,
-    retainedBindingsUnavailable, parameterBindingsKnown, planIdentity, bindingsIdentity,
+    parameterBindingsKnown, planIdentity, bindingsIdentity,
   ])
   useEffect(() => {
     if (editorPreview?.autoLoad !== false
@@ -211,20 +207,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         selectedPortId={selectedPortId} onSelect={choosePort} />
       {!editorPreview && (
         <SelectedOutputOutcome output={displayedSelectedOutput} />
-      )}
-      {retainedBindingsUnavailable && (
-        <div role="status" aria-label="Retained result parameters unavailable"
-          className="flex items-center gap-3 border-b border-border bg-amber-500/5 px-3 py-2 text-[11px] text-muted-foreground">
-          <span className="flex-1">
-            The parameters used by the saved result are not available in this session. Run this step
-            to create a result with verified parameters.
-          </span>
-          {canEdit && (
-            <Button variant="outline" size="sm" onClick={() => requestRun(nodeId)}>
-              Run this step
-            </Button>
-          )}
-        </div>
       )}
       {editorPreview && preview?.result?.editorTestInput && (
         <div role="status" className="border-b border-border bg-primary/5 px-3 py-2 text-[11px] font-medium text-foreground">

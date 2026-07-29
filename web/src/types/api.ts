@@ -1,5 +1,5 @@
 // Kernel API DTOs — camelCase on the wire, mirrors kernel/models.py.
-import type { ColumnSchema, ExactDatasetRef, NodeConfig } from './graph'
+import type { CanvasParameterBinding, ColumnSchema, ExactDatasetRef, NodeConfig } from './graph'
 import type { WireType } from '../theme/tokens'
 
 export interface ResourceSpec {
@@ -794,6 +794,7 @@ export interface RunOutput {
 export interface RetainedResultIdentity {
   runId: string
   executionManifestSha256: string
+  parameterBindings: CanvasParameterBinding[]
   output: RunOutput
 }
 

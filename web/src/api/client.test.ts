@@ -15,6 +15,7 @@ describe('API error recovery contract', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       runId: 'retained-run',
       executionManifestSha256: 'a'.repeat(64),
+      parameterBindings: [],
       output: {
         nodeId: 'transform', portId: 'out', wire: 'dataset',
         publicationKind: 'result', outcome: 'committed', uri: '/private/result.parquet', rows: 2,

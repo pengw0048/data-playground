@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 const apiMocks = vi.hoisted(() => ({
   kernel: vi.fn(), nodes: vi.fn(), me: vi.fn(), users: vi.fn(),
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
+  retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
@@ -27,6 +27,8 @@ vi.mock('../api/client', () => ({
               ? apiMocks.listCanvases
       : property === 'listRuns'
         ? apiMocks.listRuns
+      : property === 'retainedResult'
+        ? apiMocks.retainedResult
       : property === 'retainedEditorPreview'
         ? apiMocks.retainedEditorPreview
       : property === 'exampleRowsEditorPreview'
@@ -122,6 +124,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.users.mockReset().mockResolvedValue([{ id: 'alice', name: 'Alice' }])
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
+    apiMocks.retainedResult.mockReset().mockRejectedValue(new Error('no retained result'))
     apiMocks.retainedEditorPreview.mockReset()
     apiMocks.exampleRowsEditorPreview.mockReset()
     apiMocks.getCanvas.mockReset()
@@ -261,6 +264,220 @@ describe('graph store — core authority ops', () => {
     useStore.getState().loadDoc({ id: 'other', version: 1, name: 'other', nodes: [], edges: [] }, 'owner')
 
     expect(useStore.getState().agentLog).toEqual([])
+  })
+
+  it('recovers missing Transform full-run bindings from the retained manifest on reload', async () => {
+    const transform = {
+      ...NODE('transform', 'transform'),
+      data: { ...NODE('transform', 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: 'transform_code' },
+      } },
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'reopen', requirements: [],
+      parameters: [{ name: 'transform_code', type: 'string' as const, required: true }],
+      nodes: [transform], edges: [],
+    }
+    const parameterBindings = [{
+      name: 'transform_code',
+      value: "def fn(row): return {**row, 'derived': 1}",
+    }]
+    apiMocks.retainedResult.mockResolvedValueOnce({
+      runId: 'retained-transform-run',
+      executionManifestSha256: 'a'.repeat(64),
+      parameterBindings,
+      output: {
+        nodeId: 'transform', portId: 'out', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: '/results/transform.parquet',
+      },
+    })
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    await vi.waitFor(() => expect(useStore.getState().runs.transform?.parameterBindings)
+      .toEqual(parameterBindings))
+    expect(apiMocks.retainedResult).toHaveBeenCalledWith(doc, 'transform', 'out')
+    await vi.waitFor(() => expect(apiMocks.schema).toHaveBeenCalledWith(
+      doc, undefined, undefined, parameterBindings,
+    ))
+  })
+
+  it('preserves an existing local preview binding instead of replacing it with a full-run binding', () => {
+    const transform = {
+      ...NODE('transform', 'transform'),
+      data: { ...NODE('transform', 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: 'transform_code' },
+      } },
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'reopen', requirements: [],
+      parameters: [{ name: 'transform_code', type: 'string' as const, required: true }],
+      nodes: [transform], edges: [],
+    }
+    const previewBindings = [{
+      name: 'transform_code',
+      value: "def fn(row): return {**row, 'preview_only': 1}",
+    }]
+    localStorage.setItem('dp-preview-bindings-alice-c', JSON.stringify({
+      transform: {
+        canvasId: 'c', nodeId: 'transform', portId: 'out',
+        planIdentity: previewPlanIdentity(doc, 'transform', 'out'),
+        parameterBindings: previewBindings, inputManifest: [],
+      },
+    }))
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    expect(useStore.getState().runs.transform?.parameterBindings).toEqual(previewBindings)
+    expect(apiMocks.retainedResult).not.toHaveBeenCalled()
+  })
+
+  it('keeps an empty default preview binding authoritative over an older override after reload', () => {
+    const transform = {
+      ...NODE('transform', 'transform'),
+      data: { ...NODE('transform', 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: 'transform_code' },
+      } },
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'reopen defaults', requirements: [],
+      parameters: [{
+        name: 'transform_code', type: 'string' as const,
+        default: "def fn(row): return {**row, 'from_default': 1}",
+      }],
+      nodes: [transform], edges: [],
+    }
+    localStorage.setItem('dp-preview-bindings-alice-c', JSON.stringify({
+      transform: {
+        canvasId: 'c', nodeId: 'transform', portId: 'out',
+        planIdentity: previewPlanIdentity(doc, 'transform', 'out'),
+        // The user returned from an override full run to the Canvas default preview.
+        parameterBindings: [], inputManifest: [],
+      },
+    }))
+    apiMocks.retainedResult.mockResolvedValueOnce({
+      runId: 'older-override-run',
+      executionManifestSha256: 'a'.repeat(64),
+      parameterBindings: [{
+        name: 'transform_code',
+        value: "def fn(row): return {**row, 'from_override': 1}",
+      }],
+      output: {
+        nodeId: 'transform', portId: 'out', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: '/results/override.parquet',
+      },
+    })
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    expect(useStore.getState().runs.transform?.parameterBindings).toEqual([])
+    expect(useStore.getState().previewBindings.transform.parameterBindings).toEqual([])
+    expect(apiMocks.retainedResult).not.toHaveBeenCalled()
+  })
+
+  it('does not overwrite a binding entered while retained-result recovery is in flight', async () => {
+    const transform = {
+      ...NODE('transform', 'transform'),
+      data: { ...NODE('transform', 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: 'transform_code' },
+      } },
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'reopen', requirements: [],
+      parameters: [{ name: 'transform_code', type: 'string' as const, required: true }],
+      nodes: [transform], edges: [],
+    }
+    let finishRecovery!: (identity: any) => void
+    apiMocks.retainedResult.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    useStore.getState().loadDoc(doc, 'owner')
+    await vi.waitFor(() => expect(apiMocks.retainedResult).toHaveBeenCalled())
+    const local = { name: 'transform_code', value: 'local edit' }
+    useStore.getState().setRunParameterBinding('transform', local)
+
+    finishRecovery({
+      runId: 'older-retained-run', executionManifestSha256: 'a'.repeat(64),
+      parameterBindings: [{ name: 'transform_code', value: 'retained code' }],
+      output: {
+        nodeId: 'transform', portId: 'out', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: '/result.parquet',
+      },
+    })
+
+    await vi.waitFor(() => expect(useStore.getState().runs.transform?.parameterBindings)
+      .toEqual([local]))
+  })
+
+  it('merges compatible Transform binding subsets and rejects conflicting values by name', async () => {
+    const transforms = (['a', 'b'] as const).map((suffix) => ({
+      ...NODE(`transform-${suffix}`, 'transform'),
+      data: { ...NODE(`transform-${suffix}`, 'transform').data, status: 'latest' as const, config: {
+        mode: 'map', code: { parameterRef: `code_${suffix}` },
+      } },
+    }))
+    const doc = {
+      id: 'c', version: 1, name: 'conflicting bindings', requirements: [],
+      parameters: (['a', 'b'] as const).map((suffix) => ({
+        name: `code_${suffix}`, type: 'string' as const, required: true,
+      })),
+      nodes: transforms, edges: [],
+    }
+    apiMocks.schema.mockClear()
+    apiMocks.graphSizes.mockClear()
+    useStore.setState({
+      doc,
+      schemas: { stale: { out: [{ name: 'wrong', type: 'string' }] } },
+      sizes: { stale: { rows: 1, confidence: 'exact' } },
+      runs: {
+        'transform-a': { phase: 'idle', parameterBindings: [{ name: 'code_a', value: 'code a' }] },
+        'transform-b': { phase: 'idle', parameterBindings: [{ name: 'code_b', value: 'code b' }] },
+      },
+    } as any)
+
+    await useStore.getState().refreshSchemas()
+
+    const mergedBindings = [
+      { name: 'code_a', value: 'code a' },
+      { name: 'code_b', value: 'code b' },
+    ]
+    expect(apiMocks.schema).toHaveBeenCalledWith(
+      doc, undefined, undefined, mergedBindings,
+    )
+    expect(apiMocks.graphSizes).toHaveBeenCalledWith(doc, undefined, mergedBindings)
+
+    apiMocks.schema.mockClear()
+    apiMocks.graphSizes.mockClear()
+    const sharedDoc = {
+      ...doc,
+      parameters: [{ name: 'shared_code', type: 'string' as const, required: true }],
+      nodes: transforms.map((node) => ({
+        ...node,
+        data: { ...node.data, config: {
+          ...node.data.config, code: { parameterRef: 'shared_code' },
+        } },
+      })),
+    }
+    useStore.setState({
+      doc: sharedDoc,
+      schemas: { stale: { out: [{ name: 'wrong', type: 'string' }] } },
+      sizes: { stale: { rows: 1, confidence: 'exact' } },
+      runs: {
+        'transform-a': { phase: 'idle', parameterBindings: [{
+          name: 'shared_code', value: 'code a',
+        }] },
+        'transform-b': { phase: 'idle', parameterBindings: [{
+          name: 'shared_code', value: 'code b',
+        }] },
+      },
+    } as any)
+
+    await useStore.getState().refreshSchemas()
+
+    expect(useStore.getState().schemas).toEqual({})
+    expect(useStore.getState().sizes).toEqual({})
+    expect(apiMocks.schema).not.toHaveBeenCalled()
+    expect(apiMocks.graphSizes).not.toHaveBeenCalled()
   })
 
   it('settles persisted transient badges on reopen and version restore when no run is active', async () => {

@@ -520,10 +520,18 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     })
     expect(exact.ok(), exact.ok() ? '' : await exact.text()).toBe(true)
     expect((await exact.json()).runId).toBe(boundRunId)
-    const unknown = await page.request.post('/api/run/retained-result', {
+    const recovered = await page.request.post('/api/run/retained-result', {
       data: { graph, nodeId: 'filter', portId: 'out' },
     })
-    expect(unknown.status()).toBe(409)
+    expect(recovered.ok(), recovered.ok() ? '' : await recovered.text()).toBe(true)
+    const recoveredIdentity = await recovered.json() as {
+      runId: string
+      parameterBindings: Array<{ name: string; value: unknown }>
+    }
+    expect(recoveredIdentity.runId).toBe(boundRunId)
+    expect(recoveredIdentity.parameterBindings).toEqual([{
+      name: 'predicate', value: "event = 'signup'",
+    }])
 
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${doc.id}/runs`)
@@ -542,11 +550,8 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
 
       const panel = freshPage.getByTestId('panel-data')
-      await expect(panel.getByRole('status', {
-        name: 'Retained result parameters unavailable',
-      })).toBeVisible()
-      await expect(panel.getByRole('button', { name: 'Run this step' })).toBeVisible()
-      await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
+      await expect(panel.getByTestId('full-result-status')).toBeVisible()
+      await expect(panel.getByText('event', { exact: true }).first()).toBeVisible()
       const historyAfter = await freshPage.request.get(`/api/canvas/${doc.id}/runs`)
       expect(await historyAfter.json()).toEqual(runsBefore)
     } finally {
