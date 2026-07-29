@@ -153,12 +153,43 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
     storage, catalog = local_catalog
     logical_uri = str(tmp_path / "published" / "managed.parquet")
     first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    with metadb.session() as session:
+        first_entry = session.get(metadb.CatalogEntry, first_uri)
+        assert first_entry is not None
+        first_registration_id = first_entry.registration_id
+        first_placement = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == first_registration_id,
+        ))
+        assert first_placement is not None
+        placement_before = (
+            first_placement.id, first_placement.container_id, first_placement.version)
     selected_before_replacement = ManagedLocalFileRevisionAdapter().open_revision(
         first_uri, first["revision_id"])
     second_uri, second = _publish(storage, catalog, logical_uri, 2)
 
     assert first_uri != second_uri
     assert first["dataset_id"] == second["dataset_id"]
+    with metadb.session() as session:
+        second_entry = session.get(metadb.CatalogEntry, second_uri)
+        assert second_entry is not None
+        placements = list(session.scalars(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id.in_(
+                [first_registration_id, second_entry.registration_id]),
+        )))
+        assert len(placements) == 1
+        assert (
+            placements[0].id,
+            placements[0].container_id,
+            placements[0].target_id,
+            placements[0].version,
+        ) == (
+            placement_before[0],
+            placement_before[1],
+            second_entry.registration_id,
+            placement_before[2] + 1,
+        )
     adapter = ManagedLocalFileRevisionAdapter()
     history, cursor = adapter.revision_history(second_uri, limit=1)
     assert history[0]["revision_id"] == second["revision_id"]

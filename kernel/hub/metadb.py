@@ -3702,6 +3702,20 @@ def _workspace_follow_target_name_in_session(
     ).values(name=current, version=WorkspacePlacement.version + 1))
 
 
+def _workspace_retarget_managed_dataset_head_in_session(
+        s, *, previous_registration_id: str, current_registration_id: str) -> None:
+    """Keep one placement when a managed logical dataset replaces its physical catalog head."""
+    if previous_registration_id == current_registration_id:
+        return
+    s.execute(update(WorkspacePlacement).where(
+        WorkspacePlacement.target_kind == "dataset",
+        WorkspacePlacement.target_id == previous_registration_id,
+    ).values(
+        target_id=current_registration_id,
+        version=WorkspacePlacement.version + 1,
+    ))
+
+
 def _workspace_backfill_root_placements_in_session(s) -> None:
     """One-way pre-1.0 migration of existing local resources into the Workspace root."""
     for canvas_id, name in s.execute(select(Canvas.id, Canvas.name)).all():
@@ -18335,6 +18349,8 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
     logical = None
     old_uri = None
     logical_id = None
+    replaced_registration_id = None
+    replaced_entry_name = None
     locked_entries: dict[str, CatalogEntry] = {}
     attempt = attempt_identity
     parent_snapshots = [
@@ -18454,6 +18470,8 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
                     s.delete(child)
             prior = locked_entries.get(old_uri)
             if prior is not None:
+                replaced_registration_id = prior.registration_id
+                replaced_entry_name = prior.name
                 s.delete(prior)
             s.flush()
 
@@ -18484,6 +18502,12 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
     _sync_children(s, uri, tags, cols)
     s.flush()
 
+    if replaced_registration_id is not None:
+        _workspace_retarget_managed_dataset_head_in_session(
+            s,
+            previous_registration_id=replaced_registration_id,
+            current_registration_id=entry.registration_id,
+        )
     if logical is not None and logical_id is not None:
         logical.current_uri = uri
         logical.current_publish_seq = int(attempt.publish_seq)
@@ -18498,10 +18522,11 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         lineage_publication_key)
     _workspace_ensure_root_placement_in_session(
         s, target_kind="dataset", target_id=entry.registration_id, name=entry.name)
-    if previous_entry_name is not None:
+    followed_name = replaced_entry_name or previous_entry_name
+    if followed_name is not None:
         _workspace_follow_target_name_in_session(
             s, target_kind="dataset", target_id=entry.registration_id,
-            previous_name=previous_entry_name, name=entry.name)
+            previous_name=followed_name, name=entry.name)
     _materialize_folder(s, entry.folder or "")
     _workspace_sync_dataset_folder_in_session(
         s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
@@ -19423,6 +19448,8 @@ def catalog_publish_managed_local_file(
             raise RuntimeError("managed local publication identity is missing")
         old_uri = logical.current_uri
         old = s.get(CatalogEntry, old_uri, with_for_update=True) if old_uri else None
+        replaced_registration_id = old.registration_id if old is not None else None
+        replaced_entry_name = old.name if old is not None else None
         current = s.get(CatalogEntry, artifact_uri, with_for_update=True)
         if current is not None:
             raise RuntimeError("managed local artifact is already cataloged")
@@ -19452,6 +19479,20 @@ def catalog_publish_managed_local_file(
         )
         s.add(entry)
         _sync_children(s, artifact_uri, tags, cols)
+        s.flush()
+        if replaced_registration_id is not None:
+            _workspace_retarget_managed_dataset_head_in_session(
+                s,
+                previous_registration_id=replaced_registration_id,
+                current_registration_id=entry.registration_id,
+            )
+            _workspace_follow_target_name_in_session(
+                s,
+                target_kind="dataset",
+                target_id=entry.registration_id,
+                previous_name=replaced_entry_name or str(name),
+                name=entry.name,
+            )
         revision_id = uuid.uuid4().hex
         committed_at = _db_now(s)
         revision = ManagedLocalFileRevision(
@@ -19514,10 +19555,8 @@ def catalog_publish_managed_local_file(
         logical.state = "active"
         logical.governance_doc = json.dumps(_catalog_governance(payload), default=str, sort_keys=True)
         _materialize_folder(s, folder)
-        entry = s.get(CatalogEntry, artifact_uri)
-        if entry is not None:
-            _workspace_sync_dataset_folder_in_session(
-                s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
+        _workspace_sync_dataset_folder_in_session(
+            s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         # The revision ledger, rather than the replaceable head projection, retains every artifact.
         sync_local_result_owner(s, "managed_file_revision", revision_id, artifact_uri)
         if merge_context is not None:

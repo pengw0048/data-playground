@@ -1539,6 +1539,17 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
     }, parents=["s3://source/one"], pipeline="canvas-v1",
         lineage=_lineage(producer="canvas-v1"))
     stable_id = metadb.catalog_get(first["uri"])["id"]
+    with metadb.session() as session:
+        first_entry = session.get(metadb.CatalogEntry, first["uri"])
+        assert first_entry is not None
+        first_registration_id = first_entry.registration_id
+        first_placement = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == first_registration_id,
+        ))
+        assert first_placement is not None
+        placement_before = (
+            first_placement.id, first_placement.container_id, first_placement.version)
     metadb.catalog_set_declared_key(first["uri"], ["id"])
     metadb.catalog_set_embedding(first["uri"], "model", 1, b"\x00\x00\x80?")
     relationship = {
@@ -1575,6 +1586,25 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
     assert ("s3://source/two", second["uri"]) in exact_facts
     assert metadb.catalog_embeddings_for("model") == [(second["uri"], b"\x00\x00\x80?")]
     with metadb.session() as session:
+        second_entry = session.get(metadb.CatalogEntry, second["uri"])
+        assert second_entry is not None
+        placements = list(session.scalars(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id.in_(
+                [first_registration_id, second_entry.registration_id]),
+        )))
+        assert len(placements) == 1
+        assert (
+            placements[0].id,
+            placements[0].container_id,
+            placements[0].target_id,
+            placements[0].version,
+        ) == (
+            placement_before[0],
+            placement_before[1],
+            second_entry.registration_id,
+            placement_before[2] + 1,
+        )
         logical_row = session.scalar(select(metadb.CatalogLogicalDataset).where(
             metadb.CatalogLogicalDataset.current_uri == second["uri"]))
         assert logical_row is not None
