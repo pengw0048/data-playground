@@ -25,7 +25,8 @@ async function timedPhase(name, action, detail) {
     const result = await action()
     if (timingFile) {
       appendTimingEvent(timingFile, {
-        kind: 'phase', name, status: 'passed', detail, startedAt,
+        kind: 'phase', scope: 'playwright-webserver', parent: 'playwright-run',
+        name, status: 'passed', detail, startedAt,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started),
       })
     }
@@ -33,7 +34,8 @@ async function timedPhase(name, action, detail) {
   } catch (error) {
     if (timingFile) {
       appendTimingEvent(timingFile, {
-        kind: 'phase', name, status: 'failed', detail, startedAt,
+        kind: 'phase', scope: 'playwright-webserver', parent: 'playwright-run',
+        name, status: 'failed', detail, startedAt,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started),
       })
     }
@@ -115,7 +117,8 @@ async function main() {
         env: { ...process.env, DP_DATABASE_URL: databaseUrl },
         stdio: 'inherit',
       })
-      await waitForServer(server)
+      const spawnFailure = new Promise((_, rejectSpawn) => server.once('error', rejectSpawn))
+      await Promise.race([waitForServer(server), spawnFailure])
     },
     'Real kernel readiness after the exact candidate wheel and plugin set has been installed.',
   )

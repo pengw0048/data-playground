@@ -7,11 +7,43 @@ export function appendTimingEvent(outputFile, event) {
 }
 
 export function readTimingEvents(outputFile) {
-  if (!existsSync(outputFile)) return []
-  return readFileSync(outputFile, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
+  if (!existsSync(outputFile)) {
+    return {
+      events: [],
+      parseDiagnostic: {
+        partial: false,
+        invalidLineCount: 0,
+        invalidLineNumbers: [],
+      },
+    }
+  }
+
+  const events = []
+  const invalidLineNumbers = []
+  for (const [index, line] of readFileSync(outputFile, 'utf8').split('\n').entries()) {
+    if (!line.trim()) continue
+    try {
+      const event = JSON.parse(line)
+      if (!event || typeof event !== 'object' || Array.isArray(event)) {
+        invalidLineNumbers.push(index + 1)
+        continue
+      }
+      events.push(event)
+    } catch {
+      // A killed writer can leave one truncated tail record. Keep all complete records and report
+      // only line metadata so the summary never repeats potentially sensitive artifact contents.
+      invalidLineNumbers.push(index + 1)
+    }
+  }
+
+  return {
+    events,
+    parseDiagnostic: {
+      partial: invalidLineNumbers.length > 0,
+      invalidLineCount: invalidLineNumbers.length,
+      invalidLineNumbers,
+    },
+  }
 }
 
 const FINAL_NON_FAILURE_STATUSES = new Set(['passed', 'skipped'])
