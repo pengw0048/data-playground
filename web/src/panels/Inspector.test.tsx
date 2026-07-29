@@ -1,7 +1,7 @@
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
-import type { ColumnSchema } from '../types/graph'
+import type { CanvasEdge, ColumnSchema } from '../types/graph'
 import type { CatalogTable } from '../types/api'
 import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
@@ -1244,7 +1244,110 @@ describe('Inspector — Join configuration', () => {
   })
 })
 
-describe('Inspector — row-reference join diagnosis', () => {
+describe('Inspector — Join hints', () => {
+  const edge = (id: string, source: string, targetHandle: string): CanvasEdge => ({
+    id, source, sourceHandle: 'out', target: 'join', targetHandle, data: { wire: 'dataset' },
+  })
+  const leftEdge = edge('left-join', 'left', 'a')
+  const rightEdge = edge('right-join', 'right', 'b')
+
+  const selectJoin = (edges: CanvasEdge[]) => {
+    useStore.setState({
+      selectedIds: ['join'], canvasRole: 'owner', runs: {},
+      doc: {
+        id: 'join-hints', name: 'Join hints', version: 1, requirements: [],
+        nodes: [
+          { id: 'left', type: 'source', position: { x: 0, y: 0 }, data: { title: 'left', status: 'draft', history: [], config: { uri: 'left.parquet' } } },
+          { id: 'right', type: 'source', position: { x: 0, y: 1 }, data: { title: 'right', status: 'draft', history: [], config: { uri: 'right.parquet' } } },
+          { id: 'join', type: 'join', position: { x: 1, y: 0 }, data: { title: 'join', status: 'draft', history: [], config: { on: 'id' } } },
+        ],
+        edges,
+      },
+      schemas: { left: { out: cols }, right: { out: cols }, join: { out: cols } },
+      catalog: [],
+      previews: {},
+    } as any)
+  }
+
+  const advanceAnalysis = async () => {
+    await act(async () => { await vi.advanceTimersByTimeAsync(350) })
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it.each([
+    ['zero inputs', []],
+    ['only the left input', [leftEdge]],
+    ['only the right input', [rightEdge]],
+    ['two edges on the left input', [leftEdge, edge('other-left-join', 'right', 'a')]],
+  ])('does not request or render Join hints with %s', async (_case, edges) => {
+    vi.useFakeTimers()
+    const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({ suggestions: [] } as any)
+    vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] } as any)
+    selectJoin(edges)
+
+    render(<Inspector />)
+    await advanceAnalysis()
+
+    expect(joinAnalysis).not.toHaveBeenCalled()
+    expect(screen.queryByText('Join hints')).not.toBeInTheDocument()
+    expect(screen.queryByText('No matching key columns between the two inputs.')).not.toBeInTheDocument()
+  })
+
+  it('runs analysis for one left and one right semantic input', async () => {
+    vi.useFakeTimers()
+    const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({
+      suggestions: [{
+        leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:1',
+        confidence: 'verified', score: 2, reason: 'matching key',
+      }],
+      warning: null,
+      note: null,
+    } as any)
+    vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] } as any)
+    selectJoin([rightEdge, leftEdge])
+
+    render(<Inspector />)
+    expect(screen.getByText('Analyzing keys…')).toBeInTheDocument()
+    await advanceAnalysis()
+
+    expect(joinAnalysis).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('id = id')).toBeInTheDocument()
+    expect(screen.queryByText('No matching key columns between the two inputs.')).not.toBeInTheDocument()
+  })
+
+  it('keeps the genuine no-match fallback for a complete analysis without suggestions', async () => {
+    vi.useFakeTimers()
+    const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({
+      suggestions: [], warning: null, note: null,
+    } as any)
+    vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] } as any)
+    selectJoin([leftEdge, rightEdge])
+
+    render(<Inspector />)
+    await advanceAnalysis()
+
+    expect(joinAnalysis).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('No matching key columns between the two inputs.')).toBeInTheDocument()
+  })
+
+  it('does not describe a failed complete analysis as no matching keys', async () => {
+    vi.useFakeTimers()
+    const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockRejectedValue(new Error('analysis unavailable'))
+    vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] } as any)
+    selectJoin([leftEdge, rightEdge])
+
+    render(<Inspector />)
+    await advanceAnalysis()
+
+    expect(joinAnalysis).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('Key suggestions are unavailable. Choose join keys manually.')).toBeInTheDocument()
+    expect(screen.queryByText('No matching key columns between the two inputs.')).not.toBeInTheDocument()
+  })
+
   it('renders a configured blocking code and never describes unknown evidence as safe', async () => {
     const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({
       suggestions: [
@@ -1260,8 +1363,8 @@ describe('Inspector — row-reference join diagnosis', () => {
           { id: 'right', type: 'source', position: { x: 0, y: 1 }, data: { title: 'right', status: 'draft', history: [], config: { uri: 'right.parquet' } } },
           { id: 'join', type: 'join', position: { x: 1, y: 0 }, data: { title: 'join', status: 'draft', history: [], config: { on: 'account_id' } } },
         ], edges: [
-          { id: 'left-join', source: 'left', target: 'join', data: { wire: 'dataset' } },
-          { id: 'right-join', source: 'right', target: 'join', data: { wire: 'dataset' } },
+          leftEdge,
+          rightEdge,
         ] },
       schemas: { left: { out: cols }, right: { out: cols }, join: { out: cols } },
     } as any)
@@ -1270,7 +1373,6 @@ describe('Inspector — row-reference join diagnosis', () => {
     expect(screen.getByText('reference match')).toBeInTheDocument()
     expect(screen.getByText('reference unknown')).toBeInTheDocument()
     expect(screen.queryByText(/reference safe/i)).not.toBeInTheDocument()
-    joinAnalysis.mockRestore()
   })
 })
 
