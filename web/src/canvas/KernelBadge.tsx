@@ -47,19 +47,18 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
   const pushToast = useStore((s) => s.pushToast)
   // a run starting/finishing warms/changes the kernel — refresh the always-visible badge on that edge
   const runActive = useStore((s) => Object.values(s.runs).some((r) => r.phase === 'running' || r.phase === 'estimating'))
-  // A successful preview may have started this canvas's kernel. Use its settled request identity as
-  // the same refresh edge as runs, rather than assuming that a preview necessarily made it warm.
-  const previewRefreshKey = useStore((s) => Object.values(s.previews)
-    .filter((preview) => preview.canvasId === s.doc.id && preview.result && !preview.result.error && !preview.result.notPreviewable)
-    .map((preview) => `${preview.nodeId}:${preview.portId ?? ''}:${preview.requestGeneration}`)
-    .sort()
-    .join('|'))
+  const successfulPreviewGeneration = useStore((s) => Object.values(s.previews).reduce((latest, preview) => {
+    if (preview.canvasId !== s.doc.id || preview.loading || preview.error
+      || !preview.result || preview.result.error || preview.result.notPreviewable) return latest
+    return Math.max(latest, preview.requestGeneration)
+  }, 0))
   const canEdit = roleCanEdit(canvasRole)
   const [open, setOpen] = useState(false)
   const [status, setStatus] = useState<CanvasKernelStatus | null>(null)
   const [offline, setOffline] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const seq = useRef(0)  // discards a late response from a previous canvas / superseded poll
+  const previewGeneration = useRef({ canvasId, value: successfulPreviewGeneration })
 
   const refresh = useCallback(async () => {
     if (!canvasId) return
@@ -75,7 +74,7 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
   // switching canvases must never show the previous canvas's kernel: reset + invalidate any in-flight
   useEffect(() => { setStatus(null); setOffline(false); seq.current++ }, [canvasId])
 
-  // Refresh on canvas change, successful previews, and run lifecycle (event-driven), and poll on a BOUNDED interval — fast
+  // Refresh on canvas change and run lifecycle (event-driven), and poll on a BOUNDED interval — fast
   // (3s) while the popover is open, slow (30s) while closed so a kernel that dies/starts while closed
   // is still detected without hammering. The endpoint returns {exists:false} for a not-yet-persisted
   // canvas, so this never logs a 404.
@@ -83,7 +82,20 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
     void refresh()
     const id = window.setInterval(() => void refresh(), open ? 3_000 : 30_000)
     return () => window.clearInterval(id)
-  }, [refresh, runActive, previewRefreshKey, open, kernelUp])
+  }, [refresh, runActive, open, kernelUp])
+
+  // A successful preview may have started this canvas's kernel. Refresh only on the rising edge of a
+  // newly settled successful request; retries and failures never inherit success from retained rows.
+  useEffect(() => {
+    const previous = previewGeneration.current
+    if (previous.canvasId !== canvasId) {
+      previewGeneration.current = { canvasId, value: successfulPreviewGeneration }
+      return
+    }
+    if (successfulPreviewGeneration <= previous.value) return
+    previewGeneration.current = { canvasId, value: successfulPreviewGeneration }
+    void refresh()
+  }, [canvasId, refresh, successfulPreviewGeneration])
 
   const cat = category(kernelUp, offline, status)
 
