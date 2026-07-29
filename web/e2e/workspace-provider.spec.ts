@@ -43,6 +43,66 @@ test.describe('provider Workspace Source acceptance', () => {
     ] }))
   })
 
+  test('replaces a provider-backed Source from the Workspace catalog without weakening its exact binding', async ({ page }) => {
+    test.setTimeout(60_000)
+    const rootResponse = await page.request.get('/api/workspace/containers/workspace-local-root?limit=100')
+    expect(rootResponse.ok()).toBeTruthy()
+    const root = await rootResponse.json() as {
+      container: { version: number }
+      items: Array<{ id: string; providerPlacementId?: string }>
+    }
+    const collection = root.items.find((item) => item.providerPlacementId === 'browser-collection-a')
+    expect(collection).toBeTruthy()
+    const collectionResponse = await page.request.get(
+      `/api/workspace/containers/${encodeURIComponent(collection!.id.replace(/^container:/, ''))}?limit=100`,
+    )
+    expect(collectionResponse.ok()).toBeTruthy()
+    const collectionPage = await collectionResponse.json() as {
+      items: Array<{ id: string; providerPlacementId?: string }>
+    }
+    const observations = collectionPage.items.find((item) => item.providerPlacementId === 'browser-observations-a')
+    expect(observations).toBeTruthy()
+    const createdResponse = await page.request.post('/api/workspace/canvases', { data: {
+      containerId: 'workspace-local-root', expectedContainerVersion: root.container.version,
+      name: 'Provider source replacement', providerDatasetRefs: [observations!.id],
+    } })
+    expect(createdResponse.ok()).toBeTruthy()
+    const created = await createdResponse.json() as { id: string; nodeId: string }
+    await page.goto(`/#/canvas/${encodeURIComponent(created.id)}`)
+    const source = page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })
+    await expect(source).toHaveCount(1)
+    await source.getByRole('button', { name: 'Change dataset' }).click()
+    await page.getByRole('button', { name: 'Browse Workspace catalog…' }).click()
+    const picker = page.getByRole('dialog', { name: 'Browse Workspace catalog' })
+    const search = picker.getByTestId('workspace-source-search')
+    await expect(search).toBeFocused()
+    await search.fill('labels')
+    const replacementRequest = page.waitForResponse((response) =>
+      response.url().includes('/api/workspace/resources/') && response.url().endsWith('/source')
+      && response.request().method() === 'GET')
+    await picker.getByRole('button', { name: new RegExp(relatedDatasetName, 'i') }).click()
+    expect((await replacementRequest).ok()).toBeTruthy()
+    await expect(picker).toBeHidden()
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${created.id}`)
+      if (!response.ok()) return null
+      return (await response.json()).nodes.find((node: { id: string }) => node.id === created.nodeId)
+    }).toMatchObject({
+      data: { title: relatedDatasetName, config: {
+        providerReadMode: 'exact', providerMountId: 'browser-provider',
+        providerSourceBindingId: expect.any(String),
+        datasetRef: { kind: 'exact', revisionId: 'browser-provider-labels-v1' },
+      } },
+    })
+    const saved = await (await page.request.get(`/api/canvas/${created.id}`)).json() as {
+      nodes: Array<{ id: string; data: { config: { uri?: string; providerResourceRef?: string; datasetRef?: { datasetId?: string } } } }>
+    }
+    const config = saved.nodes.find((node) => node.id === created.nodeId)!.data.config
+    expect(config.uri).toMatch(/^workspace-provider:\/\//)
+    expect(config.providerResourceRef).not.toBe(observations!.id)
+    expect(config.datasetRef?.datasetId).toMatch(/^workspace-provider:/)
+  })
+
   test('deduplicates canonical provider placements, then previews, runs, and inspects the exact Source in Chromium', async ({ page }) => {
     test.setTimeout(90_000)
     const providerCatalogBefore = readFileSync(resolve(providerRoot!, 'catalog.json'))

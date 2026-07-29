@@ -1,5 +1,5 @@
 // Kernel API DTOs — camelCase on the wire, mirrors kernel/models.py.
-import type { ColumnSchema, ExactDatasetRef } from './graph'
+import type { ColumnSchema, ExactDatasetRef, NodeConfig } from './graph'
 import type { WireType } from '../theme/tokens'
 
 export interface ResourceSpec {
@@ -416,6 +416,11 @@ export interface WorkspaceCanonicalDatasetContext {
   revisionId?: string | null
   committedAt?: string | null
   columns: ColumnSchema[]
+}
+/** A provider Source config admitted by the backend from an opaque Workspace resource. */
+export interface WorkspaceProviderSource {
+  name: string
+  config: NodeConfig
 }
 export interface WorkspaceProviderRelinkResult {
   ok: boolean

@@ -6,7 +6,7 @@ import type {
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
-  WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
@@ -293,6 +293,11 @@ export const api = {
   workspaceCanonicalDataset: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceCanonicalDatasetContext>(
       `/workspace/resources/${encodeURIComponent(resourceId)}/canonical-dataset`,
+      { signal: options?.signal },
+    ),
+  workspaceProviderSource: (resourceId: string, options?: { signal?: AbortSignal }) =>
+    req<WorkspaceProviderSource>(
+      `/workspace/resources/${encodeURIComponent(resourceId)}/source`,
       { signal: options?.signal },
     ),
   workspaceRelink: (resourceId: string, body: { mountId: string; resourceId: string }) =>

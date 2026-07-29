@@ -8,7 +8,7 @@ import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
 import { JoinWithRelated } from '../../components/JoinWithRelated'
-import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
+import type { CatalogTable, DatasetRevision, DatasetRevisionDetail, WorkspaceSearchGroup } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
 type ExactRevisionState = 'idle' | 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
@@ -75,6 +75,7 @@ export function requestSourceEntryAction(nodeId: string, action: SourceEntryActi
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
+  const [workspaceDialog, setWorkspaceDialog] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [q, setQ] = useState('')
   const [results, setResults] = useState<CatalogTable[] | null>(null)  // null = not yet searched
@@ -124,7 +125,7 @@ function Source({ id, data }: NodeComponentProps) {
   }, [selectedExact?.datasetId, selectedExact?.revisionId, exactDetailRequest])
 
   useEffect(() => {
-    if (!canEdit) { setOpen(false); setDialog(false) }
+    if (!canEdit) { setOpen(false); setDialog(false); setWorkspaceDialog(false) }
   }, [canEdit])
 
   useEffect(() => {
@@ -171,6 +172,16 @@ function Source({ id, data }: NodeComponentProps) {
     updateConfig(id, localDatasetBinding(t))
     rename(id, t.name)
     setOpen(false); setQ('')
+  }
+
+  const pickWorkspaceProvider = async (resourceId: string) => {
+    if (!canEdit) return
+    const source = await api.workspaceProviderSource(resourceId)
+    // This endpoint is the only source of provider binding, URI, and exact-revision facts. A
+    // Workspace occurrence is navigation context, never a client-side recipe for Source config.
+    updateConfig(id, source.config)
+    rename(id, source.name)
+    setWorkspaceDialog(false)
   }
 
   // upload a local file → store it + bind this source to it
@@ -244,9 +255,10 @@ function Source({ id, data }: NodeComponentProps) {
       )}
 
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={250}>
-        {/* search the whole catalog server-side (it can be thousands of tables) */}
+        <div className="px-[9px] pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Local catalog</div>
+        {/* Search the local catalog server-side (it can be thousands of tables). */}
         <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} onClick={(e) => e.stopPropagation()}
-          placeholder="Search datasets…" data-testid="source-search"
+          placeholder="Search local datasets…" data-testid="source-search"
           className="mb-1 w-full rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] outline-none focus:border-primary" />
         {resultsError && kernelUp && (
           <div role="alert" className="m-1 flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
@@ -282,15 +294,20 @@ function Source({ id, data }: NodeComponentProps) {
           </button>
         ))}
         <div className="my-1 h-px bg-border" />
+        <button onClick={(e) => { e.stopPropagation(); setOpen(false); setWorkspaceDialog(true) }}
+          className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
+          <Icon name="search" size={12} /> Browse Workspace catalog…
+        </button>
         <button onClick={(e) => { e.stopPropagation(); setOpen(false); setDialog(true) }}
           className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
-          <Icon name="search" size={12} /> Browse files…
+          <Icon name="search" size={12} /> Register accessible path / URI…
         </button>
         <button onClick={(e) => { e.stopPropagation(); fileRef.current?.click() }}
           className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
-          <Icon name="export" size={12} /> Upload a file…
+          <Icon name="export" size={12} /> Upload local file…
         </button>
       </Popover>
+      {workspaceDialog && <WorkspaceProviderPicker onClose={() => setWorkspaceDialog(false)} onPick={pickWorkspaceProvider} />}
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
       {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
         disabled={!canEdit} onChange={(event) => updateConfig(id, {
@@ -308,6 +325,100 @@ function Source({ id, data }: NodeComponentProps) {
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}
     </NodeCard>
   )
+}
+
+function WorkspaceProviderPicker({ onClose, onPick }: {
+  onClose: () => void
+  onPick: (resourceId: string) => Promise<void>
+}) {
+  const [query, setQuery] = useState('')
+  const [groups, setGroups] = useState<WorkspaceSearchGroup[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [request, setRequest] = useState(0)
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
+  const [selecting, setSelecting] = useState<string | null>(null)
+  const [selectionError, setSelectionError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const term = query.trim()
+    if (!term) { setGroups(null); setError(null); setNextCursor(null); setHasMore(false); return }
+    let live = true
+    const timer = setTimeout(() => {
+      setGroups(null); setError(null); setSelectionError(null); setNextCursor(null); setHasMore(false); setLoadMoreError(null)
+      void api.workspaceSearch(term, { limit: 25 }).then((page) => {
+        if (!live) return
+        setGroups(page.groups ?? []); setNextCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+      }).catch((caught) => {
+        if (live) setError(caught instanceof Error ? caught.message : String(caught))
+      })
+    }, 150)
+    return () => { live = false; clearTimeout(timer) }
+  }, [query, request])
+
+  const datasets = (groups ?? []).flatMap((group) => group.items
+    .filter((item) => group.source.kind === 'provider' && ['complete', 'page'].includes(group.source.completeness)
+      && item.source === 'provider' && item.kind === 'dataset' && !item.detached
+      && item.referenceState === 'current' && item.canonicalReferenceState !== 'offline'
+      && item.canonicalReferenceState !== 'permission_lost' && item.canonicalReferenceState !== 'detached'
+      && item.canonicalReferenceState !== 'provider_error' && !item.lastKnown)
+    .map((item) => ({ item, provider: group.source.provider ?? item.provider ?? 'Provider' })))
+  const unavailable = (groups ?? []).filter((group) => group.source.kind === 'provider'
+    && !['complete', 'page'].includes(group.source.completeness))
+  const selectProvider = async (resourceId: string) => {
+    if (selecting) return
+    setSelecting(resourceId); setSelectionError(null)
+    try { await onPick(resourceId) }
+    catch (caught) { setSelectionError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setSelecting(null) }
+  }
+  const loadMore = async () => {
+    const term = query.trim()
+    if (!term || !nextCursor || loadingMore) return
+    setLoadingMore(true); setLoadMoreError(null)
+    try {
+      const page = await api.workspaceSearch(term, { limit: 25, cursor: nextCursor })
+      setGroups((current) => {
+        const merged = new Map((current ?? []).map((group) => [group.source.id, { ...group, items: [...group.items] }]))
+        for (const incoming of page.groups ?? []) {
+          const existing = merged.get(incoming.source.id)
+          if (!existing) { merged.set(incoming.source.id, incoming); continue }
+          const ids = new Set(existing.items.map((item) => item.id))
+          existing.items.push(...incoming.items.filter((item) => !ids.has(item.id)))
+          existing.source = incoming.source
+        }
+        return [...merged.values()]
+      })
+      setNextCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+    } catch (caught) { setLoadMoreError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setLoadingMore(false) }
+  }
+
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onMouseDown={onClose}>
+    <div role="dialog" aria-modal="true" aria-label="Browse Workspace catalog" onMouseDown={(event) => event.stopPropagation()}
+      className="flex max-h-[calc(100vh-2rem)] w-full max-w-[560px] flex-col rounded-lg border border-border bg-card p-4 shadow-xl">
+      <div className="flex items-center gap-2"><div className="min-w-0 flex-1 text-sm font-semibold">Browse Workspace catalog</div><button type="button" aria-label="Close Workspace catalog" onClick={onClose}><Icon name="close" size={15} /></button></div>
+      <p className="mt-1 text-[11px] text-muted-foreground">Search mounted provider datasets. Selecting one preserves its canonical binding and exact revision admission.</p>
+      <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} data-testid="workspace-source-search"
+        placeholder="Search mounted datasets…" className="mt-3 w-full rounded-md border border-border bg-background px-2 py-2 text-sm outline-none focus:border-primary" />
+      <div className="mt-2 min-h-0 overflow-y-auto rounded-md border border-border p-1" data-testid="workspace-source-results">
+        {!query.trim() && <div className="p-2 text-[12px] text-muted-foreground">Enter a search to browse mounted Workspace providers.</div>}
+        {query.trim() && groups === null && !error && <div className="p-2 text-[12px] text-muted-foreground">Searching mounted providers…</div>}
+        {error && <div role="alert" className="flex items-center justify-between gap-2 p-2 text-[12px] text-destructive"><span>Couldn't search Workspace: {error}</span><button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button></div>}
+        {unavailable.map((group) => <div key={group.source.id} role="status" className="flex items-center justify-between gap-2 rounded p-2 text-[11px] text-muted-foreground"><span>{group.source.provider ?? 'Provider'} unavailable: {group.source.error ?? group.source.completeness}</span><button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button></div>)}
+        {datasets.map(({ item, provider }) => <button key={item.id} type="button" disabled={selecting !== null} onClick={() => void selectProvider(item.id)}
+          className="flex w-full flex-col rounded-md px-2 py-2 text-left hover:bg-accent disabled:opacity-50">
+          <span className="truncate text-xs font-semibold text-foreground">{item.name}</span><span className="truncate text-[10.5px] text-muted-foreground">{provider}{item.providerDatasetId ? ` · ${item.providerDatasetId}` : ''}</span>
+        </button>)}
+        {query.trim() && groups !== null && !error && datasets.length === 0 && <div className="p-2 text-[12px] text-muted-foreground">No mounted provider datasets match this search.</div>}
+        {hasMore && <button type="button" disabled={loadingMore} onClick={() => void loadMore()} className="w-full rounded-md px-2 py-2 text-xs font-semibold text-primary hover:bg-accent disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry loading more provider datasets' : 'Load more provider datasets'}</button>}
+      </div>
+      {selectionError && <div role="alert" className="mt-2 text-[12px] text-destructive">Couldn't select provider dataset: {selectionError}</div>}
+      <div className="mt-3 flex justify-end"><button type="button" onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-xs">Cancel</button></div>
+    </div>
+  </div>
 }
 
 function RevisionControl({ nodeId, table, selected, exactDetailState: detailState, onRetryExact, canEdit, onChange }: {

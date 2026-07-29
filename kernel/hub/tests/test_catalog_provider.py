@@ -708,6 +708,16 @@ with TestClient(app) as client:
     serialized_context = json.dumps(canonical_context, sort_keys=True)
     for forbidden in ("reference.csv", str(Path(os.environ["DP_WORKSPACE"]).parent)):
         assert forbidden not in serialized_context
+    replacement = client.get(f"/api/workspace/resources/{nested_resource['id']}/source")
+    assert replacement.status_code == 200, replacement.text
+    replacement_config = replacement.json()["config"]
+    assert replacement.json()["name"] == "nested"
+    assert replacement_config["uri"].startswith("workspace-provider://")
+    assert replacement_config["providerSourceBindingId"] == source_binding["sourceBindingId"]
+    assert replacement_config["datasetRef"]["datasetId"] == canonical_context["datasetIdentity"]
+    assert replacement_config["datasetRef"]["revisionId"] == canonical_context["revisionId"]
+    assert replacement_config["providerReadMode"] == "exact"
+    assert "reference.csv" not in json.dumps(replacement_config)
     body = {
         "requestId": "00000000-0000-4000-8000-000000000791",
         "containerId": remote["localPlacement"]["containerId"],

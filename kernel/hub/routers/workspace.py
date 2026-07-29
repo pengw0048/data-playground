@@ -39,6 +39,7 @@ from hub.models import (
     WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceCanonicalDatasetContext,
+    WorkspaceProviderSource,
     WorkspaceResourceResolution,
     WorkspaceProviderRelinkRequest,
     WorkspaceProviderRelinkResult,
@@ -761,6 +762,25 @@ def canonical_workspace_provider_dataset(
             resource_id, uid=uid,
             resolve_physical=get_deps().resolve_physical_adapter,
         )
+    except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
+        _provider_dataset_action_error(exc)
+        raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
+
+
+@router.get(
+    "/workspace/resources/{resource_id}/source",
+    response_model=WorkspaceProviderSource,
+)
+def workspace_provider_source(
+    resource_id: str,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Admit one selected provider dataset as the canonical Source replacement config."""
+    try:
+        source = workspace_providers.provider_dataset_source(
+            resource_id, uid=uid, resolve_physical=get_deps().resolve_physical_adapter)
+        data = source["data"]
+        return {"name": data["title"], "config": data["config"]}
     except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
         _provider_dataset_action_error(exc)
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover

@@ -7,7 +7,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), destinations: vi.fn(), browseDestination: vi.fn(),
   registerFile: vi.fn(), mkdirDestination: vi.fn(), datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
-  datasetRevisionCapabilities: vi.fn(), resolveDatasetRevision: vi.fn(),
+  datasetRevisionCapabilities: vi.fn(), resolveDatasetRevision: vi.fn(), workspaceSearch: vi.fn(), workspaceProviderSource: vi.fn(),
 }))
 vi.mock('../../api/client', () => ({ api: mocks }))
 
@@ -34,6 +34,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetId: 'dataset-1', revisionId: '1', retentionOwner: 'provider', summary: { rowCount: 1 },
       preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
     })
+    mocks.workspaceSearch.mockResolvedValue({ query: 'remote', groups: [], nextCursor: null, hasMore: false })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
       kernelUp: true,
@@ -215,6 +216,51 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(mocks.tablesPage).toHaveBeenCalledTimes(2)
   })
 
+  it('replaces a Source with the canonical exact binding selected from Workspace providers', async () => {
+    const oldConfig = {
+      uri: 'workspace-provider://old-binding', providerResourceRef: 'dataset:old-placement',
+      providerMountId: 'mount-a', providerSourceBindingId: 'a'.repeat(32),
+      providerName: 'fixture', providerReadMode: 'exact' as const,
+      datasetRef: { kind: 'exact' as const, datasetId: 'workspace-provider:old', revisionId: 'old-revision' },
+    }
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'remote', nextCursor: null, hasMore: false,
+      groups: [{ source: { id: 'mount-b', kind: 'provider', completeness: 'complete', provider: 'fixture-b' }, items: [{
+        id: 'dataset:provider-placement-b', kind: 'dataset', name: 'remote orders', detached: false,
+        source: 'provider', mountId: 'mount-b', provider: 'fixture-b', providerDatasetId: 'orders',
+        referenceState: 'current', canonicalReferenceState: 'current', lastKnown: false,
+      }] }],
+    })
+    const canonicalConfig = {
+      uri: 'workspace-provider://canonical-binding', providerResourceRef: 'dataset:provider-placement-b',
+      providerMountId: 'mount-b', providerSourceBindingId: 'b'.repeat(32), providerName: 'fixture-b',
+      providerReadMode: 'exact' as const,
+      datasetRef: { kind: 'exact' as const, datasetId: 'workspace-provider:canonical', revisionId: 'provider-r2' },
+    }
+    mocks.workspaceProviderSource.mockResolvedValue({ name: 'remote orders', config: canonicalConfig })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, edges: [], nodes: [{
+      id: 's1', type: 'source', position: { x: 0, y: 0 }, data: { title: 'old orders', status: 'latest', config: oldConfig },
+    }] } } as any)
+    render1({ title: 'old orders', status: 'latest', config: oldConfig })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Change dataset' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Browse Workspace catalog…' }))
+    const search = await screen.findByTestId('workspace-source-search')
+    expect(search).toHaveFocus()
+    fireEvent.change(search, { target: { value: 'remote' } })
+    const result = await screen.findByRole('button', { name: /remote orders/i })
+    fireEvent.click(result)
+
+    await waitFor(() => expect(mocks.workspaceProviderSource).toHaveBeenCalledWith('dataset:provider-placement-b'))
+    const config = useStore.getState().doc.nodes[0].data.config
+    expect(config).toEqual(canonicalConfig)
+    expect(config.uri).toBe('workspace-provider://canonical-binding')
+    expect(config.providerSourceBindingId).toBe('b'.repeat(32))
+    expect(config.datasetRef).toEqual({ kind: 'exact', datasetId: 'workspace-provider:canonical', revisionId: 'provider-r2' })
+    expect(useStore.getState().doc.nodes[0].data.title).toBe('remote orders')
+  })
+
   it('does not change the source until a browsed file has been registered successfully', async () => {
     const oldConfig = {
       uri: 'workspace-provider://binding', tableId: 't1',
@@ -230,7 +276,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       .mockResolvedValueOnce({ id: 't2', name: 'new', uri: 'file:///data/new.csv', rowCount: 1, columns: [{ name: 'x', type: 'int', capabilities: [] }] })
     render1({ title: 'orders source', status: 'draft', config: oldConfig })
     fireEvent.click(screen.getByText('orders'))
-    fireEvent.click(screen.getByText(/Browse files/i))
+    fireEvent.click(screen.getByText(/Register accessible path/i))
     fireEvent.click(await screen.findByText('new.csv'))
 
     expect(await screen.findByText(/Couldn't open file: HTTP 422/i)).toBeInTheDocument()
