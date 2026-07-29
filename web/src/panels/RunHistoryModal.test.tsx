@@ -912,8 +912,14 @@ describe('durable full results', () => {
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
   })
 
-  it('does not use default bindings when a fresh session cannot prove run parameters', async () => {
-    const requestRun = vi.fn()
+  it('recovers saved result bindings from the server instead of guessing Canvas defaults', async () => {
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'parameterized-run',
+      executionManifestSha256: 'a'.repeat(64),
+      parameterBindings: [{ name: 'predicate', value: "event = 'refund'" }],
+      output: committedOutput('/outputs/parameterized.parquet', 105),
+    })
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
     const doc = {
       id: 'history-canvas', name: 'History', version: 1, requirements: [],
       parameters: [{ name: 'predicate', type: 'string' as const, default: "event = 'purchase'" }],
@@ -930,18 +936,17 @@ describe('durable full results', () => {
       previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
       runs: {},
       canvasRole: 'owner',
-      requestRun,
     } as any)
-    const user = userEvent.setup()
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('status', { name: 'Retained result parameters unavailable' }))
-      .toBeInTheDocument()
-    expect(apiMock.retainedResult).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Run this step' }))
-    expect(requestRun).toHaveBeenCalledWith('target')
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledWith(
+      doc, 'target', 'out', undefined,
+    ))
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'parameterized-run', 'target', 'out', 50, 0,
+    ))
+    expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 105 rows')
   })
 
   it('does not recover an old retained result after the node becomes stale', async () => {

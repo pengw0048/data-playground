@@ -79,6 +79,7 @@ let _fileListGeneration = 0       // stale same-user list responses cannot overw
 let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
+let _retainedResultRecoveryGeneration = 0 // persisted full-run bindings recover independently of previews
 let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
 let _viewportFitGeneration = 0    // example fits are one-shot even when the same Canvas is reused
 const _draftSyncInFlight = new Set<string>()
@@ -574,6 +575,32 @@ interface RunState {
   parametersReady?: boolean
   parameterContractFingerprint?: string
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
+}
+
+function currentSchemaParameterBindings(
+  doc: CanvasDoc,
+  runs: Record<string, RunState>,
+): CanvasParameterBinding[] | undefined | null {
+  const merged = new Map<string, CanvasParameterBinding>()
+  let found = false
+  for (const [nodeId, run] of Object.entries(runs)) {
+    const node = doc.nodes.find((candidate) => candidate.id === nodeId)
+    if (node?.data.status !== 'latest'
+        || targetParameterDeclarations(doc, nodeId).length === 0) continue
+    if (run.parameterBindings === undefined) continue
+    found = true
+    for (const binding of run.parameterBindings) {
+      const existing = merged.get(binding.name)
+      if (existing !== undefined
+          && parameterBindingsIdentity([existing]) !== parameterBindingsIdentity([binding])) {
+        return null
+      }
+      merged.set(binding.name, binding)
+    }
+  }
+  return found
+    ? [...merged.values()].sort((left, right) => compareIdentityText(left.name, right.name))
+    : undefined
 }
 
 // A Write card and the Run flow may observe the same semantic change in one render turn. Share the
@@ -2713,7 +2740,7 @@ export const useStore = create<Store>((set, get) => ({
       const previews = { ...s.previews }; delete previews[id]
       const previewBindings = { ...s.previewBindings }; delete previewBindings[id]
       return {
-        previews, previewBindings,
+        previews, previewBindings, schemas: {}, sizes: {},
         runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? { phase: 'parameters' as const }),
           parameterBindings, parametersReady: false, estimate: undefined,
@@ -2733,7 +2760,7 @@ export const useStore = create<Store>((set, get) => ({
       const previews = { ...s.previews }; delete previews[id]
       const previewBindings = { ...s.previewBindings }; delete previewBindings[id]
       return {
-        previews, previewBindings,
+        previews, previewBindings, schemas: {}, sizes: {},
         runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? { phase: 'parameters' as const }),
           parameterBindings, parametersReady: false, estimate: undefined,
@@ -4312,10 +4339,29 @@ export const useStore = create<Store>((set, get) => ({
   refreshSchemas: async () => {
     // guard against out-of-order responses: only the latest request may write the schema map
     const seq = ++_schemaSeq
-    try { const schemas = await api.schema(get().doc); if (seq === _schemaSeq) set({ schemas }) }
+    const state = get()
+    const doc = state.doc
+    const parameterBindings = currentSchemaParameterBindings(doc, state.runs)
+    if (parameterBindings === null) {
+      // One full-graph schema request can carry only one Canvas binding intent. Conflicting current
+      // forms stay unknown rather than allowing node order or omitted server recovery to pick one.
+      if (seq === _schemaSeq) set({ schemas: {}, sizes: {} })
+      return
+    }
+    try {
+      const schemas = parameterBindings === undefined
+        ? await api.schema(doc)
+        : await api.schema(doc, undefined, undefined, parameterBindings)
+      if (seq === _schemaSeq) set({ schemas })
+    }
     catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline: keep last-known */ }
     // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
-    try { const sizes = await api.graphSizes(get().doc); if (seq === _schemaSeq) set({ sizes }) }
+    try {
+      const sizes = parameterBindings === undefined
+        ? await api.graphSizes(doc)
+        : await api.graphSizes(doc, undefined, parameterBindings)
+      if (seq === _schemaSeq) set({ sizes })
+    }
     catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline / no sources countable: keep last-known */ }
   },
 
@@ -4376,12 +4422,15 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {},
+        schemas: {}, sizes: {},
+        numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {
       _settlingLoadedDoc = false
     }
+    recoverRetainedResultBindings(get, set, d)
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
@@ -4635,6 +4684,50 @@ function applyPerNodeStatus(
     })
     return changed ? { doc: { ...s.doc, nodes } } : {}
   })
+}
+
+function recoverRetainedResultBindings(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  doc: CanvasDoc,
+) {
+  const generation = ++_retainedResultRecoveryGeneration
+  const userId = get().currentUser?.id
+  for (const node of doc.nodes) {
+    if (node.type !== 'transform' || node.data.status !== 'latest'
+        || targetParameterDeclarations(doc, node.id).length === 0) continue
+    const planIdentity = previewPlanIdentity(doc, node.id, 'out')
+    const initialRun = get().runs[node.id]
+    // A preview binding is local user intent, not a full-result identity. Preserve it and let the
+    // server validate it explicitly during schema refresh; recover only a genuinely missing form.
+    if (initialRun?.parameterBindings !== undefined) continue
+    void api.retainedResult(doc, node.id, 'out').then((identity) => {
+      let installed = false
+      set((state) => {
+        const latestNode = state.doc.nodes.find((candidate) => candidate.id === node.id)
+        if (
+          generation !== _retainedResultRecoveryGeneration
+          || state.doc.id !== doc.id
+          || state.currentUser?.id !== userId
+          || latestNode?.data.status !== 'latest'
+          || previewPlanIdentity(state.doc, node.id, 'out') !== planIdentity
+          || state.runs[node.id] !== undefined
+          || identity.output.nodeId !== node.id
+          || identity.output.portId !== 'out'
+          || !Array.isArray(identity.parameterBindings)
+        ) return {}
+        installed = true
+        return { runs: { ...state.runs, [node.id]: {
+          phase: 'idle' as const,
+          parameterBindings: identity.parameterBindings,
+        } } }
+      })
+      if (installed) void get().refreshSchemas()
+    }).catch(() => {
+      // Missing/stale/temporarily unavailable retained state remains unknown. Schema recovery and
+      // the result panel use the same server contract and may retry independently.
+    })
+  }
 }
 
 // On canvas open, recover normal active runs plus the latest durable profile per node/plan. Profiles

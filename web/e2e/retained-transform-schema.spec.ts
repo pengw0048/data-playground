@@ -12,12 +12,14 @@ async function eventsTable(page: import('@playwright/test').Page): Promise<Catal
   return table
 }
 
-test('a current retained Transform result types Join keys across reload and invalidates after an edit', async ({ page }) => {
+test('a parameterized retained Transform result types Join keys across reload and invalidates after an edit', async ({ page }) => {
   test.setTimeout(45_000)
   const events = await eventsTable(page)
   const canvasId = `retained-transform-schema-${Date.now()}`
+  const transformCode = "def fn(row):\n    return {**row, 'amount_doubled': row['amount'] * 2}"
   const graph = {
     id: canvasId, name: 'Retained Transform schema', version: 1, requirements: [],
+    parameters: [{ name: 'transform_code', type: 'string', required: true }],
     nodes: [
       { id: 'left', type: 'source', position: { x: 60, y: 80 }, data: {
         title: 'Left events', status: 'draft', config: {
@@ -27,7 +29,7 @@ test('a current retained Transform result types Join keys across reload and inva
       { id: 'transform', type: 'transform', position: { x: 310, y: 80 }, data: {
         title: 'Derived amount', status: 'draft', config: {
           source: 'adhoc', mode: 'map', onError: 'raise',
-          code: "def fn(row):\n    return {**row, 'amount_doubled': row['amount'] * 2}",
+          code: { parameterRef: 'transform_code' },
         },
       } },
       { id: 'right', type: 'source', position: { x: 310, y: 290 }, data: {
@@ -50,6 +52,7 @@ test('a current retained Transform result types Join keys across reload and inva
   try {
     const started = await page.request.post('/api/run', { data: {
       graph, targetNodeId: 'transform', confirmed: true, submissionId: crypto.randomUUID(),
+      parameterBindings: [{ name: 'transform_code', value: transformCode }],
     } })
     expect(started.ok(), await started.text()).toBeTruthy()
     const { runId } = await started.json() as { runId: string }
