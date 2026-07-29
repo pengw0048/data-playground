@@ -506,7 +506,9 @@ def test_source_limit_is_typed_and_not_downgraded_by_estimate_or_plan(monkeypatc
     assert "at most" in cone_error.value.detail
 
     monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
-    monkeypatch.setattr(run_routes, "_require_graph_read_access", lambda *_args: None)
+    monkeypatch.setattr(
+        run_routes, "_require_graph_read_access", lambda *_args: (None, None)
+    )
     monkeypatch.setattr(run_routes, "_reject_invalid", lambda *_args: None)
     monkeypatch.setattr(run_routes, "_actuals_for", lambda *_args: {})
     monkeypatch.setattr(run_routes.graph_mod, "resolve_source_refs", lambda *_args: None)
