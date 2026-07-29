@@ -5,6 +5,13 @@ import type { BackendNodeSpec } from '../api/client'
 import { getBackendSpec, nodeInvalidReason, parseNumericParam, registerGenericNodes } from './generic'
 
 describe('generic node registration', () => {
+  it('requires a Join key pair or an explicit advanced condition', () => {
+    const node = (config: Record<string, unknown>) => ({ type: 'join', data: { config } })
+    expect(nodeInvalidReason(node({ on: '', condition: '' }))).toBe('Choose at least one left and right column.')
+    expect(nodeInvalidReason(node({ on: 'id', condition: '' }))).toBeNull()
+    expect(nodeInvalidReason(node({ on: '', condition: 'a.id = b.account_id OR a.email = b.email' }))).toBeNull()
+  })
+
   it('preserves the installed fixture descriptor at every frontend registration boundary', () => {
     const descriptors = contractDescriptors as unknown as BackendNodeSpec[]
     expect(registerGenericNodes(descriptors)).toBe(2)

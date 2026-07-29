@@ -425,11 +425,13 @@ def join_sql(lcols: list, rcols: list, a: str, b: str, on: str, condition: str, 
              *, con=None) -> str:
     """The DuckDB join SQL over two views `a`,`b` — the SINGLE source of truth for join semantics + output
     naming, so the single-node engine and the distributed backend (dp_ray) never diverge. `on` = a
-    comma-separated USING key list; `condition` = a raw ON expression (a.x = b.y); else a CROSS join."""
+    comma-separated USING key list; `condition` = a raw ON expression (a.x = b.y)."""
     on, cond, how = (on or "").strip(), (condition or "").strip(), normalize_how(how)
     qa, qb = quote_identifier(a), quote_identifier(b)
-    if how == "cross" or (not on and not cond):
-        return f"SELECT {join_projection(lcols, rcols)} FROM {qa} AS a CROSS JOIN {qb} AS b"
+    if not on and not cond:
+        raise ValueError("Join needs at least one left and right column or an advanced condition")
+    if how == "cross":
+        raise ValueError("cross joins require an explicit product operation")
     if cond:
         validate_fragment(FragmentKind.JOIN_ON, cond, con=con)
         return f"SELECT {join_projection(lcols, rcols)} FROM {qa} AS a {how.upper()} JOIN {qb} AS b ON ({cond})"

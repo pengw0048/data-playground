@@ -25,6 +25,39 @@ async function unregister(request: APIRequestContext, table: Table) {
 }
 
 test.describe('Join key builder', () => {
+  test('rerun all refuses a Join with no configured match condition', async ({ page }) => {
+    const canvasId = `join-missing-condition-${Date.now()}`
+    try {
+      const created = await page.request.post('/api/canvas', { data: {
+        id: canvasId, name: 'Join missing condition', version: 1,
+        nodes: [
+          { id: 'left', type: 'source', position: { x: 50, y: 100 }, data: { title: 'left', status: 'draft', history: [], config: { uri: 'events' } } },
+          { id: 'right', type: 'source', position: { x: 50, y: 360 }, data: { title: 'right', status: 'draft', history: [], config: { uri: 'events' } } },
+          { id: 'join', type: 'join', position: { x: 460, y: 220 }, data: { title: 'join', status: 'draft', history: [], config: { how: 'inner', on: '', condition: '' } } },
+        ],
+        edges: [
+          { id: 'left-a', source: 'left', target: 'join', targetHandle: 'a', data: { wire: 'dataset' } },
+          { id: 'right-b', source: 'right', target: 'join', targetHandle: 'b', data: { wire: 'dataset' } },
+        ],
+      } })
+      expect(created.ok()).toBeTruthy()
+
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      await expect(page.getByTestId('join-missing-condition')).toHaveText('Choose at least one left and right column.')
+      const dispatched = page.waitForRequest((request) => {
+        const path = new URL(request.url()).pathname
+        return request.method() === 'POST' && (path === '/api/run' || path === '/api/run/estimate')
+      }, { timeout: 750 }).then(() => true).catch(() => false)
+      const feedback = page.getByTestId('toast').filter({ hasText: 'Choose at least one left and right column.' })
+      const feedbackBeforeClick = await feedback.count()
+      await page.getByRole('button', { name: 'Rerun all' }).click()
+      await expect(feedback).toHaveCount(feedbackBeforeClick + 1)
+      expect(await dispatched).toBe(false)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
   test('uses the real a/b schemas for same, different, multi-key, advanced, and rewired joins', async ({ page }) => {
     test.setTimeout(45_000)
     const token = `join-key-builder-${Date.now()}`

@@ -1717,7 +1717,7 @@ def test_join_duplicate_columns_preserved():
     g = {"id": "c", "version": 1, "nodes": [
         N("a", "source", {"uri": _uri("events")}),
         N("b", "source", {"uri": _uri("images")}),
-        N("j", "join", {"how": "inner"}),  # no key → cross join; both have 'id'
+        N("j", "join", {"how": "inner", "condition": "a.id = b.id"}),
     ], "edges": [E("a", "j", None, "a"), E("b", "j", None, "b")]}
     r = client.post("/api/run/preview", json={"graph": g, "nodeId": "j", "k": 3}).json()
     assert r["notPreviewable"]

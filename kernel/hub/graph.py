@@ -391,7 +391,8 @@ def unknown_kinds(graph: Graph, known) -> list[tuple[str, str]]:
 
 def validation_error(
         graph: Graph, node_specs: dict, known_kinds=(),
-        target_node_id: str | None = None) -> tuple[str, bool] | None:
+        target_node_id: str | None = None, *,
+        enforce_join_condition: bool = True) -> tuple[str, bool] | None:
     """One authoritative, side-effect-free graph validity decision for every ingress.
 
     Returns ``(message, acyclic)`` so compile can keep its error-plan response while execution,
@@ -416,7 +417,34 @@ def validation_error(
         return "incompatible connection: " + "; ".join(incompatible[:5]), True
     if not is_acyclic(graph):
         return "graph has a cycle — control flow must be encapsulated (§5.7)", False
+    if enforce_join_condition:
+        join_condition = join_condition_errors(graph, target_node_id)
+        if join_condition:
+            return "invalid graph: " + "; ".join(join_condition[:5]), True
     return None
+
+
+def join_condition_errors(graph: Graph, target_node_id: str | None = None) -> list[str]:
+    """Reject executable joins that would otherwise become an implicit cross join.
+
+    A target-scoped request only needs the joins in that target's upstream execution cone.  A
+    whole-graph request validates every Join.  The condition's SQL syntax remains the engine's
+    responsibility; this guard only distinguishes an absent condition from an explicit one.
+    """
+    nodes = upstream_chain(graph, target_node_id) if target_node_id is not None else graph.nodes
+    errors: list[str] = []
+    for node in nodes:
+        if node.type != "join":
+            continue
+        data = node.data if isinstance(node.data, dict) else {}
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        on = str(config.get("on") or "").strip()
+        condition = str(config.get("condition") or "").strip()
+        if not on and not condition:
+            errors.append(
+                f"Join node '{node.id}' needs at least one left and right column or an advanced condition"
+            )
+    return errors
 
 
 def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
