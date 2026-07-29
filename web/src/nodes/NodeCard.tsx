@@ -46,7 +46,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const togglePanel = useStore((s) => s.togglePanel)
   const closePanel = useStore((s) => s.closePanel)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
-  const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, id))
@@ -129,7 +128,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
               >
                 {st.glyph}
               </span>
-              <EditableTitle id={id} title={data.title} onRename={rename} selected={selected} canEdit={canEdit} />
+              <EditableTitle id={id} title={data.title} selected={selected} canEdit={canEdit} />
               <span className="flex-1" />
               {disabled && (
                 <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px] text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
@@ -280,27 +279,24 @@ function ActionIcon({ name, label, active, onClick, disabled }: {
   )
 }
 
-function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string; title: string; onRename: (id: string, t: string) => void; selected?: boolean; canEdit: boolean }) {
-  const [editing, setEditing] = useState(false)
-  const [val, setVal] = useState(title)
-  useEffect(() => setVal(title), [title])
-  useEffect(() => { if (!canEdit) setEditing(false) }, [canEdit])
-  // let the ⋯-menu "Rename" (and any external trigger) enter edit mode for this node
-  useEffect(() => {
-    const onRenameEvt = (e: Event) => { if (canEdit && (e as CustomEvent).detail?.id === id) setEditing(true) }
-    window.addEventListener('dp-rename', onRenameEvt)
-    return () => window.removeEventListener('dp-rename', onRenameEvt)
-  }, [canEdit, id])
+function EditableTitle({ id, title, selected, canEdit }: { id: string; title: string; selected?: boolean; canEdit: boolean }) {
+  const renameDraft = useStore((s) => s.renameDraft?.id === id ? s.renameDraft : null)
+  const startRename = useStore((s) => s.startRename)
+  const updateRenameDraft = useStore((s) => s.updateRenameDraft)
+  const commitRename = useStore((s) => s.commitRename)
+  const cancelRename = useStore((s) => s.cancelRename)
+  const editing = renameDraft !== null
+  const val = renameDraft?.value ?? title
   if (editing) {
     return (
       <input
         autoFocus
         value={val}
         aria-label="Node title"
-        onChange={(e) => setVal(e.target.value)}
+        onChange={(e) => updateRenameDraft(id, e.target.value)}
         onClick={(e) => e.stopPropagation()}
-        onBlur={() => { setEditing(false); if (val.trim()) onRename(id, val.trim()) }}
-        onKeyDown={(e) => { if (e.key === 'Enter') { setEditing(false); if (val.trim()) onRename(id, val.trim()) } if (e.key === 'Escape') { setVal(title); setEditing(false) } }}
+        onBlur={() => commitRename(id)}
+        onKeyDown={(e) => { if (e.key === 'Enter') commitRename(id); if (e.key === 'Escape') cancelRename(id) }}
         className="w-[130px] rounded-sm border border-primary px-1 py-px text-[13.5px] font-semibold text-foreground outline-none"
       />
     )
@@ -308,8 +304,8 @@ function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string;
   return (
     <span
       // click the name of an already-selected node to rename (Figma-style); double-click always works
-      onClick={(e) => { if (canEdit && selected) { e.stopPropagation(); setEditing(true) } }}
-      onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); setEditing(true) } }}
+      onClick={(e) => { if (canEdit && selected) { e.stopPropagation(); startRename(id, title) } }}
+      onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); startRename(id, title) } }}
       title={canEdit ? 'Click (when selected) or double-click to rename' : 'View-only'}
       className={cn('truncate text-[13.5px] font-semibold text-foreground', canEdit && 'cursor-text')}
     >
@@ -320,18 +316,18 @@ function EditableTitle({ id, title, onRename, selected, canEdit }: { id: string;
 
 function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind: string; canEdit: boolean; disabled: boolean; bypassed: boolean }) {
   const [open, setOpen] = useState(false)
+  const renameRequested = useRef(false)
   useNodeTransientSurface(`node-more-menu:${id}`, open, () => setOpen(false))
   const { bypass, disable, duplicate, removeNode, openPanel } = useStore.getState()
+  const startRename = useStore((s) => s.startRename)
   const canBypass = getSpec(kind)?.canBypass
 
   const requestRename = () => {
-    // Let Radix finish closing the menu before the title input mounts and takes focus. Dispatching
-    // inline from onSelect races the menu's own focus cleanup: the input can blur and disappear before
-    // the user types, silently leaving the old title in place.
+    // The title must not mount until the menu's close has committed. Dispatching from onSelect (or
+    // even its animation frame) races Radix's focus cleanup: that cleanup can blur and unmount the
+    // freshly focused input, silently committing the old title.
+    renameRequested.current = true
     setOpen(false)
-    requestAnimationFrame(() => {
-      window.dispatchEvent(new CustomEvent('dp-rename', { detail: { id } }))
-    })
   }
 
   // Most items call store actions directly (no Dialogs), so onSelect can run inline and let the menu
@@ -368,7 +364,13 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
         className="dp-panel w-[184px]"
         // don't yank focus back to the trigger on close — the shelf/trigger may unmount, and the
         // "Rename" flow needs the freshly-mounted title input to keep focus (matches the old popover)
-        onCloseAutoFocus={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => {
+          e.preventDefault()
+          if (renameRequested.current) {
+            renameRequested.current = false
+            startRename(id, useStore.getState().doc.nodes.find((node) => node.id === id)?.data.title ?? '')
+          }
+        }}
         onClick={(e) => e.stopPropagation()}
       >
         {canEdit && item('rename', 'Rename', requestRename)}
