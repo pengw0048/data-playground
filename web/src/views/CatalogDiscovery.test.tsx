@@ -152,6 +152,7 @@ describe('Catalog discovery request and mutation truth', () => {
   })
 
   it('renders exact revision rows as the full-page primary view without reading latest rows', async () => {
+    const onUseTables = vi.fn()
     mocks.datasetRevision.mockResolvedValue({
       datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
       committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
@@ -170,7 +171,7 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       selectedRegistrationId="registration-other" initialRevisionId="rev-receipt"
       initialRevisionDatasetId="logical-receipt-id"
-      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+      onUseTables={onUseTables} onUploadDataset={store.uploadDataset} />)
 
     const viewer = await screen.findByTestId('dataset-viewer')
     expect(viewer).toHaveClass('absolute', 'inset-0')
@@ -183,6 +184,38 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).not.toHaveBeenCalled()
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact revision is view-only')
+    expect(screen.queryByTestId('detail-use')).not.toBeInTheDocument()
+    expect(onUseTables).not.toHaveBeenCalled()
+  })
+
+  it('preserves the exact route when catalog metadata is saved from the viewer', async () => {
+    const onSelectedTableChange = vi.fn()
+    const saved = { ...TABLE, name: 'renamed orders', metadataRevision: 'm2_orders' }
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
+      committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
+      parentRevisionId: null, producerOperation: 'write',
+      summary: { rowCount: 2, totalBytes: 128 },
+      preview: {
+        columns: TABLE.columns, rows: [{ order_id: 7 }], hasMore: false, rowLimit: 100,
+      },
+    })
+    mocks.saveTableEdit.mockResolvedValue(saved)
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-receipt"
+      initialRevisionDatasetId="logical-receipt-id"
+      onSelectedTableChange={onSelectedTableChange}
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    await screen.findByTestId('detail-use-unavailable')
+    onSelectedTableChange.mockClear()
+    openCatalogDetails()
+    fireEvent.change(screen.getByTestId('detail-name'), { target: { value: saved.name } })
+    fireEvent.click(screen.getByTestId('detail-save'))
+
+    await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalled())
+    expect(onSelectedTableChange).toHaveBeenCalledWith(saved, 'route')
   })
 
   it('fails an unavailable exact viewer closed without substituting latest rows', async () => {

@@ -196,10 +196,10 @@ export function CatalogDiscovery({
 
   useEffect(() => { void loadFirst() }, [loadFirst])
 
-  const selectTable = useCallback((table: CatalogTable | null) => {
+  const selectTable = useCallback((table: CatalogTable | null, origin: 'user' | 'route' = 'user') => {
     selectedLookupId.current = table?.registrationId ?? null
     setSelected(table)
-    onSelectedTableChange?.(table, 'user')
+    onSelectedTableChange?.(table, origin)
   }, [onSelectedTableChange])
   useEffect(() => {
     if (selectedRegistrationId === undefined) return
@@ -521,7 +521,13 @@ export function CatalogDiscovery({
         <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
           initialRevisionId={initialRevisionId}
           initialRevisionDatasetId={initialRevisionDatasetId}
-          onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }}
+          onChanged={(t) => {
+            // Saving catalog metadata refreshes the selected registration; it does not navigate
+            // away from an exact-revision route.
+            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
+            setCatalogRevision((v) => v + 1)
+            void loadFirst()
+          }}
           onFolder={(folder) => {
             if (onOpenInWorkspace) void onOpenInWorkspace(selected)
             else { setFolder(folder); selectTable(null) }
@@ -1208,7 +1214,15 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               {requestedExact ? `Exact revision ${requestedExact.revisionId}` : 'Latest dataset'}
             </div>
           </div>
-          <button onClick={() => onUse(table)} data-testid="detail-use" className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary"><Icon name="plus" size={12} /> Use in Canvas</button>
+          {requestedExact
+            ? <span data-testid="detail-use-unavailable"
+              className="shrink-0 rounded-md bg-muted px-2.5 py-1 text-[11.5px] font-semibold text-muted-foreground">
+              Exact revision is view-only
+            </span>
+            : <button onClick={() => onUse(table)} data-testid="detail-use"
+              className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary">
+              <Icon name="plus" size={12} /> Use in Canvas
+            </button>}
         </div>
 
         <div tabIndex={0} aria-label="Dataset detail content" data-testid="dataset-detail-content"
