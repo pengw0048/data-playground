@@ -676,12 +676,14 @@ test.describe('Related data and possible key matches', () => {
 
       const search = page.getByPlaceholder('Dataset, column, tag…')
       await search.fill(`${token}-focused`)
+      await page.getByRole('button', { name: /Show possible key matches/ }).click()
       await expect(page.getByRole('button', { name: new RegExp(`${token}-focused`, 'i') })).toBeVisible()
       await expect(truncation).toBeHidden()
 
       await search.fill('')
       const folder = page.getByPlaceholder('Optional folder subtree')
       await folder.fill(`${token}/focused`)
+      await page.getByRole('button', { name: /Show possible key matches/ }).click()
       await expect(page.getByRole('button', { name: new RegExp(`${token}-focused`, 'i') })).toBeVisible()
       await expect(truncation).toBeHidden()
     } finally {

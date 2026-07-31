@@ -6,7 +6,7 @@ const workspaceRoot = /\/api\/workspace\/containers\/workspace-local-root(?:\?|$
 
 async function openWorkspaceTable(page: Page, name: string) {
   await (await workspaceResource(page, 'dataset', name)).click()
-  await expect(page.getByRole('dialog', { name })).toBeVisible()
+  await expect(page.getByRole('region', { name })).toBeVisible()
 }
 
 async function namedTable(request: APIRequestContext, name: string) {
