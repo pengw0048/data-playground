@@ -1184,7 +1184,7 @@ interface Store {
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
-  nodeRevealRequest: NodeRevealRequest | null // URL-originated only; Canvas consumes it without autosaving
+  nodeRevealRequest: NodeRevealRequest | null // explicit presentation request; Canvas consumes it without autosaving
   viewportFitRequest: CanvasViewportFitRequest | null // successful example open only; consumed once after measurement
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>

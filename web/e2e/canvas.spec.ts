@@ -913,6 +913,8 @@ test.describe('Data Playground canvas', () => {
       await addFromOutput(page, sources.nth(0), 'join')
       const join = page.locator('.react-flow__node-join')
       await expect(join).toHaveCount(1)
+      await expect(page.locator('[data-node-reveal-pending]'))
+        .toHaveAttribute('data-node-reveal-pending', 'false')
       await connectHandles(page, sources.nth(1), join.locator('.react-flow__handle-left').nth(1))
       await expect(page.locator('.react-flow__edge')).toHaveCount(2)
       await page.getByRole('button', { name: 'Fit view', exact: true }).click()

@@ -41,11 +41,11 @@ function revealNodeGroup(
   rfNodes: readonly Node[],
   nodeIds: readonly string[],
   surface: DOMRect,
-  viewport: { setCenter: (x: number, y: number, options: { zoom: number, duration: number }) => void },
-): boolean {
+  viewport: { setCenter: (x: number, y: number, options: { zoom: number, duration: number }) => Promise<boolean> },
+): Promise<boolean> | null {
   const measured = new Map(rfNodes.map((node) => [node.id, node]))
   const nodes = nodeIds.map((id) => doc.find((node) => node.id === id))
-  if (nodes.some((node) => !node)) return false
+  if (nodes.some((node) => !node)) return null
   const bounds = (nodes as CanvasNode[]).map((node) => {
     const measuredNode = measured.get(node.id)
     const width = measuredNode?.measured?.width ?? measuredNode?.width
@@ -54,7 +54,7 @@ function revealNodeGroup(
     const position = absoluteNodePosition(doc, node)
     return { x: position.x, y: position.y, width, height }
   })
-  if (bounds.some((bound) => bound === null)) return false
+  if (bounds.some((bound) => bound === null)) return null
   const boxes = bounds as Array<{ x: number, y: number, width: number, height: number }>
   const left = Math.min(...boxes.map((box) => box.x))
   const top = Math.min(...boxes.map((box) => box.y))
@@ -65,16 +65,15 @@ function revealNodeGroup(
   const safe = { left: 196, top: 96, right: surface.width - 16, bottom: surface.height - 208 }
   const width = safe.right - safe.left
   const height = safe.bottom - safe.top
-  if (width <= 0 || height <= 0) return false
+  if (width <= 0 || height <= 0) return null
   const zoom = Math.max(0.2, Math.min(1, width / (right - left + 64), height / (bottom - top + 64)))
   const safeCenterX = (safe.left + safe.right) / 2
   const safeCenterY = (safe.top + safe.bottom) / 2
-  viewport.setCenter(
+  return viewport.setCenter(
     (left + right) / 2 + (surface.width / 2 - safeCenterX) / zoom,
     (top + bottom) / 2 + (surface.height / 2 - safeCenterY) / zoom,
     { zoom, duration: 350 },
-  )
-  return true
+  ).then(() => true)
 }
 
 // Directional arrowheads for the wires (open chevrons). Defined once; referenced by id from
@@ -306,9 +305,9 @@ export function Canvas() {
     viewportInitialized, nodesInitialized, fitView, acknowledgeViewportFit,
   ])
 
-  // A route request is intentionally distinct from normal selection: a click in the Canvas updates
-  // the shareable node= URL but must never seize the user's viewport. Wait for React Flow to mount
-  // the requested card, then consume this exact request once.
+  // An explicit reveal is intentionally distinct from normal selection: a route or a newly
+  // connected step may own the viewport, while an ordinary click must never seize it. Wait for
+  // React Flow to mount the requested card, then consume this exact request once.
   useEffect(() => {
     if (!nodeRevealRequest || nodeRevealRequest.canvasId !== doc.id
         || revealedRequestId.current === nodeRevealRequest.id) return
@@ -320,18 +319,23 @@ export function Canvas() {
     // Wait for React Flow's ResizeObserver to accept that real size before centering; otherwise it
     // uses the previous full-width viewport and leaves the selected card underneath the Inspector.
     if (!surface || Math.abs(flowWidth - surface.width) > 0.5 || Math.abs(flowHeight - surface.height) > 0.5) return
+    const consumeAfterReveal = (completion: Promise<boolean>) => {
+      const requestId = nodeRevealRequest.id
+      revealedRequestId.current = requestId
+      // Keep the request observable until React Flow finishes the animated viewport transition.
+      // A following coordinate-driven gesture can then wait on completion rather than guess a delay.
+      void completion.then(
+        () => acknowledgeNodeReveal(requestId),
+        () => acknowledgeNodeReveal(requestId),
+      )
+    }
     if (nodeIds.length > 1) {
       if (!viewportInitialized) return
-      if (revealNodeGroup(doc.nodes, rfNodes, nodeIds, surface, { setCenter })) {
-        revealedRequestId.current = nodeRevealRequest.id
-        acknowledgeNodeReveal(nodeRevealRequest.id)
-      }
+      const completion = revealNodeGroup(doc.nodes, rfNodes, nodeIds, surface, { setCenter })
+      if (completion) consumeAfterReveal(completion)
       return
     }
-    if (locateNode(doc.nodes, nodeRevealRequest.nodeId, { setCenter, getZoom })) {
-      revealedRequestId.current = nodeRevealRequest.id
-      acknowledgeNodeReveal(nodeRevealRequest.id)
-    }
+    consumeAfterReveal(locateNode(doc.nodes, nodeRevealRequest.nodeId, { setCenter, getZoom }))
   }, [
     nodeRevealRequest, doc.id, doc.nodes, rfNodes, flowWidth, flowHeight,
     viewportInitialized, setCenter, getZoom, acknowledgeNodeReveal,
@@ -558,7 +562,9 @@ export function Canvas() {
   }, [removeSelected, bypass, disable])
 
   return (
-    <div ref={canvasRef} style={{ position: 'absolute', inset: 0 }}
+    <div ref={canvasRef}
+      data-node-reveal-pending={nodeRevealRequest?.canvasId === doc.id ? 'true' : 'false'}
+      style={{ position: 'absolute', inset: 0 }}
       onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
       onDragOver={onDragOverFiles} onDragLeave={onDragLeaveFiles} onDrop={onDropFiles}>
       <ArrowDefs />
@@ -656,10 +662,16 @@ export function Canvas() {
                 y: (finder.anchor.top + finder.anchor.bottom) / 2,
               })
               const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
-              useStore.getState().addConnectedNode(kind, pos, {
+              const created = useStore.getState().addConnectedNode(kind, pos, {
                 source: finder.source.nodeId, sourceHandle: finder.source.handleId ?? '',
                 targetHandle: target.id, wire: finder.wire,
               })
+              // Selection opens the Inspector and narrows the Canvas. Reveal only after that real
+              // surface resize, so a consecutive rightward insertion cannot land underneath it.
+              if (created) {
+                const current = useStore.getState()
+                current.requestNodeReveal(current.doc.id, created.id)
+              }
             }
             setFinder(null)
           }}

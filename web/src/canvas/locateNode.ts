@@ -2,7 +2,7 @@ import type { CanvasNode } from '../types/graph'
 
 export type NodeViewport = {
   getZoom: () => number
-  setCenter: (x: number, y: number, options: { zoom: number; duration: number }) => void
+  setCenter: (x: number, y: number, options: { zoom: number; duration: number }) => Promise<boolean>
 }
 
 /**
@@ -28,11 +28,11 @@ export function absoluteNodePosition(nodes: CanvasNode[], node: CanvasNode): { x
 }
 
 /** Locate one existing card without fitting the entire graph or persisting a viewport change. */
-export function locateNode(nodes: CanvasNode[], id: string, viewport: NodeViewport): boolean {
+export async function locateNode(nodes: CanvasNode[], id: string, viewport: NodeViewport): Promise<boolean> {
   const node = nodes.find((candidate) => candidate.id === id)
   if (!node) return false
   const position = absoluteNodePosition(nodes, node)
-  viewport.setCenter(position.x + 116, position.y + 72, {
+  await viewport.setCenter(position.x + 116, position.y + 72, {
     zoom: Math.max(0.8, Math.min(viewport.getZoom(), 1.3)),
     duration: 350,
   })
