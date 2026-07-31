@@ -27,7 +27,7 @@ vi.mock('../store/graph', () => ({
   ),
 }))
 
-import { AppMenu, CanvasInboxIndicator, FileMenu } from './TopBar'
+import { AppMenu, FileMenu } from './TopBar'
 
 describe('AppMenu', () => {
   it('describes work destinations in researcher language', async () => {
@@ -74,19 +74,5 @@ describe('FileMenu', () => {
     expect(trigger).toHaveAttribute('title', state.doc.name)
     expect(trigger).toHaveTextContent(state.doc.name)
     expect(trigger.querySelector('.truncate')).not.toBeNull()
-  })
-})
-
-describe('CanvasInboxIndicator', () => {
-  it('identifies the count as Inbox state instead of rendering an unexplained number', async () => {
-    const user = userEvent.setup()
-    render(<CanvasInboxIndicator count={2} />)
-
-    const indicator = screen.getByRole('button', { name: 'Inbox, 2 unread outcomes' })
-    expect(indicator).toHaveAttribute('title', '2 Inbox outcomes need attention')
-    expect(indicator).toHaveTextContent('2')
-    expect(indicator.querySelector('svg')).not.toBeNull()
-    await user.click(indicator)
-    expect(state.setInboxQuery).toHaveBeenCalledWith('')
   })
 })

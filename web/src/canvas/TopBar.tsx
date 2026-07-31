@@ -24,9 +24,9 @@ import { CanvasDraftMenu } from './LocalDrafts'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
-import { api } from '../api/client'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
+import { CanvasInboxPopover } from './CanvasInboxPopover'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -50,7 +50,6 @@ export function TopBar() {
   const [importOpen, setImportOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [copyOpen, setCopyOpen] = useState(false)
-  const [inboxUnreadCount, setInboxUnreadCount] = useState<number | null>(null)
   const [workspaceReturnDestination, setWorkspaceReturnDestination] = useState<string | null | undefined>(undefined)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
@@ -84,16 +83,6 @@ export function TopBar() {
     return () => window.removeEventListener('dp-open-settings', onOpen)
   }, [])
 
-  // Canvas only shows a count the existing endpoint has actually confirmed. Unlike the Workspace
-  // rail's retained shell state, a Canvas fetch failure has no prior Canvas value to preserve.
-  useEffect(() => {
-    let live = true
-    void api.inboxUnreadCount()
-      .then(({ count }) => { if (live) setInboxUnreadCount(count) })
-      .catch(() => { if (live) setInboxUnreadCount(null) })
-    return () => { live = false }
-  }, [])
-
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
     setSettingsCategory(undefined)
@@ -121,7 +110,7 @@ export function TopBar() {
         style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden">
           <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
-          {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
+          <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
           <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
@@ -220,20 +209,6 @@ function MenuDestination({ label, detail }: { label: string; detail: string }) {
     <span>{label}</span>
     <span aria-hidden className="mt-0.5 whitespace-normal text-[10px] leading-tight text-muted-foreground">{detail}</span>
   </span>
-}
-
-export function CanvasInboxIndicator({ count }: { count: number }) {
-  const setInboxQuery = useStore((s) => s.setInboxQuery)
-  const inboxQuery = useStore((s) => s.inboxQuery)
-  const bounded = count > 99 ? '99+' : String(count)
-  return <button type="button" data-testid="canvas-inbox-unread-badge" onClick={() => setInboxQuery(inboxQuery)}
-    aria-label={`Inbox, ${count} unread outcomes`} title={`${count} Inbox outcome${count === 1 ? '' : 's'} need attention`}
-    className="relative grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
-    <Icon name="note" size={16} />
-    <span aria-hidden className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-foreground px-1 text-[9px] font-bold leading-none text-background">
-      {bounded}
-    </span>
-  </button>
 }
 
 export function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
