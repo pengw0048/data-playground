@@ -7,7 +7,7 @@ import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
 import type { ProcessorMode } from '../types/graph'
-import type { ProcessorDescriptor } from '../types/api'
+import type { InstalledProcessorSource, ProcessorDescriptor } from '../types/api'
 import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
 import { api } from '../api/client'
 import {
@@ -137,6 +137,15 @@ export function CodeFullscreen() {
     candidateIsLibrary ? candidateCfg.processor : undefined,
     candidateIsLibrary ? candidateCfg.version : undefined,
     listedProcessor,
+  )
+  const {
+    source: installedSource,
+    loading: installedSourceLoading,
+    error: installedSourceError,
+  } = useInstalledProcessorSource(
+    candidateIsLibrary ? candidateCfg.processor : undefined,
+    candidateIsLibrary ? candidateCfg.version : undefined,
+    libraryDescriptor?.provenance === 'plugin',
   )
   if (!fs || !node) return null
 
@@ -292,6 +301,9 @@ export function CodeFullscreen() {
               loading={libraryDescriptorLoading}
               error={libraryDescriptorError}
               runnable={runnable}
+              installedSource={installedSource}
+              installedSourceLoading={installedSourceLoading}
+              installedSourceError={installedSourceError}
             />
           ) : (
             <div className="min-h-0 flex-1">
@@ -502,18 +514,68 @@ function useExactLibraryDescriptor(
   return state
 }
 
+function useInstalledProcessorSource(
+  processor: unknown,
+  version: unknown,
+  enabled: boolean,
+): { source?: InstalledProcessorSource; loading: boolean; error: string } {
+  const id = typeof processor === 'string' && processor ? processor : undefined
+  const exactVersion = typeof version === 'string' && version ? version : undefined
+  const [state, setState] = useState<{
+    key: string
+    source?: InstalledProcessorSource
+    loading: boolean
+    error: string
+  }>({ key: '', loading: false, error: '' })
+  const key = enabled && id && exactVersion ? `${id}\u0000${exactVersion}` : ''
+
+  useEffect(() => {
+    if (!key || !id || !exactVersion) {
+      setState({ key: '', source: undefined, loading: false, error: '' })
+      return
+    }
+    let current = true
+    setState({ key, source: undefined, loading: true, error: '' })
+    void api.installedProcessorSource(id, exactVersion).then((source) => {
+      if (current) setState({ key, source, loading: false, error: '' })
+    }).catch((error) => {
+      if (!current) return
+      setState({
+        key,
+        source: undefined,
+        loading: false,
+        error: typeof error === 'object' && error !== null
+          && 'status' in error && error.status === 404
+          ? ''
+          : (error as Error).message || `Could not load installed source for ${id}@${exactVersion}.`,
+      })
+    })
+    return () => { current = false }
+  }, [exactVersion, id, key])
+
+  return state.key === key
+    ? state
+    : { source: undefined, loading: Boolean(key), error: '' }
+}
+
 function LibraryProcessorDefinition({
   configuredRef,
   descriptor,
   loading,
   error,
   runnable,
+  installedSource,
+  installedSourceLoading,
+  installedSourceError,
 }: {
   configuredRef?: string
   descriptor?: ProcessorDescriptor
   loading: boolean
   error: string
   runnable: boolean
+  installedSource?: InstalledProcessorSource
+  installedSourceLoading: boolean
+  installedSourceError: string
 }) {
   const parameters = descriptor ? processorParameterEntries(descriptor.paramsSchema) : []
   const status = loading
@@ -628,13 +690,11 @@ function LibraryProcessorDefinition({
           </>
         )}
 
-        <div className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
-          <div className="font-semibold text-foreground">Implementation source unavailable</div>
-          <div className="mt-1">
-            This registry entry does not publish executable source. Canvas execution uses the exact
-            registered processor shown above; the blank editor previously shown here was not source code.
-          </div>
-        </div>
+        <InstalledSourcePanel
+          source={installedSource}
+          loading={installedSourceLoading}
+          error={installedSourceError}
+        />
         <div className={`mt-3 rounded-md px-4 py-3 text-[11.5px] leading-relaxed ${
           error || !descriptor || descriptor.previewable === false
             ? 'border border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-200'
@@ -644,6 +704,65 @@ function LibraryProcessorDefinition({
         </div>
       </div>
     </section>
+  )
+}
+
+function InstalledSourcePanel({
+  source,
+  loading,
+  error,
+}: {
+  source?: InstalledProcessorSource
+  loading: boolean
+  error: string
+}) {
+  if (source) {
+    return (
+      <section aria-label="Installed processor source"
+        className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
+        <div className="font-semibold text-foreground">Installed processor source</div>
+        <div className="mt-1">
+          This is the exact local implementation installed for this Canvas processor. It does not
+          indicate remote or distributed dispatch.
+        </div>
+        <pre className="mt-3 max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground">
+          <code>{source.source}</code>
+        </pre>
+        <details className="mt-2">
+          <summary className="cursor-pointer font-medium text-foreground">Source integrity</summary>
+          <div className="mt-1">
+            <span className="mr-2 uppercase">{source.language}</span>
+            <span className="break-all font-mono">SHA-256 {source.sha256}</span>
+          </div>
+        </details>
+      </section>
+    )
+  }
+  if (loading) {
+    return (
+      <div role="status"
+        className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] text-muted-foreground">
+        Loading installed processor source…
+      </div>
+    )
+  }
+  if (error) {
+    return (
+      <div role="alert"
+        className="mt-6 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-[11.5px] text-destructive">
+        <div className="font-semibold">Installed processor source could not be loaded</div>
+        <div className="mt-1">{error}</div>
+      </div>
+    )
+  }
+  return (
+    <div className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
+      <div className="font-semibold text-foreground">Implementation source unavailable</div>
+      <div className="mt-1">
+        This registry entry does not publish executable source. Canvas execution uses the exact
+        registered processor shown above.
+      </div>
+    </div>
   )
 }
 

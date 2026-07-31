@@ -42,6 +42,7 @@ from hub.plugins.adapters import (
 )
 from hub.plugins.capabilities import tag_columns
 from hub.plugins.importer import ImporterNotConfigured
+from hub.plugins.processors import ProcessorSourceUnavailable
 from hub.routers.dataset_views import supports_dataset_view_source
 from hub.sampling import provenance_for_dataset
 from hub.settings import settings
@@ -66,6 +67,7 @@ from hub.models import (
     Facets,
     FieldLineagePage,
     ImportRequest,
+    InstalledProcessorSource,
     JoinSuggestion,
     KernelInfo,
     LineageFactsPage,
@@ -1364,6 +1366,23 @@ def import_pipeline(req: ImportRequest) -> PipelineImport:
 @router.get("/processors", response_model=list[ProcessorDescriptor])
 def list_processors(uid: str = Depends(current_user)) -> list[ProcessorDescriptor]:
     return get_deps().registry.list(uid)
+
+
+@router.get(
+    "/processors/{processor_id}/versions/{version}/source",
+    response_model=InstalledProcessorSource,
+)
+def installed_processor_source(
+        processor_id: str, version: str,
+        uid: str = Depends(current_user)) -> InstalledProcessorSource:
+    """Return only source that the exact installed plugin processor explicitly publishes."""
+    try:
+        return get_deps().registry.installed_source(processor_id, version)
+    except KeyError as exc:
+        raise HTTPException(404, "Installed processor source unavailable") from exc
+    except ProcessorSourceUnavailable as exc:
+        raise HTTPException(
+            503, "Installed processor source could not be loaded") from exc
 
 
 def _transform_library_entry(item: dict, *, availability: str = "active") -> dict:

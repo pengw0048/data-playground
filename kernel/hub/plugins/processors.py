@@ -14,14 +14,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import datetime
+import hashlib
+import re
 from typing import Any, Callable
 
 from hub import sandbox
 from hub.models import (
     PREVIEWABLE_MODES,
     ColumnSchema,
+    InstalledProcessorSource,
     ProcessorDescriptor,
 )
+
+MAX_INSTALLED_SOURCE_BYTES = 1_000_000
+_SOURCE_LANGUAGE = re.compile(r"^[a-z][a-z0-9_+-]{0,31}$")
+
+
+@dataclass(frozen=True)
+class ProcessorSourceProvider:
+    """Explicit opt-in for publishing one exact installed source resource."""
+
+    language: str
+    read: Callable[[], bytes]
+
+
+class ProcessorSourceUnavailable(RuntimeError):
+    """The opted-in installed resource could not be read safely."""
 
 
 @dataclass
@@ -45,6 +63,7 @@ class RegisteredProcessor:
     semantic_digest: str | None = None
     code: str | None = None                       # code-backed (promoted / inline)
     fn_factory: Callable[[dict], Callable] | None = None  # plugin-supplied operator
+    source: ProcessorSourceProvider | None = None  # plugin opt-in; never part of descriptors/manifests
 
     @property
     def previewable(self) -> bool:
@@ -78,6 +97,11 @@ class ProcessorRegistry:
     def register(self, p: RegisteredProcessor) -> None:
         if p.id.startswith("tr_"):
             raise ValueError("plugin processor ids cannot use the reserved promoted Transform namespace")
+        if p.source is not None and (
+            not _SOURCE_LANGUAGE.fullmatch(p.source.language)
+            or not callable(p.source.read)
+        ):
+            raise ValueError("processor source requires a canonical language and byte reader")
         self._procs[p.id] = p
 
     def promote(self, *, owner_id: str, id: str, title: str, mode: str, code: str,
@@ -126,6 +150,29 @@ class ProcessorRegistry:
         except KeyError:
             return False
         return True
+
+    def installed_source(self, pid: str, version: str) -> InstalledProcessorSource:
+        processor = self.get(pid, version)
+        provider = processor.source
+        if processor.provenance != "plugin" or provider is None:
+            raise KeyError((pid, version, "source"))
+        try:
+            payload = provider.read()
+            if not isinstance(payload, bytes):
+                raise TypeError("processor source reader must return bytes")
+            if len(payload) > MAX_INSTALLED_SOURCE_BYTES:
+                raise ValueError("processor source exceeds the response limit")
+            source = payload.decode("utf-8")
+        except Exception as exc:
+            raise ProcessorSourceUnavailable(
+                f"installed source for {pid}@{version} is unavailable") from exc
+        return InstalledProcessorSource(
+            processor_id=pid,
+            version=version,
+            language=provider.language,
+            source=source,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
 
     @staticmethod
     def _from_promoted(item: dict) -> RegisteredProcessor:

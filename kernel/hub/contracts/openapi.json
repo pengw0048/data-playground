@@ -5664,6 +5664,43 @@
         "title": "InputDriftSource",
         "type": "object"
       },
+      "InstalledProcessorSource": {
+        "description": "Exact plugin-published source, fetched separately from processor metadata.",
+        "properties": {
+          "language": {
+            "title": "Language",
+            "type": "string"
+          },
+          "processorId": {
+            "title": "Processorid",
+            "type": "string"
+          },
+          "sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "processorId",
+          "version",
+          "language",
+          "source",
+          "sha256"
+        ],
+        "title": "InstalledProcessorSource",
+        "type": "object"
+      },
       "JoinAnalysis": {
         "description": "Everything the join node's inspector needs: ranked key suggestions for its two inputs, and a\nfan-out warning when the join isn't 1:1 (the result lands at the finer grain — a later\nparent-grain metric would double-count unless you aggregate).",
         "properties": {
@@ -24548,6 +24585,97 @@
           }
         },
         "summary": "Delete Processor Version"
+      }
+    },
+    "/api/processors/{processor_id}/versions/{version}/source": {
+      "get": {
+        "description": "Return only source that the exact installed plugin processor explicitly publishes.",
+        "operationId": "installed_processor_source_api_processors__processor_id__versions__version__source_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "processor_id",
+            "required": true,
+            "schema": {
+              "title": "Processor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledProcessorSource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Installed Processor Source"
       }
     },
     "/api/readyz": {

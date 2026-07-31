@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 
@@ -91,6 +92,101 @@ def test_library_is_keyset_paginated_filterable_and_keeps_deleted_exact_truth() 
     assert detail["versions"][0]["availability"] == "deleted"
     assert detail["versions"][0]["version"] == exact["version"]
     assert "code" not in detail["versions"][0]
+
+
+def test_plugin_installed_source_is_exact_opt_in_and_separate_from_metadata() -> None:
+    from hub.deps import get_deps
+    from hub.plugins.processors import ProcessorSourceProvider, RegisteredProcessor
+
+    uid = _user("installed-source")
+    processor_id = f"plugin.source.{uuid.uuid4().hex}"
+    source = (
+        b"MAX_DECODED_PIXELS = 50_000_000\n\n"
+        b"def processor_factory(params):\n"
+        b"    return lambda row: {**row, 'bounded': MAX_DECODED_PIXELS}\n"
+    )
+    registry = get_deps().registry
+    registry.register(RegisteredProcessor(
+        id=processor_id,
+        version="v7",
+        title="Installed source fixture",
+        mode="map",
+        fn_factory=lambda _params: lambda row: row,
+        source=ProcessorSourceProvider(language="python", read=lambda: source),
+    ))
+    try:
+        listed = client.get("/api/processors", headers=_headers(uid))
+        assert listed.status_code == 200
+        descriptor = next(item for item in listed.json() if item["id"] == processor_id)
+        assert "source" not in descriptor
+        assert "MAX_DECODED_PIXELS" not in listed.text
+
+        detail = client.get(
+            f"/api/transform-library/{processor_id}",
+            headers=_headers(uid),
+            params={"version": "v7"},
+        )
+        assert detail.status_code == 200
+        assert "source" not in detail.json()["versions"][0]
+        assert "MAX_DECODED_PIXELS" not in detail.text
+
+        response = client.get(
+            f"/api/processors/{processor_id}/versions/v7/source",
+            headers=_headers(uid),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "processorId": processor_id,
+            "version": "v7",
+            "language": "python",
+            "source": source.decode("utf-8"),
+            "sha256": hashlib.sha256(source).hexdigest(),
+        }
+        assert client.get(
+            f"/api/processors/{processor_id}/versions/v6/source",
+            headers=_headers(uid),
+        ).status_code == 404
+    finally:
+        registry._procs.pop(processor_id, None)
+
+
+def test_installed_source_unavailable_is_honest_and_does_not_expose_loader_errors() -> None:
+    from hub.deps import get_deps
+    from hub.plugins.processors import ProcessorSourceProvider, RegisteredProcessor
+
+    uid = _user("installed-source-unavailable")
+    registry = get_deps().registry
+    plain_id = f"plugin.plain.{uuid.uuid4().hex}"
+    broken_id = f"plugin.broken.{uuid.uuid4().hex}"
+
+    def broken_reader() -> bytes:
+        raise OSError("/private/plugin/path/mapping.py contains internal detail")
+
+    registry.register(RegisteredProcessor(
+        id=plain_id, title="No source", mode="map",
+        fn_factory=lambda _params: lambda row: row,
+    ))
+    registry.register(RegisteredProcessor(
+        id=broken_id, title="Broken source", mode="map",
+        fn_factory=lambda _params: lambda row: row,
+        source=ProcessorSourceProvider(language="python", read=broken_reader),
+    ))
+    try:
+        absent = client.get(
+            f"/api/processors/{plain_id}/versions/v1/source",
+            headers=_headers(uid),
+        )
+        assert absent.status_code == 404
+        broken = client.get(
+            f"/api/processors/{broken_id}/versions/v1/source",
+            headers=_headers(uid),
+        )
+        assert broken.status_code == 503
+        assert broken.json()["detail"] == "Installed processor source could not be loaded"
+        assert "/private/" not in broken.text
+    finally:
+        registry._procs.pop(plain_id, None)
+        registry._procs.pop(broken_id, None)
 
 
 def test_library_unicode_keyset_and_search_use_one_canonical_order() -> None:
