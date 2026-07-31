@@ -113,3 +113,33 @@ test('preserves the compact short-title layout', async ({ page }) => {
     expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBeTruthy()
   }
 })
+
+test('browser Back cannot carry a title rollback into another Canvas', async ({ page }) => {
+  const canvasAName = 'Canvas A original'
+  const canvasBName = 'Canvas B original'
+  const canvasA = await createCanvas(page, canvasAName, 'history-a')
+  const canvasB = await createCanvas(page, canvasBName, 'history-b')
+  try {
+    await openCanvas(page, canvasB)
+    await openCanvas(page, canvasA)
+    await page.getByTestId('canvas-title').click()
+    await page.getByRole('textbox', { name: 'Canvas name' }).fill('Canvas A in progress')
+
+    await page.goBack()
+    await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasB)}$`))
+    await expect(page.getByRole('textbox', { name: 'Canvas name' })).toHaveCount(0)
+    await expect(page.getByTestId('canvas-title')).toHaveText(canvasBName)
+
+    // A late Escape from the detached A input must not rename the newly active B Canvas.
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('canvas-title')).toHaveText(canvasBName)
+    await expect(page.getByTestId('autosave')).toContainText('saved')
+    const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasB)}`)
+    expect(response.ok(), await response.text()).toBeTruthy()
+    expect((await response.json()).name).toBe(canvasBName)
+  } finally {
+    for (const canvasId of [canvasA, canvasB]) {
+      expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBeTruthy()
+    }
+  }
+})

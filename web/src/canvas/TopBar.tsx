@@ -245,10 +245,21 @@ export function CanvasTitle() {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(doc.name ?? '')
   const original = useRef(doc.name ?? '')
+  const editingCanvasId = useRef(doc.id)
   const input = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
-    if (!editing) setDraft(doc.name ?? '')
+    if (editingCanvasId.current !== doc.id) {
+      // TopBar survives browser Back/Forward navigation between Canvases. Never carry an input or
+      // its Escape rollback target across that identity boundary.
+      editingCanvasId.current = doc.id
+      original.current = doc.name ?? ''
+      setDraft(doc.name ?? '')
+      setEditing(false)
+    } else if (!editing) {
+      original.current = doc.name ?? ''
+      setDraft(doc.name ?? '')
+    }
   }, [doc.id, doc.name, editing])
 
   useEffect(() => {
@@ -259,13 +270,16 @@ export function CanvasTitle() {
 
   const begin = () => {
     if (!canEdit) return
+    editingCanvasId.current = doc.id
     original.current = doc.name ?? ''
     setDraft(doc.name ?? '')
     setEditing(true)
   }
   const cancel = () => {
-    renameFile(original.current)
-    setDraft(original.current)
+    // A stale input event can arrive after navigation but before React removes the old element.
+    // It must not rename the newly active Canvas.
+    if (editingCanvasId.current === doc.id) renameFile(original.current)
+    setDraft(doc.name ?? '')
     setEditing(false)
   }
 

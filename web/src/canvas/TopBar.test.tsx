@@ -137,6 +137,26 @@ describe('CanvasTitle', () => {
     expect(screen.queryByRole('textbox', { name: 'Canvas name' })).not.toBeInTheDocument()
   })
 
+  it('drops an in-progress rename when browser navigation activates another Canvas', async () => {
+    const user = userEvent.setup()
+    state.doc = { id: 'canvas-a', name: 'Canvas A original' }
+    const { rerender } = render(<CanvasTitle />)
+
+    await user.click(screen.getByTestId('canvas-title'))
+    const staleInput = screen.getByRole('textbox', { name: 'Canvas name' })
+    await user.clear(staleInput)
+    await user.type(staleInput, 'Canvas A in progress')
+
+    state.doc = { id: 'canvas-b', name: 'Canvas B original' }
+    rerender(<CanvasTitle />)
+
+    expect(screen.queryByRole('textbox', { name: 'Canvas name' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('canvas-title')).toHaveTextContent('Canvas B original')
+    state.renameFile.mockClear()
+    fireEvent.keyDown(staleInput, { key: 'Escape' })
+    expect(state.renameFile).not.toHaveBeenCalled()
+  })
+
   it('commits the current name on blur', async () => {
     const user = userEvent.setup()
     render(<><CanvasTitle /><button type="button">Next control</button></>)
