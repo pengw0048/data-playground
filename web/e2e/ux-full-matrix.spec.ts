@@ -53,6 +53,7 @@ test.describe('full researcher acceptance matrix', () => {
     await openWorkspaceTable(page, left.name)
     await page.getByTestId('detail-relationships').click()
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible()
+    await page.getByTestId('er-mode-joins').click()
     await expect(page.locator('.react-flow__node', { hasText: left.name })).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: right.name })).toBeVisible()
   })

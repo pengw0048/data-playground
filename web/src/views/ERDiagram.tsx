@@ -143,12 +143,21 @@ const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 export function ERDiagram() {
   const pushToast = useStore((s) => s.pushToast)
   const erFocusUri = useStore((s) => s.erFocusUri)
+  const erFocusDatasetId = useStore((s) => s.erFocusDatasetId)
+  const erMode = useStore((s) => s.erMode)
+  const erReturn = useStore((s) => s.erReturn)
+  const setRelationshipsFocus = useStore((s) => s.setRelationshipsFocus)
+  const setRelationshipsMode = useStore((s) => s.setRelationshipsMode)
+  const returnFromRelationships = useStore((s) => s.returnFromRelationships)
   const openWorkspace = useStore((s) => s.setView)
 
   // focus === null → the global / folder view; otherwise the neighbourhood of that uri
   const [focus, setFocus] = useState<string | null>(erFocusUri)
   const [hops, setHops] = useState(1)
-  const [mode, setMode] = useState<'joins' | 'lineage'>('joins')
+  const [mode, setMode] = useState<'joins' | 'lineage'>(erMode)
+  const [focusResolving, setFocusResolving] = useState(!erFocusUri && !!erFocusDatasetId)
+  const [focusResolutionError, setFocusResolutionError] = useState<string | null>(null)
+  const [focusResolutionRevision, setFocusResolutionRevision] = useState(0)
   const [folder, setFolder] = useState('')
   const [folders, setFolders] = useState<string[]>([])
   const [search, setSearch] = useState('')
@@ -174,6 +183,36 @@ export function ERDiagram() {
   const graphContainer = useRef<HTMLDivElement>(null)
   const dataReq = useRef(0)
   const relsReq = useRef(0)
+  const focusReq = useRef(0)
+
+  useEffect(() => { setMode(erMode) }, [erMode])
+
+  useEffect(() => {
+    const request = ++focusReq.current
+    setFocusResolutionError(null)
+    if (erFocusUri) {
+      setFocus(erFocusUri)
+      setFocusResolving(false)
+      return
+    }
+    if (!erFocusDatasetId) {
+      setFocus(null)
+      setFocusResolving(false)
+      return
+    }
+    setFocus(null)
+    setFocusResolving(true)
+    void api.tableByRegistration(erFocusDatasetId).then((table) => {
+      if (request !== focusReq.current) return
+      setFocus(table.uri)
+      setFocusResolving(false)
+    }).catch((caught) => {
+      if (request !== focusReq.current) return
+      setFocusResolutionError(errorMessage(caught))
+      setFocusResolving(false)
+    })
+    return () => { focusReq.current += 1 }
+  }, [erFocusDatasetId, erFocusUri, focusResolutionRevision])
 
   const loadRelationships = useCallback(async () => {
     const s = ++relsReq.current
@@ -197,6 +236,10 @@ export function ERDiagram() {
     ? lineageFocus.canonical : focus
   const focusName = tables.find((t) => t.uri === visibleFocus)?.name ?? visibleFocus?.split('/').slice(-1)[0]
   useEffect(() => {
+    if (focusResolving || focusResolutionError) {
+      setLoading(focusResolving)
+      return
+    }
     const s = ++dataReq.current
     setLoading(true); setError(null)
     ;(async () => {
@@ -227,7 +270,7 @@ export function ERDiagram() {
       }
     })()
     return () => { dataReq.current += 1 }
-  }, [focus, visibleFocus, hops, mode, folder, rels, reloadKey])
+  }, [focus, visibleFocus, hops, mode, folder, rels, reloadKey, focusResolving, focusResolutionError])
 
   const refresh = useCallback(() => setReloadKey((k) => k + 1), [])
 
@@ -243,8 +286,13 @@ export function ERDiagram() {
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
     position: positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
-    data: { table: t, pk: pkOf(t), focused: t.uri === visibleFocus, onFocus: () => setFocus(t.uri) } satisfies EntityData,
-  })), [visible, positions, visibleFocus])
+    data: {
+      table: t,
+      pk: pkOf(t),
+      focused: t.uri === visibleFocus,
+      onFocus: () => { setFocus(t.uri); setRelationshipsFocus(t) },
+    } satisfies EntityData,
+  })), [visible, positions, visibleFocus, setRelationshipsFocus])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []
@@ -314,7 +362,8 @@ export function ERDiagram() {
     })
   }, [])
 
-  const capped = !focus && total > visible.length
+  const hasFocusedRoute = !!focus || !!erFocusDatasetId
+  const capped = !hasFocusedRoute && total > visible.length
   const layoutKey = useMemo(() => JSON.stringify(nodes.map((node) => node.id)), [nodes])
 
   return (
@@ -323,15 +372,18 @@ export function ERDiagram() {
         <div className="flex items-center gap-2">
           <span className="text-[12.5px] font-semibold text-foreground">Relationships</span>
           <span className="flex-1" />
+          {erReturn && <button type="button" onClick={returnFromRelationships}
+            data-testid="er-back-to-dataset" aria-label="Back to dataset"
+            className="text-[10.5px] font-semibold text-primary hover:underline">← Dataset</button>}
           <button onClick={() => setShowHelp((v) => !v)} aria-label="How this works" title="How this works"
             className="grid h-5 w-5 place-items-center rounded-full border border-border text-[11px] font-bold hover:bg-accent">?</button>
         </div>
 
-        {focus ? (
+        {hasFocusedRoute ? (
           <div className="flex flex-col gap-2" data-testid="er-focus-bar">
             <div className="flex items-center gap-1.5">
-              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-primary">Focused: {focusName}</span>
-              <button onClick={() => setFocus(null)} className="text-[10.5px] underline hover:text-foreground" data-testid="er-clear-focus">show all</button>
+              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-primary">Focused: {focusName ?? (focusResolving ? 'loading…' : 'dataset')}</span>
+              <button onClick={() => { setFocus(null); setRelationshipsFocus(null) }} className="text-[10.5px] underline hover:text-foreground" data-testid="er-clear-focus">show all</button>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10.5px]">Hops</span>
@@ -343,7 +395,7 @@ export function ERDiagram() {
               <span className="flex-1" />
               <div className="inline-flex rounded-md border border-border p-0.5 text-[10.5px]">
                 {(['joins', 'lineage'] as const).map((m) => (
-                  <button key={m} onClick={() => setMode(m)} data-testid={`er-mode-${m}`}
+                  <button key={m} onClick={() => { setMode(m); setRelationshipsMode(m) }} data-testid={`er-mode-${m}`}
                     className={cn('rounded px-1.5 py-0.5', mode === m ? 'bg-accent font-semibold text-foreground' : 'hover:text-foreground')}>{m}</button>
                 ))}
               </div>
@@ -378,6 +430,13 @@ export function ERDiagram() {
         )}
 
         {loading && <span data-testid="er-catalog-loading">Loading…</span>}
+        {focusResolutionError && (
+          <span role="alert" className="text-destructive">
+            Couldn't restore the focused dataset: {focusResolutionError}{' '}
+            <button onClick={() => setFocusResolutionRevision((value) => value + 1)}
+              data-testid="er-focus-retry" className="font-semibold underline">Retry</button>
+          </span>
+        )}
         {error && (
           <span role="alert" className="text-destructive">
             Couldn't load: {error}{' '}
@@ -395,7 +454,7 @@ export function ERDiagram() {
 
       {!loading && !error && visible.length === 0 && (
         <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
-          {focus ? 'No neighbours at this hop distance.' : total === 0 ? (
+          {hasFocusedRoute ? 'No neighbours at this hop distance.' : total === 0 ? (
             <span className="pointer-events-auto">No datasets registered yet — add some in <button onClick={() => openWorkspace('workspace')} className="underline">Workspace</button>.</span>
           ) : 'No datasets in this folder.'}
         </div>
