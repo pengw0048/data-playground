@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { expect, test, type Page } from '@playwright/test'
 
-type WriteReceipt = { datasetId: string; revisionId: string; schema: Array<{ name: string }> }
+type WriteReceipt = {
+  datasetId: string
+  revisionId: string
+  name: string
+  rows: number
+  schema: Array<{ name: string }>
+}
 type ExactBase = { uri: string; tableId: string; datasetId: string; revisionId: string; filename: string }
 type RunStatus = {
   runId: string
@@ -124,11 +130,33 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
     const submitted = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upsert')
       && response.request().method() === 'POST')
     await control.getByRole('button', { name: 'Run keyed upsert' }).click()
-    await json<{ taskId: string }>(await submitted, 'submit browser keyed upsert')
-    await expect(control.getByText('Published exact revision')).toBeVisible({ timeout: 20_000 })
+    const task = await json<{ taskId: string }>(await submitted, 'submit browser keyed upsert')
+    const published = control.getByLabel('Published result')
+    await expect(published).toBeVisible({ timeout: 20_000 })
     await expect(control).toContainText('1 matched · 2 inserted · 2 unchanged')
-    await control.getByRole('button', { name: 'Open exact revision' }).click()
-    await expect(control.getByLabel('Exact revision detail')).toContainText(`Parent ${target.revisionId}`)
+    const completed = await json<{ receipt?: WriteReceipt | null }>(
+      await page.request.get(`/api/keyed-upsert/${encodeURIComponent(task.taskId)}`),
+      'read browser keyed-upsert publication',
+    )
+    const receipt = completed.receipt
+    expect(receipt).toBeTruthy()
+    await expect(published).toContainText(`Published · ${receipt!.name} · ${receipt!.rows.toLocaleString()} rows`)
+    await expect(published).not.toContainText(receipt!.datasetId)
+    await expect(published).not.toContainText(receipt!.revisionId)
+    const exactDataset = published.getByRole('link', { name: 'Open dataset' })
+    await expect(exactDataset).toHaveAttribute(
+      'href',
+      `#/workspace/${encodeURIComponent(`dataset:${receipt!.datasetId}`)}?${new URLSearchParams({
+        scope: 'datasets',
+        revision: receipt!.revisionId,
+        revisionDataset: receipt!.datasetId,
+      })}`,
+    )
+    await exactDataset.click()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    const datasetDetails = page.getByTestId('detail-dataset-details')
+    await datasetDetails.locator('summary').click()
+    await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${target.revisionId}`)
 
     // Reopen exactly the immutable base and upserted head through the ordinary revision APIs.
     const finalHead = await json<{ datasetId: string; revisionId: string }>(

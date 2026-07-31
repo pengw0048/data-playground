@@ -4,6 +4,8 @@ import { expect, test, type Page } from '@playwright/test'
 type WriteReceipt = {
   datasetId: string
   revisionId: string
+  name: string
+  rows: number
   schema: Array<{ name: string }>
 }
 
@@ -128,31 +130,44 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     const writeCard = page.locator('.react-flow__node[data-id="write"]')
     await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
-    await expect(inspector.getByLabel('Certified column merge')).toBeVisible()
-    await inspector.getByRole('button', { name: 'Check eligibility' }).click()
-    const preflight = inspector.getByLabel('Merge preflight')
+    const control = inspector.getByLabel('Certified column merge')
+    await expect(control).toBeVisible()
+    await control.getByRole('button', { name: 'Check eligibility' }).click()
+    const preflight = control.getByLabel('Merge preflight')
     await expect(preflight).toContainText('Eligible exact merge')
     await expect(preflight).toContainText('replacement → replace_me (replace); addition → added_numeric (add)')
     await expect(preflight).toContainText('Output schema: id: int, untouched_text: string, untouched_numeric: float, replace_me: string, added_numeric: float')
 
     const submitted = page.waitForResponse((response) => response.url().endsWith('/api/merge-columns')
       && response.request().method() === 'POST')
-    await inspector.getByRole('button', { name: 'Run column merge' }).click()
+    await control.getByRole('button', { name: 'Run column merge' }).click()
     const task = await json<{ taskId: string }>(await submitted, 'submit browser column merge')
-    await expect(inspector.getByText('Published exact revision')).toBeVisible({ timeout: 20_000 })
-    await inspector.getByRole('button', { name: 'Open in Jobs' }).click()
+    const published = control.getByLabel('Published result')
+    await expect(published).toBeVisible({ timeout: 20_000 })
+    const jobs = await json<{ items: Array<{ outputReceipt?: WriteReceipt | null }> }>(
+      await page.request.get(`/api/jobs?run_id=${encodeURIComponent(task.taskId)}&limit=1`),
+      'read browser merge publication',
+    )
+    const final = jobs.items[0]?.outputReceipt
+    expect(final).toBeTruthy()
+    await expect(published).toContainText(`Published · ${final!.name} · ${final!.rows.toLocaleString()} rows`)
+    await expect(published).not.toContainText(final!.datasetId)
+    await expect(published).not.toContainText(final!.revisionId)
+    await expect(published.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      `#/workspace/${encodeURIComponent(`dataset:${final!.datasetId}`)}?${new URLSearchParams({
+        scope: 'datasets',
+        revision: final!.revisionId,
+        revisionDataset: final!.datasetId,
+      })}`,
+    )
+    await control.getByRole('button', { name: 'Open in Jobs' }).click()
 
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
     const job = page.getByRole('button', { name: `Open run ${task.taskId} in Issue 585 exact merge canvas` })
     await expect(job).toBeVisible()
     await page.getByText('Technical evidence', { exact: true }).click()
     await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
-    const jobs = await json<{ items: Array<{ outputReceipt?: WriteReceipt | null }> }>(
-      await page.request.get(`/api/jobs?run_id=${encodeURIComponent(task.taskId)}&limit=1`),
-      'reopen browser merge in Jobs API',
-    )
-    const final = jobs.items[0]?.outputReceipt
-    expect(final).toBeTruthy()
     const exactDataset = page.getByRole('link', { name: 'Open dataset' })
     await expect(exactDataset).toHaveAttribute(
       'href',
