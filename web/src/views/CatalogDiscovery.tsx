@@ -1031,11 +1031,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     headRequest.current += 1
     factsRequest.current += 1
     setLatestHead(null); setHeadError(null); setExactFacts(null); setFactsError(null); setFactsLoading(false)
-    if (requestedExact) {
-      setHeadChecking(false)
-    } else {
-      void resolveLatestHead()
-    }
+    // Exact routes still resolve the current head as evidence for the page label. The exact
+    // preview remains pinned and is never replaced with latest data if this lookup fails.
+    void resolveLatestHead()
     return () => {
       headRequest.current += 1
       factsRequest.current += 1
@@ -1201,8 +1199,13 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     ? requestedExactDetail?.preview.columns ?? []
     : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
-  const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
+  const factsVerifiedLatest = !requestedExact && factsMatchKnownHead && !headChecking && !headError
   const displayedVersion = requestedExact ?? exactFacts ?? latestHead
+  const exactVersionContext = !requestedExact
+    ? null
+    : latestHead
+      ? sameRevision(requestedExact, latestHead) ? 'Current exact version' : 'Historical exact version'
+      : 'Exact version'
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1223,13 +1226,13 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-bold text-foreground">{table.name}</div>
             <div data-testid="dataset-version-context" className="truncate text-[10.5px] text-muted-foreground">
-              {requestedExact ? 'Published version' : 'Latest dataset'}
+              {exactVersionContext ?? 'Latest dataset'}
             </div>
           </div>
           {requestedExact
             ? <span data-testid="detail-use-unavailable"
               className="shrink-0 rounded-md bg-muted px-2.5 py-1 text-[11.5px] font-semibold text-muted-foreground">
-              Exact revision is view-only
+              {exactVersionContext} · view-only
             </span>
             : <button onClick={() => onUse(table)} data-testid="detail-use"
               className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary">
@@ -1244,7 +1247,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
               <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
-              {requestedExactDetail ? <span data-testid="dataset-facts-source">· Published version</span> : null}
+              {requestedExactDetail ? <span data-testid="dataset-facts-source">· {exactVersionContext}</span> : null}
               {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Versioned facts</span> : null}
               {!requestedExact && !exactFacts && latestHead ? <span data-testid="dataset-facts-source">· Latest version</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
@@ -1260,7 +1263,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                   </p>
                 </div>
                 {requestedExact ? <span className="rounded bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
-                  Exact revision
+                  {exactVersionContext}
                 </span> : <span className="rounded bg-muted px-2 py-1 text-[10px] font-semibold text-muted-foreground">
                   Latest dataset
                 </span>}
@@ -1333,16 +1336,16 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               </div>
             </details>
 
-          {headChecking && !latestHead ? (
+          {!requestedExact && headChecking && !latestHead ? (
             <div role="status" className="text-[11px] text-muted-foreground">Checking latest dataset head…</div>
           ) : null}
-          {headError ? (
+          {!requestedExact && headError ? (
             <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-[11px] text-destructive">
               <span>Couldn't verify the latest dataset head: {headError}</span>
               <button type="button" onClick={() => void resolveLatestHead()} className="shrink-0 font-semibold underline">Retry</button>
             </div>
           ) : null}
-          {latestHead && !factsMatchKnownHead ? (
+          {!requestedExact && latestHead && !factsMatchKnownHead ? (
             <div role="status" data-testid="dataset-facts-stale"
               className="flex flex-col gap-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-3 py-2 text-[11px] text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
               <div>

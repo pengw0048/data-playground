@@ -272,6 +272,10 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.route('**/api/catalog/tables/dataset-1?registration=true', async (route) => route.fulfill({
     json: { ...template, id: 'dataset-1', name: 'Published column enrichment' },
   }))
+  await page.route('**/api/catalog/tables/dataset-1/revisions/resolve', async (route) => route.fulfill({ json: {
+    datasetId: 'dataset-1', revisionId: 'rev-published', committedAt: '2026-07-19T12:01:00Z',
+    retentionOwner: 'core', selector: 'latest',
+  } }))
   await page.route('**/api/catalog/revision-details', async (route) => {
     expect(route.request().method()).toBe('POST')
     const request = route.request().postDataJSON() as { datasetId: string; revisionId: string }
@@ -307,8 +311,8 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await exactDataset.click()
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
   const viewer = page.getByRole('region', { name: 'Published column enrichment' })
-  await expect(viewer).toContainText('Published version')
-  await expect(viewer).toContainText('Exact revision is view-only')
+  await expect(viewer).toContainText('Current exact version')
+  await expect(viewer).toContainText('Current exact version · view-only')
   await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()
   await viewer.getByRole('button', { name: 'Back to Jobs' }).click()
   await expect(page).toHaveURL(/#\/jobs\?run=merge-task-1$/)

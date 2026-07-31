@@ -256,6 +256,10 @@ test('browses and opens one exact retained dataset revision without drifting to 
       : { items: [{ datasetId: 'stable-dataset', revisionId: 'rev-2', committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' }], nextCursor: 'opaque-page-2', hasMore: true },
     })
   })
+  await page.route('**/api/catalog/tables/*/revisions/resolve', async (route) => route.fulfill({ json: {
+    datasetId: 'stable-dataset', revisionId: 'rev-2', committedAt: '2026-07-16T12:00:00Z',
+    retentionOwner: 'provider', selector: 'latest',
+  } }))
   await page.route('**/api/catalog/revision-details', async (route) => {
     expect(route.request().method()).toBe('POST')
     const body = route.request().postDataJSON() as { datasetId: string; revisionId: string }
@@ -306,6 +310,8 @@ test('browses and opens one exact retained dataset revision without drifting to 
 
   await page.getByTestId('revision-open-rev-2').click()
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Current exact version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Current exact version · view-only')
   const datasetDetails = page.getByTestId('detail-dataset-details')
   await datasetDetails.locator('summary').click()
   await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
@@ -322,10 +328,19 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(dataPreview.getByLabel('Dataset preview scope')).toContainText('preview capped at 100 rows')
   await expect(dataPreview.getByText('Binary media preview is unavailable.', { exact: true })).toBeVisible()
   await expect(dataPreview.getByText('The browser could not display this media.', { exact: true })).toBeVisible()
+  await expect(dataPreview.getByRole('cell', { name: '2', exact: true })).toBeVisible()
   await expect(page.getByRole('table')).toHaveCount(1)
   await expect(page.getByRole('img', { name: 'Media image' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /certify/i })).toHaveCount(0)
   await expect(page.getByText(/row identity/i)).toHaveCount(0)
+
+  await page.getByTestId('revision-history-load-more').click()
+  await page.getByTestId('revision-open-rev-1').click()
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Historical exact version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Historical exact version · view-only')
+  await expect(page.getByRole('region', { name: 'Data preview' })).toContainText('Historical exact version')
+  await expect(dataPreview.getByRole('cell', { name: '1', exact: true })).toBeVisible()
+  await expect(dataPreview.getByRole('cell', { name: '2', exact: true })).toHaveCount(0)
   expect(historyRequests).toBeGreaterThanOrEqual(2)
 
   await page.reload()

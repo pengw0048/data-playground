@@ -153,6 +153,10 @@ describe('Catalog discovery request and mutation truth', () => {
 
   it('renders exact revision rows as the full-page primary view without reading latest rows', async () => {
     const onUseTables = vi.fn()
+    mocks.resolveDatasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
+      committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core', selector: 'latest',
+    })
     mocks.datasetRevisions.mockResolvedValue({
       items: [{
         datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
@@ -190,9 +194,9 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
     expect(within(viewer).getAllByRole('table')).toHaveLength(1)
     expect(within(viewer).queryByText('Exact revision preview')).not.toBeInTheDocument()
-    expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Published version')
+    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Current exact version'))
     expect(screen.getByTestId('dataset-version-context')).not.toHaveTextContent('rev-receipt')
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Published version')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current exact version')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('logical-receipt-id')
     expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent(
       'from this exact revision')
@@ -208,10 +212,78 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledWith('logical-receipt-id', 'rev-receipt')
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.sample).not.toHaveBeenCalled()
-    expect(mocks.resolveDatasetRevision).not.toHaveBeenCalled()
-    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact revision is view-only')
+    expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Current exact version · view-only')
+    expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
+    expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
     expect(screen.queryByTestId('detail-use')).not.toBeInTheDocument()
     expect(onUseTables).not.toHaveBeenCalled()
+  })
+
+  it('labels a retained exact revision as historical without exposing technical identities', async () => {
+    mocks.resolveDatasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-head',
+      committedAt: '2026-07-31T12:00:00Z', retentionOwner: 'core', selector: 'latest',
+    })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-old',
+      committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
+      parentRevisionId: null, producerOperation: 'write',
+      summary: { rowCount: 1, totalBytes: 64 },
+      preview: {
+        columns: TABLE.columns, rows: [{ order_id: 1 }], hasMore: false, rowLimit: 100,
+      },
+    })
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [
+        { datasetId: 'logical-receipt-id', revisionId: 'rev-head', committedAt: '2026-07-31T12:00:00Z', retentionOwner: 'core' },
+        { datasetId: 'logical-receipt-id', revisionId: 'rev-old', committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core' },
+      ],
+      nextCursor: null, hasMore: false,
+    })
+
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-old"
+      initialRevisionDatasetId="logical-receipt-id"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Historical exact version'))
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Historical exact version · view-only')
+    expect(screen.getByRole('region', { name: 'Data preview' })).toHaveTextContent('Historical exact version')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Historical exact version')
+    expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
+    expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
+
+    const technical = screen.getByTestId('detail-dataset-details')
+    expect(technical).not.toHaveAttribute('open')
+    fireEvent.click(within(technical).getByText('Dataset details'))
+    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('logical-receipt-id@rev-old')
+  })
+
+  it('keeps an exact version neutral when the current head cannot be resolved', async () => {
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-retained',
+      committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'provider',
+      parentRevisionId: null, producerOperation: 'write',
+      summary: { rowCount: 1, totalBytes: 64 },
+      preview: {
+        columns: TABLE.columns, rows: [{ order_id: 7 }], hasMore: false, rowLimit: 100,
+      },
+    })
+
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-retained"
+      initialRevisionDatasetId="logical-receipt-id"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    expect(await screen.findByRole('cell', { name: '7' })).toBeVisible()
+    await waitFor(() => expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id))
+    expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Exact version')
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact version · view-only')
+    expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
+    expect(screen.queryByText(/latest dataset head/i)).not.toBeInTheDocument()
   })
 
   it('uses the routed Canvas destination as the full-page viewer Back label', async () => {
@@ -264,7 +336,7 @@ describe('Catalog discovery request and mutation truth', () => {
       'This exact revision is unavailable or no longer retained. Latest was not substituted.')
     expect(screen.queryByTestId('detail-preview-scroll')).not.toBeInTheDocument()
     expect(mocks.sample).not.toHaveBeenCalled()
-    expect(mocks.resolveDatasetRevision).not.toHaveBeenCalled()
+    expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
   })
 
   it('re-resolves an already selected path when a same-page exact receipt pair names another dataset', async () => {
