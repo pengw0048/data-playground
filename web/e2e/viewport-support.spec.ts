@@ -309,7 +309,14 @@ test.describe('minimum viewport support', () => {
         datasetId: `workspace-provider:viewport-provider/viewport-provider-source-binding-generation`,
         revisionId: `revision-${'a'.repeat(240)}`,
         summary: { rowCount: 2, dataFileCount: null, totalBytes: null, fragmentCount: null },
-        preview: { columns: canonicalColumns.slice(0, 2), rows: [{ provider_column_0: 'first', provider_column_1: 'second' }], hasMore: false, rowLimit: 100 },
+        preview: {
+          columns: [
+            ...canonicalColumns.slice(0, 2),
+            { name: '_rowid', type: 'uint64', provenance: 'inferred', capabilities: [], annotations: [] },
+          ],
+          rows: [{ provider_column_0: 'first', provider_column_1: 'second', _rowid: 7 }],
+          hasMore: false, rowLimit: 100,
+        },
       },
     }))
     await page.route(
@@ -332,8 +339,14 @@ test.describe('minimum viewport support', () => {
     await expect(detail.getByText('Location', { exact: true })).toBeVisible()
     await expect(detail.getByText('Version', { exact: true })).toBeVisible()
     await expect(detail.getByText('2 rows')).toBeVisible()
+    const columnSummary = detail.getByTestId('provider-column-summary')
+    await expect(columnSummary).toContainText('120 data columns')
+    await expect(columnSummary).toContainText('1 system column')
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
-    await expect(detail.getByText('114 more columns', { exact: true })).toBeVisible()
+    await expect(detail.getByText('114 more data columns', { exact: true })).toBeVisible()
+    await expect(detail.getByText('System row ID').first()).toHaveAttribute(
+      'title', /not a canonical data column/,
+    )
     await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
     await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })

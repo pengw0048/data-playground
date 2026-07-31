@@ -1318,7 +1318,7 @@ describe('WorkspaceExplorer', () => {
 
     const detail = await screen.findByRole('region', { name: 'observations' })
     expect(detail).toHaveTextContent('LocationMount warehouse / Remote / observationsfixture')
-    expect(detail).toHaveTextContent('2 rows· 1 columns')
+    expect(detail).toHaveTextContent('2 rows· 1 data column')
     expect(detail).toHaveTextContent('Preview')
     await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith(
       CANONICAL_DATASET_CONTEXT.datasetIdentity, CANONICAL_DATASET_CONTEXT.revisionId,
@@ -1338,6 +1338,79 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('separates canonical data columns from exact-preview system columns in Workspace', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    const dataColumns = [
+      { name: 'image', type: 'binary', provenance: 'provider' as const, capabilities: [], annotations: [] },
+      { name: 'source_rowid', type: 'int', provenance: 'provider' as const, capabilities: [], annotations: [] },
+    ]
+    const rowId = { name: '_rowid', type: 'uint64', provenance: 'inferred' as const, capabilities: [], annotations: [] }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({ ...CANONICAL_DATASET_CONTEXT, columns: dataColumns })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: CANONICAL_DATASET_CONTEXT.datasetIdentity, revisionId: CANONICAL_DATASET_CONTEXT.revisionId,
+      summary: { rowCount: 1, dataFileCount: null, totalBytes: null, fragmentCount: null },
+      preview: {
+        columns: [dataColumns[0], rowId, dataColumns[1]],
+        rows: [{ image: '<123 bytes>', _rowid: 7, source_rowid: 42 }], hasMore: false, rowLimit: 100,
+      },
+    })
+
+    render(<WorkspaceExplorer />)
+
+    const context = await screen.findByTestId('canonical-provider-dataset-context')
+    await waitFor(() => expect(within(context).getByTestId('provider-column-summary')).toHaveTextContent(
+      '1 row· 2 data columns· 1 system column',
+    ))
+    const systemLabels = within(context).getAllByText('System row ID')
+    expect(systemLabels).toHaveLength(2)
+    for (const label of systemLabels) {
+      expect(label).toHaveAttribute('title', expect.stringContaining('not a canonical data column'))
+    }
+    expect(within(context).getAllByTestId('provider-preview-column-name').map((column) => column.textContent)).toEqual([
+      'image', '_rowid', 'source_rowid',
+    ])
+  })
+
+  it.each([
+    ['the current Workspace route', ''],
+    ['the exact current-version route', new URLSearchParams({
+      revision: CANONICAL_DATASET_CONTEXT.revisionId,
+      revisionDataset: CANONICAL_DATASET_CONTEXT.datasetIdentity,
+    }).toString()],
+  ])('keeps a provider-declared _rowid in the canonical data schema on %s', async (_route, query) => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.workspaceDatasetQuery = query
+    const declaredRowId = {
+      name: '_rowid', type: 'string', provenance: 'provider' as const, capabilities: [], annotations: [],
+    }
+    const inferredPreviewRowId = { ...declaredRowId, provenance: 'inferred' as const }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({
+      ...CANONICAL_DATASET_CONTEXT, columns: [declaredRowId],
+    })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: CANONICAL_DATASET_CONTEXT.datasetIdentity, revisionId: CANONICAL_DATASET_CONTEXT.revisionId,
+      summary: { rowCount: 1, dataFileCount: null, totalBytes: null, fragmentCount: null },
+      preview: { columns: [inferredPreviewRowId], rows: [{ _rowid: 'business-key' }], hasMore: false, rowLimit: 100 },
+    })
+
+    render(<WorkspaceExplorer />)
+
+    const context = await screen.findByTestId('canonical-provider-dataset-context')
+    await waitFor(() => expect(within(context).getByTestId('provider-column-summary')).toHaveTextContent(
+      '1 row· 1 data column',
+    ))
+    expect(within(context).getByTestId('provider-column-summary')).not.toHaveTextContent('system')
+    expect(within(context).queryByText('System row ID')).not.toBeInTheDocument()
   })
 
   it('opens a provider search result in the full-page dataset route while preserving search context', async () => {
@@ -1415,8 +1488,11 @@ describe('WorkspaceExplorer', () => {
       datasetId: 'workspace-provider:retained-source', revisionId: 'retained-revision-3',
       committedAt: '2026-07-20T12:00:00Z', retentionOwner: 'provider', summary: { rowCount: 1 },
       preview: {
-        columns: [{ name: 'historical_value', type: 'string', capabilities: [] }],
-        rows: [{ historical_value: 'retained row' }], hasMore: false, rowLimit: 100,
+        columns: [
+          { name: 'historical_value', type: 'string', capabilities: [] },
+          { name: '_rowid', type: 'uint64', provenance: 'inferred', capabilities: [] },
+        ],
+        rows: [{ historical_value: 'retained row', _rowid: 9 }], hasMore: false, rowLimit: 100,
       },
     })
     render(<WorkspaceExplorer />)
@@ -1425,8 +1501,13 @@ describe('WorkspaceExplorer', () => {
     expect(detail).toHaveTextContent('Selected version')
     const context = within(detail).getByTestId('canonical-provider-dataset-context')
     expect(context).toHaveTextContent('1 row')
-    expect(context).toHaveTextContent('1 columns')
+    expect(context).toHaveTextContent('1 data column')
+    expect(context).toHaveTextContent('1 system column')
     expect(context).toHaveTextContent('historical_value · string')
+    expect(within(context).getAllByText('System row ID')).toHaveLength(2)
+    expect(within(context).getAllByTestId('provider-preview-column-name').map((column) => column.textContent)).toEqual([
+      'historical_value', '_rowid',
+    ])
     expect(context).toHaveTextContent('retained row')
     expect(context).not.toHaveTextContent('value · int64')
     expect(detail).not.toHaveTextContent("Couldn't load provider details")
@@ -1735,13 +1816,21 @@ describe('WorkspaceExplorer', () => {
       completeness: 'complete', sources: [PROVIDER_COMPLETE],
     })
     mocks.workspaceCanonicalDataset.mockResolvedValue({ ...CANONICAL_DATASET_CONTEXT, columns })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: CANONICAL_DATASET_CONTEXT.datasetIdentity, revisionId: CANONICAL_DATASET_CONTEXT.revisionId,
+      summary: { rowCount: 2, dataFileCount: null, totalBytes: null, fragmentCount: null },
+      preview: {
+        columns: columns.slice(0, 2),
+        rows: [{ 'column-0': 'first', 'column-1': 'second' }], hasMore: false, rowLimit: 100,
+      },
+    })
     render(<WorkspaceExplorer />)
 
     const context = await screen.findByTestId('canonical-provider-dataset-context')
-    expect(within(context).getByText('column-0')).toBeVisible()
+    expect(within(context).getAllByText('column-0')[0]).toBeVisible()
     expect(within(context).getByText('column-5')).toBeVisible()
     expect(within(context).queryByText('column-6')).not.toBeInTheDocument()
-    expect(context).toHaveTextContent('21 more columns')
+    expect(context).toHaveTextContent('21 more data columns')
   })
 
   it('keeps a wide provider detail scrollable while its close and use actions stay reachable', async () => {
