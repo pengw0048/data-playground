@@ -298,7 +298,10 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByTitle('Normalizes event locations for downstream training.')).toBeInTheDocument()
     expect(screen.queryByText('Apply a Python transform to rows')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Open processor definition' })).toBeVisible()
-    expect(screen.getByText(`${processorId}@v1`)).toBeInTheDocument()
+    expect(screen.getByText('Immutable version v1')).toBeVisible()
+    expect(screen.getByText(`${processorId}@v1`, { exact: false })).not.toBeVisible()
+    fireEvent.click(screen.getByText('Technical details'))
+    expect(screen.getByText(`${processorId}@v1`, { exact: false })).toBeVisible()
     expect(screen.queryByText('(empty)')).not.toBeInTheDocument()
   })
 

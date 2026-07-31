@@ -371,14 +371,20 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             <div className="text-[11.5px] font-semibold text-foreground">
               {libraryProcessor?.title ?? 'Exact Library processor'}
             </div>
-            <div className="mt-1 break-all font-mono text-[10.5px] text-muted-foreground">
-              {configuredProcessorRef(cfg.processor, cfg.version) ?? 'No exact processor selected'}
+            <div className="mt-1 text-[10.5px] text-muted-foreground">
+              Immutable version {typeof cfg.version === 'string' ? cfg.version : 'not selected'}
             </div>
           </div>
           <div className="mt-1.5">
             <CodeBtn icon="external" label="Open processor definition"
               onClick={() => openCodeFullscreen(nodeId, 'code', 'python')} />
           </div>
+          <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+            <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+            <div className="mt-1.5 break-all font-mono">
+              Processor reference: {configuredProcessorRef(cfg.processor, cfg.version) ?? 'No exact processor selected'}
+            </div>
+          </details>
         </Section>
       )}
 

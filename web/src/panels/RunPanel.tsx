@@ -14,6 +14,7 @@ import type { DatasetViewerCanvasReturn } from '../router'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
+  const graphSize = useStore((s) => s.sizes[nodeId])
   const estimate = useStore((s) => s.estimate)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
@@ -72,9 +73,17 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
   const exactRunReadiness = writeAdmission?.exactRunReadiness ?? est?.exactRunReadiness
   const exactRunReady = exactRunReadiness?.ready !== false
+  // Admission remains authoritative for confirmation. A retained-input preflight may deliberately
+  // avoid reopening rows while the current graph metadata pass has already proved this node's
+  // count. Use that server-owned count only for visible copy; keep admission evidence unchanged.
+  const visibleRows = est?.rows ?? (
+    graphSize?.rows != null && graphSize.confidence === 'exact'
+      ? graphSize.rows
+      : null
+  )
   const confirmationActionLabel = isManagedWrite
     ? 'Publish a new version'
-    : est?.rows == null ? 'Run with unknown row count' : `Run ${est.rows.toLocaleString()} rows`
+    : visibleRows == null ? 'Run with unknown row count' : `Run ${visibleRows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
     ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
     : exactRunReady ? 'Run' : 'Exact input registration required'
@@ -134,7 +143,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <Label>CONFIRM RUN</Label>
             <div className="mt-0.5 text-2xl font-bold text-foreground">{confirmationActionLabel}</div>
             <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-              {confirmationCopy(est, writeAdmission)}
+              {confirmationCopy(est, writeAdmission, visibleRows)}
             </div>
             <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
               isWrite={isWrite} outputName={outputName} destination={destination}
@@ -439,11 +448,13 @@ function confirmationReasons(estimate: RunEstimate, admission?: WriteAdmission):
   return [...reasons]
 }
 
-function confirmationCopy(estimate: RunEstimate, admission?: WriteAdmission): string {
+function confirmationCopy(
+  estimate: RunEstimate, admission?: WriteAdmission, visibleRows = estimate.rows,
+): string {
   const reasons = confirmationReasons(estimate, admission)
-  const cost = estimate.rows == null
+  const cost = visibleRows == null
     ? 'This full run will process an unknown number of rows.'
-    : `This full run will process ${estimate.rows.toLocaleString()} rows${estimate.bytes != null ? ` (about ${formatByteEstimate(estimate.bytes)})` : ''}.`
+    : `This full run will process ${visibleRows.toLocaleString()} rows${estimate.bytes != null ? ` (about ${formatByteEstimate(estimate.bytes)})` : ''}.`
   const risk = reasons.includes('destructive_overwrite')
     ? 'It will overwrite the selected provider output.'
     : reasons.includes('schema_drift')

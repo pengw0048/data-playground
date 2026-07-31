@@ -183,6 +183,11 @@ describe('TransformsLibrary', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
     fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
     expect(screen.getByLabelText('Target Canvas')).toHaveValue('target')
+    expect(screen.getByRole('option', { name: 'Exact target' })).toBeVisible()
+    expect(screen.queryByRole('option', { name: /target/ })).toHaveAccessibleName('Exact target')
+    expect(screen.getByText('Canvas ID: target')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Technical details'))
+    expect(screen.getByText('Canvas ID: target')).toBeVisible()
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {

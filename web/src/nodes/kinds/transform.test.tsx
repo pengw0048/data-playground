@@ -180,6 +180,39 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByText(/bounded testing cannot be enabled safely/i)).not.toBeInTheDocument()
   })
 
+  it('shows the owner-scoped exact source for a promoted Library processor', async () => {
+    const promotedSource = [
+      'def fn(row):',
+      "    return {**row, 'normalized': True}",
+    ].join('\n')
+    apiMocks.installedProcessorSource.mockResolvedValue({
+      processorId: PROCESSOR_ID,
+      version: 'v1',
+      language: 'python',
+      source: promotedSource,
+      sha256: 'b'.repeat(64),
+    })
+    useStore.setState({
+      processors: [{
+        id: PROCESSOR_ID, version: 'v1', title: 'Normalize rows', mode: 'map',
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+        paramsSchema: {}, previewable: true, blurb: 'Owner-promoted row normalizer.',
+        provenance: 'promoted',
+      }],
+      fullscreenCode: { nodeId: node.id, param: 'code', lang: 'python' },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
+    expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
+    expect(implementation).toHaveTextContent("return {**row, 'normalized': True}")
+    expect(implementation).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
+    const details = screen.getByText('Technical details').closest('details')
+    expect(details).not.toHaveAttribute('open')
+    expect(within(details as HTMLElement).getByText(`${PROCESSOR_ID}@v1`)).not.toBeVisible()
+  })
+
   it('shows the exact Library definition and tests a previewable processor on retained upstream rows', async () => {
     const installedSource = [
       'MAX_DECODED_IMAGE_PIXELS = 50_000_000',
@@ -262,6 +295,7 @@ describe('Transform exact processor labels', () => {
     expect(definition).toHaveTextContent('image_key')
     expect(definition).toHaveTextContent('default "image"')
     const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
+    expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
     expect(implementation).toHaveTextContent('Installed processor source')
     expect(implementation).toHaveTextContent('exact local implementation')
     expect(implementation).toHaveTextContent('does not indicate remote or distributed dispatch')
@@ -320,6 +354,7 @@ describe('Transform exact processor labels', () => {
     render(<CodeFullscreen />)
 
     expect(await screen.findByText('Implementation source unavailable')).toBeVisible()
+    expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
     expect(screen.queryByRole('region', { name: 'Installed processor source' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test transform' })).toBeEnabled()
   })

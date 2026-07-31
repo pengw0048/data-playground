@@ -642,7 +642,8 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
-    expect(await screen.findByText(/not bound to latest head orders-dataset@3/i)).toBeInTheDocument()
+    expect(await screen.findByText(/refresh to show header and column facts for the latest version/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Latest version')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
@@ -657,14 +658,15 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@3')
 
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
-    expect(await screen.findByText(/latest head is orders-dataset@4/i)).toBeInTheDocument()
+    expect(await screen.findByText(/header and columns describe an earlier version/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@4')
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    expect(await screen.findByText("Couldn't refresh exact head facts: provider offline")).toBeInTheDocument()
+    expect(await screen.findByText("Couldn't refresh the latest dataset facts: provider offline")).toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
     expect(screen.getByTestId('dataset-facts-stale')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))

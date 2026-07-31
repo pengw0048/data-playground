@@ -1346,16 +1346,16 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <div role="status" data-testid="dataset-facts-stale"
               className="flex flex-col gap-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-3 py-2 text-[11px] text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
               <div>
-                <div className="font-semibold">Dataset facts need refresh</div>
+                <div className="font-semibold">Dataset facts may be out of date</div>
                 <div className="break-words">{exactFacts
-                  ? `Header and Columns are bound to exact revision ${revisionLabel(exactFacts)}; latest head is ${revisionLabel(latestHead)}.`
-                  : `Header and Columns are not bound to latest head ${revisionLabel(latestHead)}.`}</div>
+                  ? 'Header and columns describe an earlier version. Refresh to show facts for the latest version.'
+                  : 'Refresh to show header and column facts for the latest version.'}</div>
               </div>
-              {factsError ? <div role="alert">Couldn't refresh exact head facts: {factsError}</div> : null}
+              {factsError ? <div role="alert">Couldn't refresh the latest dataset facts: {factsError}</div> : null}
               <button type="button" onClick={() => void refreshHeadFacts()} disabled={factsLoading}
                 data-testid="refresh-dataset-facts"
                 className="self-start font-semibold underline disabled:opacity-50">
-                {factsLoading ? 'Refreshing head facts…' : factsError ? 'Retry head facts' : 'Refresh head facts'}
+                {factsLoading ? 'Refreshing dataset facts…' : factsError ? 'Retry dataset facts' : 'Refresh dataset facts'}
               </button>
             </div>
           ) : null}

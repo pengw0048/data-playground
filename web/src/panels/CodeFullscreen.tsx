@@ -145,7 +145,7 @@ export function CodeFullscreen() {
   } = useInstalledProcessorSource(
     candidateIsLibrary ? candidateCfg.processor : undefined,
     candidateIsLibrary ? candidateCfg.version : undefined,
-    libraryDescriptor?.provenance === 'plugin',
+    candidateIsLibrary,
   )
   if (!fs || !node) return null
 
@@ -593,10 +593,16 @@ function LibraryProcessorDefinition({
       className="min-h-0 flex-1 overflow-auto bg-background/30 px-7 py-6">
       <div className="mx-auto max-w-[760px]">
         <div className="text-[10px] font-bold uppercase tracking-[0.7px] text-muted-foreground">
-          Exact registry processor
+          Library processor
         </div>
-        <div className="mt-1 break-all font-mono text-[13px] font-semibold text-foreground">
-          {configuredRef ?? 'No exact processor selected'}
+        <h2 className="mt-1 text-xl font-semibold text-foreground">
+          {descriptor?.title ?? 'Exact Library processor'}
+        </h2>
+        <div className="mt-1 text-[11.5px] text-muted-foreground">
+          Immutable version {descriptor?.version
+            ?? (configuredRef?.includes('@')
+              ? configuredRef.slice(configuredRef.lastIndexOf('@') + 1)
+              : 'not available')}
         </div>
 
         {loading && (
@@ -612,8 +618,7 @@ function LibraryProcessorDefinition({
 
         {descriptor && (
           <>
-            <h2 className="mt-5 text-xl font-semibold text-foreground">{descriptor.title}</h2>
-            <p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">
+            <p className="mt-5 text-[13px] leading-relaxed text-muted-foreground">
               {descriptor.blurb || 'No registry description was supplied for this processor.'}
             </p>
 
@@ -690,6 +695,15 @@ function LibraryProcessorDefinition({
           </>
         )}
 
+        <details className="mt-6 rounded-md border border-border bg-card px-3 py-2 text-[11px] text-muted-foreground">
+          <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
+          <div className="mt-2">
+            <div>Processor reference</div>
+            <div className="break-all font-mono text-foreground">
+              {configuredRef ?? 'No exact processor selected'}
+            </div>
+          </div>
+        </details>
         <InstalledSourcePanel
           source={installedSource}
           loading={installedSourceLoading}
