@@ -10,11 +10,18 @@ async function fresh(page: Page) {
   // A fresh workspace has an explicit entry choice; tests create a blank Canvas through that UI
   // rather than relying on the retired implicit bootstrap Canvas.
   const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
+  await expect.poll(() => page.evaluate(() => (
+    location.hash.startsWith('#/canvas/')
+      || Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Start a blank Canvas')
+  ))).toBe(true)
   if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
   await page.getByTestId('app-menu').click()
-  await page.getByText('New Canvas').click()
+  const menu = page.getByRole('menu', { name: 'Data Playground menu' })
+  await expect(menu).toBeVisible()
+  await menu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
+  await expect(menu).toBeHidden()
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }

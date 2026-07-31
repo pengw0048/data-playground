@@ -6,8 +6,14 @@ export async function goToWorkspace(page: Page) {
 }
 
 export async function backToWorkspace(page: Page) {
+  const menu = page.getByRole('menu', { name: 'Data Playground menu' })
+  // A preceding menu selection may still be finishing its close animation while a newly created
+  // Canvas settles. Reopening before that portal is hidden makes Radix replace the clicked item.
+  await expect(menu).toBeHidden()
+  await expect(page.getByTestId('autosave')).toContainText(/saved/)
   await page.getByTestId('app-menu').click()
-  await page.getByText('Back to Workspace').click()
+  await expect(menu).toBeVisible()
+  await menu.getByRole('menuitem', { name: 'Back to Workspace', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
 }
 
