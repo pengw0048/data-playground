@@ -54,7 +54,10 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
     void api.workspaceResource(`canvas:${canvasId}`).then((resolved) => {
       if (!current || resolved.resource?.kind !== 'canvas') return
       // `parentId` is an API-issued stable Workspace reference, never a reconstructed path.
-      onReturnDestination(resolved.resource.parentId ?? null)
+      // The local root is the generic Workspace route, not a user-visible nested destination.
+      onReturnDestination(displayAncestors(resolved.ancestors).length === 0
+        ? null
+        : resolved.resource.parentId ?? null)
       if (locationUnavailable(resolved.resource, resolved.source)) {
         setState({ kind: 'unavailable' })
         return

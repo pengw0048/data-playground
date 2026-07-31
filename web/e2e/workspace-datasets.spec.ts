@@ -171,7 +171,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
     await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
-    await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
+    await expect(page).toHaveURL(/#\/workspace$/)
     await page.getByRole('tab', { name: 'Local catalog' }).click()
     await expect(search).toHaveValue('')
     await search.fill('issue497_')

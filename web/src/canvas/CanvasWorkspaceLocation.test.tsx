@@ -59,7 +59,7 @@ describe('CanvasWorkspaceLocation', () => {
     })
     render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
 
-    await waitFor(() => expect(onReturnDestination).toHaveBeenLastCalledWith(ROOT.id))
+    await waitFor(() => expect(onReturnDestination).toHaveBeenLastCalledWith(null))
     expect(screen.queryByRole('navigation', { name: 'Canvas Workspace location' })).not.toBeInTheDocument()
   })
 

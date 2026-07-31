@@ -146,12 +146,13 @@ async function fresh(page: Page) {
   if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('app-menu').click()
-  await page.getByText('New Canvas').click()
+  const menu = await openSettledAppMenu(page)
+  await menu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
   // The previous canvas is often empty too. Waiting only for zero rendered nodes can therefore return
   // before async create + file refresh + navigation finish, and the test would mutate the old canvas.
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
+  await expect(menu).toBeHidden()
 }
 
 async function enablePipelineImporter(page: Page) {
@@ -445,8 +446,8 @@ test.describe('Data Playground canvas', () => {
     // An edit made while the mutation revalidates run history must stay on this Canvas and reach
     // durable storage; cancelling this click gives the existing autosave debounce time to finish.
     const exampleHash = await page.evaluate(() => location.hash)
-    await page.getByTestId('app-menu').click()
-    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
+    const exampleMenu = await openSettledAppMenu(page)
+    await exampleMenu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(exampleHash)
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
@@ -474,14 +475,14 @@ test.describe('Data Playground canvas', () => {
 
     // Examples remain on empty/first-run surfaces rather than leaking into current-Canvas actions.
     await page.unroute(`**/api/canvas/${blankId}/runs`)
-    await page.getByTestId('app-menu').click()
-    await expect(page.getByText('Purchases per user')).toHaveCount(0)
+    const currentCanvasMenu = await openSettledAppMenu(page)
+    await expect(currentCanvasMenu.getByText('Purchases per user')).toHaveCount(0)
     await page.keyboard.press('Escape')
 
     // A lost PUT response retains a version-fenced local draft; it must not turn into a speculative create.
     const editedHash = await page.evaluate(() => location.hash)
-    await page.getByTestId('app-menu').click()
-    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
+    const responseLossMenu = await openSettledAppMenu(page)
+    await responseLossMenu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(editedHash)
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const responseLossId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
