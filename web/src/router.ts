@@ -10,6 +10,9 @@ const DATASET_QUERY_KEYS = [
   'dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match',
   'revision', 'revisionDataset', 'returnCanvas', 'returnNode',
 ] as const
+const DATASET_VIEWER_QUERY_KEYS = [
+  'revision', 'revisionDataset', 'returnCanvas', 'returnNode',
+] as const
 
 export interface DatasetViewerCanvasReturn {
   canvasId: string
@@ -41,7 +44,7 @@ export function parseHash(): Route {
   if (seg === 'workspace') {
     const workspaceScope = params.get('scope') === 'datasets' ? 'datasets' : 'all'
     const datasetParams = new URLSearchParams()
-    for (const key of DATASET_QUERY_KEYS) {
+    for (const key of workspaceScope === 'datasets' ? DATASET_QUERY_KEYS : DATASET_VIEWER_QUERY_KEYS) {
       const value = params.get(key)
       if (value) datasetParams.set(key, value)
     }
@@ -50,7 +53,7 @@ export function parseHash(): Route {
       view: 'workspace',
       workspaceResourceId: decodedId,
       ...(workspaceScope === 'datasets' ? { workspaceScope } : {}),
-      ...(workspaceScope === 'datasets' && workspaceDatasetQuery ? { workspaceDatasetQuery } : {}),
+      ...(workspaceDatasetQuery ? { workspaceDatasetQuery } : {}),
       ...(workspaceScope === 'all' && workspaceQuery ? { workspaceQuery } : {}),
     }
   }
@@ -101,7 +104,14 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
       const value = datasetParams.get(key)
       if (value) workspaceParams.set(key, value)
     }
-  } else if (view === 'workspace' && workspaceQuery?.trim()) workspaceParams.set('q', workspaceQuery.trim())
+  } else if (view === 'workspace') {
+    if (workspaceQuery?.trim()) workspaceParams.set('q', workspaceQuery.trim())
+    const datasetParams = new URLSearchParams(workspaceDatasetQuery)
+    for (const key of DATASET_VIEWER_QUERY_KEYS) {
+      const value = datasetParams.get(key)
+      if (value) workspaceParams.set(key, value)
+    }
+  }
   const transformParams = new URLSearchParams(transformQuery)
   if (view === 'transforms' && transformVersion) transformParams.set('version', transformVersion)
   if (view === 'transforms' && transformCanvasId && transformNodeId) {
@@ -122,6 +132,7 @@ export function datasetViewerHash(
   datasetId: string,
   revisionId?: string,
   returnToCanvas?: DatasetViewerCanvasReturn,
+  workspaceResourceId?: string,
 ): string {
   const params = new URLSearchParams()
   if (revisionId) {
@@ -134,8 +145,8 @@ export function datasetViewerHash(
   }
   const datasetQuery = params.size ? params.toString() : undefined
   return routeHash(
-    'workspace', undefined, `dataset:${datasetId}`, undefined, undefined, undefined,
-    undefined, 'datasets', datasetQuery,
+    'workspace', undefined, workspaceResourceId ?? `dataset:${datasetId}`, undefined, undefined, undefined,
+    undefined, workspaceResourceId ? 'all' : 'datasets', datasetQuery,
   )
 }
 

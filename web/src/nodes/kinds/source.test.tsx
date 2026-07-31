@@ -149,7 +149,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
     render1({ title: 'provider orders', status: 'latest', config: {
-      providerResourceRef: 'dataset:provider-orders', providerName: 'fixture', providerReadMode: 'exact',
+      providerResourceRef: 'dataset:provider-placement-orders', providerName: 'fixture', providerReadMode: 'exact',
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
@@ -160,9 +160,25 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     const openDataset = screen.getByRole('link', { name: 'Open dataset' })
     expect(openDataset).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Aprovider-orders?scope=datasets&revision=empty-r7&revisionDataset=provider-orders&returnCanvas=c&returnNode=s1',
+      '#/workspace/dataset%3Aprovider-placement-orders?revision=empty-r7&revisionDataset=provider-orders&returnCanvas=c&returnNode=s1',
     )
     expect(openDataset.querySelector('ellipse')).not.toBeNull()
+  })
+
+  it('does not misroute an incomplete provider binding into the local catalog', async () => {
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'provider-orders', revisionId: 'empty-r7', retentionOwner: 'provider', summary: { rowCount: 0 },
+      preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
+    render1({ title: 'provider orders', status: 'latest', config: {
+      uri: 'workspace-provider://missing-placement', providerName: 'fixture', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
+    } })
+
+    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 0 columns')).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
   it('keeps a long exact identity out of the Source card summary', async () => {

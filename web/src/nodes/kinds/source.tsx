@@ -92,6 +92,7 @@ function Source({ id, data }: NodeComponentProps) {
   const ref = String(data.config.uri ?? '')
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
   const providerDataset = !!data.config.providerResourceRef
+  const providerBinding = providerDataset || !!data.config.providerReadMode || ref.startsWith('workspace-provider://')
   const datasetRef = data.config.datasetRef
   const datasetParameter = isParameterRef(datasetRef) ? datasetRef : null
   const selectedRef = datasetRef && !isParameterRef(datasetRef) ? datasetRef : null
@@ -196,7 +197,7 @@ function Source({ id, data }: NodeComponentProps) {
 
   // A card is for choosing and orienting.  It deliberately names one source, one version state,
   // and one count/schema summary; opaque identities belong in Inspector → Connection details.
-  const sourceLabel = providerDataset ? data.config.providerName ?? 'Provider' : 'Local catalog'
+  const sourceLabel = providerBinding ? data.config.providerName ?? 'Provider' : 'Local catalog'
   const meta = datasetParameter
     ? `${sourceLabel} · Run-time dataset parameter · Rows and columns vary by run`
     : selectedExact
@@ -213,13 +214,13 @@ function Source({ id, data }: NodeComponentProps) {
                 : `${sourceLabel} · Selected version · Loading rows and columns…`
       : table
         ? `${sourceLabel} · Current version · ${countSummary(table.rowCount, table.columns.length)}`
-        : providerDataset
+        : providerBinding
           ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Exact version not selected' : 'Current version'} · Rows and columns unknown`
           : 'Choose a dataset'
 
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
-      {table || providerDataset ? (
+      {table || providerBinding ? (
         // Show the bound dataset name (the node title is separately editable, so it cannot be
         // relied on to say what is bound). The header eye is the distinct preview affordance.
         <button
@@ -309,13 +310,14 @@ function Source({ id, data }: NodeComponentProps) {
         <option value="">Pinned/current dataset</option>
         {datasetParameters.map((item) => <option key={item.name} value={item.name}>Parameter: {item.label || item.name}</option>)}
       </select>}
-      {!datasetParameter && !providerDataset && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
+      {!datasetParameter && !providerBinding && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
         exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
-      {selectedExact && <a href={datasetViewerHash(
+      {selectedExact && (!providerBinding || data.config.providerResourceRef) && <a href={datasetViewerHash(
         selectedExact.datasetId,
         selectedExact.revisionId,
         { canvasId, nodeId: id },
+        data.config.providerResourceRef,
       )}
         onClick={(event) => event.stopPropagation()}
         className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-semibold text-primary hover:underline">

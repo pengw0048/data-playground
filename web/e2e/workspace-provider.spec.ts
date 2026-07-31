@@ -294,6 +294,53 @@ test.describe('provider Workspace Source acceptance', () => {
       new URL(page.url()).hash.split('/').pop()!.split('?')[0],
     )
 
+    const exactProviderCanvas = await (await page.request.get(`/api/canvas/${canvasId}`)).json() as {
+      nodes: Array<{ id: string; type: string; data: { config: {
+        providerResourceRef?: string
+        datasetRef?: { kind?: string; datasetId?: string; revisionId?: string }
+      } } }>
+    }
+    const exactProviderSource = exactProviderCanvas.nodes.find((node) => node.type === 'source')!
+    const exactProviderConfig = exactProviderSource.data.config
+    expect(exactProviderConfig.providerResourceRef).toBeTruthy()
+    expect(exactProviderConfig.datasetRef).toMatchObject({
+      kind: 'exact', revisionId: 'browser-provider-revision-v1',
+    })
+    const openExactProvider = source.getByRole('link', { name: 'Open dataset' })
+    await expect(openExactProvider).toBeVisible()
+    const exactProviderQuery = new URLSearchParams({
+      revision: exactProviderConfig.datasetRef!.revisionId!,
+      revisionDataset: exactProviderConfig.datasetRef!.datasetId!,
+      returnCanvas: canvasId,
+      returnNode: exactProviderSource.id,
+    })
+    await expect(openExactProvider).toHaveAttribute(
+      'href',
+      `#/workspace/${encodeURIComponent(exactProviderConfig.providerResourceRef!)}?${exactProviderQuery}`,
+    )
+    await expect(openExactProvider).not.toHaveAttribute('href', /scope=datasets/)
+    await openExactProvider.click()
+    const exactProviderViewer = page.getByTestId('provider-dataset-viewer')
+    await expect(exactProviderViewer).toBeVisible()
+    await expect(exactProviderViewer).toContainText('Selected version')
+    const exactProviderContext = exactProviderViewer.getByTestId('canonical-provider-dataset-context')
+    await expect(exactProviderContext).toContainText('2 rows')
+    await expect(exactProviderContext).toContainText('2 columns')
+    await expect(exactProviderContext).toContainText('id · int')
+    await expect(exactProviderContext).toContainText('value · string')
+    await expect(exactProviderViewer.getByRole('button', { name: 'Use in Canvas' })).toHaveCount(0)
+    await page.reload()
+    await expect(page.getByTestId('provider-dataset-viewer')).toContainText('Selected version')
+    await expect(page.getByTestId('canonical-provider-dataset-context')).toContainText('value · string')
+    const expectedCanvasReturnUrl = new URL(
+      `/#/canvas/${encodeURIComponent(canvasId)}?node=${encodeURIComponent(exactProviderSource.id)}`,
+      page.url(),
+    ).href
+    await page.getByTestId('provider-dataset-viewer').getByRole('button', { name: 'Back to Canvas' }).click()
+    await expect(page).toHaveURL(expectedCanvasReturnUrl)
+    await expect(page.locator(`.react-flow__node[data-id="${exactProviderSource.id}"]`)).toHaveClass(/selected/)
+    await expect(source).toContainText('dp-file-catalog · Selected version · 2 rows · 2 columns')
+
     const beforeMutableReplacement = await (await page.request.get(`/api/canvas/${canvasId}`)).json()
     const beforeMutableConfig = beforeMutableReplacement.nodes.find(
       (node: { type: string }) => node.type === 'source',

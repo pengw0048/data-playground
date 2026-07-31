@@ -1394,6 +1394,88 @@ describe('WorkspaceExplorer', () => {
     })).toBeVisible()
   })
 
+  it('restores an exact provider Source viewer from its route and returns to the live Canvas node', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.workspaceDatasetQuery = new URLSearchParams({
+      revision: 'retained-revision-3',
+      revisionDataset: 'workspace-provider:retained-source',
+      returnCanvas: 'canvas-1',
+      returnNode: 'source-1',
+    }).toString()
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset.mockRejectedValue(new Error('current provider head unavailable'))
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'workspace-provider:retained-source', revisionId: 'retained-revision-3',
+      committedAt: '2026-07-20T12:00:00Z', retentionOwner: 'provider', summary: { rowCount: 1 },
+      preview: {
+        columns: [{ name: 'historical_value', type: 'string', capabilities: [] }],
+        rows: [{ historical_value: 'retained row' }], hasMore: false, rowLimit: 100,
+      },
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('region', { name: 'observations' })
+    expect(detail).toHaveTextContent('Selected version')
+    const context = within(detail).getByTestId('canonical-provider-dataset-context')
+    expect(context).toHaveTextContent('1 row')
+    expect(context).toHaveTextContent('1 columns')
+    expect(context).toHaveTextContent('historical_value · string')
+    expect(context).toHaveTextContent('retained row')
+    expect(context).not.toHaveTextContent('value · int64')
+    expect(detail).not.toHaveTextContent("Couldn't load provider details")
+    expect(within(detail).queryByRole('button', { name: 'Use in Canvas' })).not.toBeInTheDocument()
+    expect(mocks.datasetRevision).toHaveBeenCalledWith(
+      'workspace-provider:retained-source', 'retained-revision-3',
+    )
+    expect(mocks.datasetRevision).not.toHaveBeenCalledWith(
+      CANONICAL_DATASET_CONTEXT.datasetIdentity, CANONICAL_DATASET_CONTEXT.revisionId,
+    )
+
+    fireEvent.click(within(detail).getByRole('button', { name: 'Back to Canvas' }))
+    expect(store.activateLoadedCanvasRoute).toHaveBeenCalledWith('canvas-1', 'source-1')
+    expect(store.clearWorkspaceDatasetViewerState).toHaveBeenCalledWith('')
+    expect(store.openFile).not.toHaveBeenCalled()
+  })
+
+  it('rejects a mismatched exact provider revision response instead of showing it as selected', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.workspaceDatasetQuery = new URLSearchParams({
+      revision: 'retained-revision-3',
+      revisionDataset: 'workspace-provider:retained-source',
+    }).toString()
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'workspace-provider:other-source', revisionId: 'other-revision',
+      retentionOwner: 'provider', summary: { rowCount: 1 },
+      preview: { columns: [{ name: 'wrong', type: 'string', capabilities: [] }], rows: [{ wrong: 'row' }], hasMore: false, rowLimit: 100 },
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('region', { name: 'observations' })
+    expect(await within(detail).findByText(/returned a different dataset version/)).toBeVisible()
+    expect(within(detail).queryByText('wrong · string')).not.toBeInTheDocument()
+    expect(within(detail).queryByText('row', { exact: true })).not.toBeInTheDocument()
+    fireEvent.click(within(detail).getByRole('button', { name: 'Back to Workspace' }))
+    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', {
+      resourceId: EXTERNAL_FOLDER.id,
+      datasetQuery: '',
+    })
+  })
+
   it('keeps a healthy paged provider usable and labels its continuation in researcher language', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     const pagedSource = { ...PROVIDER_COMPLETE, completeness: 'page' as const }
