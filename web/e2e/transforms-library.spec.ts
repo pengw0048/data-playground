@@ -52,7 +52,9 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await expect(node).toContainText(transform.version)
 
   const canvasUrl = page.url()
-  await node.getByText('View definition', { exact: true }).click()
+  const viewDefinition = page.getByRole('button', { name: 'View processor definition' })
+  await expect(viewDefinition).toBeVisible()
+  await viewDefinition.click()
   await expect(page).toHaveURL(canvasUrl)
   const canvasDefinition = page.getByRole('region', { name: 'Library processor definition' })
   await expect(canvasDefinition).toContainText(sourceCode)

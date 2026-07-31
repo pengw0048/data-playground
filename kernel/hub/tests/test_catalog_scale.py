@@ -127,6 +127,54 @@ def test_pagination_body_and_windowing(scale_catalog):
     assert first.isdisjoint(second)
 
 
+def test_example_source_resolution_requires_one_current_local_registration():
+    prefix = f"{_SCALE}example-resolution/"
+    unique_name = f"example_unique_{uuid.uuid4().hex}"
+    duplicate_name = f"example_duplicate_{uuid.uuid4().hex}"
+    exact_uri = f"example_exact_{uuid.uuid4().hex}"
+    entries = [
+        _doc(unique_name, f"{prefix}unique"),
+        _doc(duplicate_name, f"{prefix}duplicate-a"),
+        _doc(duplicate_name, f"{prefix}duplicate-b"),
+        _doc("different-display-name", exact_uri),
+        _doc(exact_uri, f"{prefix}same-name-as-exact-uri"),
+    ]
+    metadb.catalog_bulk_seed(entries)
+    try:
+        response = client.post("/api/catalog/example-sources/resolve", json={
+            "refs": [exact_uri, unique_name, duplicate_name, "missing-example-source"],
+        })
+        assert response.status_code == 200, response.text
+        resolutions = {item["ref"]: item for item in response.json()["resolutions"]}
+        assert resolutions[exact_uri]["state"] == "resolved"
+        assert resolutions[exact_uri]["table"]["uri"] == exact_uri
+        assert resolutions[unique_name]["state"] == "resolved"
+        assert resolutions[unique_name]["table"]["registrationId"]
+        assert resolutions[duplicate_name] == {
+            "ref": duplicate_name, "state": "ambiguous", "table": None,
+        }
+        assert resolutions["missing-example-source"] == {
+            "ref": "missing-example-source", "state": "absent", "table": None,
+        }
+    finally:
+        metadb.catalog_delete_prefix(prefix)
+        metadb.catalog_delete_prefix(exact_uri)
+
+
+def test_example_source_resolution_refuses_an_external_catalog_provider(monkeypatch):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    class ExternalCatalog(InMemoryCatalog):
+        pass
+
+    monkeypatch.setattr(get_deps(), "catalog", object.__new__(ExternalCatalog))
+    response = client.post("/api/catalog/example-sources/resolve", json={"refs": ["events"]})
+    assert response.status_code == 501
+    assert response.json()["detail"] == (
+        "the active Catalog provider does not expose local example bindings"
+    )
+
+
 def test_five_thousand_dataset_discovery_stays_bounded():
     prefix = f"{_SCALE}five-thousand/"
     metadb.catalog_delete_prefix(prefix)

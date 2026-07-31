@@ -443,6 +443,32 @@ class CatalogTable(Wire):
     metadata_revision: str | None = None
 
 
+CatalogExampleSourceRef = Annotated[str, Field(min_length=1, max_length=8192)]
+
+
+class CatalogExampleSourceResolveRequest(Wire):
+    """Bare seeded example refs that may be upgraded to exact local Catalog registrations."""
+    refs: list[CatalogExampleSourceRef] = Field(min_length=1, max_length=20)
+
+
+class CatalogExampleSourceResolution(Wire):
+    ref: CatalogExampleSourceRef
+    state: Literal["resolved", "ambiguous", "absent"]
+    table: CatalogTable | None = None
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> "CatalogExampleSourceResolution":
+        if (self.state == "resolved") != (self.table is not None):
+            raise ValueError("only a resolved example Source may expose a Catalog table")
+        if self.table is not None and not self.table.registration_id:
+            raise ValueError("a resolved example Source requires an exact Catalog registration")
+        return self
+
+
+class CatalogExampleSourceResolveResponse(Wire):
+    resolutions: list[CatalogExampleSourceResolution]
+
+
 class DatasetRevision(Wire):
     """One immutable provider-native dataset revision."""
     dataset_id: str = Field(min_length=1, max_length=512)

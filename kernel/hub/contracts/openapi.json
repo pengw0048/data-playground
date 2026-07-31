@@ -578,6 +578,78 @@
         "title": "CatalogEdit",
         "type": "object"
       },
+      "CatalogExampleSourceResolution": {
+        "properties": {
+          "ref": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Ref",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "resolved",
+              "ambiguous",
+              "absent"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "table": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CatalogTable"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ref",
+          "state"
+        ],
+        "title": "CatalogExampleSourceResolution",
+        "type": "object"
+      },
+      "CatalogExampleSourceResolveRequest": {
+        "description": "Bare seeded example refs that may be upgraded to exact local Catalog registrations.",
+        "properties": {
+          "refs": {
+            "items": {
+              "maxLength": 8192,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "CatalogExampleSourceResolveRequest",
+        "type": "object"
+      },
+      "CatalogExampleSourceResolveResponse": {
+        "properties": {
+          "resolutions": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogExampleSourceResolution"
+            },
+            "title": "Resolutions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "resolutions"
+        ],
+        "title": "CatalogExampleSourceResolveResponse",
+        "type": "object"
+      },
       "CatalogFolder": {
         "description": "A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY\nfolder exist and be renamed/deleted, so a folder can be created up front and filled later.",
         "properties": {
@@ -16938,6 +17010,89 @@
           }
         },
         "summary": "Get Canvas Versions"
+      }
+    },
+    "/api/catalog/example-sources/resolve": {
+      "post": {
+        "description": "Upgrade seeded example refs only when the built-in local Catalog proves an exact identity.\n\nExternal Workspace provider placements use their canonical-dataset endpoints instead; this\nnarrow resolver must not absorb those identities into the local Catalog namespace.",
+        "operationId": "resolve_example_sources_api_catalog_example_sources_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogExampleSourceResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogExampleSourceResolveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Resolve Example Sources"
       }
     },
     "/api/catalog/facets": {

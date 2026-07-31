@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
-    Integer, LargeBinary, String, Text, UniqueConstraint, and_, cast, create_engine, delete, exists,
+    Integer, LargeBinary, String, Text, UniqueConstraint, and_, case, cast, create_engine, delete, exists,
     func, literal, or_, select, text, tuple_, update,
 )
 from sqlalchemy.exc import IntegrityError
@@ -20755,6 +20755,46 @@ def catalog_get(token: str) -> dict | None:
         if r is None:
             return None
         return _row_to_doc(r, [t.tag for t in s.scalars(select(CatalogTag).where(CatalogTag.uri == r.uri))])
+
+
+def catalog_resolve_example_sources(refs: list[str]) -> list[dict]:
+    """Resolve example Source refs against current local registrations with bounded DB reads.
+
+    An exact current URI wins. A bare fallback name resolves only when it has exactly one current
+    registration; opaque IDs are deliberately not considered because an example name may collide
+    with one. Missing and ambiguous refs remain runnable bare fallbacks on the client.
+    """
+    with session() as s:
+        resolutions: list[dict] = []
+        for original in refs:
+            token = str(original).rstrip("/")
+            bare = bool(token and "/" not in token and "\\" not in token)
+            identity = (
+                or_(CatalogEntry.uri == token, CatalogEntry.name == token)
+                if bare else CatalogEntry.uri == token
+            )
+            matches = list(s.scalars(
+                select(CatalogEntry).where(identity).order_by(
+                    case((CatalogEntry.uri == token, 0), else_=1), CatalogEntry.uri,
+                ).limit(3)
+            )) if token else []
+            row = next((candidate for candidate in matches if candidate.uri == token), None)
+            state = "resolved" if row is not None else "absent"
+            if row is None and bare:
+                named = [candidate for candidate in matches if candidate.name == token]
+                if len(named) == 1:
+                    row = named[0]
+                    state = "resolved"
+                elif len(named) > 1:
+                    state = "ambiguous"
+            table = None
+            if row is not None:
+                tags = [tag.tag for tag in s.scalars(
+                    select(CatalogTag).where(CatalogTag.uri == row.uri)
+                )]
+                table = _row_to_doc(row, tags)
+            resolutions.append({"ref": original, "state": state, "table": table})
+        return resolutions
 
 
 def catalog_revision_binding(dataset_id: str) -> dict | None:

@@ -54,9 +54,28 @@ describe('NodeCard result summary', () => {
     expect(screen.queryByText(/\b250 rows\b/)).not.toBeInTheDocument()
   })
 
-  it('names retained successful snapshots as output versions', () => {
+  it('hides output-run history on Source nodes', () => {
     const data = useStore.getState().doc.nodes[0].data
     useStore.setState({ selectedIds: ['target'] })
+
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Output versions' })).not.toBeInTheDocument()
+  })
+
+  it('names retained successful snapshots as output versions on output nodes', () => {
+    useStore.setState((state) => ({
+      selectedIds: ['target'],
+      doc: {
+        ...state.doc,
+        nodes: state.doc.nodes.map((node) => ({ ...node, type: 'filter' })),
+      },
+    }))
+    const data = useStore.getState().doc.nodes[0].data
 
     render(
       <TooltipProvider>

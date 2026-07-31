@@ -19,21 +19,20 @@ export function HistoryPanel({ nodeId }: { nodeId: string }) {
 
   if (items.length === 0) {
     return <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>
-      <div>No successful output yet.</div>
-      {node?.data.status === 'failed' && (
-        <button
-          onClick={() => setJobsQuery(new URLSearchParams({
-            canvas: canvasId, node: nodeId, status: 'failed',
-          }).toString())}
-          style={{
-            marginTop: 10, padding: '5px 10px', border: `1px solid ${color.border}`,
-            borderRadius: 7, background: 'hsl(var(--card))', color: color.focus,
-            fontSize: 11, fontWeight: 600, cursor: 'pointer',
-          }}
-        >
-          View in Jobs
-        </button>
-      )}
+      <div>No output is restorable from the current Canvas version.</div>
+      <div style={{ marginTop: 5 }}>Older runs and receipts, if any, remain in Jobs.</div>
+      <button
+        onClick={() => setJobsQuery(new URLSearchParams({
+          canvas: canvasId, node: nodeId,
+        }).toString())}
+        style={{
+          marginTop: 10, padding: '5px 10px', border: `1px solid ${color.border}`,
+          borderRadius: 7, background: 'hsl(var(--card))', color: color.focus,
+          fontSize: 11, fontWeight: 600, cursor: 'pointer',
+        }}
+      >
+        View node Jobs
+      </button>
     </div>
   }
 

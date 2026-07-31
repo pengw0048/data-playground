@@ -72,12 +72,15 @@ export function NodeCard({ id, data, children, metaOverride }: {
 
   const kind = node?.type ?? 'transform'
   const libraryTransform = kind === 'transform' && data.config.source === 'library'
+  const configuredLibraryTransform = libraryTransform
+    && typeof data.config.processor === 'string' && data.config.processor.length > 0
+    && typeof data.config.version === 'string' && data.config.version.length > 0
   const accent = kindAccent[kind] ?? '#8a8f98'
   const st = statusTok[data.status] ?? statusTok.draft
   const bypassed = !!data.bypassed
   const disabled = !!data.disabled
   const off = disabled || offDownstream  // dimmed either way; only self-disabled shows the badge
-  const hasCode = KINDS_WITH_CODE.has(kind)
+  const hasCode = KINDS_WITH_CODE.has(kind) && (!libraryTransform || configuredLibraryTransform)
   const busy = runState === 'running' || runState === 'estimating'
   const inputColumns = useInputColumns(id)
   const numericDrafts = useStore((s) => s.numericParamDrafts[id])
@@ -230,7 +233,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}
-          <ActionIcon name="clock" label="Output versions" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
+          {kind !== 'source' && (
+            <ActionIcon name="clock" label="Output versions" active={openPanel === 'history'} onClick={() => togglePanel(id, 'history')} />
+          )}
           {hasCode && <ActionIcon
             name={libraryTransform ? 'fx' : 'code'}
             label={libraryTransform ? 'View processor definition' : canEdit ? 'Edit code' : 'View code'}

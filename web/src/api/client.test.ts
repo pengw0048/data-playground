@@ -11,6 +11,23 @@ afterEach(() => {
 })
 
 describe('API error recovery contract', () => {
+  it('asks the server to resolve example Sources in one authoritative local batch', async () => {
+    const payload = { resolutions: [{
+      ref: 'events', state: 'resolved',
+      table: { id: 'tbl-events', registrationId: 'reg-events', name: 'events', uri: '/data/events.parquet', columns: [] },
+    }] }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await expect(api.resolveExampleSources(['events'])).resolves.toEqual(payload)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/catalog/example-sources/resolve',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ refs: ['events'] }) }),
+    )
+  })
+
   it('marks the current owner’s visible Inbox items read with one batch request', async () => {
     const payload = { markedCount: 3, readAt: '2026-07-29T12:00:00Z' }
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(

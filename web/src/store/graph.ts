@@ -258,6 +258,52 @@ function mergeIntoCatalog(set: (fn: (s: Store) => Partial<Store>) => void, table
   })
 }
 
+// Runnable examples keep stable seeded names as their offline fallback. Before persistence, ask the
+// server to prove any exact local registrations in one bounded request; a client working set can
+// never prove that a display name is globally unique.
+async function canonicalizeExampleSources(
+  doc: CanvasDoc,
+): Promise<{ doc: CanvasDoc; tables: CatalogTable[] }> {
+  const sources = doc.nodes.filter((node) => (
+    node.type === 'source'
+    && !node.data.config.registrationId
+    && !node.data.config.tableId
+    && typeof node.data.config.uri === 'string'
+    && node.data.config.uri.length > 0
+  ))
+  if (!sources.length) return { doc, tables: [] }
+  try {
+    const response = await api.resolveExampleSources(sources.map((node) => String(node.data.config.uri)))
+    const resolutions = new Map(response.resolutions.map((resolution) => [resolution.ref, resolution]))
+    const tables: CatalogTable[] = []
+    let changed = false
+    const nodes = doc.nodes.map((node) => {
+      if (!sources.includes(node)) return node
+      const ref = String(node.data.config.uri)
+      const resolution = resolutions.get(ref)
+      const table = resolution?.state === 'resolved' ? resolution.table : null
+      if (!table?.registrationId) return node
+      changed = true
+      tables.push(table)
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          config: {
+            ...node.data.config,
+            uri: table.uri,
+            tableId: table.id,
+            registrationId: table.registrationId,
+          },
+        },
+      }
+    })
+    return { doc: changed ? { ...doc, nodes } : doc, tables }
+  } catch {
+    return { doc, tables: [] }
+  }
+}
+
 export interface PreviewState {
   canvasId: string
   nodeId: string
@@ -3983,8 +4029,26 @@ export const useStore = create<Store>((set, get) => ({
       replacePristine = runsEmpty
     }
     const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
-    const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
-    if (!doc) return get().newFile()
+    const example = exampleDoc(key, id)  // bare seeded names remain the offline runnable fallback
+    if (!example) return get().newFile()
+    const resolved = await canonicalizeExampleSources(example)
+    if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+    if (replacePristine) {
+      const latest = get()
+      const latestCandidate: ExampleReplacementSnapshot = {
+        doc: latest.doc,
+        canvasRole: latest.canvasRole,
+        currentDraftId: latest.currentDraftId,
+        serverVersion: latest.serverVersion,
+      }
+      if (!isPristineExampleReplacement(latestCandidate)
+          || !isSameExampleReplacementSnapshot(candidate, latestCandidate)) {
+        get().pushToast('Canvas changed while preparing the example; your edit was kept. Choose the example again.', 'info')
+        return { ok: false }
+      }
+    }
+    const doc = resolved.doc
+    mergeIntoCatalog(set, resolved.tables)
     // A response-lost in-place save must retain the known server base. Retrying it as a create could
     // collide with the original Canvas and turn an uncertain update into a different document.
     if (replacePristine) doc.version = current.serverVersion!

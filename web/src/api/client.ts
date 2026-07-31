@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
+  CatalogBrowse, CatalogEdit, CatalogExampleSourceResolveResponse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, InstalledProcessorSource, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
@@ -274,6 +274,10 @@ export const api = {
   // One filtered/sorted page with its bounded window and total in the response body.
   tablesPage: (params: CatalogQueryParams = {}) =>
     req<CatalogPage>(`/catalog/tables${catalogQuery(params)}`),
+  resolveExampleSources: (refs: string[]) =>
+    req<CatalogExampleSourceResolveResponse>('/catalog/example-sources/resolve', {
+      method: 'POST', body: JSON.stringify({ refs }),
+    }),
   facets: (params: CatalogQueryParams = {}) =>
     req<Facets>(`/catalog/facets${catalogQuery(params)}`),
   catalogTree: (prefix = '', options?: { signal?: AbortSignal }) =>

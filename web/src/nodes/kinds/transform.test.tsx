@@ -131,6 +131,7 @@ describe('Transform exact processor labels', () => {
   it('opens an available exact processor definition without leaving the Canvas', () => {
     const Transform = getComponent('transform')!
     useStore.setState({
+      selectedIds: [node.id],
       processors: [{
         id: PROCESSOR_ID, version: 'v1', title: 'Pinned processor', mode: 'map',
         category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
@@ -144,7 +145,9 @@ describe('Transform exact processor labels', () => {
       </ReactFlowProvider></TooltipProvider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: /View definition/ }))
+    expect(screen.getByLabelText('Selected exact processor')).toHaveTextContent('Pinned processor')
+    expect(screen.queryByRole('button', { name: /View definition/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'View processor definition' }))
     expect(useStore.getState()).toMatchObject({
       view: 'canvas',
       fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
@@ -159,6 +162,7 @@ describe('Transform exact processor labels', () => {
       data: { ...node.data, config: { source: 'library', mode: 'map', code: null } },
     }
     useStore.setState({
+      selectedIds: [unconfigured.id],
       doc: {
         id: 'canvas', name: 'canvas', version: 1, requirements: [],
         nodes: [unconfigured], edges: [],
@@ -170,6 +174,7 @@ describe('Transform exact processor labels', () => {
       </ReactFlowProvider></TooltipProvider>,
     )
 
+    expect(screen.queryByRole('button', { name: 'View processor definition' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Choose/ }))
     expect(useStore.getState()).toMatchObject({
       view: 'transforms', transformResourceId: null, transformVersion: null,
@@ -286,7 +291,7 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
-  it('opens a Library definition instead of advertising editable source code', () => {
+  it('keeps the exact Library definition on the selected shelf instead of the card body', () => {
     const Transform = getComponent('transform')!
     useStore.setState({ selectedIds: [node.id] })
     render(
@@ -296,6 +301,7 @@ describe('Transform exact processor labels', () => {
     )
 
     expect(screen.getByRole('button', { name: 'View processor definition' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: /View definition/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
   })
 
