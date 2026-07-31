@@ -165,7 +165,10 @@ test.describe('provider Workspace Source acceptance', () => {
     })
     await expect(resource).toBeVisible({ timeout: 20_000 })
     await resource.click()
-    const detail = page.getByRole('dialog', { name: datasetNameA })
+    const detail = page.getByRole('region', { name: datasetNameA })
+    await expect(page.getByRole('form', { name: 'Workspace search' })).toHaveCount(0)
+    await expect(resource).toHaveCount(0)
+    await expect(page.getByTestId('first-run-canvas-choice')).toHaveCount(0)
     const location = detail.getByText('Location', { exact: true }).locator('..')
     await expect(location).toContainText('Mount browser-provider')
     await expect(location).toContainText(`${containerNameA} / ${datasetNameA}`)
@@ -248,9 +251,11 @@ test.describe('provider Workspace Source acceptance', () => {
     )?.id
     expect(typedPlacementId).toBeTruthy()
     const canonicalDetail = detail.getByTestId('canonical-provider-dataset-context')
-    await expect(detail).toContainText('Exact version · browser-provider-revision-v1')
     await expect(canonicalDetail).toContainText('id · int')
     await expect(canonicalDetail).toContainText('value · string')
+    await detail.getByText('Dataset details', { exact: true }).click()
+    await expect(detail.getByText('Version identity', { exact: true })).toBeVisible()
+    await expect(detail.getByText('browser-provider-revision-v1', { exact: true })).toBeVisible()
     await detail.getByRole('button', { name: 'Use in Canvas' }).click()
 
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetNameA}` })
@@ -318,7 +323,7 @@ test.describe('provider Workspace Source acceptance', () => {
     })
     await expect(typedResource).toBeVisible()
     await typedResource.click()
-    const typedDetail = page.getByRole('dialog', { name: typedDatasetName })
+    const typedDetail = page.getByRole('region', { name: typedDatasetName })
     await typedDetail.getByRole('button', { name: 'Use in Canvas' }).click()
     const typedUseDialog = page.getByRole('dialog', { name: `Use ${typedDatasetName}` })
     const addToCurrent = typedUseDialog.getByRole('button', { name: /^Add to a recent Canvas/ })
@@ -428,7 +433,7 @@ test.describe('provider Workspace Source acceptance', () => {
     })
     await expect(duplicateResource).toBeVisible({ timeout: 20_000 })
     await duplicateResource.click()
-    const duplicateDetail = page.getByRole('dialog', { name: datasetNameB })
+    const duplicateDetail = page.getByRole('region', { name: datasetNameB })
     await expect(duplicateDetail).toContainText(`Also observed at${containerNameA} / ${datasetNameA}`)
     const placementBRequest = page.waitForResponse((response) =>
       decodeURIComponent(new URL(response.url()).pathname.split('/').pop() ?? '') === placementBId
@@ -437,13 +442,15 @@ test.describe('provider Workspace Source acceptance', () => {
     const placementBResponse = await placementBRequest
     const placementBResolution = await placementBResponse.json() as { canonicalSourceBinding?: { mountId: string; sourceBindingId: string } }
     expect(placementBResolution.canonicalSourceBinding).toEqual(placementAResolution.canonicalSourceBinding)
-    await expect(page.getByRole('dialog', { name: datasetNameB })).toBeVisible()
+    await expect(page.getByRole('region', { name: datasetNameB })).toBeVisible()
     const canonicalBResponse = await page.request.get(
       `/api/workspace/resources/${encodeURIComponent(placementBId!)}/canonical-dataset`,
     )
     expect(canonicalBResponse.ok()).toBeTruthy()
     expect(await canonicalBResponse.json()).toEqual(canonicalA)
-    await expect(duplicateDetail).toContainText('Exact version · browser-provider-revision-v1')
+    await duplicateDetail.getByText('Dataset details', { exact: true }).click()
+    await expect(duplicateDetail.getByText('Version identity', { exact: true })).toBeVisible()
+    await expect(duplicateDetail.getByText('browser-provider-revision-v1', { exact: true })).toBeVisible()
     await duplicateDetail.getByRole('button', { name: 'Use in Canvas' }).click()
     const duplicateUseDialog = page.getByRole('dialog', { name: `Use ${datasetNameB}` })
     const chooseCanvas = duplicateUseDialog.getByRole('button', { name: /^Choose another Canvas/ })
@@ -591,13 +598,13 @@ test.describe('provider Workspace Source acceptance', () => {
       })
     })
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
-    const detachedPlacement = page.getByRole('dialog', { name: datasetNameA })
+    const detachedPlacement = page.getByRole('region', { name: datasetNameA })
     await expect(detachedPlacement).toContainText('Placement state · detached')
     await expect(detachedPlacement).toContainText('Canonical dataset state · current')
     placementState = 'canonical-offline'
     await page.goto('/#/workspace')
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
-    const canonicalUnavailable = page.getByRole('dialog', { name: datasetNameA })
+    const canonicalUnavailable = page.getByRole('region', { name: datasetNameA })
     await expect(canonicalUnavailable).toContainText('Canonical dataset state · offline')
     await expect(canonicalUnavailable).toContainText('Placement state · current')
     await expect(canonicalUnavailable.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()

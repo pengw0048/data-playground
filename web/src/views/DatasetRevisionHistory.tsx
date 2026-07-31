@@ -57,6 +57,13 @@ export function DatasetRevisionHistory({
 }) {
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
+  const viewerCanvasReturn = (() => {
+    if (!detailsInViewer) return undefined
+    const params = new URLSearchParams(encodedQuery)
+    const canvasId = params.get('returnCanvas') || undefined
+    const nodeId = params.get('returnNode') || undefined
+    return canvasId ? { canvasId, nodeId } : undefined
+  })()
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
   const [items, setItems] = useState<DatasetRevision[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
@@ -246,7 +253,7 @@ export function DatasetRevisionHistory({
             const className = `flex w-full items-start gap-2 border-b border-border/60 px-2 py-1.5 text-left last:border-0 hover:bg-accent ${active ? 'bg-accent' : ''}`
             return detailsInViewer
               ? <a key={`${revision.datasetId}:${revision.revisionId}`}
-                  href={datasetViewerHash(revision.datasetId, revision.revisionId)}
+                  href={datasetViewerHash(revision.datasetId, revision.revisionId, viewerCanvasReturn)}
                   aria-label={`Open revision ${revision.revisionId}`} className={className}>
                   {content}
                 </a>

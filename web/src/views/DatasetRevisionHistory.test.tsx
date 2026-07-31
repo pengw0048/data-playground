@@ -156,6 +156,24 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
+  it('preserves Canvas return context when the full-page viewer switches revisions', async () => {
+    store.workspaceDatasetQuery = new URLSearchParams({
+      revision: 'rev-current',
+      revisionDataset: 'dataset-stable',
+      returnCanvas: 'canvas-1',
+      returnNode: 'source',
+    }).toString()
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer />)
+
+    expect(await screen.findByRole('link', { name: 'Open revision rev-2' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnCanvas=canvas-1&returnNode=source',
+    )
+  })
+
   it('keeps a slow save capability probe current while revision pagination advances', async () => {
     const capability = deferred<{
       selectors: ('exact' | 'latest')[]

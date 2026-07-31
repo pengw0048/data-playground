@@ -63,6 +63,8 @@ export interface CatalogDiscoveryProps {
   initialRevisionId?: string
   /** Authoritative logical dataset identity paired with the requested revision. */
   initialRevisionDatasetId?: string
+  /** Accessible Back destination for a routed full-page detail. */
+  detailBackLabel?: string
 }
 
 export interface CatalogDiscoveryQueryState {
@@ -84,7 +86,7 @@ export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
   queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange, onOpenInWorkspace,
   workspaceLocation, onRetryWorkspaceLocation,
-  initialRevisionId, initialRevisionDatasetId,
+  initialRevisionId, initialRevisionDatasetId, detailBackLabel,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -348,6 +350,41 @@ export function CatalogDiscovery({
   // warm the working set first, or the new source node can't resolve its table and shows "Select dataset"
   const use = (t: CatalogTable) => onUseTables([t])
 
+  if (selected) {
+    return (
+      <div className="relative h-full">
+        <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
+          backLabel={detailBackLabel}
+          initialRevisionId={initialRevisionId}
+          initialRevisionDatasetId={initialRevisionDatasetId}
+          onChanged={(t) => {
+            // Saving catalog metadata refreshes the selected registration; it does not navigate
+            // away from an exact-revision route.
+            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
+            setCatalogRevision((v) => v + 1)
+            void loadFirst()
+          }}
+          onFolder={(folder) => {
+            if (onOpenInWorkspace) void onOpenInWorkspace(selected)
+            else { setFolder(folder); selectTable(null) }
+          }}
+          folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
+          folderActionVisible={!!onOpenInWorkspace || !!selected.folder}
+          folderActionDisabled={!!onOpenInWorkspace && (!selected.registrationId
+            || workspaceLocation?.state === 'resolving' || workspaceLocation?.state === 'unavailable')}
+          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.'
+            : workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…'
+              : workspaceLocation?.state === 'unavailable'
+                ? workspaceLocation.reason ?? 'This dataset is not currently available in Workspace.' : undefined}
+          onFolderRetry={workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
+            ? onRetryWorkspaceLocation : undefined}
+          onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }}
+          onOpenTable={selectTable}
+          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-full flex-col">
       {/* header: title + register / upload */}
@@ -517,34 +554,6 @@ export function CatalogDiscovery({
         </div>
       </div>
 
-      {selected && (
-        <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
-          initialRevisionId={initialRevisionId}
-          initialRevisionDatasetId={initialRevisionDatasetId}
-          onChanged={(t) => {
-            // Saving catalog metadata refreshes the selected registration; it does not navigate
-            // away from an exact-revision route.
-            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
-            setCatalogRevision((v) => v + 1)
-            void loadFirst()
-          }}
-          onFolder={(folder) => {
-            if (onOpenInWorkspace) void onOpenInWorkspace(selected)
-            else { setFolder(folder); selectTable(null) }
-          }}
-          folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
-          folderActionVisible={!!onOpenInWorkspace || !!selected.folder}
-          folderActionDisabled={!!onOpenInWorkspace && (!selected.registrationId
-            || workspaceLocation?.state === 'resolving' || workspaceLocation?.state === 'unavailable')}
-          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.'
-            : workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…'
-              : workspaceLocation?.state === 'unavailable'
-                ? workspaceLocation.reason ?? 'This dataset is not currently available in Workspace.' : undefined}
-          onFolderRetry={workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
-            ? onRetryWorkspaceLocation : undefined}
-          onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
-          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
-      )}
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
 
       {/* Facets stay bounded with the active query. Empty folders remain discoverable through
@@ -912,6 +921,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
   folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
+  backLabel = 'Back to Workspace',
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
@@ -921,6 +931,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   onFolderRetry?: () => void
   initialRevisionId?: string
   initialRevisionDatasetId?: string
+  backLabel?: string
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1191,6 +1202,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
   const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
+  const displayedVersion = requestedExact ?? exactFacts ?? latestHead
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1200,10 +1212,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
   return (
     <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="dataset-viewer">
-      <div role="dialog" aria-label={table.name}
+      <div role="region" aria-label={table.name}
         className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
         <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
-          <button ref={closeRef} onClick={requestClose} aria-label="Close"
+          <button ref={closeRef} onClick={requestClose} aria-label={backLabel}
             className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
             <Icon name="chevronLeft" size={14} /> Back
           </button>
@@ -1233,8 +1245,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
               {requestedExactDetail ? <span data-testid="dataset-facts-source">· Published version</span> : null}
-              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
-              {!requestedExact && !exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
+              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Versioned facts</span> : null}
+              {!requestedExact && !exactFacts && latestHead ? <span data-testid="dataset-facts-source">· Latest version</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
@@ -1310,10 +1322,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                   <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
                   <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
                 </div> : null}
-                {requestedExact ? <div data-testid="dataset-version-identity">
-                  <div className="text-[10px] text-muted-foreground">Exact version identity</div>
+                {displayedVersion ? <div data-testid="dataset-version-identity">
+                  <div className="text-[10px] text-muted-foreground">
+                    {requestedExact ? 'Exact version identity' : 'Version identity'}
+                  </div>
                   <code className="break-all text-[10.5px] text-foreground">
-                    {revisionLabel(requestedExact)}
+                    {revisionLabel(displayedVersion)}
                   </code>
                 </div> : null}
               </div>
@@ -1332,16 +1346,16 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <div role="status" data-testid="dataset-facts-stale"
               className="flex flex-col gap-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-3 py-2 text-[11px] text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
               <div>
-                <div className="font-semibold">Dataset facts need refresh</div>
+                <div className="font-semibold">Dataset facts may be out of date</div>
                 <div className="break-words">{exactFacts
-                  ? `Header and Columns are bound to exact revision ${revisionLabel(exactFacts)}; latest head is ${revisionLabel(latestHead)}.`
-                  : `Header and Columns are not bound to latest head ${revisionLabel(latestHead)}.`}</div>
+                  ? 'Header and columns describe an earlier version. Refresh to show facts for the latest version.'
+                  : 'Refresh to show header and column facts for the latest version.'}</div>
               </div>
-              {factsError ? <div role="alert">Couldn't refresh exact head facts: {factsError}</div> : null}
+              {factsError ? <div role="alert">Couldn't refresh the latest dataset facts: {factsError}</div> : null}
               <button type="button" onClick={() => void refreshHeadFacts()} disabled={factsLoading}
                 data-testid="refresh-dataset-facts"
                 className="self-start font-semibold underline disabled:opacity-50">
-                {factsLoading ? 'Refreshing head facts…' : factsError ? 'Retry head facts' : 'Refresh head facts'}
+                {factsLoading ? 'Refreshing dataset facts…' : factsError ? 'Retry dataset facts' : 'Refresh dataset facts'}
               </button>
             </div>
           ) : null}

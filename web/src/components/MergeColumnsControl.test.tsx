@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   state: {} as any,
-  preflight: vi.fn(), submit: vi.fn(), task: vi.fn(), jobs: vi.fn(), revision: vi.fn(),
+  preflight: vi.fn(), submit: vi.fn(), task: vi.fn(), jobs: vi.fn(),
   tableByRegistration: vi.fn(), resolveDatasetRevision: vi.fn(), cancel: vi.fn(), retry: vi.fn(),
 }))
 
@@ -14,7 +14,7 @@ vi.mock('../store/graph', () => ({
 vi.mock('../api/client', () => ({
   api: {
     mergeColumnsPreflight: mocks.preflight, submitMergeColumns: mocks.submit,
-    mergeColumnsTask: mocks.task, workspaceJobs: mocks.jobs, datasetRevision: mocks.revision,
+    mergeColumnsTask: mocks.task, workspaceJobs: mocks.jobs,
     tableByRegistration: mocks.tableByRegistration, resolveDatasetRevision: mocks.resolveDatasetRevision,
     cancelMergeColumnsTask: mocks.cancel, retryMergeColumnsTask: mocks.retry,
   },
@@ -52,6 +52,7 @@ describe('MergeColumnsControl', () => {
     }
     mocks.preflight.mockResolvedValue(preflight)
     mocks.submit.mockResolvedValue({ taskId: 'task-1', status: 'queued', canRetry: false, canCancel: true, mergeColumns: { phase: 'validating', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true } })
+    mocks.jobs.mockResolvedValue({ items: [] })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', uri: 'managed://dataset-1/current.parquet' })
     mocks.resolveDatasetRevision.mockResolvedValue({ datasetId: 'dataset-1', revisionId: 'rev-current', committedAt: '2026-07-19T12:00:00Z', retentionOwner: 'core', selector: 'latest' })
   })
@@ -210,6 +211,33 @@ describe('MergeColumnsControl', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     await screen.findByText('done')
     expect(screen.queryByText('Submitting…')).not.toBeInTheDocument()
+  })
+
+  it('opens a completed publication in the shared full-page dataset viewer', async () => {
+    const merge = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns
+    merge.taskId = 'done-task'
+    mocks.task.mockResolvedValueOnce({
+      taskId: 'done-task', status: 'done', canRetry: false, canCancel: false,
+      mergeColumns: { phase: 'done', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1',
+        candidate: 'committed', reused: false, canRetry: false, canCancel: false },
+    })
+    mocks.jobs.mockResolvedValueOnce({ items: [{ outputReceipt: {
+      datasetId: 'dataset-1', revisionId: 'rev-2', name: 'merged observations',
+      rows: 4, bytes: 128, schema: [], partitions: [], publication: {},
+      durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-2', retentionOwner: 'core' },
+    } }] })
+
+    render(<MergeColumnsControl nodeId="write" />)
+
+    const published = await screen.findByLabelText('Published result')
+    expect(published).toHaveTextContent('Published · merged observations · 4 rows')
+    expect(published).not.toHaveTextContent('dataset-1@rev-2')
+    expect(within(published).getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-2&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
+    )
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
+    expect(mocks.jobs).toHaveBeenCalledWith({ runId: 'done-task', limit: 1 })
   })
 
   it('persists an ambiguous submission before POST and recovers the same id after reopening', async () => {

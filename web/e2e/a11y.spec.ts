@@ -91,7 +91,7 @@ test.describe('accessibility gate @ux-smoke', () => {
     await fresh(page)
     await backToWorkspace(page)
     await (await workspaceResource(page, 'dataset', 'images')).click()
-    await expect(page.getByRole('dialog', { name: 'images' })).toBeVisible()
+    await expect(page.getByRole('region', { name: 'images' })).toBeVisible()
     const detailContent = page.getByTestId('dataset-detail-content')
     await detailContent.focus()
     await expect(detailContent).toBeFocused()

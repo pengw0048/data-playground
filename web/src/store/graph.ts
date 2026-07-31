@@ -1317,6 +1317,8 @@ interface Store {
   // -- app shell (Figma-style views) --
   view: DpView
   setView: (v: DpView) => void
+  /** Publish a route to the already loaded Canvas without replacing its in-memory document. */
+  activateLoadedCanvasRoute: (canvasId: string, nodeId?: string) => boolean
   erFocusUri: string | null                       // the table the relationship graph opens focused on (null = global)
   openRelationships: (uri: string | null) => void
   workspaceResourceId: string | null
@@ -1331,6 +1333,8 @@ interface Store {
     searchQuery?: string
     datasetQuery?: string
   }) => void
+  /** Clear a temporary Dataset viewer after Canvas navigation without publishing a Workspace route. */
+  clearWorkspaceDatasetViewerState: (listQuery: string) => void
   workspaceDatasetQuery: string
   setWorkspaceDatasetQuery: (query: string) => void
   jobsQuery: string
@@ -1788,6 +1792,24 @@ export const useStore = create<Store>((set, get) => ({
           transformUpgradeCanvasId: null, transformUpgradeNodeId: null }
       : { view })
   },
+  activateLoadedCanvasRoute: (canvasId, nodeId) => {
+    const state = get()
+    if (state.doc.id !== canvasId) return false
+    startNavigation()
+    if (state.view !== 'canvas') _fileNavigationGeneration += 1
+    const nodeExists = !!nodeId && state.doc.nodes.some((node) => node.id === nodeId)
+    set({
+      view: 'canvas',
+      selectedId: nodeExists ? nodeId! : null,
+      selectedIds: nodeExists ? [nodeId!] : [],
+    })
+    if (nodeExists) get().requestNodeReveal(canvasId, nodeId!)
+    else {
+      get().clearNodeReveal()
+      if (nodeId) get().pushToast('The requested node is no longer in this Canvas.', 'info')
+    }
+    return true
+  },
   erFocusUri: null,
   openRelationships: (uri) => {
     startNavigation()
@@ -1824,6 +1846,12 @@ export const useStore = create<Store>((set, get) => ({
       ...(context?.datasetQuery !== undefined ? { workspaceDatasetQuery: context.datasetQuery } : {}),
       view: 'workspace',
     })
+  },
+  clearWorkspaceDatasetViewerState: (workspaceDatasetQuery) => {
+    // This cleanup belongs to a completed viewer → Canvas handoff. Refuse to publish its hidden
+    // Workspace state before the Canvas is active; doing so would insert a phantom history entry.
+    if (get().view !== 'canvas') return
+    set({ workspaceResourceId: null, workspaceDatasetQuery })
   },
   workspaceDatasetQuery: '',
   setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {

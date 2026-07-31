@@ -51,6 +51,14 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await expect(node).toHaveCount(1)
   await expect(node).toContainText(transform.version)
 
+  await page.getByRole('button', { name: 'View processor definition' }).click()
+  const canvasDefinition = page.getByRole('region', { name: 'Library processor definition' })
+  await expect(canvasDefinition).toContainText(sourceCode)
+  await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).not.toBeVisible()
+  await canvasDefinition.getByText('Technical details').click()
+  await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).toBeVisible()
+  await page.getByRole('button', { name: 'Close' }).click()
+
   const canvasResponse = await request.get(`/api/canvas/${encodeURIComponent(canvasId)}`, { headers })
   expect(canvasResponse.ok()).toBe(true)
   const canvas = await canvasResponse.json() as { nodes: Array<{ id: string }> }

@@ -373,15 +373,18 @@ export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
   const firstRunChoice = useStore((state) => state.firstRunChoice)
+  const requestedResourceId = useStore((state) => state.workspaceResourceId)
+  const fullPageResource = requestedResourceId?.startsWith('dataset:')
+    || requestedResourceId?.startsWith('dataset_view:')
   const providerPlacementObservations = useProviderPlacementObservations()
   const previousScope = useRef(scope)
   useEffect(() => {
     if (previousScope.current !== scope) providerPlacementObservations.reset()
     previousScope.current = scope
   }, [scope, providerPlacementObservations])
-  return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="flex h-full min-h-0 flex-col">
-    {firstRunChoice && <FirstRunCanvasChoice />}
-    <WorkspaceLocalDrafts />
+  return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="relative flex h-full min-h-0 flex-col overflow-hidden">
+    {!fullPageResource && firstRunChoice && <FirstRunCanvasChoice />}
+    {!fullPageResource && <WorkspaceLocalDrafts />}
     <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
   </div></WorkspaceOverflowMenuProvider></ProviderPlacementObservationsContext.Provider>
 }
@@ -736,6 +739,60 @@ function WorkspaceMixedExplorer() {
       datasetQuery: serializeWorkspaceDatasetQuery(next),
     })
   }
+  const providerActionDialog = providerDatasetAction ? <ProviderDatasetActionDialog
+    resource={providerDatasetAction}
+    container={container}
+    files={files}
+    currentCanvasId={currentCanvasId}
+    targetState={canvasTargetState}
+    onClose={() => setProviderDatasetAction(null)}
+    onRefreshCanvases={refreshFiles}
+    onOpened={(canvasId, nodeId) => {
+      setProviderDatasetAction(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId)
+    }} /> : null
+  const relinkDialog = relinkResource ? <RelinkResourceDialog
+    resource={relinkResource}
+    onClose={() => setRelinkResource(null)}
+    onRelinked={(resource) => {
+      setRelinkResource(null)
+      pushToast(`Relinked to ${resource.name}`, 'success')
+      setWorkspaceResource(resource.id)
+    }} /> : null
+  const datasetActionDialog = datasetAction && container?.version != null ? <DatasetActionDialog
+    action={datasetAction} container={container}
+    files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState}
+    onClose={() => setDatasetAction(null)}
+    onRefreshCanvases={refreshFiles}
+    onOpened={(canvasId, nodeId) => {
+      setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null)
+      void openCreatedSourceCanvas(canvasId, nodeId)
+    }} /> : null
+
+  if (selectedDataset && isExternal(selectedDataset)) return <>
+    <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
+      canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
+      onUse={() => useProviderDataset(selectedDataset)}
+      onRelink={() => setRelinkResource(selectedDataset)} />
+    {providerActionDialog}
+    {relinkDialog}
+  </>
+
+  if (selectedTable) return <>
+    <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
+      onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
+      folderActionLabel="Open in Workspace"
+      folderActionVisible
+      folderActionDisabled={!isCurrentCatalogLocation(container)}
+      folderActionTitle={!isCurrentCatalogLocation(container)
+        ? 'This dataset is not currently available in Workspace.' : undefined}
+      onOpenTable={setSelectedTable} onFolder={() => {
+        if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
+          setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
+        } else pushToast('This dataset is not currently available in Workspace.', 'error')
+      }}
+      onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />
+    {datasetActionDialog}
+  </>
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -839,27 +896,11 @@ function WorkspaceMixedExplorer() {
         </div>}
       </div>
 
-      {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
-        onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
-        folderActionLabel="Open in Workspace"
-        folderActionVisible
-        folderActionDisabled={!isCurrentCatalogLocation(container)}
-        folderActionTitle={!isCurrentCatalogLocation(container)
-          ? 'This dataset is not currently available in Workspace.' : undefined}
-        onOpenTable={setSelectedTable} onFolder={() => {
-          if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
-            setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
-          } else pushToast('This dataset is not currently available in Workspace.', 'error')
-        }}
-        onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
       {selectedView && <DatasetViewDetail definition={selectedView} onClose={closeDetail} onDeleted={() => {
         setSelectedView(null)
         pushToast('DatasetView deleted', 'success')
         setWorkspaceResource(`container:${containerId}`)
       }} />}
-      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
-        canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
-        onUse={() => useProviderDataset(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {addDataOpen && <AddDataModal onClose={() => setAddDataOpen(false)} onUploadDataset={uploadDataset}
         onCompleted={reload} />}
@@ -883,16 +924,8 @@ function WorkspaceMixedExplorer() {
         onRenamed={() => { setCanvasRenameResource(null); void refreshFiles(); reload() }} />}
       {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
         onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
-      {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
-        files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
-        onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId, nodeId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
-      {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
-        container={container} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setProviderDatasetAction(null)}
-        onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId, nodeId) => {
-          setProviderDatasetAction(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId)
-        }} />}
+      {datasetActionDialog}
+      {providerActionDialog}
       {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
         onMoved={(result, destinationPath) => {
           setMoveResource(null)
@@ -900,12 +933,7 @@ function WorkspaceMixedExplorer() {
             destinationPath })
           reload()
         }} />}
-      {relinkResource && <RelinkResourceDialog resource={relinkResource} onClose={() => setRelinkResource(null)}
-        onRelinked={(resource) => {
-          setRelinkResource(null)
-          pushToast(`Relinked to ${resource.name}`, 'success')
-          setWorkspaceResource(resource.id)
-        }} />}
+      {relinkDialog}
     </div>
   )
 }
@@ -936,10 +964,12 @@ function WorkspaceDatasets() {
   const refreshFiles = useStore((state) => state.refreshFiles)
   const openFile = useStore((state) => state.openFile)
   const select = useStore((state) => state.select)
+  const activateLoadedCanvasRoute = useStore((state) => state.activateLoadedCanvasRoute)
   const pushToast = useStore((state) => state.pushToast)
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
   const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
+  const clearWorkspaceDatasetViewerState = useStore((state) => state.clearWorkspaceDatasetViewerState)
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
 
@@ -957,6 +987,12 @@ function WorkspaceDatasets() {
     const datasetId = params.get('revisionDataset') || undefined
     return revisionId && datasetId ? { revisionId, datasetId } : undefined
   }, [encodedQuery])
+  const viewerCanvasReturn = useMemo(() => {
+    const params = new URLSearchParams(encodedQuery)
+    const canvasId = params.get('returnCanvas') || undefined
+    const nodeId = params.get('returnNode') || undefined
+    return canvasId ? { canvasId, nodeId } : undefined
+  }, [encodedQuery])
   const initialRevisionId = exactRevision?.revisionId
   const initialRevisionDatasetId = exactRevision?.datasetId
   const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
@@ -969,6 +1005,7 @@ function WorkspaceDatasets() {
   const [destinationError, setDestinationError] = useState<string | null>(null)
   const [destinationRevision, setDestinationRevision] = useState(0)
   const [selectedWorkspaceTable, setSelectedWorkspaceTable] = useState<CatalogTable | null>(null)
+  const returningToCanvas = useRef(false)
   const [detailResolutionRevision, setDetailResolutionRevision] = useState(0)
   const detailResolutionSeq = useRef(0)
   const selectedWorkspaceKey = selectedWorkspaceTable?.registrationId
@@ -1110,17 +1147,51 @@ function WorkspaceDatasets() {
         title="Local catalog" queryState={query}
         initialRevisionId={initialRevisionId}
         initialRevisionDatasetId={initialRevisionDatasetId}
+        detailBackLabel={viewerCanvasReturn ? 'Back to Canvas' : 'Back to Workspace'}
         onQueryStateChange={(next) => {
           const params = new URLSearchParams(serializeWorkspaceDatasetQuery(next))
           if (hasExactRevision) {
             params.set('revision', initialRevisionId)
             params.set('revisionDataset', initialRevisionDatasetId)
           }
+          if (viewerCanvasReturn) {
+            params.set('returnCanvas', viewerCanvasReturn.canvasId)
+            if (viewerCanvasReturn.nodeId) params.set('returnNode', viewerCanvasReturn.nodeId)
+          }
           setEncodedQuery(params.toString())
         }}
         selectedRegistrationId={selectedRegistrationId}
         onSelectedTableChange={(table, origin = 'user') => {
+          // Clearing the exact Workspace route below causes CatalogDiscovery to report its own
+          // route selection as null. That acknowledgement must not start a competing Workspace
+          // navigation while the explicit Canvas return is still loading.
+          if (!table && origin === 'route' && returningToCanvas.current) return
           setSelectedWorkspaceTable(table)
+          if (!table && origin === 'user' && viewerCanvasReturn) {
+            // Canvas-origin viewers are a temporary detour. After returning, retain only the list
+            // query so the next ordinary Workspace visit does not reopen this receipt; the
+            // explicit node route restores Inspector selection.
+            returningToCanvas.current = true
+            const listQuery = serializeWorkspaceDatasetQuery(query)
+            // Open the Canvas first so the router publishes one atomic destination. Cleaning the
+            // retained Workspace viewer state before this resolves would insert a phantom
+            // Workspace history entry between the exact Dataset viewer and its Canvas.
+            if (currentCanvasId === viewerCanvasReturn.canvasId
+                && activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) {
+              // The viewer is only a route detour; its originating Canvas remains live in memory.
+              // The route action validates/reveals the requested node and publishes the final hash
+              // without reloading an edit that is still inside the autosave debounce.
+              clearWorkspaceDatasetViewerState(listQuery)
+              returningToCanvas.current = false
+              return
+            }
+            void openFile(viewerCanvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
+              if (!opened) return
+              if (!activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) return
+              clearWorkspaceDatasetViewerState(listQuery)
+            }).finally(() => { returningToCanvas.current = false })
+            return
+          }
           // Exact revision navigation belongs to the selected route as an atomic pair. A user
           // close or user-selected replacement leaves that route, while route resolution itself
           // (including a transient null) must preserve it.
@@ -1776,10 +1847,10 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse }: {
+function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse, onRelink }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
-  onRetry: () => void; onUse: () => void
+  onRetry: () => void; onUse: () => void; onRelink: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
@@ -1854,19 +1925,36 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     })
     return () => controller.abort()
   }, [canonicalContext, previewRevision])
-  return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
-    <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
-      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
-        className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
+  return <section aria-label={resource.name}
+    className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
+    data-testid="provider-dataset-viewer">
+      <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
+        <button onClick={onClose} aria-label="Back to Workspace"
+          className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
+          <Icon name="chevronLeft" size={14} /> Back
+        </button>
+        <Icon name="db" size={16} />
+        <div className="min-w-0 flex-1">
+          <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
+          <div className="truncate text-[10.5px] text-muted-foreground">Mounted dataset · {resource.provider ?? resource.mountId ?? 'external source'}</div>
+        </div>
+        <button onClick={onRetry} aria-label="Reload dataset"
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
+          <Icon name="refresh" size={12} /> Reload
+        </button>
+        <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+          className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>
+      </div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
-        className="mt-5 grid min-h-0 flex-1 content-start gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-5">
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Location</div>
           <div className="break-words">Mount <strong>{resource.mountId ?? 'external'}</strong>{placementPath ? ` / ${placementPath}` : ''}</div>
           {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
         </section>
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
           <div className="text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
-            ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact version · {canonicalContext.revisionId}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
+            ? <><span className="block">Published version</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
             : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
         </section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
@@ -1884,17 +1972,25 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           {canonicalContext.readMode === 'exact' && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
             {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
             {preview && (preview.preview.rows.length
-              ? <div className="mt-1 overflow-x-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.slice(0, 4).map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
+              ? <div data-testid="provider-dataset-preview-scroll" tabIndex={0}
+                  className="mt-1 max-h-[420px] overflow-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
         </section>}
+        {source && source.completeness !== 'complete' && !providerIssue
+          && <div role="status" aria-label="Dataset source status"
+            className="rounded-md border border-border bg-muted/30 p-2 text-muted-foreground">
+            {sourceCompletenessLabel(source.completeness)}
+          </div>}
         {providerIssue && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           {providerIssue}<button type="button" onClick={retryProviderDetails} className="ml-2 font-semibold underline">Retry</button>
+          {(resource.lastKnown || placementState !== 'current' || canonicalUnavailable)
+            && <button type="button" onClick={onRelink} className="ml-2 font-semibold underline">Relink</button>}
         </div>}
-        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
+        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Dataset details</summary>
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
             {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
             {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}
-            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div><div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
+            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div>{canonicalContext.revisionId && <><div className="mt-1 text-muted-foreground">Version identity</div><div className="break-all font-mono">{canonicalContext.revisionId}</div></>}<div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
             <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
             {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
             {resource.lastKnown && <div className="text-muted-foreground">Retained placement facts{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
@@ -1902,9 +1998,9 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
             {alternatePlacements.length > 0 && <div><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1 text-muted-foreground">Only placements already loaded in this Workspace session are shown.</div></div>}
           </div>
         </details>
+        </div>
       </div>
-    </div>
-  </div>
+  </section>
 }
 
 function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, targetState, onClose, onOpened, onRefreshCanvases }: {

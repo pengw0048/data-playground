@@ -1,4 +1,4 @@
-import { datasetViewerHash } from '../router'
+import { datasetViewerHash, type DatasetViewerCanvasReturn } from '../router'
 import type {
   RunOutput, WriteAdmission, WriteReceipt, WriteSchemaDrift,
 } from '../types/api'
@@ -17,14 +17,30 @@ function writeMode(mode: WriteAdmission['mode'] | undefined): string {
   return 'Write mode is not available yet'
 }
 
-function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
+function ExactRevisionAction({ receipt, returnToCanvas }: {
+  receipt: WriteReceipt
+  returnToCanvas?: DatasetViewerCanvasReturn
+}) {
   // The receipt already supplies the immutable identity. Navigation keeps it in the URL so reload
   // and browser Back reopen the same viewer; the viewer owns authorization and retention errors.
   return <a
     className="mt-2 inline-flex rounded-md bg-primary px-2.5 py-1.5 text-[10.5px] font-semibold text-primary-foreground shadow-sm"
-    href={datasetViewerHash(receipt.datasetId, receipt.revisionId)}>
+    href={datasetViewerHash(receipt.datasetId, receipt.revisionId, returnToCanvas)}>
     Open dataset
   </a>
+}
+
+export function PublishedDatasetResult({ receipt, name = receipt.name, returnToCanvas }: {
+  receipt: WriteReceipt
+  name?: string
+  returnToCanvas?: DatasetViewerCanvasReturn
+}) {
+  return <div aria-label="Published result"
+    className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
+    <div><strong>Published</strong> · <span className="font-mono">{name}</span> · {receipt.rows.toLocaleString()} rows</div>
+    <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt}
+      returnToCanvas={returnToCanvas} />
+  </div>
 }
 
 function schemaText(fields: { name: string; type: string }[]): string {
@@ -127,8 +143,9 @@ function PublicationDetails({ admission, outcomeAdmission, receipt, schemaDrift,
   </details>
 }
 
-export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false, publishing = false }: {
+export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false, publishing = false, returnToCanvas }: {
   outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean; publishing?: boolean
+  returnToCanvas?: DatasetViewerCanvasReturn
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
   const summaryAdmission = completed ? outcomeAdmission : admission
@@ -143,12 +160,12 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
-      <div>
+      {!receipt && <div>
         <span className="font-semibold text-foreground">
           {managed ? 'Dataset name' : 'Output name'}
         </span>
         <div className="font-mono text-foreground">{displayedName}</div>
-      </div>
+      </div>}
       <div>
         <span className="font-semibold text-foreground">Destination</span>
         <div className="text-muted-foreground">{destination}</div>
@@ -175,10 +192,8 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
               : 'Ready to run'}
           </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Checking output…</div>}
-      {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <div><strong>Published</strong> · <span className="font-mono">{displayedName}</span> · {receipt.rows.toLocaleString()} rows</div>
-        <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
-      </div>}
+      {receipt && <PublishedDatasetResult receipt={receipt} name={displayedName}
+        returnToCanvas={returnToCanvas} />}
     </div>
     <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt}
       schemaDrift={schemaDrift} outputs={outputs} />

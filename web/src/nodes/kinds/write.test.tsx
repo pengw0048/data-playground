@@ -221,13 +221,16 @@ describe('Write card — typed local mode truth', () => {
         runs: { write: {
           phase: 'done', writeAdmission: undefined, writeSubmissionId: undefined,
           writeAdmissionFingerprint: undefined,
-          status: { outputs: [{ writeReceipt: { revisionId: 'committed-7', datasetId: 'dataset-1' } }] },
+          status: { outputs: [{ writeReceipt: {
+            revisionId: 'committed-7', datasetId: 'dataset-1', name: 'committed output',
+          } }] },
         } },
       } as any)
       await Promise.resolve()
     })
 
-    expect(screen.getByText(/version committed-7/)).toBeInTheDocument()
+    expect(screen.getByText(/Published · committed output/)).toBeInTheDocument()
+    expect(screen.queryByText(/committed-7/)).not.toBeInTheDocument()
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
     expect(useStore.getState().runs.write.writeSubmissionId).not.toBe('completed-submission')
     await Promise.resolve()
@@ -242,7 +245,7 @@ describe('Write card — typed local mode truth', () => {
         phase: 'idle',
         writeOutcome: {
           runId: 'published-run',
-          receipt: { revisionId: 'recovered-8', datasetId: 'dataset-1' },
+          receipt: { revisionId: 'recovered-8', datasetId: 'dataset-1', name: 'recovered output' },
           outputs: [],
         },
       } },
@@ -255,11 +258,13 @@ describe('Write card — typed local mode truth', () => {
     const Write = getComponent('write')!
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
 
-    expect(screen.getByText(/published · version recovered-8/)).toBeInTheDocument()
+    expect(screen.getByText(/Published · recovered output/)).toBeInTheDocument()
+    expect(screen.queryByText(/recovered-8/)).not.toBeInTheDocument()
     await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toMatchObject({
       mode: 'replace',
     }))
-    expect(screen.getByText(/published · version recovered-8/)).toBeInTheDocument()
+    expect(screen.getByText(/Published · recovered output/)).toBeInTheDocument()
+    expect(screen.queryByText(/recovered-8/)).not.toBeInTheDocument()
     expect(useStore.getState().runs.write.writeOutcome?.runId).toBe('published-run')
   })
 

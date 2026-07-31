@@ -36,6 +36,7 @@ describe('RunPanel typed parameter gate', () => {
         { name: 'when', value: '2026-07-18T10:00:00' },
         { name: 'input', value: { kind: 'exact', datasetId: 'dataset-1' } },
       ] } },
+      sizes: {},
       estimate: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), refreshPreviewInputs: vi.fn(),
       previewBindings: {}, canvasRole: 'owner', setRunParameterBinding: mocks.setBinding,
       clearRunParameterBinding: mocks.clearBinding, submitRunParameters: mocks.submit,
@@ -236,6 +237,51 @@ describe('RunPanel typed parameter gate', () => {
       ? /estimated data volume is large/i : /row count is above the automatic-run limit/i)).toBeVisible()
     expect(screen.queryByText(/heads up/i)).not.toBeInTheDocument()
   })
+
+  it('uses a current exact graph count for visible confirmation copy without rewriting admission evidence', () => {
+    mocks.state.sizes = { target: { rows: 2_000, confidence: 'exact' } }
+    mocks.state.runs.target = {
+      phase: 'confirm',
+      estimate: {
+        rows: null,
+        bytes: null,
+        placement: 'local',
+        needsConfirm: true,
+        confirmationReasons: ['unknown_population'],
+        breakdown: 'size unknown · retained input was not reopened during admission',
+      },
+    }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getAllByText('Run 2,000 rows')).toHaveLength(2)
+    expect(screen.getByText(/This full run will process 2,000 rows/)).toBeVisible()
+    const details = screen.getByText('Technical details').closest('details')!
+    fireEvent.click(screen.getByText('Technical details'))
+    expect(details).toHaveTextContent('size unknown · retained input was not reopened during admission')
+  })
+
+  it.each(['bounded', 'unknown'])(
+    'does not turn a %s graph-size hint into a visible exact row claim',
+    (confidence) => {
+      mocks.state.sizes = { target: { rows: 2_000, confidence } }
+      mocks.state.runs.target = {
+        phase: 'confirm',
+        estimate: {
+          rows: null,
+          bytes: null,
+          placement: 'local',
+          needsConfirm: true,
+          confirmationReasons: ['unknown_population'],
+        },
+      }
+
+      render(<RunPanel nodeId="target" />)
+
+      expect(screen.getAllByText('Run with unknown row count')).toHaveLength(2)
+      expect(screen.getByText(/unknown number of rows/)).toBeVisible()
+    },
+  )
 
   it('shows configured column merges only through their certified admission control', async () => {
     mocks.state.doc.nodes = [{

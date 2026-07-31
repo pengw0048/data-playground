@@ -60,7 +60,7 @@ function Write({ id, data }: NodeComponentProps) {
   const displayName = admission?.intent?.destination.name ?? name
   const runtimeSchema = admission?.intent?.schemaMode === 'runtime'
   const semantics = receipt
-    ? `published · version ${receipt.revisionId}`
+    ? `Published · ${receipt.name || displayName || 'dataset'}`
     : admission?.managed
       ? admission.blocker ? 'needs attention' : runtimeSchema
         ? 'ready to run · columns checked during run'
@@ -68,8 +68,13 @@ function Write({ id, data }: NodeComponentProps) {
       : admission ? 'ready to run' : 'checking output…'
   const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   const upsertSemantics = upsert?.taskId ? 'keyed upsert tracked' : upsert?.keys?.length ? 'keyed upsert configured' : null
+  const cardSummary = receipt
+    ? semantics
+    : displayName
+      ? `→ ${destinationLabel} · ${mergeSemantics ?? upsertSemantics ?? semantics}`
+      : 'name an output → choose a destination in the panel'
   return (
-    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${destinationLabel} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : 'name an output → choose a destination in the panel'}>
+    <NodeCard id={id} data={data} metaOverride={cardSummary}>
       <div className="grid gap-2">
         <Field label="output name">
           <MiniInput value={name} placeholder="output" invalid={nameError != null}

@@ -10,9 +10,11 @@ import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import type { DatasetViewerCanvasReturn } from '../router'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
+  const graphSize = useStore((s) => s.sizes[nodeId])
   const estimate = useStore((s) => s.estimate)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
@@ -20,6 +22,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
+  const returnToCanvas = { canvasId: doc.id, nodeId }
   const target = doc.nodes.find((node) => node.id === nodeId)
   const isWrite = target?.type === 'write'
   const mergeRules = target?.data.config.mergeColumns
@@ -70,9 +73,17 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
   const exactRunReadiness = writeAdmission?.exactRunReadiness ?? est?.exactRunReadiness
   const exactRunReady = exactRunReadiness?.ready !== false
+  // Admission remains authoritative for confirmation. A retained-input preflight may deliberately
+  // avoid reopening rows while the current graph metadata pass has already proved this node's
+  // count. Use that server-owned count only for visible copy; keep admission evidence unchanged.
+  const visibleRows = est?.rows ?? (
+    graphSize?.rows != null && graphSize.confidence === 'exact'
+      ? graphSize.rows
+      : null
+  )
   const confirmationActionLabel = isManagedWrite
     ? 'Publish a new version'
-    : est?.rows == null ? 'Run with unknown row count' : `Run ${est.rows.toLocaleString()} rows`
+    : visibleRows == null ? 'Run with unknown row count' : `Run ${visibleRows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
     ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
     : exactRunReady ? 'Run' : 'Exact input registration required'
@@ -132,11 +143,12 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <Label>CONFIRM RUN</Label>
             <div className="mt-0.5 text-2xl font-bold text-foreground">{confirmationActionLabel}</div>
             <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-              {confirmationCopy(est, writeAdmission)}
+              {confirmationCopy(est, writeAdmission, visibleRows)}
             </div>
             <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
               isWrite={isWrite} outputName={outputName} destination={destination}
-              admission={writeAdmission} receipt={receipt ?? undefined} />
+              admission={writeAdmission} receipt={receipt ?? undefined}
+              returnToCanvas={returnToCanvas} />
           </> : <>
             <Label>ESTIMATE</Label>
             <div className="mt-0.5 flex items-baseline gap-2">
@@ -145,7 +157,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               </span>
             </div>
             {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
-            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
+            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
+              admission={writeAdmission} receipt={receipt} returnToCanvas={returnToCanvas} />}
           </>}
           {!isWrite && exactRunReadiness?.ready === false && (
             <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
@@ -207,7 +220,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <PerNode st={st} />
           {isManagedWrite
             ? <WritePublicationSummary compact outputName={outputName} destination={destination}
-                admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing />
+                admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing
+                returnToCanvas={returnToCanvas} />
             : <RunOutputs outputs={st.outputs} />}
           <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} disabled={!canEdit} title={canEdit ? 'Stop this run' : 'View-only canvas'} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop
@@ -219,7 +233,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         isManagedWrite ? <>
           <Label>MANAGED REVISION PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
-            outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed />
+            outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed
+            returnToCanvas={returnToCanvas} />
           <PerNode st={st} compact />
         </> : <>
           <Label>DONE</Label>
@@ -433,11 +448,13 @@ function confirmationReasons(estimate: RunEstimate, admission?: WriteAdmission):
   return [...reasons]
 }
 
-function confirmationCopy(estimate: RunEstimate, admission?: WriteAdmission): string {
+function confirmationCopy(
+  estimate: RunEstimate, admission?: WriteAdmission, visibleRows = estimate.rows,
+): string {
   const reasons = confirmationReasons(estimate, admission)
-  const cost = estimate.rows == null
+  const cost = visibleRows == null
     ? 'This full run will process an unknown number of rows.'
-    : `This full run will process ${estimate.rows.toLocaleString()} rows${estimate.bytes != null ? ` (about ${formatByteEstimate(estimate.bytes)})` : ''}.`
+    : `This full run will process ${visibleRows.toLocaleString()} rows${estimate.bytes != null ? ` (about ${formatByteEstimate(estimate.bytes)})` : ''}.`
   const risk = reasons.includes('destructive_overwrite')
     ? 'It will overwrite the selected provider output.'
     : reasons.includes('schema_drift')
@@ -455,7 +472,7 @@ function confirmationCopy(estimate: RunEstimate, admission?: WriteAdmission): st
 }
 
 function ConfirmationTechnicalDetails({
-  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt,
+  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt, returnToCanvas,
 }: {
   estimate: RunEstimate
   pinnedInputs: { nodeId: string; title: string; ref: DatasetRef }[]
@@ -464,6 +481,7 @@ function ConfirmationTechnicalDetails({
   destination: string
   admission?: WriteAdmission
   receipt?: WriteReceipt
+  returnToCanvas: DatasetViewerCanvasReturn
 }) {
   const reasons = confirmationReasons(estimate, admission)
   return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
@@ -479,7 +497,7 @@ function ConfirmationTechnicalDetails({
         </div>
       })}
       {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
-        admission={admission} receipt={receipt} />}
+        admission={admission} receipt={receipt} returnToCanvas={returnToCanvas} />}
     </div>
   </details>
 }

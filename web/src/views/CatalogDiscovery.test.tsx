@@ -102,7 +102,7 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.tableByRegistration.mockResolvedValue({ ...TABLE, id: 'tbl_orders', registrationId: 'registration-path' })
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       selectedRegistrationId="registration-path" onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('registration-path')
     expect(mocks.table).not.toHaveBeenCalled()
   })
@@ -142,7 +142,7 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       selectedRegistrationId="registration-other" initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id"
       onSelectedTableChange={onSelectedTableChange} onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('logical-receipt-id')
     expect(mocks.tableByRegistration).not.toHaveBeenCalledWith('registration-other')
@@ -174,8 +174,12 @@ describe('Catalog discovery request and mutation truth', () => {
       onUseTables={onUseTables} onUploadDataset={store.uploadDataset} />)
 
     const viewer = await screen.findByTestId('dataset-viewer')
+    expect(screen.queryByTestId('catalog-search')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('register-dataset')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Use dataset orders' })).not.toBeInTheDocument()
     expect(viewer).toHaveClass('absolute', 'inset-0')
     expect(viewer).not.toHaveClass('w-[420px]')
+    expect(within(viewer).getByRole('button', { name: 'Back to Workspace' })).toBeVisible()
     expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
     expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Published version')
     expect(screen.getByTestId('dataset-version-context')).not.toHaveTextContent('rev-receipt')
@@ -199,6 +203,16 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact revision is view-only')
     expect(screen.queryByTestId('detail-use')).not.toBeInTheDocument()
     expect(onUseTables).not.toHaveBeenCalled()
+  })
+
+  it('uses the routed Canvas destination as the full-page viewer Back label', async () => {
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-orders" detailBackLabel="Back to Canvas"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    const viewer = await screen.findByTestId('dataset-viewer')
+    expect(within(viewer).getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
+    expect(within(viewer).queryByRole('button', { name: 'Close' })).not.toBeInTheDocument()
   })
 
   it('preserves the exact route when catalog metadata is saved from the viewer', async () => {
@@ -251,11 +265,11 @@ describe('Catalog discovery request and mutation truth', () => {
     const props = { sourceIdentity: store.kernelInfo, foldersMutable: true,
       selectedRegistrationId: 'registration-path', onUseTables: vi.fn(), onUploadDataset: store.uploadDataset }
     const { rerender } = render(<CatalogDiscovery {...props} />)
-    await screen.findByRole('dialog', { name: 'customers' })
+    await screen.findByRole('region', { name: 'customers' })
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('registration-path')
 
     rerender(<CatalogDiscovery {...props} initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id" />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('logical-receipt-id')
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
   })
@@ -283,7 +297,7 @@ describe('Catalog discovery request and mutation truth', () => {
     }
     const exact = { initialRevisionId: 'rev-receipt', initialRevisionDatasetId: logical }
     const { rerender } = render(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
 
     // Workspace writes the canonical registration after the exact logical lookup succeeds.
@@ -294,11 +308,11 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
 
     rerender(<CatalogDiscovery {...props} selectedRegistrationId="registration-customers" />)
-    await screen.findByRole('dialog', { name: 'customers' })
+    await screen.findByRole('region', { name: 'customers' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
 
     rerender(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(3)
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith(logical)
   })
@@ -443,7 +457,7 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('downstream'))
   })
 
-  it('surfaces detail failures, preserves edits after a failed save, and refreshes the tree after save and delete', async () => {
+  it('surfaces detail failures, preserves edits after a failed save, and restores a refreshed list after delete', async () => {
     mocks.lineage
       .mockRejectedValueOnce(new Error('HTTP 503: lineage unavailable'))
       .mockResolvedValueOnce({ rootUri: TABLE.uri, nodes: [], edges: [] })
@@ -481,10 +495,13 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByTestId('detail-save'))
-    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith('Saved', 'success'))
+    expect(screen.queryByTestId('catalog-search')).not.toBeInTheDocument()
+    expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByTestId('detail-unregister'))
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
-    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByTestId('catalog-search')).toBeInTheDocument())
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
   })
 
   it('shows the full bounded first page as the primary dataset view', async () => {
@@ -625,30 +642,41 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
-    expect(await screen.findByText(/not bound to latest head orders-dataset@3/i)).toBeInTheDocument()
-    expect(screen.queryByTestId('dataset-facts-source')).not.toBeInTheDocument()
+    expect(await screen.findByText(/refresh to show header and column facts for the latest version/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@3')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Latest version')
+    expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    expect(await screen.findByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    await waitFor(() => expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts'))
+    expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
     expect(screen.getAllByText('legacy_code')).not.toHaveLength(0)
+    const details = screen.getByTestId('detail-dataset-details')
+    expect(screen.getByTestId('dataset-version-identity')).not.toBeVisible()
+    fireEvent.click(within(details).getByText('Dataset details'))
+    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@3')
 
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
-    expect(await screen.findByText(/latest head is orders-dataset@4/i)).toBeInTheDocument()
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    expect(await screen.findByText(/header and columns describe an earlier version/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@4')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
+    expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    expect(await screen.findByText("Couldn't refresh exact head facts: provider offline")).toBeInTheDocument()
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    expect(await screen.findByText("Couldn't refresh the latest dataset facts: provider offline")).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
     expect(screen.getByTestId('dataset-facts-stale')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    await waitFor(() => expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@4'))
+    await waitFor(() => expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4'))
     expect(screen.getByText('4 rows')).toBeInTheDocument()
     expect(screen.getByText('· 2 cols')).toBeInTheDocument()
     expect(screen.queryByText('legacy_code')).not.toBeInTheDocument()
     expect(screen.getByText('· verified latest head')).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4')
+    expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@4')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(1, 'orders-dataset', '3')
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'orders-dataset', '4')
@@ -800,7 +828,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(confirm).toHaveBeenCalledWith('Discard unsaved catalog edits?')
-    expect(screen.getByRole('dialog', { name: 'orders' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'orders' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('detail-save'))
     expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()

@@ -11,7 +11,10 @@ vi.mock('../store/graph', () => ({
   roleCanEdit: (role: string) => role !== 'viewer',
   useStore: (selector: (state: any) => unknown) => selector(mocks.state),
 }))
-vi.mock('../router', () => ({ routeHash: (...parts: unknown[]) => `#/${parts.filter(Boolean).join('/')}` }))
+vi.mock('../router', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../router')>(),
+  routeHash: (...parts: unknown[]) => `#/${parts.filter(Boolean).join('/')}`,
+}))
 vi.mock('../api/client', () => ({
   api: {
     tablesPage: mocks.tablesPage, resolveDatasetRevision: mocks.resolve, tableByRegistration: mocks.table, datasetRevision: mocks.revision,
@@ -200,6 +203,29 @@ describe('ManagedSidecarMergeControl', () => {
     expect(stored.base).toEqual({ kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r6' })
     expect(stored.taskId).toBeUndefined()
     expect(screen.getByRole('button', { name: 'Start managed merge' })).toBeDisabled()
+  })
+
+  it('returns both completed-task dataset links to the owning Write node', async () => {
+    install({ config: configured({ taskId: 'done-task' }) })
+    mocks.task.mockResolvedValue({
+      taskId: 'done-task', status: 'done', canCancel: false, canRetry: false,
+      base: { kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r4' },
+      receipt: {
+        datasetId: 'base-dataset', revisionId: 'base-r5', name: 'wide base', rows: 1,
+      },
+      mergeColumns: { phase: 'done', candidate: 'committed', reused: false },
+    })
+
+    render(<ManagedSidecarMergeControl nodeId="write" />)
+
+    expect(await screen.findByRole('link', { name: 'Open published child' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Abase-dataset?scope=datasets&revision=base-r5&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
+    )
+    expect(screen.getByRole('link', { name: 'Open exact base' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Abase-dataset?scope=datasets&revision=base-r4&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
+    )
   })
 
   it('blocks incomplete and schema-incoherent drafts before preflight without claiming server authority', async () => {

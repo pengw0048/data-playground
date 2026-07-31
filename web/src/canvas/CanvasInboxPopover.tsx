@@ -27,6 +27,7 @@ function subject(item: InboxItemDto): string {
 export function CanvasInboxPopover() {
   const setInboxQuery = useStore((state) => state.setInboxQuery)
   const setJobsQuery = useStore((state) => state.setJobsQuery)
+  const canvasId = useStore((state) => state.doc.id)
   const [open, setOpen] = useState(false)
   const [count, setCount] = useState<number | null>(null)
   const [items, setItems] = useState<InboxItemDto[]>([])
@@ -222,9 +223,10 @@ export function CanvasInboxPopover() {
                     {item.datasetContext && (
                       <Button variant="outline" size="sm" asChild className="h-7 px-2 text-[10.5px]">
                         <a
-                          href={item.datasetContext.deepLink ?? datasetViewerHash(
+                          href={datasetViewerHash(
                             item.datasetContext.datasetId,
                             item.datasetContext.revisionId ?? undefined,
+                            { canvasId },
                           )}
                           onClick={() => {
                             markReadForNavigation(item)

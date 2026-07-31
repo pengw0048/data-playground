@@ -85,6 +85,7 @@ function Source({ id, data }: NodeComponentProps) {
   const replaceSourceBinding = useStore((s) => s.replaceSourceBinding)
   const select = useStore((s) => s.select)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const canvasId = useStore((s) => s.doc.id)
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
   // agent/example/programmatic source), not only by an exact uri match.
   const tid = data.config.tableId
@@ -311,10 +312,14 @@ function Source({ id, data }: NodeComponentProps) {
       {!datasetParameter && !providerDataset && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
         exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
-      {selectedExact && <a href={datasetViewerHash(selectedExact.datasetId, selectedExact.revisionId)}
+      {selectedExact && <a href={datasetViewerHash(
+        selectedExact.datasetId,
+        selectedExact.revisionId,
+        { canvasId, nodeId: id },
+      )}
         onClick={(event) => event.stopPropagation()}
         className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-semibold text-primary hover:underline">
-        <Icon name="eye" size={11} /> Open dataset
+        <Icon name="db" size={11} /> Open dataset
       </a>}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />

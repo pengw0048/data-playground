@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, KernelError, toMergeColumnsGraph } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
-import type { DatasetRevisionDetail, MergeColumnRule, MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, WriteReceipt } from '../types/api'
+import type { MergeColumnRule, MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, WriteReceipt } from '../types/api'
 import type { NodeConfig } from '../types/graph'
+import { PublishedDatasetResult } from './WritePublicationSummary'
 import { Button } from '@/components/ui/button'
 
 export interface MergeColumnsConfig {
@@ -85,35 +86,6 @@ function requestKey(request: MergeColumnsRequest): string {
   return JSON.stringify({ semantic: semanticKey(request), submissionId: request.submissionId })
 }
 
-function ExactReceipt({ receipt }: { receipt: WriteReceipt }) {
-  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
-  const open = async () => {
-    setLoading(true); setError('')
-    try {
-      // Exact revision only.  A compacted/unavailable revision remains an honest error; never
-      // silently substitute the moving catalog head.
-      setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId))
-    } catch (caught) { setError(cleanError(caught)) } finally { setLoading(false) }
-  }
-  return <div className="mt-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2 text-[10.5px] text-muted-foreground">
-    <div className="font-semibold text-foreground">Published exact revision</div>
-    <div className="mt-0.5 break-all font-mono">{receipt.datasetId}@{receipt.revisionId}</div>
-    <div>{countLabel(receipt.rows)} rows · {countLabel(receipt.bytes)} bytes</div>
-    <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => void open()} disabled={loading}>
-      {loading ? 'Opening exact revision…' : 'Open exact revision'}
-    </Button>
-    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}</div>}
-    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-muted/30 p-2">
-      <div>Committed {detail.committedAt ? new Date(detail.committedAt).toLocaleString() : 'at an unknown time'} · {detail.summary.rowCount == null ? 'row count unavailable' : `${countLabel(detail.summary.rowCount)} rows`}</div>
-      <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'} · {detail.preview.columns.length} fields</div>
-      <div className="mt-1 overflow-auto"><table className="w-full text-left"><thead><tr>{detail.preview.columns.map((field) => <th key={field.name} className="pr-2 font-medium">{field.name}</th>)}</tr></thead><tbody>{detail.preview.rows.slice(0, 5).map((row, index) => <tr key={index}>{detail.preview.columns.map((field) => <td key={field.name} className="max-w-24 truncate pr-2 font-mono">{String(row[field.name] ?? '')}</td>)}</tr>)}</tbody></table></div>
-      {detail.preview.hasMore && <div className="mt-1">Preview is bounded; this remains the exact published revision.</div>}
-    </div>}
-  </div>
-}
-
 /**
  * The one UI surface for the certified local merge.  It has no client-side eligibility logic:
  * configuration is persisted on the existing Write card, whereas every correctness statement
@@ -121,6 +93,7 @@ function ExactReceipt({ receipt }: { receipt: WriteReceipt }) {
  */
 export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: string; compact?: boolean }) {
   const node = useStore((state) => state.doc.nodes.find((item) => item.id === nodeId))
+  const canvasId = useStore((state) => state.doc.id)
   const doc = useStore((state) => state.doc)
   const updateConfig = useStore((state) => state.updateConfig)
   const canEdit = useStore((state) => roleCanEdit(state.canvasRole))
@@ -387,7 +360,10 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
         {task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}
         {task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}</div>}
     </div>}
-    {receipt && <ExactReceipt receipt={receipt} />}
+    {receipt && <div className="mt-2 text-[10.5px]">
+      <PublishedDatasetResult receipt={receipt}
+        returnToCanvas={{ canvasId, nodeId }} />
+    </div>}
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">Tracked durable Task</div>
       <div className="mt-0.5">Its current state is loading or temporarily unavailable. This is not treated as a new admission.</div>

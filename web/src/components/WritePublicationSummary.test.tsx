@@ -78,7 +78,8 @@ describe('WritePublicationSummary task-first output states', () => {
       destination="Workspace outputs" admission={nextAdmission}
       receipt={{ ...receipt, name: 'published' }} completed />)
 
-    expect(screen.getAllByText('published')).toHaveLength(2)
+    expect(screen.getAllByText('published')).toHaveLength(1)
+    expect(screen.queryByText('Dataset name')).not.toBeInTheDocument()
     expect(screen.queryByText('next')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Published result')).toHaveTextContent('Published · published · 2 rows')
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
@@ -153,9 +154,21 @@ describe('WritePublicationSummary task-first output states', () => {
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
     expect(screen.getByLabelText('Published result')).toHaveTextContent('Published · output · 2 rows')
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
+    expect(screen.queryByText('Dataset name')).not.toBeInTheDocument()
+    expect(screen.getAllByText('output')).toHaveLength(1)
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
+    )
+  })
+
+  it('keeps the originating Canvas and node in an Inspector receipt link', () => {
+    render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
+      receipt={receipt} completed returnToCanvas={{ canvasId: 'canvas-1', nodeId: 'write' }} />)
+
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
     )
   })
 })
