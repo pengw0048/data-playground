@@ -233,6 +233,37 @@ describe('TransformsLibrary', () => {
     expect(store.setTransformLibraryQuery).toHaveBeenCalledWith('')
   })
 
+  it('does not misreport a Unicode casefold match returned by the server', async () => {
+    const strasse = { ...entry(), title: 'Straße scorer' }
+    store.transformLibraryQuery = 'q=STRASSE'
+    mocks.transformLibrary.mockResolvedValue({ items: [strasse], hasMore: false, nextCursor: null })
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: strasse.id, provenance: 'promoted', requestedVersion: strasse.version, versions: [strasse],
+    })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('button', { name: /Straße scorer/ })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Straße scorer' })).toBeVisible()
+    expect(screen.queryByTestId('selected-transform-filter-context')).not.toBeInTheDocument()
+  })
+
+  it('does not claim a selection is filtered out before pagination is exhausted', async () => {
+    store.transformLibraryQuery = 'q=other'
+    mocks.transformLibrary.mockResolvedValue({
+      items: [{ ...entry(), id: 'tr_other', title: 'Other scorer' }],
+      hasMore: true,
+      nextCursor: 'cursor-2',
+    })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('button', { name: /Other scorer/ })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Robot scorer' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeVisible()
+    expect(screen.queryByTestId('selected-transform-filter-context')).not.toBeInTheDocument()
+  })
+
   it('keeps the four filter controls in one responsive toolbar contract', () => {
     render(<TransformsLibrary />)
 

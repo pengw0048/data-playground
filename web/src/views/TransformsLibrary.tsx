@@ -26,27 +26,6 @@ function queryValue(query: string, key: string): string {
   return new URLSearchParams(query).get(key) ?? ''
 }
 
-function normalizedLibraryText(value: string): string {
-  return value.normalize('NFKC').toLowerCase()
-}
-
-function matchesLibraryFilters(entry: TransformLibraryEntry, filters: {
-  q: string
-  source: 'all' | 'promoted' | 'plugin'
-  mode: string
-  category: string
-}): boolean {
-  if (filters.source !== 'all' && entry.provenance !== filters.source) return false
-  const mode = normalizedLibraryText(filters.mode.trim())
-  const category = normalizedLibraryText(filters.category.trim())
-  if (mode && normalizedLibraryText(entry.mode) !== mode) return false
-  if (category && normalizedLibraryText(entry.category) !== category) return false
-  const query = normalizedLibraryText(filters.q.trim())
-  return !query || normalizedLibraryText([
-    entry.title, entry.blurb, entry.category, entry.mode, entry.id,
-  ].join('\n')).includes(query)
-}
-
 export function TransformsLibrary() {
   const routeQuery = useStore((state) => state.transformLibraryQuery)
   const selectedId = useStore((state) => state.transformResourceId)
@@ -57,6 +36,7 @@ export function TransformsLibrary() {
   const setResource = useStore((state) => state.setTransformResource)
   const [items, setItems] = useState<TransformLibraryEntry[]>([])
   const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [resolvedListSignature, setResolvedListSignature] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -93,9 +73,11 @@ export function TransformsLibrary() {
   useEffect(() => {
     let live = true
     setLoading(true); setLoadingMore(false); setError(null); setItems([]); setNextCursor(null)
+    setResolvedListSignature(null)
     void api.transformLibrary({ ...filters, limit: PAGE_SIZE }).then((page) => {
       if (!live) return
       setItems(page.items); setNextCursor(page.nextCursor ?? null)
+      setResolvedListSignature(listSignature)
     }).catch((caught) => { if (live) setError(errorMessage(caught)) })
       .finally(() => { if (live) setLoading(false) })
     return () => { live = false }
@@ -132,14 +114,10 @@ export function TransformsLibrary() {
   )) ?? null
   const requestedMissing = !!selectedVersion && !!detail
     && !detail.versions.some((version) => version.version === selectedVersion)
-  // The list represents the newest active version for one identity. Compare that same version to
-  // the route filters so pagination cannot make an exact selection look filtered out by mistake.
-  const selectedListEntry = detail?.versions.find((version) => version.availability === 'active')
-    ?? detail?.versions[0]
-    ?? null
   const selectedOutsideFilteredResults = Boolean(
-    hasFilters && selectedId && selectedListEntry && !loading && !error
-      && !matchesLibraryFilters(selectedListEntry, filters),
+    hasFilters && selectedId && !loading && !error && resolvedListSignature === listSignature
+      && nextCursor === null
+      && !items.some((item) => item.id === selectedId),
   )
 
   return <div className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col px-5 py-5 sm:px-7">
