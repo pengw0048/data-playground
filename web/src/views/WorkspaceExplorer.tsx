@@ -430,6 +430,8 @@ function WorkspaceMixedExplorer() {
   const setWorkspaceSearchQuery = useStore((s) => s.setWorkspaceSearchQuery)
   const openFile = useStore((s) => s.openFile)
   const select = useStore((s) => s.select)
+  const activateLoadedCanvasRoute = useStore((s) => s.activateLoadedCanvasRoute)
+  const clearWorkspaceDatasetViewerState = useStore((s) => s.clearWorkspaceDatasetViewerState)
   const files = useStore((s) => s.files)
   const currentCanvasId = useStore((s) => s.doc?.id ?? '')
   const refreshFiles = useStore((s) => s.refreshFiles)
@@ -438,6 +440,17 @@ function WorkspaceMixedExplorer() {
   const pushToast = useStore((s) => s.pushToast)
   const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
+  const providerViewerRoute = useMemo(() => {
+    const params = new URLSearchParams(workspaceDatasetQuery)
+    const revisionId = params.get('revision') || undefined
+    const datasetId = params.get('revisionDataset') || undefined
+    const canvasId = params.get('returnCanvas') || undefined
+    const nodeId = params.get('returnNode') || undefined
+    return {
+      exactRevision: revisionId && datasetId ? { revisionId, datasetId } : undefined,
+      canvasReturn: canvasId ? { canvasId, nodeId } : undefined,
+    }
+  }, [workspaceDatasetQuery])
 
   // A create response is the sole authority for this short-lived selection. Opening an existing
   // Canvas remains selection-neutral, and a multi-dataset create intentionally has no node id.
@@ -649,7 +662,26 @@ function WorkspaceMixedExplorer() {
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
     setWorkspaceResource(resource.id)
   }
-  const closeDetail = () => setWorkspaceResource(`container:${containerId}`)
+  const closeDetail = () => {
+    const canvasReturn = providerViewerRoute.canvasReturn
+    if (!canvasReturn) {
+      if (providerViewerRoute.exactRevision) {
+        switchWorkspaceScope('all', { resourceId: `container:${containerId}`, datasetQuery: '' })
+        return
+      }
+      setWorkspaceResource(`container:${containerId}`)
+      return
+    }
+    if (currentCanvasId === canvasReturn.canvasId
+        && activateLoadedCanvasRoute(canvasReturn.canvasId, canvasReturn.nodeId)) {
+      clearWorkspaceDatasetViewerState('')
+      return
+    }
+    void openFile(canvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
+      if (!opened || !activateLoadedCanvasRoute(canvasReturn.canvasId, canvasReturn.nodeId)) return
+      clearWorkspaceDatasetViewerState('')
+    })
+  }
   const useTable = (table: CatalogTable) => {
     if (!selectedDataset) {
       pushToast('Could not resolve the stable Workspace dataset identity', 'error')
@@ -771,6 +803,8 @@ function WorkspaceMixedExplorer() {
   if (selectedDataset && isExternal(selectedDataset)) return <>
     <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
       canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
+      exactRevision={providerViewerRoute.exactRevision}
+      backLabel={providerViewerRoute.canvasReturn ? 'Back to Canvas' : 'Back to Workspace'}
       onUse={() => useProviderDataset(selectedDataset)}
       onRelink={() => setRelinkResource(selectedDataset)} />
     {providerActionDialog}
@@ -1847,9 +1881,12 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse, onRelink }: {
+function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exactRevision, backLabel,
+  onClose, onRetry, onUse, onRelink }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
+  exactRevision?: { datasetId: string; revisionId: string }
+  backLabel: 'Back to Workspace' | 'Back to Canvas'
   onRetry: () => void; onUse: () => void; onRelink: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
@@ -1866,10 +1903,15 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   const canonicalState = resource.canonicalReferenceState
   const canonicalUnavailable = canonicalState != null && canonicalState !== 'current'
   const unavailable = itemAvailability(resource)
-  const providerIssue = canonicalContextError
-    ? `Couldn't load provider details: ${canonicalContextError}`
-    : previewError
-      ? `Couldn't load the selected version preview: ${previewError}`
+  const selectedDatasetId = exactRevision?.datasetId ?? canonicalContext?.datasetIdentity
+  const selectedRevisionId = exactRevision?.revisionId
+    ?? (canonicalContext?.readMode === 'exact' ? canonicalContext.revisionId ?? undefined : undefined)
+  const selectedColumns = exactRevision ? preview?.preview.columns ?? [] : canonicalContext?.columns ?? []
+  const selectedCommittedAt = exactRevision ? preview?.committedAt : canonicalContext?.committedAt
+  const providerIssue = previewError
+    ? `Couldn't load the selected version preview: ${previewError}`
+    : !exactRevision && canonicalContextError
+      ? `Couldn't load provider details: ${canonicalContextError}`
     : source && !sourceIsUsable(source)
       ? statusMessage(source) ?? 'This provider is not available right now.'
       : placementState !== 'current'
@@ -1915,21 +1957,27 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     const controller = new AbortController()
     setPreview(null)
     setPreviewError(null)
-    if (!canonicalContext || canonicalContext.readMode !== 'exact' || !canonicalContext.revisionId) {
+    if (!selectedDatasetId || !selectedRevisionId) {
       return () => controller.abort()
     }
-    void api.datasetRevision(canonicalContext.datasetIdentity, canonicalContext.revisionId).then((detail) => {
-      if (!controller.signal.aborted) setPreview(detail)
+    void api.datasetRevision(selectedDatasetId, selectedRevisionId).then((detail) => {
+      if (controller.signal.aborted) return
+      if (exactRevision
+          && (detail.datasetId !== selectedDatasetId || detail.revisionId !== selectedRevisionId)) {
+        setPreviewError('The provider returned a different dataset version than the one requested.')
+        return
+      }
+      setPreview(detail)
     }).catch((caught) => {
       if (!controller.signal.aborted) setPreviewError(errorMessage(caught))
     })
     return () => controller.abort()
-  }, [canonicalContext, previewRevision])
+  }, [exactRevision, selectedDatasetId, selectedRevisionId, previewRevision])
   return <section aria-label={resource.name}
     className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
     data-testid="provider-dataset-viewer">
       <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
-        <button onClick={onClose} aria-label="Back to Workspace"
+        <button onClick={onClose} aria-label={backLabel}
           className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
           <Icon name="chevronLeft" size={14} /> Back
         </button>
@@ -1942,8 +1990,8 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
           <Icon name="refresh" size={12} /> Reload
         </button>
-        <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
-          className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>
+        {!exactRevision && <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+          className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>}
       </div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
@@ -1953,23 +2001,25 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
         </section>
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
-          <div className="text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
-            ? <><span className="block">Published version</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
+          <div className="text-[11px] text-muted-foreground">{selectedRevisionId
+            ? <><span className="block">{exactRevision ? 'Selected version' : 'Published version'}</span>{selectedCommittedAt && <span>Committed {new Date(selectedCommittedAt).toLocaleString()}</span>}</>
             : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
         </section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
           && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading canonical dataset context…</div>}
-        {canonicalContext && <section data-testid="canonical-provider-dataset-context" className="grid gap-2">
-          <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground"><span>{preview?.summary.rowCount == null ? 'Rows not reported' : `${preview.summary.rowCount.toLocaleString()} rows`}</span><span>· {canonicalContext.columns.length} columns</span></div>
+        {(canonicalContext || exactRevision) && <section data-testid="canonical-provider-dataset-context" className="grid gap-2">
+          <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground"><span>{preview?.summary.rowCount == null ? 'Rows not reported' : `${preview.summary.rowCount.toLocaleString()} rows`}</span><span>· {selectedColumns.length} columns</span></div>
           <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
-            {canonicalContext.columns.length
-              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
-                {canonicalContext.columns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
-                  && <div className="text-muted-foreground">{canonicalContext.columns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
+            {exactRevision && !preview && !previewError
+              ? <div className="mt-1 text-[11px] text-muted-foreground">Loading selected schema…</div>
+              : selectedColumns.length
+              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{selectedColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
+                {selectedColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
+                  && <div className="text-muted-foreground">{selectedColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
               </div>
               : <div>No canonical columns were reported.</div>}
           </div>
-          {canonicalContext.readMode === 'exact' && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
+          {selectedRevisionId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
             {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
             {preview && (preview.preview.rows.length
               ? <div data-testid="provider-dataset-preview-scroll" tabIndex={0}
@@ -1990,7 +2040,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
             {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
             {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}
-            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div>{canonicalContext.revisionId && <><div className="mt-1 text-muted-foreground">Version identity</div><div className="break-all font-mono">{canonicalContext.revisionId}</div></>}<div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
+            {(canonicalContext || exactRevision) && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{selectedDatasetId}</div>{selectedRevisionId && <><div className="mt-1 text-muted-foreground">Version identity</div><div className="break-all font-mono">{selectedRevisionId}</div></>}<div className="mt-1 text-muted-foreground">Read mode</div><div>{exactRevision ? 'exact' : canonicalContext?.readMode}</div></div>}
             <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
             {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
             {resource.lastKnown && <div className="text-muted-foreground">Retained placement facts{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}

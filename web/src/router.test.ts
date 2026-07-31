@@ -84,6 +84,27 @@ describe('Workspace routes', () => {
     })
   })
 
+  it('opens a provider exact dataset at its Workspace placement without projecting it into the local catalog', () => {
+    window.location.hash = datasetViewerHash(
+      'workspace-provider:canonical-source',
+      'provider revision 9',
+      { canvasId: 'canvas 1', nodeId: 'source 1' },
+      'dataset:external/provider-placement',
+    )
+
+    expect(window.location.hash).not.toContain('scope=datasets')
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:external/provider-placement',
+      workspaceDatasetQuery: new URLSearchParams({
+        revision: 'provider revision 9',
+        revisionDataset: 'workspace-provider:canonical-source',
+        returnCanvas: 'canvas 1',
+        returnNode: 'source 1',
+      }).toString(),
+    })
+  })
+
   it('deliberately redirects former Recents and Tables URLs to Workspace', () => {
     window.location.hash = '#/files'
     expect(parseHash()).toEqual({ view: 'workspace' })

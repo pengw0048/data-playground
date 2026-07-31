@@ -1899,7 +1899,10 @@ export const useStore = create<Store>((set, get) => ({
         view: 'workspace', workspaceResourceId: route.workspaceResourceId ?? null, workspaceScope,
         ...(workspaceScope === 'datasets'
           ? { workspaceDatasetQuery: route.workspaceDatasetQuery ?? '' }
-          : { workspaceSearchQuery: route.workspaceQuery ?? '' }),
+          : {
+              workspaceSearchQuery: route.workspaceQuery ?? '',
+              workspaceDatasetQuery: route.workspaceDatasetQuery ?? '',
+            }),
       })
     } else if (route.view === 'jobs') set({ view: 'jobs', jobsQuery: route.jobsQuery ?? '' })
     else if (route.view === 'inbox') set({ view: 'inbox', inboxQuery: route.inboxQuery ?? '' })
