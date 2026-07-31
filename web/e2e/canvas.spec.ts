@@ -2387,7 +2387,8 @@ test.describe('Data Playground canvas', () => {
       await expect(publication).toContainText(/Published.*rows/)
 
       const publicationDetails = publication.locator('details')
-      const firstReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
+      const receiptRow = publicationDetails.getByText('Receipt:', { exact: true }).locator('..')
+      const firstReceiptId = (await receiptRow.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
       expect(firstReceiptId).toBeTruthy()
       const firstRevision = firstReceiptId?.split('@').at(-1)
       expect(firstRevision).toBeTruthy()
@@ -2398,9 +2399,9 @@ test.describe('Data Playground canvas', () => {
       await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      await expect(publicationDetails).not.toContainText(firstReceiptId!, { timeout: 20_000 })
+      await expect(receiptRow).not.toContainText(firstReceiptId!, { timeout: 20_000 })
       const secondReceipt = publication.getByRole('link', { name: 'Open dataset' })
-      const secondReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
+      const secondReceiptId = (await receiptRow.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
       const secondRevision = secondReceiptId?.split('@').at(-1)
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
