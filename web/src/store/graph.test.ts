@@ -230,6 +230,49 @@ describe('graph store — core authority ops', () => {
     })
   })
 
+  it('returns to the loaded Canvas without replacing its document and reveals a valid node', () => {
+    const source = NODE('source', 'source')
+    const liveDoc = { ...emptyTestDoc('c'), nodes: [source] }
+    useStore.setState({
+      doc: liveDoc,
+      view: 'workspace',
+      selectedId: null,
+      selectedIds: [],
+      nodeRevealRequest: null,
+    })
+
+    expect(useStore.getState().activateLoadedCanvasRoute('c', 'source')).toBe(true)
+
+    const state = useStore.getState()
+    expect(state.doc).toBe(liveDoc)
+    expect(state.view).toBe('canvas')
+    expect(state.selectedId).toBe('source')
+    expect(state.selectedIds).toEqual(['source'])
+    expect(state.nodeRevealRequest).toMatchObject({ canvasId: 'c', nodeId: 'source' })
+    expect(state.toasts).toEqual([])
+  })
+
+  it('clears a stale return node while preserving the loaded Canvas document', () => {
+    const liveDoc = { ...emptyTestDoc('c'), nodes: [NODE('source', 'source')] }
+    useStore.setState({
+      doc: liveDoc,
+      view: 'workspace',
+      selectedId: 'source',
+      selectedIds: ['source'],
+      nodeRevealRequest: { id: 1, canvasId: 'c', nodeId: 'source' },
+    })
+
+    expect(useStore.getState().activateLoadedCanvasRoute('c', 'deleted-node')).toBe(true)
+
+    const state = useStore.getState()
+    expect(state.doc).toBe(liveDoc)
+    expect(state.view).toBe('canvas')
+    expect(state.selectedId).toBeNull()
+    expect(state.selectedIds).toEqual([])
+    expect(state.nodeRevealRequest).toBeNull()
+    expect(state.toasts.at(-1)?.msg).toBe('The requested node is no longer in this Canvas.')
+  })
+
   it('promotes same-title nodes with distinct stable identities and reuses one identity on retry', async () => {
     const transform = (id: string) => ({
       ...NODE(id, 'transform'),

@@ -350,6 +350,41 @@ export function CatalogDiscovery({
   // warm the working set first, or the new source node can't resolve its table and shows "Select dataset"
   const use = (t: CatalogTable) => onUseTables([t])
 
+  if (selected) {
+    return (
+      <div className="relative h-full">
+        <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
+          backLabel={detailBackLabel}
+          initialRevisionId={initialRevisionId}
+          initialRevisionDatasetId={initialRevisionDatasetId}
+          onChanged={(t) => {
+            // Saving catalog metadata refreshes the selected registration; it does not navigate
+            // away from an exact-revision route.
+            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
+            setCatalogRevision((v) => v + 1)
+            void loadFirst()
+          }}
+          onFolder={(folder) => {
+            if (onOpenInWorkspace) void onOpenInWorkspace(selected)
+            else { setFolder(folder); selectTable(null) }
+          }}
+          folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
+          folderActionVisible={!!onOpenInWorkspace || !!selected.folder}
+          folderActionDisabled={!!onOpenInWorkspace && (!selected.registrationId
+            || workspaceLocation?.state === 'resolving' || workspaceLocation?.state === 'unavailable')}
+          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.'
+            : workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…'
+              : workspaceLocation?.state === 'unavailable'
+                ? workspaceLocation.reason ?? 'This dataset is not currently available in Workspace.' : undefined}
+          onFolderRetry={workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
+            ? onRetryWorkspaceLocation : undefined}
+          onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }}
+          onOpenTable={selectTable}
+          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-full flex-col">
       {/* header: title + register / upload */}
@@ -519,35 +554,6 @@ export function CatalogDiscovery({
         </div>
       </div>
 
-      {selected && (
-        <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
-          backLabel={detailBackLabel}
-          initialRevisionId={initialRevisionId}
-          initialRevisionDatasetId={initialRevisionDatasetId}
-          onChanged={(t) => {
-            // Saving catalog metadata refreshes the selected registration; it does not navigate
-            // away from an exact-revision route.
-            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
-            setCatalogRevision((v) => v + 1)
-            void loadFirst()
-          }}
-          onFolder={(folder) => {
-            if (onOpenInWorkspace) void onOpenInWorkspace(selected)
-            else { setFolder(folder); selectTable(null) }
-          }}
-          folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
-          folderActionVisible={!!onOpenInWorkspace || !!selected.folder}
-          folderActionDisabled={!!onOpenInWorkspace && (!selected.registrationId
-            || workspaceLocation?.state === 'resolving' || workspaceLocation?.state === 'unavailable')}
-          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.'
-            : workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…'
-              : workspaceLocation?.state === 'unavailable'
-                ? workspaceLocation.reason ?? 'This dataset is not currently available in Workspace.' : undefined}
-          onFolderRetry={workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
-            ? onRetryWorkspaceLocation : undefined}
-          onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
-          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
-      )}
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
 
       {/* Facets stay bounded with the active query. Empty folders remain discoverable through
@@ -1206,7 +1212,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
   return (
     <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="dataset-viewer">
-      <div role="dialog" aria-label={table.name}
+      <div role="region" aria-label={table.name}
         className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
         <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
           <button ref={closeRef} onClick={requestClose} aria-label={backLabel}

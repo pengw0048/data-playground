@@ -16,7 +16,8 @@ const store = vi.hoisted(() => ({
   workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
   clearWorkspaceDatasetViewerState: vi.fn(),
   workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
-  setWorkspaceResource: vi.fn(), openFile: vi.fn(), select: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
+  setWorkspaceResource: vi.fn(), openFile: vi.fn(), select: vi.fn(), activateLoadedCanvasRoute: vi.fn(),
+  rememberTables: vi.fn(), pushToast: vi.fn(),
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
   doc: { id: '', version: 0 },
@@ -119,6 +120,7 @@ describe('WorkspaceExplorer', () => {
     store.files = [{ id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' }]
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
+    store.activateLoadedCanvasRoute.mockImplementation((canvasId: string) => store.doc.id === canvasId)
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
@@ -224,11 +226,26 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByText('Detail back: Back to Canvas')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
 
-    await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('canvas-1', { skipViewportFit: true }))
+    expect(store.activateLoadedCanvasRoute).toHaveBeenCalledWith('canvas-1', 'write')
     expect(store.clearWorkspaceDatasetViewerState).toHaveBeenCalledWith('')
     expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
-    expect(store.select).toHaveBeenCalledWith('write')
+    expect(store.openFile).not.toHaveBeenCalled()
     expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
+  })
+
+  it('loads the return Canvas only when it is no longer the live in-memory document', async () => {
+    store.doc = { id: 'different-canvas', version: 3 }
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt&returnCanvas=canvas-1&returnNode=write'
+    render(<WorkspaceExplorer />)
+
+    store.activateLoadedCanvasRoute.mockReturnValue(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+
+    await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('canvas-1', { skipViewportFit: true }))
+    expect(store.activateLoadedCanvasRoute).toHaveBeenLastCalledWith('canvas-1', 'write')
+    await waitFor(() => expect(store.clearWorkspaceDatasetViewerState).toHaveBeenCalledWith(''))
   })
 
   it('continues a bounded page only when the user requests more', async () => {

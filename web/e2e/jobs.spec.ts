@@ -306,7 +306,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   )
   await exactDataset.click()
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
-  const viewer = page.getByRole('dialog', { name: 'Published column enrichment' })
+  const viewer = page.getByRole('region', { name: 'Published column enrichment' })
   await expect(viewer).toContainText('Published version')
   await expect(viewer).toContainText('Exact revision is view-only')
   await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()

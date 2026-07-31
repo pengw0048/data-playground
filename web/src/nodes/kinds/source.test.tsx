@@ -157,10 +157,12 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
-    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+    const openDataset = screen.getByRole('link', { name: 'Open dataset' })
+    expect(openDataset).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Aprovider-orders?scope=datasets&revision=empty-r7&revisionDataset=provider-orders&returnCanvas=c&returnNode=s1',
     )
+    expect(openDataset.querySelector('ellipse')).not.toBeNull()
   })
 
   it('keeps a long exact identity out of the Source card summary', async () => {

@@ -1317,6 +1317,8 @@ interface Store {
   // -- app shell (Figma-style views) --
   view: DpView
   setView: (v: DpView) => void
+  /** Publish a route to the already loaded Canvas without replacing its in-memory document. */
+  activateLoadedCanvasRoute: (canvasId: string, nodeId?: string) => boolean
   erFocusUri: string | null                       // the table the relationship graph opens focused on (null = global)
   openRelationships: (uri: string | null) => void
   workspaceResourceId: string | null
@@ -1789,6 +1791,24 @@ export const useStore = create<Store>((set, get) => ({
       ? { view, transformResourceId: null, transformVersion: null,
           transformUpgradeCanvasId: null, transformUpgradeNodeId: null }
       : { view })
+  },
+  activateLoadedCanvasRoute: (canvasId, nodeId) => {
+    const state = get()
+    if (state.doc.id !== canvasId) return false
+    startNavigation()
+    if (state.view !== 'canvas') _fileNavigationGeneration += 1
+    const nodeExists = !!nodeId && state.doc.nodes.some((node) => node.id === nodeId)
+    set({
+      view: 'canvas',
+      selectedId: nodeExists ? nodeId! : null,
+      selectedIds: nodeExists ? [nodeId!] : [],
+    })
+    if (nodeExists) get().requestNodeReveal(canvasId, nodeId!)
+    else {
+      get().clearNodeReveal()
+      if (nodeId) get().pushToast('The requested node is no longer in this Canvas.', 'info')
+    }
+    return true
   },
   erFocusUri: null,
   openRelationships: (uri) => {

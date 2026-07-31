@@ -319,7 +319,7 @@ function Source({ id, data }: NodeComponentProps) {
       )}
         onClick={(event) => event.stopPropagation()}
         className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-semibold text-primary hover:underline">
-        <Icon name="eye" size={11} /> Open dataset
+        <Icon name="db" size={11} /> Open dataset
       </a>}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />

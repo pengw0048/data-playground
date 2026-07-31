@@ -160,12 +160,12 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
-      <div>
+      {!receipt && <div>
         <span className="font-semibold text-foreground">
           {managed ? 'Dataset name' : 'Output name'}
         </span>
         <div className="font-mono text-foreground">{displayedName}</div>
-      </div>
+      </div>}
       <div>
         <span className="font-semibold text-foreground">Destination</span>
         <div className="text-muted-foreground">{destination}</div>

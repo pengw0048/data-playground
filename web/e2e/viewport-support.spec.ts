@@ -142,7 +142,7 @@ test.describe('minimum viewport support', () => {
 
     // Browse and inspect a dataset without the detail drawer hiding its close/use actions.
     await (await workspaceResource(page, 'dataset', process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events')).click()
-    const detail = page.getByRole('dialog', { name: process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events' })
+    const detail = page.getByRole('region', { name: process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events' })
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Back to Workspace' }), 'dataset detail back')
@@ -323,9 +323,9 @@ test.describe('minimum viewport support', () => {
     )
 
     await page.goto(`/#/workspace/${encodeURIComponent(dataset.id)}`)
-    const detail = page.getByRole('dialog', { name: dataset.name })
+    const detail = page.getByRole('region', { name: dataset.name })
     const content = detail.getByTestId('provider-dataset-detail-content')
-    const close = detail.getByRole('button', { name: 'Close' })
+    const close = detail.getByRole('button', { name: 'Back to Workspace' })
     const use = detail.getByRole('button', { name: 'Use in Canvas' })
     await expectFullyInViewport(page, close, `${vp?.width}px provider detail close`)
     await expectFullyInViewport(page, use, `${vp?.width}px provider use action`)
@@ -445,7 +445,7 @@ test.describe('minimum viewport support', () => {
 
     const tableName = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
     await (await workspaceResource(page, 'dataset', tableName)).click()
-    const detail = page.getByRole('dialog', { name: tableName })
+    const detail = page.getByRole('region', { name: tableName })
     await expectFullyInViewport(page, detail, '1024px dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), '1024px dataset use action')
     await detail.getByRole('button', { name: 'Back to Workspace' }).click()

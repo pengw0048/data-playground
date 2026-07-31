@@ -102,7 +102,7 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.tableByRegistration.mockResolvedValue({ ...TABLE, id: 'tbl_orders', registrationId: 'registration-path' })
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       selectedRegistrationId="registration-path" onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('registration-path')
     expect(mocks.table).not.toHaveBeenCalled()
   })
@@ -142,7 +142,7 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       selectedRegistrationId="registration-other" initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id"
       onSelectedTableChange={onSelectedTableChange} onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('logical-receipt-id')
     expect(mocks.tableByRegistration).not.toHaveBeenCalledWith('registration-other')
@@ -174,6 +174,9 @@ describe('Catalog discovery request and mutation truth', () => {
       onUseTables={onUseTables} onUploadDataset={store.uploadDataset} />)
 
     const viewer = await screen.findByTestId('dataset-viewer')
+    expect(screen.queryByTestId('catalog-search')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('register-dataset')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Use dataset orders' })).not.toBeInTheDocument()
     expect(viewer).toHaveClass('absolute', 'inset-0')
     expect(viewer).not.toHaveClass('w-[420px]')
     expect(within(viewer).getByRole('button', { name: 'Back to Workspace' })).toBeVisible()
@@ -262,11 +265,11 @@ describe('Catalog discovery request and mutation truth', () => {
     const props = { sourceIdentity: store.kernelInfo, foldersMutable: true,
       selectedRegistrationId: 'registration-path', onUseTables: vi.fn(), onUploadDataset: store.uploadDataset }
     const { rerender } = render(<CatalogDiscovery {...props} />)
-    await screen.findByRole('dialog', { name: 'customers' })
+    await screen.findByRole('region', { name: 'customers' })
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('registration-path')
 
     rerender(<CatalogDiscovery {...props} initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id" />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('logical-receipt-id')
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
   })
@@ -294,7 +297,7 @@ describe('Catalog discovery request and mutation truth', () => {
     }
     const exact = { initialRevisionId: 'rev-receipt', initialRevisionDatasetId: logical }
     const { rerender } = render(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
 
     // Workspace writes the canonical registration after the exact logical lookup succeeds.
@@ -305,11 +308,11 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
 
     rerender(<CatalogDiscovery {...props} selectedRegistrationId="registration-customers" />)
-    await screen.findByRole('dialog', { name: 'customers' })
+    await screen.findByRole('region', { name: 'customers' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
 
     rerender(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
-    await screen.findByRole('dialog', { name: 'orders' })
+    await screen.findByRole('region', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledTimes(3)
     expect(mocks.tableByRegistration).toHaveBeenLastCalledWith(logical)
   })
@@ -454,7 +457,7 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('downstream'))
   })
 
-  it('surfaces detail failures, preserves edits after a failed save, and refreshes the tree after save and delete', async () => {
+  it('surfaces detail failures, preserves edits after a failed save, and restores a refreshed list after delete', async () => {
     mocks.lineage
       .mockRejectedValueOnce(new Error('HTTP 503: lineage unavailable'))
       .mockResolvedValueOnce({ rootUri: TABLE.uri, nodes: [], edges: [] })
@@ -492,10 +495,13 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByTestId('detail-save'))
-    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith('Saved', 'success'))
+    expect(screen.queryByTestId('catalog-search')).not.toBeInTheDocument()
+    expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByTestId('detail-unregister'))
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
-    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByTestId('catalog-search')).toBeInTheDocument())
+    await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
   })
 
   it('shows the full bounded first page as the primary dataset view', async () => {
@@ -820,7 +826,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(confirm).toHaveBeenCalledWith('Discard unsaved catalog edits?')
-    expect(screen.getByRole('dialog', { name: 'orders' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'orders' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('detail-save'))
     expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()

@@ -39,7 +39,7 @@ test('Workspace renders bounded field evidence and opens only its resolved targe
   })
   await page.goto('/#/workspace?scope=datasets')
   await page.getByRole('button', { name: `Open dataset ${source.name}` }).click()
-  await expect(page.getByRole('dialog', { name: source.name })).toBeVisible()
+  await expect(page.getByRole('region', { name: source.name })).toBeVisible()
   await page.getByRole('button', { name: 'Inspect evidence for foreign_id' }).click()
 
   const evidence = page.getByTestId('field-evidence-foreign_id')
@@ -54,5 +54,5 @@ test('Workspace renders bounded field evidence and opens only its resolved targe
   await expect(currentCatalogLink).toBeInViewport()
   await currentCatalogLink.click()
   await expect(page).toHaveURL(new RegExp(`#\\/workspace\\/${encodeURIComponent(`dataset:${target!.registrationId}`)}$`))
-  await expect(page.getByRole('dialog', { name: target!.name })).toBeVisible()
+  await expect(page.getByRole('region', { name: target!.name })).toBeVisible()
 })

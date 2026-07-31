@@ -2373,6 +2373,58 @@ test.describe('Data Playground canvas', () => {
       )
       expect(revisionResponse.ok()).toBeTruthy()
       const exact = await revisionResponse.json() as { datasetId: string; revisionId: string }
+      const alternateRevisionId = `${exact.revisionId}-alternate`
+      const exactDetail = {
+        datasetId: exact.datasetId,
+        revisionId: exact.revisionId,
+        committedAt: '2026-07-30T12:00:00Z',
+        retentionOwner: 'provider',
+        parentRevisionId: null,
+        producerOperation: 'fixture',
+        summary: { rowCount: 1, dataFileCount: 1, totalBytes: 8, fragmentCount: 1 },
+        preview: {
+          columns: [{
+            fieldId: 'value', name: 'value', type: 'int64', nullable: false,
+            provenance: 'provider', capabilities: [],
+          }],
+          rows: [{ value: 1 }],
+          hasMore: false,
+          rowLimit: 100,
+        },
+      }
+      await page.route(/\/api\/catalog\/tables\/.+\/revisions\?limit=/, async (route) => {
+        await route.fulfill({ json: {
+          items: [
+            {
+              datasetId: exact.datasetId,
+              revisionId: alternateRevisionId,
+              committedAt: exactDetail.committedAt,
+              retentionOwner: exactDetail.retentionOwner,
+            },
+            {
+              datasetId: exact.datasetId,
+              revisionId: exact.revisionId,
+              committedAt: exactDetail.committedAt,
+              retentionOwner: exactDetail.retentionOwner,
+            },
+          ],
+          nextCursor: null,
+          hasMore: false,
+        } })
+      })
+      await page.route('**/api/catalog/revision-details', async (route) => {
+        const requested = route.request().postDataJSON() as { datasetId: string; revisionId: string }
+        if (requested.datasetId !== exact.datasetId
+            || ![exact.revisionId, alternateRevisionId].includes(requested.revisionId)) {
+          await route.continue()
+          return
+        }
+        await route.fulfill({ json: {
+          ...exactDetail,
+          revisionId: requested.revisionId,
+          parentRevisionId: requested.revisionId === alternateRevisionId ? exact.revisionId : null,
+        } })
+      })
       const created = await page.request.post('/api/canvas', { data: {
         id: canvasId, name: 'Exact Source return', version: 1, requirements: [], nodes: [{
           id: 'source', type: 'source', position: { x: 280, y: 180 }, data: {
@@ -2385,10 +2437,27 @@ test.describe('Data Playground canvas', () => {
         }], edges: [],
       } })
       expect(created.ok()).toBeTruthy()
+      // Keep the edit demonstrably inside the local autosave window. Any same-Canvas GET during the
+      // viewer detour would therefore reload the server's old title and fail the assertions below.
+      await page.route((url) => url.pathname === `/api/canvas/${canvasId}`, async (route) => {
+        if (route.request().method() === 'PUT') {
+          await route.abort('failed')
+          return
+        }
+        await route.continue()
+      })
 
       await page.goto(`/#/canvas/${canvasId}?node=source`)
       await page.setViewportSize({ width: 1280, height: 720 })
       const sourceCard = page.locator('.react-flow__node[data-id="source"]')
+      await sourceCard.locator('[title="Click (when selected) or double-click to rename"]').dblclick()
+      await sourceCard.getByRole('textbox', { name: 'Node title' }).fill('Unsaved researcher title')
+      await sourceCard.getByRole('textbox', { name: 'Node title' }).press('Enter')
+      await expect(sourceCard).toContainText('Unsaved researcher title')
+      const serverCanvas = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      expect(serverCanvas.ok()).toBeTruthy()
+      const serverDoc = await serverCanvas.json() as { nodes: Array<{ id: string; data: { title: string } }> }
+      expect(serverDoc.nodes.find((node) => node.id === 'source')?.data.title).toBe('Exact events')
       const openDataset = sourceCard.getByRole('link', { name: 'Open dataset' })
       await expect(openDataset).toBeVisible()
       await expect(openDataset).toHaveAttribute(
@@ -2399,18 +2468,44 @@ test.describe('Data Playground canvas', () => {
       await openDataset.click()
       const viewer = page.getByTestId('dataset-viewer')
       await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+      const viewerBack = viewer.getByRole('button', { name: 'Back to Canvas' })
+      await expect(viewerBack).toBeFocused()
+      await expect(page.getByTestId('catalog-search')).toHaveCount(0)
+      await expect(page.getByTestId('register-dataset')).toHaveCount(0)
+      await expect(page.getByRole('button', { name: `Use dataset ${table!.name}` })).toHaveCount(0)
+      await page.keyboard.press('Shift+Tab')
+      await expect(page.getByTestId('catalog-search')).toHaveCount(0)
+      await expect(page.getByRole('button', { name: `Use dataset ${table!.name}` })).toHaveCount(0)
+      const alternateRevision = viewer.getByRole('link', { name: `Open revision ${alternateRevisionId}` })
+      await expect(alternateRevision).toHaveAttribute(
+        'href',
+        new RegExp(
+          `revision=${encodeURIComponent(alternateRevisionId)}`
+          + `&revisionDataset=${encodeURIComponent(exact.datasetId)}`
+          + `&returnCanvas=${encodeURIComponent(canvasId)}&returnNode=source$`,
+        ),
+      )
+      await alternateRevision.click()
+      await expect(viewer.getByTestId('dataset-version-identity')).toContainText(
+        `${exact.datasetId}@${alternateRevisionId}`,
+      )
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
 
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
       const inspector = page.getByTestId('inspector')
       await expect(inspector).toContainText('DATASET')
       await expect(inspector).toContainText(`Exact version ${exact.revisionId}`)
+      const returnedSource = page.locator('.react-flow__node[data-id="source"]')
+      await expect(returnedSource).toHaveClass(/selected/)
+      await expect(returnedSource).toContainText('Unsaved researcher title')
+      await page.waitForTimeout(700)
+      await expect(returnedSource).toContainText('Unsaved researcher title')
 
       await page.goBack()
       await expect(page).toHaveURL(
         new RegExp(
           `#\\/workspace\\/dataset%3A${encodeURIComponent(exact.datasetId)}`
-          + `\\?scope=datasets&revision=${encodeURIComponent(exact.revisionId)}`
+          + `\\?scope=datasets&revision=${encodeURIComponent(alternateRevisionId)}`
           + `&revisionDataset=${encodeURIComponent(exact.datasetId)}`
           + `&returnCanvas=${encodeURIComponent(canvasId)}&returnNode=source$`,
         ),
@@ -2420,6 +2515,24 @@ test.describe('Data Playground canvas', () => {
       await page.goForward()
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
       await expect(page.getByTestId('inspector')).toContainText(`Exact version ${exact.revisionId}`)
+      await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
+
+      const staleViewerHash = `#/workspace/${encodeURIComponent(`dataset:${exact.datasetId}`)}?${new URLSearchParams({
+        scope: 'datasets',
+        revision: alternateRevisionId,
+        revisionDataset: exact.datasetId,
+        returnCanvas: canvasId,
+        returnNode: 'deleted-node',
+      })}`
+      await page.evaluate((hash) => { window.location.hash = hash }, staleViewerHash)
+      const staleViewer = page.getByTestId('dataset-viewer')
+      await expect(staleViewer.getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
+      await staleViewer.getByRole('button', { name: 'Back to Canvas' }).click()
+
+      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}$`))
+      await expect(page.getByTestId('inspector')).toHaveCount(0)
+      await expect(page.getByText('The requested node is no longer in this Canvas.')).toBeVisible()
+      await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }

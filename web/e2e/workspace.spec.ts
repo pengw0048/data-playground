@@ -27,10 +27,10 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await search.press('Enter')
       await expect(page).toHaveURL(/#\/workspace\?q=/)
       await (await workspaceResource(page, 'dataset', dataset.name)).click()
-      await expect(page.getByRole('dialog', { name: dataset.name })).toBeVisible()
+      await expect(page.getByRole('region', { name: dataset.name })).toBeVisible()
       await expect(page).toHaveURL(/#\/workspace\/dataset%3A.+\?q=/)
       await page.reload()
-      await expect(page.getByRole('dialog', { name: dataset.name })).toBeVisible()
+      await expect(page.getByRole('region', { name: dataset.name })).toBeVisible()
       await expect(search).toHaveValue(dataset.name)
       await page.getByRole('button', { name: 'Back to Workspace' }).click()
       await page.getByRole('button', { name: 'Clear Workspace search' }).click()
@@ -307,7 +307,7 @@ test('browses and opens one exact retained dataset revision without drifting to 
   expect(historyRequests).toBeGreaterThanOrEqual(2)
 
   await page.reload()
-  await expect(page.getByRole('dialog', { name: dataset.name })).toBeVisible()
+  await expect(page.getByRole('region', { name: dataset.name })).toBeVisible()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
 })
 

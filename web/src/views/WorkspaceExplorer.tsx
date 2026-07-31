@@ -951,6 +951,7 @@ function WorkspaceDatasets() {
   const refreshFiles = useStore((state) => state.refreshFiles)
   const openFile = useStore((state) => state.openFile)
   const select = useStore((state) => state.select)
+  const activateLoadedCanvasRoute = useStore((state) => state.activateLoadedCanvasRoute)
   const pushToast = useStore((state) => state.pushToast)
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
@@ -1162,10 +1163,19 @@ function WorkspaceDatasets() {
             // Open the Canvas first so the router publishes one atomic destination. Cleaning the
             // retained Workspace viewer state before this resolves would insert a phantom
             // Workspace history entry between the exact Dataset viewer and its Canvas.
+            if (currentCanvasId === viewerCanvasReturn.canvasId
+                && activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) {
+              // The viewer is only a route detour; its originating Canvas remains live in memory.
+              // The route action validates/reveals the requested node and publishes the final hash
+              // without reloading an edit that is still inside the autosave debounce.
+              clearWorkspaceDatasetViewerState(listQuery)
+              returningToCanvas.current = false
+              return
+            }
             void openFile(viewerCanvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
               if (!opened) return
+              if (!activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) return
               clearWorkspaceDatasetViewerState(listQuery)
-              if (viewerCanvasReturn.nodeId) select(viewerCanvasReturn.nodeId)
             }).finally(() => { returningToCanvas.current = false })
             return
           }
