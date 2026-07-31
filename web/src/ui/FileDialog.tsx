@@ -101,6 +101,7 @@ export function FileDialog(props:
   }, [])
 
   const dest = dests.find((d) => d.id === destId)
+  const filenameError = mode === 'save' ? validateDatasetName(filename) : null
   const segs = path ? path.split('/').filter(Boolean) : []
   const pickOpenFile = async (entry: BrowseEntry) => {
     if (mode !== 'open' || pickingUri) return
@@ -145,6 +146,10 @@ export function FileDialog(props:
     } finally {
       setMakingFolder(false)
     }
+  }
+  const pickSaveDestination = () => {
+    if (mode !== 'save' || !dest || !writable || filenameError) return
+    props.onPick({ destId, destName: dest.name, path, filename })
   }
 
   return createPortal(
@@ -279,16 +284,29 @@ export function FileDialog(props:
         </div>
 
         {mode === 'save' && (
-          <div className="flex items-center gap-2 border-t border-border px-[14px] py-2.5">
+          <div className="flex items-end gap-2 border-t border-border px-[14px] py-2.5">
             {!writable
               ? <span className="flex-1 text-[11px] text-amber-600">This destination can't accept this output — install its plugin or choose another destination.</span>
-              : <>
-                  <span className="text-[11.5px] text-muted-foreground">Dataset name</span>
-                  <Input ref={fileRef} value={filename} onChange={(e) => setFilename(e.target.value)}
-                    className="dp-mono min-w-0 flex-1 text-[12.5px]" />
-                </>}
-            <Button size="sm" disabled={!filename.trim() || !dest || !writable}
-              onClick={() => dest && props.onPick({ destId, destName: dest.name, path, filename: filename.trim() })}>
+              : <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="file-dialog-dataset-name" className="shrink-0 text-[11.5px] text-muted-foreground">
+                      Dataset name
+                    </label>
+                    <Input id="file-dialog-dataset-name" ref={fileRef} value={filename}
+                      aria-invalid={filenameError ? true : undefined}
+                      aria-describedby={filenameError ? 'file-dialog-dataset-name-error' : undefined}
+                      onChange={(e) => setFilename(e.target.value)}
+                      className="dp-mono min-w-0 flex-1 text-[12.5px]" />
+                  </div>
+                  {filenameError && (
+                    <div id="file-dialog-dataset-name-error" role="alert"
+                      className="mt-1 text-[11px] text-destructive">
+                      {filenameError}
+                    </div>
+                  )}
+                </div>}
+            <Button size="sm" disabled={!!filenameError || !dest || !writable}
+              onClick={pickSaveDestination}>
               Save here
             </Button>
           </div>
@@ -302,3 +320,20 @@ export function FileDialog(props:
 const crumbBtn = 'inline-flex items-center gap-[3px] rounded px-1 py-0.5 text-[11.5px] font-semibold text-primary transition-colors hover:bg-accent/60'
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 const joinRelativePath = (path: string, child: string) => path ? `${path}/${child}` : child
+
+function validateDatasetName(value: string): string | null {
+  if (!value.trim()) return 'Enter a dataset name.'
+  if (value !== value.trim()) {
+    return 'Dataset name cannot contain surrounding whitespace. Edit it to continue.'
+  }
+  if (/^\.+$/.test(value)) return 'Dataset name cannot consist only of dots.'
+  const hasControlCharacter = [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+  })
+  if (['/', '\\', ':', '*', '?', '['].some((character) => value.includes(character))
+      || hasControlCharacter) {
+    return 'Dataset name must be one name, not a path. Remove slashes, “:”, “*”, “?”, “[”, and control characters.'
+  }
+  return null
+}

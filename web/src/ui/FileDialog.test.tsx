@@ -106,6 +106,42 @@ describe('FileDialog request and open-mutation truth', () => {
     })
   })
 
+  it('keeps the exact dataset name and blocks invalid names until corrected', async () => {
+    const pick = vi.fn()
+    render(
+      <FileDialog mode="save" defaultName=" padded.parquet " onClose={vi.fn()} onPick={pick} />,
+    )
+
+    await screen.findByText('orders.csv')
+    const input = screen.getByRole('textbox', { name: 'Dataset name' })
+    const save = screen.getByRole('button', { name: 'Save here' })
+    expect(input).toHaveValue(' padded.parquet ')
+    expect(screen.getByRole('alert')).toHaveTextContent(/surrounding whitespace/i)
+    expect(save).toBeDisabled()
+    fireEvent.click(save)
+    expect(pick).not.toHaveBeenCalled()
+
+    for (const [invalid, message] of [
+      ['../outside', /one name, not a path/i],
+      ['..', /only of dots/i],
+      ['line\u0085break', /control characters/i],
+    ] as const) {
+      fireEvent.change(input, { target: { value: invalid } })
+      expect(screen.getByRole('alert')).toHaveTextContent(message)
+      expect(save).toBeDisabled()
+      fireEvent.click(save)
+      expect(pick).not.toHaveBeenCalled()
+    }
+
+    fireEvent.change(input, { target: { value: 'padded.parquet' } })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    expect(pick).toHaveBeenCalledWith({
+      destId: 'local', destName: 'Workspace', path: '', filename: 'padded.parquet',
+    })
+  })
+
   it('creates and enters a child folder before saving', async () => {
     const pick = vi.fn()
     render(<FileDialog mode="save" defaultName="embeddings.parquet" onClose={vi.fn()} onPick={pick} />)
