@@ -77,12 +77,12 @@ def _validate(payload: dict, uid: str):
     return client.post("/api/canvas/copy/validate", json=payload, headers={"X-DP-User": uid})
 
 
-def _create(payload: dict, validation: dict, uid: str):
+def _create(payload: dict, validation: dict, uid: str, *, confirm_warnings: bool = True):
     return client.post("/api/canvas/copy", json={
         **payload,
         "copyIntentDigest": validation["copyIntentDigest"],
         "validationDigest": validation["validationDigest"],
-        "confirmWarnings": True,
+        "confirmWarnings": confirm_warnings,
     }, headers={"X-DP-User": uid})
 
 
@@ -156,7 +156,10 @@ def test_current_copy_preserves_current_source_filter_write_document():
             {
                 "id": "source", "type": "source", "position": {"x": 40, "y": 60},
                 "data": {"title": "events", "status": "latest", "config": {"uri": "events"},
-                         "autoPlaced": True},
+                         "autoPlaced": True, "currentOutputVersionId": "source-output-v1",
+                         "history": [{"runId": "source-run"}],
+                         "lastRun": {"rows": 400, "outputs": [{"uri": "result://source"}]},
+                         "result": {"rows": [{"event": "purchase"}]}},
             },
             {
                 "id": "filter", "type": "filter", "position": {"x": 280, "y": 60},
@@ -171,7 +174,10 @@ def test_current_copy_preserves_current_source_filter_write_document():
                     "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
                 }, "meta": "sink · needs full pass", "needsFullPass": True,
                          "autoPlaced": False, "lastRun": {"rows": 380, "ms": 38,
-                         "placement": "local"}},
+                         "placement": "local", "receipt": "dataset@revision"},
+                         "currentOutputVersionId": "revision",
+                         "history": [{"runId": "write-run"}],
+                         "result": {"rows": [{"total": 380}]}},
             },
         ]
         document["edges"] = [
@@ -185,20 +191,64 @@ def test_current_copy_preserves_current_source_filter_write_document():
     assert checked.status_code == 200, checked.text
     validation = checked.json()
     assert validation["canImport"] is True
-    created = _create(payload, validation, owner)
+    assert validation["requiresConfirmation"] is False
+    assert not any(item["code"].startswith("uri_") for item in validation["diagnostics"])
+    created = _create(payload, validation, owner, confirm_warnings=False)
     assert created.status_code == 200, created.text
 
     with metadb.session() as session:
         copied = json.loads(session.get(metadb.Canvas, created.json()["id"]).doc)
     assert len(copied["nodes"]) == 3
     assert [node["data"].get("autoPlaced") for node in copied["nodes"]] == [True, True, False]
+    assert copied["nodes"][0]["data"] == {
+        "title": "events", "status": "draft", "config": {"uri": "events"},
+        "autoPlaced": True,
+    }
     assert copied["nodes"][2]["data"]["config"] == {
         "writeMode": "overwrite", "filename": "filtered_events",
         "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
     }
-    assert "meta" not in copied["nodes"][2]["data"]
-    assert "needsFullPass" not in copied["nodes"][2]["data"]
-    assert "lastRun" not in copied["nodes"][2]["data"]
+    assert copied["nodes"][2]["data"] == {
+        "title": "write", "status": "draft", "config": {
+            "writeMode": "overwrite", "filename": "filtered_events",
+            "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
+        }, "autoPlaced": False,
+    }
+
+
+def test_current_copy_keeps_a_confirmed_missing_registered_source_fail_closed(tmp_path):
+    owner = _user("copy-missing-owner")
+    source_id = _canvas(owner, "Missing registered source")
+    source_path = tmp_path / "removed.csv"
+    source_path.write_text("id,value\n1,ready\n")
+    uri = str(source_path)
+    metadb.catalog_upsert_entry(uri, "removed", {
+        "id": f"tbl-copy-missing-{uuid.uuid4().hex}",
+        "name": "removed", "uri": uri,
+    })
+    source_path.unlink()
+    try:
+        with metadb.session() as session:
+            source = session.get(metadb.Canvas, source_id)
+            document = json.loads(source.doc)
+            document["nodes"] = [{
+                "id": "source", "type": "source", "position": {"x": 40, "y": 60},
+                "data": {"title": "removed", "status": "latest", "config": {"uri": uri}},
+            }]
+            source.doc = json.dumps(document)
+        payload = _payload(source_id, name="Missing source copy")
+
+        checked = _validate(payload, owner)
+        assert checked.status_code == 200, checked.text
+        validation = checked.json()
+        assert validation["requiresConfirmation"] is True
+        assert any(item["code"] == "uri_unavailable" for item in validation["diagnostics"])
+        blocked = _create(payload, validation, owner, confirm_warnings=False)
+        assert blocked.status_code == 409
+        assert "confirm them" in blocked.text
+        assert _create(payload, validation, owner).status_code == 200
+    finally:
+        metadb.catalog_delete_entry(uri)
 
 
 def test_authorized_retained_manifest_clone_uses_exact_definition_without_live_fallback():

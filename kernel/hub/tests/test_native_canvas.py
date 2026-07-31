@@ -370,6 +370,36 @@ def test_diagnostics_recalculate_data_intent_and_cover_exact_uri_provider_and_de
                for item in mismatch.json()["diagnostics"])
 
 
+def test_remote_registration_metadata_stays_unproven_and_duplicate_uris_probe_once(monkeypatch):
+    uri = f"s3://offline-bucket/{uuid.uuid4().hex}.parquet"
+    metadb.catalog_upsert_entry(uri, "offline", {
+        "id": f"tbl-{uuid.uuid4().hex}", "name": "offline", "uri": uri,
+    })
+    original_get = metadb.catalog_get
+    calls = 0
+
+    def counted_get(token: str):
+        nonlocal calls
+        calls += 1
+        return original_get(token)
+
+    monkeypatch.setattr(metadb, "catalog_get", counted_get)
+    canvas = {
+        "nodes": [{
+            "id": f"source-{index}", "type": "source",
+            "data": {"config": {"uri": uri}},
+        } for index in range(2)],
+    }
+    try:
+        diagnostics = native_canvas._data_diagnostics(canvas)
+        assert calls == 1
+        assert [item.code for item in diagnostics] == [
+            "uri_availability_unproven", "uri_availability_unproven",
+        ]
+    finally:
+        metadb.catalog_delete_entry(uri)
+
+
 def test_diagnostics_verify_exact_library_processor_version_without_using_it():
     deps = get_deps()
     processor = RegisteredProcessor(

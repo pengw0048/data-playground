@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 from collections.abc import Iterable
@@ -352,8 +353,32 @@ def _exact_dataset_diagnostic(ref: dict[str, Any], path: str) -> Diagnostic | No
     return Diagnostic("data_unavailable", "warning", message, path)
 
 
+def _registered_uri_availability(uri: str) -> str:
+    """Return bounded local evidence for one registered Source intent.
+
+    Catalog metadata proves registration, not readability. Local-file existence is the one current
+    availability check we can make without contacting an adapter or a credentialed remote provider;
+    every non-file registration therefore remains explicitly unproven.
+    """
+    entry = metadb.catalog_get(uri)
+    if entry is None:
+        return "unavailable"
+    registered_uri = entry.get("uri")
+    if not isinstance(registered_uri, str):
+        return "unproven"
+    from hub.paths import local_path
+    try:
+        path = local_path(registered_uri)
+    except ValueError:
+        return "unproven"
+    if path is None:
+        return "unproven"
+    return "available" if os.path.exists(path) else "unavailable"
+
+
 def _data_diagnostics(canvas: dict[str, Any]) -> list[Diagnostic]:
     result: list[Diagnostic] = []
+    uri_availability: dict[str, str] = {}
     for node in canvas["nodes"]:
         if node.get("type") != "source":
             continue
@@ -369,16 +394,19 @@ def _data_diagnostics(canvas: dict[str, Any]) -> list[Diagnostic]:
                 result.append(diagnostic)
         uri = config.get("uri")
         if isinstance(uri, str):
-            entry = metadb.catalog_get(uri)
-            if entry is None or entry.get("missing"):
+            availability = uri_availability.get(uri)
+            if availability is None:
+                availability = _registered_uri_availability(uri)
+                uri_availability[uri] = availability
+            if availability == "unavailable":
                 result.append(Diagnostic(
                     "uri_unavailable", "warning",
                     f"Source '{node['id']}' URI intent is not available in this workspace. Relink it before running.",
                     path))
-            elif not isinstance(selected, dict):
+            elif availability == "unproven" and not isinstance(selected, dict):
                 result.append(Diagnostic(
                     "uri_availability_unproven", "warning",
-                    f"Source '{node['id']}' URI is registered, but availability is not probed before warning acknowledgement.",
+                    f"Source '{node['id']}' URI is registered, but its availability could not be confirmed. Relink it if the source no longer opens.",
                     path))
         if any(key in config for key in (
                 "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode")):
