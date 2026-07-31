@@ -351,6 +351,32 @@ renders generically (`grid` for media, `json` for pretty-printed cells), surface
 `reg.add_processor(proc)` adds a reusable transform to the library picker — a `Processor` with
 `id`, `title`, `mode`, and `build(params)`. See `kernel/hub/plugins/processors.py`.
 
+A plugin can explicitly publish the exact installed implementation for one processor by setting
+`RegisteredProcessor.source` to a `ProcessorSourceProvider`. The reader must return the packaged
+resource bytes; core computes the SHA-256 digest and exposes the UTF-8 source only through the exact,
+separately fetched source endpoint. It is never copied into processor listings, Canvas documents, or
+execution manifests, and core never introspects a factory:
+
+```python
+from importlib.resources import files
+from hub.plugins.processors import ProcessorSourceProvider, RegisteredProcessor
+
+processor = RegisteredProcessor(
+    id="my_pack.normalize",
+    title="Normalize",
+    mode="map",
+    fn_factory=processor_factory,
+    source=ProcessorSourceProvider(
+        language="python",
+        read=lambda: files("my_pack").joinpath("mapping.py").read_bytes(),
+    ),
+)
+```
+
+Only opt in with a dedicated source file that is safe to disclose to every user authorized to inspect
+that processor definition. Do not publish modules containing credentials, environment details, or
+unrelated implementation.
+
 `reg.set_catalog(catalog)` replaces the dataset catalog provider. The protocol in `backends.py` is
 the source of truth: bounded discovery via `list_page(CatalogQuery)`, `facets`, `browse(prefix)`,
 `search(q, mode, limit, query=CatalogQuery)`, `search_modes`, plus `get_table`,

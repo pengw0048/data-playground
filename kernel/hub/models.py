@@ -2621,6 +2621,16 @@ class ProcessorDescriptor(Wire):
     semantic_digest: str | None = None
 
 
+class InstalledProcessorSource(Wire):
+    """Exact plugin-published source, fetched separately from processor metadata."""
+
+    processor_id: str
+    version: str
+    language: str
+    source: str
+    sha256: PlanDigest
+
+
 TransformAvailability = Literal["active", "deleted", "missing"]
 
 

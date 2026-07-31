@@ -3,8 +3,17 @@ import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
 
+const apiMocks = vi.hoisted(() => ({
+  installedProcessorSource: vi.fn(),
+}))
 vi.mock('../../api/client', () => ({
-  api: new Proxy({}, { get: () => async () => ({}) }),
+  api: new Proxy(apiMocks, {
+    get: (target, property) => (
+      property in target
+        ? target[property as keyof typeof target]
+        : async () => ({})
+    ),
+  }),
   KernelError: class KernelError extends Error {},
   setApiUser: vi.fn(),
 }))
@@ -42,6 +51,8 @@ const node = {
 
 describe('Transform exact processor labels', () => {
   beforeEach(() => {
+    apiMocks.installedProcessorSource.mockReset()
+      .mockRejectedValue(Object.assign(new Error('source unavailable'), { status: 404 }))
     useStore.setState({
       canvasRole: 'owner', fullscreenCode: null, previews: {},
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [node], edges: [] },
@@ -170,6 +181,20 @@ describe('Transform exact processor labels', () => {
   })
 
   it('shows the exact Library definition and tests a previewable processor on retained upstream rows', async () => {
+    const installedSource = [
+      'MAX_DECODED_IMAGE_PIXELS = 50_000_000',
+      '',
+      'def processor_factory(params):',
+      '    return lambda row: row',
+      '',
+    ].join('\n')
+    apiMocks.installedProcessorSource.mockResolvedValue({
+      processorId: PROCESSOR_ID,
+      version: 'v1',
+      language: 'python',
+      source: installedSource,
+      sha256: 'a'.repeat(64),
+    })
     const source = {
       id: 'source', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'Image source', status: 'latest' as const, config: { uri: 'images.parquet' } },
@@ -236,7 +261,13 @@ describe('Transform exact processor labels', () => {
     expect(definition).toHaveTextContent('width')
     expect(definition).toHaveTextContent('image_key')
     expect(definition).toHaveTextContent('default "image"')
-    expect(definition).toHaveTextContent('Implementation source unavailable')
+    const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
+    expect(implementation).toHaveTextContent('Installed processor source')
+    expect(implementation).toHaveTextContent('exact local implementation')
+    expect(implementation).toHaveTextContent('does not indicate remote or distributed dispatch')
+    expect(implementation).toHaveTextContent('MAX_DECODED_IMAGE_PIXELS = 50_000_000')
+    expect(implementation).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)
+    expect(definition).not.toHaveTextContent('Implementation source unavailable')
     expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument()
 
     const test = screen.getByRole('button', { name: 'Test transform' })
@@ -245,6 +276,52 @@ describe('Transform exact processor labels', () => {
     fireEvent.click(test)
     expect(runEditorPreview).toHaveBeenCalledWith('transform')
     expect(screen.queryByRole('button', { name: 'Example rows' })).not.toBeInTheDocument()
+  })
+
+  it('keeps an honest unavailable state when a plugin does not publish source', async () => {
+    const sourceNode = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Source', status: 'latest' as const, config: { uri: 'rows.parquet' } },
+    }
+    const connectedDoc = {
+      id: 'canvas', name: 'canvas', version: 1, requirements: [],
+      nodes: [sourceNode, node],
+      edges: [{
+        id: 'source-transform', source: 'source', sourceHandle: 'out',
+        target: 'transform', targetHandle: 'in', data: { wire: 'dataset' as const },
+      }],
+    }
+    useStore.setState({
+      doc: connectedDoc,
+      processors: [{
+        id: PROCESSOR_ID, version: 'v1', title: 'Private transform', mode: 'map',
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+        paramsSchema: {}, previewable: true, blurb: 'A processor without published source.',
+        provenance: 'plugin',
+      }],
+      editorPreviews: { transform: {
+        canvasId: connectedDoc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(connectedDoc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: 1,
+        offset: 0,
+        result: {
+          columns: [], rows: [{ id: 1 }], truncated: false,
+          editorTestInput: {
+            runId: 'source-run', nodeId: 'source', portId: 'out',
+            label: 'Source', rows: 1,
+          },
+        },
+      } },
+      fullscreenCode: { nodeId: node.id, param: 'code', lang: 'python' },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    expect(await screen.findByText('Implementation source unavailable')).toBeVisible()
+    expect(screen.queryByRole('region', { name: 'Installed processor source' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test transform' })).toBeEnabled()
   })
 
   it('explains why a non-previewable Library processor cannot be tested', async () => {

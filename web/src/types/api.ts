@@ -695,6 +695,14 @@ export interface ProcessorDescriptor {
   semanticDigest?: string | null
 }
 
+export interface InstalledProcessorSource {
+  processorId: string
+  version: string
+  language: string
+  source: string
+  sha256: string
+}
+
 export type TransformAvailability = 'active' | 'deleted' | 'missing'
 
 export interface TransformRetention {
