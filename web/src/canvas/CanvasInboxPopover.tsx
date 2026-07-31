@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type InboxItemDto } from '../api/client'
-import { routeHash } from '../router'
+import { datasetViewerHash } from '../router'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import {
@@ -222,7 +222,10 @@ export function CanvasInboxPopover() {
                     {item.datasetContext && (
                       <Button variant="outline" size="sm" asChild className="h-7 px-2 text-[10.5px]">
                         <a
-                          href={item.datasetContext.deepLink ?? routeHash('workspace', undefined, `dataset:${item.datasetContext.datasetId}`)}
+                          href={item.datasetContext.deepLink ?? datasetViewerHash(
+                            item.datasetContext.datasetId,
+                            item.datasetContext.revisionId ?? undefined,
+                          )}
                           onClick={() => {
                             markReadForNavigation(item)
                             setOpen(false)

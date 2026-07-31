@@ -175,7 +175,7 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1'))
   })
 
-  it('preserves a receipt logical revision identity while canonicalizing its Workspace registration', async () => {
+  it('preserves a receipt logical revision identity and route while resolving its current registration', async () => {
     store.workspaceScope = 'datasets'
     store.workspaceResourceId = 'dataset:logical-receipt'
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
@@ -183,7 +183,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(screen.getByText('Exact deep link: logical-receipt@rev-receipt')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Open receipt dataset' }))
-    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:registration-current')
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith('dataset:registration-current')
     expect(store.setWorkspaceDatasetQuery).not.toHaveBeenCalledWith(expect.not.stringContaining('revision=rev-receipt'))
   })
 

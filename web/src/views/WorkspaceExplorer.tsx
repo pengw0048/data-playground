@@ -1132,9 +1132,12 @@ function WorkspaceDatasets() {
           }
           if (!table) setWorkspaceResource(null)
           else if (table.registrationId) {
-            // A route may canonicalize an old registration or receipt logical id to the current
-            // registration. Only an explicit user selection starts a different dataset journey.
-            setWorkspaceResource(`dataset:${table.registrationId}`)
+            // Keep an exact receipt URL atomic: resolving its logical dataset to a current Catalog
+            // registration must not add a second browser-history entry before the user presses Back.
+            // Ordinary latest routes may still canonicalize stale registration ids.
+            if (!(hasExactRevision && origin === 'route')) {
+              setWorkspaceResource(`dataset:${table.registrationId}`)
+            }
           }
           else pushToast('This dataset has no stable Workspace identity', 'error')
         }}

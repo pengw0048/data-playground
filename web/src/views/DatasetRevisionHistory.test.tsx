@@ -142,6 +142,20 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevisions).toHaveBeenLastCalledWith(TABLE.id, { limit: 20, cursor: 'opaque cursor' })
   })
 
+  it('opens a full-page exact viewer when history is already inside the dataset viewer', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer />)
+
+    const link = await screen.findByRole('link', { name: 'Open revision rev-2' })
+    expect(link).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable',
+    )
+    expect(mocks.datasetRevision).not.toHaveBeenCalled()
+  })
+
   it('keeps a slow save capability probe current while revision pagination advances', async () => {
     const capability = deferred<{
       selectors: ('exact' | 'latest')[]

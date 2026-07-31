@@ -459,10 +459,10 @@ describe('RunPanel typed parameter gate', () => {
     render(<RunPanel nodeId="target" />)
     const publication = screen.getByLabelText('Write publication')
     expect(publication).toHaveTextContent('Append to the selected dataset')
-    expect(publication).toHaveTextContent('Output published')
-    expect(publication).toHaveTextContent('results · version revision-9 · 2 rows')
+    expect(publication).toHaveTextContent('Published · results · 2 rows')
+    expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-9')
     expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'View published version' })).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
     const details = screen.getByText('Technical details').closest('details')!
     expect(details).not.toHaveAttribute('open')

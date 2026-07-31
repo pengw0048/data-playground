@@ -147,17 +147,32 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(job).toBeVisible()
     await page.getByText('Technical evidence', { exact: true }).click()
     await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
-    await page.getByRole('button', { name: 'Open exact revision' }).click()
-    await expect(page.getByLabel('Exact revision detail')).toContainText(`Parent ${base.revisionId}`)
-
-    // Reopen exactly the immutable base and final results; these assertions intentionally use the
-    // ordinary revision APIs, not an in-process storage path or a moving catalog head.
     const jobs = await json<{ items: Array<{ outputReceipt?: WriteReceipt | null }> }>(
       await page.request.get(`/api/jobs?run_id=${encodeURIComponent(task.taskId)}&limit=1`),
       'reopen browser merge in Jobs API',
     )
     const final = jobs.items[0]?.outputReceipt
     expect(final).toBeTruthy()
+    const exactDataset = page.getByRole('link', { name: 'Open dataset' })
+    await expect(exactDataset).toHaveAttribute(
+      'href',
+      `#/workspace/${encodeURIComponent(`dataset:${final!.datasetId}`)}?${new URLSearchParams({
+        scope: 'datasets',
+        revision: final!.revisionId,
+        revisionDataset: final!.datasetId,
+      })}`,
+    )
+    await exactDataset.click()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    const datasetDetails = page.getByTestId('detail-dataset-details')
+    await datasetDetails.locator('summary').click()
+    await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
+      `${final!.datasetId}@${final!.revisionId}`,
+    )
+    await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${base.revisionId}`)
+
+    // Reopen exactly the immutable base and final results; these assertions intentionally use the
+    // ordinary revision APIs, not an in-process storage path or a moving catalog head.
     const baseDetail = await json<{ revisionId: string; preview: { columns: Array<{ name: string }>; rows: Array<Record<string, unknown>> } }>(
       await page.request.get(`/api/catalog/revisions/${encodeURIComponent(base.datasetId)}/${encodeURIComponent(base.revisionId)}`),
       'reopen exact base revision',

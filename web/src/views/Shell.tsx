@@ -48,7 +48,7 @@ export function Shell() {
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
       <Rail onSettings={openSettings} unreadCount={unreadCount} />
-      <main style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
+      <main style={{ position: 'relative', flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'workspace' && <WorkspaceExplorer />}
         {view === 'jobs' && <JobsView />}
         {view === 'inbox' && <InboxView onUnreadChange={refreshUnread} />}

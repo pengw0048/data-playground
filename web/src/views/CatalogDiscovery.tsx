@@ -7,6 +7,7 @@ import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { MediaCellRenderer } from '../components/MediaCellRenderer'
 import { PreviewDetails, PreviewSummary } from '../components/PreviewPresentation'
 import type {
   CatalogQueryParams, CatalogTable, CatalogUnregisterResult, DatasetRevisionDetail,
@@ -16,7 +17,8 @@ import type {
 // The Workspace dataset discovery surface is built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
 // (infinite scroll), and a right FACET RAIL (tags/owners with counts). A search box (debounced) and a
-// sort control drive the same query; clicking a row opens a detail drawer to inspect columns + lineage
+// sort control drive the same query; clicking a row opens the shared dataset viewer to inspect rows,
+// columns, revisions, and lineage
 // and curate the dataset's folder/tags/owner/description.
 
 const PAGE = 50
@@ -194,10 +196,10 @@ export function CatalogDiscovery({
 
   useEffect(() => { void loadFirst() }, [loadFirst])
 
-  const selectTable = useCallback((table: CatalogTable | null) => {
+  const selectTable = useCallback((table: CatalogTable | null, origin: 'user' | 'route' = 'user') => {
     selectedLookupId.current = table?.registrationId ?? null
     setSelected(table)
-    onSelectedTableChange?.(table, 'user')
+    onSelectedTableChange?.(table, origin)
   }, [onSelectedTableChange])
   useEffect(() => {
     if (selectedRegistrationId === undefined) return
@@ -519,7 +521,13 @@ export function CatalogDiscovery({
         <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
           initialRevisionId={initialRevisionId}
           initialRevisionDatasetId={initialRevisionDatasetId}
-          onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }}
+          onChanged={(t) => {
+            // Saving catalog metadata refreshes the selected registration; it does not navigate
+            // away from an exact-revision route.
+            selectTable(t, initialRevisionId && initialRevisionDatasetId ? 'route' : 'user')
+            setCatalogRevision((v) => v + 1)
+            void loadFirst()
+          }}
           onFolder={(folder) => {
             if (onOpenInWorkspace) void onOpenInWorkspace(selected)
             else { setFolder(folder); selectTable(null) }
@@ -900,7 +908,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
   )
 }
 
-// ---- detail drawer: columns + metadata editor + lineage ---------------------
+// ---- full-page dataset viewer: rows first, evidence and curation second -----
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
   folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
@@ -930,10 +938,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const [lineageError, setLineageError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
-  const [previewOpen, setPreviewOpen] = useState(true)
   const [preview, setPreview] = useState<SampleResult | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  const [requestedExactDetail, setRequestedExactDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [requestedExactLoading, setRequestedExactLoading] = useState(false)
+  const [requestedExactError, setRequestedExactError] = useState<string | null>(null)
   const [latestHead, setLatestHead] = useState<DatasetRevisionResolution | null>(null)
   const [headChecking, setHeadChecking] = useState(true)
   const [headError, setHeadError] = useState<string | null>(null)
@@ -947,8 +957,45 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const closeRef = useRef<HTMLButtonElement>(null)
   const lineageRequest = useRef(0)
   const previewRequest = useRef(0)
+  const requestedExactRequest = useRef(0)
   const headRequest = useRef(0)
   const factsRequest = useRef(0)
+  const requestedExact = initialRevisionId && initialRevisionDatasetId
+    ? { datasetId: initialRevisionDatasetId, revisionId: initialRevisionId }
+    : null
+
+  const loadRequestedExact = useCallback(async () => {
+    if (!initialRevisionId || !initialRevisionDatasetId) return
+    const requested = { datasetId: initialRevisionDatasetId, revisionId: initialRevisionId }
+    const request = ++requestedExactRequest.current
+    setRequestedExactLoading(true); setRequestedExactError(null); setRequestedExactDetail(null)
+    try {
+      const detail = await api.datasetRevision(requested.datasetId, requested.revisionId)
+      if (request !== requestedExactRequest.current) return
+      if (!sameRevision(detail, requested)) {
+        throw new Error(`Exact revision response did not match ${revisionLabel(requested)}`)
+      }
+      setRequestedExactDetail(detail)
+    } catch (error) {
+      if (request !== requestedExactRequest.current) return
+      const status = statusOf(error)
+      const prefix = status === 403
+        ? 'You do not have permission to open this exact revision.'
+        : status === 404 || status === 410
+          ? 'This exact revision is unavailable or no longer retained.'
+          : `Couldn't load this exact revision: ${errorMessage(error)}.`
+      setRequestedExactError(`${prefix} Latest was not substituted.`)
+    } finally {
+      if (request === requestedExactRequest.current) setRequestedExactLoading(false)
+    }
+  }, [initialRevisionDatasetId, initialRevisionId])
+
+  useEffect(() => {
+    requestedExactRequest.current += 1
+    setRequestedExactDetail(null); setRequestedExactError(null); setRequestedExactLoading(false)
+    if (initialRevisionId && initialRevisionDatasetId) void loadRequestedExact()
+    return () => { requestedExactRequest.current += 1 }
+  }, [initialRevisionDatasetId, initialRevisionId, loadRequestedExact, table.id])
 
   const resolveLatestHead = useCallback(async () => {
     const request = ++headRequest.current
@@ -973,12 +1020,16 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     headRequest.current += 1
     factsRequest.current += 1
     setLatestHead(null); setHeadError(null); setExactFacts(null); setFactsError(null); setFactsLoading(false)
-    void resolveLatestHead()
+    if (requestedExact) {
+      setHeadChecking(false)
+    } else {
+      void resolveLatestHead()
+    }
     return () => {
       headRequest.current += 1
       factsRequest.current += 1
     }
-  }, [resolveLatestHead, table.registrationId, table.version])
+  }, [resolveLatestHead, table.registrationId, table.version, initialRevisionDatasetId, initialRevisionId])
 
   const loadLineage = useCallback(async () => {
     const s = ++lineageRequest.current
@@ -998,10 +1049,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   }, [loadLineage])
   useEffect(() => { closeRef.current?.focus() }, [])
   const loadPreview = async () => {
+    if (requestedExact) return
     const s = ++previewRequest.current
     setPreviewLoading(true); setPreviewError(null)
     try {
-      const next = await api.sample(table.uri, 30)
+      const next = await api.sample(table.uri, 100)
       if (s === previewRequest.current) {
         setPreview(next)
         // Preview is a current-data read. Re-resolve the provider-native head afterwards instead
@@ -1018,15 +1070,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   // and make failures retryable, but do not make researchers discover an expandable section first.
   useEffect(() => {
     previewRequest.current += 1
-    setPreviewOpen(true); setPreview(null); setPreviewError(null); setPreviewLoading(false)
-    void loadPreview()
+    setPreview(null); setPreviewError(null); setPreviewLoading(false)
+    if (!requestedExact) void loadPreview()
     return () => { previewRequest.current += 1 }
-  }, [table.uri])
-  const togglePreview = () => {
-    const next = !previewOpen
-    setPreviewOpen(next)
-    if (next && !preview && !previewLoading) void loadPreview()
-  }
+  }, [table.uri, initialRevisionDatasetId, initialRevisionId])
   const refreshHeadFacts = async () => {
     if (!latestHead) return
     const target = latestHead
@@ -1136,8 +1183,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const children = (lin?.edges ?? []).filter((e) => e.parent === lineageRoot)
   const lineageNode = (u: string) => lin?.nodes.find((n) => n.uri === u)
   const nameOf = (u: string) => lineageNode(u)?.name ?? u.split('/').slice(-1)[0]
-  const displayRowCount = exactFacts ? exactFacts.summary.rowCount : table.rowCount
-  const displayColumns = exactFacts ? exactFacts.preview.columns : table.columns
+  const displayRowCount = requestedExact
+    ? requestedExactDetail?.summary.rowCount ?? null
+    : exactFacts ? exactFacts.summary.rowCount : table.rowCount
+  const displayColumns = requestedExact
+    ? requestedExactDetail?.preview.columns ?? []
+    : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
   const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
 
@@ -1148,30 +1199,103 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const persistedDeclaredKey = initialKey(base)
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={requestClose}>
-      <div role="dialog" aria-modal="true" aria-label={table.name}
-        className="flex h-full w-[420px] max-w-full flex-col overflow-hidden border-l border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-3">
+    <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="dataset-viewer">
+      <div role="dialog" aria-label={table.name}
+        className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
+        <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
+          <button ref={closeRef} onClick={requestClose} aria-label="Close"
+            className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
+            <Icon name="chevronLeft" size={14} /> Back
+          </button>
           <Icon name="db" size={16} />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-[14px] font-bold text-foreground">{table.name}</div>
+            <div className="truncate text-[15px] font-bold text-foreground">{table.name}</div>
+            <div data-testid="dataset-version-context" className="truncate text-[10.5px] text-muted-foreground">
+              {requestedExact ? 'Published version' : 'Latest dataset'}
+            </div>
           </div>
-          <button onClick={() => onUse(table)} data-testid="detail-use" className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary"><Icon name="plus" size={12} /> Use in Canvas</button>
-          <button ref={closeRef} onClick={requestClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
+          {requestedExact
+            ? <span data-testid="detail-use-unavailable"
+              className="shrink-0 rounded-md bg-muted px-2.5 py-1 text-[11.5px] font-semibold text-muted-foreground">
+              Exact revision is view-only
+            </span>
+            : <button onClick={() => onUse(table)} data-testid="detail-use"
+              className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary">
+              <Icon name="plus" size={12} /> Use in Canvas
+            </button>}
         </div>
 
         <div tabIndex={0} aria-label="Dataset detail content" data-testid="dataset-detail-content"
-          className="min-h-0 flex-1 overflow-y-auto p-4 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
-          <div className="flex flex-col gap-4 text-[12.5px]">
+          className="min-h-0 flex-1 overflow-y-auto p-5 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+          <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-5 text-[12.5px]">
             <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
               <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
-              <span>· {displayColumns.length} cols</span>
+              <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
-              {exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
-              {!exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
+              {requestedExactDetail ? <span data-testid="dataset-facts-source">· Published version</span> : null}
+              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
+              {!requestedExact && !exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
+
+            <section aria-labelledby="dataset-preview-title" className="rounded-xl border border-border bg-card p-3 shadow-sm">
+              <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                <div>
+                  <h2 id="dataset-preview-title" className="text-[13px] font-bold text-foreground">Data preview</h2>
+                  <p className="text-[10.5px] text-muted-foreground">
+                    Bounded first page · up to 100 rows. This viewer does not scan or render the entire dataset.
+                  </p>
+                </div>
+                {requestedExact ? <span className="rounded bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
+                  Exact revision
+                </span> : <span className="rounded bg-muted px-2 py-1 text-[10px] font-semibold text-muted-foreground">
+                  Latest dataset
+                </span>}
+              </div>
+
+              {requestedExactLoading ? <div role="status" className="grid h-[240px] place-items-center text-[11px] text-muted-foreground">
+                Loading exact revision preview…
+              </div> : null}
+              {requestedExactError ? (
+                <div role="alert" className="flex h-[240px] items-center justify-center">
+                  <div className="max-w-xl rounded-lg border border-destructive/30 px-4 py-3 text-[11px] text-destructive">
+                    <div>{requestedExactError}</div>
+                    <button type="button" onClick={() => void loadRequestedExact()}
+                      data-testid="exact-preview-retry" className="mt-2 font-semibold underline">Retry exact revision</button>
+                  </div>
+                </div>
+              ) : null}
+              {requestedExactDetail ? <>
+                <div role="status" aria-label="Dataset preview scope"
+                  className="mb-2 rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
+                  Showing {requestedExactDetail.preview.rows.length.toLocaleString()} preview
+                  {requestedExactDetail.preview.rows.length === 1 ? ' row' : ' rows'} from this exact revision.
+                  {requestedExactDetail.preview.hasMore
+                    ? ` More rows exist; preview capped at ${requestedExactDetail.preview.rowLimit.toLocaleString()} rows.`
+                    : ''}
+                </div>
+                <DatasetPreviewTable columns={requestedExactDetail.preview.columns}
+                  rows={requestedExactDetail.preview.rows} exact />
+              </> : null}
+
+              {!requestedExact && <>
+                {previewLoading && !preview ? <div role="status" className="grid h-[240px] place-items-center text-[11px] text-muted-foreground">Loading latest preview…</div> : null}
+                {previewError ? (
+                  <div role="alert" className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-[11px] text-destructive">
+                    <span>Couldn't load latest preview: {previewError}{preview ? ' (showing stale preview)' : ''}</span>
+                    <button onClick={() => void loadPreview()} data-testid="detail-preview-retry" className="shrink-0 font-semibold underline">Retry</button>
+                  </div>
+                ) : null}
+                {preview ? <div className="flex flex-col gap-2">
+                  {!preview.error && !preview.notPreviewable && <CatalogPreviewScope
+                    preview={preview} stale={Boolean(previewError)} visibleRows={preview.rows.length} />}
+                  {preview.error || preview.notPreviewable || !preview.columns.length || !preview.rows.length
+                    ? <div className="grid h-[240px] place-items-center rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">{preview.reason || emptyCatalogPreviewMessage(preview)}</div>
+                    : <DatasetPreviewTable columns={preview.columns} rows={preview.rows} />}
+                </div> : null}
+              </>}
+            </section>
 
             <details data-testid="detail-dataset-details" className="rounded-lg border border-border px-3 py-2 text-[11px]">
               <summary className="cursor-pointer font-semibold text-foreground">
@@ -1185,6 +1309,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 {table.registrationId ? <div>
                   <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
                   <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
+                </div> : null}
+                {requestedExact ? <div data-testid="dataset-version-identity">
+                  <div className="text-[10px] text-muted-foreground">Exact version identity</div>
+                  <code className="break-all text-[10.5px] text-foreground">
+                    {revisionLabel(requestedExact)}
+                  </code>
                 </div> : null}
               </div>
             </details>
@@ -1219,43 +1349,25 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <section>
             <div className="mb-1 flex items-baseline justify-between gap-2">
               <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</div>
-              <span className="text-[10.5px] text-muted-foreground">{displayColumns.length} columns</span>
+              <span className="text-[10.5px] text-muted-foreground">
+                {requestedExact && !requestedExactDetail ? 'Exact revision' : `${displayColumns.length} columns`}
+              </span>
             </div>
-            {displayColumns.length ? <div tabIndex={0} aria-label="Dataset schema columns" data-testid="detail-schema-scroll"
+            {requestedExactLoading ? <div role="status" className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
+              Loading exact revision schema…
+            </div> : requestedExactError ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
+              Exact revision schema is unavailable. Latest schema was not substituted.
+            </div> : displayColumns.length ? <div tabIndex={0} aria-label="Dataset schema columns" data-testid="detail-schema-scroll"
               className="grid max-h-[132px] grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto overscroll-contain rounded-lg border border-border px-3 py-2 text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
               {displayColumns.map((column) => <div key={column.name} className="flex min-w-0 items-center gap-1"><span className="min-w-0 flex-1 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span><FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" /></div>)}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
           </section>
 
-          <section>
-            <button onClick={togglePreview} data-testid="detail-preview" aria-expanded={previewOpen}
-              className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground hover:text-foreground">
-              <Icon name={previewOpen ? 'chevronDown' : 'chevronRight'} size={11} /> Row preview
-            </button>
-            {previewOpen && <>
-              {previewLoading && !preview ? <div className="px-1 py-1 text-[11px] text-muted-foreground">Loading preview…</div> : null}
-              {previewError ? (
-                <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-[11px] text-destructive">
-                  <span>Couldn't load preview: {previewError}{preview ? ' (showing stale preview)' : ''}</span>
-                  <button onClick={() => void loadPreview()} data-testid="detail-preview-retry" className="shrink-0 font-semibold underline">Retry</button>
-                </div>
-              ) : null}
-              {preview ? <div className="flex flex-col gap-1">
-                {!preview.error && !preview.notPreviewable && <CatalogPreviewScope
-                  preview={preview} stale={Boolean(previewError)} visibleRows={Math.min(4, preview.rows.length)} />}
-                {preview.error || preview.notPreviewable || !preview.rows.length
-                  ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">{preview.reason || emptyCatalogPreviewMessage(preview)}</div>
-                  : <><div tabIndex={0} aria-label="Row preview table" data-testid="detail-preview-scroll"
-                    className="overflow-x-auto rounded-lg border border-border focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.columns.map((c) => (
-                    <th key={c.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
-                  ))}</tr></thead><tbody>{preview.rows.slice(0, 4).map((r, i) => (
-                    <tr key={i}>{preview.columns.map((c) => <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{cell(r[c.name])}</td>)}</tr>
-                  ))}</tbody></table></div></>}
-              </div> : null}
-            </>}
-          </section>
-
-          <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
+          <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table}
+            initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId}
+            detailsInViewer viewerDetail={requestedExactDetail}
+            viewerLoading={requestedExactLoading} viewerError={requestedExactError}
+            onViewerRetry={() => { void loadRequestedExact() }} />
 
           <details className="rounded-lg border border-border p-3">
             <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Edit catalog details</summary>
@@ -1305,7 +1417,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
           {/* lineage — click a row to open that dataset */}
           <section>
-            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> Lineage{lin?.truncated ? ' (truncated)' : ''}</div>
+            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> {requestedExact ? 'Current catalog lineage' : 'Lineage'}{lin?.truncated ? ' (truncated)' : ''}</div>
             {lineageLoading && !lin ? <div className="py-0.5 text-[11px] text-muted-foreground">Loading…</div> : null}
             {lineageError ? (
               <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
@@ -1353,6 +1465,44 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       </div>
     </div>
   )
+}
+
+function DatasetPreviewTable({ columns, rows, exact = false }: {
+  columns: SampleResult['columns']
+  rows: Record<string, unknown>[]
+  exact?: boolean
+}) {
+  if (!columns.length) {
+    return <div className="grid h-[240px] place-items-center rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
+      {exact ? 'This exact revision supplied no columns.' : 'This dataset supplied no columns.'}
+    </div>
+  }
+  return <div tabIndex={0} aria-label="Dataset rows" data-testid="detail-preview-scroll"
+    className="h-[52vh] min-h-[240px] max-h-[560px] overflow-auto rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+    <table className="dp-mono w-max min-w-full text-[10.5px]">
+      <thead><tr>{columns.map((column) => (
+        <th key={column.name}
+          className="sticky top-0 z-10 border-b border-border bg-muted px-2.5 py-2 text-left font-semibold shadow-[0_1px_0_hsl(var(--border))]">
+          <FieldEvidenceButton column={column} marker
+            className="dp-mono rounded px-0.5 hover:bg-accent" />
+        </th>
+      ))}</tr></thead>
+      <tbody>{rows.map((row, index) => <tr key={index} className="hover:bg-muted/30">
+        {columns.map((column) => <td key={column.name}
+          className="max-w-[320px] truncate whitespace-nowrap border-b border-border/40 px-2.5 py-1.5">
+          {(column.capabilities ?? []).includes('media')
+            ? <MediaCellRenderer column={column.name} value={row[column.name]}
+                mediaKind={column.mediaKind} viewport="table" />
+            : cell(row[column.name])}
+        </td>)}
+      </tr>)}</tbody>
+    </table>
+    {!rows.length ? <div className="border-t border-border px-3 py-3 text-[11px] text-muted-foreground">
+      {exact
+        ? 'This exact revision returned no preview rows; its retained schema remains available below.'
+        : 'The bounded preview returned no rows.'}
+    </div> : null}
+  </div>
 }
 
 function CatalogPreviewScope({ preview, stale, visibleRows }: {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type CanvasFile, type DatasetTaskKind, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
-import type { DatasetRevisionDetail, WriteReceipt } from '../types/api'
-import { routeHash } from '../router'
+import type { WriteReceipt } from '../types/api'
+import { datasetViewerHash, routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -482,6 +482,11 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const phase = jobPhase(item)
   const report = item.distributionReport
   const dataset = item.datasetContext
+  const datasetHref = publishedRevision
+    ? datasetViewerHash(publishedRevision.datasetId, publishedRevision.revisionId)
+    : dataset
+      ? dataset.deepLink ?? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined)
+      : null
   const active = item.status === 'queued' || item.status === 'running'
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
@@ -530,8 +535,8 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
-        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
-        {committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
+        {datasetHref && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={datasetHref}>Open dataset</a>}
+        {!publishedRevision && committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
           {committed.length === 1 ? 'Open result' : `Open result ${index + 1}`}
         </button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
@@ -562,18 +567,5 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
 }
 
 function ExactRevisionReceipt({ receipt }: { receipt: WriteReceipt }) {
-  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
-  const open = async () => {
-    setLoading(true); setError('')
-    try { setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId)) }
-    catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
-    finally { setLoading(false) }
-  }
-  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes
-    <Button size="sm" variant="outline" className="ml-2 h-6 px-2 text-[10px]" onClick={() => void open()} disabled={loading}>{loading ? 'Opening…' : 'Open exact revision'}</Button>
-    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}</div>}
-    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-muted/30 p-2 text-[10.5px]"><div>Committed {detail.committedAt ? new Date(detail.committedAt).toLocaleString() : 'at an unknown time'} · {detail.summary.rowCount == null ? 'row count unavailable' : `${detail.summary.rowCount.toLocaleString()} rows`}</div><div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'} · {detail.preview.columns.length} fields</div><div className="mt-1 overflow-auto"><table className="w-full text-left"><thead><tr>{detail.preview.columns.map((column) => <th key={column.name} className="pr-2 font-medium">{column.name}</th>)}</tr></thead><tbody>{detail.preview.rows.slice(0, 5).map((row, index) => <tr key={index}>{detail.preview.columns.map((column) => <td key={column.name} className="max-w-24 truncate pr-2 font-mono">{String(row[column.name] ?? '')}</td>)}</tr>)}</tbody></table></div>{detail.preview.hasMore && <div className="mt-1 text-muted-foreground">Preview is bounded; this remains the exact published revision.</div>}</div>}
-  </div>
+  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
 }

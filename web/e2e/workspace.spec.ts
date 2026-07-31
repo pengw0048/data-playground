@@ -230,6 +230,8 @@ test('browses and opens one exact retained dataset revision without drifting to 
   expect(catalog.ok()).toBe(true)
   const dataset = (await catalog.json()).items[0] as { id: string; name: string }
   expect(dataset).toBeTruthy()
+  await page.route('**/api/catalog/tables/stable-dataset?registration=true', (route) =>
+    route.fulfill({ json: dataset }))
 
   let historyRequests = 0
   await page.route('**/api/catalog/tables/*/revisions*', async (route) => {
@@ -282,13 +284,19 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await page.getByTestId('revision-history-load-more').click()
   await expect(page.getByText('rev-1')).toBeVisible()
 
-  await page.getByRole('button', { name: 'Open revision rev-2' }).click()
-  await expect(page.getByText('Exact revision rev-2')).toBeVisible()
-  await expect(page.getByText(/Parent rev-1 · producer append/)).toBeVisible()
-  await expect(page.getByText('breaking')).toBeVisible()
-  await expect(page.getByText(/Preview truncated at 100 rows.*exact revision/i)).toBeVisible()
-  await expect(page.getByText('Binary media preview is unavailable.', { exact: true })).toBeVisible()
-  await expect(page.getByText('The browser could not display this media.', { exact: true })).toBeVisible()
+  await page.getByRole('link', { name: 'Open revision rev-2' }).click()
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  const datasetDetails = page.getByTestId('detail-dataset-details')
+  await datasetDetails.locator('summary').click()
+  await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
+    'stable-dataset@rev-2',
+  )
+  const technicalRevision = page.getByTestId('revision-detail')
+  await expect(technicalRevision.getByText(/Parent rev-1 · producer append/)).toBeVisible()
+  await expect(technicalRevision.getByText('breaking')).toBeVisible()
+  await expect(technicalRevision.getByText(/Preview truncated at 100 rows.*exact revision/i)).toBeVisible()
+  await expect(technicalRevision.getByText('Binary media preview is unavailable.', { exact: true })).toBeVisible()
+  await expect(technicalRevision.getByText('The browser could not display this media.', { exact: true })).toBeVisible()
   await expect(page.getByRole('img', { name: 'Media image' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /certify/i })).toHaveCount(0)
   await expect(page.getByText(/row identity/i)).toHaveCount(0)
