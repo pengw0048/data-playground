@@ -479,6 +479,12 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByRole('menu', { name: 'Canvas actions' }), '1024px Canvas actions menu')
     await expect(page.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
     await page.keyboard.press('Escape')
+    // Escape closes the menu and clears the Canvas selection. The selection-owned Inspector only
+    // returns for one real node, so restore that explicit precondition before exercising expansion.
+    const source = page.locator('.react-flow__node').first()
+    await source.click()
+    await expect(source).toHaveClass(/selected/)
+    await expect(page.locator('.react-flow__node.selected')).toHaveCount(1)
     await page.getByRole('button', { name: 'Expand Inspector', exact: true }).click()
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
     await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'icons')

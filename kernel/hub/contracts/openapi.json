@@ -5665,7 +5665,7 @@
         "type": "object"
       },
       "InstalledProcessorSource": {
-        "description": "Exact plugin-published source, fetched separately from processor metadata.",
+        "description": "Exact implementation source, fetched separately from source-free processor metadata.\n\nPromoted versions return their immutable user-authored code. Plugin versions remain explicit\nopt-in resources and never expose arbitrary installed files.",
         "properties": {
           "language": {
             "title": "Language",
@@ -24589,7 +24589,7 @@
     },
     "/api/processors/{processor_id}/versions/{version}/source": {
       "get": {
-        "description": "Return only source that the exact installed plugin processor explicitly publishes.",
+        "description": "Return owner-scoped promoted source or source an exact plugin explicitly publishes.",
         "operationId": "installed_processor_source_api_processors__processor_id__versions__version__source_get",
         "parameters": [
           {

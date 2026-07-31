@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import datetime
 import hashlib
 import re
+import secrets
 from typing import Any, Callable
 
 from hub import sandbox
@@ -151,25 +152,66 @@ class ProcessorRegistry:
             return False
         return True
 
-    def installed_source(self, pid: str, version: str) -> InstalledProcessorSource:
-        processor = self.get(pid, version)
-        provider = processor.source
-        if processor.provenance != "plugin" or provider is None:
-            raise KeyError((pid, version, "source"))
+    def installed_source(
+            self, pid: str, version: str, *,
+            owner_id: str | None = None) -> InstalledProcessorSource:
+        """Return one exact promoted source or one plugin's explicitly published source."""
+        language = "python"
+        if pid.startswith("tr_"):
+            from hub import metadb
+            from hub.promoted_transforms import promoted_transform_definition
+
+            try:
+                if owner_id is None:
+                    raise KeyError((pid, version, "source"))
+                item = metadb.owned_promoted_transform_version(owner_id, pid, version)
+                if item is None:
+                    raise KeyError((pid, version, "source"))
+                processor = self._from_promoted(item)
+                if not isinstance(processor.code, str) or processor.semantic_digest is None:
+                    raise ValueError("promoted source metadata is incomplete")
+                digest, _definition = promoted_transform_definition(
+                    title=processor.title,
+                    blurb=processor.blurb,
+                    category=processor.category,
+                    mode=processor.mode,
+                    code=processor.code,
+                    input_schema=processor.input_schema,
+                    output_schema=processor.output_schema,
+                    requirements=processor.requirements,
+                )
+                if not secrets.compare_digest(digest, processor.semantic_digest):
+                    raise ValueError("promoted source semantic digest does not match")
+                payload = processor.code.encode("utf-8")
+            except KeyError:
+                raise
+            except Exception as exc:
+                raise ProcessorSourceUnavailable(
+                    f"promoted source for {pid}@{version} failed integrity validation") from exc
+        else:
+            processor = self.get(pid, version)
+            provider = processor.source
+            if processor.provenance != "plugin" or provider is None:
+                raise KeyError((pid, version, "source"))
+            language = provider.language
+            try:
+                payload = provider.read()
+                if not isinstance(payload, bytes):
+                    raise TypeError("processor source reader must return bytes")
+            except Exception as exc:
+                raise ProcessorSourceUnavailable(
+                    f"installed source for {pid}@{version} is unavailable") from exc
         try:
-            payload = provider.read()
-            if not isinstance(payload, bytes):
-                raise TypeError("processor source reader must return bytes")
             if len(payload) > MAX_INSTALLED_SOURCE_BYTES:
                 raise ValueError("processor source exceeds the response limit")
             source = payload.decode("utf-8")
         except Exception as exc:
             raise ProcessorSourceUnavailable(
-                f"installed source for {pid}@{version} is unavailable") from exc
+                f"implementation source for {pid}@{version} is unavailable") from exc
         return InstalledProcessorSource(
             processor_id=pid,
             version=version,
-            language=provider.language,
+            language=language,
             source=source,
             sha256=hashlib.sha256(payload).hexdigest(),
         )

@@ -18,8 +18,28 @@ async function expectToolbarInsideCanvas(page: Page, viewportWidth: number) {
   expect(canvasBox!.x + canvasBox!.width).toBeLessThan(viewportWidth)
 }
 
+async function expectSelectedNodeInsideCanvas(page: Page, type: string) {
+  const node = page.locator(`.react-flow__node-${type}.selected`)
+  const output = node.locator('.react-flow__handle-right[role="button"]')
+  await expect(node).toHaveCount(1)
+  await expect(output).toBeVisible()
+  await expect(page.locator('[data-node-reveal-pending]'))
+    .toHaveAttribute('data-node-reveal-pending', 'false')
+  await expect.poll(async () => {
+    const [nodeBox, outputBox, canvasBox] = await Promise.all([
+      node.boundingBox(), output.boundingBox(), page.locator('.react-flow').boundingBox(),
+    ])
+    if (!nodeBox || !outputBox || !canvasBox) return false
+    const left = canvasBox.x - 0.5
+    const right = canvasBox.x + canvasBox.width + 0.5
+    return nodeBox.x >= left && nodeBox.x + nodeBox.width <= right
+      && outputBox.x >= left && outputBox.x + outputBox.width <= right
+  }).toBe(true)
+  return output
+}
+
 test.describe('Workspace Source port-add flow @ux-smoke', () => {
-  test('keeps creation global and connects a local Transform from the selected Source port', async ({ page }) => {
+  test('keeps consecutive connected steps visible without a manual fit', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await goToWorkspace(page)
 
@@ -51,12 +71,19 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
     await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
     await expectToolbarInsideCanvas(page, 1440)
 
+    await page.setViewportSize({ width: 1280, height: 720 })
     await sourcePort.press('Enter')
     const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
     await expect(finder).not.toHaveAttribute('aria-modal')
     await expect(page.locator('.dp-modal-overlay')).toHaveCount(0)
+    await finder.getByRole('textbox', { name: 'Search operations' }).fill('sample')
+    await finder.getByRole('option', { name: /^sample/i }).first().click()
+
+    const samplePort = await expectSelectedNodeInsideCanvas(page, 'sample')
+    await samplePort.press('Enter')
     await finder.getByRole('textbox', { name: 'Search operations' }).fill('transform')
     await finder.getByRole('option', { name: /^transform/i }).first().click()
+    await expectSelectedNodeInsideCanvas(page, 'transform')
 
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
@@ -73,8 +100,11 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
         })),
       }
     }).toEqual({
-      nodeTypes: ['source', 'transform'],
-      edges: [{ source: 'source', target: 'transform', wire: 'dataset' }],
+      nodeTypes: ['sample', 'source', 'transform'],
+      edges: [
+        { source: 'source', target: 'sample', wire: 'dataset' },
+        { source: 'sample', target: 'transform', wire: 'sample' },
+      ],
     })
   })
 })
