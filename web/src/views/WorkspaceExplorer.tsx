@@ -379,7 +379,7 @@ export function WorkspaceExplorer() {
     if (previousScope.current !== scope) providerPlacementObservations.reset()
     previousScope.current = scope
   }, [scope, providerPlacementObservations])
-  return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="flex h-full min-h-0 flex-col">
+  return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="relative flex h-full min-h-0 flex-col overflow-hidden">
     {firstRunChoice && <FirstRunCanvasChoice />}
     <WorkspaceLocalDrafts />
     <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
@@ -1854,19 +1854,32 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     })
     return () => controller.abort()
   }, [canonicalContext, previewRevision])
-  return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
-    <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
-      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
-        className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
+  return <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="provider-dataset-viewer">
+    <div role="dialog" aria-label={resource.name}
+      className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
+      <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
+        <button onClick={onClose} aria-label="Close"
+          className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
+          <Icon name="chevronLeft" size={14} /> Back
+        </button>
+        <Icon name="db" size={16} />
+        <div className="min-w-0 flex-1">
+          <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
+          <div className="truncate text-[10.5px] text-muted-foreground">Mounted dataset · {resource.provider ?? resource.mountId ?? 'external source'}</div>
+        </div>
+        <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+          className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>
+      </div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
-        className="mt-5 grid min-h-0 flex-1 content-start gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-5">
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Location</div>
           <div className="break-words">Mount <strong>{resource.mountId ?? 'external'}</strong>{placementPath ? ` / ${placementPath}` : ''}</div>
           {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
         </section>
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
           <div className="text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
-            ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact version · {canonicalContext.revisionId}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
+            ? <><span className="block">Published version</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
             : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
         </section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
@@ -1884,17 +1897,18 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           {canonicalContext.readMode === 'exact' && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
             {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
             {preview && (preview.preview.rows.length
-              ? <div className="mt-1 overflow-x-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.slice(0, 4).map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
+              ? <div data-testid="provider-dataset-preview-scroll" tabIndex={0}
+                  className="mt-1 max-h-[420px] overflow-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
         </section>}
         {providerIssue && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           {providerIssue}<button type="button" onClick={retryProviderDetails} className="ml-2 font-semibold underline">Retry</button>
         </div>}
-        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
+        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Dataset details</summary>
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
             {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
             {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}
-            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div><div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
+            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div>{canonicalContext.revisionId && <><div className="mt-1 text-muted-foreground">Version identity</div><div className="break-all font-mono">{canonicalContext.revisionId}</div></>}<div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
             <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
             {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
             {resource.lastKnown && <div className="text-muted-foreground">Retained placement facts{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
@@ -1902,6 +1916,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
             {alternatePlacements.length > 0 && <div><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1 text-muted-foreground">Only placements already loaded in this Workspace session are shown.</div></div>}
           </div>
         </details>
+        </div>
       </div>
     </div>
   </div>

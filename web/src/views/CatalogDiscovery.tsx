@@ -1191,6 +1191,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
   const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
+  const displayedVersion = requestedExact ?? exactFacts ?? latestHead
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1233,8 +1234,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
               {requestedExactDetail ? <span data-testid="dataset-facts-source">· Published version</span> : null}
-              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
-              {!requestedExact && !exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
+              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Versioned facts</span> : null}
+              {!requestedExact && !exactFacts && latestHead ? <span data-testid="dataset-facts-source">· Latest version</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
@@ -1310,10 +1311,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                   <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
                   <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
                 </div> : null}
-                {requestedExact ? <div data-testid="dataset-version-identity">
-                  <div className="text-[10px] text-muted-foreground">Exact version identity</div>
+                {displayedVersion ? <div data-testid="dataset-version-identity">
+                  <div className="text-[10px] text-muted-foreground">
+                    {requestedExact ? 'Exact version identity' : 'Version identity'}
+                  </div>
                   <code className="break-all text-[10.5px] text-foreground">
-                    {revisionLabel(requestedExact)}
+                    {revisionLabel(displayedVersion)}
                   </code>
                 </div> : null}
               </div>

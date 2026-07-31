@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, KernelError } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
-import type { DatasetRevisionDetail, UpsertPreflight, UpsertRequest, UpsertTask, WriteReceipt } from '../types/api'
+import type { UpsertPreflight, UpsertRequest, UpsertTask } from '../types/api'
 import type { NodeConfig } from '../types/graph'
+import { PublishedDatasetResult } from './WritePublicationSummary'
 import { Button } from '@/components/ui/button'
 
 export interface KeyedUpsertConfig {
@@ -65,30 +66,6 @@ function requestFrom(intent: ResolvedIntent, submissionId: string): UpsertReques
     payloadDatasetId: intent.payloadDatasetId, payloadRevisionId: intent.payloadRevisionId,
     keys: intent.keys,
   }
-}
-
-function ExactRevision({ receipt }: { receipt: WriteReceipt }) {
-  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
-  const open = async () => {
-    setLoading(true); setError('')
-    try {
-      setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId))
-    } catch (caught) { setError(cleanError(caught)) } finally { setLoading(false) }
-  }
-  return <div className="mt-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2 text-[10.5px] text-muted-foreground">
-    <div className="font-semibold text-foreground">Published exact revision</div>
-    <div className="mt-0.5 break-all font-mono">{receipt.datasetId}@{receipt.revisionId}</div>
-    <div>{countLabel(receipt.rows)} rows · {countLabel(receipt.bytes)} bytes</div>
-    <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => void open()} disabled={loading}>
-      {loading ? 'Opening exact revision…' : 'Open exact revision'}
-    </Button>
-    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}</div>}
-    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-muted/30 p-2">
-      <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'} · {detail.preview.columns.length} fields</div>
-    </div>}
-  </div>
 }
 
 function EvidenceSummary({ evidence, base, expectedHead, keys, schema, eligible }: {
@@ -321,7 +298,9 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
         {task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}
       </div>}
     </div>}
-    {task?.receipt && <ExactRevision receipt={task.receipt} />}
+    {task?.receipt && <div className="mt-2 text-[10.5px]">
+      <PublishedDatasetResult receipt={task.receipt} />
+    </div>}
 
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">Tracked durable Task</div>

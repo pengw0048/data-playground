@@ -27,6 +27,17 @@ function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
   </a>
 }
 
+export function PublishedDatasetResult({ receipt, name = receipt.name }: {
+  receipt: WriteReceipt
+  name?: string
+}) {
+  return <div aria-label="Published result"
+    className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
+    <div><strong>Published</strong> · <span className="font-mono">{name}</span> · {receipt.rows.toLocaleString()} rows</div>
+    <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
+  </div>
+}
+
 function schemaText(fields: { name: string; type: string }[]): string {
   return fields.length ? fields.map((field) => `${field.name}: ${field.type}`).join(', ') : 'unknown'
 }
@@ -175,10 +186,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
               : 'Ready to run'}
           </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Checking output…</div>}
-      {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <div><strong>Published</strong> · <span className="font-mono">{displayedName}</span> · {receipt.rows.toLocaleString()} rows</div>
-        <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
-      </div>}
+      {receipt && <PublishedDatasetResult receipt={receipt} name={displayedName} />}
     </div>
     <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt}
       schemaDrift={schemaDrift} outputs={outputs} />

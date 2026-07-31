@@ -1289,6 +1289,50 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
   })
 
+  it('opens a provider search result in the full-page dataset route while preserving search context', async () => {
+    store.workspaceSearchQuery = 'will_demo'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'will_demo', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{
+        source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' },
+        items: [EXTERNAL_DATASET],
+      }],
+    })
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    const view = render(<WorkspaceExplorer />)
+
+    const results = await screen.findByTestId('workspace-search-results')
+    fireEvent.click(within(results).getByRole('button', {
+      name: 'Open dataset observations from Source-only mount warehouse · fixture',
+    }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(EXTERNAL_DATASET.id)
+
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    view.rerender(<WorkspaceExplorer />)
+
+    const viewer = await screen.findByTestId('provider-dataset-viewer')
+    expect(viewer).toHaveClass('absolute', 'inset-0', 'bg-background')
+    const detail = within(viewer).getByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveClass('min-w-0', 'flex-1')
+    expect(detail).not.toHaveClass('w-[420px]')
+    expect(await within(detail).findByText('Published version')).toBeVisible()
+    const datasetDetails = within(detail).getByText('Dataset details', { exact: true }).parentElement!
+    expect(datasetDetails).not.toHaveAttribute('open')
+    expect(within(datasetDetails).getByText('revision-7')).not.toBeVisible()
+    expect(screen.getByTestId('workspace-search-results')).toBeInTheDocument()
+
+    fireEvent.click(within(detail).getByRole('button', { name: 'Close' }))
+    expect(store.setWorkspaceResource).toHaveBeenLastCalledWith(EXTERNAL_FOLDER.id)
+    expect(store.setWorkspaceSearchQuery).not.toHaveBeenCalled()
+  })
+
   it('keeps a healthy paged provider usable and labels its continuation in researcher language', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     const pagedSource = { ...PROVIDER_COMPLETE, completeness: 'page' as const }
@@ -1323,7 +1367,7 @@ describe('WorkspaceExplorer', () => {
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     expect(within(detail).getByRole('status')).toHaveTextContent('provider timed out')
     expect(within(detail).getAllByRole('button', { name: 'Retry' })).toHaveLength(1)
-    const connection = within(detail).getByText('Connection details', { exact: true })
+    const connection = within(detail).getByText('Dataset details', { exact: true })
     expect(connection.parentElement).not.toHaveAttribute('open')
     expect(within(detail).getByText('Provider result state · partial')).not.toBeVisible()
   })
@@ -1445,13 +1489,13 @@ describe('WorkspaceExplorer', () => {
     view.rerender(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
-    const connection = within(detail).getByText('Connection details', { exact: true })
+    const connection = within(detail).getByText('Dataset details', { exact: true })
     expect(connection.parentElement).not.toHaveAttribute('open')
     fireEvent.click(connection)
     expect(detail).toHaveTextContent('Workspace placementremote-dataset')
     expect(detail).toHaveTextContent('Canonical dataset IDcanonical-observations')
     expect(detail).toHaveTextContent('Source dataset identityworkspace-provider:canonical-source')
-    expect(detail).toHaveTextContent('Exact version · revision-7')
+    expect(detail).toHaveTextContent('Version identityrevision-7')
     expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
       'Schemavalue · int64',
     )
@@ -1609,7 +1653,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     await screen.findByTestId('canonical-provider-dataset-context')
-    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Exact version')
+    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Published version')
     expect(mocks.workspaceCanonicalDataset.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(store.workspaceResourceId).toBe(EXTERNAL_DATASET.id)
   })
@@ -1911,7 +1955,7 @@ describe('WorkspaceExplorer', () => {
     const first = render(<WorkspaceExplorer />)
     const detachedDetail = await screen.findByRole('dialog', { name: 'observations' })
     expect(detachedDetail).toHaveTextContent('This provider location is not available right now.')
-    fireEvent.click(within(detachedDetail).getByText('Connection details', { exact: true }))
+    fireEvent.click(within(detachedDetail).getByText('Dataset details', { exact: true }))
     expect(detachedDetail).toHaveTextContent('Placement state · detached')
     first.unmount()
     mocks.workspaceResource.mockClear()

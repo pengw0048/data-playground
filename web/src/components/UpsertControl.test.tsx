@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   state: {} as any,
-  preflight: vi.fn(), submit: vi.fn(), task: vi.fn(), revision: vi.fn(), cancel: vi.fn(), retry: vi.fn(),
+  preflight: vi.fn(), submit: vi.fn(), task: vi.fn(), cancel: vi.fn(), retry: vi.fn(),
 }))
 
 vi.mock('../store/graph', () => ({
@@ -13,7 +13,7 @@ vi.mock('../store/graph', () => ({
 vi.mock('../api/client', () => ({
   api: {
     upsertPreflight: mocks.preflight, submitUpsert: mocks.submit, upsertTask: mocks.task,
-    datasetRevision: mocks.revision, cancelUpsertTask: mocks.cancel, retryUpsertTask: mocks.retry,
+    cancelUpsertTask: mocks.cancel, retryUpsertTask: mocks.retry,
   },
   KernelError: class KernelError extends Error {
     status: number
@@ -94,11 +94,16 @@ describe('UpsertControl', () => {
 
   it('shows the published evidence and exact revision after a done run', async () => {
     mocks.state = baseState({ keys: ['id'], taskId: 'task-1' })
-    mocks.task.mockResolvedValue({ taskId: 'task-1', status: 'done', datasetId: 'dataset-1', expectedHeadRevisionId: 'rev-1', payloadDatasetId: 'payload-1', payloadRevisionId: 'prev-1', childRevisionId: 'rev-2', canCancel: false, canRetry: false, evidence: { matched: 2, inserted: 1, unchanged: 1, rejected: 0, duplicate: 0, conflict: 0 }, receipt: { datasetId: 'dataset-1', revisionId: 'rev-2', rows: 4, bytes: 128, schema: [], partitions: [], publication: {} as any, provenance: {} as any, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-2', retentionOwner: 'core' }, parentHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'rev-1' } } })
+    mocks.task.mockResolvedValue({ taskId: 'task-1', status: 'done', datasetId: 'dataset-1', expectedHeadRevisionId: 'rev-1', payloadDatasetId: 'payload-1', payloadRevisionId: 'prev-1', childRevisionId: 'rev-2', canCancel: false, canRetry: false, evidence: { matched: 2, inserted: 1, unchanged: 1, rejected: 0, duplicate: 0, conflict: 0 }, receipt: { datasetId: 'dataset-1', revisionId: 'rev-2', name: 'target', rows: 4, bytes: 128, schema: [], partitions: [], publication: {} as any, provenance: {} as any, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-2', retentionOwner: 'core' }, parentHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'rev-1' } } })
     render(<UpsertControl nodeId="write" />)
     await screen.findByText('2 matched · 1 inserted · 1 unchanged')
-    expect(screen.getByText('Published exact revision')).toBeInTheDocument()
-    expect(screen.getByText('dataset-1@rev-2')).toBeInTheDocument()
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('Published · target · 4 rows')
+    expect(screen.getByLabelText('Published result')).not.toHaveTextContent('dataset-1@rev-2')
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-2&revisionDataset=dataset-1',
+    )
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })
 
   it('never advertises the mode for an unsupported destination', () => {
