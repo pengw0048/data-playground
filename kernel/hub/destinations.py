@@ -129,7 +129,11 @@ _BACKENDS: dict[str, DestinationBackend] = {
 
 
 def _within_local_root(root: str, candidate: str) -> bool:
-    return candidate == root or candidate.startswith(root + os.sep)
+    try:
+        return os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        # Windows paths on different drives have no common path and are never contained.
+        return False
 
 
 def register_backend(b: DestinationBackend) -> None:

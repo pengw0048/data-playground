@@ -4825,6 +4825,36 @@ def test_local_destination_symlink_escape_fails_closed(tmp_path):
     assert not (outside / "child").exists()
 
 
+def test_local_destination_filesystem_root_contains_real_children(tmp_path):
+    from hub import destinations
+
+    root = os.path.realpath(os.sep)
+    child = os.path.realpath(tmp_path)
+    relative = os.path.relpath(child, root)
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"destination data")
+    backend = destinations.LocalBackend()
+
+    listing = backend.browse(root, relative)
+    assert not listing.get("error")
+    assert {entry["name"] for entry in listing["entries"]} == {"source.parquet"}
+    assert backend.target_uri(root, relative, "result.parquet") == os.path.join(
+        child, "result.parquet")
+
+    backend.mkdir(root, relative, "nested")
+    assert (tmp_path / "nested").is_dir()
+
+
+def test_local_destination_cross_drive_containment_fails_closed(monkeypatch):
+    from hub import destinations
+
+    def no_common_path(_paths):
+        raise ValueError("paths are on different drives")
+
+    monkeypatch.setattr(destinations.os.path, "commonpath", no_common_path)
+    assert destinations._within_local_root("C:\\outputs", "D:\\results") is False
+
+
 def test_object_store_feather_roundtrip(tmp_path, object_store_cred):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a
