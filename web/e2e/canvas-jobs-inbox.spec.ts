@@ -65,7 +65,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     const chooseDestination = inspector.getByRole('button', { name: 'Choose destination…' })
     await expect(chooseDestination).toBeVisible()
     await chooseDestination.click()
-    const dialog = page.locator('.dp-modal-overlay')
+    const dialog = page.getByRole('dialog', { name: 'Choose output destination' })
     await dialog.locator('input').fill(filename)
     await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
     const publication = inspector.getByLabel('Write publication')

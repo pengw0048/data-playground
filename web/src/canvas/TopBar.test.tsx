@@ -7,13 +7,20 @@ const themeValues = new Map<string, string>()
 const state = vi.hoisted(() => ({
   setJobsQuery: vi.fn(),
   newFile: vi.fn(),
+  kernelUp: true,
+  saved: true,
   kernelInfo: { capabilities: [] as string[] },
   doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' },
   renameFile: vi.fn(),
   deleteFile: vi.fn(),
   discardLocalDraft: vi.fn(),
   currentDraftId: null,
+  localDrafts: [] as Array<{ draftId: string; syncState: string }>,
   canvasRole: 'owner',
+  rerunAll: vi.fn(),
+  past: [] as unknown[],
+  future: [] as unknown[],
+  peers: {} as Record<string, { name: string; color: string }>,
 }))
 
 vi.mock('../store/graph', () => ({
@@ -24,7 +31,19 @@ vi.mock('../store/graph', () => ({
   ),
 }))
 
-import { AppMenu, CanvasTitle } from './TopBar'
+vi.mock('../panels/SettingsModal', () => ({
+  SettingsModal: ({ onClose, initialCategory }: { onClose: () => void; initialCategory?: string }) => (
+    <div role="dialog" aria-label="Settings">
+      <span>{initialCategory}</span>
+      <button type="button" onClick={onClose}>Close settings</button>
+    </div>
+  ),
+}))
+vi.mock('./CanvasWorkspaceLocation', () => ({ CanvasWorkspaceLocation: () => null }))
+vi.mock('./CanvasInboxPopover', () => ({ CanvasInboxPopover: () => null }))
+vi.mock('./KernelBadge', () => ({ KernelBadge: () => null }))
+
+import { AppMenu, CanvasTitle, TopBar } from './TopBar'
 
 const appMenuProps = () => ({
   onWorkspace: vi.fn(),
@@ -180,5 +199,22 @@ describe('CanvasTitle', () => {
     await userEvent.setup().click(title)
     expect(screen.queryByRole('textbox', { name: 'Canvas name' })).not.toBeInTheDocument()
     expect(state.renameFile).not.toHaveBeenCalled()
+  })
+})
+
+describe('TopBar Settings handoff', () => {
+  it('runs the scoped close callback after Settings restores its trigger', async () => {
+    const onClose = vi.fn()
+    render(<TopBar />)
+    const trigger = screen.getByTestId('app-menu')
+
+    fireEvent(window, new CustomEvent('dp-open-settings', {
+      detail: { category: 'destinations', trigger, onClose },
+    }))
+
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toHaveTextContent('destinations')
+    fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+    expect(trigger).toHaveFocus()
   })
 })

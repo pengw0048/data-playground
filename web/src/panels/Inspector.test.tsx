@@ -431,26 +431,46 @@ describe('Inspector — effective named outputs', () => {
     expect(publication).toHaveTextContent('dataset-1@rev-1')
   })
 
-  it('hands destination management to the Canvas Settings destinations pane', async () => {
+  it('returns from destination Settings with the picker draft intact and destinations reloaded', async () => {
     selectNode('write', undefined)
     useStore.setState({
       currentUser: { id: 'admin', name: 'Admin', capabilities: ['global_settings'] },
     })
-    vi.spyOn(api, 'destinations').mockResolvedValue({
-      destinations: [{ id: 'outputs', name: 'Workspace outputs', backend: 'local', root: '/workspace/outputs' }],
+    const destinations = vi.spyOn(api, 'destinations').mockResolvedValue({
+      destinations: [
+        { id: 'outputs', name: 'Workspace outputs', backend: 'local', root: '/workspace/outputs' },
+        { id: 'research', name: 'Research outputs', backend: 's3', root: 's3://research/outputs' },
+      ],
       backends: ['local', 's3', 'gs'],
     })
+    const browse = vi.spyOn(api, 'browseDestination').mockImplementation(async (destinationId, path) => ({
+      path,
+      entries: path ? [] : [{ name: 'daily', kind: 'dir' as const, uri: `${destinationId}://daily` }],
+      writable: true,
+    }))
     const onOpenSettings = vi.fn()
     window.addEventListener('dp-open-settings', onOpenSettings)
 
     render(<Inspector />)
     fireEvent.click(screen.getByRole('button', { name: 'Choose destination…' }))
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Research outputs' }))[0])
+    fireEvent.click(await screen.findByRole('button', { name: 'daily' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Dataset name' }), {
+      target: { value: 'daily-embeddings.parquet' },
+    })
     fireEvent.click(await screen.findByRole('button', { name: 'Manage destinations' }))
 
     expect(onOpenSettings).toHaveBeenCalledTimes(1)
-    const event = onOpenSettings.mock.calls[0][0] as CustomEvent<{ category: string }>
+    const event = onOpenSettings.mock.calls[0][0] as CustomEvent<{ category: string; onClose: () => void }>
     expect(event.detail.category).toBe('destinations')
     await waitFor(() => expect(screen.queryByText('Choose output destination')).not.toBeInTheDocument())
+    act(() => event.detail.onClose())
+
+    expect(await screen.findByRole('dialog', { name: 'Choose output destination' })).toBeVisible()
+    await waitFor(() => expect(destinations).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('textbox', { name: 'Dataset name' })).toHaveValue('daily-embeddings.parquet')
+    expect(screen.getByRole('button', { name: 'daily' })).toBeVisible()
+    expect(browse).toHaveBeenCalledWith('research', 'daily')
     window.removeEventListener('dp-open-settings', onOpenSettings)
   })
 
