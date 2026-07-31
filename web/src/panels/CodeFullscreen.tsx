@@ -19,11 +19,15 @@ import {
 const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
 
 interface EditorUpstreamRequest {
+  sequence: number
   editorNodeId: string
   upstreamNodeId: string
   upstreamPortId?: string
   upstreamPlanIdentity: string
   baselineRunId?: string
+  baselineEditorInputRunId?: string
+  baselineUpstreamStatus?: string
+  refreshPreviewGeneration?: number
   cancelled?: boolean
 }
 
@@ -55,6 +59,8 @@ export function CodeFullscreen() {
   // presented as its test input.
   const [upstreamRequest, setUpstreamRequest] = useState<EditorUpstreamRequest>()
   const refreshedUpstreamRunId = useRef<string | null>(null)
+  const refreshedUpstreamStatusRequest = useRef<number | null>(null)
+  const upstreamRequestSequence = useRef(0)
   const upstreamDispatching = useRef(false)
   const upstreamConfirming = useRef(false)
   const upstreamCancelling = useRef(false)
@@ -85,6 +91,8 @@ export function CodeFullscreen() {
     setPromotionError('')
     setUpstreamRequest(undefined)
     refreshedUpstreamRunId.current = null
+    refreshedUpstreamStatusRequest.current = null
+    upstreamRequestSequence.current = 0
     upstreamDispatching.current = false
     upstreamConfirming.current = false
     upstreamCancelling.current = false
@@ -97,6 +105,9 @@ export function CodeFullscreen() {
     : undefined
   const editorUpstreamNodeId = editorUpstreamEdge?.source
   const editorUpstreamPortId = editorUpstreamEdge?.sourceHandle ?? undefined
+  const editorUpstreamNode = editorUpstreamNodeId
+    ? doc.nodes.find((candidate) => candidate.id === editorUpstreamNodeId)
+    : undefined
   const upstreamRun = editorUpstreamNodeId ? runs[editorUpstreamNodeId] : undefined
   const upstreamRunId = upstreamRun?.status?.runId
   const requestIsCurrent = Boolean(
@@ -112,14 +123,47 @@ export function CodeFullscreen() {
     requestIsCurrent && upstreamRun?.phase === 'done' && upstreamRunId
     && upstreamRunId !== upstreamRequest?.baselineRunId,
   )
+  const upstreamStatusReachedLatest = Boolean(
+    requestIsCurrent
+    && upstreamRequest?.baselineUpstreamStatus !== 'latest'
+    && editorUpstreamNode?.data.status === 'latest',
+  )
   useEffect(() => {
     // Re-select through the server-owned retained-result contract after the exact upstream run
-    // succeeds. This neither runs nor persists the downstream Transform as a full Canvas run.
-    if (!fs || testInput !== 'upstream' || !editorUpstreamNodeId || !freshUpstreamRunDone
-        || !upstreamRunId || refreshedUpstreamRunId.current === upstreamRunId) return
-    refreshedUpstreamRunId.current = upstreamRunId
+    // succeeds. Provider-backed graph state can expose the retained result before its initiating
+    // run-phase event catches up, so a request-local draft/stale → latest transition is also proof
+    // that it is time to ask the server for the exact retained input.
+    if (!fs || testInput !== 'upstream' || !editorUpstreamNodeId || !upstreamRequest) return
+    const refreshForRun = Boolean(
+      freshUpstreamRunDone && upstreamRunId
+      && refreshedUpstreamRunId.current !== upstreamRunId,
+    )
+    const refreshForStatus = Boolean(
+      upstreamStatusReachedLatest
+      && refreshedUpstreamStatusRequest.current !== upstreamRequest.sequence,
+    )
+    if (!refreshForRun && !refreshForStatus) return
+    if (refreshForRun && upstreamRunId) refreshedUpstreamRunId.current = upstreamRunId
+    if (refreshForStatus) {
+      refreshedUpstreamStatusRequest.current = upstreamRequest.sequence
+      if (upstreamRunId && upstreamRunId !== upstreamRequest.baselineRunId) {
+        refreshedUpstreamRunId.current = upstreamRunId
+      }
+    }
+    const priorGeneration = useStore.getState().editorPreviews[fs.nodeId]?.requestGeneration
     void runEditorPreview(fs.nodeId)
-  }, [editorUpstreamNodeId, freshUpstreamRunDone, fs, runEditorPreview, testInput, upstreamRunId])
+    const refreshPreviewGeneration = useStore.getState()
+      .editorPreviews[fs.nodeId]?.requestGeneration
+    if (refreshPreviewGeneration == null || refreshPreviewGeneration === priorGeneration) return
+    setUpstreamRequest((current) => (
+      current?.sequence === upstreamRequest.sequence
+        ? { ...current, refreshPreviewGeneration }
+        : current
+    ))
+  }, [
+    editorUpstreamNodeId, freshUpstreamRunDone, fs, runEditorPreview, testInput,
+    upstreamRequest, upstreamRunId, upstreamStatusReachedLatest,
+  ])
   const candidateCfg = (node?.data.config ?? {}) as Record<string, unknown>
   const candidateIsTransform = node?.type === 'transform'
   const candidateIsLibrary = candidateIsTransform && candidateCfg.source === 'library'
@@ -168,12 +212,20 @@ export function CodeFullscreen() {
   const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
   const syntaxErrorLine = preview?.result?.failureCategory === 'syntax_error'
     ? preview.result.syntaxError?.line : undefined
+  const selectedEditorInputRunId = preview?.result?.editorTestInput?.runId
   const freshUpstreamResultReady = Boolean(
-    freshUpstreamRunDone && upstreamRunId
-    && preview?.result?.editorTestInput?.runId === upstreamRunId,
+    requestIsCurrent && !upstreamRequest?.cancelled
+    && upstreamRun?.phase !== 'failed'
+    && preview && previewIsCurrent(preview, doc, fs.nodeId)
+    && upstreamRequest?.refreshPreviewGeneration != null
+    && preview.requestGeneration === upstreamRequest.refreshPreviewGeneration
+    && selectedEditorInputRunId
+    && selectedEditorInputRunId !== upstreamRequest?.baselineEditorInputRunId
+    && selectedEditorInputRunId !== upstreamRequest?.baselineRunId,
   )
   const upstreamSelectionFailed = Boolean(
-    freshUpstreamRunDone && refreshedUpstreamRunId.current === upstreamRunId
+    requestIsCurrent && upstreamRequest?.refreshPreviewGeneration != null
+    && preview?.requestGeneration === upstreamRequest.refreshPreviewGeneration
     && preview && !preview.loading && !freshUpstreamResultReady,
   )
   const upstreamAttemptBusy = Boolean(
@@ -220,20 +272,28 @@ export function CodeFullscreen() {
   }
   const runUpstream = () => {
     if (!editorUpstreamNodeId || !canRunUpstream || upstreamDispatching.current) return
-    const phase = useStore.getState().runs[editorUpstreamNodeId]?.phase
+    const current = useStore.getState()
+    const phase = current.runs[editorUpstreamNodeId]?.phase
     if (phase === 'estimating' || phase === 'confirm' || phase === 'running') return
     upstreamDispatching.current = true
     upstreamConfirming.current = false
     upstreamCancelling.current = false
     refreshedUpstreamRunId.current = null
+    refreshedUpstreamStatusRequest.current = null
+    const baselinePreview = current.editorPreviews[fs.nodeId]
     setUpstreamRequest({
+      sequence: ++upstreamRequestSequence.current,
       editorNodeId: fs.nodeId,
       upstreamNodeId: editorUpstreamNodeId,
       upstreamPortId: editorUpstreamPortId,
       upstreamPlanIdentity: previewPlanIdentity(
-        doc, editorUpstreamNodeId, editorUpstreamPortId,
+        current.doc, editorUpstreamNodeId, editorUpstreamPortId,
       ),
-      baselineRunId: useStore.getState().runs[editorUpstreamNodeId]?.status?.runId,
+      baselineRunId: current.runs[editorUpstreamNodeId]?.status?.runId,
+      baselineEditorInputRunId: baselinePreview?.result?.editorTestInput?.runId,
+      baselineUpstreamStatus: current.doc.nodes.find(
+        (candidate) => candidate.id === editorUpstreamNodeId,
+      )?.data.status,
     })
     void requestRun(editorUpstreamNodeId).finally(() => {
       upstreamDispatching.current = false
@@ -941,6 +1001,10 @@ function EditorUpstreamRunStatus({
   const upstreamLabel = useStore((s) => s.doc.nodes.find((node) => node.id === nodeId)?.data.title ?? nodeId)
   const rows = estimate?.rows == null ? 'an unknown number of rows' : `${estimate.rows.toLocaleString()} rows`
 
+  // A server-owned editor input is stronger evidence than a lagging run-status event. The graph
+  // may already expose the retained result while the initiating surface still says "running".
+  if (resultReady) return null
+
   if (phase === 'confirm') return (
     <section aria-label="Confirm upstream run" className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px]">
       <div className="font-semibold text-foreground">Confirm upstream run</div>
@@ -963,10 +1027,6 @@ function EditorUpstreamRunStatus({
       <div className="font-semibold text-destructive">Upstream run failed</div>
       <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{run?.error ?? 'The upstream result could not be produced.'}</p>
     </section>
-  )
-
-  if (phase === 'done' && resultReady) return (
-    null
   )
 
   if (phase === 'done' && selectionFailed) return (
