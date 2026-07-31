@@ -7,7 +7,7 @@ import type { PortSpec } from '../types/graph'
 // A typed port. Shape + tint encode the wire type (design — wire types). Incompatible
 // types can't connect — validity is enforced by the canvas onConnect check.
 // Affordance: an UNCONNECTED port is a hollow (outline) shape; a connected one is filled. On hover the
-// port grows and (output side) shows a "+" while hovered or selected — the visible affordance,
+// port grows and (output side) shows a "+" while hovered or keyboard-focused — the visible affordance,
 // instead of only a cursor change.
 // Output port UX: drag connects; a plain CLICK opens the add-node menu (React Flow doesn't fire
 // onConnectEnd on a no-move click, so we drive the menu off a real click event here).
@@ -18,15 +18,16 @@ export function Port({ spec, side, index, count, nodeId }: {
   const tok = wireTokens[w] ?? wireTokens.dataset
   const isSource = side === 'output'
   const top = count === 1 ? '50%' : `${((index + 1) / (count + 1)) * 100}%`
-  const [hover, setHover] = useState(false)
+  const [hovered, setHovered] = useState(false)
+  const [focused, setFocused] = useState(false)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
-  const selected = useStore((s) => !!nodeId && s.selectedIds.includes(nodeId))
   const connected = useStore((s) => s.doc.edges.some((e) => isSource
     ? e.source === nodeId && (e.sourceHandle == null || e.sourceHandle === spec.id)
     : e.target === nodeId && (e.targetHandle == null || e.targetHandle === spec.id)))
   const round = tok.shape !== 'square' && tok.shape !== 'diamond'
-  const addAffordance = canEdit && isSource && (hover || selected)
-  const emphasized = connected || hover || addAffordance
+  const engaged = hovered || focused
+  const addAffordance = canEdit && isSource && engaged
+  const emphasized = connected || engaged
   const interactive = canEdit && isSource && !!nodeId
   const openOperationPicker = (target: HTMLElement) => {
     if (!nodeId) return
@@ -71,8 +72,10 @@ export function Port({ spec, side, index, count, nodeId }: {
       tabIndex={interactive ? 0 : undefined}
       aria-label={interactive ? `Add operation from ${spec.label ?? `${w} output`}` : undefined}
       aria-haspopup={interactive ? 'dialog' : undefined}
-      onMouseEnter={() => { if (canEdit) setHover(true) }}
-      onMouseLeave={() => setHover(false)}
+      onMouseEnter={() => { if (canEdit) setHovered(true) }}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => { if (canEdit) setFocused(true) }}
+      onBlur={() => setFocused(false)}
       onClick={interactive ? (e) => {
         e.stopPropagation()
         openOperationPicker(e.currentTarget)

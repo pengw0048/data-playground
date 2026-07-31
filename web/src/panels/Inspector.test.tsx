@@ -1045,6 +1045,10 @@ describe('Inspector — Source connection details', () => {
     } as any)
 
     render(<Inspector />)
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/provider%3A%2F%2Fdatasets%2Forders?revision=revision%3Aan-intentionally-long-opaque-identity&revisionDataset=provider%3Adataset%3Aan-intentionally-long-opaque-identity&returnCanvas=source-connection&returnNode=source',
+    )
     expect(screen.getByText('binding:very-long-provider-source-binding')).not.toBeVisible()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
 
@@ -1058,6 +1062,24 @@ describe('Inspector — Source connection details', () => {
     expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
     expect(exact).toHaveBeenCalledWith('provider:dataset:an-intentionally-long-opaque-identity', 'revision:an-intentionally-long-opaque-identity')
     exact.mockRestore()
+  })
+
+  it('does not misroute an incomplete provider Source to the local dataset viewer', () => {
+    useStore.setState({
+      selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {},
+      catalog: [], doc: { id: 'source-connection', name: 'Source connection', version: 1, requirements: [], edges: [],
+        nodes: [{ id: 'source', type: 'source', position: { x: 0, y: 0 }, data: {
+          title: 'orders', status: 'latest', history: [], config: {
+            uri: 'workspace-provider://missing-placement', providerName: 'Luma Data API', providerReadMode: 'exact',
+            datasetRef: { kind: 'exact', datasetId: 'provider:dataset:orders', revisionId: 'revision:orders-v1' },
+          },
+        } }],
+      },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 })
 

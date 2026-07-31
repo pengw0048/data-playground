@@ -148,7 +148,7 @@ export function CanvasInboxPopover() {
             <span
               data-testid="canvas-inbox-unread-badge"
               aria-hidden
-              className="absolute -right-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-foreground px-1 text-[9px] font-bold leading-none text-background"
+              className="absolute right-0 top-0 grid h-4 min-w-4 place-items-center rounded-full bg-foreground px-1 text-[9px] font-bold leading-none text-background"
             >
               {count > 99 ? '99+' : count}
             </span>

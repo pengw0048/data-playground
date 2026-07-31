@@ -174,7 +174,7 @@ test.describe('minimum viewport support', () => {
     await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
     await node.click()
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Add operation from dataset output' })).toBeVisible()
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
     if (testInfo.project.name === 'chromium-reference-viewport') {
@@ -225,7 +225,7 @@ test.describe('minimum viewport support', () => {
     await runPanel.getByTitle('Close').click()
     await expect(runPanel).toHaveCount(0)
 
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const runHistory = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Run history' }) })
     await expectFullyInViewport(page, runHistory, 'run history')
@@ -482,9 +482,10 @@ test.describe('minimum viewport support', () => {
     await expect(appMenu.getByText('runs and background tasks', { exact: true })).toBeVisible()
     await expect(appMenu.getByRole('menuitem', { name: 'Inbox', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
-    await page.getByTestId('canvas-menu').click()
-    await expectFullyInViewport(page, page.getByRole('menu', { name: 'Canvas actions' }), '1024px Canvas actions menu')
-    await expect(page.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
+    await expect(appMenu).toBeHidden()
+    await page.getByTestId('app-menu').click()
+    await expectFullyInViewport(page, appMenu, '1024px Canvas menu')
+    await expect(appMenu.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
     await page.keyboard.press('Escape')
     // Escape closes the menu and clears the Canvas selection. The selection-owned Inspector only
     // returns for one real node, so restore that explicit precondition before exercising expansion.

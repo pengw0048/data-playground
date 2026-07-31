@@ -111,12 +111,11 @@ export function TopBar() {
       <div data-layout-region="canvas-top-chrome"
         style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden">
-          <AppMenu onWorkspace={() => navigateToWorkspace(null)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} />
-          <CanvasInboxPopover />
-          <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
-          <CanvasTitle />
-          <CanvasOverflowMenu
-            onShowInWorkspace={() => navigateToWorkspace(workspaceReturnDestination)}
+          <AppMenu
+            onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)}
+            onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)}
+            onImport={() => setImportOpen(true)}
+            onNativeImport={() => setNativeImportOpen(true)}
             onCanvasSettings={() => setCanvasSettingsOpen(true)}
             onRunHistory={() => setRunsOpen(true)}
             onVersionHistory={() => setVersionsOpen(true)}
@@ -124,6 +123,9 @@ export function TopBar() {
             onCopy={() => setCopyOpen(true)}
             copyable={!!canvasRole && kernelUp && saved && !currentDraftId}
           />
+          <CanvasInboxPopover />
+          <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
+          <CanvasTitle />
           <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
             <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
@@ -177,16 +179,31 @@ function PeerAvatars() {
   )
 }
 
-// Global destinations and preferences live here. Current-Canvas actions belong to CanvasOverflowMenu.
-export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
+// The primary menu owns both global destinations and the current Canvas lifecycle. Keeping one
+// predictable entry point avoids a second, ambiguous overflow trigger beside the Canvas title.
+export function AppMenu({
+  onWorkspace, onSettings, onImport, onNativeImport, onCanvasSettings, onRunHistory,
+  onVersionHistory, onNativeExport, onCopy, copyable,
+}: {
   onWorkspace: () => void
   onSettings: () => void
   onImport: () => void
   onNativeImport: () => void
+  onCanvasSettings: () => void
+  onRunHistory: () => void
+  onVersionHistory: () => void
+  onNativeExport: () => void
+  onCopy: () => void
+  copyable: boolean
 }) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
+  const doc = useStore((s) => s.doc)
+  const currentDraftId = useStore((s) => s.currentDraftId)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const deleteFile = useStore((s) => s.deleteFile)
+  const discardLocalDraft = useStore((s) => s.discardLocalDraft)
   const [themeMode, setVisibleThemeMode] = useState<ThemeMode>(getThemeMode)
   useEffect(() => {
     const sync = () => setVisibleThemeMode(getThemeMode())
@@ -209,6 +226,12 @@ export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
         {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
+        <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
+        <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>
@@ -222,6 +245,8 @@ export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
           </DropdownMenuSubContent>
         </DropdownMenuSub>
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
+        {canvasRole === 'owner' && <DropdownMenuSeparator />}
+        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -325,42 +350,6 @@ export function CanvasTitle() {
   >
     {name}
   </button>
-}
-
-export function CanvasOverflowMenu({ onShowInWorkspace, onCanvasSettings, onRunHistory, onVersionHistory, onNativeExport, onCopy, copyable }: {
-  onShowInWorkspace: () => void
-  onCanvasSettings: () => void
-  onRunHistory: () => void
-  onVersionHistory: () => void
-  onNativeExport: () => void
-  onCopy: () => void
-  copyable: boolean
-}) {
-  const doc = useStore((s) => s.doc)
-  const currentDraftId = useStore((s) => s.currentDraftId)
-  const canvasRole = useStore((s) => s.canvasRole)
-  const deleteFile = useStore((s) => s.deleteFile)
-  const discardLocalDraft = useStore((s) => s.discardLocalDraft)
-
-  return <DropdownMenu modal={false}>
-    <DropdownMenuTrigger asChild>
-      <Button data-testid="canvas-menu" variant="ghost" size="icon" aria-label="Canvas actions" title="Canvas actions" className="h-7 w-7 shrink-0">
-        <Icon name="more" size={15} />
-      </Button>
-    </DropdownMenuTrigger>
-    <DropdownMenuContent align="start" className="w-[210px]">
-      <DropdownMenuItem onSelect={onShowInWorkspace}><Icon name="grid" size={14} /> Show in Workspace</DropdownMenuItem>
-      <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
-      <DropdownMenuSeparator />
-      <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
-      <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
-      <DropdownMenuSeparator />
-      <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
-      <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
-      {canvasRole === 'owner' && <DropdownMenuSeparator />}
-      {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
-    </DropdownMenuContent>
-  </DropdownMenu>
 }
 
 function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {

@@ -6,7 +6,6 @@ import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
-import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
 import { cn } from '@/lib/utils'
@@ -30,7 +29,6 @@ export function Toolbar() {
   const agentOpen = useStore((s) => s.agentOpen)
   const canvasRole = useStore((s) => s.canvasRole)
   const [open, setOpen] = useState<Category | null>(null)
-  const [operationFinderOpen, setOperationFinderOpen] = useState(false)
   const [locatorOpen, setLocatorOpen] = useState(false)
   const toolbarRef = useRef<HTMLDivElement>(null)
 
@@ -63,7 +61,6 @@ export function Toolbar() {
     const pos = safeToolbarPosition(useStore.getState().doc.nodes, base)
     addNode(kind, pos)
     setOpen(null)
-    setOperationFinderOpen(false)
   }
 
   const toolbarDensity = useToolbarDensity(toolbarRef)
@@ -106,8 +103,7 @@ export function Toolbar() {
 
               <div className="mx-1 h-[22px] w-px bg-border" />
 
-              <ToolbarIconButton label="Add operation" icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
-              <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
+              <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
                 <button
@@ -125,7 +121,6 @@ export function Toolbar() {
           </div>
         </div>
       )}
-      {operationFinderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </>
   )

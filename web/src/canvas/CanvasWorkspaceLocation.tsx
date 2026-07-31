@@ -54,7 +54,10 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
     void api.workspaceResource(`canvas:${canvasId}`).then((resolved) => {
       if (!current || resolved.resource?.kind !== 'canvas') return
       // `parentId` is an API-issued stable Workspace reference, never a reconstructed path.
-      onReturnDestination(resolved.resource.parentId ?? null)
+      // The local root is the generic Workspace route, not a user-visible nested destination.
+      onReturnDestination(displayAncestors(resolved.ancestors).length === 0
+        ? null
+        : resolved.resource.parentId ?? null)
       if (locationUnavailable(resolved.resource, resolved.source)) {
         setState({ kind: 'unavailable' })
         return
@@ -80,7 +83,7 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
 
   const ancestors = displayAncestors(state.ancestors)
   // A root-only "Workspace" row repeats the global destination without communicating location.
-  // Keep the resolver active for Show in Workspace, but render a path only when it has a named parent.
+  // Keep the resolver active for Back to Workspace, but render a path only when it has a named parent.
   if (ancestors.length === 0) return null
 
   return (

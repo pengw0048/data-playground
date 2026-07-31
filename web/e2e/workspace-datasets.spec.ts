@@ -168,10 +168,10 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     }).toEqual(['done', 'done'])
 
     await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' })).toHaveCount(0)
-    await page.getByTestId('canvas-menu').click()
-    await page.getByText('Show in Workspace').click()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace').click()
     await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
-    await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
+    await expect(page).toHaveURL(/#\/workspace$/)
     await page.getByRole('tab', { name: 'Local catalog' }).click()
     await expect(search).toHaveValue('')
     await search.fill('issue497_')

@@ -24,7 +24,20 @@ vi.mock('../store/graph', () => ({
   ),
 }))
 
-import { AppMenu, CanvasOverflowMenu, CanvasTitle } from './TopBar'
+import { AppMenu, CanvasTitle } from './TopBar'
+
+const appMenuProps = () => ({
+  onWorkspace: vi.fn(),
+  onSettings: vi.fn(),
+  onImport: vi.fn(),
+  onNativeImport: vi.fn(),
+  onCanvasSettings: vi.fn(),
+  onRunHistory: vi.fn(),
+  onVersionHistory: vi.fn(),
+  onNativeExport: vi.fn(),
+  onCopy: vi.fn(),
+  copyable: true,
+})
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -45,16 +58,10 @@ beforeEach(() => {
 })
 
 describe('AppMenu', () => {
-  it('uses a standard menu affordance and keeps only global destinations and preferences', async () => {
+  it('uses one standard menu for global destinations and current-Canvas actions', async () => {
     const user = userEvent.setup()
-    render(
-      <AppMenu
-        onWorkspace={vi.fn()}
-        onSettings={vi.fn()}
-        onImport={vi.fn()}
-        onNativeImport={vi.fn()}
-      />,
-    )
+    const props = appMenuProps()
+    render(<AppMenu {...props} />)
 
     const trigger = screen.getByRole('button', { name: 'Data Playground menu' })
     expect(trigger).toHaveAttribute('title', 'Data Playground menu')
@@ -75,22 +82,20 @@ describe('AppMenu', () => {
     expect(screen.getByRole('menuitem', { name: 'Import native Canvas…' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Appearance' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Settings' })).toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Run history' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Version history' })).not.toBeInTheDocument()
-    expect(screen.queryByTestId('copy-canvas')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('export-native-canvas')).not.toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Canvas settings…' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Run history' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Version history' })).toBeInTheDocument()
+    expect(screen.getByTestId('copy-canvas')).toBeInTheDocument()
+    expect(screen.getByTestId('export-native-canvas')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Delete this Canvas' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Canvas actions' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('menuitem', { name: 'Back to Workspace' }))
+    expect(props.onWorkspace).toHaveBeenCalledTimes(1)
   })
 
   it('offers System, Light, and Dark as an Appearance submenu', async () => {
     const user = userEvent.setup()
-    render(
-      <AppMenu
-        onWorkspace={vi.fn()}
-        onSettings={vi.fn()}
-        onImport={vi.fn()}
-        onNativeImport={vi.fn()}
-      />,
-    )
+    render(<AppMenu {...appMenuProps()} />)
 
     await user.click(screen.getByRole('button', { name: 'Data Playground menu' }))
     await user.hover(screen.getByRole('menuitem', { name: 'Appearance' }))
@@ -175,35 +180,5 @@ describe('CanvasTitle', () => {
     await userEvent.setup().click(title)
     expect(screen.queryByRole('textbox', { name: 'Canvas name' })).not.toBeInTheDocument()
     expect(state.renameFile).not.toHaveBeenCalled()
-  })
-})
-
-describe('CanvasOverflowMenu', () => {
-  it('owns only current-Canvas actions', async () => {
-    const user = userEvent.setup()
-    const onShowInWorkspace = vi.fn()
-    render(
-      <CanvasOverflowMenu
-        onShowInWorkspace={onShowInWorkspace}
-        onCanvasSettings={vi.fn()}
-        onRunHistory={vi.fn()}
-        onVersionHistory={vi.fn()}
-        onNativeExport={vi.fn()}
-        onCopy={vi.fn()}
-        copyable
-      />,
-    )
-
-    await user.click(screen.getByRole('button', { name: 'Canvas actions' }))
-    expect(screen.getByRole('menuitem', { name: 'Show in Workspace' })).toBeInTheDocument()
-    expect(screen.getByRole('menuitem', { name: 'Canvas settings…' })).toBeInTheDocument()
-    expect(screen.getByRole('menuitem', { name: 'Run history' })).toBeInTheDocument()
-    expect(screen.getByRole('menuitem', { name: 'Version history' })).toBeInTheDocument()
-    expect(screen.getByRole('menuitem', { name: 'Delete this Canvas' })).toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'New Canvas' })).not.toBeInTheDocument()
-    expect(screen.queryByText('Create example Canvas')).not.toBeInTheDocument()
-    expect(screen.queryByText('Files')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('menuitem', { name: 'Show in Workspace' }))
-    expect(onShowInWorkspace).toHaveBeenCalledTimes(1)
   })
 })
