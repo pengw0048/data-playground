@@ -61,14 +61,14 @@ describe('Shell primary navigation', () => {
   it('opens top-level Jobs and Transforms instead of retaining unavailable details', () => {
     useStore.setState({
       view: 'jobs',
-      jobsQuery: 'report=missing-report&compare=missing-comparison',
+      jobsQuery: 'status=failed&canvas=demo-canvas&run=missing-run&output=write%3Aout&report=missing-report&compare=missing-comparison',
       transformResourceId: 'missing-transform',
       transformVersion: 'v9',
     } as never)
     render(<Shell />)
 
     fireEvent.click(screen.getByTestId('rail-jobs'))
-    expect(useStore.getState()).toMatchObject({ view: 'jobs', jobsQuery: '' })
+    expect(useStore.getState()).toMatchObject({ view: 'jobs', jobsQuery: 'status=failed&canvas=demo-canvas' })
 
     useStore.setState({ view: 'transforms' } as never)
     fireEvent.click(screen.getByTestId('rail-transforms'))

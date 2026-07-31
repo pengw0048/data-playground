@@ -87,7 +87,9 @@ export function DistributionReportLauncher({ definition }: { definition: Dataset
   </section>
 }
 
-export function DistributionReportPage({ reportId, compareReportId, onClose }: { reportId: string; compareReportId?: string; onClose?: () => void }) {
+export function DistributionReportPage({ reportId, compareReportId, backHref = routeHash('jobs'), onClose }: {
+  reportId: string; compareReportId?: string; backHref?: string; onClose?: () => void
+}) {
   const [envelope, setEnvelope] = useState<DistributionReportEnvelope | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshError, setRefreshError] = useState<ReportFailure | null>(null)
@@ -147,7 +149,11 @@ export function DistributionReportPage({ reportId, compareReportId, onClose }: {
   if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading exact retained report…</div>
   if (!envelope) return <div role="alert" className="m-4 grid gap-3 rounded border border-destructive/30 bg-destructive/10 p-4 text-[12px] text-destructive">
     <span>{unavailableMessage(refreshError)} <button className="font-semibold underline" onClick={() => void load(reportId, true)}>Retry</button></span>
-    <a href={routeHash('jobs')} onClick={onClose ? (event) => { event.preventDefault(); onClose() } : undefined}
+    <a href={backHref} onClick={onClose ? (event) => {
+      event.preventDefault()
+      window.history.replaceState(window.history.state, '', backHref)
+      onClose()
+    } : undefined}
       className="w-fit rounded-md border border-border bg-background px-3 py-1.5 font-semibold text-foreground hover:bg-accent">
       Back to Jobs
     </a>

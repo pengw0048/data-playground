@@ -99,12 +99,15 @@ describe('TransformsLibrary', () => {
 
   it('recovers from an unavailable Transform deep link', async () => {
     mocks.transformLibraryDetail.mockRejectedValue(new KernelError(404, 'Transform not found'))
+    store.transformLibraryQuery = 'q=robot'
+    window.location.hash = '#/transforms/tr_exact?version=v1&q=robot'
 
     render(<TransformsLibrary />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Transform not found')
     fireEvent.click(screen.getByRole('button', { name: 'Back to Transforms' }))
     expect(store.setTransformResource).toHaveBeenCalledWith(null)
+    expect(window.location.hash).toBe('#/transforms?q=robot')
   })
 
   it('shows the exact user-authored source for a promoted version', async () => {
