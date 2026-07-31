@@ -66,6 +66,30 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   expect(canvasResponse.ok()).toBe(true)
   const canvas = await canvasResponse.json() as { nodes: Array<{ id: string }> }
   expect(canvas.nodes).toHaveLength(1)
+  const transformNodeId = canvas.nodes[0].id
+
+  await page.goto(
+    `/#/transforms/${encodeURIComponent(transform.id)}?version=${encodeURIComponent(transform.version)}&canvas=${encodeURIComponent(canvasId)}&node=${encodeURIComponent(transformNodeId)}`,
+  )
+  await expect(page.getByRole('heading', { name: title })).toBeVisible()
+  const backToExactNode = page.getByRole('link', { name: 'Back to Canvas' })
+  await expect(backToExactNode).toHaveAttribute(
+    'href', `#/canvas/${encodeURIComponent(canvasId)}?node=${encodeURIComponent(transformNodeId)}`,
+  )
+
+  await page.getByLabel('Search Transforms').fill(`no-match-${suffix}`)
+  const filteredContext = page.getByTestId('selected-transform-filter-context')
+  await expect(filteredContext).toContainText('The selected Transform remains open.')
+  await expect(filteredContext).toContainText('No list results match the current filters.')
+  await expect(page.getByRole('heading', { name: title })).toBeVisible()
+  await filteredContext.getByRole('button', { name: 'Clear filters' }).click()
+  await expect(filteredContext).toHaveCount(0)
+  expect(new URL(page.url()).hash).not.toContain('q=')
+
+  await backToExactNode.click()
+  await expect(page).toHaveURL(
+    new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=${encodeURIComponent(transformNodeId)}$`),
+  )
 
   expect((await request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`, { headers })).ok()).toBe(true)
   expect((await request.delete(
