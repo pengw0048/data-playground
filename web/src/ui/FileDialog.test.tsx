@@ -64,7 +64,7 @@ describe('FileDialog request and open-mutation truth', () => {
     expect(register).toHaveBeenCalledTimes(2)
   })
 
-  it('keeps save selection capability-neutral until the chosen destination is admitted', async () => {
+  it('browses a configured save location and returns the selected relative folder', async () => {
     mocks.destinations.mockResolvedValueOnce({
       destinations: [
         { id: 'managed', name: 'Workspace outputs', backend: 'local', root: '/outputs' },
@@ -72,49 +72,105 @@ describe('FileDialog request and open-mutation truth', () => {
       ],
       backends: ['local', 'plugin'],
     })
+    mocks.browseDestination.mockImplementation(async (destinationId: string, path: string) => ({
+      path,
+      entries: path
+        ? [{ name: 'existing.parquet', kind: 'file' as const, uri: `provider://exports/${path}/existing.parquet` }]
+        : [
+            { name: 'daily', kind: 'dir' as const, uri: `provider://exports/daily` },
+            { name: 'orders.parquet', kind: 'file' as const, uri: `provider://exports/orders.parquet` },
+          ],
+      writable: true,
+      destinationId,
+    }))
     const pick = vi.fn()
     render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={pick} />)
 
     expect(await screen.findByText('Destinations')).toBeVisible()
     expect(screen.getByText('Choose output destination')).toBeVisible()
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Workspace outputs')
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Local')
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('/outputs')
     fireEvent.click(screen.getByRole('button', { name: 'External provider' }))
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('External provider')
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('plugin')
-    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('provider://exports')
+    expect(await screen.findByText('orders.parquet')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'daily' }))
+    expect(await screen.findByText('existing.parquet')).toBeVisible()
     expect(screen.queryByText(/managed revision|versioned revision/i)).not.toBeInTheDocument()
-    expect(screen.getByText('Output name')).toBeVisible()
-    expect(screen.queryByText('orders.csv')).not.toBeInTheDocument()
-    expect(screen.queryByTitle('New folder')).not.toBeInTheDocument()
-    expect(mocks.browseDestination).not.toHaveBeenCalled()
+    expect(screen.getByText('Dataset name')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New folder' })).toBeVisible()
+    expect(mocks.browseDestination).toHaveBeenCalledWith('external', 'daily')
     expect(mocks.mkdirDestination).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: 'Use destination' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save here' }))
 
     expect(pick).toHaveBeenCalledWith({
-      destId: 'external', destName: 'External provider', path: '', filename: 'results',
+      destId: 'external', destName: 'External provider', path: 'daily', filename: 'results',
     })
   })
 
-  it('explains object-store presets and hands destination management to Settings', async () => {
+  it('creates and enters a child folder before saving', async () => {
+    const pick = vi.fn()
+    render(<FileDialog mode="save" defaultName="embeddings.parquet" onClose={vi.fn()} onPick={pick} />)
+
+    await screen.findByText('orders.csv')
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'New folder name' }), { target: { value: 'experiments' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() => expect(mocks.mkdirDestination).toHaveBeenCalledWith('local', '', 'experiments'))
+    await waitFor(() => expect(mocks.browseDestination).toHaveBeenCalledWith('local', 'experiments'))
+    expect(screen.getByRole('button', { name: 'experiments' })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Save here' }))
+    expect(pick).toHaveBeenCalledWith({
+      destId: 'local', destName: 'Workspace', path: 'experiments', filename: 'embeddings.parquet',
+    })
+  })
+
+  it('keeps invalid-name and create-folder failures inline and recoverable', async () => {
+    mocks.mkdirDestination
+      .mockResolvedValueOnce({ error: 'folder already exists' })
+      .mockResolvedValueOnce({ ok: true })
+    render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={vi.fn()} />)
+
+    await screen.findByText('orders.csv')
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    const input = screen.getByRole('textbox', { name: 'New folder name' })
+    fireEvent.change(input, { target: { value: '../outside' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByText(/without slashes/i)).toBeVisible()
+    expect(mocks.mkdirDestination).not.toHaveBeenCalled()
+
+    fireEvent.change(input, { target: { value: 'daily' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByText('folder already exists')).toBeVisible()
+    expect(input).toHaveValue('daily')
+
+    fireEvent.change(input, { target: { value: 'weekly' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(mocks.mkdirDestination).toHaveBeenCalledTimes(2))
+    expect(await screen.findByRole('button', { name: 'weekly' })).toBeVisible()
+  })
+
+  it('keeps a list-denied configured prefix selectable and hands management to Settings', async () => {
     mocks.destinations.mockResolvedValueOnce({
       destinations: [
         { id: 's3-results', name: 'Research outputs', backend: 's3', root: 's3://ml-results/daily' },
       ],
       backends: ['local', 's3', 'gs'],
     })
+    mocks.browseDestination.mockResolvedValueOnce({
+      path: '', entries: [], writable: true, error: 'Access Denied while listing',
+    })
     const manage = vi.fn()
+    const pick = vi.fn()
     render(
       <FileDialog mode="save" defaultName="embeddings.parquet" onClose={vi.fn()}
-        onPick={vi.fn()} onManageDestinations={manage} />,
+        onPick={pick} onManageDestinations={manage} />,
     )
 
-    const selected = await screen.findByLabelText('Selected destination')
-    expect(selected).toHaveTextContent('Research outputs')
-    expect(selected).toHaveTextContent('S3')
-    expect(selected).toHaveTextContent('s3://ml-results/daily')
-    expect(selected).toHaveTextContent(/Add local, S3, or GCS locations as named destinations in Settings/i)
+    expect(await screen.findByText(/Couldn't load this folder: Access Denied/i)).toBeVisible()
+    expect(screen.getByText(/You can still save to this configured location/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Save here' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Save here' }))
+    expect(pick).toHaveBeenCalledWith({
+      destId: 's3-results', destName: 'Research outputs', path: '', filename: 'embeddings.parquet',
+    })
 
     fireEvent.click(screen.getByRole('button', { name: 'Manage destinations' }))
     expect(manage).toHaveBeenCalledTimes(1)

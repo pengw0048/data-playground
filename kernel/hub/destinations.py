@@ -56,7 +56,7 @@ class LocalBackend:
         return base if (base == top or base.startswith(top + os.sep)) else top  # never escape the root
 
     def mkdir(self, root: str, path: str, name: str) -> None:
-        os.makedirs(os.path.join(self._safe(root, path), os.path.basename(name)), exist_ok=True)
+        os.mkdir(os.path.join(self._safe(root, path), _folder_name(name)))
 
 
 class ObjectStoreBackend:
@@ -155,6 +155,20 @@ def _find(workspace: str, dest_id: str) -> dict | None:
     return next((d for d in presets(workspace) if d.get("id") == dest_id), None)
 
 
+def _folder_name(name: str) -> str:
+    """Validate one child segment without silently rewriting an unsafe request."""
+    if (
+        not name
+        or name != name.strip()
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(ord(char) < 32 for char in name)
+    ):
+        raise ValueError("folder name must be one non-empty path segment")
+    return name
+
+
 def selected_object_store_credential(workspace: str, dest_id: str | None) -> tuple[str, str] | None:
     """Return the selected credential source and destination label without resolving secret material.
 
@@ -212,11 +226,15 @@ def mkdir(workspace: str, dest_id: str, path: str, name: str) -> dict:
     d = _find(workspace, dest_id)
     if not d:
         return {"error": "unknown destination"}
+    try:
+        folder = _folder_name(name)
+    except ValueError as e:
+        return {"error": str(e)}
     b = _BACKENDS.get(d.get("backend", "local"))
     if b is None or not hasattr(b, "mkdir"):
         return {"ok": True}  # object stores have no real folders — the prefix is created on write
     try:
-        b.mkdir(d.get("root", ""), path or "", name)
+        b.mkdir(d.get("root", ""), path or "", folder)
         return {"ok": True}
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}

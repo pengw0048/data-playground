@@ -4782,6 +4782,23 @@ def test_object_store_destination_browse_rejects_paths_outside_root(monkeypatch,
     assert not called
 
 
+def test_local_destination_mkdir_is_one_contained_new_child(tmp_path):
+    from hub import destinations
+
+    root = tmp_path / "outputs"
+    root.mkdir()
+    backend = destinations.LocalBackend()
+
+    backend.mkdir(str(root), "", "daily")
+    assert (root / "daily").is_dir()
+    with pytest.raises(FileExistsError):
+        backend.mkdir(str(root), "", "daily")
+    for name in ("", ".", "..", "../outside", "nested/child", r"nested\child", " padded "):
+        with pytest.raises(ValueError):
+            backend.mkdir(str(root), "", name)
+    assert not (tmp_path / "outside").exists()
+
+
 def test_object_store_feather_roundtrip(tmp_path, object_store_cred):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a

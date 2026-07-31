@@ -393,7 +393,7 @@ describe('Inspector — effective named outputs', () => {
     window.removeEventListener('dp-open-settings', onOpenSettings)
   })
 
-  it('explains administrator-managed destinations without exposing Settings to an editor', async () => {
+  it('shows configured destinations without exposing Settings to an editor', async () => {
     selectNode('write', undefined)
     useStore.setState({
       currentUser: { id: 'editor', name: 'Editor', capabilities: [] },
@@ -408,8 +408,8 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
     fireEvent.click(screen.getByRole('button', { name: 'Choose destination…' }))
 
-    expect(await screen.findByText(/Destinations are configured by an administrator/i)).toBeVisible()
-    expect(screen.getByText(/Ask an administrator to add or change a local, S3, or GCS location/i)).toBeVisible()
+    expect((await screen.findAllByRole('button', { name: 'Workspace outputs' }))[0]).toBeVisible()
+    expect(screen.getByText('Dataset name')).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Manage destinations' })).not.toBeInTheDocument()
     expect(onOpenSettings).not.toHaveBeenCalled()
     window.removeEventListener('dp-open-settings', onOpenSettings)
