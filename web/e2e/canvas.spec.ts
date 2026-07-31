@@ -1164,7 +1164,9 @@ test.describe('Data Playground canvas', () => {
       ['Compute', 'transform'],
     ] as const) {
       await addNode(page, category, title)
-      const shelf = page.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'Output versions' }).locator('..')
+      const addedNode = page.locator('.react-flow__node').last()
+      await expect(addedNode.getByText(title, { exact: true }).first()).toBeVisible()
+      const shelf = addedNode.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'Output versions' }).locator('..')
       await expect(shelf).toBeVisible()
       const shelfBox = await boxOf(shelf)
       expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the visible Canvas`).toBe(true)
