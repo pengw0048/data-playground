@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { api, type BrowseEntry, type DestinationPreset } from '../api/client'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -11,29 +11,37 @@ import { Icon } from './Icon'
 // write admission can say whether that selection publishes a managed revision.
 export interface OpenResult { uri: string; name: string }
 export interface SaveResult { destId: string; destName: string; path: string; filename: string }
+export interface SaveDialogDraft { destId: string; path: string; filename: string }
+
+type CommonDialogProps = {
+  onClose: () => void
+  title?: string
+  /** Preserve the original picker trigger across a temporary Settings handoff. */
+  restoreFocusTo?: HTMLElement | null
+}
 
 export function FileDialog(props:
-  | { mode: 'open'; onPick: (r: OpenResult) => void | Promise<void>; onClose: () => void; title?: string }
-  | {
+  | (CommonDialogProps & { mode: 'open'; onPick: (r: OpenResult) => void | Promise<void> })
+  | (CommonDialogProps & {
       mode: 'save'
       defaultName?: string
+      initialDraft?: SaveDialogDraft
       onPick: (r: SaveResult) => void
-      onClose: () => void
-      onManageDestinations?: () => void
-      title?: string
-    },
+      onManageDestinations?: (draft: SaveDialogDraft, restoreFocusTo: HTMLElement | null) => void
+    }),
 ) {
   const { mode, onClose } = props
   const [dests, setDests] = useState<DestinationPreset[]>([])
-  const [destId, setDestId] = useState('')
-  const [path, setPath] = useState('')
+  const [destId, setDestId] = useState(mode === 'save' ? (props.initialDraft?.destId ?? '') : '')
+  const [path, setPath] = useState(mode === 'save' ? (props.initialDraft?.path ?? '') : '')
   const [entries, setEntries] = useState<BrowseEntry[]>([])
   const [destError, setDestError] = useState<string | null>(null)
   const [browseError, setBrowseError] = useState<string | null>(null)
   const [loadingDests, setLoadingDests] = useState(true)
   const [loading, setLoading] = useState(false)
   const [writable, setWritable] = useState(true)
-  const [filename, setFilename] = useState(mode === 'save' ? (props.defaultName ?? 'output') : '')
+  const [filename, setFilename] = useState(mode === 'save'
+    ? (props.initialDraft?.filename ?? props.defaultName ?? 'output') : '')
   const [pickError, setPickError] = useState<string | null>(null)
   const [pickingUri, setPickingUri] = useState<string | null>(null)
   const [creatingFolder, setCreatingFolder] = useState(false)
@@ -41,6 +49,10 @@ export function FileDialog(props:
   const [folderError, setFolderError] = useState<string | null>(null)
   const [makingFolder, setMakingFolder] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  const handingOff = useRef(false)
+  const [returnFocus] = useState<HTMLElement | null>(() => props.restoreFocusTo !== undefined
+    ? props.restoreFocusTo
+    : document.activeElement instanceof HTMLElement ? document.activeElement : null)
   const destinationRequest = useRef(0)
   const browseRequest = useRef(0)
 
@@ -62,11 +74,6 @@ export function FileDialog(props:
     void loadDestinations()
     return () => { destinationRequest.current += 1 }
   }, [loadDestinations])
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !pickingUri) onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, pickingUri])
   const refresh = useCallback(async () => {
     const s = ++browseRequest.current
     setPickError(null)
@@ -92,14 +99,6 @@ export function FileDialog(props:
     void refresh()
     return () => { browseRequest.current += 1 }
   }, [refresh])
-  // Select the proposed logical name once when an output-destination dialog opens.
-  useEffect(() => {
-    if (mode !== 'save') return
-    const el = fileRef.current
-    if (el) { el.focus(); const dot = filename.lastIndexOf('.'); el.setSelectionRange(0, dot > 0 ? dot : filename.length) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
   const dest = dests.find((d) => d.id === destId)
   const filenameError = mode === 'save' ? validateDatasetName(filename) : null
   const segs = path ? path.split('/').filter(Boolean) : []
@@ -152,22 +151,44 @@ export function FileDialog(props:
     props.onPick({ destId, destName: dest.name, path, filename })
   }
 
-  return createPortal(
-    <div className="dp-modal-overlay fixed inset-0 z-[2100] grid place-items-center bg-black/30" onMouseDown={() => { if (!pickingUri) onClose() }}>
-      <div onMouseDown={(e) => e.stopPropagation()}
+  return (
+    <DialogPrimitive.Root open onOpenChange={(open) => { if (!open && !pickingUri) onClose() }}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="dp-modal-overlay fixed inset-0 z-[2100] bg-black/30" />
+        <DialogPrimitive.Content aria-modal="true" aria-describedby={undefined}
+          onEscapeKeyDown={(event) => {
+            // The dialog closes during document capture. Stop this native event there so React
+            // Flow cannot also treat it as Escape on the underlying selected node.
+            event.stopPropagation()
+            if (pickingUri) event.preventDefault()
+          }}
+          onPointerDownOutside={(event) => { if (pickingUri) event.preventDefault() }}
+          onOpenAutoFocus={(event) => {
+            if (mode !== 'save' || !fileRef.current) return
+            event.preventDefault()
+            fileRef.current.focus()
+            const dot = filename.lastIndexOf('.')
+            fileRef.current.setSelectionRange(0, dot > 0 ? dot : filename.length)
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            if (!handingOff.current) returnFocus?.focus()
+          }}
         className={cn(
-          'flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg',
+          'fixed left-1/2 top-1/2 z-[2100] flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg',
           mode === 'save'
             ? 'h-[min(520px,88vh)] w-[min(760px,94vw)]'
             : 'h-[min(460px,88vh)] w-[min(640px,94vw)]',
         )}>
         <div className="flex items-center gap-2 border-b border-border px-[14px] py-[11px]">
           <span className="flex items-center text-muted-foreground"><Icon name={mode === 'save' ? 'export' : 'db'} size={14} /></span>
-          <span className="text-[13.5px] font-semibold">
+          <DialogPrimitive.Title className="text-[13.5px] font-semibold">
             {props.title ?? (mode === 'save' ? 'Choose output destination' : 'Open a file')}
-          </span>
+          </DialogPrimitive.Title>
           <span className="flex-1" />
-          <button onClick={onClose} disabled={pickingUri !== null} aria-label="Close" className="grid h-6 w-[26px] place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"><Icon name="close" size={13} /></button>
+          <DialogPrimitive.Close asChild>
+            <button disabled={pickingUri !== null} aria-label="Close" className="grid h-6 w-[26px] place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"><Icon name="close" size={13} /></button>
+          </DialogPrimitive.Close>
         </div>
 
         <div className="flex min-h-0 flex-1">
@@ -198,7 +219,10 @@ export function FileDialog(props:
             </div>}
             <span className="flex-1" />
             {mode === 'save' && props.onManageDestinations && (
-              <Button variant="ghost" size="sm" className="mt-2 justify-start" onClick={props.onManageDestinations}>
+              <Button variant="ghost" size="sm" className="mt-2 justify-start" onClick={() => {
+                handingOff.current = true
+                props.onManageDestinations?.({ destId, path, filename }, returnFocus)
+              }}>
                 <Icon name="settings" size={12} /> Manage destinations
               </Button>
             )}
@@ -311,9 +335,9 @@ export function FileDialog(props:
             </Button>
           </div>
         )}
-      </div>
-    </div>,
-    document.body,
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
   )
 }
 

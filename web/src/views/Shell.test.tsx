@@ -39,6 +39,9 @@ describe('Shell primary navigation', () => {
   it('opens Workspace home instead of restoring a stale resource dialog', async () => {
     render(<Shell />)
 
+    expect(screen.getByText('local mode')).toBeVisible()
+    expect(screen.queryByText('signed in')).not.toBeInTheDocument()
+
     fireEvent.click(screen.getByTestId('rail-collapse'))
     const productMark = screen.getByTestId('workspace-product-mark')
     expect(productMark).toContainHTML('<svg')
@@ -53,6 +56,15 @@ describe('Shell primary navigation', () => {
     })
     expect(screen.getByText('workspace view')).toBeVisible()
     await waitFor(() => expect(mocks.inboxUnreadCount).toHaveBeenCalled())
+  })
+
+  it('labels an authenticated identity as signed in', () => {
+    useStore.setState({ authEnabled: true } as never)
+
+    render(<Shell />)
+
+    expect(screen.getByText('signed in')).toBeVisible()
+    expect(screen.queryByText('local mode')).not.toBeInTheDocument()
   })
 
   it('does not let an older unread-count response overwrite a mark-all refresh', async () => {

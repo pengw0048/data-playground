@@ -234,6 +234,28 @@ describe('InboxView', () => {
     expect(screen.queryByText('Climate analysis')).toBeNull()
     expect(mocks.inboxMarkAllRead).toHaveBeenCalledTimes(1)
     expect(onUnreadChange).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Mark all as read' })).toBeDisabled()
+  })
+
+  it('disables mark-all when the complete loaded result is already read', async () => {
+    mocks.inboxList.mockResolvedValue({
+      items: [item({ readAt: '2026-07-17T12:05:00Z' })], hasMore: false, nextCursor: null,
+    })
+    render(<InboxView />)
+
+    await screen.findByText('Climate analysis')
+    expect(screen.getByRole('button', { name: 'Mark all as read' })).toBeDisabled()
+    expect(mocks.inboxMarkAllRead).not.toHaveBeenCalled()
+  })
+
+  it('keeps mark-all available when older pages may still contain unread items', async () => {
+    mocks.inboxList.mockResolvedValue({
+      items: [item({ readAt: '2026-07-17T12:05:00Z' })], hasMore: true, nextCursor: 'older',
+    })
+    render(<InboxView />)
+
+    await screen.findByText('Climate analysis')
+    expect(screen.getByRole('button', { name: 'Mark all as read' })).toBeEnabled()
   })
 
   it('keeps rows unread and refreshes server truth when mark-all fails', async () => {

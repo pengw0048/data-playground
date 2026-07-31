@@ -8,7 +8,7 @@ import { useInputColumns, useSchemaWarnings } from '../nodes/fields'
 import { codeHash, outputPortId } from '../nodes/schema'
 import { color, status as statusTok, kindAccent } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
-import { FileDialog } from '../ui/FileDialog'
+import { FileDialog, type SaveDialogDraft } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
 import { api, KernelError } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
@@ -590,6 +590,8 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
     (s) => s.currentUser?.capabilities?.includes('global_settings') === true,
   )
   const [dlg, setDlg] = useState(false)
+  const [pickerDraft, setPickerDraft] = useState<SaveDialogDraft | null>(null)
+  const [pickerRestoreFocus, setPickerRestoreFocus] = useState<HTMLElement | null | undefined>(undefined)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   const filename = String(cfg.filename ?? cfg.name ?? 'output')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
@@ -614,22 +616,40 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
         outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'}
         returnToCanvas={{ canvasId, nodeId }} />
       <div className="mt-2">
-        <CodeBtn icon="export" label="Choose destination…" onClick={() => setDlg(true)} />
+        <CodeBtn icon="export" label="Choose destination…" onClick={() => {
+          setPickerDraft(null)
+          setPickerRestoreFocus(undefined)
+          setDlg(true)
+        }} />
       </div>
       {dlg && (
-        <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
+        <FileDialog mode="save" defaultName={filename} initialDraft={pickerDraft ?? undefined}
+          restoreFocusTo={pickerRestoreFocus}
+          onClose={() => {
+            setDlg(false)
+            setPickerDraft(null)
+            setPickerRestoreFocus(undefined)
+          }}
           onManageDestinations={canManageDestinations
-            ? () => {
+            ? (draft, restoreFocusTo) => {
+                setPickerDraft(draft)
+                setPickerRestoreFocus(restoreFocusTo)
                 setDlg(false)
                 window.dispatchEvent(new CustomEvent('dp-open-settings', {
                   detail: {
                     category: 'destinations',
                     trigger: document.querySelector<HTMLElement>('[data-testid="app-menu"]'),
+                    onClose: () => setDlg(true),
                   },
                 }))
               }
             : undefined}
-          onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
+          onPick={(r) => {
+            updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename })
+            setDlg(false)
+            setPickerDraft(null)
+            setPickerRestoreFocus(undefined)
+          }} />
       )}
     </Section>
   )

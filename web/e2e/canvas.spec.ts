@@ -2238,12 +2238,12 @@ test.describe('Data Playground canvas', () => {
     })
   })
 
-  test('identity lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
-    await page.goto('/')
+  test('session context lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
+    await fresh(page)
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
     await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
     await backToWorkspace(page)
-    await expect(page.getByText('signed in')).toBeVisible() // identity indicator on the Workspace shell
+    await expect(page.getByText('local mode')).toBeVisible() // truthful session context on the Workspace shell
     await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
@@ -2345,7 +2345,7 @@ test.describe('Data Playground canvas', () => {
     const inspector = page.getByTestId('inspector')
     await inspector.getByRole('button', { name: 'Choose destination…' }).click()
     await expect(page.getByText('Choose output destination', { exact: true })).toBeVisible()
-    const dialog = page.locator('.dp-modal-overlay')
+    const dialog = page.getByRole('dialog', { name: 'Choose output destination' })
     await expect(dialog.getByText('Dataset name', { exact: true })).toBeVisible()
     const folder = `experiment-${Date.now()}`
     await dialog.getByRole('button', { name: 'New folder' }).click()
@@ -2574,7 +2574,7 @@ test.describe('Data Playground canvas', () => {
       const chooseDestination = inspector.getByRole('button', { name: 'Choose destination…' })
       await expect(chooseDestination).toBeVisible()
       await chooseDestination.click()
-      const dialog = page.locator('.dp-modal-overlay')
+      const dialog = page.getByRole('dialog', { name: 'Choose output destination' })
       await dialog.locator('input').fill(filename)
       await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
 
@@ -2652,7 +2652,7 @@ test.describe('Data Playground canvas', () => {
       await finder.getByRole('option', { name: /write/i }).first().click()
       const inspector = page.getByTestId('inspector')
       await inspector.getByRole('button', { name: 'Choose destination…' }).click()
-      const dialog = page.locator('.dp-modal-overlay')
+      const dialog = page.getByRole('dialog', { name: 'Choose output destination' })
       await dialog.locator('input').fill(`issue399-recovery-${Date.now()}.parquet`)
       await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
       await expect(inspector.getByLabel('Write publication')).toContainText('Create a new dataset')
@@ -2712,7 +2712,7 @@ test.describe('Data Playground canvas', () => {
       const inspector = page.getByTestId('inspector')
       const filename = `issue401-${Date.now()}.lance`
       await inspector.getByRole('button', { name: 'Choose destination…' }).click()
-      const dialog = page.locator('.dp-modal-overlay')
+      const dialog = page.getByRole('dialog', { name: 'Choose output destination' })
       await dialog.locator('input').fill(filename)
       await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
 
@@ -2852,7 +2852,8 @@ test.describe('Data Playground canvas', () => {
     await page.locator('.react-flow__node').getByRole('button', { name: /Select dataset/ }).click()
     await page.getByText('Register accessible path / URI…').click()
     await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
-    await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
+    const dialog = page.getByRole('dialog', { name: 'Open a dataset' })
+    await expect(dialog.getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
   })
 
   test('Add menus describe built-in operations by their research task at 1280x720 @ux-smoke', async ({ page }) => {
@@ -2910,8 +2911,10 @@ test.describe('Data Playground canvas', () => {
 
     await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
     await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    await expect(inspector).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+    await expect(inspector).toBeVisible()
 
     await inspector.getByRole('button', { name: 'Select dataset' }).click()
     await page.getByText('events', { exact: true }).first().click()

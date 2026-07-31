@@ -129,6 +129,27 @@ test.describe('minimum viewport support', () => {
     // Rail destinations are operable (click each, land on its surface, return).
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
+    const transformFilters = page.getByTestId('transform-filter-toolbar')
+    await expectFullyInViewport(page, transformFilters, 'Transform filter toolbar')
+    const transformFilterControls = [
+      page.getByLabel('Search Transforms'),
+      page.getByLabel('Transform source'),
+      page.getByLabel('Transform mode'),
+      page.getByLabel('Transform category'),
+    ]
+    const transformFilterBoxes = await Promise.all(transformFilterControls.map(async (control, index) => {
+      await expectFullyInViewport(page, control, `Transform filter ${index + 1}`)
+      return boxOf(control)
+    }))
+    const filterTops = transformFilterBoxes.map((box) => box.y)
+    expect(
+      Math.max(...filterTops) - Math.min(...filterTops),
+      'Transform filters should stay on one desktop row',
+    ).toBeLessThanOrEqual(1)
+    expect(
+      (await boxOf(transformFilters)).height,
+      'Transform filter toolbar should not consume multiple rows at the desktop viewport',
+    ).toBeLessThanOrEqual(48)
     await page.getByTestId('rail-workspace').click()
     await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
 
