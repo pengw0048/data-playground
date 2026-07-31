@@ -1543,6 +1543,24 @@ function invalidateWriteAdmissions(
   return next
 }
 
+function invalidateCurrentResults(
+  doc: CanvasDoc,
+  runs: Store['runs'],
+  affectedNodeIds: Iterable<string>,
+): { nodes: CanvasNode[]; runs: Store['runs'] } {
+  const affected = new Set(affectedNodeIds)
+  return {
+    // Retain lastRun/history as durable output history, but stale the status that lets Canvas
+    // present that output as the current result for the changed graph.
+    nodes: doc.nodes.map((node) => (
+      affected.has(node.id) && node.data.status === 'latest'
+        ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
+        : node
+    )),
+    runs: invalidateWriteAdmissions(doc, runs, affected),
+  }
+}
+
 async function superviseTrackedProfileCancellation(
   get: () => Store,
   set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
@@ -2064,7 +2082,8 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((s) => {
       const previews = { ...s.previews }; delete previews[id]
-      const runs = invalidateWriteAdmissions(s.doc, s.runs, downstream(s.doc, id))
+      const invalidated = invalidateCurrentResults(s.doc, s.runs, downstream(s.doc, id))
+      const runs = { ...invalidated.runs }
       delete runs[id]
       const profileJobs = Object.fromEntries(
         Object.entries(s.profileJobs).filter(([, job]) => job.nodeId !== id),
@@ -2073,7 +2092,7 @@ export const useStore = create<Store>((set, get) => ({
       return {
         doc: {
           ...s.doc,
-          nodes: s.doc.nodes.filter((n) => n.id !== id),
+          nodes: invalidated.nodes.filter((n) => n.id !== id),
           edges: s.doc.edges.filter((e) => e.source !== id && e.target !== id),
         },
         selectedId: s.selectedId === id ? null : s.selectedId,
@@ -2103,17 +2122,16 @@ export const useStore = create<Store>((set, get) => ({
       const autoPosition = target?.data.autoPlaced
         ? connectedPosition(placementNodes, placedInputs, target.position, target.id)
         : null
-      const nodes = placementNodes.map((n) => {
-        const staleTarget = (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
-        const movedTarget = n.id === edge.target && autoPosition
-        return staleTarget || movedTarget
-          ? { ...n, ...(movedTarget ? { position: autoPosition } : {}), data: staleTarget ? { ...n.data, status: 'stale' as NodeStatus } : n.data }
-          : n
-      })
-      const runs = invalidateWriteAdmissions(
-        s.doc, s.runs, [edge.target, ...stale],
+      const positionedNodes = placementNodes.map((n) => (
+        n.id === edge.target && autoPosition ? { ...n, position: autoPosition } : n
+      ))
+      const invalidated = invalidateCurrentResults(
+        { ...s.doc, nodes: positionedNodes }, s.runs, [edge.target, ...stale],
       )
-      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes }, runs }
+      return {
+        doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes: invalidated.nodes },
+        runs: invalidated.runs,
+      }
     })
   },
 
@@ -2129,18 +2147,14 @@ export const useStore = create<Store>((set, get) => ({
         affected.add(previous.target)
         for (const nodeId of downstream(s.doc, previous.target)) affected.add(nodeId)
       }
-      const nodes = s.doc.nodes.map((n) =>
-        (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
-          ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
-          : n,
-      )
+      const invalidated = invalidateCurrentResults(s.doc, s.runs, affected)
       return {
         doc: {
           ...s.doc,
           edges: s.doc.edges.map((candidate) => candidate.id === id ? { ...edge, id } : candidate),
-          nodes,
+          nodes: invalidated.nodes,
         },
-        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
+        runs: invalidated.runs,
       }
     })
   },
@@ -2153,9 +2167,14 @@ export const useStore = create<Store>((set, get) => ({
       const affected = removed
         ? [removed.target, ...downstream(s.doc, removed.target)]
         : []
+      const invalidated = invalidateCurrentResults(s.doc, s.runs, affected)
       return {
-        doc: { ...s.doc, edges: s.doc.edges.filter((edge) => edge.id !== id) },
-        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
+        doc: {
+          ...s.doc,
+          nodes: invalidated.nodes,
+          edges: s.doc.edges.filter((edge) => edge.id !== id),
+        },
+        runs: invalidated.runs,
       }
     })
   },
@@ -2274,14 +2293,25 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((s) => {
       const previews = Object.fromEntries(Object.entries(s.previews).filter(([k]) => !nodeIds.has(k)))
-      const runs = Object.fromEntries(Object.entries(s.runs).filter(([k]) => !nodeIds.has(k)))
+      const removedEdges = s.doc.edges.filter((edge) => (
+        edgeIds.has(edge.id) || nodeIds.has(edge.source) || nodeIds.has(edge.target)
+      ))
+      const affected = new Set<string>()
+      for (const edge of removedEdges) {
+        affected.add(edge.target)
+        for (const nodeId of downstream(s.doc, edge.target)) affected.add(nodeId)
+      }
+      const invalidated = invalidateCurrentResults(s.doc, s.runs, affected)
+      const runs = Object.fromEntries(
+        Object.entries(invalidated.runs).filter(([k]) => !nodeIds.has(k)),
+      )
       const profileJobs = Object.fromEntries(
         Object.entries(s.profileJobs).filter(([, job]) => !nodeIds.has(job.nodeId)),
       )
       return {
         doc: {
           ...s.doc,
-          nodes: s.doc.nodes.filter((n) => !nodeIds.has(n.id)),
+          nodes: invalidated.nodes.filter((n) => !nodeIds.has(n.id)),
           edges: s.doc.edges.filter((e) => !edgeIds.has(e.id) && !nodeIds.has(e.source) && !nodeIds.has(e.target)),
         },
         selectedId: null, selectedIds: [],
@@ -2294,23 +2324,43 @@ export const useStore = create<Store>((set, get) => ({
   bypass: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     get().commit()
-    set((s) => ({
-      doc: {
-        ...s.doc,
-        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, bypassed: !n.data.bypassed, disabled: false } } : n)),
-      },
-    }))
+    set((s) => {
+      const invalidated = invalidateCurrentResults(
+        s.doc, s.runs, [id, ...downstream(s.doc, id)],
+      )
+      return {
+        doc: {
+          ...s.doc,
+          nodes: invalidated.nodes.map((n) => (
+            n.id === id
+              ? { ...n, data: { ...n.data, bypassed: !n.data.bypassed, disabled: false } }
+              : n
+          )),
+        },
+        runs: invalidated.runs,
+      }
+    })
   },
 
   disable: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     get().commit()
-    set((s) => ({
-      doc: {
-        ...s.doc,
-        nodes: s.doc.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, disabled: !n.data.disabled, bypassed: false } } : n)),
-      },
-    }))
+    set((s) => {
+      const invalidated = invalidateCurrentResults(
+        s.doc, s.runs, [id, ...downstream(s.doc, id)],
+      )
+      return {
+        doc: {
+          ...s.doc,
+          nodes: invalidated.nodes.map((n) => (
+            n.id === id
+              ? { ...n, data: { ...n.data, disabled: !n.data.disabled, bypassed: false } }
+              : n
+          )),
+        },
+        runs: invalidated.runs,
+      }
+    })
   },
 
   rename: (id, title) => {
