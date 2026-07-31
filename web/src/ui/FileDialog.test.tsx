@@ -26,13 +26,14 @@ describe('FileDialog request and open-mutation truth', () => {
 
   it('behaves as a modal, contains Tab focus, closes with Escape, and restores its trigger', async () => {
     const user = userEvent.setup()
+    const leakedEscape = vi.fn()
     function Harness() {
       const [open, setOpen] = useState(false)
-      return <>
+      return <div onKeyDown={(event) => { if (event.key === 'Escape') leakedEscape() }}>
         <button type="button" onClick={() => setOpen(true)}>Browse outputs</button>
         {open && <FileDialog mode="save" defaultName="results.parquet"
           onClose={() => setOpen(false)} onPick={vi.fn()} />}
-      </>
+      </div>
     }
 
     render(<Harness />)
@@ -51,6 +52,7 @@ describe('FileDialog request and open-mutation truth', () => {
     await user.keyboard('{Escape}')
     expect(screen.queryByRole('dialog', { name: 'Choose output destination' })).not.toBeInTheDocument()
     expect(trigger).toHaveFocus()
+    expect(leakedEscape).not.toHaveBeenCalled()
   })
 
   it('distinguishes destination and browse failures from an empty folder and retries both', async () => {

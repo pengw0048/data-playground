@@ -2903,8 +2903,10 @@ test.describe('Data Playground canvas', () => {
 
     await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
     await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    await expect(inspector).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+    await expect(inspector).toBeVisible()
 
     await inspector.getByRole('button', { name: 'Select dataset' }).click()
     await page.getByText('events', { exact: true }).first().click()

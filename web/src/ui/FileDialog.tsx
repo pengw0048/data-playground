@@ -156,7 +156,12 @@ export function FileDialog(props:
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="dp-modal-overlay fixed inset-0 z-[2100] bg-black/30" />
         <DialogPrimitive.Content aria-modal="true" aria-describedby={undefined}
-          onEscapeKeyDown={(event) => { if (pickingUri) event.preventDefault() }}
+          onEscapeKeyDown={(event) => {
+            // The dialog closes during document capture. Stop this native event there so React
+            // Flow cannot also treat it as Escape on the underlying selected node.
+            event.stopPropagation()
+            if (pickingUri) event.preventDefault()
+          }}
           onPointerDownOutside={(event) => { if (pickingUri) event.preventDefault() }}
           onOpenAutoFocus={(event) => {
             if (mode !== 'save' || !fileRef.current) return
