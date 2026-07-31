@@ -736,6 +736,34 @@ function WorkspaceMixedExplorer() {
       datasetQuery: serializeWorkspaceDatasetQuery(next),
     })
   }
+  const providerActionDialog = providerDatasetAction ? <ProviderDatasetActionDialog
+    resource={providerDatasetAction}
+    container={container}
+    files={files}
+    currentCanvasId={currentCanvasId}
+    targetState={canvasTargetState}
+    onClose={() => setProviderDatasetAction(null)}
+    onRefreshCanvases={refreshFiles}
+    onOpened={(canvasId, nodeId) => {
+      setProviderDatasetAction(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId)
+    }} /> : null
+  const relinkDialog = relinkResource ? <RelinkResourceDialog
+    resource={relinkResource}
+    onClose={() => setRelinkResource(null)}
+    onRelinked={(resource) => {
+      setRelinkResource(null)
+      pushToast(`Relinked to ${resource.name}`, 'success')
+      setWorkspaceResource(resource.id)
+    }} /> : null
+
+  if (selectedDataset && isExternal(selectedDataset)) return <>
+    <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
+      canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
+      onUse={() => useProviderDataset(selectedDataset)}
+      onRelink={() => setRelinkResource(selectedDataset)} />
+    {providerActionDialog}
+    {relinkDialog}
+  </>
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -857,9 +885,6 @@ function WorkspaceMixedExplorer() {
         pushToast('DatasetView deleted', 'success')
         setWorkspaceResource(`container:${containerId}`)
       }} />}
-      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
-        canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
-        onUse={() => useProviderDataset(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {addDataOpen && <AddDataModal onClose={() => setAddDataOpen(false)} onUploadDataset={uploadDataset}
         onCompleted={reload} />}
@@ -887,12 +912,7 @@ function WorkspaceMixedExplorer() {
         files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
         onRefreshCanvases={refreshFiles}
         onOpened={(canvasId, nodeId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
-      {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
-        container={container} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setProviderDatasetAction(null)}
-        onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId, nodeId) => {
-          setProviderDatasetAction(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId)
-        }} />}
+      {providerActionDialog}
       {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
         onMoved={(result, destinationPath) => {
           setMoveResource(null)
@@ -900,12 +920,7 @@ function WorkspaceMixedExplorer() {
             destinationPath })
           reload()
         }} />}
-      {relinkResource && <RelinkResourceDialog resource={relinkResource} onClose={() => setRelinkResource(null)}
-        onRelinked={(resource) => {
-          setRelinkResource(null)
-          pushToast(`Relinked to ${resource.name}`, 'success')
-          setWorkspaceResource(resource.id)
-        }} />}
+      {relinkDialog}
     </div>
   )
 }
@@ -1776,10 +1791,10 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse }: {
+function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse, onRelink }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
-  onRetry: () => void; onUse: () => void
+  onRetry: () => void; onUse: () => void; onRelink: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
@@ -1854,11 +1869,11 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     })
     return () => controller.abort()
   }, [canonicalContext, previewRevision])
-  return <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="provider-dataset-viewer">
-    <div role="dialog" aria-label={resource.name}
-      className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
+  return <section aria-label={resource.name}
+    className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
+    data-testid="provider-dataset-viewer">
       <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
-        <button onClick={onClose} aria-label="Close"
+        <button onClick={onClose} aria-label="Back to Workspace"
           className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
           <Icon name="chevronLeft" size={14} /> Back
         </button>
@@ -1867,6 +1882,10 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
           <div className="truncate text-[10.5px] text-muted-foreground">Mounted dataset · {resource.provider ?? resource.mountId ?? 'external source'}</div>
         </div>
+        <button onClick={onRetry} aria-label="Reload dataset"
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
+          <Icon name="refresh" size={12} /> Reload
+        </button>
         <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
           className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>
       </div>
@@ -1901,8 +1920,15 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
                   className="mt-1 max-h-[420px] overflow-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
         </section>}
+        {source && source.completeness !== 'complete' && !providerIssue
+          && <div role="status" aria-label="Dataset source status"
+            className="rounded-md border border-border bg-muted/30 p-2 text-muted-foreground">
+            {sourceCompletenessLabel(source.completeness)}
+          </div>}
         {providerIssue && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           {providerIssue}<button type="button" onClick={retryProviderDetails} className="ml-2 font-semibold underline">Retry</button>
+          {(resource.lastKnown || placementState !== 'current' || canonicalUnavailable)
+            && <button type="button" onClick={onRelink} className="ml-2 font-semibold underline">Relink</button>}
         </div>}
         <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Dataset details</summary>
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
@@ -1918,8 +1944,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
         </details>
         </div>
       </div>
-    </div>
-  </div>
+  </section>
 }
 
 function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, targetState, onClose, onOpened, onRefreshCanvases }: {
