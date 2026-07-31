@@ -232,9 +232,15 @@ describe('DistributionReportPage', () => {
     { status: 403, code: 'permission_denied', expected: 'not authorized to open this retained report' },
   ])('classifies a $status report load from stable API status and code', async ({ status, code, expected }) => {
     mocks.distributionReport.mockRejectedValue(new KernelError(status, 'sanitized API detail', code, false))
-    render(<DistributionReportPage reportId="unavailable" />)
+    const onClose = vi.fn()
+    render(<DistributionReportPage reportId="unavailable" backHref="#/jobs?status=failed" onClose={onClose} />)
     expect(await screen.findByRole('alert')).toHaveTextContent(expected)
     expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible()
+    const back = screen.getByRole('link', { name: 'Back to Jobs' })
+    expect(back).toHaveAttribute('href', '#/jobs?status=failed')
+    fireEvent.click(back)
+    expect(onClose).toHaveBeenCalledOnce()
+    expect(window.location.hash).toBe('#/jobs?status=failed')
   })
 
   it('explains an active report whose exact revision became unavailable', async () => {

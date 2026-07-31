@@ -143,6 +143,16 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: query })
   })
 
+  it('builds canonical list routes without stale unavailable detail identities', () => {
+    window.location.hash = routeHash('jobs')
+    expect(window.location.hash).toBe('#/jobs')
+    expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: '' })
+
+    window.location.hash = routeHash('transforms')
+    expect(window.location.hash).toBe('#/transforms')
+    expect(parseHash()).toEqual({ view: 'transforms' })
+  })
+
   it('opens an exact retained distribution-report link in Jobs detail', () => {
     const reportId = 'a'.repeat(32)
     window.location.hash = `#/distribution-reports/${reportId}`

@@ -58,6 +58,26 @@ describe('Shell primary navigation', () => {
     await waitFor(() => expect(mocks.inboxUnreadCount).toHaveBeenCalled())
   })
 
+  it('opens top-level Jobs and Transforms instead of retaining unavailable details', () => {
+    useStore.setState({
+      view: 'jobs',
+      jobsQuery: 'status=failed&canvas=demo-canvas&run=missing-run&output=write%3Aout&report=missing-report&compare=missing-comparison',
+      transformResourceId: 'missing-transform',
+      transformVersion: 'v9',
+    } as never)
+    render(<Shell />)
+
+    fireEvent.click(screen.getByTestId('rail-jobs'))
+    expect(useStore.getState()).toMatchObject({ view: 'jobs', jobsQuery: 'status=failed&canvas=demo-canvas' })
+
+    useStore.setState({ view: 'transforms' } as never)
+    fireEvent.click(screen.getByTestId('rail-transforms'))
+    expect(useStore.getState()).toMatchObject({
+      view: 'transforms', transformResourceId: null, transformVersion: null,
+      transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+    })
+  })
+
   it('labels an authenticated identity as signed in', () => {
     useStore.setState({ authEnabled: true } as never)
 

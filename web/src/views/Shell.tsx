@@ -64,8 +64,11 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
   const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
+  const setJobsQuery = useStore((s) => s.setJobsQuery)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
+  const setTransformResource = useStore((s) => s.setTransformResource)
   const inboxQuery = useStore((s) => s.inboxQuery)
+  const jobsQuery = useStore((s) => s.jobsQuery)
   const currentUser = useStore((s) => s.currentUser)
   const authEnabled = useStore((s) => s.authEnabled)
   const [collapsed, setCollapsed] = useCollapsibleRegion('navigation')
@@ -75,7 +78,13 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   const item = (v: DpView, icon: IconName, label: string, badge?: number) => (
     <Button variant="ghost" onClick={() => {
       if (v === 'workspace') setWorkspaceResource(null)
+      else if (v === 'jobs') {
+        const next = new URLSearchParams(jobsQuery)
+        for (const key of ['run', 'output', 'report', 'compare']) next.delete(key)
+        setJobsQuery(next.toString())
+      }
       else if (v === 'inbox') setInboxQuery(inboxQuery)
+      else if (v === 'transforms') setTransformResource(null)
       else setView(v)
     }} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}

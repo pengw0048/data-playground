@@ -87,7 +87,9 @@ export function DistributionReportLauncher({ definition }: { definition: Dataset
   </section>
 }
 
-export function DistributionReportPage({ reportId, compareReportId, onClose }: { reportId: string; compareReportId?: string; onClose?: () => void }) {
+export function DistributionReportPage({ reportId, compareReportId, backHref = routeHash('jobs'), onClose }: {
+  reportId: string; compareReportId?: string; backHref?: string; onClose?: () => void
+}) {
   const [envelope, setEnvelope] = useState<DistributionReportEnvelope | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshError, setRefreshError] = useState<ReportFailure | null>(null)
@@ -145,7 +147,17 @@ export function DistributionReportPage({ reportId, compareReportId, onClose }: {
   }
 
   if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading exact retained report…</div>
-  if (!envelope) return <div role="alert" className="m-4 rounded border border-destructive/30 bg-destructive/10 p-4 text-[12px] text-destructive">{unavailableMessage(refreshError)} <button className="font-semibold underline" onClick={() => void load(reportId, true)}>Retry</button></div>
+  if (!envelope) return <div role="alert" className="m-4 grid gap-3 rounded border border-destructive/30 bg-destructive/10 p-4 text-[12px] text-destructive">
+    <span>{unavailableMessage(refreshError)} <button className="font-semibold underline" onClick={() => void load(reportId, true)}>Retry</button></span>
+    <a href={backHref} onClick={onClose ? (event) => {
+      event.preventDefault()
+      window.history.replaceState(window.history.state, '', backHref)
+      onClose()
+    } : undefined}
+      className="w-fit rounded-md border border-border bg-background px-3 py-1.5 font-semibold text-foreground hover:bg-accent">
+      Back to Jobs
+    </a>
+  </div>
   const { task, report, viewSnapshot } = envelope
   return <div className="mx-auto grid max-w-6xl gap-4 p-4 sm:p-7">
     <header className="flex flex-wrap items-start gap-3 border-b border-border pb-4"><div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Retained distribution report</div><h1 className="text-[20px] font-bold">{viewSnapshot.name}</h1><div className="mt-1 flex flex-wrap gap-2 text-[11px] text-muted-foreground"><Badge variant="secondary" className="capitalize">{task.status}</Badge><span>Updated {date(envelope.updatedAt)}</span>{task.progress != null && <span>{Math.round(task.progress * 100)}% complete</span>}</div></div>

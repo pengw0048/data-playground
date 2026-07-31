@@ -322,11 +322,13 @@ export function JobsView() {
   const ordinaryFilters = hasOrdinaryFilters(params)
 
   const reportId = params.get('report')
-  if (reportId) return <DistributionReportPage reportId={reportId} compareReportId={params.get('compare') || undefined} onClose={() => {
+  if (reportId) {
     const next = new URLSearchParams(params)
     next.delete('report'); next.delete('compare')
-    setJobsQuery(next.toString())
-  }} />
+    const backHref = routeHash('jobs', undefined, undefined, undefined, next.toString())
+    return <DistributionReportPage reportId={reportId} compareReportId={params.get('compare') || undefined}
+      backHref={backHref} onClose={() => setJobsQuery(next.toString())} />
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col">
