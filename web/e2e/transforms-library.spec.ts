@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { createHash } from 'node:crypto'
 
 test('deep-links an exact Transform and atomically creates its target Canvas', async ({ page, request }) => {
   const createdUser = await request.post('/api/users', {
@@ -10,6 +11,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   const headers = { 'X-DP-User': userId }
   const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`
   const title = `Robot scorer ${suffix}`
+  const sourceCode = "def fn(row):\n    row['score'] = 1.0\n    return row"
   const promoted = await request.post('/api/processors/promote', {
     headers,
     data: {
@@ -18,7 +20,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
       blurb: 'Scores one exact robot observation schema.',
       category: 'robotics',
       mode: 'map',
-      code: "def fn(row):\n    row['score'] = 1.0\n    return row",
+      code: sourceCode,
       inputColumns: ['observation'],
       inputSchema: [{ name: 'observation', type: 'string' }],
       outputSchema: [{ name: 'score', type: 'float64' }],
@@ -31,6 +33,12 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
 
   await page.goto(`/#/transforms/${encodeURIComponent(transform.id)}?version=${transform.version}`)
   await expect(page.getByRole('heading', { name: title })).toBeVisible()
+  const implementation = page.getByRole('region', { name: 'Implementation source' })
+  await expect(implementation).toContainText("row['score'] = 1.0")
+  await implementation.getByText('Source integrity').click()
+  await expect(implementation).toContainText(
+    `SHA-256 ${createHash('sha256').update(sourceCode).digest('hex')}`,
+  )
   await expect(page.getByRole('button', { name: `Use exact ${transform.version}` })).toBeEnabled()
   expect(new URL(page.url()).hash).toContain(`version=${transform.version}`)
 

@@ -1375,14 +1375,15 @@ def list_processors(uid: str = Depends(current_user)) -> list[ProcessorDescripto
 def installed_processor_source(
         processor_id: str, version: str,
         uid: str = Depends(current_user)) -> InstalledProcessorSource:
-    """Return only source that the exact installed plugin processor explicitly publishes."""
+    """Return owner-scoped promoted source or source an exact plugin explicitly publishes."""
     try:
-        return get_deps().registry.installed_source(processor_id, version)
+        return get_deps().registry.installed_source(
+            processor_id, version, owner_id=uid)
     except KeyError as exc:
-        raise HTTPException(404, "Installed processor source unavailable") from exc
+        raise HTTPException(404, "Processor implementation source unavailable") from exc
     except ProcessorSourceUnavailable as exc:
         raise HTTPException(
-            503, "Installed processor source could not be loaded") from exc
+            503, "Processor implementation source could not be loaded") from exc
 
 
 def _transform_library_entry(item: dict, *, availability: str = "active") -> dict:

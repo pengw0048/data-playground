@@ -94,6 +94,99 @@ def test_library_is_keyset_paginated_filterable_and_keeps_deleted_exact_truth() 
     assert "code" not in detail["versions"][0]
 
 
+def test_promoted_source_is_durable_exact_owner_scoped_and_integrity_checked() -> None:
+    from hub.plugins.processors import ProcessorRegistry
+
+    owner = _user("promoted-source-owner")
+    other = _user("promoted-source-other")
+    key = f"source-{uuid.uuid4().hex}"
+    first = _promote(owner, key, title="Versioned source", marker="v1")
+    second = _promote(owner, key, title="Versioned source", marker="v2")
+    expected = {
+        first["version"]: "def fn(row):\n    row['marker'] = 'v1'\n    return row",
+        second["version"]: "def fn(row):\n    row['marker'] = 'v2'\n    return row",
+    }
+
+    detail = client.get(
+        f"/api/transform-library/{first['id']}", headers=_headers(owner),
+        params={"version": first["version"]},
+    )
+    assert detail.status_code == 200
+    assert all("source" not in version and "code" not in version
+               for version in detail.json()["versions"])
+    listed = client.get("/api/processors", headers=_headers(owner))
+    assert listed.status_code == 200
+    descriptor = next(item for item in listed.json() if item["id"] == first["id"])
+    assert "source" not in descriptor and "code" not in descriptor
+    assert "'marker'" not in listed.text and "'marker'" not in detail.text
+
+    # A fresh registry has no process-local promoted entries; source comes from the durable exact row.
+    restarted = ProcessorRegistry()
+    for version, code in expected.items():
+        durable = restarted.installed_source(
+            first["id"], version, owner_id=owner)
+        assert durable.source == code
+        assert durable.sha256 == hashlib.sha256(code.encode()).hexdigest()
+
+        response = client.get(
+            f"/api/processors/{first['id']}/versions/{version}/source",
+            headers=_headers(owner),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "processorId": first["id"],
+            "version": version,
+            "language": "python",
+            "source": code,
+            "sha256": hashlib.sha256(code.encode()).hexdigest(),
+        }
+        unauthorized = client.get(
+            f"/api/processors/{first['id']}/versions/{version}/source",
+            headers=_headers(other),
+        )
+        assert unauthorized.status_code == 404
+        assert unauthorized.json()["detail"] == "Processor implementation source unavailable"
+
+    assert client.get(
+        f"/api/processors/{first['id']}/versions/v999/source",
+        headers=_headers(owner),
+    ).status_code == 404
+
+    # A tombstone remains an immutable owner-visible version and keeps its inspectable definition.
+    deleted = client.delete(
+        f"/api/processors/{first['id']}/versions/{first['version']}",
+        headers=_headers(owner),
+    )
+    assert deleted.status_code == 200, deleted.text
+    retained_source = client.get(
+        f"/api/processors/{first['id']}/versions/{first['version']}/source",
+        headers=_headers(owner),
+    )
+    assert retained_source.status_code == 200
+    assert retained_source.json()["source"] == expected[first["version"]]
+
+    with metadb.session() as session:
+        row = session.get(
+            metadb.PromotedTransformVersion, (second["id"], 2))
+        assert row is not None
+        original_digest = row.semantic_digest
+        row.semantic_digest = "0" * 64
+    try:
+        corrupt = client.get(
+            f"/api/processors/{second['id']}/versions/{second['version']}/source",
+            headers=_headers(owner),
+        )
+        assert corrupt.status_code == 503
+        assert corrupt.json()["detail"] == "Processor implementation source could not be loaded"
+        assert "integrity" not in corrupt.text
+    finally:
+        with metadb.session() as session:
+            row = session.get(
+                metadb.PromotedTransformVersion, (second["id"], 2))
+            assert row is not None
+            row.semantic_digest = original_digest
+
+
 def test_plugin_installed_source_is_exact_opt_in_and_separate_from_metadata() -> None:
     from hub.deps import get_deps
     from hub.plugins.processors import ProcessorSourceProvider, RegisteredProcessor
@@ -115,6 +208,9 @@ def test_plugin_installed_source_is_exact_opt_in_and_separate_from_metadata() ->
         source=ProcessorSourceProvider(language="python", read=lambda: source),
     ))
     try:
+        direct = registry.installed_source(processor_id, "v7")
+        assert direct.source == source.decode("utf-8")
+
         listed = client.get("/api/processors", headers=_headers(uid))
         assert listed.status_code == 200
         descriptor = next(item for item in listed.json() if item["id"] == processor_id)
@@ -182,7 +278,7 @@ def test_installed_source_unavailable_is_honest_and_does_not_expose_loader_error
             headers=_headers(uid),
         )
         assert broken.status_code == 503
-        assert broken.json()["detail"] == "Installed processor source could not be loaded"
+        assert broken.json()["detail"] == "Processor implementation source could not be loaded"
         assert "/private/" not in broken.text
     finally:
         registry._procs.pop(plain_id, None)
