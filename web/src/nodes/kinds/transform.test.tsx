@@ -544,7 +544,23 @@ describe('Transform exact processor labels', () => {
     }
     const requestRun = vi.fn().mockResolvedValue(undefined)
     const run = vi.fn().mockResolvedValue(undefined)
-    const runEditorPreview = vi.fn().mockResolvedValue(undefined)
+    let editorPreviewGeneration = 0
+    const runEditorPreview = vi.fn().mockImplementation(async () => {
+      const state = useStore.getState()
+      const requestGeneration = ++editorPreviewGeneration
+      useStore.setState({ editorPreviews: {
+        ...state.editorPreviews,
+        transform: {
+          canvasId: state.doc.id,
+          nodeId: 'transform',
+          planIdentity: previewPlanIdentity(state.doc, 'transform'),
+          parameterBindings: [],
+          requestGeneration,
+          loading: true,
+          offset: 0,
+        },
+      } } as any)
+    })
     const doc = {
       id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [source, upstream, adhocNode],
       edges: [
@@ -583,12 +599,13 @@ describe('Transform exact processor labels', () => {
         result: {
           columns: [], rows: [], truncated: false,
           editorTestInput: {
-            runId: 'baseline-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
+            runId: 'stale-editor-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
           },
         },
       } } } as any)
     })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    expect(screen.getByRole('status', { name: 'Upstream run progress' })).toBeVisible()
     await act(async () => {
       useStore.setState({ editorPreviews: {} } as any)
     })
@@ -621,18 +638,23 @@ describe('Transform exact processor labels', () => {
     expect(screen.getByRole('status', { name: 'Upstream run progress' })).toHaveTextContent('4 / 8 rows')
 
     await act(async () => {
-      useStore.setState({ runs: { sample: { phase: 'done', status: { runId: 'upstream-run' } } } } as any)
+      useStore.setState({ doc: {
+        ...doc,
+        nodes: doc.nodes.map((candidate) => candidate.id === 'sample'
+          ? { ...candidate, data: { ...candidate.data, status: 'latest' as const } }
+          : candidate),
+      } } as any)
     })
-    expect(screen.getByRole('status', { name: 'Upstream run progress' })).toHaveTextContent('Selecting fresh upstream result')
     expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
     await waitFor(() => expect(runEditorPreview).toHaveBeenCalledWith('transform'))
     await act(async () => {
+      const state = useStore.getState()
       useStore.setState({ editorPreviews: { transform: {
-        canvasId: doc.id,
+        canvasId: state.doc.id,
         nodeId: 'transform',
-        planIdentity: previewPlanIdentity(doc, 'transform'),
+        planIdentity: previewPlanIdentity(state.doc, 'transform'),
         parameterBindings: [],
-        requestGeneration: 1,
+        requestGeneration: editorPreviewGeneration,
         offset: 0,
         result: {
           columns: [], rows: [], truncated: false,
@@ -644,16 +666,15 @@ describe('Transform exact processor labels', () => {
     })
     expect(screen.queryByRole('status', { name: 'Upstream result ready' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    expect(screen.queryByRole('status', { name: 'Upstream run progress' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
 
-    // The retained editor input is authoritative even if the run-status channel lags behind the
-    // graph result. A real provider run can reach this state until the dialog is reopened.
     await act(async () => {
       useStore.setState({ runs: { sample: {
-        phase: 'running',
-        status: { runId: 'upstream-run', rowsProcessed: 8, totalRows: 8, progress: 1 },
+        phase: 'done', status: { runId: 'upstream-run' },
       } } } as any)
     })
-    expect(screen.queryByRole('status', { name: 'Upstream run progress' })).not.toBeInTheDocument()
+    expect(runEditorPreview).toHaveBeenCalledTimes(1)
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
 
     useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
