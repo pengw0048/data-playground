@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, KernelError } from '../api/client'
 import type { DatasetViewDefinition, DatasetViewPreview } from '../types/api'
 import { Icon } from '../ui/Icon'
+import { datasetRevisionTimeLabel } from '../lib/revisionTime'
 import { DistributionReportLauncher } from './DistributionReports'
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
@@ -62,6 +63,10 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
 
   const evidence = definition.sampleProvenance
   const temporalWindow = definition.temporalWindow
+  const committedAt = datasetRevisionTimeLabel(
+    definition.datasetRef.lastKnown?.committedAt,
+    definition.retentionOwner,
+  )
   const requestClose = () => { if (!deleting) onClose() }
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={requestClose}>
     <div role="dialog" aria-modal="true" aria-label={definition.name} aria-busy={deleting} onClick={(event) => event.stopPropagation()}
@@ -76,9 +81,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
         <div className="grid gap-4 text-[11px]">
           <section className="grid gap-1 rounded-lg border border-border bg-muted/20 p-3">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Exact dataset revision</div>
-            <div className="font-semibold">{definition.datasetRef.lastKnown?.committedAt
-              ? `Committed ${new Date(definition.datasetRef.lastKnown.committedAt).toLocaleString()}`
-              : 'Commit time not provided'}</div>
+            <div className="font-semibold">{committedAt ? `Committed ${committedAt}` : 'Commit time not provided'}</div>
             <div className="text-muted-foreground">Pinned to the saved revision; preview and reports do not follow a newer dataset head.</div>
           </section>
           <section className="grid gap-1.5">

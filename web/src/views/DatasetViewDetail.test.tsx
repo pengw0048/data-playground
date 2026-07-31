@@ -74,11 +74,15 @@ describe('DatasetViewDetail', () => {
   })
 
   it('keeps complete dataset and view identities behind closed technical details', async () => {
-    render(<DatasetViewDetail definition={DEFINITION} onClose={vi.fn()} onDeleted={vi.fn()} />)
+    const legacyCoreDefinition = {
+      ...DEFINITION,
+      datasetRef: { ...DEFINITION.datasetRef, lastKnown: { committedAt: '2026-07-17T12:00:00' } },
+    }
+    render(<DatasetViewDetail definition={legacyCoreDefinition} onClose={vi.fn()} onDeleted={vi.fn()} />)
 
     expect(await screen.findByText('grasp')).toBeInTheDocument()
     expect(screen.getByText('Exact dataset revision')).toBeVisible()
-    expect(screen.getByText(/Committed/)).toBeVisible()
+    expect(screen.getByText(`Committed ${new Date('2026-07-17T12:00:00Z').toLocaleString()}`)).toBeVisible()
     const details = screen.getByTestId('dataset-view-technical-details')
     expect(details).not.toHaveAttribute('open')
     expect(within(details).getByText('dataset-stable')).not.toBeVisible()

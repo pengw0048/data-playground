@@ -84,6 +84,17 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _definition_committed_at(
+    value: object,
+    *,
+    retention_owner: Literal["core", "provider"],
+) -> object:
+    """Keep core-owned commit instants explicit without guessing provider clock semantics."""
+    if retention_owner == "core" and isinstance(value, datetime.datetime):
+        return metadb._core_utc_datetime(value)
+    return value
+
+
 def _request_payload(request: DatasetViewCreateRequest, *, include_name: bool) -> dict:
     payload = {
         "schemaVersion": 1,
@@ -322,7 +333,10 @@ def create_dataset_view(
             workspace = metadb.dataset_view_source_workspace(request.dataset_ref.dataset_id)
             view_id = uuid.uuid4().hex
             placement_id = uuid.uuid4().hex
-            committed_at = source.detail.get("committed_at")
+            committed_at = _definition_committed_at(
+                source.detail.get("committed_at"),
+                retention_owner=source.retention_owner,
+            )
             ref = ExactDatasetRef(
                 kind="exact",
                 dataset_id=request.dataset_ref.dataset_id,
