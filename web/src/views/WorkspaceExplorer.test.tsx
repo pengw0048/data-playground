@@ -188,7 +188,11 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'robot interactions' })
-    expect(detail).toHaveTextContent('revision:rev-7')
+    expect(detail).toHaveTextContent('Pinned to the saved revision')
+    const technicalDetails = within(detail).getByTestId('dataset-view-technical-details')
+    expect(technicalDetails).not.toHaveAttribute('open')
+    fireEvent.click(within(technicalDetails).getByText('Technical details'))
+    expect(within(technicalDetails).getByText('rev-7')).toBeVisible()
     expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
     expect(screen.getByRole('button', { name: 'Open datasetview robot interactions' }).parentElement)
       .toHaveTextContent('DatasetView · Local exact view')

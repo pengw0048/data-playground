@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetViewDefinition, DatasetViewPreview, TemporalWindowV1 } from '../types/api'
 
@@ -58,7 +58,7 @@ describe('DatasetViewDetail', () => {
     render(<DatasetViewDetail definition={DEFINITION} onClose={onClose} onDeleted={onDeleted} />)
 
     expect(await screen.findByText('grasp')).toBeInTheDocument()
-    expect(screen.getByRole('dialog', { name: 'robot interactions' })).toHaveTextContent('revision:rev-7')
+    expect(screen.getByRole('dialog', { name: 'robot interactions' })).toHaveTextContent('Pinned to the saved revision')
     fireEvent.click(screen.getByRole('button', { name: 'Delete view' }))
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
     await waitFor(() => expect(mocks.deleteDatasetView).toHaveBeenCalledWith('view-1'))
@@ -71,6 +71,25 @@ describe('DatasetViewDetail', () => {
 
     resolveDelete({ ok: true, deleted: true })
     await waitFor(() => expect(onDeleted).toHaveBeenCalledOnce())
+  })
+
+  it('keeps complete dataset and view identities behind closed technical details', async () => {
+    render(<DatasetViewDetail definition={DEFINITION} onClose={vi.fn()} onDeleted={vi.fn()} />)
+
+    expect(await screen.findByText('grasp')).toBeInTheDocument()
+    expect(screen.getByText('Exact dataset revision')).toBeVisible()
+    expect(screen.getByText(/Committed/)).toBeVisible()
+    const details = screen.getByTestId('dataset-view-technical-details')
+    expect(details).not.toHaveAttribute('open')
+    expect(within(details).getByText('dataset-stable')).not.toBeVisible()
+    expect(within(details).getByText('rev-7')).not.toBeVisible()
+
+    fireEvent.click(within(details).getByText('Technical details'))
+    expect(details).toHaveAttribute('open')
+    expect(within(details).getByText('dataset-stable')).toBeVisible()
+    expect(within(details).getByText('rev-7')).toBeVisible()
+    expect(within(details).getByText('a'.repeat(64))).toBeVisible()
+    expect(within(details).getByText('b'.repeat(64))).toBeVisible()
   })
 
   it('reports an unavailable exact revision without substituting the current head', async () => {

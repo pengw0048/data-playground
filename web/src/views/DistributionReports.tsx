@@ -211,9 +211,13 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
       <label htmlFor="compare-retained-report" className="font-semibold">Compare with retained report</label>
       <select id="compare-retained-report" value={compareReportId ?? ''} onChange={(event) => { location.hash = reportHash(report.reportId, event.target.value || undefined) }} className="min-w-64 rounded border border-border bg-background px-2 py-1">
         <option value="">No comparison</option>
-        {compareReportId && !reports.some((item) => item.reportId === compareReportId) && <option value={compareReportId}>{comparison ? `Linked report · ${comparison.coverage.right.datasetId}@${comparison.coverage.right.revisionId}` : `Linked report · ${compareReportId}`}</option>}
+        {compareReportId && !reports.some((item) => item.reportId === compareReportId) && <option value={compareReportId}>{comparison ? `Linked report · ${count(comparison.coverage.right.measuredRows)} measured rows · ${comparison.coverage.right.complete ? 'complete' : 'sample'}` : 'Linked report · loading details'}</option>}
         {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'retained report'}</option>)}
       </select><span className="text-muted-foreground">Completed reports for this DatasetView only.</span>
+      {compareReportId && !comparison && <details data-testid="linked-report-technical-evidence" className="basis-full rounded border border-border bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
+        <summary className="cursor-pointer font-semibold text-foreground">Linked report technical details</summary>
+        <div className="mt-1">Report ID <span className="break-all font-mono text-foreground">{compareReportId}</span></div>
+      </details>}
     </section>
     {!compareReportId && <ReportDocument report={report} view={view} onExamples={openExamples} />}
     {compareReportId && !comparison && !comparisonError && <><span className="text-[11px] text-muted-foreground">Loading comparison…</span><ReportDocument report={report} view={view} onExamples={openExamples} /></>}
@@ -233,19 +237,41 @@ function ReportDocument({ report, view, onExamples }: { report: DistributionRepo
 
 function Evidence({ report, view, coverage, sampling }: { report: DistributionReportDocument; view: DatasetViewDefinition; coverage: Extract<DistributionReportSection, { kind: 'coverage_schema' }> | undefined; sampling: string }) {
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before distributions</div>
-    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Dataset / revision:</strong> <span className="font-mono break-all">{report.datasetId}@{report.revisionId}</span></div><div><strong>View:</strong> {view.name} · <span className="font-mono">{report.viewDefinitionSha256}</span></div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div><div><strong>Computation:</strong> {report.computationVersion}</div></div>
+    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Exact revision:</strong> {view.datasetRef.lastKnown?.committedAt ? `committed ${date(view.datasetRef.lastKnown.committedAt)}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
     {report.sampleProvenance && <div className="rounded border border-border bg-background p-2"><strong>Sample evidence:</strong> {count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div>}
     {report.limitations.length > 0 && <ul className="list-disc pl-4 text-muted-foreground">{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul>}
+    <ReportTechnicalEvidence report={report} view={view} />
   </section>
+}
+
+function ReportTechnicalEvidence({ report, view }: { report: DistributionReportDocument; view: DatasetViewDefinition }) {
+  return <details data-testid="report-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
+      <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{report.reportId}</dd>
+      <dt>Task ID</dt><dd className="break-all font-mono text-foreground">{report.taskId}</dd>
+      <dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{report.datasetViewId}</dd>
+      <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{report.datasetId}</dd>
+      <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{report.revisionId}</dd>
+      <dt>Semantic SHA-256</dt><dd className="break-all font-mono text-foreground">{view.semanticSha256}</dd>
+      <dt>Definition SHA-256</dt><dd className="break-all font-mono text-foreground">{view.definitionSha256}</dd>
+      <dt>Report view SHA-256</dt><dd className="break-all font-mono text-foreground">{report.viewDefinitionSha256}</dd>
+      <dt>Computation version</dt><dd className="break-all font-mono text-foreground">{report.computationVersion}</dd>
+      {report.sampleProvenance && <><dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{report.sampleProvenance.identity}</dd></>}
+      <dt>Retention owner</dt><dd className="font-mono text-foreground">{view.retentionOwner}</dd>
+      <dt>Schema versions</dt><dd className="font-mono text-foreground">DatasetView {view.schemaVersion} · report {report.schemaVersion}</dd>
+    </dl>
+  </details>
 }
 
 function ComparisonDocument({ comparison, onExamples }: { comparison: DistributionReportComparison; onExamples: (target: ExampleTarget) => void }) {
   const { coverage } = comparison
   return <>
     <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]">
-      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage and identity before comparison</div>
+      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before comparison</div>
       <div className="grid gap-2 sm:grid-cols-2"><Identity label="Current report" identity={coverage.left} /><Identity label="Comparison report" identity={coverage.right} /></div>
       <strong>{coverage.comparable ? 'Coverage is comparable.' : `Coverage is not comparable: ${coverageReason(coverage.reason)}.`}</strong>
+      <ComparisonTechnicalEvidence comparison={comparison} />
     </section>
     <div className="grid gap-3">{comparison.columns.map((column) => {
       const authorized = coverage.comparable && column.comparable
@@ -261,7 +287,29 @@ function ComparisonDocument({ comparison, onExamples }: { comparison: Distributi
 }
 
 function Identity({ label, identity }: { label: string; identity: DistributionReportComparison['coverage']['left'] }) {
-  return <div><strong>{label}</strong><div className="font-mono break-all">{identity.datasetId}@{identity.revisionId}</div><div>{count(identity.measuredRows)} measured · {identity.complete ? 'complete' : 'sample'} · {identity.computationVersion}</div><div className="break-all">Sample identity: {identity.samplingIdentity}</div></div>
+  return <div><strong>{label}</strong><div>{count(identity.measuredRows)} measured rows · {identity.complete ? 'complete coverage' : 'sample coverage'}</div>{identity.sampleProvenance && <div className="text-muted-foreground">{identity.sampleProvenance.strategy} · {count(identity.sampleProvenance.returnedRows)} returned{identity.sampleProvenance.totalRows != null ? ` of ${count(identity.sampleProvenance.totalRows)}` : ''}</div>}</div>
+}
+
+function ComparisonTechnicalEvidence({ comparison }: { comparison: DistributionReportComparison }) {
+  return <details data-testid="comparison-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <div className="mt-2 grid gap-3 sm:grid-cols-2">
+      <ComparisonIdentityDetails label="Current report" identity={comparison.coverage.left} />
+      <ComparisonIdentityDetails label="Comparison report" identity={comparison.coverage.right} />
+    </div>
+  </details>
+}
+
+function ComparisonIdentityDetails({ label, identity }: { label: string; identity: DistributionReportComparison['coverage']['left'] }) {
+  return <div className="grid gap-1"><strong className="text-foreground">{label}</strong>
+    <div>Report ID <span className="break-all font-mono text-foreground">{identity.reportId}</span></div>
+    <div>DatasetView ID <span className="break-all font-mono text-foreground">{identity.datasetViewId}</span></div>
+    <div>Dataset ID <span className="break-all font-mono text-foreground">{identity.datasetId}</span></div>
+    <div>Revision ID <span className="break-all font-mono text-foreground">{identity.revisionId}</span></div>
+    <div>View definition SHA-256 <span className="break-all font-mono text-foreground">{identity.viewDefinitionSha256}</span></div>
+    <div>Computation version <span className="break-all font-mono text-foreground">{identity.computationVersion}</span></div>
+    <div>Sampling identity <span className="break-all font-mono text-foreground">{identity.samplingIdentity}</span></div>
+  </div>
 }
 
 function Delta({ column }: { column: DistributionReportComparison['columns'][number] }) {
@@ -288,7 +336,26 @@ function Bar({ value, total }: { value: number; total: number }) {
 }
 
 function ExamplesDrawer({ target, examples, error, onClose, onRetry }: { target: ExampleTarget; examples: DistributionReportBucketExamples | null; error: ReportFailure | null; onClose: () => void; onRetry: () => void }) {
-  return <div className="fixed inset-0 z-50 flex justify-end bg-black/20" onMouseDown={onClose}><section role="dialog" aria-modal="true" aria-label="Bucket examples" className="grid h-full w-[520px] max-w-full content-start gap-3 overflow-auto border-l border-border bg-card p-5 shadow-xl" onMouseDown={(event) => event.stopPropagation()}><div className="flex items-center gap-2"><strong className="flex-1">Examples from measured bucket</strong><Button size="sm" variant="outline" onClick={onClose}>Close</Button></div><span className="text-[11px] text-muted-foreground">{target.bucketKind} bucket: {target.bucketLabel} · <span className="font-mono">{target.sectionId}/{target.bucketId}</span></span>{!examples && !error && <span className="text-[11px] text-muted-foreground">Loading bounded examples…</span>}{error && <div role="alert" className="text-[11px] text-destructive">{examplesMessage(error)} <button className="font-semibold underline" onClick={onRetry}>Retry</button></div>}{examples && <><div className="grid gap-1 text-[11px]"><span><strong>Report:</strong> <span className="font-mono">{examples.reportId}</span></span><span><strong>DatasetView:</strong> {examples.datasetViewId}</span><span><strong>Exact revision:</strong> <span className="font-mono">{examples.datasetId}@{examples.revisionId}</span></span><span><strong>Bucket:</strong> {examples.bucketKind} · {examples.columnName} · {count(examples.bucketCount)} measured rows · sample {examples.samplingIdentity}</span><span>{examples.exampleSemantics.replaceAll('_', ' ')}; {examples.returnedRows} of {examples.rowLimit} returned{examples.truncated ? ' (truncated)' : ''}.</span></div>{examples.rows.length === 0 ? <span className="text-[11px] text-muted-foreground">This measured bucket has no available example rows.</span> : <pre className="overflow-auto rounded border border-border bg-muted/20 p-2 text-[10px]">{JSON.stringify(examples.rows, null, 2)}</pre>}</>}</section></div>
+  return <div className="fixed inset-0 z-50 flex justify-end bg-black/20" onMouseDown={onClose}><section role="dialog" aria-modal="true" aria-label="Bucket examples" className="grid h-full w-[520px] max-w-full content-start gap-3 overflow-auto border-l border-border bg-card p-5 shadow-xl" onMouseDown={(event) => event.stopPropagation()}><div className="flex items-center gap-2"><strong className="flex-1">Examples from measured bucket</strong><Button size="sm" variant="outline" onClick={onClose}>Close</Button></div><span className="text-[11px] text-muted-foreground">{target.bucketKind} bucket: {target.bucketLabel}</span>{!examples && !error && <span className="text-[11px] text-muted-foreground">Loading bounded examples…</span>}{error && <div role="alert" className="text-[11px] text-destructive">{examplesMessage(error)} <button className="font-semibold underline" onClick={onRetry}>Retry</button></div>}{examples && <><div className="grid gap-1 text-[11px]"><span><strong>{examples.columnName}</strong> · {count(examples.bucketCount)} measured rows in this {examples.bucketKind} bucket</span><span>Showing {examples.returnedRows} of up to {examples.rowLimit} bounded example rows{examples.truncated ? ' (truncated)' : ''}.</span></div>{examples.rows.length === 0 ? <span className="text-[11px] text-muted-foreground">This measured bucket has no available example rows.</span> : <pre className="overflow-auto rounded border border-border bg-muted/20 p-2 text-[10px]">{JSON.stringify(examples.rows, null, 2)}</pre>}</>}<ExamplesTechnicalEvidence target={target} examples={examples} /></section></div>
+}
+
+function ExamplesTechnicalEvidence({ target, examples }: { target: ExampleTarget; examples: DistributionReportBucketExamples | null }) {
+  return <details data-testid="examples-technical-evidence" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
+      <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{target.reportId}</dd>
+      <dt>Section ID</dt><dd className="break-all font-mono text-foreground">{target.sectionId}</dd>
+      <dt>Bucket ID</dt><dd className="break-all font-mono text-foreground">{target.bucketId}</dd>
+      {examples && <><dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{examples.datasetViewId}</dd>
+        <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{examples.datasetId}</dd>
+        <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{examples.revisionId}</dd>
+        <dt>View definition SHA-256</dt><dd className="break-all font-mono text-foreground">{examples.viewDefinitionSha256}</dd>
+        <dt>Computation version</dt><dd className="break-all font-mono text-foreground">{examples.computationVersion}</dd>
+        <dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{examples.samplingIdentity}</dd>
+        <dt>Example semantics</dt><dd className="break-all font-mono text-foreground">{examples.exampleSemantics}</dd>
+        <dt>Schema version</dt><dd className="font-mono text-foreground">{examples.schemaVersion}</dd></>}
+    </dl>
+  </details>
 }
 
 const signed = (value: number | null | undefined) => value == null ? 'unavailable' : `${value > 0 ? '+' : ''}${value}`

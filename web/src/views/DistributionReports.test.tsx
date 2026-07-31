@@ -66,6 +66,25 @@ describe('DistributionReportPage', () => {
     expect(screen.getByText('Other (top-K remainder)')).toBeVisible()
   })
 
+  it('keeps complete report identities behind closed technical evidence', async () => {
+    render(<DistributionReportPage reportId={'a'.repeat(32)} />)
+
+    expect(await screen.findByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText(/10 rows · sample only/)).toBeVisible()
+    const details = screen.getByTestId('report-technical-evidence')
+    expect(details).not.toHaveAttribute('open')
+    expect(within(details).getByText('dataset-1')).not.toBeVisible()
+    expect(within(details).getByText('revision-1')).not.toBeVisible()
+
+    fireEvent.click(within(details).getByText('Technical evidence'))
+    expect(details).toHaveAttribute('open')
+    expect(within(details).getByText('dataset-1')).toBeVisible()
+    expect(within(details).getByText('revision-1')).toBeVisible()
+    expect(within(details).getByText('a'.repeat(64))).toBeVisible()
+    expect(within(details).getAllByText('b'.repeat(64))).toHaveLength(2)
+    expect(within(details).getByText('distribution-v1')).toBeVisible()
+  })
+
   it('uses shortest round-trip text for small and high-magnitude finite numbers', async () => {
     const exact = envelope()
     mocks.distributionReport.mockResolvedValue({
@@ -235,7 +254,7 @@ describe('DistributionReportPage', () => {
     const comparison: DistributionReportComparison = { schemaVersion: 1, coverage: { left: { reportId: source.reportId, datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: source.revisionId, viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, right: { reportId: 'b'.repeat(32), datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: 'revision-2', viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, comparable: true, reason: 'same_deterministic_sample' }, columns: [], unmatchedLeftColumns: [], unmatchedRightColumns: [] }
     mocks.compareDistributionReports.mockResolvedValue(comparison)
     const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
-    expect(await screen.findByText('Coverage and identity before comparison')).toBeVisible()
+    expect(await screen.findByText('Coverage before comparison')).toBeVisible()
     mocks.compareDistributionReports.mockRejectedValue(new KernelError(503, 'sanitized', 'service_unavailable', true))
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('Comparison is temporarily unavailable')
@@ -275,15 +294,21 @@ describe('DistributionReportPage', () => {
     expect(screen.getByText('Coverage before distributions')).toBeVisible()
   })
 
-  it('keeps the primary document visible while a comparison is pending and exposes a linked cross-view id without metadata', async () => {
+  it('keeps the primary document visible while a linked comparison loads without exposing its raw id', async () => {
     let resolve!: (value: DistributionReportComparison) => void
     mocks.compareDistributionReports.mockReturnValue(new Promise((done) => { resolve = done }))
     render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
     expect(await screen.findByText('Loading comparison…')).toBeVisible()
     expect(screen.getByText('Coverage before distributions')).toBeVisible()
-    expect(screen.getByRole('option', { name: `Linked report · ${'c'.repeat(32)}` })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Linked report · loading details' })).toBeVisible()
+    const linkedDetails = screen.getByTestId('linked-report-technical-evidence')
+    expect(linkedDetails).not.toHaveAttribute('open')
+    expect(within(linkedDetails).getByText('c'.repeat(32))).not.toBeVisible()
+    fireEvent.click(within(linkedDetails).getByText('Linked report technical details'))
+    expect(within(linkedDetails).getByText('c'.repeat(32))).toBeVisible()
     await act(async () => { resolve(comparison('c'.repeat(32))) })
-    expect(await screen.findByText('Coverage and identity before comparison')).toBeVisible()
+    expect(await screen.findByText('Coverage before comparison')).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Linked report · 10 measured rows · sample' })).toBeVisible()
   })
 
   it('does not render deltas for incompatible coverage and preserves unknown top-K values as unknown', async () => {
@@ -307,8 +332,10 @@ describe('DistributionReportPage', () => {
     await waitFor(() => expect(mocks.compareDistributionReports).toHaveBeenCalledWith('a'.repeat(32), 'new'))
     await act(async () => { newCompare(comparison('new', true, 'new-revision')) })
     await act(async () => { oldCompare(comparison('old', true, 'old-revision')); await Promise.resolve() })
-    expect(await screen.findByText((_, node) => node?.textContent === 'dataset-1@new-revision')).toBeVisible()
-    expect(screen.queryByText((_, node) => node?.textContent === 'dataset-1@old-revision')).not.toBeInTheDocument()
+    const comparisonEvidence = await screen.findByTestId('comparison-technical-evidence')
+    fireEvent.click(within(comparisonEvidence).getByText('Technical evidence'))
+    expect(within(comparisonEvidence).getByText('new-revision')).toBeVisible()
+    expect(within(comparisonEvidence).queryByText('old-revision')).not.toBeInTheDocument()
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} />)
     let oldExample!: (value: any) => void, newExample!: (value: any) => void
     mocks.distributionReportBucketExamples.mockImplementation((_report: string, _section: string, bucket: string) => new Promise((done) => { if (bucket === 'bucket') oldExample = done; else newExample = done }))
@@ -318,6 +345,13 @@ describe('DistributionReportPage', () => {
     await act(async () => { oldExample({ schemaVersion: 1, reportId: 'a'.repeat(32), datasetViewId: view.id, datasetId: 'dataset-1', revisionId: 'revision-1', viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance, sectionId: 'numeric', bucketId: 'bucket', bucketKind: 'numeric', columnName: 'number', bucketCount: 8, exampleSemantics: 'bounded_examples_from_measured_bucket', rowLimit: 100, returnedRows: 1, truncated: false, rows: [{ evidence: 'old bucket' }] }); await Promise.resolve() })
     expect(await screen.findByText(/new bucket/)).toBeVisible()
     expect(screen.queryByText(/old bucket/)).not.toBeInTheDocument()
+    const exampleEvidence = screen.getByTestId('examples-technical-evidence')
+    expect(exampleEvidence).not.toHaveAttribute('open')
+    expect(within(exampleEvidence).getByText('top')).not.toBeVisible()
+    fireEvent.click(within(exampleEvidence).getByText('Technical evidence'))
+    expect(within(exampleEvidence).getByText('top')).toBeVisible()
+    expect(within(exampleEvidence).getByText('dataset-1')).toBeVisible()
+    expect(within(exampleEvidence).getByText('revision-1')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     mocks.distributionReportBucketExamples.mockResolvedValue({ schemaVersion: 1, reportId: 'a'.repeat(32), datasetViewId: view.id, datasetId: 'dataset-1', revisionId: 'revision-1', viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance, sectionId: 'numeric', bucketId: 'bucket', bucketKind: 'numeric', columnName: 'number', bucketCount: 0, exampleSemantics: 'bounded_examples_from_measured_bucket', rowLimit: 100, returnedRows: 0, truncated: false, rows: [] })
     fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])

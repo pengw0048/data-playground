@@ -69,17 +69,17 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       <header className="flex items-center gap-2 border-b border-border px-5 py-4">
         <Icon name="sample" size={16} />
         <div className="min-w-0 flex-1"><h2 className="truncate text-[14px] font-bold">{definition.name}</h2>
-          <div className="text-[10px] text-muted-foreground">Immutable DatasetView · schema v{definition.schemaVersion}</div></div>
+          <div className="text-[10px] text-muted-foreground">Saved dataset view · created {new Date(definition.createdAt).toLocaleString()}</div></div>
         <button onClick={requestClose} disabled={deleting} aria-label="Close DatasetView detail"><Icon name="close" size={15} /></button>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
         <div className="grid gap-4 text-[11px]">
           <section className="grid gap-1 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Exact source</div>
-            <div className="break-all font-mono">dataset:{definition.datasetRef.datasetId}</div>
-            <div className="break-all font-mono">revision:{definition.datasetRef.revisionId}</div>
-            <div className="text-muted-foreground">Committed {definition.datasetRef.lastKnown?.committedAt
-              ? new Date(definition.datasetRef.lastKnown.committedAt).toLocaleString() : 'time not provided'} · retained by {definition.retentionOwner}</div>
+            <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Exact dataset revision</div>
+            <div className="font-semibold">{definition.datasetRef.lastKnown?.committedAt
+              ? `Committed ${new Date(definition.datasetRef.lastKnown.committedAt).toLocaleString()}`
+              : 'Commit time not provided'}</div>
+            <div className="text-muted-foreground">Pinned to the saved revision; preview and reports do not follow a newer dataset head.</div>
           </section>
           <section className="grid gap-1.5">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Definition</div>
@@ -96,7 +96,6 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
             {evidence && <div className="rounded-md border border-border p-2 text-muted-foreground">
               <div><strong className="text-foreground">Sampling evidence:</strong> {evidence.returnedRows.toLocaleString()} rows returned{evidence.totalRows != null ? ` from ${evidence.totalRows.toLocaleString()}` : ''}</div>
               {evidence.limitations.map((limitation) => <div key={limitation} className="mt-1">{limitation}</div>)}
-              <div className="mt-1 break-all font-mono text-[9px]">identity:{evidence.identity}</div>
             </div>}
           </section>
           <section className="grid gap-2">
@@ -107,11 +106,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
                 : preview ? <PreviewTable preview={preview} /> : null}
           </section>
           <DistributionReportLauncher definition={definition} />
-          <section className="grid gap-1 text-[9.5px] text-muted-foreground">
-            <div>Created {new Date(definition.createdAt).toLocaleString()} by {definition.creatorId}</div>
-            <div className="break-all font-mono">semantic:{definition.semanticSha256}</div>
-            <div className="break-all font-mono">definition:{definition.definitionSha256}</div>
-          </section>
+          <DatasetViewTechnicalDetails definition={definition} />
         </div>
       </div>
       <footer className="border-t border-border p-4">
@@ -124,6 +119,26 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       </footer>
     </div>
   </div>
+}
+
+function DatasetViewTechnicalDetails({ definition }: { definition: DatasetViewDefinition }) {
+  return <details data-testid="dataset-view-technical-details" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
+      <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.datasetId}</dd>
+      <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.revisionId}</dd>
+      <dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{definition.id}</dd>
+      <dt>Semantic SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.semanticSha256}</dd>
+      <dt>Definition SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.definitionSha256}</dd>
+      {definition.sampleProvenance && <><dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{definition.sampleProvenance.identity}</dd></>}
+      <dt>Retention owner</dt><dd className="font-mono text-foreground">{definition.retentionOwner}</dd>
+      <dt>Creator ID</dt><dd className="break-all font-mono text-foreground">{definition.creatorId}</dd>
+      <dt>Schema version</dt><dd className="font-mono text-foreground">{definition.schemaVersion}</dd>
+      <dt>Container ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.containerId}</dd>
+      <dt>Placement ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.placementId}</dd>
+      <dt>Source registration ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.sourceRegistrationId}</dd>
+    </dl>
+  </details>
 }
 
 function PreviewTable({ preview }: { preview: DatasetViewPreview }) {
