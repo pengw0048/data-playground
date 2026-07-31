@@ -1134,7 +1134,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Query', 'sql')
     await page.getByRole('button', { name: 'More' }).click()
-    await page.getByRole('button', { name: 'Rename' }).click()
+    await page.getByRole('button', { name: 'Rename', exact: true }).click()
     const input = page.locator('.react-flow__node input')
     await expect(input).toBeVisible()
     await input.fill('my query')
@@ -2251,7 +2251,7 @@ test.describe('Data Playground canvas', () => {
     // navigate to Workspace → URL updates
     await backToWorkspace(page)
     await expect.poll(() => page.evaluate(() => location.hash))
-      .toBe('#/workspace/container%3Aworkspace-local-root')
+      .toBe('#/workspace')
     // browser Back returns to the canvas editor
     await page.goBack()
     await expect(page.getByTestId('toolbar')).toBeVisible()
