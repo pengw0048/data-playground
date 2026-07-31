@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, KernelError, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
+import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
   WorkspaceCanonicalDatasetContext, WorkspaceSourceStatus,
@@ -27,6 +28,42 @@ const NON_EMPTY_LOCAL_FOLDER_REASON = "Move or remove this Folder's contents bef
 const PROVIDER_PLACEMENT_CACHE_MAX_DATASETS = 64
 const PROVIDER_PLACEMENT_CACHE_MAX_PLACEMENTS = 6
 const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
+const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for exact execution; it is not a canonical data column.'
+
+type ProviderSystemColumnPresentation = {
+  column: ColumnSchema
+  label: 'System row ID' | 'System column'
+  description: string
+}
+
+function providerColumnCount(count: number, kind: 'data' | 'system'): string {
+  return `${count.toLocaleString()} ${kind} ${count === 1 ? 'column' : 'columns'}`
+}
+
+function providerRowCount(count: number | null | undefined): string {
+  if (count == null) return 'Rows not reported'
+  return `${count.toLocaleString()} ${count === 1 ? 'row' : 'rows'}`
+}
+
+function providerSystemColumn(
+  column: ColumnSchema,
+  canonicalNames: Set<string>,
+  compareWithCanonical: boolean,
+): ProviderSystemColumnPresentation | null {
+  const absentFromCanonical = compareWithCanonical && !canonicalNames.has(column.name)
+  if (column.name === '_rowid') {
+    if (compareWithCanonical && canonicalNames.has(column.name)) return null
+    if (column.provenance === 'inferred' || absentFromCanonical) {
+      return { column, label: 'System row ID', description: SYSTEM_ROW_ID_DESCRIPTION }
+    }
+  }
+  if (!absentFromCanonical) return null
+  return {
+    column,
+    label: 'System column',
+    description: 'Supplied by the exact execution preview; it is not part of the canonical data schema.',
+  }
+}
 
 type ProviderPlacementObservation = {
   placementId: string
@@ -1906,7 +1943,20 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   const selectedDatasetId = exactRevision?.datasetId ?? canonicalContext?.datasetIdentity
   const selectedRevisionId = exactRevision?.revisionId
     ?? (canonicalContext?.readMode === 'exact' ? canonicalContext.revisionId ?? undefined : undefined)
-  const selectedColumns = exactRevision ? preview?.preview.columns ?? [] : canonicalContext?.columns ?? []
+  const canonicalColumns = canonicalContext?.columns ?? []
+  const previewColumns = preview?.preview.columns ?? []
+  const canonicalNames = new Set(canonicalColumns.map((column) => column.name))
+  const canonicalMatchesSelectedRevision = canonicalContext?.datasetIdentity === selectedDatasetId
+    && canonicalContext?.revisionId === selectedRevisionId
+  const compareWithCanonical = canonicalColumns.length > 0
+    && (!exactRevision || canonicalMatchesSelectedRevision)
+  const systemColumns = previewColumns.map((column) => (
+    providerSystemColumn(column, canonicalNames, compareWithCanonical)
+  )).filter((column): column is ProviderSystemColumnPresentation => column !== null)
+  const systemColumnNames = new Set(systemColumns.map(({ column }) => column.name))
+  const selectedColumns = exactRevision ? previewColumns : canonicalColumns
+  const dataColumns = selectedColumns.filter((column) => !systemColumnNames.has(column.name))
+  const systemColumnByName = new Map(systemColumns.map((column) => [column.column.name, column]))
   const selectedCommittedAt = exactRevision ? preview?.committedAt : canonicalContext?.committedAt
   const providerIssue = previewError
     ? `Couldn't load the selected version preview: ${previewError}`
@@ -2008,14 +2058,25 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
           && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading canonical dataset context…</div>}
         {(canonicalContext || exactRevision) && <section data-testid="canonical-provider-dataset-context" className="grid gap-2">
-          <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground"><span>{preview?.summary.rowCount == null ? 'Rows not reported' : `${preview.summary.rowCount.toLocaleString()} rows`}</span><span>· {selectedColumns.length} columns</span></div>
+          <div data-testid="provider-column-summary" className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+            <span>{providerRowCount(preview?.summary.rowCount)}</span>
+            <span>· {providerColumnCount(dataColumns.length, 'data')}</span>
+            {systemColumns.length > 0 && <span>· {providerColumnCount(systemColumns.length, 'system')}</span>}
+          </div>
           <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
             {exactRevision && !preview && !previewError
               ? <div className="mt-1 text-[11px] text-muted-foreground">Loading selected schema…</div>
-              : selectedColumns.length
-              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{selectedColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
-                {selectedColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
-                  && <div className="text-muted-foreground">{selectedColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
+              : dataColumns.length || systemColumns.length
+              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{dataColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
+                {dataColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
+                  && <div className="text-muted-foreground">{dataColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more data columns</div>}
+                {systemColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map(({ column, label, description }) => <div key={column.fieldId ?? column.name} className="flex flex-wrap items-baseline gap-1">
+                  <span className="font-mono">{column.name}</span><span>· {column.type}</span>
+                  <span aria-label={`${column.name}: ${description}`} title={description}
+                    className="rounded bg-muted px-1 py-px text-[9.5px] font-semibold text-muted-foreground">{label}</span>
+                </div>)}
+                {systemColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
+                  && <div className="text-muted-foreground">{systemColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more system columns</div>}
               </div>
               : <div>No canonical columns were reported.</div>}
           </div>
@@ -2023,7 +2084,14 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
             {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
             {preview && (preview.preview.rows.length
               ? <div data-testid="provider-dataset-preview-scroll" tabIndex={0}
-                  className="mt-1 max-h-[420px] overflow-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
+                  className="mt-1 max-h-[420px] overflow-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => {
+                    const systemColumn = systemColumnByName.get(column.name)
+                    return <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">
+                      <span className="inline-flex items-center gap-1"><span data-testid="provider-preview-column-name">{column.name}</span>{systemColumn && <span
+                        aria-label={`${column.name}: ${systemColumn.description}`} title={systemColumn.description}
+                        className="rounded bg-background/80 px-1 py-px font-sans text-[9px] font-semibold text-muted-foreground">{systemColumn.label}</span>}</span>
+                    </th>
+                  })}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
         </section>}
         {source && source.completeness !== 'complete' && !providerIssue

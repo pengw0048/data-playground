@@ -325,7 +325,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(exactProviderViewer).toContainText('Selected version')
     const exactProviderContext = exactProviderViewer.getByTestId('canonical-provider-dataset-context')
     await expect(exactProviderContext).toContainText('2 rows')
-    await expect(exactProviderContext).toContainText('2 columns')
+    await expect(exactProviderContext).toContainText('2 data columns')
     await expect(exactProviderContext).toContainText('id · int')
     await expect(exactProviderContext).toContainText('value · string')
     await expect(exactProviderViewer.getByRole('button', { name: 'Use in Canvas' })).toHaveCount(0)
