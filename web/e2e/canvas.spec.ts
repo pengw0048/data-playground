@@ -237,10 +237,11 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('a saved Canvas fits on Workspace reopen and reload without taking later viewport control @canvas-viewport', async ({ page }) => {
-    const canvasId = `saved-overview-${Date.now()}`
-    const canvasName = 'Saved graph overview'
+    const suffix = Date.now()
+    const canvasId = `saved-overview-${suffix}`
+    const canvasName = `Saved graph overview ${suffix}`
     const otherCanvasId = `${canvasId}-other`
-    const otherCanvasName = 'Saved graph overview other'
+    const otherCanvasName = `Saved graph overview other ${suffix}`
     const created = await page.request.post('/api/canvas', { data: {
       id: canvasId, name: canvasName, version: 1,
       nodes: Array.from({ length: 5 }, (_, index) => ({
