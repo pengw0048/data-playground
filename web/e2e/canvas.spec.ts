@@ -474,7 +474,7 @@ test.describe('Data Playground canvas', () => {
 
     // Examples remain on empty/first-run surfaces rather than leaking into current-Canvas actions.
     await page.unroute(`**/api/canvas/${blankId}/runs`)
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await expect(page.getByText('Purchases per user')).toHaveCount(0)
     await page.keyboard.press('Escape')
 
@@ -528,38 +528,18 @@ test.describe('Data Playground canvas', () => {
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
   })
 
-  test('operation search is explicit about adding and keeps category browsing available', async ({ page }) => {
+  test('category browsing is the only global add entry', async ({ page }) => {
     await fresh(page)
     await page.setViewportSize({ width: 1280, height: 720 })
-    await page.getByRole('button', { name: 'Add operation', exact: true }).click()
-    const finder = page.getByRole('dialog', { name: 'Add an operation' })
-    const search = finder.getByRole('textbox', { name: 'Search operations' })
-    await expect(search).toBeFocused()
-    const box = await boxOf(finder)
-    expect(box.x).toBeGreaterThanOrEqual(16)
-    expect(box.x + box.width).toBeLessThanOrEqual(1264)
-    expect(box.y).toBeGreaterThanOrEqual(0)
-    expect(box.y + box.height).toBeLessThanOrEqual(720)
-    await search.fill('descriptor_contract')
-    await expect(finder.getByRole('option', { name: /descriptor contract/i })).toHaveCount(2)
-    await search.fill('sample')
-    await expect(finder.getByRole('option').first()).toContainText('sample')
-    await expect(finder.getByRole('option', { name: /^assert/i })).toHaveCount(0)
-    await expect(finder.getByRole('option', { name: /^chart/i })).toHaveCount(0)
-    await search.fill('io')
-    await expect(finder.getByRole('option', { name: /^source/i })).toHaveCount(1)
-    await expect(finder.getByRole('option', { name: /^write/i })).toHaveCount(1)
-    await expect(finder.getByRole('option', { name: /^union/i })).toHaveCount(0)
-    await expect(finder.getByRole('option', { name: /^section/i })).toHaveCount(0)
-    await search.fill('sample')
-    await search.press('Enter')
-    await expect(finder).toBeHidden()
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Shape', exact: true })).toBeVisible()
+    await addNode(page, 'Shape', 'sample')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
   })
 
-  test('selection keeps Add global while the output port creates one atomic connected step', async ({ page }) => {
+  test('selection keeps category add while the output port creates one atomic connected step', async ({ page }) => {
     const canvasId = `local-port-add-${Date.now()}`
     const created = await page.request.post('/api/canvas', { data: {
       id: canvasId, name: 'Local port add', version: 1, requirements: [], nodes: [], edges: [],
@@ -569,9 +549,8 @@ test.describe('Data Playground canvas', () => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await addNode(page, 'Sources & sinks', 'source')
 
-    const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
-    await expect(globalAdd).toBeVisible()
-    await expect(globalAdd).toHaveText('')
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Sources & sinks', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
 
@@ -1118,7 +1097,7 @@ test.describe('Data Playground canvas', () => {
     await expect(addControls.getByText('Add', { exact: true })).toBeVisible()
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveText('')
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
     const fitView = viewportControls.getByRole('button', { name: 'Fit view' })
     await expect(fitView).toBeVisible()
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
@@ -1272,7 +1251,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     const original = await page.evaluate(() => location.hash)
     const sourceId = decodeURIComponent(original.split('/').pop()!)
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByTestId('copy-canvas').click()
     await page.getByLabel('New Canvas name').fill('E2E independent copy')
     await page.getByRole('button', { name: 'Review copy' }).click()
@@ -2131,7 +2110,7 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Shape', 'filter')
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
     await expect.poll(async () => (await canvasFor(page, canvasId)).nodes.length).toBe(1)
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Version history').click()
     await expect(page.getByRole('heading', { name: 'Version history' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Restore' }).first()).toBeVisible({ timeout: 8000 }) // a snapshot to restore
@@ -2173,7 +2152,7 @@ test.describe('Data Playground canvas', () => {
       await route.continue()
     })
     try {
-      await page.getByTestId('canvas-menu').click()
+      await page.getByTestId('app-menu').click()
       await page.getByText('Version history').click()
       await page.getByRole('button', { name: 'Restore' }).first().click()
       await expect(queued.locator('[title="stale"]')).toBeVisible()
@@ -2193,7 +2172,7 @@ test.describe('Data Playground canvas', () => {
 
   test('the Canvas menu opens persisted run history', async ({ page }) => {
     await fresh(page)
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Run history').click()
     await expect(page.getByRole('heading', { name: 'Run history' })).toBeVisible()
     // a brand-new file has no runs yet — the empty state renders (proves the modal + API wired)
@@ -2235,7 +2214,7 @@ test.describe('Data Playground canvas', () => {
       } })
     })
 
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     await page.getByRole('button', { name: /Execution manifest/ }).click()
 
@@ -2472,7 +2451,8 @@ test.describe('Data Playground canvas', () => {
       expect(serverCanvas.ok()).toBeTruthy()
       const serverDoc = await serverCanvas.json() as { nodes: Array<{ id: string; data: { title: string } }> }
       expect(serverDoc.nodes.find((node) => node.id === 'source')?.data.title).toBe('Exact events')
-      const openDataset = sourceCard.getByRole('link', { name: 'Open dataset' })
+      await expect(sourceCard.getByRole('link', { name: 'Open dataset' })).toHaveCount(0)
+      const openDataset = page.getByTestId('inspector').getByRole('link', { name: 'Open dataset' })
       await expect(openDataset).toBeVisible()
       await expect(openDataset).toHaveAttribute(
         'href',
@@ -2842,7 +2822,7 @@ test.describe('Data Playground canvas', () => {
       expect(new Set(submissionIds).size).toBe(1)
 
       await page.reload()
-      await page.getByTestId('canvas-menu').click()
+      await page.getByTestId('app-menu').click()
       await page.getByText('Run history', { exact: true }).click()
       const historyReceipt = page.getByLabel(/Write receipt for run/).first()
       await expect(historyReceipt).toContainText('durable revision 3')

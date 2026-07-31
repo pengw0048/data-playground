@@ -80,7 +80,7 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
 
   const ancestors = displayAncestors(state.ancestors)
   // A root-only "Workspace" row repeats the global destination without communicating location.
-  // Keep the resolver active for Show in Workspace, but render a path only when it has a named parent.
+  // Keep the resolver active for Back to Workspace, but render a path only when it has a named parent.
   if (ancestors.length === 0) return null
 
   return (

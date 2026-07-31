@@ -89,6 +89,8 @@ describe('CanvasInboxPopover', () => {
 
     const trigger = await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' })
     expect(trigger).toHaveTextContent('2')
+    expect(screen.getByTestId('canvas-inbox-unread-badge')).toHaveClass('right-0', 'top-0')
+    expect(screen.getByTestId('canvas-inbox-unread-badge')).not.toHaveClass('-right-1', '-top-1')
     await user.click(trigger)
 
     const preview = await screen.findByRole('dialog', { name: 'Inbox preview' })

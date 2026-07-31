@@ -111,7 +111,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       expect(dialog.message()).toContain("can't be undone")
       await dialog.dismiss()
     })
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Delete this Canvas').click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
 
@@ -165,7 +165,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     }, { timeout: 30_000 }).toBe('done')
 
     await page.goto(`/#/canvas/${doc.id}`)
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Run history').click()
     await page.getByRole('button', { name: 'Open full result' }).click()
     await expect(page.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)

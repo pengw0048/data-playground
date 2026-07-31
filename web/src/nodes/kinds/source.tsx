@@ -7,7 +7,6 @@ import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
-import { datasetViewerHash } from '../../router'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail, WorkspaceSearchGroup } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
@@ -85,7 +84,6 @@ function Source({ id, data }: NodeComponentProps) {
   const replaceSourceBinding = useStore((s) => s.replaceSourceBinding)
   const select = useStore((s) => s.select)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
-  const canvasId = useStore((s) => s.doc.id)
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
   // agent/example/programmatic source), not only by an exact uri match.
   const tid = data.config.tableId
@@ -313,16 +311,6 @@ function Source({ id, data }: NodeComponentProps) {
       {!datasetParameter && !providerBinding && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
         exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
-      {selectedExact && (!providerBinding || data.config.providerResourceRef) && <a href={datasetViewerHash(
-        selectedExact.datasetId,
-        selectedExact.revisionId,
-        { canvasId, nodeId: id },
-        data.config.providerResourceRef,
-      )}
-        onClick={(event) => event.stopPropagation()}
-        className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-semibold text-primary hover:underline">
-        <Icon name="db" size={11} /> Open dataset
-      </a>}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}

@@ -60,8 +60,8 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await expect(page.getByRole('tab', { name: 'Local catalog' })).toHaveAttribute('aria-selected', 'true')
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(location).toContainText(child)
-    await page.getByTestId('canvas-menu').click()
-    await page.getByText('Show in Workspace', { exact: true }).click()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
     await expect(page).not.toHaveURL(/scope=datasets|dq=not-a-canvas-location/)
     await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(`${parent}/${child}`)
 
@@ -79,8 +79,8 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await expect(location).toContainText(`Workspace/${renamedParent}/${child}`)
     await expect(location).not.toContainText(canvas)
 
-    await page.getByTestId('canvas-menu').click()
-    await page.getByText('Show in Workspace', { exact: true }).click()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
     await page.getByRole('button', { name: `More actions for ${canvas}` }).click()
     await page.getByRole('menuitem', { name: 'Move' }).click()
     await page.getByRole('button', { name: destination, exact: true }).click()

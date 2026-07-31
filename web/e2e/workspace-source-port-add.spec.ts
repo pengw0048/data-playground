@@ -4,17 +4,17 @@ import { goToWorkspace, workspaceResource } from './support/workspace'
 async function expectToolbarInsideCanvas(page: Page, viewportWidth: number) {
   const toolbar = page.getByTestId('toolbar')
   const canvas = page.locator('.react-flow')
-  const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
-  const [toolbarBox, canvasBox, addBox] = await Promise.all([
-    toolbar.boundingBox(), canvas.boundingBox(), globalAdd.boundingBox(),
+  const locator = page.getByRole('button', { name: 'Locate existing node', exact: true })
+  const [toolbarBox, canvasBox, locatorBox] = await Promise.all([
+    toolbar.boundingBox(), canvas.boundingBox(), locator.boundingBox(),
   ])
   expect(toolbarBox).not.toBeNull()
   expect(canvasBox).not.toBeNull()
-  expect(addBox).not.toBeNull()
+  expect(locatorBox).not.toBeNull()
   expect(toolbarBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
   expect(toolbarBox!.x + toolbarBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
-  expect(addBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
-  expect(addBox!.x + addBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
+  expect(locatorBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
+  expect(locatorBox!.x + locatorBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
   expect(canvasBox!.x + canvasBox!.width).toBeLessThan(viewportWidth)
 }
 
@@ -23,6 +23,7 @@ async function expectSelectedNodeInsideCanvas(page: Page, type: string) {
   const output = node.locator('.react-flow__handle-right[role="button"]')
   await expect(node).toHaveCount(1)
   await expect(output).toBeVisible()
+  await expect(output).toHaveText('')
   await expect(page.locator('[data-node-reveal-pending]'))
     .toHaveAttribute('data-node-reveal-pending', 'false')
   await expect.poll(async () => {
@@ -53,13 +54,17 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
 
     const toolbar = page.getByTestId('toolbar')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
-    const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
     const sourcePort = page.getByRole('button', { name: 'Add operation from dataset output' })
     await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
-    await expect(globalAdd).toBeVisible()
-    await expect(globalAdd).toHaveText('')
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Sources & sinks', exact: true })).toBeVisible()
     await expect(sourcePort).toBeVisible()
+    await expect(sourcePort).toHaveText('')
+    await sourcePort.hover()
+    await expect(sourcePort).toHaveText('+')
+    await toolbar.hover()
+    await expect(sourcePort).toHaveText('')
     await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
     await expect(viewportControls.getByRole('button', { name: 'Fit view', exact: true })).toBeVisible()
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)

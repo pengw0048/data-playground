@@ -231,7 +231,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const [localJobsTime, localHistoryTime] = await page.evaluate(
       (stamps) => stamps.map((stamp) => new Date(stamp).toLocaleString()), [job!.createdAt, historyRow.createdAt],
     )
-    await page.getByTestId('canvas-menu').click()
+    await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const historyDialog = page.getByRole('dialog').filter({
       has: page.getByRole('heading', { name: 'Run history' }),

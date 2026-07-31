@@ -28,7 +28,7 @@ describe('Port add affordance', () => {
     state.doc.edges = []
   })
 
-  it('keeps a selected output visible and opens its picker from the keyboard', () => {
+  it('reveals the plus only on hover or focus and opens its picker from the keyboard', () => {
     const opened = vi.fn()
     window.addEventListener('dp-port-click', opened)
     render(<Port
@@ -40,6 +40,15 @@ describe('Port add affordance', () => {
     />)
 
     const port = screen.getByRole('button', { name: 'Add operation from dataset output' })
+    expect(port).not.toHaveTextContent('+')
+    fireEvent.mouseEnter(port)
+    expect(port).toHaveTextContent('+')
+    fireEvent.mouseLeave(port)
+    expect(port).not.toHaveTextContent('+')
+    fireEvent.focus(port)
+    expect(port).toHaveTextContent('+')
+    fireEvent.mouseEnter(port)
+    fireEvent.mouseLeave(port)
     expect(port).toHaveTextContent('+')
     vi.spyOn(port, 'getBoundingClientRect').mockReturnValue({
       left: 200, right: 215, top: 100, bottom: 115, width: 15, height: 15,
@@ -54,6 +63,14 @@ describe('Port add affordance', () => {
       opener: port,
       anchor: { left: 200, right: 215, top: 100, bottom: 115 },
     })
+    fireEvent.blur(port)
+    expect(port).not.toHaveTextContent('+')
+    fireEvent.mouseEnter(port)
+    fireEvent.focus(port)
+    fireEvent.blur(port)
+    expect(port).toHaveTextContent('+')
+    fireEvent.mouseLeave(port)
+    expect(port).not.toHaveTextContent('+')
     window.removeEventListener('dp-port-click', opened)
   })
 

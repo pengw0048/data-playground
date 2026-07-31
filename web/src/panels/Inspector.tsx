@@ -27,6 +27,7 @@ import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { requestSourceEntryAction } from '../nodes/kinds/source'
 import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
+import { datasetViewerHash } from '../router'
 
 export const INSPECTOR_W = 300
 export const INSPECTOR_COLLAPSED_W = 44
@@ -95,6 +96,12 @@ function hasLocalSourceIdentity(config: Record<string, unknown>): boolean {
 function hasProviderSourceIdentity(config: Record<string, unknown>): boolean {
   return nonEmptyString(config.providerMountId)
     && nonEmptyString(config.providerSourceBindingId)
+}
+
+function hasProviderSourceRouting(config: Record<string, unknown>): boolean {
+  return nonEmptyString(config.providerResourceRef)
+    || nonEmptyString(config.providerReadMode)
+    || sourceUri(config).startsWith('workspace-provider://')
 }
 
 function hasBoundSourceIdentity(config: Record<string, unknown>): boolean {
@@ -1044,6 +1051,7 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
 
 function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string; embedded?: boolean }) {
   const node = useStore((s) => s.doc.nodes.find((candidate) => candidate.id === nodeId))
+  const canvasId = useStore((s) => s.doc.id)
   const catalog = useStore((s) => s.catalog)
   const [open, setOpen] = useState(false)
   const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
@@ -1056,6 +1064,8 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   const selectedRef = sourceDatasetRef(config)
   const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
   const provider = hasProviderSourceIdentity(config)
+  const providerRouting = hasProviderSourceRouting(config)
+  const providerResourceRef = typeof config.providerResourceRef === 'string' ? config.providerResourceRef : undefined
   const providerName = typeof config.providerName === 'string' ? config.providerName : undefined
   const sourceLabel = provider
     ? (providerName ?? 'Mounted provider')
@@ -1106,6 +1116,10 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
 
   if (!node) return null
 
+  const datasetHref = exact && (!providerRouting || providerResourceRef)
+    ? datasetViewerHash(exact.datasetId, exact.revisionId, { canvasId, nodeId }, providerResourceRef)
+    : null
+
   const details = (
     <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
         <summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
@@ -1128,7 +1142,14 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
         </div>
     </details>
   )
-  return embedded ? details : <Section title="Data source">{details}</Section>
+  const contents = <>
+    {datasetHref && <a href={datasetHref}
+      className="inline-flex items-center gap-1 self-start text-[10.5px] font-semibold text-primary hover:underline">
+      <Icon name="db" size={11} /> Open dataset
+    </a>}
+    {details}
+  </>
+  return embedded ? contents : <Section title="Data source">{contents}</Section>
 }
 
 function ConnectionFact({ label, value }: { label: string; value: string }) {

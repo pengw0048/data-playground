@@ -136,7 +136,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     )
   })
 
-  it('keeps a selected provider exact summary on the card without field evidence clutter', async () => {
+  it('keeps a selected provider exact summary on the card without field evidence or navigation clutter', async () => {
     mocks.datasetRevision.mockResolvedValueOnce({
       datasetId: 'provider-orders', revisionId: 'empty-r7', retentionOwner: 'provider', summary: { rowCount: 0 },
       preview: {
@@ -157,12 +157,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
-    const openDataset = screen.getByRole('link', { name: 'Open dataset' })
-    expect(openDataset).toHaveAttribute(
-      'href',
-      '#/workspace/dataset%3Aprovider-placement-orders?revision=empty-r7&revisionDataset=provider-orders&returnCanvas=c&returnNode=s1',
-    )
-    expect(openDataset.querySelector('ellipse')).not.toBeNull()
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
   it('does not misroute an incomplete provider binding into the local catalog', async () => {

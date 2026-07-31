@@ -107,7 +107,7 @@ describe('Canvas controls', () => {
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
   })
 
-  it('keeps global Add operation icon-only when selection changes', () => {
+  it('does not add a second global operation picker when selection changes', () => {
     toolbarState.canvasRole = 'owner'
     toolbarState.selectedIds = ['source-1']
     toolbarState.specs = [{
@@ -120,7 +120,8 @@ describe('Canvas controls', () => {
     )
 
     expect(screen.queryByRole('button', { name: 'Add next step' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Add operation' })).not.toHaveTextContent('Add operation')
+    expect(screen.queryByRole('button', { name: 'Add operation' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Locate existing node' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Inspector/ })).not.toBeInTheDocument()
 
     toolbarState.selectedIds = []
@@ -129,6 +130,6 @@ describe('Canvas controls', () => {
         <Toolbar />
       </TooltipProvider>,
     )
-    expect(screen.getByRole('button', { name: 'Add operation' })).not.toHaveTextContent('Add operation')
+    expect(screen.queryByRole('button', { name: 'Add operation' })).not.toBeInTheDocument()
   })
 })
