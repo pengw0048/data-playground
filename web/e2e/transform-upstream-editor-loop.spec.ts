@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 type CatalogTable = { id: string; name: string; uri: string; registrationId: string }
+type PromotedTransform = { id: string; version: string }
 
 async function seededEvents(page: import('@playwright/test').Page): Promise<CatalogTable> {
   const response = await page.request.get('/api/catalog/search', {
@@ -12,7 +13,11 @@ async function seededEvents(page: import('@playwright/test').Page): Promise<Cata
   return table
 }
 
-async function openUnprimedEditor(page: import('@playwright/test').Page, suffix: string): Promise<string> {
+async function openUnprimedEditor(
+  page: import('@playwright/test').Page,
+  suffix: string,
+  promoted?: PromotedTransform,
+): Promise<string> {
   await page.setViewportSize({ width: 1280, height: 720 })
   const events = await seededEvents(page)
   const canvasId = `upstream-editor-${suffix}-${Date.now()}`
@@ -29,8 +34,13 @@ async function openUnprimedEditor(page: import('@playwright/test').Page, suffix:
       } },
       { id: 'transform', type: 'transform', position: { x: 700, y: 180 }, data: {
         title: 'Editor test', status: 'draft', config: {
-          source: 'adhoc', mode: 'map', onError: 'raise',
-          code: "def fn(row):\n    return {**row, 'tested_in_editor': True}",
+          ...(promoted ? {
+            source: 'library', processor: promoted.id, version: promoted.version,
+            mode: 'map', code: null,
+          } : {
+            source: 'adhoc', mode: 'map', onError: 'raise',
+            code: "def fn(row):\n    return {**row, 'tested_in_editor': True}",
+          }),
         },
       } },
     ],
@@ -43,10 +53,34 @@ async function openUnprimedEditor(page: import('@playwright/test').Page, suffix:
   expect(created.ok(), await created.text()).toBeTruthy()
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}?node=transform`)
   await expect(page.locator('.react-flow__node')).toHaveCount(3)
-  await page.getByRole('button', { name: 'Edit code' }).last().click()
+  await page.getByRole('button', {
+    name: promoted ? 'View processor definition' : 'Edit code',
+  }).last().click()
   await expect(page.getByRole('button', { name: 'Run upstream' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Test code' })).toBeDisabled()
+  await expect(page.getByRole('button', {
+    name: promoted ? 'Test transform' : 'Test code',
+  })).toBeDisabled()
   return canvasId
+}
+
+async function promoteReusableTransform(
+  page: import('@playwright/test').Page,
+): Promise<PromotedTransform> {
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const response = await page.request.post('/api/processors/promote', { data: {
+    id: `e2e.reusable-transform-${suffix}`,
+    title: `Reusable transform ${suffix}`,
+    blurb: 'Adds one deterministic field for bounded editor testing.',
+    category: 'testing',
+    mode: 'map',
+    code: "def fn(row):\n    return {**row, 'tested_in_editor': True}",
+    inputColumns: ['id'],
+    inputSchema: [{ name: 'id', type: 'bigint' }],
+    outputSchema: [{ name: 'tested_in_editor', type: 'bool' }],
+    requirements: [],
+  } })
+  expect(response.ok(), await response.text()).toBeTruthy()
+  return await response.json() as PromotedTransform
 }
 
 async function removeCanvas(page: import('@playwright/test').Page, canvasId: string): Promise<void> {
@@ -67,6 +101,41 @@ test('Run upstream stays in the fullscreen Transform editor and selects its fres
     await expect(page.getByText('true', { exact: true }).first()).toBeVisible({ timeout: 20_000 })
   } finally {
     await removeCanvas(page, canvasId)
+  }
+})
+
+test('Library Transform stays reusable after its fresh upstream result is tested', async ({ page }) => {
+  test.setTimeout(45_000)
+  const promoted = await promoteReusableTransform(page)
+  const canvasId = await openUnprimedEditor(page, 'library-retest', promoted)
+  try {
+    const automaticRefresh = page.waitForResponse((response) => (
+      response.url().includes('/api/run/editor-preview')
+      && response.request().method() === 'POST'
+    ))
+    await page.getByRole('button', { name: 'Run upstream' }).click()
+    expect((await automaticRefresh).ok()).toBeTruthy()
+    const testTransform = page.getByRole('button', { name: 'Test transform' })
+    await expect(page.getByText(
+      'Test result · using Editor sample · 8 input rows', { exact: true },
+    )).toBeVisible({ timeout: 20_000 })
+    await expect(testTransform).toBeEnabled()
+
+    const firstRetest = page.waitForResponse((response) => (
+      response.url().includes('/api/run/editor-preview')
+      && response.request().method() === 'POST'
+    ))
+    await testTransform.click()
+    expect((await firstRetest).ok()).toBeTruthy()
+    await expect(page.getByText(
+      'Test result · using Editor sample · 8 input rows', { exact: true },
+    )).toBeVisible()
+    await expect(testTransform).toBeEnabled()
+  } finally {
+    await removeCanvas(page, canvasId)
+    expect((await page.request.delete(
+      `/api/processors/${encodeURIComponent(promoted.id)}/versions/${encodeURIComponent(promoted.version)}`,
+    )).ok()).toBeTruthy()
   }
 })
 

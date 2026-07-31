@@ -28,6 +28,7 @@ interface EditorUpstreamRequest {
   baselineEditorInputRunId?: string
   baselineUpstreamStatus?: string
   refreshPreviewGeneration?: number
+  acceptedEditorInputRunId?: string
   cancelled?: boolean
 }
 
@@ -157,12 +158,37 @@ export function CodeFullscreen() {
     if (refreshPreviewGeneration == null || refreshPreviewGeneration === priorGeneration) return
     setUpstreamRequest((current) => (
       current?.sequence === upstreamRequest.sequence
-        ? { ...current, refreshPreviewGeneration }
+        ? { ...current, refreshPreviewGeneration, acceptedEditorInputRunId: undefined }
         : current
     ))
   }, [
     editorUpstreamNodeId, freshUpstreamRunDone, fs, runEditorPreview, testInput,
     upstreamRequest, upstreamRunId, upstreamStatusReachedLatest,
+  ])
+  const requestPreview = fs ? editorPreviews[fs.nodeId] : undefined
+  const requestPreviewInputRunId = requestPreview?.result?.editorTestInput?.runId
+  const exactFreshSelectionReady = Boolean(
+    fs && requestIsCurrent && !upstreamRequest?.cancelled
+    && upstreamRun?.phase !== 'failed'
+    && requestPreview && previewIsCurrent(requestPreview, doc, fs.nodeId)
+    && upstreamRequest?.refreshPreviewGeneration != null
+    && requestPreview.requestGeneration === upstreamRequest.refreshPreviewGeneration
+    && requestPreviewInputRunId
+    && requestPreviewInputRunId !== upstreamRequest?.baselineEditorInputRunId
+    && requestPreviewInputRunId !== upstreamRequest?.baselineRunId,
+  )
+  useEffect(() => {
+    if (!exactFreshSelectionReady || !requestPreviewInputRunId) return
+    setUpstreamRequest((current) => {
+      if (!current || current.sequence !== upstreamRequest?.sequence
+          || current.refreshPreviewGeneration !== upstreamRequest?.refreshPreviewGeneration) {
+        return current
+      }
+      return { ...current, acceptedEditorInputRunId: requestPreviewInputRunId }
+    })
+  }, [
+    exactFreshSelectionReady, requestPreviewInputRunId,
+    upstreamRequest?.refreshPreviewGeneration, upstreamRequest?.sequence,
   ])
   const candidateCfg = (node?.data.config ?? {}) as Record<string, unknown>
   const candidateIsTransform = node?.type === 'transform'
@@ -209,7 +235,7 @@ export function CodeFullscreen() {
   // references). Fall back to THIS node's own last-preview columns when the input schema isn't resolved yet
   // — NOT every node's previews (that leaked unrelated columns from across the whole graph).
   const inputNames = inputCols.map((c) => c.name)
-  const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
+  const preview = isTransform ? requestPreview : previews[fs.nodeId]
   const syntaxErrorLine = preview?.result?.failureCategory === 'syntax_error'
     ? preview.result.syntaxError?.line : undefined
   const selectedEditorInputRunId = preview?.result?.editorTestInput?.runId
@@ -218,10 +244,16 @@ export function CodeFullscreen() {
     && upstreamRun?.phase !== 'failed'
     && preview && previewIsCurrent(preview, doc, fs.nodeId)
     && upstreamRequest?.refreshPreviewGeneration != null
-    && preview.requestGeneration === upstreamRequest.refreshPreviewGeneration
     && selectedEditorInputRunId
     && selectedEditorInputRunId !== upstreamRequest?.baselineEditorInputRunId
-    && selectedEditorInputRunId !== upstreamRequest?.baselineRunId,
+    && selectedEditorInputRunId !== upstreamRequest?.baselineRunId
+    && (
+      preview.requestGeneration === upstreamRequest.refreshPreviewGeneration
+      || (
+        preview.requestGeneration > upstreamRequest.refreshPreviewGeneration
+        && selectedEditorInputRunId === upstreamRequest.acceptedEditorInputRunId
+      )
+    ),
   )
   const upstreamSelectionFailed = Boolean(
     requestIsCurrent && upstreamRequest?.refreshPreviewGeneration != null
