@@ -122,7 +122,8 @@ def test_dataset_view_commit_time_normalization_is_core_owned():
         naive, retention_owner="core",
     ) == naive.replace(tzinfo=datetime.timezone.utc)
     assert dataset_view_routes._definition_committed_at(
-        "2026-07-31T17:37:00-04:00", retention_owner="core",
+        datetime.datetime(2026, 7, 31, 17, 37, tzinfo=datetime.timezone(
+            -datetime.timedelta(hours=4))), retention_owner="core",
     ) == datetime.datetime(2026, 7, 31, 21, 37, tzinfo=datetime.timezone.utc)
     assert dataset_view_routes._definition_committed_at(
         naive, retention_owner="provider",

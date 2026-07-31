@@ -90,19 +90,9 @@ def _definition_committed_at(
     retention_owner: Literal["core", "provider"],
 ) -> object:
     """Keep core-owned commit instants explicit without guessing provider clock semantics."""
-    if retention_owner != "core" or value is None:
-        return value
-    parsed = value
-    if isinstance(value, str):
-        try:
-            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return value
-    if not isinstance(parsed, datetime.datetime):
-        return value
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
+    if retention_owner == "core" and isinstance(value, datetime.datetime):
+        return metadb._core_utc_datetime(value)
+    return value
 
 
 def _request_payload(request: DatasetViewCreateRequest, *, include_name: bool) -> dict:
