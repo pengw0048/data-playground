@@ -34,7 +34,7 @@ function Transform({ id, data }: NodeComponentProps) {
   const referenceUnavailable = reference?.availability === 'deleted'
     || reference?.availability === 'missing'
   const canViewDefinition = Boolean(proc && !referenceUnavailable)
-  const libraryAction = canViewDefinition ? 'View definition' : configuredRef ? 'Resolve' : 'Choose'
+  const libraryAction = configuredRef ? 'Resolve' : 'Choose'
 
   const meta = src === 'library'
     ? (reference?.availability === 'deleted' ? `${configuredRef} · deleted`
@@ -59,31 +59,36 @@ function Transform({ id, data }: NodeComponentProps) {
 
         {src === 'library' ? (
           <div>
-            <button
-              onClick={(e) => {
-                e.stopPropagation()
-                if (canViewDefinition) {
-                  openFullscreen(id, 'code', 'python')
-                  return
-                }
-                setTransformResource(
-                  typeof data.config.processor === 'string' ? data.config.processor : null,
-                  typeof data.config.version === 'string' ? data.config.version : null,
-                  { canvasId, nodeId: id },
-                )
-              }}
-              className={cn(
-                'flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px]',
-                proc ? 'text-foreground' : 'text-muted-foreground',
-              )}
-            >
-              <Icon name="fx" size={13} />
-              <span className="flex-1 truncate text-left">
-                {proc?.title ?? configuredRef ?? 'select processor'}
-              </span>
-              {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
-              <span className="text-[10px] font-semibold text-primary">{libraryAction}</span>
-            </button>
+            {canViewDefinition ? (
+              <div aria-label="Selected exact processor"
+                className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-foreground">
+                <Icon name="fx" size={13} />
+                <span className="flex-1 truncate text-left">{proc?.title}</span>
+                <span className="text-[10px] text-muted-foreground">{proc?.version}</span>
+              </div>
+            ) : (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setTransformResource(
+                    typeof data.config.processor === 'string' ? data.config.processor : null,
+                    typeof data.config.version === 'string' ? data.config.version : null,
+                    { canvasId, nodeId: id },
+                  )
+                }}
+                className={cn(
+                  'flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px]',
+                  proc ? 'text-foreground' : 'text-muted-foreground',
+                )}
+              >
+                <Icon name="fx" size={13} />
+                <span className="flex-1 truncate text-left">
+                  {proc?.title ?? configuredRef ?? 'select processor'}
+                </span>
+                {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
+                <span className="text-[10px] font-semibold text-primary">{libraryAction}</span>
+              </button>
+            )}
           </div>
         ) : (
           <button

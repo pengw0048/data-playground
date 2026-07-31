@@ -95,7 +95,8 @@ import {
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
-import type { CanvasTransformReference } from '../types/api'
+import type { CatalogTable, CanvasTransformReference } from '../types/api'
+import type { CanvasDoc } from '../types/graph'
 import { writeCanvasDraft } from './canvasDrafts'
 
 const storage = new Map<string, string>()
@@ -226,7 +227,7 @@ describe('graph store — core authority ops', () => {
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: true,
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
-      serverVersion: 1, saved: true, viewportFitRequest: null,
+      serverVersion: 1, saved: true, viewportFitRequest: null, catalog: [],
     })
   })
 
@@ -4687,6 +4688,49 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().viewportFitRequest).toBeNull()
     useStore.setState({ saved: false }) // an ordinary rerender must not manufacture another request
     expect(useStore.getState().viewportFitRequest).toBeNull()
+  })
+
+  it.each(['purchases', 'top3', 'quality'])(
+    'persists and reopens the %s example with its canonical local Source identity',
+    async (key) => {
+      const table: CatalogTable = {
+        id: 'tbl-events', registrationId: 'registration-events', name: 'events',
+        uri: '/workspace/data/events.parquet', rowCount: 2000, columns: [],
+      }
+      let persisted: CanvasDoc | null = null
+      useStore.setState({ catalog: [table] })
+      apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
+        persisted = structuredClone(doc)
+        return { ok: true, id: doc.id, created: true }
+      })
+
+      const created = await useStore.getState().newFromExample(key)
+
+      expect(created).toMatchObject({ ok: true, persistence: 'remote' })
+      const persistedSource = persisted?.nodes.find((node) => node.type === 'source')
+      expect(persistedSource?.data.config).toMatchObject({
+        uri: table.uri, tableId: table.id, registrationId: table.registrationId,
+      })
+
+      apiMocks.getCanvas.mockResolvedValueOnce(structuredClone(persisted!))
+      apiMocks.listCanvases.mockResolvedValueOnce([{
+        id: persisted!.id, name: persisted!.name, version: 1, role: 'owner',
+      }])
+      expect(await useStore.getState().openFile(persisted!.id, { serverCopy: true })).toBe(true)
+      expect(useStore.getState().doc.nodes.find((node) => node.type === 'source')?.data.config)
+        .toMatchObject({ uri: table.uri, tableId: table.id, registrationId: table.registrationId })
+    },
+  )
+
+  it('keeps the runnable bare Source URI when Catalog identity is unavailable offline', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({
+      ok: true, persistence: 'local-draft',
+    })
+
+    const source = useStore.getState().doc.nodes.find((node) => node.type === 'source')
+    expect(source?.data.config).toEqual({ uri: 'events' })
   })
 
   it('creates a separate example when an otherwise blank Canvas has run history', async () => {

@@ -133,20 +133,21 @@ describe('HistoryPanel output versions', () => {
     expect(screen.getByText('Previous output')).toBeVisible()
   })
 
-  it('sends an empty failed node to its filtered Jobs attempts', () => {
+  it('describes the current-version restore boundary and opens node-filtered Jobs', () => {
     setNode('failed')
 
     render(<HistoryPanel nodeId="target" />)
 
-    expect(screen.getByText('No successful output yet.')).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'View in Jobs' }))
-    expect(setJobsQuery).toHaveBeenCalledWith('canvas=canvas-1&node=target&status=failed')
+    expect(screen.getByText('No output is restorable from the current Canvas version.')).toBeVisible()
+    expect(screen.getByText('Older runs and receipts, if any, remain in Jobs.')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'View node Jobs' }))
+    expect(setJobsQuery).toHaveBeenCalledWith('canvas=canvas-1&node=target')
   })
 
-  it('does not imply that an untouched draft has a failed run', () => {
+  it('does not claim that an untouched draft has never had a successful run', () => {
     render(<HistoryPanel nodeId="target" />)
 
-    expect(screen.getByText('No successful output yet.')).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'View in Jobs' })).not.toBeInTheDocument()
+    expect(screen.queryByText('No successful output yet.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'View node Jobs' })).toBeVisible()
   })
 })

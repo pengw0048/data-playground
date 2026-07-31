@@ -258,6 +258,36 @@ function mergeIntoCatalog(set: (fn: (s: Store) => Partial<Store>) => void, table
   })
 }
 
+// Runnable examples use stable seeded dataset names so they still work before Catalog metadata is
+// available (for example in an offline local-first tab). When the real local registration is known,
+// persist that canonical identity instead of letting the card and Inspector infer different truths
+// from the same bare URI.
+function canonicalizeExampleSources(doc: CanvasDoc, catalog: CatalogTable[]): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((node) => {
+    if (node.type !== 'source') return node
+    const ref = typeof node.data.config.uri === 'string' ? node.data.config.uri : ''
+    const table = catalog.find((candidate) => (
+      candidate.registrationId && (candidate.uri === ref || candidate.name === ref)
+    ))
+    if (!table?.registrationId) return node
+    changed = true
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        config: {
+          ...node.data.config,
+          uri: table.uri,
+          tableId: table.id,
+          registrationId: table.registrationId,
+        },
+      },
+    }
+  })
+  return changed ? { ...doc, nodes } : doc
+}
+
 export interface PreviewState {
   canvasId: string
   nodeId: string
@@ -3971,8 +4001,9 @@ export const useStore = create<Store>((set, get) => ({
       replacePristine = runsEmpty
     }
     const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
-    const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
-    if (!doc) return get().newFile()
+    const example = exampleDoc(key, id)  // bare seeded names remain the offline runnable fallback
+    if (!example) return get().newFile()
+    const doc = canonicalizeExampleSources(example, get().catalog)
     // A response-lost in-place save must retain the known server base. Retrying it as a create could
     // collide with the original Canvas and turn an uncertain update into a different document.
     if (replacePristine) doc.version = current.serverVersion!
