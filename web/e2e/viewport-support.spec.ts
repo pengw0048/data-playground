@@ -237,7 +237,7 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('settings-modal'), 'settings modal (canvas)')
   })
 
-  test('wide provider detail contains scrolling without hiding actions or scrolling Workspace', async ({ page }, testInfo) => {
+  test('wide provider full-page detail contains scrolling without hiding actions or background Workspace', async ({ page }, testInfo) => {
     const vp = page.viewportSize()
     const expectedViewport = testInfo.project.name === 'chromium-reference-viewport'
       ? REFERENCE_VIEWPORT
@@ -337,10 +337,11 @@ test.describe('minimum viewport support', () => {
     await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
     await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })
-    const connectionDetails = detail.getByText('Connection details', { exact: true })
-    await expect(connectionDetails.locator('..')).not.toHaveAttribute('open', '')
-    await connectionDetails.click()
+    const datasetDetails = detail.getByText('Dataset details', { exact: true })
+    await expect(datasetDetails.locator('..')).not.toHaveAttribute('open', '')
+    await datasetDetails.click()
     await expect(detail.getByText('Source dataset identity', { exact: true })).toBeVisible()
+    await expect(page.getByTestId('workspace-scroll-surface')).toHaveCount(0)
 
     const contentSize = await content.evaluate((element) => ({
       clientHeight: element.clientHeight,
@@ -360,20 +361,13 @@ test.describe('minimum viewport support', () => {
       await expect.poll(() => content.evaluate((element) => element.scrollTop))
         .toBeGreaterThan(0)
 
-      const workspace = page.getByTestId('workspace-scroll-surface')
-      const workspaceSize = await workspace.evaluate((element) => ({
-        clientHeight: element.clientHeight,
-        scrollHeight: element.scrollHeight,
-      }))
-      expect(workspaceSize.scrollHeight, 'the Workspace fixture should be independently scrollable')
-        .toBeGreaterThan(workspaceSize.clientHeight)
-      await workspace.evaluate((element) => { element.scrollTop = 120 })
-      const workspaceScrollTop = await workspace.evaluate((element) => element.scrollTop)
+      const windowScrollY = await page.evaluate(() => window.scrollY)
       await content.evaluate((element) => { element.scrollTop = element.scrollHeight })
       await content.hover()
       await page.mouse.wheel(0, 800)
       await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-      expect(await workspace.evaluate((element) => element.scrollTop)).toBe(workspaceScrollTop)
+      expect(await page.evaluate(() => window.scrollY)).toBe(windowScrollY)
+      await expect(page.getByTestId('workspace-scroll-surface')).toHaveCount(0)
     } else {
       expect(await content.evaluate((element) => element.scrollTop)).toBe(0)
     }
