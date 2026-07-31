@@ -202,7 +202,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
   }
 })
 
-test('Canvas Inbox count omits failures and refreshes from confirmed mark-read state @ux-smoke', async ({ page }) => {
+test('Canvas Inbox previews outcomes in place and refreshes from confirmed mark-read state @ux-smoke', async ({ page }) => {
   const canvasId = 'canvas-inbox-count'
   const created = await page.request.post('/api/canvas', { data: {
     id: canvasId, name: 'Inbox count', version: 1,
@@ -227,6 +227,7 @@ test('Canvas Inbox count omits failures and refreshes from confirmed mark-read s
 
   await page.goto(`/#/canvas/${canvasId}`)
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveCount(0)
+  await expect(page.getByTestId('canvas-inbox')).toHaveAccessibleName('Inbox')
   unread = 2
   let releaseCanvas!: () => void
   const canvasHydration = new Promise<void>((resolve) => { releaseCanvas = resolve })
@@ -236,13 +237,15 @@ test('Canvas Inbox count omits failures and refreshes from confirmed mark-read s
   })
   await page.reload()
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('2')
-  await page.getByTestId('canvas-inbox-unread-badge').click()
-  await expect(page).toHaveURL(/#\/inbox$/)
+  await page.getByTestId('canvas-inbox').click()
+  await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}$`))
+  const preview = page.getByRole('dialog', { name: 'Inbox preview' })
+  await expect(preview).toBeVisible()
   releaseCanvas()
-  await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible()
-  await page.getByRole('button', { name: 'Mark read' }).click()
+  await preview.getByRole('button', { name: 'Mark read' }).click()
+  await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('1')
+  await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}$`))
+  await preview.getByRole('button', { name: 'View all Inbox' }).click()
   await expect(page).toHaveURL(/#\/inbox$/)
   await page.unroute(`**/api/canvas/${canvasId}`)
-  await page.goto(`/#/canvas/${canvasId}`)
-  await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('1')
 })

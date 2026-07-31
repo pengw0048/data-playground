@@ -1,55 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type InboxItemDto, type InboxTaskKind } from '../api/client'
+import { api, type InboxItemDto } from '../api/client'
 import { routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
+import {
+  inboxKindLabel,
+  inboxOutcomeLabel,
+  inboxOutcomeSummary,
+  inboxRelativeTime,
+} from './inboxPresentation'
 
 const PAGE_SIZE = 50
 const FILTERS = ['all', 'unread'] as const
 
-function outcomeLabel(item: InboxItemDto): string {
-  if (item.outcome === 'completed') return 'Completed'
-  if (item.outcome === 'cancelled') return 'Cancelled'
-  return 'Failed'
-}
-
-function outcomeSummary(item: InboxItemDto): string {
-  if (item.taskKind === 'restore_revision_write' && item.outcome === 'completed') return 'Revision restored'
-  if (item.taskKind === 'keyed_upsert_write' && item.outcome === 'completed') return 'Revision upserted'
-  if (item.completedWrite) {
-    return `“${item.completedWrite.outputName}” written · ${item.completedWrite.rowCount} rows`
-  }
-  if (item.outcome === 'failed' && item.diagnosticCode) return item.diagnosticCode.replace(/_/g, ' ')
-  if (item.outcome === 'failed') return 'Work failed'
-  return item.outcome === 'cancelled' ? 'Cancelled before completion' : 'Finished successfully'
-}
-
-const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
-  managed_local_write: 'Managed local write',
-  external_wait: 'External wait',
-  linear_checkpoint_write: 'Checkpointed write',
-  bounded_fanout_write: 'Bounded fan-out write',
-  merge_columns_write: 'Merge columns write',
-  restore_revision_write: 'Dataset restore',
-  keyed_upsert_write: 'Keyed upsert',
-}
-
 export function kindLabel(kind: InboxItemDto['taskKind'] | string): string {
-  return TASK_KIND_LABELS[kind as InboxTaskKind] ?? `Unknown task type: ${kind}`
-}
-
-function relTime(iso: string): string {
-  const t = Date.parse(iso)
-  if (Number.isNaN(t)) return ''
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000))
-  if (s < 60) return 'just now'
-  if (s < 3600) return `${Math.round(s / 60)}m ago`
-  if (s < 86400) return `${Math.round(s / 3600)}h ago`
-  if (s < 604800) return `${Math.round(s / 86400)}d ago`
-  return `${Math.round(s / 604800)}w ago`
+  return inboxKindLabel(kind)
 }
 
 export function mergeMonotonic(current: InboxItemDto[], incoming: InboxItemDto[]): InboxItemDto[] {
@@ -267,19 +235,19 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant={item.outcome === 'completed' ? 'secondary' : 'destructive'}>
-                        {outcomeLabel(item)}
+                        {inboxOutcomeLabel(item)}
                       </Badge>
                       {!item.readAt && <span className="text-[10.5px] font-semibold uppercase tracking-wide text-foreground">Unread</span>}
-                      <span className="text-[11px] text-muted-foreground">{kindLabel(item.taskKind)}</span>
+                      <span className="text-[11px] text-muted-foreground">{inboxKindLabel(item.taskKind)}</span>
                     </div>
                     <div className="mt-1 text-[13px] font-medium text-foreground">
                       {item.datasetContext
                         ? (item.datasetContext.name || item.datasetContext.datasetId)
                         : item.canvasName ?? 'Canvas unavailable'}
                     </div>
-                    <div className="mt-0.5 text-[11.5px] text-muted-foreground">{outcomeSummary(item)}</div>
+                    <div className="mt-0.5 text-[11.5px] text-muted-foreground">{inboxOutcomeSummary(item)}</div>
                     <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-                      {relTime(item.terminalAt)}
+                      {inboxRelativeTime(item.terminalAt)}
                       {item.datasetContext && !item.datasetContext.name
                         && ` · Dataset ${item.datasetContext.datasetId}`}
                       {item.canvasName == null && !item.datasetContext && ' · authorization revoked or canvas missing'}
