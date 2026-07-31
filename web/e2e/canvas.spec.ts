@@ -1281,6 +1281,55 @@ test.describe('Data Playground canvas', () => {
     expect(copied._copiedFrom.canvasVersion).toBeGreaterThanOrEqual(1)
   })
 
+  test('copies a resolved registered Source without a dependency acknowledgement at 1280x720', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await fresh(page)
+    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(5)
+
+    const source = page.locator('.react-flow__node-source')
+    await source.hover()
+    await source.getByRole('button', { name: 'View data' }).click()
+    const preview = page.getByTestId('panel-data')
+    await expect(preview.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
+    await preview.getByTitle('Close').click()
+    await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
+
+    const original = await page.evaluate(() => location.hash)
+    const menu = await openSettledAppMenu(page)
+    await menu.getByTestId('copy-canvas').click()
+    const dialog = page.getByRole('dialog', { name: 'Save a copy' })
+    await dialog.getByRole('button', { name: 'Review copy' }).click()
+    await expect(dialog.getByText('5 nodes · 4 connections · 0 requirements')).toBeVisible()
+    await expect(dialog.getByRole('checkbox')).toHaveCount(0)
+    const create = dialog.getByRole('button', { name: 'Create and open' })
+    await expect(create).toBeEnabled()
+    const dialogBox = await boxOf(dialog)
+    expect(dialogBox.x).toBeGreaterThanOrEqual(0)
+    expect(dialogBox.y).toBeGreaterThanOrEqual(0)
+    expect(dialogBox.x + dialogBox.width).toBeLessThanOrEqual(1280)
+    expect(dialogBox.y + dialogBox.height).toBeLessThanOrEqual(720)
+
+    await create.click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
+    const copyId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const copied = await (await page.request.get(`/api/canvas/${copyId}`)).json() as {
+      nodes: Array<{ type: string; data: Record<string, unknown> }>
+    }
+    for (const node of copied.nodes) {
+      expect(node.data.status).toBe('draft')
+      expect(node.data).not.toHaveProperty('history')
+      expect(node.data).not.toHaveProperty('lastRun')
+      expect(node.data).not.toHaveProperty('currentOutputVersionId')
+      expect(node.data).not.toHaveProperty('result')
+    }
+    expect(await (await page.request.get(`/api/canvas/${copyId}/runs`)).json()).toEqual([])
+    const inbox = await (await page.request.get('/api/inbox?filter=all')).json() as {
+      items: Array<{ canvasId?: string }>
+    }
+    expect(inbox.items.some((item) => item.canvasId === copyId)).toBe(false)
+  })
+
   test('pipeline import lands a returned graph on its newly created canvas', async ({ page }) => {
     await enablePipelineImporter(page)
     await fresh(page)
