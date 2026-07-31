@@ -177,14 +177,24 @@ describe('Workspace routes', () => {
   })
 
   it.each([
-    ['#/canvas/%E0%A4%A', { view: 'canvas' }],
-    ['#/workspace/%E0%A4%A', { view: 'workspace' }],
-    ['#/transforms/%E0%A4%A', { view: 'transforms' }],
-    ['#/distribution-reports/%E0%A4%A', { view: 'canvas' }],
+    ['#/canvas/%E0%A4%A', { view: 'workspace', canonicalHash: '#/workspace' }],
+    ['#/workspace/%E0%A4%A', { view: 'workspace', canonicalHash: '#/workspace' }],
+    ['#/transforms/%E0%A4%A', { view: 'transforms', canonicalHash: '#/transforms' }],
+    ['#/distribution-reports/%E0%A4%A', { view: 'workspace', canonicalHash: '#/workspace' }],
   ])('keeps malformed encoded route identifiers inside routing for %s', (hash, expected) => {
     window.location.hash = hash
     expect(() => parseHash()).not.toThrow()
     expect(parseHash()).toEqual(expected)
+  })
+
+  it('reserves last-Canvas recovery for the bare route', () => {
+    window.location.hash = '#/'
+    expect(parseHash()).toEqual({ view: 'canvas' })
+
+    for (const hash of ['#/not-a-route', '#//not-a-route', '#///also-invalid', '#/canvas', '#/?unexpected=true']) {
+      window.location.hash = hash
+      expect(parseHash()).toEqual({ view: 'workspace', canonicalHash: '#/workspace' })
+    }
   })
 
   it('round-trips an exact Transform upgrade context without mixing it into filters', () => {
