@@ -158,7 +158,10 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
     const datasetDetails = page.getByTestId('detail-dataset-details')
     await datasetDetails.locator('summary').click()
-    await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${target.revisionId}`)
+    const revisionTechnicalDetails = page.getByTestId('revision-technical-details')
+    await revisionTechnicalDetails.locator('summary').click()
+    await expect(revisionTechnicalDetails.getByText('Parent revision', { exact: true })).toBeVisible()
+    await expect(revisionTechnicalDetails.getByText(target.revisionId, { exact: true })).toBeVisible()
 
     // Reopen exactly the immutable base and upserted head through the ordinary revision APIs.
     const finalHead = await json<{ datasetId: string; revisionId: string }>(

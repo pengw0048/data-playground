@@ -2483,7 +2483,7 @@ test.describe('Data Playground canvas', () => {
       await page.keyboard.press('Shift+Tab')
       await expect(page.getByTestId('catalog-search')).toHaveCount(0)
       await expect(page.getByRole('button', { name: `Use dataset ${table!.name}` })).toHaveCount(0)
-      const alternateRevision = viewer.getByRole('link', { name: `Open revision ${alternateRevisionId}` })
+      const alternateRevision = viewer.getByTestId(`revision-open-${alternateRevisionId}`)
       await expect(alternateRevision).toHaveAttribute(
         'href',
         new RegExp(

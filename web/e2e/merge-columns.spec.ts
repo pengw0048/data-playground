@@ -188,7 +188,10 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
       `${final!.datasetId}@${final!.revisionId}`,
     )
-    await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${base.revisionId}`)
+    const revisionTechnicalDetails = page.getByTestId('revision-technical-details')
+    await revisionTechnicalDetails.locator('summary').click()
+    await expect(revisionTechnicalDetails.getByText('Parent revision', { exact: true })).toBeVisible()
+    await expect(revisionTechnicalDetails.getByText(base.revisionId, { exact: true })).toBeVisible()
     await page.getByTestId('dataset-viewer').getByRole('button', { name: 'Back to Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(task.taskId)}$`))
     await expect(job).toHaveAttribute('aria-expanded', 'true')

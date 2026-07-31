@@ -270,7 +270,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await (await workspaceResource(page, 'dataset', outputName)).click()
     const revisionHistory = page.getByTestId('dataset-revision-history')
     await expect(revisionHistory).toBeVisible({ timeout: 15_000 })
-    await revisionHistory.getByRole('link', { name: `Open revision ${dataset!.revisionId}` }).click()
+    await revisionHistory.getByTestId(`revision-open-${dataset!.revisionId}`).click()
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
 
     // 8. Reopen that same revision from Jobs' primary result action while retaining receipt evidence.
