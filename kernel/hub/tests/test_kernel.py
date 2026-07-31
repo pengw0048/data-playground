@@ -4782,6 +4782,79 @@ def test_object_store_destination_browse_rejects_paths_outside_root(monkeypatch,
     assert not called
 
 
+def test_local_destination_mkdir_is_one_contained_new_child(tmp_path):
+    from hub import destinations
+
+    root = tmp_path / "outputs"
+    root.mkdir()
+    backend = destinations.LocalBackend()
+
+    backend.mkdir(str(root), "", "daily")
+    assert (root / "daily").is_dir()
+    with pytest.raises(FileExistsError):
+        backend.mkdir(str(root), "", "daily")
+    for name in ("", ".", "..", "../outside", "nested/child", r"nested\child", " padded "):
+        with pytest.raises(ValueError):
+            backend.mkdir(str(root), "", name)
+    assert not (tmp_path / "outside").exists()
+
+
+def test_local_destination_symlink_escape_fails_closed(tmp_path):
+    from hub import destinations
+
+    root = tmp_path / "outputs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.parquet").write_bytes(b"not destination data")
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+    backend = destinations.LocalBackend()
+
+    listing = backend.browse(str(root), "")
+    assert "escape" not in {entry["name"] for entry in listing["entries"]}
+
+    rejected = backend.browse(str(root), "escape")
+    assert rejected["path"] == "escape"
+    assert rejected["entries"] == []
+    assert rejected["writable"] is False
+    assert "configured root" in rejected["error"]
+    with pytest.raises(ValueError, match="configured root"):
+        backend.target_uri(str(root), "escape", "result.parquet")
+    with pytest.raises(ValueError, match="configured root"):
+        backend.mkdir(str(root), "escape", "child")
+    assert not (outside / "child").exists()
+
+
+def test_local_destination_filesystem_root_contains_real_children(tmp_path):
+    from hub import destinations
+
+    root = os.path.realpath(os.sep)
+    child = os.path.realpath(tmp_path)
+    relative = os.path.relpath(child, root)
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"destination data")
+    backend = destinations.LocalBackend()
+
+    listing = backend.browse(root, relative)
+    assert not listing.get("error")
+    assert {entry["name"] for entry in listing["entries"]} == {"source.parquet"}
+    assert backend.target_uri(root, relative, "result.parquet") == os.path.join(
+        child, "result.parquet")
+
+    backend.mkdir(root, relative, "nested")
+    assert (tmp_path / "nested").is_dir()
+
+
+def test_local_destination_cross_drive_containment_fails_closed(monkeypatch):
+    from hub import destinations
+
+    def no_common_path(_paths):
+        raise ValueError("paths are on different drives")
+
+    monkeypatch.setattr(destinations.os.path, "commonpath", no_common_path)
+    assert destinations._within_local_root("C:\\outputs", "D:\\results") is False
+
+
 def test_object_store_feather_roundtrip(tmp_path, object_store_cred):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a

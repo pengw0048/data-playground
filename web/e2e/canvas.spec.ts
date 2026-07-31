@@ -2308,9 +2308,14 @@ test.describe('Data Playground canvas', () => {
     await inspector.getByRole('button', { name: 'Choose destination…' }).click()
     await expect(page.getByText('Choose output destination', { exact: true })).toBeVisible()
     const dialog = page.locator('.dp-modal-overlay')
-    await expect(dialog.getByLabel('Selected destination')).toBeVisible()
+    await expect(dialog.getByText('Dataset name', { exact: true })).toBeVisible()
+    const folder = `experiment-${Date.now()}`
+    await dialog.getByRole('button', { name: 'New folder' }).click()
+    await dialog.getByRole('textbox', { name: 'New folder name' }).fill(folder)
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click()
+    await expect(dialog.getByRole('button', { name: folder, exact: true })).toBeVisible()
     await dialog.locator('input').fill('my_output.parquet')
-    await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
+    await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
     await expect(page.getByText('Choose output destination', { exact: true })).toHaveCount(0)
     const publication = inspector.getByLabel('Write publication')
     await expect(publication).toContainText('my_output.parquet')
@@ -2352,7 +2357,7 @@ test.describe('Data Playground canvas', () => {
       await chooseDestination.click()
       const dialog = page.locator('.dp-modal-overlay')
       await dialog.locator('input').fill(filename)
-      await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
 
       const publication = inspector.getByLabel('Write publication')
       await expect(publication).toContainText(filename)
@@ -2412,7 +2417,7 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Choose destination…' }).click()
       const dialog = page.locator('.dp-modal-overlay')
       await dialog.locator('input').fill(`issue399-recovery-${Date.now()}.parquet`)
-      await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
       await expect(inspector.getByLabel('Write publication')).toContainText('Create a new dataset')
 
       await page.route('**/api/run/estimate', async (route) => {
@@ -2472,7 +2477,7 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Choose destination…' }).click()
       const dialog = page.locator('.dp-modal-overlay')
       await dialog.locator('input').fill(filename)
-      await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Save here', exact: true }).click()
 
       // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
       // destination for the typed append journey below.

@@ -36,6 +36,10 @@ export function FileDialog(props:
   const [filename, setFilename] = useState(mode === 'save' ? (props.defaultName ?? 'output') : '')
   const [pickError, setPickError] = useState<string | null>(null)
   const [pickingUri, setPickingUri] = useState<string | null>(null)
+  const [creatingFolder, setCreatingFolder] = useState(false)
+  const [newFolderName, setNewFolderName] = useState('')
+  const [folderError, setFolderError] = useState<string | null>(null)
+  const [makingFolder, setMakingFolder] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const destinationRequest = useRef(0)
   const browseRequest = useRef(0)
@@ -66,18 +70,15 @@ export function FileDialog(props:
   const refresh = useCallback(async () => {
     const s = ++browseRequest.current
     setPickError(null)
-    if (mode === 'save') {
-      setEntries([]); setBrowseError(null); setLoading(false); setWritable(true)
-      return
-    }
     if (!destId) {
       setEntries([]); setBrowseError(null); setLoading(false)
       return
     }
-    setLoading(true); setBrowseError(null); setEntries([])
+    setLoading(true); setBrowseError(null); setEntries([]); setWritable(true)
     try {
       const r = await api.browseDestination(destId, path)
       if (s !== browseRequest.current) return
+      if (r.path !== path) setPath(r.path)
       setEntries(r.entries)
       setBrowseError(r.error ?? null)
       setWritable(r.writable !== false)
@@ -86,7 +87,7 @@ export function FileDialog(props:
     } finally {
       if (s === browseRequest.current) setLoading(false)
     }
-  }, [destId, mode, path])
+  }, [destId, path])
   useEffect(() => {
     void refresh()
     return () => { browseRequest.current += 1 }
@@ -100,6 +101,7 @@ export function FileDialog(props:
   }, [])
 
   const dest = dests.find((d) => d.id === destId)
+  const filenameError = mode === 'save' ? validateDatasetName(filename) : null
   const segs = path ? path.split('/').filter(Boolean) : []
   const pickOpenFile = async (entry: BrowseEntry) => {
     if (mode !== 'open' || pickingUri) return
@@ -112,11 +114,53 @@ export function FileDialog(props:
       setPickingUri(null)
     }
   }
+  const selectDestination = (id: string) => {
+    setDestId(id)
+    setPath('')
+    setCreatingFolder(false)
+    setNewFolderName('')
+    setFolderError(null)
+  }
+  const createFolder = async () => {
+    if (mode !== 'save' || !dest || makingFolder) return
+    const name = newFolderName
+    const invalid = !name || name !== name.trim() || name === '.' || name === '..'
+      || /[\\/]/.test(name) || [...name].some((char) => char.charCodeAt(0) < 32)
+    if (invalid) {
+      setFolderError('Use one exact folder name without surrounding spaces, slashes, control characters, “.”, or “..”.')
+      return
+    }
+    setMakingFolder(true)
+    setFolderError(null)
+    try {
+      const result = await api.mkdirDestination(dest.id, path, name)
+      if (result.error) {
+        setFolderError(result.error)
+        return
+      }
+      setCreatingFolder(false)
+      setNewFolderName('')
+      setPath(joinRelativePath(path, name))
+    } catch (e) {
+      setFolderError(errorMessage(e))
+    } finally {
+      setMakingFolder(false)
+    }
+  }
+  const pickSaveDestination = () => {
+    if (mode !== 'save' || !dest || !writable || filenameError) return
+    props.onPick({ destId, destName: dest.name, path, filename })
+  }
 
   return createPortal(
     <div className="dp-modal-overlay fixed inset-0 z-[2100] grid place-items-center bg-black/30" onMouseDown={() => { if (!pickingUri) onClose() }}>
       <div onMouseDown={(e) => e.stopPropagation()}
-        className="flex h-[min(460px,88vh)] w-[min(640px,94vw)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg">
+        className={cn(
+          'flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg',
+          mode === 'save'
+            ? 'h-[min(520px,88vh)] w-[min(760px,94vw)]'
+            : 'h-[min(460px,88vh)] w-[min(640px,94vw)]',
+        )}>
         <div className="flex items-center gap-2 border-b border-border px-[14px] py-[11px]">
           <span className="flex items-center text-muted-foreground"><Icon name={mode === 'save' ? 'export' : 'db'} size={14} /></span>
           <span className="text-[13.5px] font-semibold">
@@ -128,12 +172,12 @@ export function FileDialog(props:
 
         <div className="flex min-h-0 flex-1">
           {/* left sidebar — switch configured destination */}
-          <div className="w-[168px] shrink-0 overflow-y-auto border-r border-border bg-muted/30 p-1.5">
+          <div className="flex w-[184px] shrink-0 flex-col overflow-y-auto border-r border-border bg-muted/30 p-1.5">
             <div className="px-2 py-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
               {mode === 'save' ? 'Destinations' : 'Places'}
             </div>
             {dests.map((d) => (
-              <button key={d.id} onClick={() => { setDestId(d.id); setPath('') }}
+              <button key={d.id} onClick={() => selectDestination(d.id)}
                 className={cn('flex w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors',
                   d.id === destId ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50')}>
                 <span className="flex items-center text-muted-foreground"><Icon name={d.backend === 'local' ? 'grid' : 'link'} size={13} /></span>
@@ -152,55 +196,17 @@ export function FileDialog(props:
             {!loadingDests && !destError && dests.length === 0 && <div className="p-2 text-[11px] text-muted-foreground">
               No destinations.
             </div>}
+            <span className="flex-1" />
+            {mode === 'save' && props.onManageDestinations && (
+              <Button variant="ghost" size="sm" className="mt-2 justify-start" onClick={props.onManageDestinations}>
+                <Icon name="settings" size={12} /> Manage destinations
+              </Button>
+            )}
           </div>
 
-          {mode === 'save' ? (
-            <div className="flex min-w-0 flex-1 items-center justify-center p-6">
-              {dest ? (
-                <div aria-label="Selected destination"
-                  className="w-full max-w-sm rounded-md border border-border bg-muted/30 p-4">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
-                    Selected destination
-                  </div>
-                  <div className="mt-1 flex items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">{dest.name}</span>
-                    <span className="rounded border border-border bg-background px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      {destinationBackendLabel(dest.backend)}
-                    </span>
-                  </div>
-                  <div className="mt-3 text-[10px] font-medium text-muted-foreground">Root or prefix</div>
-                  <div className="dp-mono mt-1 break-all rounded border border-border bg-background px-2 py-1.5 text-[11px] text-foreground">
-                    {dest.root}
-                  </div>
-                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
-                    The next run will request the output name below inside this configured location.
-                    The server confirms access before writing.
-                  </p>
-                  <div className="mt-3 border-t border-border pt-3 text-[11px] leading-relaxed text-muted-foreground">
-                    {props.onManageDestinations
-                      ? 'Add local, S3, or GCS locations as named destinations in Settings, then select one here.'
-                      : 'Destinations are configured by an administrator. Ask an administrator to add or change a local, S3, or GCS location.'}
-                  </div>
-                  {props.onManageDestinations && (
-                    <Button variant="outline" size="sm" className="mt-2" onClick={props.onManageDestinations}>
-                      <Icon name="settings" size={12} /> Manage destinations
-                    </Button>
-                  )}
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">
-                  {loadingDests
-                    ? 'Loading destinations…'
-                    : destError
-                      ? 'Destinations are unavailable. Retry from the sidebar.'
-                      : 'No destinations configured.'}
-                </div>
-              )}
-            </div>
-          ) : (
-            /* Open mode keeps the kernel-accessible path browser. */
-            <div className="flex min-w-0 flex-1 flex-col">
-              <div className="flex items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border px-3 py-[7px] text-[11.5px] text-muted-foreground">
+          {/* Open and save share one browser. Save selects the current folder, not an arbitrary URI. */}
+          <div className="flex min-w-0 flex-1 flex-col">
+              <div className="flex min-h-10 items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border px-3 py-[7px] text-[11.5px] text-muted-foreground">
                 <button onClick={() => setPath('')} className={crumbBtn}>{dest?.name ?? '—'}</button>
                 {segs.map((s, i) => (
                   <span key={i} className="inline-flex items-center gap-1">
@@ -208,8 +214,33 @@ export function FileDialog(props:
                     <button onClick={() => setPath(segs.slice(0, i + 1).join('/'))} className={crumbBtn}>{s}</button>
                   </span>
                 ))}
+                <span className="flex-1" />
+                {mode === 'save' && dest && writable && (
+                  <Button variant="ghost" size="sm" className="shrink-0"
+                    onClick={() => { setCreatingFolder(true); setFolderError(null) }}>
+                    <Icon name="plus" size={12} /> New folder
+                  </Button>
+                )}
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+                {mode === 'save' && creatingFolder && (
+                  <form className="m-1 rounded-md border border-border bg-muted/30 p-2"
+                    onSubmit={(e) => { e.preventDefault(); void createFolder() }}>
+                    <div className="flex items-center gap-2">
+                      <Input autoFocus aria-label="New folder name" value={newFolderName}
+                        onChange={(e) => { setNewFolderName(e.target.value); setFolderError(null) }}
+                        placeholder="Folder name" className="min-w-0 flex-1 text-xs" />
+                      <Button size="sm" type="submit" disabled={makingFolder}>
+                        {makingFolder ? 'Creating…' : 'Create'}
+                      </Button>
+                      <Button size="sm" type="button" variant="ghost" disabled={makingFolder}
+                        onClick={() => { setCreatingFolder(false); setNewFolderName(''); setFolderError(null) }}>
+                        Cancel
+                      </Button>
+                    </div>
+                    {folderError && <div role="alert" className="mt-1.5 text-[11px] text-destructive">{folderError}</div>}
+                  </form>
+                )}
                 {pickError && (
                   <div role="alert" className="m-1 rounded-md border border-destructive/30 px-3 py-2 text-xs text-destructive">
                     Couldn't open file: {pickError}. Your selection has not been changed; choose the file to retry.
@@ -219,40 +250,64 @@ export function FileDialog(props:
                     {loadingDests ? 'Loading places…' : destError ? 'Places are unavailable. Retry from the sidebar.' : 'No destinations configured.'}
                   </div>
                   : loading ? <div className="p-4 text-xs text-muted-foreground">Loading…</div>
-                  : browseError ? <div role="alert" className="m-1 flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-3 py-2 text-xs text-destructive">
-                      <span>Couldn't load this folder: {browseError}</span>
-                      <button onClick={() => void refresh()} data-testid="file-dialog-browse-retry" className="shrink-0 font-semibold underline">Retry</button>
-                    </div>
+                  : browseError ? <>
+                      <div role="alert" className="m-1 flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-3 py-2 text-xs text-destructive">
+                        <span>Couldn't load this folder: {browseError}</span>
+                        <button onClick={() => void refresh()} data-testid="file-dialog-browse-retry" className="shrink-0 font-semibold underline">Retry</button>
+                      </div>
+                      {mode === 'save' && writable && (
+                        <div className="px-3 py-2 text-[11px] text-muted-foreground">
+                          You can still save to this configured location; write access is checked when the run starts.
+                        </div>
+                      )}
+                    </>
                   : entries.length === 0 ? <div className="p-4 text-xs text-muted-foreground">Empty folder.</div>
-                  : entries.map((e) => (
-                    <button key={e.uri} disabled={pickingUri !== null} onClick={() => {
-                      if (e.kind === 'dir') setPath(path ? `${path}/${e.name}` : e.name)
-                      else void pickOpenFile(e)
-                    }}
-                      className="flex w-full items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] text-foreground transition-colors hover:bg-accent disabled:opacity-60">
-                      <span className={cn('flex items-center', e.kind === 'dir' ? 'text-primary' : 'text-muted-foreground')}><Icon name={e.kind === 'dir' ? 'grid' : 'db'} size={14} /></span>
-                      <span className="flex-1 overflow-hidden text-ellipsis">{e.name}</span>
-                      {pickingUri === e.uri && <span className="text-[10.5px] text-muted-foreground">Opening…</span>}
-                      {e.kind === 'dir' && <span className="flex items-center text-muted-foreground"><Icon name="chevronRight" size={12} /></span>}
-                    </button>
-                  ))}
+                  : entries.map((e) => e.kind === 'dir' || mode === 'open' ? (
+                      <button key={e.uri} disabled={pickingUri !== null} onClick={() => {
+                        if (e.kind === 'dir') setPath(joinRelativePath(path, e.name))
+                        else void pickOpenFile(e)
+                      }}
+                        className="flex w-full items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] text-foreground transition-colors hover:bg-accent disabled:opacity-60">
+                        <span className={cn('flex items-center', e.kind === 'dir' ? 'text-primary' : 'text-muted-foreground')}><Icon name={e.kind === 'dir' ? 'grid' : 'db'} size={14} /></span>
+                        <span className="flex-1 overflow-hidden text-ellipsis">{e.name}</span>
+                        {pickingUri === e.uri && <span className="text-[10.5px] text-muted-foreground">Opening…</span>}
+                        {e.kind === 'dir' && <span className="flex items-center text-muted-foreground"><Icon name="chevronRight" size={12} /></span>}
+                      </button>
+                    ) : (
+                      <div key={e.uri} className="flex w-full items-center gap-[9px] rounded-md px-2.5 py-2 text-left text-[12.5px] text-muted-foreground">
+                        <span className="flex items-center"><Icon name="db" size={14} /></span>
+                        <span className="flex-1 overflow-hidden text-ellipsis">{e.name}</span>
+                      </div>
+                    ))}
               </div>
-            </div>
-          )}
+          </div>
         </div>
 
         {mode === 'save' && (
-          <div className="flex items-center gap-2 border-t border-border px-[14px] py-2.5">
+          <div className="flex items-end gap-2 border-t border-border px-[14px] py-2.5">
             {!writable
               ? <span className="flex-1 text-[11px] text-amber-600">This destination can't accept this output — install its plugin or choose another destination.</span>
-              : <>
-                  <span className="text-[11.5px] text-muted-foreground">Output name</span>
-                  <Input ref={fileRef} value={filename} onChange={(e) => setFilename(e.target.value)}
-                    className="dp-mono min-w-0 flex-1 text-[12.5px]" />
-                </>}
-            <Button size="sm" disabled={!filename.trim() || !dest || !writable}
-              onClick={() => dest && props.onPick({ destId, destName: dest.name, path: '', filename: filename.trim() })}>
-              Use destination
+              : <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="file-dialog-dataset-name" className="shrink-0 text-[11.5px] text-muted-foreground">
+                      Dataset name
+                    </label>
+                    <Input id="file-dialog-dataset-name" ref={fileRef} value={filename}
+                      aria-invalid={filenameError ? true : undefined}
+                      aria-describedby={filenameError ? 'file-dialog-dataset-name-error' : undefined}
+                      onChange={(e) => setFilename(e.target.value)}
+                      className="dp-mono min-w-0 flex-1 text-[12.5px]" />
+                  </div>
+                  {filenameError && (
+                    <div id="file-dialog-dataset-name-error" role="alert"
+                      className="mt-1 text-[11px] text-destructive">
+                      {filenameError}
+                    </div>
+                  )}
+                </div>}
+            <Button size="sm" disabled={!!filenameError || !dest || !writable}
+              onClick={pickSaveDestination}>
+              Save here
             </Button>
           </div>
         )}
@@ -264,9 +319,21 @@ export function FileDialog(props:
 
 const crumbBtn = 'inline-flex items-center gap-[3px] rounded px-1 py-0.5 text-[11.5px] font-semibold text-primary transition-colors hover:bg-accent/60'
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
-const destinationBackendLabel = (backend: string) => {
-  if (backend === 'local') return 'Local'
-  if (backend === 's3') return 'S3'
-  if (backend === 'gs') return 'GCS'
-  return backend
+const joinRelativePath = (path: string, child: string) => path ? `${path}/${child}` : child
+
+function validateDatasetName(value: string): string | null {
+  if (!value.trim()) return 'Enter a dataset name.'
+  if (value !== value.trim()) {
+    return 'Dataset name cannot contain surrounding whitespace. Edit it to continue.'
+  }
+  if (/^\.+$/.test(value)) return 'Dataset name cannot consist only of dots.'
+  const hasControlCharacter = [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+  })
+  if (['/', '\\', ':', '*', '?', '['].some((character) => value.includes(character))
+      || hasControlCharacter) {
+    return 'Dataset name must be one name, not a path. Remove slashes, “:”, “*”, “?”, “[”, and control characters.'
+  }
+  return null
 }

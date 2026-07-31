@@ -30,9 +30,10 @@ class LocalBackend:
 
     def browse(self, root: str, path: str, cred_id: str | None = None) -> dict:
         top = os.path.realpath(root)
-        base = os.path.realpath(os.path.join(top, path.lstrip("/")))
-        if not (base == top or base.startswith(top + os.sep)):  # never escape the destination root
-            base, path = top, ""
+        try:
+            base = self._safe(root, path)
+        except ValueError as e:
+            return {"path": path, "entries": [], "error": str(e), "writable": False}
         try:
             names = sorted(os.listdir(base))
         except OSError as e:
@@ -42,6 +43,8 @@ class LocalBackend:
             if fn.startswith("."):
                 continue
             p = os.path.join(base, fn)
+            if not _within_local_root(top, os.path.realpath(p)):
+                continue
             # a `.lance` dir is a dataset (a "file"), not a folder to descend into
             is_dir = os.path.isdir(p) and not fn.endswith(".lance")
             entries.append({"name": fn, "kind": "dir" if is_dir else "file", "uri": p})
@@ -53,10 +56,12 @@ class LocalBackend:
     def _safe(self, root: str, path: str) -> str:
         top = os.path.realpath(root)
         base = os.path.realpath(os.path.join(top, path.lstrip("/")))
-        return base if (base == top or base.startswith(top + os.sep)) else top  # never escape the root
+        if not _within_local_root(top, base):
+            raise ValueError("destination path must stay within its configured root")
+        return base
 
     def mkdir(self, root: str, path: str, name: str) -> None:
-        os.makedirs(os.path.join(self._safe(root, path), os.path.basename(name)), exist_ok=True)
+        os.mkdir(os.path.join(self._safe(root, path), _folder_name(name)))
 
 
 class ObjectStoreBackend:
@@ -123,6 +128,14 @@ _BACKENDS: dict[str, DestinationBackend] = {
 }
 
 
+def _within_local_root(root: str, candidate: str) -> bool:
+    try:
+        return os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        # Windows paths on different drives have no common path and are never contained.
+        return False
+
+
 def register_backend(b: DestinationBackend) -> None:
     """Plugin extension point — add real s3/gcs/catalog browsing behind the same interface."""
     _BACKENDS[b.kind] = b
@@ -155,6 +168,20 @@ def _find(workspace: str, dest_id: str) -> dict | None:
     return next((d for d in presets(workspace) if d.get("id") == dest_id), None)
 
 
+def _folder_name(name: str) -> str:
+    """Validate one child segment without silently rewriting an unsafe request."""
+    if (
+        not name
+        or name != name.strip()
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(ord(char) < 32 for char in name)
+    ):
+        raise ValueError("folder name must be one non-empty path segment")
+    return name
+
+
 def selected_object_store_credential(workspace: str, dest_id: str | None) -> tuple[str, str] | None:
     """Return the selected credential source and destination label without resolving secret material.
 
@@ -183,7 +210,7 @@ def browse(workspace: str, dest_id: str, path: str) -> dict:
     if not b:
         return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
     res = b.browse(d.get("root", ""), path or "", d.get("credId"))
-    res["writable"] = True  # both local and object-store backends can write
+    res.setdefault("writable", True)  # a backend may fail closed for an unsafe selected path
     return res
 
 
@@ -212,11 +239,15 @@ def mkdir(workspace: str, dest_id: str, path: str, name: str) -> dict:
     d = _find(workspace, dest_id)
     if not d:
         return {"error": "unknown destination"}
+    try:
+        folder = _folder_name(name)
+    except ValueError as e:
+        return {"error": str(e)}
     b = _BACKENDS.get(d.get("backend", "local"))
     if b is None or not hasattr(b, "mkdir"):
         return {"ok": True}  # object stores have no real folders — the prefix is created on write
     try:
-        b.mkdir(d.get("root", ""), path or "", name)
+        b.mkdir(d.get("root", ""), path or "", folder)
         return {"ok": True}
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
