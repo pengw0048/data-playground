@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sqlite3
@@ -113,6 +114,19 @@ def _workspace_item(client: TestClient, container_id: str, resource_id: str) -> 
     if found is None:
         raise AssertionError(f"Workspace resource {resource_id!r} was not found")
     return found
+
+
+def test_dataset_view_commit_time_normalization_is_core_owned():
+    naive = datetime.datetime(2026, 7, 31, 21, 37)
+    assert dataset_view_routes._definition_committed_at(
+        naive, retention_owner="core",
+    ) == naive.replace(tzinfo=datetime.timezone.utc)
+    assert dataset_view_routes._definition_committed_at(
+        "2026-07-31T17:37:00-04:00", retention_owner="core",
+    ) == datetime.datetime(2026, 7, 31, 21, 37, tzinfo=datetime.timezone.utc)
+    assert dataset_view_routes._definition_committed_at(
+        naive, retention_owner="provider",
+    ) is naive
 
 
 def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_path):
@@ -481,6 +495,7 @@ def test_core_revision_hold_is_installed_and_released_with_view(
             assert created.status_code == 201, created.text
             definition = created.json()
             assert definition["retentionOwner"] == "core"
+            assert definition["datasetRef"]["lastKnown"]["committedAt"].endswith("Z")
             parsed = DatasetViewDefinitionV1.model_validate(definition)
             assert dataset_view_routes._canonical_sha256(
                 parsed.definition_digest_payload()) == definition["definitionSha256"]
