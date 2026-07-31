@@ -4,22 +4,22 @@ import { goToWorkspace, workspaceResource } from './support/workspace'
 async function expectToolbarInsideCanvas(page: Page, viewportWidth: number) {
   const toolbar = page.getByTestId('toolbar')
   const canvas = page.locator('.react-flow')
-  const nextStep = page.getByRole('button', { name: 'Add next step', exact: true })
-  const [toolbarBox, canvasBox, nextStepBox] = await Promise.all([
-    toolbar.boundingBox(), canvas.boundingBox(), nextStep.boundingBox(),
+  const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
+  const [toolbarBox, canvasBox, addBox] = await Promise.all([
+    toolbar.boundingBox(), canvas.boundingBox(), globalAdd.boundingBox(),
   ])
   expect(toolbarBox).not.toBeNull()
   expect(canvasBox).not.toBeNull()
-  expect(nextStepBox).not.toBeNull()
+  expect(addBox).not.toBeNull()
   expect(toolbarBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
   expect(toolbarBox!.x + toolbarBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
-  expect(nextStepBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
-  expect(nextStepBox!.x + nextStepBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
+  expect(addBox!.x).toBeGreaterThanOrEqual(canvasBox!.x - 0.5)
+  expect(addBox!.x + addBox!.width).toBeLessThanOrEqual(canvasBox!.x + canvasBox!.width + 0.5)
   expect(canvasBox!.x + canvasBox!.width).toBeLessThan(viewportWidth)
 }
 
-test.describe('Workspace Source next-step flow @ux-smoke', () => {
-  test('keeps the selected Source next-step flow responsive and connects Transform', async ({ page }) => {
+test.describe('Workspace Source port-add flow @ux-smoke', () => {
+  test('keeps creation global and connects a local Transform from the selected Source port', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await goToWorkspace(page)
 
@@ -33,30 +33,30 @@ test.describe('Workspace Source next-step flow @ux-smoke', () => {
 
     const toolbar = page.getByTestId('toolbar')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
-    const nextStep = page.getByRole('button', { name: 'Add next step', exact: true })
+    const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
+    const sourcePort = page.getByRole('button', { name: 'Add operation from dataset output' })
     await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
-    await expect(nextStep).toBeVisible()
-    await expect(nextStep).toContainText('Add next step')
-    await expect(toolbar).toHaveAttribute('data-density', 'compact')
-    await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
+    await expect(globalAdd).toBeVisible()
+    await expect(globalAdd).toHaveText('')
+    await expect(sourcePort).toBeVisible()
+    await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
     await expect(viewportControls.getByRole('button', { name: 'Fit view', exact: true })).toBeVisible()
+    await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
+    await expect(page.getByTestId('inspector').getByRole('button', { name: 'Find join candidates' })).toBeVisible()
+    await expect(page.getByTestId(/^join-with-related-canvas-/)).toHaveCount(0)
     await expectToolbarInsideCanvas(page, 1280)
 
     await page.setViewportSize({ width: 1440, height: 900 })
     await expect(toolbar).toHaveAttribute('data-density', 'comfortable')
-    await expect(toolbar.getByText('View', { exact: true })).toBeVisible()
-    await expect(viewportControls.getByRole('button', { name: 'Fit view', exact: true })).toBeVisible()
-    await expect(nextStep).toContainText('Add next step')
     await expectToolbarInsideCanvas(page, 1440)
 
-    await nextStep.click()
-    const finder = page.getByRole('dialog', { name: 'Add an operation' })
+    await sourcePort.press('Enter')
+    const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
+    await expect(finder).not.toHaveAttribute('aria-modal')
+    await expect(page.locator('.dp-modal-overlay')).toHaveCount(0)
     await finder.getByRole('textbox', { name: 'Search operations' }).fill('transform')
-    const transform = finder.getByRole('option', { name: /^transform/i }).first()
-    await expect(finder.getByLabel('Next-step context')).toContainText('Add next step after events')
-    await expect(transform).not.toContainText('Adds unconnected')
-    await expect(transform).not.toContainText('Add next step after events')
-    await transform.click()
+    await finder.getByRole('option', { name: /^transform/i }).first().click()
 
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)

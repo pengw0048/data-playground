@@ -18,7 +18,7 @@ import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
 import type { CanvasNode } from '../types/graph'
-import { NodeFinder } from './NodeFinder'
+import { NodeFinder, type ScreenRect } from './NodeFinder'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
@@ -186,7 +186,13 @@ export function Canvas() {
     return () => disconnectCollab()
   }, [docId])
 
-  const [finder, setFinder] = useState<{ x: number; y: number; wire: WireType; source: { nodeId: string; handleId: string | null } } | null>(null)
+  const [finder, setFinder] = useState<{
+    anchor: ScreenRect
+    boundary: ScreenRect
+    opener: HTMLElement
+    wire: WireType
+    source: { nodeId: string; handleId: string | null }
+  } | null>(null)
 
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
@@ -466,14 +472,30 @@ export function Canvas() {
   useEffect(() => {
     const onPortClick = (ev: Event) => {
       if (!canEdit) return
-      const { nodeId, handleId, x, y } = (ev as CustomEvent).detail as { nodeId: string; handleId: string; x: number; y: number }
-      const wire = portWire(doc.nodes, nodeId, handleId, 'source')
-      if (!wire) return
-      setFinder({ x, y, wire: wire as WireType, source: { nodeId, handleId } })
+      const { nodeId, handleId, anchor, opener } = (ev as CustomEvent).detail as {
+        nodeId: string
+        handleId: string
+        anchor: ScreenRect
+        opener: HTMLElement
+      }
+      // Resolve compatibility at activation time. A newly added node can paint before this effect
+      // is refreshed with the next graph snapshot; reading the store avoids dropping a fast click
+      // or key press against an otherwise visible port.
+      const wire = portWire(useStore.getState().doc.nodes, nodeId, handleId, 'source')
+      const surface = canvasRef.current?.getBoundingClientRect()
+      if (!wire || !surface) return
+      const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
+      const boundary = {
+        left: surface.left,
+        right: surface.right,
+        top: surface.top,
+        bottom: toolbarTop == null ? surface.bottom : Math.min(surface.bottom, toolbarTop - 8),
+      }
+      setFinder({ anchor, boundary, opener, wire: wire as WireType, source: { nodeId, handleId } })
     }
     window.addEventListener('dp-port-click', onPortClick)
     return () => window.removeEventListener('dp-port-click', onPortClick)
-  }, [canEdit, doc.nodes])
+  }, [canEdit])
 
   // keyboard: Delete / Backspace remove selection; B bypass; M mute
   useEffect(() => {
@@ -611,13 +633,19 @@ export function Canvas() {
           specs={allSpecs()}
           wire={finder.wire}
           compatibleOnly
+          anchor={finder.anchor}
+          boundary={finder.boundary}
+          returnFocus={finder.opener}
           onClose={() => setFinder(null)}
           onPick={(kind) => {
             const target = firstCompatibleInput(kind, finder.wire)
             // Keep the graph contract at the creation boundary as well as in the picker. This prevents
             // a stale plugin registry update from creating an incompatible unconnected node.
             if (target) {
-              const p = screenToFlowPosition({ x: finder.x, y: finder.y })
+              const p = screenToFlowPosition({
+                x: finder.anchor.right,
+                y: (finder.anchor.top + finder.anchor.bottom) / 2,
+              })
               const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
               useStore.getState().addConnectedNode(kind, pos, {
                 source: finder.source.nodeId, sourceHandle: finder.source.handleId ?? '',

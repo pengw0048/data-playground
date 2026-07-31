@@ -31,7 +31,6 @@ vi.mock('../api/client', () => ({
 import { JoinWithRelated } from './JoinWithRelated'
 
 const inspectorTrigger = 'Find join candidates'
-const canvasTrigger = 'Find join candidates'
 const leftInputTrigger = 'Find join candidates · left'
 const dialogName = 'Find join candidates'
 
@@ -86,13 +85,13 @@ describe('JoinWithRelated', () => {
     mocks.getCanvas.mockResolvedValue({ ...mocks.state.doc, version: 4 })
   })
 
-  it('uses the same researcher task name on Source and Inspector entries and in the dialog', async () => {
+  it('keeps Source discovery in the Inspector and out of the Canvas card', async () => {
     const { rerender } = render(<JoinWithRelated nodeId="source-1" />)
-    expect(screen.getByRole('button', { name: inspectorTrigger })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
+    expect(await screen.findByRole('dialog', { name: dialogName })).toBeVisible()
 
     rerender(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
-    expect(await screen.findByRole('dialog', { name: dialogName })).toBeVisible()
+    expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
   })
 
   it('separates evidence, keeps unknown explicit, and cancellation mutates nothing', async () => {
@@ -129,8 +128,8 @@ describe('JoinWithRelated', () => {
       refinementRequired: false,
     })
 
-    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
+    render(<JoinWithRelated nodeId="source-1" />)
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     const dialog = await screen.findByRole('dialog', { name: dialogName })
     expect(within(dialog).getByText(/declared or reference-backed relationships and possible key matches/))
       .toBeVisible()
@@ -436,9 +435,9 @@ describe('JoinWithRelated', () => {
     await waitFor(() => expect(opener).toHaveFocus())
   })
 
-  it('uses the Canvas modal shortcut-isolation contract and ignores Delete', async () => {
-    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    fireEvent.click(screen.getByRole('button', { name: canvasTrigger }))
+  it('uses the related-data modal isolation contract and ignores Delete', async () => {
+    render(<JoinWithRelated nodeId="source-1" />)
+    fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     const dialog = screen.getByRole('dialog', { name: dialogName })
     expect(dialog.parentElement).toHaveClass('dp-modal-overlay')
@@ -461,16 +460,14 @@ describe('JoinWithRelated', () => {
     ))
   })
 
-  it('offers the Canvas action only for a canonical Source binding', () => {
-    const { unmount } = render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
-    expect(screen.getByTestId('join-with-related-canvas-source-1')).toHaveAccessibleName(canvasTrigger)
-    unmount()
-
+  it('never offers the Source action on the Canvas card', () => {
+    const { rerender } = render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
     mocks.state.doc.nodes[0].data.config = {
       uri: 'events.parquet', tableId: 'tbl-events',
       providerMountId: '', providerSourceBindingId: '',
     }
-    render(<JoinWithRelated nodeId="source-1" surface="canvas" />)
+    rerender(<JoinWithRelated nodeId="source-1" surface="canvas" />)
     expect(screen.queryByTestId('join-with-related-canvas-source-1')).toBeNull()
   })
 

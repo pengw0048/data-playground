@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { NodeFinder, findNodeSpecs } from './NodeFinder'
+import { NodeFinder, findNodeSpecs, portFinderPlacement } from './NodeFinder'
 import type { NodeSpec } from '../nodes/registry'
 
 const node = (overrides: Partial<NodeSpec>): NodeSpec => ({
@@ -9,6 +9,20 @@ const node = (overrides: Partial<NodeSpec>): NodeSpec => ({
 })
 
 describe('node finder', () => {
+  it('keeps an anchored picker beside its port and inside the Canvas boundary', () => {
+    expect(portFinderPlacement(
+      { left: 600, right: 615, top: 200, bottom: 215 },
+      { left: 0, right: 724, top: 0, bottom: 650 },
+      720,
+    )).toEqual({ left: 192, top: 200, width: 400, maxHeight: 442 })
+
+    expect(portFinderPlacement(
+      { left: 100, right: 115, top: 580, bottom: 595 },
+      { left: 0, right: 724, top: 0, bottom: 650 },
+      720,
+    )).toEqual({ left: 123, bottom: 125, width: 400, maxHeight: 480 })
+  })
+
   it('keeps exact name matches ahead of compatibility and hides weaker metadata matches', () => {
     const specs = [
       node({ kind: 'same-plugin', title: 'Filter', source: 'plugin:quality-pack', inputs: [{ id: 'in', wire: 'metric', accepts: ['metric'] }] }),
@@ -100,17 +114,29 @@ describe('node finder', () => {
     expect(options[1]).not.toHaveTextContent('quality-filter')
   })
 
-  it('uses the same keyboard-first picker for compatible port connections', () => {
+  it('uses the same keyboard-first search in a non-modal port popover', () => {
     const onPick = vi.fn()
     const onClose = vi.fn()
     const specs = [
       node({ kind: 'transform', title: 'Transform', source: 'plugin:quality-pack' }),
       node({ kind: 'metric-only', title: 'Metric only', inputs: [{ id: 'metric', wire: 'metric', accepts: ['metric'] }] }),
     ]
-    render(<NodeFinder specs={specs} wire="dataset" compatibleOnly onPick={onPick} onClose={onClose} />)
+    render(<NodeFinder
+      specs={specs}
+      wire="dataset"
+      compatibleOnly
+      anchor={{ left: 200, right: 215, top: 150, bottom: 165 }}
+      boundary={{ left: 0, right: 900, top: 0, bottom: 700 }}
+      onPick={onPick}
+      onClose={onClose}
+    />)
 
     const search = screen.getByRole('textbox', { name: 'Search operations' })
-    expect(screen.getByRole('dialog', { name: 'Connect to an operation' })).toBeVisible()
+    const dialog = screen.getByRole('dialog', { name: 'Connect to an operation' })
+    expect(dialog).toBeVisible()
+    expect(dialog).not.toHaveAttribute('aria-modal')
+    expect(dialog.closest('.dp-modal-overlay')).toBeNull()
+    expect(dialog).toHaveStyle({ left: '223px', width: '400px' })
     expect(search).toHaveFocus()
     expect(screen.getAllByRole('option')).toHaveLength(1)
     expect(screen.getByText('For dataset output')).toBeVisible()
@@ -125,28 +151,6 @@ describe('node finder', () => {
     expect(onPick).toHaveBeenCalledTimes(2)
     fireEvent.keyDown(search, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledOnce()
-  })
-
-  it('states selected-node context once and marks only choices that cannot connect', () => {
-    render(<NodeFinder
-      specs={[
-        node({ kind: 'filter', title: 'Filter' }),
-        node({ kind: 'metric-only', title: 'Metric only', inputs: [{ id: 'metric', wire: 'metric', accepts: ['metric'] }] }),
-      ]}
-      nextStepKinds={new Set(['filter'])}
-      nextStepLabel="events"
-      onPick={vi.fn()}
-      onClose={vi.fn()}
-    />)
-
-    const context = screen.getByLabelText('Next-step context')
-    expect(context).toHaveTextContent('Add next step after events')
-    expect(screen.getByRole('dialog').textContent?.match(/Add next step after events/g)).toHaveLength(1)
-    const filter = screen.getByRole('option', { name: /filter/i })
-    expect(filter).not.toHaveTextContent('Adds unconnected')
-    expect(filter).not.toHaveTextContent('Add next step after events')
-    expect(screen.getByRole('option', { name: /metric only/i })).toHaveTextContent('Adds unconnected')
-    expect(screen.getByRole('textbox', { name: 'Search operations' })).toHaveFocus()
   })
 
   it('renders only the first 100 results while reporting a truncated full search', () => {
