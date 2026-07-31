@@ -116,6 +116,15 @@ const NODE = (id: string, type = 'source') => ({
   data: { title: id, config: {}, status: 'draft' as const, history: [] },
 })
 
+const CURRENT_NODE = (id: string, type = 'source') => ({
+  ...NODE(id, type),
+  data: {
+    ...NODE(id, type).data,
+    status: 'latest' as const,
+    lastRun: { rows: 10, ms: 25, placement: 'local' as const },
+  },
+})
+
 const WRITE_RECEIPT = (revisionId: string, rows = 2) => ({
   datasetId: 'dataset-1',
   revisionId,
@@ -649,6 +658,117 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
   })
 
+  it('marks the surviving downstream cone stale when an edge is removed', () => {
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [
+          CURRENT_NODE('source'), CURRENT_NODE('target', 'filter'),
+          CURRENT_NODE('downstream', 'write'), CURRENT_NODE('unrelated'),
+        ],
+        edges: [
+          { id: 'source-target', source: 'source', target: 'target' },
+          { id: 'target-downstream', source: 'target', target: 'downstream' },
+        ],
+      },
+    }))
+
+    useStore.getState().removeEdge('source-target')
+
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['source', 'latest'],
+      ['target', 'stale'],
+      ['downstream', 'stale'],
+      ['unrelated', 'latest'],
+    ])
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'target')?.data.lastRun)
+      .toEqual({ rows: 10, ms: 25, placement: 'local' })
+  })
+
+  it('marks surviving descendants stale when an upstream node is removed', () => {
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [
+          CURRENT_NODE('source'), CURRENT_NODE('target', 'filter'),
+          CURRENT_NODE('downstream', 'write'), CURRENT_NODE('unrelated'),
+        ],
+        edges: [
+          { id: 'source-target', source: 'source', target: 'target' },
+          { id: 'target-downstream', source: 'target', target: 'downstream' },
+        ],
+      },
+    }))
+
+    useStore.getState().removeNode('source')
+
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['target', 'stale'],
+      ['downstream', 'stale'],
+      ['unrelated', 'latest'],
+    ])
+  })
+
+  it.each([
+    ['selected upstream node', ['source']],
+    ['selected input edge', ['source-target']],
+  ])('marks surviving descendants stale after deleting a %s', (_label, selectedIds) => {
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [
+          CURRENT_NODE('source'), CURRENT_NODE('target', 'filter'),
+          CURRENT_NODE('downstream', 'write'), CURRENT_NODE('unrelated'),
+        ],
+        edges: [
+          { id: 'source-target', source: 'source', target: 'target' },
+          { id: 'target-downstream', source: 'target', target: 'downstream' },
+        ],
+      },
+      selectedIds,
+      selectedId: selectedIds[0],
+    }))
+
+    useStore.getState().removeSelected()
+
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'target')?.data.status)
+      .toBe('stale')
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'downstream')?.data.status)
+      .toBe('stale')
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'unrelated')?.data.status)
+      .toBe('latest')
+  })
+
+  it.each(['bypass', 'disable'] as const)(
+    'marks the toggled node and downstream results stale after %s changes execution semantics',
+    (operation) => {
+      useStore.setState((state) => ({
+        doc: {
+          ...state.doc,
+          nodes: [
+            CURRENT_NODE('source'), CURRENT_NODE('transform', 'filter'),
+            CURRENT_NODE('downstream', 'write'), CURRENT_NODE('unrelated'),
+          ],
+          edges: [
+            { id: 'source-transform', source: 'source', target: 'transform' },
+            { id: 'transform-downstream', source: 'transform', target: 'downstream' },
+          ],
+        },
+      }))
+
+      useStore.getState()[operation]('transform')
+
+      expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+        ['source', 'latest'],
+        ['transform', 'stale'],
+        ['downstream', 'stale'],
+        ['unrelated', 'latest'],
+      ])
+      const toggled = useStore.getState().doc.nodes.find((node) => node.id === 'transform')
+      expect(operation === 'bypass' ? toggled?.data.bypassed : toggled?.data.disabled).toBe(true)
+    },
+  )
+
   it('restores the exact output identity when successive versions share a config', () => {
     const target = NODE('target', 'filter')
     const config = { predicate: 'score > 0' }
@@ -828,7 +948,7 @@ describe('graph store — core authority ops', () => {
     })
     expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
       ['source', 'latest'],
-      ['old-target', 'latest'],
+      ['old-target', 'stale'],
       ['new-target', 'stale'],
       ['downstream', 'stale'],
     ])

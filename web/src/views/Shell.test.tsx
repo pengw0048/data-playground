@@ -39,6 +39,11 @@ describe('Shell primary navigation', () => {
   it('opens Workspace home instead of restoring a stale resource dialog', async () => {
     render(<Shell />)
 
+    fireEvent.click(screen.getByTestId('rail-collapse'))
+    const productMark = screen.getByTestId('workspace-product-mark')
+    expect(productMark).toContainHTML('<svg')
+    expect(productMark).toHaveTextContent('')
+
     fireEvent.click(screen.getByTestId('rail-workspace'))
 
     expect(useStore.getState()).toMatchObject({

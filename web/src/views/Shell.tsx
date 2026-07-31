@@ -102,7 +102,14 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
     <aside data-testid="workspace-rail" aria-label="Primary navigation"
       className={cn('flex h-full flex-col border-r border-border bg-card p-3 transition-[width] duration-150', collapsed ? 'w-[64px] flex-[0_0_64px]' : 'w-[232px] flex-[0_0_232px]')}>
       <div className={cn('flex items-center gap-2 pb-3 pt-1', collapsed ? 'justify-center px-0' : 'px-2')}>
-        {!collapsed && <span className="grid h-[22px] w-[22px] place-items-center rounded-md bg-foreground text-[13px] font-bold text-background">D</span>}
+        {!collapsed && (
+          <span
+            data-testid="workspace-product-mark"
+            className="grid h-[22px] w-[22px] place-items-center rounded-md border border-border bg-background text-foreground"
+          >
+            <Icon name="db" size={13} />
+          </span>
+        )}
         {!collapsed && <span className="min-w-0 flex-1 truncate text-[13.5px] font-bold text-foreground">Data Playground</span>}
         <button type="button" data-testid="rail-collapse" onClick={() => setCollapsed((value) => !value)}
           aria-expanded={!collapsed}
