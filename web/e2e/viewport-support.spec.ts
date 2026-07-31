@@ -482,9 +482,10 @@ test.describe('minimum viewport support', () => {
     await expect(appMenu.getByText('runs and background tasks', { exact: true })).toBeVisible()
     await expect(appMenu.getByRole('menuitem', { name: 'Inbox', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
+    await expect(appMenu).toBeHidden()
     await page.getByTestId('app-menu').click()
-    await expectFullyInViewport(page, page.getByRole('menu', { name: 'Data Playground menu' }), '1024px Canvas menu')
-    await expect(page.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
+    await expectFullyInViewport(page, appMenu, '1024px Canvas menu')
+    await expect(appMenu.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
     await page.keyboard.press('Escape')
     // Escape closes the menu and clears the Canvas selection. The selection-owned Inspector only
     // returns for one real node, so restore that explicit precondition before exercising expansion.
