@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { datasetViewerHash, initRouter, parseHash, resetRouterForTests, routeHash } from './router'
+import { datasetViewerHash, initRouter, parseDatasetViewerReturn, parseHash, resetRouterForTests, routeHash } from './router'
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation } from './navigationOwnership'
 
@@ -82,6 +82,31 @@ describe('Workspace routes', () => {
         returnNode: 'write 1',
       }).toString(),
     })
+
+    const jobsQuery = new URLSearchParams({ status: 'failed', run: 'run 1' }).toString()
+    window.location.hash = datasetViewerHash(
+      'dataset/with spaces',
+      'revision 9',
+      { view: 'jobs', query: jobsQuery },
+    )
+    const jobsRoute = parseHash()
+    expect(jobsRoute).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:dataset/with spaces',
+      workspaceScope: 'datasets',
+      workspaceDatasetQuery: new URLSearchParams({
+        revision: 'revision 9',
+        revisionDataset: 'dataset/with spaces',
+        returnView: 'jobs',
+        returnQuery: jobsQuery,
+      }).toString(),
+    })
+    expect(parseDatasetViewerReturn(jobsRoute.workspaceDatasetQuery ?? '')).toEqual({
+      view: 'jobs', query: jobsQuery,
+    })
+    expect(parseDatasetViewerReturn(new URLSearchParams({
+      returnView: 'inbox', returnQuery: 'filter=unread&next=https%3A%2F%2Fevil.example',
+    }).toString())).toEqual({ view: 'inbox', query: 'filter=unread' })
   })
 
   it('opens a provider exact dataset at its Workspace placement without projecting it into the local catalog', () => {

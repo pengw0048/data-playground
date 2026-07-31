@@ -262,8 +262,9 @@ describe('InboxView', () => {
   })
 
   it('renders a canvas-less dataset item with an exact dataset-viewer deep-link', async () => {
+    useStore.setState({ inboxQuery: 'filter=unread' } as never)
     mocks.inboxList.mockResolvedValue({ items: [item({
-      taskKind: 'keyed_upsert_write', canvasId: null, canvasName: null, readAt: '2026-07-17T12:05:00Z',
+      taskKind: 'keyed_upsert_write', canvasId: null, canvasName: null, readAt: null,
       datasetContext: { taskKind: 'keyed_upsert_write', datasetId: 'ds-logical-7', revisionId: 'rev-7', name: 'Sensor upserts' },
     })], hasMore: false, nextCursor: null })
     render(<InboxView />)
@@ -275,7 +276,7 @@ describe('InboxView', () => {
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Ads-logical-7?scope=datasets&revision=rev-7&revisionDataset=ds-logical-7',
+      '#/workspace/dataset%3Ads-logical-7?scope=datasets&revision=rev-7&revisionDataset=ds-logical-7&returnView=inbox&returnQuery=filter%3Dunread',
     )
   })
 

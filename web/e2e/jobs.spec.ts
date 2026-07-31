@@ -302,7 +302,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
   await expect(exactDataset).toHaveAttribute(
     'href',
-    '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1',
+    '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-task-1',
   )
   await exactDataset.click()
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
@@ -310,4 +310,8 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await expect(viewer).toContainText('Published version')
   await expect(viewer).toContainText('Exact revision is view-only')
   await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()
+  await viewer.getByRole('button', { name: 'Back to Jobs' }).click()
+  await expect(page).toHaveURL(/#\/jobs\?run=merge-task-1$/)
+  await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toHaveAttribute('aria-expanded', 'true')
 })

@@ -1335,6 +1335,8 @@ interface Store {
   }) => void
   /** Clear a temporary Dataset viewer after Canvas navigation without publishing a Workspace route. */
   clearWorkspaceDatasetViewerState: (listQuery: string) => void
+  /** Atomically leave a Dataset viewer for its originating Jobs or Inbox route. */
+  returnFromWorkspaceDatasetViewer: (view: 'jobs' | 'inbox', query: string, listQuery: string) => void
   workspaceDatasetQuery: string
   setWorkspaceDatasetQuery: (query: string) => void
   jobsQuery: string
@@ -1852,6 +1854,16 @@ export const useStore = create<Store>((set, get) => ({
     // Workspace state before the Canvas is active; doing so would insert a phantom history entry.
     if (get().view !== 'canvas') return
     set({ workspaceResourceId: null, workspaceDatasetQuery })
+  },
+  returnFromWorkspaceDatasetViewer: (view, query, workspaceDatasetQuery) => {
+    startNavigation()
+    if (get().view !== view) _fileNavigationGeneration += 1
+    set({
+      view,
+      workspaceResourceId: null,
+      workspaceDatasetQuery,
+      ...(view === 'jobs' ? { jobsQuery: query } : { inboxQuery: query }),
+    })
   },
   workspaceDatasetQuery: '',
   setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {

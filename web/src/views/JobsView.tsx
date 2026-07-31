@@ -392,7 +392,7 @@ export function JobsView() {
             <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
               <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
             </div>
-            {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} />)}
+            {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
           </div>
         </section>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
@@ -474,7 +474,7 @@ function JobSubject({ name }: { name: string }) {
   )
 }
 
-function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void }) {
+function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const publishedRevision = managedWriteRevisionReceipt(item, committed)
@@ -483,9 +483,9 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const report = item.distributionReport
   const dataset = item.datasetContext
   const datasetHref = publishedRevision
-    ? datasetViewerHash(publishedRevision.datasetId, publishedRevision.revisionId)
+    ? datasetViewerHash(publishedRevision.datasetId, publishedRevision.revisionId, { view: 'jobs', query: returnQuery })
     : dataset
-      ? dataset.deepLink ?? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined)
+      ? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined, { view: 'jobs', query: returnQuery })
       : null
   const active = item.status === 'queued' || item.status === 'running'
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
@@ -505,7 +505,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
                 : item.externalWait ? 'Waiting for external work'
                   : item.status === 'queued' ? 'Queued'
                     : 'In progress'
-  const outcomeDetail = item.error || (!report && rows != null ? rowLabel(rows) : null)
+  const outcomeDetail = item.error ? 'Open for failure details' : !report && rows != null ? rowLabel(rows) : null
   const duration = item.ms != null ? fmtMs(item.ms) : active ? 'In progress' : 'Unavailable'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}

@@ -273,6 +273,25 @@ describe('graph store — core authority ops', () => {
     expect(state.toasts.at(-1)?.msg).toBe('The requested node is no longer in this Canvas.')
   })
 
+  it.each(['jobs', 'inbox'] as const)('returns from a Dataset viewer to %s atomically', (view) => {
+    useStore.setState({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:published',
+      workspaceDatasetQuery: 'revision=rev-1&revisionDataset=published',
+      jobsQuery: '',
+      inboxQuery: '',
+    })
+
+    useStore.getState().returnFromWorkspaceDatasetViewer(view, 'filter=failed&run=run-1', 'dq=published')
+
+    expect(useStore.getState()).toMatchObject({
+      view,
+      workspaceResourceId: null,
+      workspaceDatasetQuery: 'dq=published',
+      [view === 'jobs' ? 'jobsQuery' : 'inboxQuery']: 'filter=failed&run=run-1',
+    })
+  })
+
   it('promotes same-title nodes with distinct stable identities and reuses one identity on retry', async () => {
     const transform = (id: string) => ({
       ...NODE(id, 'transform'),

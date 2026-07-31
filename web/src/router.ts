@@ -8,15 +8,50 @@ export interface Route { view: DpView; canvasId?: string; nodeId?: string; works
 
 const DATASET_QUERY_KEYS = [
   'dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match',
-  'revision', 'revisionDataset', 'returnCanvas', 'returnNode',
+  'revision', 'revisionDataset', 'returnCanvas', 'returnNode', 'returnView', 'returnQuery',
 ] as const
 const DATASET_VIEWER_QUERY_KEYS = [
-  'revision', 'revisionDataset', 'returnCanvas', 'returnNode',
+  'revision', 'revisionDataset', 'returnCanvas', 'returnNode', 'returnView', 'returnQuery',
 ] as const
+const DATASET_VIEWER_RETURN_QUERY_KEYS = {
+  jobs: ['status', 'canvas', 'node', 'backend', 'after', 'before', 'q', 'run', 'output', 'report', 'compare'],
+  inbox: ['filter'],
+} as const
 
 export interface DatasetViewerCanvasReturn {
   canvasId: string
   nodeId?: string
+}
+
+export interface DatasetViewerActivityReturn {
+  view: 'jobs' | 'inbox'
+  query?: string
+}
+
+export type DatasetViewerReturn = DatasetViewerCanvasReturn | DatasetViewerActivityReturn
+export type ParsedDatasetViewerReturn =
+  | ({ view: 'canvas' } & DatasetViewerCanvasReturn)
+  | DatasetViewerActivityReturn
+
+function activityReturnQuery(view: 'jobs' | 'inbox', query?: string): string | undefined {
+  const source = new URLSearchParams(query)
+  const safe = new URLSearchParams()
+  for (const key of DATASET_VIEWER_RETURN_QUERY_KEYS[view]) {
+    const value = source.get(key)
+    if (value) safe.set(key, value)
+  }
+  return safe.toString() || undefined
+}
+
+export function parseDatasetViewerReturn(query: string): ParsedDatasetViewerReturn | undefined {
+  const params = new URLSearchParams(query)
+  const canvasId = params.get('returnCanvas') || undefined
+  if (canvasId) {
+    return { view: 'canvas', canvasId, nodeId: params.get('returnNode') || undefined }
+  }
+  const view = params.get('returnView')
+  if (view !== 'jobs' && view !== 'inbox') return undefined
+  return { view, query: activityReturnQuery(view, params.get('returnQuery') || undefined) }
 }
 
 function decodeRouteSegment(value: string | undefined): string | undefined {
@@ -131,7 +166,7 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
 export function datasetViewerHash(
   datasetId: string,
   revisionId?: string,
-  returnToCanvas?: DatasetViewerCanvasReturn,
+  returnTo?: DatasetViewerReturn,
   workspaceResourceId?: string,
 ): string {
   const params = new URLSearchParams()
@@ -139,9 +174,13 @@ export function datasetViewerHash(
     params.set('revision', revisionId)
     params.set('revisionDataset', datasetId)
   }
-  if (returnToCanvas?.canvasId) {
-    params.set('returnCanvas', returnToCanvas.canvasId)
-    if (returnToCanvas.nodeId) params.set('returnNode', returnToCanvas.nodeId)
+  if (returnTo && 'canvasId' in returnTo) {
+    params.set('returnCanvas', returnTo.canvasId)
+    if (returnTo.nodeId) params.set('returnNode', returnTo.nodeId)
+  } else if (returnTo) {
+    params.set('returnView', returnTo.view)
+    const query = activityReturnQuery(returnTo.view, returnTo.query)
+    if (query) params.set('returnQuery', query)
   }
   const datasetQuery = params.size ? params.toString() : undefined
   return routeHash(

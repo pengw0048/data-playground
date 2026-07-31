@@ -15,6 +15,7 @@ const store = vi.hoisted(() => ({
   workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
   workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
   clearWorkspaceDatasetViewerState: vi.fn(),
+  returnFromWorkspaceDatasetViewer: vi.fn(),
   workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
   setWorkspaceResource: vi.fn(), openFile: vi.fn(), select: vi.fn(), activateLoadedCanvasRoute: vi.fn(),
   rememberTables: vi.fn(), pushToast: vi.fn(),
@@ -242,6 +243,29 @@ describe('WorkspaceExplorer', () => {
     expect(store.clearWorkspaceDatasetViewerState).toHaveBeenCalledWith('')
     expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
     expect(store.openFile).not.toHaveBeenCalled()
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
+  })
+
+  it.each([
+    ['jobs', 'status=failed&run=run-7', 'Back to Jobs'],
+    ['inbox', 'filter=unread', 'Back to Inbox'],
+  ] as const)('returns an exact viewer to its originating %s context', (view, returnQuery, label) => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceDatasetQuery = new URLSearchParams({
+      dq: 'published',
+      revision: 'rev-receipt',
+      revisionDataset: 'logical-receipt',
+      returnView: view,
+      returnQuery,
+    }).toString()
+    render(<WorkspaceExplorer />)
+
+    expect(screen.getByText(`Detail back: ${label}`)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+
+    expect(store.returnFromWorkspaceDatasetViewer).toHaveBeenCalledWith(view, returnQuery, 'dq=published')
+    expect(store.activateLoadedCanvasRoute).not.toHaveBeenCalled()
     expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
   })
 
