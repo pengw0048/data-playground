@@ -432,7 +432,7 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
 
     expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Fix before running: the upstream transform “Normalize purchases” does not have a bounded output schema contract. Select the upstream transform “Normalize purchases”, then in the Inspector choose Output schema (contract) → Infer from sample.')
-    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission and exact receipt above a blocked next admission', () => {
@@ -461,7 +461,7 @@ describe('Inspector — effective named outputs', () => {
 
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
     expect(screen.getByText('Mode').parentElement).toHaveTextContent('Append to the selected dataset')
-    expect(screen.getByRole('button', { name: 'View published version' })).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
     fireEvent.click(screen.getByText('Technical details'))
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@7')
@@ -476,7 +476,7 @@ describe('Inspector — effective named outputs', () => {
       }, status: { outputs: [] },
     } } } as any)
     render(<Inspector />)
-    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Run finished, but the published dataset could not be confirmed.')
   })
 

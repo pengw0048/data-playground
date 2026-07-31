@@ -151,6 +151,54 @@ describe('Catalog discovery request and mutation truth', () => {
     )
   })
 
+  it('renders exact revision rows as the full-page primary view without reading latest rows', async () => {
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
+      committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
+      parentRevisionId: null, producerOperation: 'write',
+      summary: { rowCount: 2, totalBytes: 128 },
+      preview: {
+        columns: [
+          { name: 'order_id', type: 'int', capabilities: ['key'] },
+          { name: 'status', type: 'string', capabilities: [] },
+        ],
+        rows: [{ order_id: 7, status: 'exact-only-row' }],
+        hasMore: true,
+        rowLimit: 100,
+      },
+    })
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-receipt"
+      initialRevisionDatasetId="logical-receipt-id"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    const viewer = await screen.findByTestId('dataset-viewer')
+    expect(viewer).toHaveClass('absolute', 'inset-0')
+    expect(viewer).not.toHaveClass('w-[420px]')
+    expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
+    expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent(
+      'exact revision logical-receipt-id@rev-receipt')
+    expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent('capped at 100')
+    expect(mocks.datasetRevision).toHaveBeenCalledWith('logical-receipt-id', 'rev-receipt')
+    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
+    expect(mocks.sample).not.toHaveBeenCalled()
+    expect(mocks.resolveDatasetRevision).not.toHaveBeenCalled()
+  })
+
+  it('fails an unavailable exact viewer closed without substituting latest rows', async () => {
+    mocks.datasetRevision.mockRejectedValue(Object.assign(new Error('compacted'), { status: 410 }))
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-receipt"
+      initialRevisionDatasetId="logical-receipt-id"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This exact revision is unavailable or no longer retained. Latest was not substituted.')
+    expect(screen.queryByTestId('detail-preview-scroll')).not.toBeInTheDocument()
+    expect(mocks.sample).not.toHaveBeenCalled()
+    expect(mocks.resolveDatasetRevision).not.toHaveBeenCalled()
+  })
+
   it('re-resolves an already selected path when a same-page exact receipt pair names another dataset', async () => {
     mocks.tableByRegistration.mockImplementation(async (registrationId: string) => registrationId === 'registration-path'
       ? TABLE_2
@@ -374,7 +422,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.queryByText('Parents')).not.toBeInTheDocument()
     expect(screen.queryByText('Children')).not.toBeInTheDocument()
 
-    expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Couldn't load latest preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
     expect(screen.getByText('Showing 1 preview row.')).toBeInTheDocument()
@@ -394,7 +442,7 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
   })
 
-  it('shows a compact preview by default while retaining the full preview scope', async () => {
+  it('shows the full bounded first page as the primary dataset view', async () => {
     const rows = Array.from({ length: 50 }, (_, order_id) => ({ order_id }))
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows, rowCount: 50,
@@ -403,10 +451,11 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    expect(await screen.findByText('Showing 4 of 50 preview rows.')).toBeInTheDocument()
+    expect(await screen.findByText('Showing 50 preview rows.')).toBeInTheDocument()
     expect(screen.queryByText('rows 1–50')).not.toBeInTheDocument()
-    expect(screen.getAllByRole('cell')).toHaveLength(4)
-    expect(screen.getAllByText('Showing 4 of 50 preview rows.')).toHaveLength(1)
+    expect(screen.getAllByRole('cell')).toHaveLength(50)
+    expect(screen.getAllByText('Showing 50 preview rows.')).toHaveLength(1)
+    expect(screen.getByTestId('detail-preview-scroll').querySelector('th')).toHaveClass('sticky', 'top-0')
   })
 
   it('keeps default schema evidence and scrollable preview inspection keyboard reachable', async () => {
@@ -423,7 +472,6 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('dataset-location')).toHaveTextContent(TABLE.uri)
     expect(screen.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     expect(screen.getByText('Edit catalog details').parentElement).not.toHaveAttribute('open')
-    expect(screen.getByTestId('detail-preview')).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
     expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
   })
@@ -572,7 +620,15 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: [], asOfOrdering: null, timezone: null, datasetViewSave: false,
+    })
     mocks.resolveDatasetRevision.mockRejectedValue(Object.assign(new Error('revision resolution absent'), { status: 501 }))
+    mocks.sample.mockResolvedValue({
+      columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
+      hasMore: true, truncated: true, completeness: 'page',
+      notPreviewable: false, wire: 'dataset',
+    })
     mocks.saveTableEdit.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({
       mode: 'best_effort', limit: 50,

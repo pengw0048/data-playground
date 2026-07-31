@@ -1,7 +1,6 @@
-import { useState } from 'react'
-import { api } from '../api/client'
+import { datasetViewerHash } from '../router'
 import type {
-  DatasetRevisionDetail, RunOutput, WriteAdmission, WriteReceipt, WriteSchemaDrift,
+  RunOutput, WriteAdmission, WriteReceipt, WriteSchemaDrift,
 } from '../types/api'
 
 export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
@@ -19,33 +18,13 @@ function writeMode(mode: WriteAdmission['mode'] | undefined): string {
 }
 
 function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const open = async () => {
-    setLoading(true); setError(''); setDetail(null)
-    try {
-      // A receipt supplies both immutable ids. Never resolve or substitute a latest revision here.
-      setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId))
-    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
-    finally { setLoading(false) }
-  }
-  const schemaFieldCount = detail?.preview?.columns?.length ?? 0
-  return <>
-    <button type="button"
-      className="mt-2 inline-flex rounded-md bg-primary px-2.5 py-1.5 text-[10.5px] font-semibold text-primary-foreground shadow-sm disabled:opacity-60"
-      onClick={() => void open()} disabled={loading}>
-      {loading ? 'Loading published version…' : 'View published version'}
-    </button>
-    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-background p-2 text-muted-foreground">
-      <div className="font-semibold text-foreground">Published dataset · version {detail.revisionId}</div>
-      {detail.name && <div>Name <span className="font-mono">{detail.name}</span></div>}
-      <div>Committed {detail.committedAt ?? 'unknown'}</div>
-      <div>{detail.summary?.rowCount?.toLocaleString?.() ?? 'unknown'} rows · {schemaFieldCount} schema {schemaFieldCount === 1 ? 'field' : 'fields'}</div>
-      <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'}</div>
-    </div>}
-    {error && <div role="alert" className="mt-1 text-destructive">Could not load this published version: {error}. A newer version was not substituted.</div>}
-  </>
+  // The receipt already supplies the immutable identity. Navigation keeps it in the URL so reload
+  // and browser Back reopen the same viewer; the viewer owns authorization and retention errors.
+  return <a
+    className="mt-2 inline-flex rounded-md bg-primary px-2.5 py-1.5 text-[10.5px] font-semibold text-primary-foreground shadow-sm"
+    href={datasetViewerHash(receipt.datasetId, receipt.revisionId)}>
+    Open dataset
+  </a>
 }
 
 function schemaText(fields: { name: string; type: string }[]): string {
@@ -197,8 +176,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
           </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Checking output…</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <div><strong>Output published</strong></div>
-        <div><span className="font-mono">{displayedName}</span> · version <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows</div>
+        <div><strong>Published</strong> · <span className="font-mono">{displayedName}</span> · {receipt.rows.toLocaleString()} rows</div>
         <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
       </div>}
     </div>

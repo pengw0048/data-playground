@@ -1,8 +1,5 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
-
-const mocks = vi.hoisted(() => ({ datasetRevision: vi.fn() }))
-vi.mock('../api/client', () => ({ api: mocks }))
+import { fireEvent, render, screen, within } from '@testing-library/react'
+import { describe, expect, it } from 'vitest'
 
 import { WritePublicationSummary } from './WritePublicationSummary'
 
@@ -83,8 +80,8 @@ describe('WritePublicationSummary task-first output states', () => {
 
     expect(screen.getAllByText('published')).toHaveLength(2)
     expect(screen.queryByText('next')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Published result')).toHaveTextContent('Output published')
-    expect(screen.getByLabelText('Published result')).toHaveTextContent('published · version revision-7 · 2 rows')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('Published · published · 2 rows')
+    expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
   })
 
   it('reloads exact schema comparison evidence from the receipt alone', () => {
@@ -126,7 +123,7 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(summary).toHaveTextContent('Output name')
     expect(summary).toHaveTextContent('Overwrite provider output')
     expect(summary).toHaveTextContent('Run finished. The selected backend wrote the output.')
-    expect(screen.queryByRole('button', { name: 'View published version' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission in the task-first summary after active admission cleanup or replacement', () => {
@@ -152,59 +149,13 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.queryByText('Revision mode is not available yet')).not.toBeInTheDocument()
   })
 
-  it('opens only the receipt-backed exact revision and fails closed when it is unavailable', async () => {
-    mocks.datasetRevision.mockRejectedValueOnce(new Error('revision compacted'))
+  it('opens the receipt-backed exact revision in the shared dataset viewer', () => {
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('A newer version was not substituted')
-    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
-    expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-1', 'revision-7')
-  })
-
-  it('shows an inline exact result only after the exact receipt lookup succeeds', async () => {
-    mocks.datasetRevision.mockResolvedValueOnce({
-      datasetId: 'dataset-1', revisionId: 'revision-7', committedAt: '2026-07-21T12:00:00Z',
-      name: 'published', parentRevisionId: 'revision-6', summary: { rowCount: 2 },
-      preview: { columns: [{ name: 'id' }] },
-    })
-    render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
-    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-7'))
-    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('2 rows · 1 schema field')
-    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Name published')
-    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Parent revision-6')
-  })
-
-  it('clears a previously opened detail before a later exact lookup fails', async () => {
-    mocks.datasetRevision.mockResolvedValueOnce({ datasetId: 'dataset-1', revisionId: 'revision-7', summary: {}, preview: { columns: [] } })
-      .mockRejectedValueOnce(new Error('permission lost'))
-    render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    const action = screen.getByRole('button', { name: 'View published version' })
-    fireEvent.click(action)
-    await screen.findByLabelText('Exact revision detail')
-    fireEvent.click(action)
-    expect(await screen.findByRole('alert')).toHaveTextContent('A newer version was not substituted')
-    expect(screen.queryByLabelText('Exact revision detail')).not.toBeInTheDocument()
-  })
-
-  it('cannot install stale exact detail after the receipt changes', async () => {
-    let resolveFirst!: (value: unknown) => void
-    mocks.datasetRevision.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
-      .mockResolvedValueOnce({
-        datasetId: 'dataset-1', revisionId: 'revision-8', summary: { rowCount: 3 }, preview: { columns: [] },
-      })
-    const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
-
-    const nextReceipt = { ...receipt, revisionId: 'revision-8', head: { ...receipt.head, revisionId: 'revision-8' } }
-    rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={nextReceipt} completed />)
-    fireEvent.click(screen.getByRole('button', { name: 'View published version' }))
-    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-8'))
-
-    await act(async () => resolveFirst({
-      datasetId: 'dataset-1', revisionId: 'revision-7', summary: { rowCount: 2 }, preview: { columns: [] },
-    }))
-    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('Published dataset · version revision-8')
-    expect(screen.getByLabelText('Exact revision detail')).not.toHaveTextContent('revision-7')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('Published · output · 2 rows')
+    expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
+    )
   })
 })

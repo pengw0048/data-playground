@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { initRouter, parseHash, resetRouterForTests, routeHash } from './router'
+import { datasetViewerHash, initRouter, parseHash, resetRouterForTests, routeHash } from './router'
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation } from './navigationOwnership'
 
@@ -44,6 +44,26 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({
       view: 'workspace', workspaceResourceId: 'dataset:registration-current', workspaceScope: 'datasets',
       workspaceDatasetQuery: datasetQuery,
+    })
+  })
+
+  it('builds one dataset viewer route for latest and exact dataset identities', () => {
+    window.location.hash = datasetViewerHash('dataset/with spaces')
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:dataset/with spaces',
+      workspaceScope: 'datasets',
+    })
+
+    window.location.hash = datasetViewerHash('dataset/with spaces', 'revision 9')
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:dataset/with spaces',
+      workspaceScope: 'datasets',
+      workspaceDatasetQuery: new URLSearchParams({
+        revision: 'revision 9',
+        revisionDataset: 'dataset/with spaces',
+      }).toString(),
     })
   })
 

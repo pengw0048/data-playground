@@ -199,7 +199,7 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const started = await json<{ runId: string }>(await runResponse, 'start runtime-schema Write')
     await expect(publication.getByLabel('Published result')).toContainText(
-      'Output published', { timeout: 30_000 })
+      'Published', { timeout: 30_000 })
     let job: { runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null } | undefined
     await expect.poll(async () => {
       const jobs = await json<{ items: Array<{ runId: string; status: string; outputReceipt?: { rows: number; schema: Array<{ name: string }> } | null }> }>(

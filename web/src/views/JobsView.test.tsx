@@ -696,8 +696,8 @@ describe('JobsView', () => {
 
     expect(await screen.findByText('Dataset restore · Climate observations')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
-    const link = screen.getByRole('link', { name: 'Open revision history' })
-    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9')
+    const link = screen.getByRole('link', { name: 'Open dataset' })
+    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9?scope=datasets')
   })
 
 })

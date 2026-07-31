@@ -2382,16 +2382,16 @@ test.describe('Data Playground canvas', () => {
       await expect(publication.locator('details')).not.toHaveAttribute('open')
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await confirmRun(page)
-      const firstReceipt = publication.getByRole('button', { name: 'View published version' })
+      const firstReceipt = publication.getByRole('link', { name: 'Open dataset' })
       await expect(firstReceipt).toBeVisible({ timeout: 20_000 })
-      await firstReceipt.click()
-      const firstRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/version\s+(\S+)/)?.[1]
-      expect(firstRevision).toBeTruthy()
-      await expect(publication).toContainText(/published.*rows/)
+      await expect(publication).toContainText(/Published.*rows/)
 
       const publicationDetails = publication.locator('details')
       const firstReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
       expect(firstReceiptId).toBeTruthy()
+      const firstRevision = firstReceiptId?.split('@').at(-1)
+      expect(firstRevision).toBeTruthy()
+      await expect(firstReceipt).toHaveAttribute('href', new RegExp(`revision=${encodeURIComponent(firstRevision!)}`))
       const summaryMode = publication.getByText('Mode', { exact: true }).locator('..')
       await expect(summaryMode).toContainText('Create a new dataset')
       await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
@@ -2399,11 +2399,12 @@ test.describe('Data Playground canvas', () => {
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await expect(publicationDetails).not.toContainText(firstReceiptId!, { timeout: 20_000 })
-      const secondReceipt = publication.getByRole('button', { name: 'View published version' })
-      await secondReceipt.click()
-      const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/version\s+(\S+)/)?.[1]
+      const secondReceipt = publication.getByRole('link', { name: 'Open dataset' })
+      const secondReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
+      const secondRevision = secondReceiptId?.split('@').at(-1)
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
+      await expect(secondReceipt).toHaveAttribute('href', new RegExp(`revision=${encodeURIComponent(secondRevision!)}`))
       await expect(summaryMode).toContainText('Replace the selected dataset')
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
@@ -2460,7 +2461,7 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      await expect(inspector.getByLabel('Write publication').getByRole('button', { name: 'View published version' })).toBeVisible({ timeout: 20_000 })
+      await expect(inspector.getByLabel('Write publication').getByRole('link', { name: 'Open dataset' })).toBeVisible({ timeout: 20_000 })
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
     } finally {
@@ -2600,10 +2601,12 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      const receipt = inspector.getByLabel('Write publication').getByRole('button', { name: 'View published version' })
+      const publication = inspector.getByLabel('Write publication')
+      const receipt = publication.getByRole('link', { name: 'Open dataset' })
       await expect(receipt).toBeVisible({ timeout: 20_000 })
-      await receipt.click()
-      await expect(inspector.getByLabel('Exact revision detail')).toContainText('version 3')
+      const details = publication.locator('details')
+      await details.locator('summary').click()
+      await expect(details).toContainText(/Receipt:\s*\S+@3/)
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
 

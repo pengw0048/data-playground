@@ -153,7 +153,7 @@ test.describe('minimum viewport support', () => {
     await expect(datasetDetails).toHaveAttribute('open', '')
     await expect(datasetDetails.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
-    await expect(detail.getByText('Row preview', { exact: true })).toBeVisible()
+    await expect(detail.getByRole('heading', { name: 'Data preview' })).toBeVisible()
     await expect(detail.getByRole('status').filter({
       hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
     })).toBeVisible({ timeout: 15_000 })

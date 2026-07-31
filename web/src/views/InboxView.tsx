@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type InboxItemDto } from '../api/client'
-import { routeHash } from '../router'
+import { datasetViewerHash, routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
@@ -270,9 +270,9 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                         size="sm"
                         asChild
                       >
-                        <a href={item.datasetContext.deepLink ?? routeHash('workspace', undefined, `dataset:${item.datasetContext.datasetId}`)}
+                        <a href={item.datasetContext.deepLink ?? datasetViewerHash(item.datasetContext.datasetId)}
                            onClick={() => void markRead(item)}>
-                          Revision history
+                          Open dataset
                         </a>
                       </Button>
                     )}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type CanvasFile, type DatasetTaskKind, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
 import type { DatasetRevisionDetail, WriteReceipt } from '../types/api'
-import { routeHash } from '../router'
+import { datasetViewerHash, routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -530,7 +530,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
-        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
+        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? datasetViewerHash(dataset.datasetId)}>Open dataset</a>}
         {committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
           {committed.length === 1 ? 'Open result' : `Open result ${index + 1}`}
         </button>)}

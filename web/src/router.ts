@@ -109,6 +109,17 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
   return path + query
 }
 
+/** One canonical route for opening either the latest dataset or one immutable revision. */
+export function datasetViewerHash(datasetId: string, revisionId?: string): string {
+  const datasetQuery = revisionId
+    ? new URLSearchParams({ revision: revisionId, revisionDataset: datasetId }).toString()
+    : undefined
+  return routeHash(
+    'workspace', undefined, `dataset:${datasetId}`, undefined, undefined, undefined,
+    undefined, 'datasets', datasetQuery,
+  )
+}
+
 /** A shareable absolute link that opens straight into this canvas. */
 export function canvasLink(id: string): string {
   return `${location.origin}${location.pathname}${routeHash('canvas', id)}`

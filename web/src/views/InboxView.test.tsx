@@ -272,8 +272,8 @@ describe('InboxView', () => {
     expect(screen.getByText('Revision upserted')).toBeInTheDocument()
     expect(screen.queryByText('Dataset ds-logical-7')).toBeNull()
     expect(screen.queryByText(/authorization revoked/i)).toBeNull()
-    const link = screen.getByRole('link', { name: 'Revision history' })
-    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')
+    const link = screen.getByRole('link', { name: 'Open dataset' })
+    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7?scope=datasets')
   })
 
 })

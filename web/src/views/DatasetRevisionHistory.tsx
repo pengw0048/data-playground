@@ -9,6 +9,7 @@ import type {
 import { Icon } from '../ui/Icon'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { MediaCellRenderer } from '../components/MediaCellRenderer'
+import { datasetViewerHash } from '../router'
 
 const PAGE_SIZE = 20
 const MAX_RESERVOIR_SEED = 2_147_483_647
@@ -39,7 +40,21 @@ function delta(current?: number | null, parent?: number | null) {
   return change === 0 ? 'no change' : `${change > 0 ? '+' : ''}${change.toLocaleString()}`
 }
 
-export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisionDatasetId }: { table: CatalogTable; initialRevisionId?: string; initialRevisionDatasetId?: string }) {
+export function DatasetRevisionHistory({
+  table, initialRevisionId, initialRevisionDatasetId, detailsInViewer = false,
+  viewerDetail, viewerLoading = false, viewerError = null, onViewerRetry,
+}: {
+  table: CatalogTable
+  initialRevisionId?: string
+  initialRevisionDatasetId?: string
+  /** The parent dataset viewer owns the exact row read; history only changes its route identity. */
+  detailsInViewer?: boolean
+  /** Reuse the viewer's exact read for secondary comparison/save/restore controls. */
+  viewerDetail?: DatasetRevisionDetail | null
+  viewerLoading?: boolean
+  viewerError?: string | null
+  onViewerRetry?: () => void
+}) {
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
@@ -61,6 +76,7 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   const historyRequest = useRef(0)
   const capabilityRequest = useRef(0)
   const detailRequest = useRef(0)
+  const viewerParentRequest = useRef(0)
   const openedRevision = useRef('')
 
   const navigateRevision = useCallback((revision: DatasetRevision) => {
@@ -99,10 +115,18 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
       historyRequest.current += 1
       capabilityRequest.current += 1
       detailRequest.current += 1
+      viewerParentRequest.current += 1
     }
   }, [loadFirst])
 
   useEffect(() => {
+    if (detailsInViewer) {
+      openedRevision.current = ''
+      detailRequest.current += 1
+      setSelected(null); setDetail(null); setParent(null)
+      setDetailError(null); setParentError(null); setDetailLoading(false)
+      return
+    }
     if (!initialRevisionId || !initialRevisionDatasetId) {
       if (openedRevision.current) {
         openedRevision.current = ''
@@ -119,7 +143,29 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
     void openRevision({ datasetId: initialRevisionDatasetId, revisionId: initialRevisionId, retentionOwner: 'core' })
   // openRevision is defined below as a stable callback; the requested identity is the fence.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [table.id, table.registrationId, initialRevisionId, initialRevisionDatasetId])
+  }, [table.id, table.registrationId, initialRevisionId, initialRevisionDatasetId, detailsInViewer])
+
+  useEffect(() => {
+    if (!detailsInViewer) return
+    const request = ++viewerParentRequest.current
+    setParent(null); setParentError(null)
+    const parentRevisionId = viewerDetail?.parentRevisionId
+    if (!viewerDetail || !parentRevisionId) return
+    void api.datasetRevision(viewerDetail.datasetId, parentRevisionId).then((next) => {
+      if (request !== viewerParentRequest.current) return
+      if (next.datasetId !== viewerDetail.datasetId || next.revisionId !== parentRevisionId) {
+        throw new Error('Parent response did not match the requested exact revision')
+      }
+      setParent(next)
+    }).catch((error) => {
+      if (request === viewerParentRequest.current) {
+        setParentError(statusOf(error) === 410
+          ? 'The parent revision is no longer retained; schema and summary comparison are unavailable.'
+          : `Couldn't load the parent comparison: ${errorMessage(error)}`)
+      }
+    })
+    return () => { viewerParentRequest.current += 1 }
+  }, [detailsInViewer, viewerDetail])
 
   const loadMore = async () => {
     if (!cursor || loadingMore) return
@@ -168,6 +214,14 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   }, [])
 
   if (availability === 'absent') return null
+  const viewerRevision: DatasetRevision | null = detailsInViewer && initialRevisionId && initialRevisionDatasetId
+    ? {
+        datasetId: initialRevisionDatasetId,
+        revisionId: initialRevisionId,
+        committedAt: viewerDetail?.committedAt ?? null,
+        retentionOwner: viewerDetail?.retentionOwner ?? 'core',
+      }
+    : null
   return <section data-testid="dataset-revision-history" className="flex flex-col gap-2 rounded-lg border border-border p-3">
     <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
       <Icon name="clock" size={12} /> Revision history
@@ -179,19 +233,31 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
       {items.length === 0 ? <div className="text-[11px] text-muted-foreground">No retained revisions are available.</div>
         : <div className="max-h-[188px] overflow-y-auto rounded-md border border-border">
           {items.map((revision) => {
-            const active = selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
-            return <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
-              aria-label={`Open revision ${revision.revisionId}`} onClick={() => {
-                navigateRevision(revision)
-                void openRevision(revision)
-              }}
-              className={`flex w-full items-start gap-2 border-b border-border/60 px-2 py-1.5 text-left last:border-0 hover:bg-accent ${active ? 'bg-accent' : ''}`}>
+            const active = detailsInViewer
+              ? initialRevisionDatasetId === revision.datasetId && initialRevisionId === revision.revisionId
+              : selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
+            const content = <>
               <span className="min-w-0 flex-1">
                 <span className="dp-mono block break-all text-[10.5px] font-semibold text-foreground">{revision.revisionId}</span>
                 <span className="block text-[9.5px] text-muted-foreground">{timestamp(revision.committedAt)}</span>
               </span>
               <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[9px] text-muted-foreground">retained by {revision.retentionOwner}</span>
-            </button>
+            </>
+            const className = `flex w-full items-start gap-2 border-b border-border/60 px-2 py-1.5 text-left last:border-0 hover:bg-accent ${active ? 'bg-accent' : ''}`
+            return detailsInViewer
+              ? <a key={`${revision.datasetId}:${revision.revisionId}`}
+                  href={datasetViewerHash(revision.datasetId, revision.revisionId)}
+                  aria-label={`Open revision ${revision.revisionId}`} className={className}>
+                  {content}
+                </a>
+              : <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
+                  aria-label={`Open revision ${revision.revisionId}`} onClick={() => {
+                    navigateRevision(revision)
+                    void openRevision(revision)
+                  }}
+                  className={className}>
+                  {content}
+                </button>
           })}
         </div>}
       {hasMore && <div className="flex items-center justify-between gap-2 text-[10.5px] text-muted-foreground">
@@ -199,8 +265,13 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
         <button onClick={() => void loadMore()} disabled={loadingMore} data-testid="revision-history-load-more" className="shrink-0 font-semibold text-primary underline disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry' : 'Load more'}</button>
       </div>}
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
-      {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
+      {selected && !detailsInViewer && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
+        canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
+        onRestore={setRestoreDetail} />}
+      {viewerRevision && <RevisionDetail revision={viewerRevision} detail={viewerDetail ?? null}
+        parent={parent} loading={viewerLoading} error={viewerError} parentError={parentError}
+        onRetry={onViewerRetry ?? (() => {})}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
         onRestore={setRestoreDetail} />}
     </>}
@@ -212,7 +283,7 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
         const restored = { datasetId: child.sourceDatasetId, revisionId: child.childRevisionId!,
           committedAt: null, retentionOwner: 'core' as const }
         navigateRevision(restored)
-        void openRevision(restored)
+        if (!detailsInViewer) void openRevision(restored)
       }} />}
   </section>
 }

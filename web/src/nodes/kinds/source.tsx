@@ -7,6 +7,7 @@ import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
+import { datasetViewerHash } from '../../router'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail, WorkspaceSearchGroup } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
@@ -310,6 +311,11 @@ function Source({ id, data }: NodeComponentProps) {
       {!datasetParameter && !providerDataset && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
         exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
+      {selectedExact && <a href={datasetViewerHash(selectedExact.datasetId, selectedExact.revisionId)}
+        onClick={(event) => event.stopPropagation()}
+        className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-semibold text-primary hover:underline">
+        <Icon name="eye" size={11} /> Open dataset
+      </a>}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}
