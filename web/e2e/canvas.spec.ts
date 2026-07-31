@@ -66,6 +66,17 @@ async function addNode(page: Page, category: string, kindTitle: string) {
   await menu.getByText(kindTitle, { exact: true }).click()
 }
 
+async function openSettledAppMenu(page: Page) {
+  const menu = page.getByRole('menu', { name: 'Data Playground menu' })
+  // Some journeys have just selected "New Canvas". Wait for that menu's closing portal to
+  // unmount before opening the next one, or the locator can resolve to the stale animated copy.
+  await expect(menu).toBeHidden()
+  await page.getByTestId('app-menu').click()
+  await expect(menu).toBeVisible()
+  await expect(menu).toHaveAttribute('data-state', 'open')
+  return menu
+}
+
 async function addFromOutput(page: Page, node: Locator, operation: string) {
   await node.locator('.react-flow__handle-right').click()
   const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
@@ -1226,9 +1237,9 @@ test.describe('Data Playground canvas', () => {
     expect(exported.ok()).toBe(true)
     const envelope = await exported.json()
 
-    await page.getByTestId('app-menu').click()
-    await expect(page.getByTestId('import-pipeline')).toHaveCount(0)
-    await page.getByTestId('import-native-canvas').click()
+    const menu = await openSettledAppMenu(page)
+    await expect(menu.getByTestId('import-pipeline')).toHaveCount(0)
+    await menu.getByTestId('import-native-canvas').click()
     await page.locator('input[type="file"]').setInputFiles({
       name: 'round-trip.dp-canvas.json', mimeType: 'application/json',
       buffer: Buffer.from(JSON.stringify(envelope)),
@@ -1272,8 +1283,8 @@ test.describe('Data Playground canvas', () => {
       }),
     }))
 
-    await page.getByTestId('app-menu').click()
-    await page.getByTestId('import-pipeline').click()
+    const menu = await openSettledAppMenu(page)
+    await menu.getByTestId('import-pipeline').click()
     await page.getByPlaceholder(/my_table_or_uri/).fill('{"source":"x"}')
     await page.getByRole('button', { name: 'Import', exact: true }).click()
 
