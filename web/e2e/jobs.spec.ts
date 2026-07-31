@@ -295,20 +295,19 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.goto('/#/jobs')
   await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
   await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
+  const exactDataset = page.getByRole('link', { name: 'Open dataset' })
   await page.getByText('Technical evidence', { exact: true }).click()
   await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
   await expect(page.getByText('rev-published')).toBeVisible()
-  const exactDataset = page.getByRole('link', { name: 'Open dataset' })
+  await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
   await expect(exactDataset).toHaveAttribute(
     'href',
     '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1',
   )
   await exactDataset.click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText(
-    'exact revision dataset-1@rev-published',
-  )
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
   const viewer = page.getByRole('dialog', { name: 'Published column enrichment' })
-  await expect(viewer).toContainText('Exact revision rev-published')
+  await expect(viewer).toContainText('Published version')
   await expect(viewer).toContainText('Exact revision is view-only')
   await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()
 })

@@ -482,6 +482,11 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const phase = jobPhase(item)
   const report = item.distributionReport
   const dataset = item.datasetContext
+  const datasetHref = publishedRevision
+    ? datasetViewerHash(publishedRevision.datasetId, publishedRevision.revisionId)
+    : dataset
+      ? dataset.deepLink ?? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined)
+      : null
   const active = item.status === 'queued' || item.status === 'running'
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
@@ -530,8 +535,8 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
-        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined)}>Open dataset</a>}
-        {committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
+        {datasetHref && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={datasetHref}>Open dataset</a>}
+        {!publishedRevision && committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
           {committed.length === 1 ? 'Open result' : `Open result ${index + 1}`}
         </button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
@@ -562,9 +567,5 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
 }
 
 function ExactRevisionReceipt({ receipt }: { receipt: WriteReceipt }) {
-  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes
-    <Button size="sm" variant="outline" className="ml-2 h-6 px-2 text-[10px]" asChild>
-      <a href={datasetViewerHash(receipt.datasetId, receipt.revisionId)}>Open dataset</a>
-    </Button>
-  </div>
+  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
 }

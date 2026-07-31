@@ -485,14 +485,16 @@ describe('JobsView', () => {
     expect(row.closest('article')).toHaveTextContent('12 rows')
     expect(row.closest('article')).not.toHaveTextContent('output retained')
     fireEvent.click(row)
-    openTechnicalEvidence()
-    expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
-      'dataset dataset-1 · revision revision-7 · 12 rows',
-    )
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
     )
+    expect(screen.queryByRole('button', { name: 'Open result' })).not.toBeInTheDocument()
+    openTechnicalEvidence()
+    expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
+      'dataset dataset-1 · revision revision-7 · 12 rows',
+    )
+    expect(screen.getAllByRole('link', { name: 'Open dataset' })).toHaveLength(1)
   })
 
   it('shows exact durable task state and requests cancellation from Jobs', async () => {

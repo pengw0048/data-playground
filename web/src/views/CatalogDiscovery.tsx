@@ -1210,8 +1210,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <Icon name="db" size={16} />
           <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-bold text-foreground">{table.name}</div>
-            <div className="truncate text-[10.5px] text-muted-foreground">
-              {requestedExact ? `Exact revision ${requestedExact.revisionId}` : 'Latest dataset'}
+            <div data-testid="dataset-version-context" className="truncate text-[10.5px] text-muted-foreground">
+              {requestedExact ? 'Published version' : 'Latest dataset'}
             </div>
           </div>
           {requestedExact
@@ -1232,7 +1232,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
               <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
-              {requestedExactDetail ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(requestedExactDetail)}</span> : null}
+              {requestedExactDetail ? <span data-testid="dataset-facts-source">· Published version</span> : null}
               {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Exact revision {revisionLabel(exactFacts)}</span> : null}
               {!requestedExact && !exactFacts && latestHead ? <span>· Latest version {revisionLabel(latestHead)}</span> : null}
               {factsVerifiedLatest ? <span>· verified latest head</span> : null}
@@ -1269,11 +1269,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               {requestedExactDetail ? <>
                 <div role="status" aria-label="Dataset preview scope"
                   className="mb-2 rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
-                  Showing {requestedExactDetail.preview.rows.length.toLocaleString()} bounded preview
-                  {requestedExactDetail.preview.rows.length === 1 ? ' row' : ' rows'} from exact revision{' '}
-                  <span className="font-mono">{revisionLabel(requestedExactDetail)}</span>.
+                  Showing {requestedExactDetail.preview.rows.length.toLocaleString()} preview
+                  {requestedExactDetail.preview.rows.length === 1 ? ' row' : ' rows'} from this exact revision.
                   {requestedExactDetail.preview.hasMore
-                    ? ` More rows exist; this page is capped at ${requestedExactDetail.preview.rowLimit.toLocaleString()}.`
+                    ? ` More rows exist; preview capped at ${requestedExactDetail.preview.rowLimit.toLocaleString()} rows.`
                     : ''}
                 </div>
                 <DatasetPreviewTable columns={requestedExactDetail.preview.columns}
@@ -1310,6 +1309,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 {table.registrationId ? <div>
                   <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
                   <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
+                </div> : null}
+                {requestedExact ? <div data-testid="dataset-version-identity">
+                  <div className="text-[10px] text-muted-foreground">Exact version identity</div>
+                  <code className="break-all text-[10.5px] text-foreground">
+                    {revisionLabel(requestedExact)}
+                  </code>
                 </div> : null}
               </div>
             </details>
