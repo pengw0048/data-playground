@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useState } from 'react'
 
@@ -22,6 +23,35 @@ describe('FileDialog request and open-mutation truth', () => {
     mocks.mkdirDestination.mockResolvedValue({ ok: true })
   })
   afterEach(() => cleanup())
+
+  it('behaves as a modal, contains Tab focus, closes with Escape, and restores its trigger', async () => {
+    const user = userEvent.setup()
+    function Harness() {
+      const [open, setOpen] = useState(false)
+      return <>
+        <button type="button" onClick={() => setOpen(true)}>Browse outputs</button>
+        {open && <FileDialog mode="save" defaultName="results.parquet"
+          onClose={() => setOpen(false)} onPick={vi.fn()} />}
+      </>
+    }
+
+    render(<Harness />)
+    const trigger = screen.getByRole('button', { name: 'Browse outputs' })
+    await user.click(trigger)
+
+    const dialog = screen.getByRole('dialog', { name: 'Choose output destination' })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    const name = screen.getByRole('textbox', { name: 'Dataset name' })
+    expect(name).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Save here' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Close' })).toHaveFocus()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: 'Choose output destination' })).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
 
   it('distinguishes destination and browse failures from an empty folder and retries both', async () => {
     mocks.destinations
@@ -240,5 +270,8 @@ describe('FileDialog request and open-mutation truth', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Manage destinations' }))
     expect(manage).toHaveBeenCalledTimes(1)
+    expect(manage).toHaveBeenCalledWith({
+      destId: 's3-results', path: '', filename: 'embeddings.parquet',
+    }, expect.any(HTMLElement))
   })
 })

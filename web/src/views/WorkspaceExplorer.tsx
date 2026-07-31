@@ -212,11 +212,25 @@ const isExternal = (resource: WorkspaceResource | null) => resource?.source === 
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
 const isCurrentCatalogLocation = (resource: WorkspaceResource | null) => !!resource && !resource.detached
   && (identity(resource) === LOCAL_ROOT_ID || resource.catalogFolderState === 'current')
+const isDetachedLocalPlacement = (resource: WorkspaceResource) => resource.detached && !isExternal(resource)
+const hasDetachedDatasetRecovery = (resource: WorkspaceResource) => (
+  isDetachedLocalPlacement(resource) && resource.kind === 'dataset'
+)
 function itemAvailability(resource: WorkspaceResource): {
   state: 'unavailable' | 'unsupported'; label: 'Unavailable' | 'Unsupported'; reason: string
 } | null {
   const raw = resource.unavailableReason
-  if (!raw) return null
+  if (!raw) {
+    if (!isDetachedLocalPlacement(resource)) return null
+    const reason = resource.kind === 'dataset'
+      ? 'The local dataset is no longer available. Open it to view recovery details.'
+      : resource.kind === 'canvas'
+        ? 'This Canvas is no longer available.'
+        : resource.kind === 'container'
+          ? 'This local folder is no longer available.'
+          : 'This local item is no longer available.'
+    return { state: 'unavailable', label: 'Unavailable', reason }
+  }
   if (raw.startsWith('Unsupported: ')) {
     return { state: 'unsupported', label: 'Unsupported', reason: raw.slice('Unsupported: '.length) }
   }
@@ -695,7 +709,7 @@ function WorkspaceMixedExplorer() {
   }, [requestedResourceId, searchQuery, load, revision, providerPlacementObservations])
 
   const open = (resource: WorkspaceResource) => {
-    if (itemAvailability(resource)) return
+    if (itemAvailability(resource) && !hasDetachedDatasetRecovery(resource)) return
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
     setWorkspaceResource(resource.id)
   }
@@ -1878,6 +1892,8 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const menuOpen = openId === resource.id
   const unavailable = itemAvailability(resource)
+  const canOpen = !unavailable || hasDetachedDatasetRecovery(resource)
+  const hasSecondaryAction = !!(onNewFolder || onRenameFolder || onDeleteFolder || onMove || onRenameCanvas || onDeleteCanvas)
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
@@ -1887,17 +1903,17 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
         : resource.kind === 'canvas' ? 'Local'
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
-  return <div className={`flex min-w-0 items-center rounded-lg border border-border bg-card ${unavailable ? '' : 'hover:border-primary/40 hover:bg-accent'}`}>
-    <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!!unavailable}
+  return <div className={`flex min-w-0 items-center rounded-lg border border-border bg-card ${canOpen ? 'hover:border-primary/40 hover:bg-accent' : ''}`}>
+    <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!canOpen}
       title={unavailable?.reason}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left disabled:cursor-not-allowed">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}</span>
-      {resource.kind === 'container' && !unavailable && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
+      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached && !isDetachedLocalPlacement(resource) ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}</span>
+      {resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
-    {unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
+    {resource.unavailableReason && unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
       className="mr-2 shrink-0 font-semibold text-primary underline">Retry</button>}
-    {!unavailable && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
+    {hasSecondaryAction && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
       <DropdownMenuTrigger asChild>
         <button type="button" aria-label={`More actions for ${resource.name}`}
           onPointerDown={(event) => {
@@ -1906,7 +1922,7 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
           className="mr-2 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground">•••</button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" aria-label={`Actions for ${resource.name}`} className="min-w-40">
-        <DropdownMenuItem onSelect={onOpen}>{resource.kind === 'dataset' ? 'Open in Workspace' : 'Open'}</DropdownMenuItem>
+        {canOpen && <DropdownMenuItem onSelect={onOpen}>{resource.kind === 'dataset' ? 'Open in Workspace' : 'Open'}</DropdownMenuItem>}
         {onNewFolder && <DropdownMenuItem onSelect={onNewFolder}>New folder</DropdownMenuItem>}
         {onRenameFolder && <DropdownMenuItem onSelect={onRenameFolder}>Rename</DropdownMenuItem>}
         {onDeleteFolder && <DropdownMenuItem onSelect={onDeleteFolder} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}

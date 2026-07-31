@@ -345,6 +345,33 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(healthy.id)
   })
 
+  it('keeps read-only rows to one Open affordance and labels a recoverable missing local dataset', async () => {
+    const missing = {
+      ...DATASET,
+      id: 'dataset:missing-dataset',
+      placementId: 'missing-dataset-placement',
+      detached: true,
+    }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [DATASET, missing], nextCursor: null, hasMore: false, completeness: 'complete',
+    })
+    render(<WorkspaceExplorer />)
+
+    const rows = await screen.findAllByRole('button', { name: 'Open dataset observations' })
+    expect(rows).toHaveLength(2)
+    expect(rows[0].parentElement).not.toHaveTextContent('Unavailable')
+    expect(rows[1]).toBeEnabled()
+    expect(rows[1].parentElement).toHaveTextContent('Unavailable')
+    expect(rows[1].parentElement).toHaveTextContent(
+      'The local dataset is no longer available. Open it to view recovery details.',
+    )
+    expect(rows[1].parentElement).not.toHaveTextContent('detached')
+    expect(screen.queryByRole('button', { name: /More actions for observations/ })).not.toBeInTheDocument()
+
+    fireEvent.click(rows[1])
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(missing.id)
+  })
+
   it('keeps folder names readable while distinguishing Catalog authority without a second hierarchy', async () => {
     const catalogFolder = { ...FOLDER, id: 'container:catalog-research', catalogFolderId: 'folder-stable-1', catalogFolderPath: 'research' }
     const catalogDataset = { ...DATASET, name: 'Research' }
@@ -480,10 +507,8 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
     render(<WorkspaceExplorer />)
 
-    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
-    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Open canvas Analysis' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
   })
 
   it('does not expose Canvas mutations for a detached placement', async () => {
@@ -491,22 +516,19 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [detachedCanvas], nextCursor: null, hasMore: false, completeness: 'complete' })
     render(<WorkspaceExplorer />)
 
-    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
-    expect(screen.getByRole('menu')).toHaveTextContent('Open')
-    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    const row = await screen.findByRole('button', { name: 'Open canvas Analysis' })
+    expect(row).toBeDisabled()
+    expect(row.parentElement).toHaveTextContent('Unavailable')
+    expect(row.parentElement).toHaveTextContent('This Canvas is no longer available.')
+    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
   })
 
   it('keeps a source-only provider Folder free of Folder writes while retaining local Canvas creation', async () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [EXTERNAL_FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
-    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Remote' }), { button: 0, ctrlKey: false })
-    expect(screen.getByRole('menu')).toHaveTextContent('Open')
-    expect(screen.queryByRole('menuitem', { name: 'New folder' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Open folder Remote from Source-only mount warehouse · fixture' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'More actions for Remote' })).not.toBeInTheDocument()
     expect(screen.getByText('Connected catalogs manage their folders. Canvases created here stay local to Data Playground.')).toBeVisible()
     expect(mocks.workspaceCreateFolder).not.toHaveBeenCalled()
     expect(mocks.workspaceRenameFolder).not.toHaveBeenCalled()
@@ -602,11 +624,10 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
-    expect(screen.getByRole('menu')).toHaveTextContent('Open')
-    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    const row = await screen.findByRole('button', { name: 'Open canvas Analysis' })
+    expect(row).toBeDisabled()
+    expect(row.parentElement).toHaveTextContent('Unavailable')
+    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
   })
 
   it('keeps completed search pages visible when loading the continuation fails', async () => {

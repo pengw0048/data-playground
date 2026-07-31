@@ -30,6 +30,12 @@ import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 import { CanvasInboxPopover } from './CanvasInboxPopover'
 
+type OpenSettingsDetail = HTMLElement | {
+  category?: string
+  trigger?: HTMLElement | null
+  onClose?: () => void
+}
+
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
@@ -54,6 +60,7 @@ export function TopBar() {
   const [copyOpen, setCopyOpen] = useState(false)
   const [workspaceReturnDestination, setWorkspaceReturnDestination] = useState<string | null | undefined>(undefined)
   const settingsTrigger = useRef<HTMLElement | null>(null)
+  const settingsAfterClose = useRef<(() => void) | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
     : currentDraft?.syncState === 'conflict'
@@ -71,12 +78,14 @@ export function TopBar() {
   // let anything (e.g. the agent's "Configure a model" CTA) open Settings
   useEffect(() => {
     const onOpen = (event: Event) => {
-      const detail = (event as CustomEvent<HTMLElement | { category?: string; trigger?: HTMLElement | null }>).detail
+      const detail = (event as CustomEvent<OpenSettingsDetail>).detail
       if (detail instanceof HTMLElement) {
         settingsTrigger.current = detail
+        settingsAfterClose.current = null
         setSettingsCategory(undefined)
       } else {
         settingsTrigger.current = detail?.trigger ?? document.querySelector('[data-testid="app-menu"]')
+        settingsAfterClose.current = detail?.onClose ?? null
         setSettingsCategory(detail?.category)
       }
       setSettingsOpen(true)
@@ -87,12 +96,18 @@ export function TopBar() {
 
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
+    settingsAfterClose.current = null
     setSettingsCategory(undefined)
     setSettingsOpen(true)
   }
   const closeSettings = () => {
+    const afterClose = settingsAfterClose.current
+    settingsAfterClose.current = null
     setSettingsOpen(false)
-    requestAnimationFrame(() => settingsTrigger.current?.focus())
+    requestAnimationFrame(() => {
+      settingsTrigger.current?.focus()
+      afterClose?.()
+    })
   }
   const navigateToWorkspace = (resourceId: string | null | undefined) => {
     const store = useStore.getState()
