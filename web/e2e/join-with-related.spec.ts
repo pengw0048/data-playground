@@ -25,9 +25,9 @@ async function catalogTable(request: APIRequestContext, query: string): Promise<
 }
 
 async function sourceRelatedAction(page: Page) {
+  await page.locator('.react-flow__node[data-id="selected-source"]').click()
   const expand = page.getByRole('button', { name: 'Expand Inspector', exact: true })
   if (await expand.isVisible().catch(() => false)) await expand.click()
-  await page.locator('.react-flow__node[data-id="selected-source"]').click()
   const action = page.getByTestId('inspector').getByTestId('join-with-related-selected-source')
   await expect(action).toHaveAccessibleName('Find join candidates')
   return action

@@ -169,6 +169,8 @@ export function Canvas() {
   const disable = useStore((s) => s.disable)
   const { screenToFlowPosition, setCenter, getZoom, fitView, viewportInitialized } = useReactFlow()
   const canvasRef = useRef<HTMLDivElement>(null)
+  const flowWidth = useReactFlowStore((state) => state.width)
+  const flowHeight = useReactFlowStore((state) => state.height)
   const internalNodeGeometryIdentity = useReactFlowStore(
     (state) => viewportNodeGeometryIdentity(state.nodes),
   )
@@ -313,9 +315,13 @@ export function Canvas() {
     const nodeIds = nodeRevealRequest.nodeIds ?? [nodeRevealRequest.nodeId]
     const mounted = Array.from(document.querySelectorAll<HTMLElement>('.react-flow__node'))
     if (!nodeIds.every((nodeId) => mounted.some((element) => element.dataset.id === nodeId))) return
+    const surface = canvasRef.current?.getBoundingClientRect()
+    // A route selection can mount the Inspector and shrink the flexed Canvas in the same commit.
+    // Wait for React Flow's ResizeObserver to accept that real size before centering; otherwise it
+    // uses the previous full-width viewport and leaves the selected card underneath the Inspector.
+    if (!surface || Math.abs(flowWidth - surface.width) > 0.5 || Math.abs(flowHeight - surface.height) > 0.5) return
     if (nodeIds.length > 1) {
-      const surface = canvasRef.current?.getBoundingClientRect()
-      if (!surface || !viewportInitialized) return
+      if (!viewportInitialized) return
       if (revealNodeGroup(doc.nodes, rfNodes, nodeIds, surface, { setCenter })) {
         revealedRequestId.current = nodeRevealRequest.id
         acknowledgeNodeReveal(nodeRevealRequest.id)
@@ -326,7 +332,10 @@ export function Canvas() {
       revealedRequestId.current = nodeRevealRequest.id
       acknowledgeNodeReveal(nodeRevealRequest.id)
     }
-  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, viewportInitialized, setCenter, getZoom, acknowledgeNodeReveal])
+  }, [
+    nodeRevealRequest, doc.id, doc.nodes, rfNodes, flowWidth, flowHeight,
+    viewportInitialized, setCenter, getZoom, acknowledgeNodeReveal,
+  ])
 
   // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes

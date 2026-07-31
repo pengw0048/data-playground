@@ -303,6 +303,7 @@ test.describe('Data Playground canvas', () => {
       // The fit uses React Flow's actual canvas region, not the browser window. Switch to a graph
       // with deliberately different geometry while the Inspector is collapsed, then back again.
       // That proves a same-count stale RF node set cannot consume the next document's request.
+      await nodes.first().click()
       await page.getByRole('button', { name: 'Collapse Inspector', exact: true }).click()
       await backToWorkspace(page)
       await (await workspaceResource(page, 'canvas', otherCanvasName)).click()
@@ -722,12 +723,13 @@ test.describe('Data Playground canvas', () => {
     await second.click({ modifiers: ['Shift'] })
     await expect(first).toHaveClass(/selected/)
     await expect(second).toHaveClass(/selected/)
-    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
+    await expect(page.getByTestId('inspector')).toHaveCount(0)
 
     const pane = page.locator('.react-flow__pane')
     await pane.click({ position: { x: 5, y: 5 } })
     await expect(first).not.toHaveClass(/selected/)
     await expect(second).not.toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toHaveCount(0)
     const firstBox = await boxOf(first)
     const secondBox = await boxOf(second)
     await page.mouse.move(firstBox.x - 12, firstBox.y - 12)
@@ -739,7 +741,7 @@ test.describe('Data Playground canvas', () => {
     await page.mouse.up()
     await expect(first).toHaveClass(/selected/)
     await expect(second).toHaveClass(/selected/)
-    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
+    await expect(page.getByTestId('inspector')).toHaveCount(0)
   })
 
   test('the Appearance submenu switches between light and dark (and flips the tokens)', async ({ page }) => {
@@ -1709,9 +1711,9 @@ test.describe('Data Playground canvas', () => {
   test('the right inspector shows and edits the selected node', async ({ page }) => {
     await fresh(page)
     const inspector = page.getByTestId('inspector')
-    await expect(inspector).toBeVisible()
-    await expect(inspector.getByText(/Select a node/)).toBeVisible() // empty state
+    await expect(inspector).toHaveCount(0)
     await addNode(page, 'Shape', 'filter') // a newly added node is auto-selected
+    await expect(inspector).toBeVisible()
     await expect(inspector.getByText('FILTER')).toBeVisible()
     await expect(inspector.getByText('Properties')).toBeVisible()
     // the node's param is editable from the inspector (reused generic param editor)
