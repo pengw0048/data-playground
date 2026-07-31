@@ -15,6 +15,7 @@ import {
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
 import { examples } from '../examples'
+import { parseDatasetViewerReturn, type ParsedDatasetViewerReturn } from '../router'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
@@ -29,6 +30,23 @@ const PROVIDER_PLACEMENT_CACHE_MAX_DATASETS = 64
 const PROVIDER_PLACEMENT_CACHE_MAX_PLACEMENTS = 6
 const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
 const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for exact execution; it is not a canonical data column.'
+
+function datasetViewerBackLabel(returnTo?: ParsedDatasetViewerReturn): 'Back to Workspace' | 'Back to Canvas' | 'Back to Jobs' | 'Back to Inbox' {
+  if (returnTo?.view === 'canvas') return 'Back to Canvas'
+  if (returnTo?.view === 'jobs') return 'Back to Jobs'
+  if (returnTo?.view === 'inbox') return 'Back to Inbox'
+  return 'Back to Workspace'
+}
+
+function preserveDatasetViewerReturn(params: URLSearchParams, returnTo?: ParsedDatasetViewerReturn) {
+  if (returnTo?.view === 'canvas') {
+    params.set('returnCanvas', returnTo.canvasId)
+    if (returnTo.nodeId) params.set('returnNode', returnTo.nodeId)
+  } else if (returnTo) {
+    params.set('returnView', returnTo.view)
+    if (returnTo.query) params.set('returnQuery', returnTo.query)
+  }
+}
 
 type ProviderSystemColumnPresentation = {
   column: ColumnSchema
@@ -483,6 +501,7 @@ function WorkspaceMixedExplorer() {
   const select = useStore((s) => s.select)
   const activateLoadedCanvasRoute = useStore((s) => s.activateLoadedCanvasRoute)
   const clearWorkspaceDatasetViewerState = useStore((s) => s.clearWorkspaceDatasetViewerState)
+  const returnFromWorkspaceDatasetViewer = useStore((s) => s.returnFromWorkspaceDatasetViewer)
   const files = useStore((s) => s.files)
   const currentCanvasId = useStore((s) => s.doc?.id ?? '')
   const refreshFiles = useStore((s) => s.refreshFiles)
@@ -495,11 +514,9 @@ function WorkspaceMixedExplorer() {
     const params = new URLSearchParams(workspaceDatasetQuery)
     const revisionId = params.get('revision') || undefined
     const datasetId = params.get('revisionDataset') || undefined
-    const canvasId = params.get('returnCanvas') || undefined
-    const nodeId = params.get('returnNode') || undefined
     return {
       exactRevision: revisionId && datasetId ? { revisionId, datasetId } : undefined,
-      canvasReturn: canvasId ? { canvasId, nodeId } : undefined,
+      viewerReturn: parseDatasetViewerReturn(workspaceDatasetQuery),
     }
   }, [workspaceDatasetQuery])
 
@@ -714,8 +731,12 @@ function WorkspaceMixedExplorer() {
     setWorkspaceResource(resource.id)
   }
   const closeDetail = () => {
-    const canvasReturn = providerViewerRoute.canvasReturn
-    if (!canvasReturn) {
+    const viewerReturn = providerViewerRoute.viewerReturn
+    if (viewerReturn && viewerReturn.view !== 'canvas') {
+      returnFromWorkspaceDatasetViewer(viewerReturn.view, viewerReturn.query ?? '', '')
+      return
+    }
+    if (!viewerReturn) {
       if (providerViewerRoute.exactRevision) {
         switchWorkspaceScope('all', { resourceId: `container:${containerId}`, datasetQuery: '' })
         return
@@ -723,6 +744,7 @@ function WorkspaceMixedExplorer() {
       setWorkspaceResource(`container:${containerId}`)
       return
     }
+    const canvasReturn = viewerReturn
     if (currentCanvasId === canvasReturn.canvasId
         && activateLoadedCanvasRoute(canvasReturn.canvasId, canvasReturn.nodeId)) {
       clearWorkspaceDatasetViewerState('')
@@ -855,7 +877,7 @@ function WorkspaceMixedExplorer() {
     <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
       canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
       exactRevision={providerViewerRoute.exactRevision}
-      backLabel={providerViewerRoute.canvasReturn ? 'Back to Canvas' : 'Back to Workspace'}
+      backLabel={datasetViewerBackLabel(providerViewerRoute.viewerReturn)}
       onUse={() => useProviderDataset(selectedDataset)}
       onRelink={() => setRelinkResource(selectedDataset)} />
     {providerActionDialog}
@@ -1055,6 +1077,7 @@ function WorkspaceDatasets() {
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
   const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
   const clearWorkspaceDatasetViewerState = useStore((state) => state.clearWorkspaceDatasetViewerState)
+  const returnFromWorkspaceDatasetViewer = useStore((state) => state.returnFromWorkspaceDatasetViewer)
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
 
@@ -1072,12 +1095,7 @@ function WorkspaceDatasets() {
     const datasetId = params.get('revisionDataset') || undefined
     return revisionId && datasetId ? { revisionId, datasetId } : undefined
   }, [encodedQuery])
-  const viewerCanvasReturn = useMemo(() => {
-    const params = new URLSearchParams(encodedQuery)
-    const canvasId = params.get('returnCanvas') || undefined
-    const nodeId = params.get('returnNode') || undefined
-    return canvasId ? { canvasId, nodeId } : undefined
-  }, [encodedQuery])
+  const viewerReturn = useMemo(() => parseDatasetViewerReturn(encodedQuery), [encodedQuery])
   const initialRevisionId = exactRevision?.revisionId
   const initialRevisionDatasetId = exactRevision?.datasetId
   const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
@@ -1232,17 +1250,14 @@ function WorkspaceDatasets() {
         title="Local catalog" queryState={query}
         initialRevisionId={initialRevisionId}
         initialRevisionDatasetId={initialRevisionDatasetId}
-        detailBackLabel={viewerCanvasReturn ? 'Back to Canvas' : 'Back to Workspace'}
+        detailBackLabel={datasetViewerBackLabel(viewerReturn)}
         onQueryStateChange={(next) => {
           const params = new URLSearchParams(serializeWorkspaceDatasetQuery(next))
           if (hasExactRevision) {
             params.set('revision', initialRevisionId)
             params.set('revisionDataset', initialRevisionDatasetId)
           }
-          if (viewerCanvasReturn) {
-            params.set('returnCanvas', viewerCanvasReturn.canvasId)
-            if (viewerCanvasReturn.nodeId) params.set('returnNode', viewerCanvasReturn.nodeId)
-          }
+          preserveDatasetViewerReturn(params, viewerReturn)
           setEncodedQuery(params.toString())
         }}
         selectedRegistrationId={selectedRegistrationId}
@@ -1252,17 +1267,21 @@ function WorkspaceDatasets() {
           // navigation while the explicit Canvas return is still loading.
           if (!table && origin === 'route' && returningToCanvas.current) return
           setSelectedWorkspaceTable(table)
-          if (!table && origin === 'user' && viewerCanvasReturn) {
+          if (!table && origin === 'user' && viewerReturn) {
+            const listQuery = serializeWorkspaceDatasetQuery(query)
+            if (viewerReturn.view !== 'canvas') {
+              returnFromWorkspaceDatasetViewer(viewerReturn.view, viewerReturn.query ?? '', listQuery)
+              return
+            }
             // Canvas-origin viewers are a temporary detour. After returning, retain only the list
             // query so the next ordinary Workspace visit does not reopen this receipt; the
             // explicit node route restores Inspector selection.
             returningToCanvas.current = true
-            const listQuery = serializeWorkspaceDatasetQuery(query)
             // Open the Canvas first so the router publishes one atomic destination. Cleaning the
             // retained Workspace viewer state before this resolves would insert a phantom
             // Workspace history entry between the exact Dataset viewer and its Canvas.
-            if (currentCanvasId === viewerCanvasReturn.canvasId
-                && activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) {
+            if (currentCanvasId === viewerReturn.canvasId
+                && activateLoadedCanvasRoute(viewerReturn.canvasId, viewerReturn.nodeId)) {
               // The viewer is only a route detour; its originating Canvas remains live in memory.
               // The route action validates/reveals the requested node and publishes the final hash
               // without reloading an edit that is still inside the autosave debounce.
@@ -1270,9 +1289,9 @@ function WorkspaceDatasets() {
               returningToCanvas.current = false
               return
             }
-            void openFile(viewerCanvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
+            void openFile(viewerReturn.canvasId, { skipViewportFit: true }).then((opened) => {
               if (!opened) return
-              if (!activateLoadedCanvasRoute(viewerCanvasReturn.canvasId, viewerCanvasReturn.nodeId)) return
+              if (!activateLoadedCanvasRoute(viewerReturn.canvasId, viewerReturn.nodeId)) return
               clearWorkspaceDatasetViewerState(listQuery)
             }).finally(() => { returningToCanvas.current = false })
             return
@@ -1939,7 +1958,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
   exactRevision?: { datasetId: string; revisionId: string }
-  backLabel: 'Back to Workspace' | 'Back to Canvas'
+  backLabel: 'Back to Workspace' | 'Back to Canvas' | 'Back to Jobs' | 'Back to Inbox'
   onRetry: () => void; onUse: () => void; onRelink: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)

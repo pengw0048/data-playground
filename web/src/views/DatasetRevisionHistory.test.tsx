@@ -188,6 +188,24 @@ describe('DatasetRevisionHistory', () => {
     )
   })
 
+  it('preserves Jobs return context when the full-page viewer switches revisions', async () => {
+    store.workspaceDatasetQuery = new URLSearchParams({
+      revision: 'rev-current',
+      revisionDataset: 'dataset-stable',
+      returnView: 'jobs',
+      returnQuery: 'status=failed&run=run-1',
+    }).toString()
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer />)
+
+    expect(await screen.findByRole('link', { name: 'Open revision rev-2' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnView=jobs&returnQuery=status%3Dfailed%26run%3Drun-1',
+    )
+  })
+
   it('keeps a slow save capability probe current while revision pagination advances', async () => {
     const capability = deferred<{
       selectors: ('exact' | 'latest')[]

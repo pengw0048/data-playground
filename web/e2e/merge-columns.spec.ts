@@ -177,6 +177,8 @@ test('certifies the real Write Inspector merge journey and exact revision histor
         scope: 'datasets',
         revision: final!.revisionId,
         revisionDataset: final!.datasetId,
+        returnView: 'jobs',
+        returnQuery: new URLSearchParams({ run: task.taskId }).toString(),
       })}`,
     )
     await exactDataset.click()
@@ -187,6 +189,9 @@ test('certifies the real Write Inspector merge journey and exact revision histor
       `${final!.datasetId}@${final!.revisionId}`,
     )
     await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${base.revisionId}`)
+    await page.getByTestId('dataset-viewer').getByRole('button', { name: 'Back to Jobs' }).click()
+    await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(task.taskId)}$`))
+    await expect(job).toHaveAttribute('aria-expanded', 'true')
 
     // Reopen exactly the immutable base and final results; these assertions intentionally use the
     // ordinary revision APIs, not an in-process storage path or a moving catalog head.
