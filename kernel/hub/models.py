@@ -2622,7 +2622,11 @@ class ProcessorDescriptor(Wire):
 
 
 class InstalledProcessorSource(Wire):
-    """Exact plugin-published source, fetched separately from processor metadata."""
+    """Exact implementation source, fetched separately from source-free processor metadata.
+
+    Promoted versions return their immutable user-authored code. Plugin versions remain explicit
+    opt-in resources and never expose arbitrary installed files.
+    """
 
     processor_id: str
     version: str

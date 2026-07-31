@@ -175,34 +175,47 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
   const [targetError, setTargetError] = useState<string | null>(null)
   const [targetEpoch, setTargetEpoch] = useState(0)
   const sourceKey = selected ? `${detail.id}\u0000${selected.version}` : ''
-  const [installedSource, setInstalledSource] = useState<{
+  const [implementationSource, setImplementationSource] = useState<{
     key: string
     value?: InstalledProcessorSource
     loading: boolean
     error: string
   }>({ key: '', loading: false, error: '' })
   useEffect(() => {
-    if (!sourceKey || !selected || detail.provenance !== 'plugin') {
-      setInstalledSource({ key: sourceKey, loading: false, error: '' })
+    if (!sourceKey || !selected) {
+      setImplementationSource({ key: sourceKey, loading: false, error: '' })
       return
     }
     let live = true
-    setInstalledSource({ key: sourceKey, loading: true, error: '' })
+    setImplementationSource({ key: sourceKey, loading: true, error: '' })
     void api.installedProcessorSource(detail.id, selected.version).then((value) => {
-      if (live) setInstalledSource({ key: sourceKey, value, loading: false, error: '' })
+      if (!live) return
+      if (value.processorId !== detail.id || value.version !== selected.version) {
+        setImplementationSource({
+          key: sourceKey,
+          loading: false,
+          error: 'The returned source does not match the selected exact version.',
+        })
+        return
+      }
+      setImplementationSource({ key: sourceKey, value, loading: false, error: '' })
     }).catch((caught) => {
       if (!live) return
-      setInstalledSource({
+      setImplementationSource({
         key: sourceKey,
         loading: false,
-        error: caught instanceof KernelError && caught.status === 404 ? '' : errorMessage(caught),
+        error: caught instanceof KernelError && caught.status === 404
+          ? (detail.provenance === 'promoted'
+              ? 'The exact promoted definition is unavailable.'
+              : '')
+          : errorMessage(caught),
       })
     })
     return () => { live = false }
   }, [detail.id, detail.provenance, selected?.version, sourceKey])
-  const exactSource = installedSource.key === sourceKey
-    ? installedSource
-    : { key: sourceKey, loading: detail.provenance === 'plugin', error: '' }
+  const exactSource = implementationSource.key === sourceKey
+    ? implementationSource
+    : { key: sourceKey, loading: Boolean(sourceKey), error: '' }
   useEffect(() => {
     let live = true
     setTarget(null); setTargetError(null)
@@ -300,6 +313,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
       source={exactSource.value}
       loading={exactSource.loading}
       error={exactSource.error}
+      provenance={detail.provenance}
     />
     {detail.provenance === 'promoted' && <section className="mt-4"><h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Retention</h3>
       <p className="mt-1 text-[11px] text-muted-foreground">{totalRetention ? `${totalRetention} durable references prevent deletion` : 'No retained Canvas, snapshot, or execution manifest references.'}</p>
@@ -359,10 +373,12 @@ function ImplementationSource({
   source,
   loading,
   error,
+  provenance,
 }: {
   source?: InstalledProcessorSource
   loading: boolean
   error: string
+  provenance: TransformLibraryDetail['provenance']
 }) {
   return <section aria-label="Implementation source" className="mt-4">
     <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
@@ -385,7 +401,9 @@ function ImplementationSource({
       <strong>Implementation source could not be loaded.</strong> {error}
     </div> : <div className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
       <strong className="text-foreground">Implementation source unavailable.</strong>{' '}
-      This exact registry version does not publish implementation source.
+      {provenance === 'plugin'
+        ? 'This plugin does not publish implementation source for this exact version.'
+        : 'This exact promoted definition has no readable implementation source.'}
     </div>}
   </section>
 }

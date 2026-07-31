@@ -9829,6 +9829,20 @@ def promoted_transform_library_cursor_key(
         return identity.library_sort_key
 
 
+def owned_promoted_transform_version(
+        owner_id: str, transform_id: str, version: str) -> dict | None:
+    """Resolve one exact immutable version only through its owner-scoped identity."""
+    number = _promoted_transform_version_number(version)
+    if number is None:
+        return None
+    with session() as s:
+        identity = s.get(PromotedTransform, str(transform_id))
+        row = s.get(PromotedTransformVersion, (str(transform_id), number))
+        if identity is None or identity.owner_id != str(owner_id) or row is None:
+            return None
+        return _promoted_transform_version_doc(row)
+
+
 def canvas_transform_references(uid: str, canvas_id: str) -> list[dict]:
     """Resolve only the exact library refs already present in one readable Canvas."""
     with session() as s:

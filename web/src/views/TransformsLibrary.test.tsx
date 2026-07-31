@@ -68,8 +68,35 @@ describe('TransformsLibrary', () => {
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'created', created: true, nodeId: 'new-transform', resource: {} })
     mocks.workspaceAddTransform.mockResolvedValue({ ok: true, id: 'target', version: 10, nodeId: 'new-transform', doc: {} })
     mocks.deleteTransformVersion.mockResolvedValue({ ok: true, deleted: true })
+    mocks.installedProcessorSource.mockImplementation((processorId: string, version: string) => (
+      Promise.resolve({
+        processorId,
+        version,
+        language: 'python',
+        source: 'def fn(row):\n    return row',
+        sha256: '0'.repeat(64),
+      })
+    ))
   })
   afterEach(() => cleanup())
+
+  it('shows the exact user-authored source for a promoted version', async () => {
+    mocks.installedProcessorSource.mockResolvedValue({
+      processorId: 'tr_exact',
+      version: 'v1',
+      language: 'python',
+      source: "def fn(row):\n    row['score'] = 1\n    return row",
+      sha256: 'b'.repeat(64),
+    })
+
+    render(<TransformsLibrary />)
+
+    await screen.findByText("row['score'] = 1", { exact: false })
+    const source = screen.getByRole('region', { name: 'Implementation source' })
+    expect(source).toHaveTextContent("row['score'] = 1")
+    expect(source).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
+    expect(mocks.installedProcessorSource).toHaveBeenCalledWith('tr_exact', 'v1')
+  })
 
   it('shows the exact source published by an installed Luma plugin version', async () => {
     const luma = {
@@ -114,7 +141,7 @@ describe('TransformsLibrary', () => {
     await screen.findByText('Implementation source unavailable.')
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent('Implementation source unavailable.')
-    expect(source).toHaveTextContent('This exact registry version does not publish implementation source.')
+    expect(source).toHaveTextContent('This plugin does not publish implementation source for this exact version.')
     expect(source).not.toHaveTextContent('not found')
   })
 
@@ -122,19 +149,15 @@ describe('TransformsLibrary', () => {
     let resolveV2: ((value: {
       processorId: string; version: string; language: string; source: string; sha256: string
     }) => void) | undefined
-    const plugin = (version: string) => ({
-      ...entry(version),
-      id: 'plugin.versioned',
-      provenance: 'plugin' as const,
-    })
-    store.transformResourceId = 'plugin.versioned'
+    const promoted = (version: string) => entry(version)
+    store.transformResourceId = 'tr_exact'
     mocks.transformLibraryDetail.mockImplementation((_id: string, version: string) => Promise.resolve({
-      id: 'plugin.versioned', provenance: 'plugin', requestedVersion: version, versions: [plugin(version)],
+      id: 'tr_exact', provenance: 'promoted', requestedVersion: version, versions: [promoted(version)],
     }))
     mocks.installedProcessorSource.mockImplementation((_id: string, version: string) => (
       version === 'v1'
         ? Promise.resolve({
-            processorId: 'plugin.versioned', version, language: 'python',
+            processorId: 'tr_exact', version, language: 'python',
             source: 'SOURCE_FROM_V1', sha256: '1'.repeat(64),
           })
         : new Promise((resolve) => { resolveV2 = resolve })
@@ -148,7 +171,7 @@ describe('TransformsLibrary', () => {
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
     expect(await screen.findByText('Loading exact implementation source…')).toBeVisible()
     resolveV2?.({
-      processorId: 'plugin.versioned', version: 'v2', language: 'python',
+      processorId: 'tr_exact', version: 'v2', language: 'python',
       source: 'SOURCE_FROM_V2', sha256: '2'.repeat(64),
     })
     expect(await screen.findByText('SOURCE_FROM_V2')).toBeVisible()
