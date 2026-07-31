@@ -20,6 +20,9 @@ const store = vi.hoisted(() => ({
   rememberTables: vi.fn(), pushToast: vi.fn(),
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
+  firstRunChoice: false,
+  localDrafts: [] as never[],
+  draftStorageErrors: [] as string[],
   doc: { id: '', version: 0 },
   files: [] as { id: string; name: string; version: number; role: 'owner' | 'editor' | 'viewer' }[],
   refreshFiles: vi.fn(),
@@ -116,6 +119,9 @@ describe('WorkspaceExplorer', () => {
     store.workspaceSearchQuery = ''
     store.workspaceScope = 'all'
     store.workspaceDatasetQuery = ''
+    store.firstRunChoice = false
+    store.localDrafts = []
+    store.draftStorageErrors = []
     store.doc = { id: 'canvas-1', version: 3 }
     store.files = [{ id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' }]
     store.refreshFiles.mockResolvedValue(true)
@@ -143,13 +149,19 @@ describe('WorkspaceExplorer', () => {
     window.location.hash = ''
   })
 
-  it('resolves a stable dataset URL into server-provided breadcrumbs and the existing detail surface', async () => {
+  it('replaces All Workspace with the local dataset detail route', async () => {
     store.workspaceResourceId = DATASET.id
+    store.firstRunChoice = true
+    store.draftStorageErrors = ['local draft warning']
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByTestId('catalog-detail')).toHaveTextContent('observations')
-    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
+    expect(screen.queryByRole('form', { name: 'Workspace search' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Workspace path' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open dataset observations' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('first-run-canvas-choice')).not.toBeInTheDocument()
+    expect(screen.queryByText('local draft warning')).not.toBeInTheDocument()
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
   })
 

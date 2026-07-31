@@ -373,6 +373,9 @@ export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
   const firstRunChoice = useStore((state) => state.firstRunChoice)
+  const requestedResourceId = useStore((state) => state.workspaceResourceId)
+  const fullPageResource = requestedResourceId?.startsWith('dataset:')
+    || requestedResourceId?.startsWith('dataset_view:')
   const providerPlacementObservations = useProviderPlacementObservations()
   const previousScope = useRef(scope)
   useEffect(() => {
@@ -380,8 +383,8 @@ export function WorkspaceExplorer() {
     previousScope.current = scope
   }, [scope, providerPlacementObservations])
   return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="relative flex h-full min-h-0 flex-col overflow-hidden">
-    {firstRunChoice && <FirstRunCanvasChoice />}
-    <WorkspaceLocalDrafts />
+    {!fullPageResource && firstRunChoice && <FirstRunCanvasChoice />}
+    {!fullPageResource && <WorkspaceLocalDrafts />}
     <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
   </div></WorkspaceOverflowMenuProvider></ProviderPlacementObservationsContext.Provider>
 }
@@ -755,6 +758,15 @@ function WorkspaceMixedExplorer() {
       pushToast(`Relinked to ${resource.name}`, 'success')
       setWorkspaceResource(resource.id)
     }} /> : null
+  const datasetActionDialog = datasetAction && container?.version != null ? <DatasetActionDialog
+    action={datasetAction} container={container}
+    files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState}
+    onClose={() => setDatasetAction(null)}
+    onRefreshCanvases={refreshFiles}
+    onOpened={(canvasId, nodeId) => {
+      setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null)
+      void openCreatedSourceCanvas(canvasId, nodeId)
+    }} /> : null
 
   if (selectedDataset && isExternal(selectedDataset)) return <>
     <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
@@ -763,6 +775,23 @@ function WorkspaceMixedExplorer() {
       onRelink={() => setRelinkResource(selectedDataset)} />
     {providerActionDialog}
     {relinkDialog}
+  </>
+
+  if (selectedTable) return <>
+    <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
+      onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
+      folderActionLabel="Open in Workspace"
+      folderActionVisible
+      folderActionDisabled={!isCurrentCatalogLocation(container)}
+      folderActionTitle={!isCurrentCatalogLocation(container)
+        ? 'This dataset is not currently available in Workspace.' : undefined}
+      onOpenTable={setSelectedTable} onFolder={() => {
+        if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
+          setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
+        } else pushToast('This dataset is not currently available in Workspace.', 'error')
+      }}
+      onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />
+    {datasetActionDialog}
   </>
 
   return (
@@ -867,19 +896,6 @@ function WorkspaceMixedExplorer() {
         </div>}
       </div>
 
-      {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
-        onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
-        folderActionLabel="Open in Workspace"
-        folderActionVisible
-        folderActionDisabled={!isCurrentCatalogLocation(container)}
-        folderActionTitle={!isCurrentCatalogLocation(container)
-          ? 'This dataset is not currently available in Workspace.' : undefined}
-        onOpenTable={setSelectedTable} onFolder={() => {
-          if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
-            setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
-          } else pushToast('This dataset is not currently available in Workspace.', 'error')
-        }}
-        onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
       {selectedView && <DatasetViewDetail definition={selectedView} onClose={closeDetail} onDeleted={() => {
         setSelectedView(null)
         pushToast('DatasetView deleted', 'success')
@@ -908,10 +924,7 @@ function WorkspaceMixedExplorer() {
         onRenamed={() => { setCanvasRenameResource(null); void refreshFiles(); reload() }} />}
       {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
         onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
-      {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
-        files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
-        onRefreshCanvases={refreshFiles}
-        onOpened={(canvasId, nodeId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
+      {datasetActionDialog}
       {providerActionDialog}
       {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
         onMoved={(result, destinationPath) => {
