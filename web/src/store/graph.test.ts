@@ -4722,6 +4722,49 @@ describe('graph store — core authority ops', () => {
     },
   )
 
+  it('prefers an exact registered URI over a same-name Catalog candidate', async () => {
+    const exact: CatalogTable = {
+      id: 'tbl-exact', registrationId: 'registration-exact', name: 'seeded-events',
+      uri: 'events', rowCount: 2000, columns: [],
+    }
+    const sameName: CatalogTable = {
+      id: 'tbl-same-name', registrationId: 'registration-same-name', name: 'events',
+      uri: '/workspace/data/other-events.parquet', rowCount: 10, columns: [],
+    }
+    let persisted: CanvasDoc | null = null
+    useStore.setState({ catalog: [sameName, exact] })
+    apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
+      persisted = structuredClone(doc)
+      return { ok: true, id: doc.id, created: true }
+    })
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true })
+    expect(persisted?.nodes.find((node) => node.type === 'source')?.data.config).toMatchObject({
+      uri: exact.uri, tableId: exact.id, registrationId: exact.registrationId,
+    })
+  })
+
+  it('keeps the bare example Source when its Catalog name is ambiguous', async () => {
+    const first: CatalogTable = {
+      id: 'tbl-events-one', registrationId: 'registration-events-one', name: 'events',
+      uri: '/workspace/data/events-one.parquet', rowCount: 10, columns: [],
+    }
+    const second: CatalogTable = {
+      id: 'tbl-events-two', registrationId: 'registration-events-two', name: 'events',
+      uri: '/workspace/data/events-two.parquet', rowCount: 20, columns: [],
+    }
+    let persisted: CanvasDoc | null = null
+    useStore.setState({ catalog: [first, second] })
+    apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
+      persisted = structuredClone(doc)
+      return { ok: true, id: doc.id, created: true }
+    })
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true })
+    expect(persisted?.nodes.find((node) => node.type === 'source')?.data.config)
+      .toEqual({ uri: 'events' })
+  })
+
   it('keeps the runnable bare Source URI when Catalog identity is unavailable offline', async () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
 

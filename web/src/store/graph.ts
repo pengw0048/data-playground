@@ -267,9 +267,11 @@ function canonicalizeExampleSources(doc: CanvasDoc, catalog: CatalogTable[]): Ca
   const nodes = doc.nodes.map((node) => {
     if (node.type !== 'source') return node
     const ref = typeof node.data.config.uri === 'string' ? node.data.config.uri : ''
-    const table = catalog.find((candidate) => (
-      candidate.registrationId && (candidate.uri === ref || candidate.name === ref)
-    ))
+    const exact = catalog.find((candidate) => candidate.registrationId && candidate.uri === ref)
+    const named = !exact && !ref.includes('/') && !ref.includes('\\')
+      ? catalog.filter((candidate) => candidate.registrationId && candidate.name === ref)
+      : []
+    const table = exact ?? (named.length === 1 ? named[0] : undefined)
     if (!table?.registrationId) return node
     changed = true
     return {
