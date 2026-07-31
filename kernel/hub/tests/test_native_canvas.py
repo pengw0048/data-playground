@@ -89,6 +89,74 @@ def test_native_canvas_drops_legacy_transform_scope():
     assert "scope" not in parsed["canvas"]["nodes"][1]["data"]["config"]
 
 
+@pytest.mark.parametrize("auto_placed", [True, False])
+def test_native_canvas_preserves_supported_placement_state(auto_placed: bool):
+    doc = _doc(f"native-placement-{auto_placed}")
+    doc["nodes"][0]["data"]["autoPlaced"] = auto_placed
+
+    envelope = native_canvas.export_envelope(doc, get_deps())
+
+    assert envelope["canvas"]["nodes"][0]["data"]["autoPlaced"] is auto_placed
+    parsed = native_canvas.parse_envelope(envelope, filename="placement.dp-canvas.json")
+    assert parsed["canvas"]["nodes"][0]["data"]["autoPlaced"] is auto_placed
+
+
+def test_native_canvas_rejects_non_boolean_placement_state():
+    doc = _doc("native-invalid-placement")
+    doc["nodes"][0]["data"]["autoPlaced"] = "yes"
+    with pytest.raises(native_canvas.NativeCanvasError, match="autoPlaced must be a boolean"):
+        native_canvas.export_envelope(doc, get_deps())
+
+    doc["nodes"][0]["data"]["autoPlaced"] = True
+    envelope = native_canvas.export_envelope(doc, get_deps())
+    envelope["canvas"]["nodes"][0]["data"]["autoPlaced"] = 1
+    with pytest.raises(native_canvas.NativeCanvasError, match="autoPlaced must be a boolean"):
+        native_canvas.parse_envelope(envelope, filename="placement.dp-canvas.json")
+
+
+def test_native_canvas_exports_current_source_filter_write_document():
+    doc = _doc("native-current-graph")
+    doc["nodes"] = [
+        {
+            "id": "source", "type": "source", "position": {"x": 40, "y": 60},
+            "data": {"title": "events", "status": "latest", "config": {"uri": "events"}},
+        },
+        {
+            "id": "filter", "type": "filter", "position": {"x": 280, "y": 60},
+            "data": {"title": "filter", "status": "latest",
+                     "config": {"predicate": "amount > 120"}, "meta": "row predicate",
+                     "autoPlaced": True},
+        },
+        {
+            "id": "write", "type": "write", "position": {"x": 520, "y": 60},
+            "data": {"title": "write", "status": "latest", "config": {
+                "writeMode": "overwrite", "filename": "filtered_events",
+                "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
+            }, "meta": "sink · needs full pass", "needsFullPass": True,
+                     "autoPlaced": False, "lastRun": {"rows": 380, "ms": 38,
+                     "placement": "local"}},
+        },
+    ]
+    doc["edges"] = [
+        {"id": "source-filter", "source": "source", "target": "filter"},
+        {"id": "filter-write", "source": "filter", "target": "write"},
+    ]
+
+    envelope = native_canvas.export_envelope(doc, get_deps())
+    parsed = native_canvas.parse_envelope(envelope, filename="current.dp-canvas.json")
+
+    assert len(parsed["canvas"]["nodes"]) == 3
+    assert parsed["canvas"]["nodes"][2]["data"]["config"] == {
+        "writeMode": "overwrite", "filename": "filtered_events",
+        "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
+    }
+    assert parsed["canvas"]["nodes"][1]["data"]["autoPlaced"] is True
+    assert parsed["canvas"]["nodes"][2]["data"]["autoPlaced"] is False
+    assert "meta" not in parsed["canvas"]["nodes"][2]["data"]
+    assert "needsFullPass" not in parsed["canvas"]["nodes"][2]["data"]
+    assert "lastRun" not in parsed["canvas"]["nodes"][2]["data"]
+
+
 def test_import_warns_for_missing_data_creates_once_and_replays_after_response_loss():
     source_id = "native-import-source"
     _seed(source_id, _doc(source_id, dataset_ref={

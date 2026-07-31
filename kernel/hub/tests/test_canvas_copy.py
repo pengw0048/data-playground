@@ -146,6 +146,61 @@ def test_current_copy_fails_closed_when_source_changes_after_validation():
         assert session.get(metadb.Canvas, copied_id) is None
 
 
+def test_current_copy_preserves_current_source_filter_write_document():
+    owner = _user("copy-placement-owner")
+    source_id = _canvas(owner, "Placed graph")
+    with metadb.session() as session:
+        source = session.get(metadb.Canvas, source_id)
+        document = json.loads(source.doc)
+        document["nodes"] = [
+            {
+                "id": "source", "type": "source", "position": {"x": 40, "y": 60},
+                "data": {"title": "events", "status": "latest", "config": {"uri": "events"},
+                         "autoPlaced": True},
+            },
+            {
+                "id": "filter", "type": "filter", "position": {"x": 280, "y": 60},
+                "data": {"title": "filter", "status": "draft",
+                         "config": {"predicate": "amount > 120"},
+                         "meta": "row predicate", "autoPlaced": True},
+            },
+            {
+                "id": "write", "type": "write", "position": {"x": 520, "y": 60},
+                "data": {"title": "write", "status": "latest", "config": {
+                    "writeMode": "overwrite", "filename": "filtered_events",
+                    "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
+                }, "meta": "sink · needs full pass", "needsFullPass": True,
+                         "autoPlaced": False, "lastRun": {"rows": 380, "ms": 38,
+                         "placement": "local"}},
+            },
+        ]
+        document["edges"] = [
+            {"id": "source-filter", "source": "source", "target": "filter"},
+            {"id": "filter-write", "source": "filter", "target": "write"},
+        ]
+        source.doc = json.dumps(document)
+    payload = _payload(source_id, name="Placed graph copy")
+
+    checked = _validate(payload, owner)
+    assert checked.status_code == 200, checked.text
+    validation = checked.json()
+    assert validation["canImport"] is True
+    created = _create(payload, validation, owner)
+    assert created.status_code == 200, created.text
+
+    with metadb.session() as session:
+        copied = json.loads(session.get(metadb.Canvas, created.json()["id"]).doc)
+    assert len(copied["nodes"]) == 3
+    assert [node["data"].get("autoPlaced") for node in copied["nodes"]] == [True, True, False]
+    assert copied["nodes"][2]["data"]["config"] == {
+        "writeMode": "overwrite", "filename": "filtered_events",
+        "destId": "outputs", "destName": "Workspace outputs", "destPath": "",
+    }
+    assert "meta" not in copied["nodes"][2]["data"]
+    assert "needsFullPass" not in copied["nodes"][2]["data"]
+    assert "lastRun" not in copied["nodes"][2]["data"]
+
+
 def test_authorized_retained_manifest_clone_uses_exact_definition_without_live_fallback():
     owner, viewer, stranger = (_user("manifest-copy-owner"), _user("manifest-copy-viewer"),
                                _user("manifest-copy-stranger"))

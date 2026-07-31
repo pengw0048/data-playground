@@ -38,16 +38,18 @@ _ENVELOPE_KEYS = frozenset({
 _CANVAS_KEYS = frozenset({"name", "nodes", "edges", "requirements", "parameters"})
 _NODE_KEYS = frozenset({"id", "type", "position", "data", "parentId"})
 _EDGE_KEYS = frozenset({"id", "source", "target", "sourceHandle", "targetHandle", "data"})
-_NODE_DATA_KEYS = frozenset({"title", "status", "config", "bypassed", "disabled"})
+_NODE_DATA_KEYS = frozenset({
+    "title", "status", "config", "bypassed", "disabled", "autoPlaced",
+})
 _NODE_DATA_RUNTIME_FIELDS = frozenset({
-    "history", "lastRun", "currentOutputVersionId", "meta", "result",
+    "history", "lastRun", "currentOutputVersionId", "meta", "needsFullPass", "result",
 })
 _CORE_CONFIG_KEYS = frozenset({
     "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
     "delimiter", "header", "n", "seed", "method", "predicate", "filterBuilder", "select", "columns", "source", "processor",
     "version", "params", "code", "io", "mode", "onError", "outputSchema", "outputSchemaSource",
     "outputSchemaCodeHash", "on", "how", "sql", "agg", "column", "chartType", "x", "y", "name", "writeMode",
-    "partitionBy", "filename", "destination", "aggs", "by", "align", "count", "k", "lang", "markdown", "script",
+    "partitionBy", "filename", "destination", "destId", "destName", "destPath", "aggs", "by", "align", "count", "k", "lang", "markdown", "script",
 })
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -129,6 +131,9 @@ def _portable_canvas(doc: dict[str, Any]) -> dict[str, Any]:
         data = node.get("data")
         if not isinstance(data, dict):
             raise NativeCanvasError(f"node '{raw.get('id', '?')}' has invalid data")
+        if "autoPlaced" in data and type(data["autoPlaced"]) is not bool:
+            raise NativeCanvasError(
+                f"node '{raw.get('id', '?')}' autoPlaced must be a boolean")
         # These fields describe local execution history, not the source document.
         # Keep only fields with established document semantics.  Unknown node-data fields are not
         # carried because a plugin could make them execution-affecting in another workspace.
@@ -264,6 +269,8 @@ def parse_envelope(value: Any, *, filename: str) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise NativeCanvasError("native Canvas node data must be an object")
         _reject_unknown(data, _NODE_DATA_KEYS, "native Canvas node data")
+        if "autoPlaced" in data and type(data["autoPlaced"]) is not bool:
+            raise NativeCanvasError("native Canvas node autoPlaced must be a boolean")
         if raw.get("type") == "transform" and isinstance(data.get("config"), dict):
             data["config"] = {key: item for key, item in data["config"].items() if key != "scope"}
     for raw in canvas.get("edges", []):
