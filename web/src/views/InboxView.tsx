@@ -163,6 +163,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
     void markRead(item)
     setJobsQuery(new URLSearchParams({ run: item.taskId }).toString())
   }
+  const completeResultIsRead = !hasMore && items.every((item) => Boolean(item.readAt))
 
   return (
     <div className="flex h-full min-w-0 flex-col" data-testid="inbox-view">
@@ -187,7 +188,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
           variant="outline"
           size="sm"
           onClick={() => void markAllRead()}
-          disabled={loading || loadingMore || markingAll || Boolean(marking)}
+          disabled={loading || loadingMore || markingAll || Boolean(marking) || completeResultIsRead}
         >
           <Icon name="check" size={13} />
           {markingAll ? 'Marking…' : 'Mark all as read'}

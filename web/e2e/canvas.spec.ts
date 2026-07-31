@@ -2230,12 +2230,12 @@ test.describe('Data Playground canvas', () => {
     })
   })
 
-  test('identity lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
-    await page.goto('/')
+  test('session context lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
+    await fresh(page)
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
     await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
     await backToWorkspace(page)
-    await expect(page.getByText('signed in')).toBeVisible() // identity indicator on the Workspace shell
+    await expect(page.getByText('local mode')).toBeVisible() // truthful session context on the Workspace shell
     await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
