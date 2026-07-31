@@ -7,6 +7,7 @@ import json
 import uuid
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from hub import metadb
 from hub.main import app
@@ -395,6 +396,105 @@ def test_exact_target_actions_are_atomic_role_checked_and_canvas_scoped() -> Non
     assert refs.json()[0]["availability"] == "active"
     assert refs.json()[0]["descriptor"]["id"] == descriptor["id"]
     assert "code" not in refs.json()[0]["descriptor"]
+
+
+def test_blank_library_transform_is_configured_in_place_and_partial_refs_fail_closed() -> None:
+    uid = _user("configure-target")
+    descriptor = _promote(
+        uid, f"configure-{uuid.uuid4().hex}", title="Configured exact", marker="v1")
+    other = _promote(
+        uid, f"configure-other-{uuid.uuid4().hex}", title="Other identity", marker="v1")
+    canvas_id = f"configure-canvas-{uuid.uuid4().hex}"
+    transform_id = "blank-transform"
+    position = {"x": 420, "y": 180}
+    edges = [
+        {"id": "source-transform", "source": "source", "target": transform_id,
+         "sourceHandle": "out", "targetHandle": "in", "data": {"wire": "dataset"}},
+        {"id": "transform-sink", "source": transform_id, "target": "sink",
+         "sourceHandle": "out", "targetHandle": "in", "data": {"wire": "dataset"}},
+    ]
+    doc = {
+        "id": canvas_id, "name": "Configure target", "version": 7,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 80, "y": 180},
+             "data": {"title": "source", "status": "latest", "config": {}}},
+            {"id": transform_id, "type": "transform", "position": position,
+             "data": {"title": "transform", "status": "draft", "config": {
+                 "source": "library", "mode": "map", "code": "def fn(row): return row",
+             }}},
+            {"id": "sink", "type": "write", "position": {"x": 760, "y": 180},
+             "data": {"title": "sink", "status": "latest", "config": {}}},
+        ],
+        "edges": edges,
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=uid, name=doc["name"], version=7,
+            doc=json.dumps(doc)))
+
+    configured = client.post(
+        f"/api/workspace/canvases/{canvas_id}/transforms",
+        headers=_headers(uid), json={
+            "transformId": descriptor["id"], "transformVersion": descriptor["version"],
+            "expectedCanvasVersion": 7, "replaceNodeId": transform_id,
+        })
+    assert configured.status_code == 200, configured.text
+    result = configured.json()["doc"]
+    assert result["edges"] == edges
+    assert len(result["nodes"]) == 3
+    exact = next(node for node in result["nodes"] if node["id"] == transform_id)
+    assert exact["position"] == position
+    assert exact["data"]["title"] == "Configured exact"
+    assert exact["data"]["config"] == {
+        "source": "library", "processor": descriptor["id"],
+        "version": descriptor["version"], "mode": "map",
+    }
+    statuses = {node["id"]: node["data"]["status"] for node in result["nodes"]}
+    assert statuses == {"source": "latest", transform_id: "draft", "sink": "stale"}
+    with metadb.session() as session:
+        snapshots = list(session.scalars(select(metadb.CanvasVersion).where(
+            metadb.CanvasVersion.canvas_id == canvas_id)))
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "before exact Transform configuration"
+    assert json.loads(snapshots[0].doc)["edges"] == edges
+
+    cross_identity = client.post(
+        f"/api/workspace/canvases/{canvas_id}/transforms",
+        headers=_headers(uid), json={
+            "transformId": other["id"], "transformVersion": other["version"],
+            "expectedCanvasVersion": 8, "replaceNodeId": transform_id,
+        })
+    assert cross_identity.status_code == 422
+    assert "keep the same identity" in cross_identity.json()["detail"]
+
+    for index, partial in enumerate((
+        {"source": "library", "processor": descriptor["id"], "mode": "map"},
+        {"source": "library", "version": descriptor["version"], "mode": "map"},
+    )):
+        partial_canvas_id = f"partial-config-{index}-{uuid.uuid4().hex}"
+        partial_doc = {
+            "id": partial_canvas_id, "name": "Partial target", "version": 1,
+            "nodes": [{
+                "id": transform_id, "type": "transform", "position": position,
+                "data": {"title": "partial", "status": "draft", "config": partial},
+            }],
+            "edges": [],
+        }
+        with metadb.session() as session:
+            session.add(metadb.Canvas(
+                id=partial_canvas_id, owner_id=uid, name=partial_doc["name"], version=1,
+                doc=json.dumps(partial_doc)))
+        rejected = client.post(
+            f"/api/workspace/canvases/{partial_canvas_id}/transforms",
+            headers=_headers(uid), json={
+                "transformId": descriptor["id"], "transformVersion": descriptor["version"],
+                "expectedCanvasVersion": 1, "replaceNodeId": transform_id,
+            })
+        assert rejected.status_code == 422
+        assert "unconfigured or use one exact processor version" in rejected.json()["detail"]
+        persisted = client.get(
+            f"/api/canvas/{partial_canvas_id}", headers=_headers(uid)).json()
+        assert persisted == partial_doc
 
 
 def test_upgrade_requires_proven_compatibility_and_invalidates_section_downstream() -> None:

@@ -4469,7 +4469,7 @@ def workspace_apply_related_join_action(
 def workspace_add_transform_action(
         *, uid: str, canvas_id: str, expected_canvas_version: int,
         transform: dict, replace_node_id: str | None = None) -> dict:
-    """Atomically add or explicitly upgrade one exact library Transform reference."""
+    """Atomically add, configure, or upgrade one exact library Transform reference."""
     with _workspace_write_session() as s:
         canvas = s.get(Canvas, str(canvas_id), with_for_update=True)
         if canvas is None:
@@ -4501,38 +4501,48 @@ def workspace_add_transform_action(
             if (not isinstance(existing, dict) or existing.get("type") != "transform"
                     or not isinstance(cfg, dict) or cfg.get("source") != "library"):
                 raise ValueError("the selected node is not a library Transform")
-            if cfg.get("processor") != candidate["data"]["config"]["processor"]:
+            current_processor = cfg.get("processor")
+            current_version = cfg.get("version")
+            unconfigured = current_processor is None and current_version is None
+            configured = (isinstance(current_processor, str) and bool(current_processor)
+                          and isinstance(current_version, str) and bool(current_version))
+            if not unconfigured and not configured:
+                raise ValueError(
+                    "a library Transform must be unconfigured or use one exact processor version")
+            if configured and current_processor != candidate["data"]["config"]["processor"]:
                 raise ValueError("a Transform upgrade must keep the same identity")
-            if cfg.get("version") == candidate["data"]["config"]["version"]:
+            if configured and current_version == candidate["data"]["config"]["version"]:
                 raise ValueError("the selected node already uses this exact Transform version")
-            processor = str(cfg.get("processor", ""))
-            if not processor.startswith("tr_"):
-                raise WorkspaceTransformCompatibilityConflict(
-                    "plugin Transform upgrades require compatible metadata for both exact versions")
-            old_number = _promoted_transform_version_number(cfg.get("version"))
-            new_number = _promoted_transform_version_number(
-                candidate["data"]["config"]["version"])
-            old_row = s.get(PromotedTransformVersion, (processor, old_number)) if old_number else None
-            new_row = s.get(PromotedTransformVersion, (processor, new_number)) if new_number else None
-            if (old_row is None or old_row.deleted_at is not None
-                    or new_row is None or new_row.deleted_at is not None):
-                raise WorkspaceTransformCompatibilityConflict(
-                    "both exact Transform versions must be active before upgrade")
-            input_compatibility = diff_columns(
-                json.loads(old_row.input_schema), json.loads(new_row.input_schema))
-            output_compatibility = diff_columns(
-                json.loads(old_row.output_schema), json.loads(new_row.output_schema))
-            if (input_compatibility.status != "compatible"
-                    or output_compatibility.status != "compatible"):
-                raise WorkspaceTransformCompatibilityConflict(
-                    "Transform upgrade requires compatible input and output schemas; "
-                    f"input is {input_compatibility.status}, output is {output_compatibility.status}")
+            if configured:
+                processor = str(current_processor)
+                if not processor.startswith("tr_"):
+                    raise WorkspaceTransformCompatibilityConflict(
+                        "plugin Transform upgrades require compatible metadata for both exact versions")
+                old_number = _promoted_transform_version_number(current_version)
+                new_number = _promoted_transform_version_number(
+                    candidate["data"]["config"]["version"])
+                old_row = s.get(PromotedTransformVersion, (processor, old_number)) if old_number else None
+                new_row = s.get(PromotedTransformVersion, (processor, new_number)) if new_number else None
+                if (old_row is None or old_row.deleted_at is not None
+                        or new_row is None or new_row.deleted_at is not None):
+                    raise WorkspaceTransformCompatibilityConflict(
+                        "both exact Transform versions must be active before upgrade")
+                input_compatibility = diff_columns(
+                    json.loads(old_row.input_schema), json.loads(new_row.input_schema))
+                output_compatibility = diff_columns(
+                    json.loads(old_row.output_schema), json.loads(new_row.output_schema))
+                if (input_compatibility.status != "compatible"
+                        or output_compatibility.status != "compatible"):
+                    raise WorkspaceTransformCompatibilityConflict(
+                        "Transform upgrade requires compatible input and output schemas; "
+                        f"input is {input_compatibility.status}, output is {output_compatibility.status}")
             cfg.update(candidate["data"]["config"])
             cfg.pop("code", None)
             data["title"] = candidate["data"]["title"]
             node_id = str(replace_node_id)
             _workspace_invalidate_downstream(doc, node_id)
-            label = "before exact Transform version upgrade"
+            label = ("before exact Transform version upgrade" if configured
+                     else "before exact Transform configuration")
         _snapshot_canvas_in_session(
             s, canvas, canvas.doc, canvas.version, author_id=uid, label=label)
         canvas.version += 1

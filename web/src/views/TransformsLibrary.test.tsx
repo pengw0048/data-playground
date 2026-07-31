@@ -49,6 +49,23 @@ const targetDoc = (version = 'v1', canvasVersion = 9) => ({
     data: { title: 'Robot scorer', status: 'latest', config: { source: 'library', processor: 'tr_exact', version, mode: 'map' } },
   }],
 })
+const blankTargetDoc = (config: Record<string, unknown> = {
+  source: 'library', mode: 'map', code: null,
+}) => ({
+  id: 'target', name: 'Exact target', version: 9,
+  edges: [
+    { id: 'source-transform', source: 'source', target: 'node-1' },
+    { id: 'transform-sink', source: 'node-1', target: 'sink' },
+  ],
+  nodes: [
+    { id: 'source', type: 'source', position: { x: 10, y: 20 },
+      data: { title: 'Source', status: 'latest', config: {} } },
+    { id: 'node-1', type: 'transform', position: { x: 320, y: 180 },
+      data: { title: 'Blank transform', status: 'draft', config } },
+    { id: 'sink', type: 'write', position: { x: 650, y: 180 },
+      data: { title: 'Write', status: 'latest', config: {} } },
+  ],
+})
 
 describe('TransformsLibrary', () => {
   beforeEach(() => {
@@ -176,6 +193,69 @@ describe('TransformsLibrary', () => {
     })
     expect(await screen.findByText('SOURCE_FROM_V2')).toBeVisible()
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
+  })
+
+  it('preserves an exact Canvas target while choosing a Transform and version', async () => {
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    mocks.getCanvas.mockResolvedValue(blankTargetDoc())
+    render(<TransformsLibrary />)
+
+    fireEvent.click((await screen.findAllByRole('button', { name: /Robot scorer/ }))[0])
+    expect(store.setTransformResource).toHaveBeenLastCalledWith(
+      'tr_exact', 'v1', { canvasId: 'target', nodeId: 'node-1' },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'v2' }))
+    expect(store.setTransformResource).toHaveBeenLastCalledWith(
+      'tr_exact', 'v2', { canvasId: 'target', nodeId: 'node-1' },
+    )
+  })
+
+  it('configures an explicit blank Transform in place without opening the generic chooser', async () => {
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    const before = blankTargetDoc()
+    const after = {
+      ...before,
+      version: 10,
+      nodes: before.nodes.map((node) => node.id === 'node-1' ? {
+        ...node,
+        data: {
+          ...node.data,
+          title: 'Robot scorer',
+          config: { source: 'library', processor: 'tr_exact', version: 'v1', mode: 'map' },
+        },
+      } : node),
+    }
+    mocks.getCanvas.mockResolvedValueOnce(before).mockResolvedValue(after)
+    mocks.workspaceAddTransform.mockResolvedValue({
+      ok: true, id: 'target', version: 10, nodeId: 'node-1', doc: after,
+    })
+    render(<TransformsLibrary />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+
+    await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {
+      transformId: 'tr_exact', transformVersion: 'v1', expectedCanvasVersion: 9,
+      replaceNodeId: 'node-1',
+    }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(store.openFile).toHaveBeenCalledWith('target', { serverCopy: true })
+    expect(store.select).toHaveBeenCalledWith('node-1')
+  })
+
+  it.each([
+    ['a different Transform', { source: 'library', processor: 'tr_other', version: 'v1', mode: 'map' }, 'different Transform'],
+    ['a partial exact ref', { source: 'library', processor: 'tr_exact', mode: 'map' }, 'incomplete processor version reference'],
+  ])('fails closed when the target has %s', async (_label, config, message) => {
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    mocks.getCanvas.mockResolvedValue(blankTargetDoc(config))
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(message)
+    expect(screen.queryByRole('button', { name: 'Use exact v1' })).not.toBeInTheDocument()
+    expect(mocks.workspaceAddTransform).not.toHaveBeenCalled()
   })
 
   it('uses only an explicitly selected editable Canvas and focuses after server confirmation', async () => {

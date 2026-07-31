@@ -61,6 +61,9 @@ export function TransformsLibrary() {
     else params.delete(key)
     setRouteQuery(params.toString())
   }
+  const targetContext = upgradeCanvasId && upgradeNodeId
+    ? { canvasId: upgradeCanvasId, nodeId: upgradeNodeId }
+    : null
 
   useEffect(() => {
     let live = true
@@ -126,7 +129,9 @@ export function TransformsLibrary() {
           No matching Transforms. Promote a tested ad-hoc Transform from a Canvas, or adjust these filters.
         </div>}
         <div className="grid gap-2">
-          {items.map((item) => <button key={`${item.id}@${item.version}`} onClick={() => setResource(item.id, item.version)}
+          {items.map((item) => <button key={`${item.id}@${item.version}`} onClick={() => setResource(
+            item.id, item.version, targetContext,
+          )}
             className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-xl border p-3.5 text-left transition-colors hover:bg-accent ${selectedId === item.id ? 'border-primary bg-primary/5' : 'border-border bg-card'}`}>
             <span className="min-w-0">
               <span className="flex flex-wrap items-center gap-1.5"><strong className="truncate text-[13px] text-foreground">{item.title}</strong>
@@ -149,15 +154,20 @@ export function TransformsLibrary() {
         {detailError && <div role="alert" className="text-sm text-destructive">{detailError}</div>}
         {detail && <TransformDetail detail={detail} selected={activeVersion} requestedMissing={requestedMissing}
           onSelectVersion={(version) => setResource(
-            detail.id, version,
-            upgradeCanvasId && upgradeNodeId
-              ? { canvasId: upgradeCanvasId, nodeId: upgradeNodeId } : null,
+            detail.id, version, targetContext,
           )} onUse={setUseEntry}
           onRefresh={() => setRefreshEpoch((value) => value + 1)} />}
       </section>
     </div>
     {useEntry && <TransformUseDialog entry={useEntry} onClose={() => setUseEntry(null)} />}
   </div>
+}
+
+type ExactTransformTarget = {
+  doc: CanvasDoc
+  node: CanvasNode
+  file: CanvasFile
+  intent: 'configure' | 'upgrade'
 }
 
 function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, onUse, onRefresh }: {
@@ -171,7 +181,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
   const openFile = useStore((state) => state.openFile)
   const selectNode = useStore((state) => state.select)
   const pushToast = useStore((state) => state.pushToast)
-  const [target, setTarget] = useState<{ doc: CanvasDoc; node: CanvasNode; file: CanvasFile } | null>(null)
+  const [target, setTarget] = useState<ExactTransformTarget | null>(null)
   const [targetError, setTargetError] = useState<string | null>(null)
   const [targetEpoch, setTargetEpoch] = useState(0)
   const sourceKey = selected ? `${detail.id}\u0000${selected.version}` : ''
@@ -227,27 +237,69 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         if (!live) return
         const file = useStore.getState().files.find((candidate) => candidate.id === upgradeCanvasId)
         const node = doc.nodes.find((candidate) => candidate.id === upgradeNodeId)
-        if (!file || !roleCanEdit(file.role)) throw new Error('The upgrade target is no longer editable')
-        if (!node || node.type !== 'transform' || node.data.config.source !== 'library'
-            || node.data.config.processor !== detail.id) {
-          throw new Error('The exact upgrade target no longer matches this Transform')
+        if (!file || !roleCanEdit(file.role)) throw new Error('The exact target is no longer editable')
+        if (!node || node.type !== 'transform' || node.data.config.source !== 'library') {
+          throw new Error('The exact target is no longer a Library Transform')
         }
-        setTarget({ doc, node, file })
+        const processor = node.data.config.processor
+        const version = node.data.config.version
+        const unconfigured = processor == null && version == null
+        const configured = typeof processor === 'string' && processor.length > 0
+          && typeof version === 'string' && version.length > 0
+        if (!unconfigured && !configured) {
+          throw new Error('The exact target has an incomplete processor version reference')
+        }
+        if (configured && processor !== detail.id) {
+          throw new Error('The exact target is configured with a different Transform')
+        }
+        setTarget({ doc, node, file, intent: unconfigured ? 'configure' : 'upgrade' })
       } catch (caught) { if (live) setTargetError(errorMessage(caught)) }
     })()
     return () => { live = false }
   }, [upgradeCanvasId, upgradeNodeId, detail.id, targetEpoch])
   const cfg = target?.node.data.config
-  const upgradeFrom = target?.node.type === 'transform' && cfg?.source === 'library'
+  const upgradeFrom = target?.intent === 'upgrade' && cfg?.source === 'library'
     && cfg.processor === detail.id ? detail.versions.find((version) => version.version === cfg.version) ?? null : null
   const inputDiff = upgradeFrom && selected ? compareSchemas(upgradeFrom.inputSchema, selected.inputSchema) : null
   const outputDiff = upgradeFrom && selected ? compareSchemas(upgradeFrom.outputSchema, selected.outputSchema) : null
-  const showUpgrade = !!selected && !!target
+  const showUpgrade = !!selected && target?.intent === 'upgrade'
     && cfg?.source === 'library' && cfg.processor === detail.id && cfg.version !== selected.version
   const canUpgrade = showUpgrade && inputDiff?.status === 'compatible'
     && outputDiff?.status === 'compatible' && selected?.availability === 'active'
   const [upgrading, setUpgrading] = useState(false)
   const [upgradeError, setUpgradeError] = useState<string | null>(null)
+  const [configuring, setConfiguring] = useState(false)
+  const [configureError, setConfigureError] = useState<string | null>(null)
+
+  const configure = async () => {
+    if (target?.intent !== 'configure' || !selected || selected.availability !== 'active') return
+    setConfiguring(true); setConfigureError(null)
+    let result: Awaited<ReturnType<typeof api.workspaceAddTransform>>
+    try {
+      result = await api.workspaceAddTransform(target.doc.id, {
+        transformId: selected.id, transformVersion: selected.version,
+        expectedCanvasVersion: target.doc.version, replaceNodeId: target.node.id,
+      })
+    } catch (caught) {
+      setConfigureError(errorMessage(caught))
+      setConfiguring(false)
+      return
+    }
+    // The server mutation is committed. Clear the blank target before any fallible local refresh so
+    // a navigation failure can never make the exact configuration look retryable.
+    setTarget(null)
+    setTargetEpoch((value) => value + 1)
+    let opened = false
+    try { await refreshFiles() } catch { /* committed; exact refetch below remains authoritative */ }
+    try { opened = await openFile(result.id, { serverCopy: true }) } catch { /* committed */ }
+    if (opened) {
+      selectNode(result.nodeId)
+      pushToast(`Configured ${selected.title}@${selected.version}; downstream results are stale`, 'success')
+    } else {
+      pushToast(`Configured ${selected.title}@${selected.version}, but the Canvas could not be opened. Open it from Workspace.`, 'info')
+    }
+    setConfiguring(false)
+  }
 
   const upgrade = async () => {
     if (!canUpgrade || !target || !selected) return
@@ -287,21 +339,30 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
   </div>
   if (!selected) return null
   const totalRetention = retained(selected)
+  const hasTargetContext = !!upgradeCanvasId && !!upgradeNodeId
+  const canConfigure = target?.intent === 'configure' && selected.availability === 'active'
   return <div>
     <div className="flex flex-wrap items-start gap-3">
       <div className="min-w-0 flex-1"><h2 className="truncate text-lg font-bold text-foreground">{selected.title}</h2>
         <p className="mt-1 text-[12px] leading-5 text-muted-foreground">{selected.blurb || 'No description supplied.'}</p></div>
-      <button onClick={() => onUse(selected)} disabled={selected.availability !== 'active'} className="rounded-md bg-foreground px-3 py-2 text-[12px] font-semibold text-background disabled:opacity-40">Use exact {selected.version}</button>
+      {(!hasTargetContext || target?.intent === 'configure') && <button
+        onClick={() => target?.intent === 'configure' ? void configure() : onUse(selected)}
+        disabled={configuring || (hasTargetContext ? !canConfigure : selected.availability !== 'active')}
+        className="rounded-md bg-foreground px-3 py-2 text-[12px] font-semibold text-background disabled:opacity-40"
+      >{configuring ? 'Configuring…' : `Use exact ${selected.version}`}</button>}
     </div>
     <div className="mt-3 flex flex-wrap gap-1.5 text-[10.5px] text-muted-foreground">
       <span className="rounded bg-muted px-2 py-1">{selected.provenance}</span><span className="rounded bg-muted px-2 py-1">{selected.category}</span><span className="rounded bg-muted px-2 py-1">{selected.mode}</span>
       <span className={`rounded px-2 py-1 ${selected.availability === 'active' ? 'bg-emerald-500/10 text-emerald-700' : 'bg-destructive/10 text-destructive'}`}>{selected.availability}</span>
     </div>
     {upgradeCanvasId && upgradeNodeId && <section className="mt-4 rounded-lg border border-border bg-background p-3">
-      <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Explicit upgrade target</h3>
+      <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
+        {target?.intent === 'configure' ? 'Exact configuration target' : 'Explicit upgrade target'}
+      </h3>
       {target ? <p className="mt-1 text-[12px]"><strong>{target.file.name}</strong> · {target.node.data.title || target.node.id} <span className="font-mono text-[10px] text-muted-foreground">{target.node.id}</span></p>
         : targetError ? <div role="alert" className="mt-1 text-[11px] text-destructive">{targetError}</div>
           : <p className="mt-1 text-[11px] text-muted-foreground">Confirming Canvas, node, and edit role…</p>}
+      {configureError && <div role="alert" className="mt-2 text-[11px] text-destructive">{configureError}</div>}
       <button onClick={() => setTargetEpoch((value) => value + 1)} className="mt-2 text-[11px] font-semibold text-primary">Reload exact target</button>
     </section>}
     <VersionList versions={detail.versions} selected={selected.version} onSelect={onSelectVersion} />

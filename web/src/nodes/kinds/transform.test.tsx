@@ -5,6 +5,10 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 
 const apiMocks = vi.hoisted(() => ({
   installedProcessorSource: vi.fn(),
+  transformLibrary: vi.fn(),
+  transformLibraryDetail: vi.fn(),
+  getCanvas: vi.fn(),
+  workspaceAddTransform: vi.fn(),
 }))
 vi.mock('../../api/client', () => ({
   api: new Proxy(apiMocks, {
@@ -40,6 +44,12 @@ import './transform'
 import { getComponent } from '../registry'
 import { previewPlanIdentity, useStore } from '../../store/graph'
 import { CodeFullscreen } from '../../panels/CodeFullscreen'
+import { TransformsLibrary } from '../../views/TransformsLibrary'
+
+const originalStoreActions = {
+  refreshFiles: useStore.getState().refreshFiles,
+  openFile: useStore.getState().openFile,
+}
 
 const PROCESSOR_ID = `tr_${'a'.repeat(29)}`
 const node = {
@@ -51,12 +61,22 @@ const node = {
 
 describe('Transform exact processor labels', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
     apiMocks.installedProcessorSource.mockReset()
       .mockRejectedValue(Object.assign(new Error('source unavailable'), { status: 404 }))
+    apiMocks.transformLibrary.mockReset()
+    apiMocks.transformLibraryDetail.mockReset().mockResolvedValue({
+      id: PROCESSOR_ID, provenance: 'promoted', requestedVersion: 'v1', versions: [],
+    })
+    apiMocks.getCanvas.mockReset()
+    apiMocks.workspaceAddTransform.mockReset()
     useStore.setState({
       canvasRole: 'owner', view: 'canvas', fullscreenCode: null, previews: {},
       transformResourceId: null, transformVersion: null,
       transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      refreshFiles: originalStoreActions.refreshFiles,
+      openFile: originalStoreActions.openFile,
+      files: [],
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [node], edges: [] },
       canvasTransformReferences: [],
       processors: [{
@@ -153,9 +173,117 @@ describe('Transform exact processor labels', () => {
     fireEvent.click(screen.getByRole('button', { name: /Choose/ }))
     expect(useStore.getState()).toMatchObject({
       view: 'transforms', transformResourceId: null, transformVersion: null,
-      transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformUpgradeCanvasId: 'canvas', transformUpgradeNodeId: 'transform',
       fullscreenCode: null,
     })
+  })
+
+  it('configures the originating blank node through the rendered exact-version flow', async () => {
+    const Transform = getComponent('transform')!
+    const source = {
+      id: 'source', type: 'source', position: { x: 20, y: 180 },
+      data: { title: 'Source', status: 'latest' as const, config: { uri: 'events.parquet' } },
+    }
+    const blank = {
+      id: 'transform', type: 'transform', position: { x: 340, y: 180 },
+      data: { title: 'Blank transform', status: 'draft' as const,
+        config: { source: 'library', mode: 'map', code: null } },
+    }
+    const sink = {
+      id: 'sink', type: 'write', position: { x: 680, y: 180 },
+      data: { title: 'Write', status: 'latest' as const, config: {} },
+    }
+    const edges = [
+      { id: 'source-transform', source: 'source', target: 'transform',
+        sourceHandle: 'out', targetHandle: 'in', data: { wire: 'dataset' as const } },
+      { id: 'transform-sink', source: 'transform', target: 'sink',
+        sourceHandle: 'out', targetHandle: 'in', data: { wire: 'dataset' as const } },
+    ]
+    let serverDoc = {
+      id: 'canvas', name: 'canvas', version: 4, requirements: [],
+      nodes: [source, blank, sink], edges,
+    }
+    const descriptor = {
+      id: PROCESSOR_ID, version: 'v1', title: 'Exact scorer', mode: 'map',
+      category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [],
+      requirements: [], paramsSchema: {}, previewable: true,
+      blurb: 'Configures the selected blank node.', provenance: 'promoted' as const,
+      availability: 'active' as const, versionCount: 1,
+      retention: { canvas: 0, canvasVersion: 0, executionManifest: 0 },
+    }
+    apiMocks.transformLibrary.mockResolvedValue({
+      items: [descriptor], hasMore: false, nextCursor: null,
+    })
+    apiMocks.transformLibraryDetail.mockResolvedValue({
+      id: PROCESSOR_ID, provenance: 'promoted', requestedVersion: 'v1', versions: [descriptor],
+    })
+    apiMocks.installedProcessorSource.mockResolvedValue({
+      processorId: PROCESSOR_ID, version: 'v1', language: 'python',
+      source: 'def fn(row): return row', sha256: 'a'.repeat(64),
+    })
+    apiMocks.getCanvas.mockImplementation(async () => serverDoc)
+    apiMocks.workspaceAddTransform.mockImplementation(async (_canvasId, body) => {
+      serverDoc = {
+        ...serverDoc,
+        version: 5,
+        nodes: serverDoc.nodes.map((candidate) => candidate.id === blank.id ? {
+          ...candidate,
+          data: {
+            ...candidate.data,
+            title: descriptor.title,
+            config: {
+              source: 'library', processor: descriptor.id,
+              version: descriptor.version, mode: descriptor.mode,
+            },
+          },
+        } : candidate),
+      }
+      return { ok: true, id: serverDoc.id, version: 5, nodeId: blank.id, doc: serverDoc }
+    })
+    const refreshFiles = vi.fn(async () => true)
+    const openFile = vi.fn(async () => {
+      useStore.setState({ doc: serverDoc as any, view: 'canvas' })
+      return true
+    })
+    useStore.setState({
+      doc: serverDoc as any,
+      files: [{ id: 'canvas', name: 'canvas', version: 4, role: 'owner' }],
+      refreshFiles,
+      openFile,
+    } as any)
+
+    const canvas = render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={blank.id} data={blank.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /Choose/ }))
+    expect(useStore.getState()).toMatchObject({
+      view: 'transforms', transformResourceId: null, transformVersion: null,
+      transformUpgradeCanvasId: 'canvas', transformUpgradeNodeId: blank.id,
+    })
+    canvas.unmount()
+
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: /Exact scorer/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+
+    await waitFor(() => expect(apiMocks.workspaceAddTransform).toHaveBeenCalledWith('canvas', {
+      transformId: PROCESSOR_ID, transformVersion: 'v1',
+      expectedCanvasVersion: 4, replaceNodeId: blank.id,
+    }))
+    await waitFor(() => expect(openFile).toHaveBeenCalledWith('canvas', { serverCopy: true }))
+    const reopened = useStore.getState().doc
+    expect(reopened.nodes).toHaveLength(3)
+    expect(reopened.nodes.map((candidate) => candidate.id)).toEqual(['source', 'transform', 'sink'])
+    expect(reopened.nodes.find((candidate) => candidate.id === blank.id)).toMatchObject({
+      id: blank.id,
+      position: blank.position,
+      data: { config: { processor: PROCESSOR_ID, version: 'v1' } },
+    })
+    expect(reopened.edges).toEqual(edges)
+    expect(useStore.getState().selectedId).toBe(blank.id)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('opens a Library definition instead of advertising editable source code', () => {
