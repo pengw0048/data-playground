@@ -35,17 +35,12 @@ async function expectFullyInViewport(page: Page, loc: Locator, label: string) {
 async function expectToolbarGroupsDoNotOverlap(page: Page, label: string) {
   const toolbar = page.getByTestId('toolbar')
   const addControls = page.getByTestId('toolbar-add-controls')
-  const viewControls = page.getByTestId('toolbar-view-controls')
   const viewportControls = page.getByTestId('canvas-viewport-controls')
   const minimap = page.locator('.react-flow__minimap')
   await expectFullyInViewport(page, toolbar, `${label} toolbar`)
   await expectFullyInViewport(page, addControls, `${label} add controls`)
-  await expectFullyInViewport(page, viewControls, `${label} view controls`)
   await expectFullyInViewport(page, viewportControls, `${label} viewport controls`)
   await expectFullyInViewport(page, minimap, `${label} minimap`)
-  const addBox = await boxOf(addControls)
-  const viewBox = await boxOf(viewControls)
-  expect(addBox.x + addBox.width, `${label} add and view controls overlap`).toBeLessThanOrEqual(viewBox.x + 0.5)
   const toolbarBox = await boxOf(toolbar)
   const viewportControlsBox = await boxOf(viewportControls)
   const minimapBox = await boxOf(minimap)
@@ -175,20 +170,21 @@ test.describe('minimum viewport support', () => {
     await openCanvasWithSource(page)
     const node = page.locator('.react-flow__node').first()
     await expectFullyInViewport(page, node, 'canvas node')
-    const viewControls = page.getByTestId('toolbar-view-controls')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
     await node.click()
-    await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Add operation from dataset output' })).toBeVisible()
+    await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
     if (testInfo.project.name === 'chromium-reference-viewport') {
       await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'comfortable')
     }
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
-    await expect(viewControls.getByRole('group', { name: 'Panel controls' })).toBeVisible()
     for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
       await expectFullyInViewport(page, viewportControls.getByRole('button', { name }), `Canvas ${name}`)
     }
-    await expectFullyInViewport(page, viewControls.getByRole('button', { name: 'Hide Inspector' }), 'Canvas Hide Inspector')
+    await expectFullyInViewport(page, page.getByRole('button', { name: 'Collapse Inspector' }), 'Canvas Collapse Inspector')
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
     // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
@@ -463,16 +459,16 @@ test.describe('minimum viewport support', () => {
 
     await openCanvasWithSource(page)
     await page.locator('.react-flow__node').first().click()
-    await expect(page.getByRole('button', { name: 'Add next step' })).toBeVisible()
-    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'compact')
-    const viewControls = page.getByTestId('toolbar-view-controls')
+    await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add operation from dataset output' })).toBeVisible()
+    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'comfortable')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector collapsed)')
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
     for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
       await expectFullyInViewport(page, viewportControls.getByRole('button', { name }), `1024px Canvas ${name}`)
     }
-    await expectFullyInViewport(page, viewControls.getByRole('button', { name: 'Show Inspector' }), '1024px Canvas Show Inspector')
+    await expectFullyInViewport(page, page.getByRole('button', { name: 'Expand Inspector' }), '1024px Canvas Expand Inspector')
     await page.getByTestId('app-menu').click()
     const appMenu = page.getByRole('menu', { name: 'Data Playground menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
@@ -480,8 +476,9 @@ test.describe('minimum viewport support', () => {
       await expect(appMenu.getByText(detail, { exact: true })).toBeVisible()
     }
     await page.keyboard.press('Escape')
-    await page.getByRole('button', { name: 'Show Inspector', exact: true }).click()
+    await page.getByRole('button', { name: 'Expand Inspector', exact: true }).click()
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
+    await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'icons')
     await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector expanded)')
   })
 })

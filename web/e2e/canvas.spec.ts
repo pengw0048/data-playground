@@ -303,7 +303,7 @@ test.describe('Data Playground canvas', () => {
       // The fit uses React Flow's actual canvas region, not the browser window. Switch to a graph
       // with deliberately different geometry while the Inspector is collapsed, then back again.
       // That proves a same-count stale RF node set cannot consume the next document's request.
-      await page.getByRole('button', { name: 'Hide Inspector', exact: true }).click()
+      await page.getByRole('button', { name: 'Collapse Inspector', exact: true }).click()
       await backToWorkspace(page)
       await (await workspaceResource(page, 'canvas', otherCanvasName)).click()
       await expect(nodes).toHaveCount(5)
@@ -535,106 +535,48 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
   })
 
-  test('selected-node Add explicitly creates the next connected step at 1280x720', async ({ page }) => {
-    const canvasId = `selected-next-step-${Date.now()}`
+  test('selection keeps Add global while the output port creates one atomic connected step', async ({ page }) => {
+    const canvasId = `local-port-add-${Date.now()}`
     const created = await page.request.post('/api/canvas', { data: {
-      id: canvasId, name: 'Selected next step', version: 1, requirements: [], nodes: [], edges: [],
+      id: canvasId, name: 'Local port add', version: 1, requirements: [], nodes: [], edges: [],
     } })
     expect(created.ok()).toBe(true)
     await page.goto(`/#/canvas/${canvasId}`)
     await page.setViewportSize({ width: 1280, height: 720 })
     await addNode(page, 'Sources & sinks', 'source')
 
-    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
-    const firstPicker = page.getByRole('dialog', { name: 'Add an operation' })
-    await firstPicker.getByRole('textbox', { name: 'Search operations' }).fill('filter')
-    const filter = firstPicker.getByRole('option', { name: /filter/i }).first()
-    await expect(firstPicker.getByLabel('Next-step context')).toContainText('Add next step after source')
-    await expect(filter).not.toContainText('Adds unconnected')
-    await expect(filter).not.toContainText('Add next step after source')
-    await filter.click()
+    const globalAdd = page.getByRole('button', { name: 'Add operation', exact: true })
+    await expect(globalAdd).toBeVisible()
+    await expect(globalAdd).toHaveText('')
+    await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
+    await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
+
+    const port = page.getByRole('button', { name: 'Add operation from dataset output' })
+    await expect(port).toBeVisible()
+    await port.press('Enter')
+    const picker = page.getByRole('dialog', { name: 'Connect to an operation' })
+    await expect(picker).not.toHaveAttribute('aria-modal')
+    await expect(page.locator('.dp-modal-overlay')).toHaveCount(0)
+    const search = picker.getByRole('textbox', { name: 'Search operations' })
+    await expect(search).toBeFocused()
+    await search.fill('filter')
+    await search.press('Enter')
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
 
-    await page.locator('.react-flow__node-source').click()
-    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
-    await page.getByRole('button', { name: 'Add operation', exact: true }).click()
-    const ambiguousPicker = page.getByRole('dialog', { name: 'Add an operation' })
-    await ambiguousPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
-    const join = ambiguousPicker.getByRole('option', { name: /join/i })
-    await expect(join).not.toContainText('Add next step')
-    await join.click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(3)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
     await page.getByRole('button', { name: 'Undo', exact: true }).click()
-
-    await page.locator('.react-flow__node-filter').click()
-    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
-    const secondPicker = page.getByRole('dialog', { name: 'Add an operation' })
-    await secondPicker.getByRole('textbox', { name: 'Search operations' }).fill('transform')
-    const transform = secondPicker.getByRole('option', { name: /transform/i }).first()
-    await expect(secondPicker.getByLabel('Next-step context')).toContainText('Add next step after filter')
-    await expect(transform).not.toContainText('Adds unconnected')
-    await expect(transform).not.toContainText('Add next step after filter')
-    await transform.click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(3)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
-
-    const transformShelf = page.getByRole('button', { name: 'Edit code' }).locator('..')
-    await expect(transformShelf).toBeVisible()
-    const shelfBox = await boxOf(transformShelf)
-    expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), 'next-step shelf is outside the visible Canvas').toBe(true)
-    expect(overlaps(shelfBox, await boxOf(page.getByTestId('toolbar'))), 'next-step shelf overlaps the toolbar').toBe(false)
-
-    await page.getByRole('button', { name: 'Undo', exact: true }).click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(2)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(0)
     await page.getByRole('button', { name: 'Redo', exact: true }).click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(3)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
-
-    const selectedTransform = page.locator('.react-flow__node-transform')
-    const transformId = await selectedTransform.getAttribute('data-id')
-    expect(transformId).not.toBeNull()
-    await selectedTransform.click()
-    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
-    const joinPicker = page.getByRole('dialog', { name: 'Add an operation' })
-    await joinPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
-    const contextualJoin = joinPicker.getByRole('option', { name: /join/i })
-    await expect(joinPicker.getByLabel('Next-step context')).toContainText('Add next step after transform')
-    await expect(contextualJoin).not.toContainText('Adds unconnected')
-    await expect(contextualJoin).not.toContainText('Add next step after transform')
-    await joinPicker.getByRole('textbox', { name: 'Search operations' }).press('Escape')
-    await expect(joinPicker).toBeHidden()
-    await expect(page.locator('.react-flow__node')).toHaveCount(3)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
-
-    await page.getByRole('button', { name: 'Add next step', exact: true }).click()
-    const confirmedJoinPicker = page.getByRole('dialog', { name: 'Add an operation' })
-    await confirmedJoinPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
-    await confirmedJoinPicker.getByRole('option', { name: /join/i }).click()
-    const joinNode = page.locator('.react-flow__node-join')
-    await expect(joinNode).toHaveCount(1)
-    await expect(joinNode).toContainText('Left dataset connected. Connect a right dataset to continue.')
-    await expect(page.getByText('This Join needs a right dataset before it can run.')).toBeVisible()
-    await expect(page.locator('.react-flow__edge')).toHaveCount(3)
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
     await expect.poll(async () => {
       const saved = await (await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)).json()
-      const join = saved.nodes.find((node: { type: string }) => node.type === 'join')
-      return join && saved.edges.some((edge: { source: string; target: string; targetHandle?: string }) => (
-        edge.source === transformId && edge.target === join.id && edge.targetHandle === 'a'
-      ))
-    }).toBeTruthy()
-    const joinBox = await boxOf(joinNode)
-    expect(contains(await boxOf(page.locator('.react-flow')), joinBox), 'Join card is outside the visible Canvas').toBe(true)
-    expect(overlaps(joinBox, await boxOf(page.getByTestId('toolbar'))), 'Join card overlaps the toolbar').toBe(false)
-
-    await page.getByRole('button', { name: 'Undo', exact: true }).click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(3)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
-    await page.getByRole('button', { name: 'Redo', exact: true }).click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(4)
-    await expect(page.locator('.react-flow__edge')).toHaveCount(3)
+      return {
+        nodeTypes: saved.nodes.map((node: { type: string }) => node.type).sort(),
+        edgeCount: saved.edges.length,
+      }
+    }).toEqual({ nodeTypes: ['filter', 'source'], edgeCount: 1 })
   })
 
   test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {
@@ -851,27 +793,57 @@ test.describe('Data Playground canvas', () => {
     expect(insideCard, 'tooltip is still inside the node card and gets clipped').toBe(false)
   })
 
-  test('clicking an output port opens the focused compatible picker and creates one connected node', async ({ page }) => {
+  test('the port picker stays local across supported viewports and creates one connected node', async ({ page }) => {
+    test.setTimeout(60_000)
     await fresh(page)
     await addNode(page, 'Query', 'sql')
-    await page.setViewportSize({ width: 1440, height: 900 })
-    // A plain click (no drag) on the sql output handle opens the same picker as toolbar Add.
-    await page.locator('.react-flow__node .react-flow__handle-right').first().click()
+    const port = page.getByRole('button', { name: 'Add operation from dataset output' })
     const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
+
+    for (const viewport of [
+      { width: 1024, height: 720 },
+      { width: 1280, height: 720 },
+      { width: 1440, height: 900 },
+    ]) {
+      await page.setViewportSize(viewport)
+      for (const collapsed of [false, true]) {
+        const collapse = page.getByRole('button', { name: 'Collapse Inspector', exact: true })
+        const expand = page.getByRole('button', { name: 'Expand Inspector', exact: true })
+        if (collapsed && await collapse.isVisible().catch(() => false)) await collapse.click()
+        if (!collapsed && await expand.isVisible().catch(() => false)) await expand.click()
+        await expect(collapsed ? expand : collapse).toBeVisible()
+
+        await port.press('Enter')
+        await expect(finder).toBeVisible()
+        await expect(finder).not.toHaveAttribute('aria-modal')
+        await expect(page.locator('.dp-modal-overlay')).toHaveCount(0)
+        await expect(finder.getByRole('textbox', { name: 'Search operations' })).toBeFocused()
+        const [portBox, finderBox, canvasBox, toolbarBox] = await Promise.all([
+          boxOf(port), boxOf(finder), boxOf(page.locator('.react-flow')), boxOf(page.getByTestId('toolbar')),
+        ])
+        expect(finderBox.width).toBeGreaterThanOrEqual(360)
+        expect(finderBox.width).toBeLessThanOrEqual(420)
+        expect(contains(canvasBox, finderBox), `${viewport.width}px port picker left the Canvas with Inspector ${collapsed ? 'collapsed' : 'expanded'}`).toBe(true)
+        expect(finderBox.y + finderBox.height).toBeLessThanOrEqual(toolbarBox.y - 7)
+        const rightGap = Math.abs(finderBox.x - (portBox.x + portBox.width))
+        const leftGap = Math.abs(finderBox.x + finderBox.width - portBox.x)
+        // At 1024px neither full 400px side may fit; clamping may leave a small gap rather than
+        // covering the source card or crossing into the Inspector.
+        expect(Math.min(rightGap, leftGap)).toBeLessThanOrEqual(64)
+        const portCenterY = portBox.y + portBox.height / 2
+        expect(portCenterY).toBeGreaterThanOrEqual(finderBox.y)
+        expect(portCenterY).toBeLessThanOrEqual(finderBox.y + finderBox.height)
+
+        await finder.getByRole('textbox', { name: 'Search operations' }).press('Escape')
+        await expect(finder).toBeHidden()
+        await expect(port).toBeFocused()
+      }
+    }
+
+    await port.press('Enter')
     const search = finder.getByRole('textbox', { name: 'Search operations' })
-    await expect(search).toBeFocused()
-    await expect(page.getByText('Search all nodes…')).toHaveCount(0)
-    const box = await boxOf(finder)
-    expect(box.x).toBeGreaterThanOrEqual(16)
-    expect(box.x + box.width).toBeLessThanOrEqual(1424)
-    expect(box.y).toBeGreaterThanOrEqual(0)
-    expect(box.y + box.height).toBeLessThanOrEqual(900)
-    await expect(finder.getByText('For dataset output')).toBeVisible()
-    await expect(finder.getByRole('option').first()).not.toContainText('in dataset')
-    await search.pressSequentially('t')
+    await search.fill('transform')
     await expect(finder.getByRole('option', { name: /transform/i })).toHaveCount(1)
-    await search.press('ArrowDown')
-    await search.press('ArrowUp')
     await search.press('Enter')
     await expect(finder).toBeHidden()
     const nodes = page.locator('.react-flow__node')
@@ -881,6 +853,13 @@ test.describe('Data Playground canvas', () => {
     const targetBox = await boxOf(nodes.nth(1))
     expect(targetBox.x, 'the connected target is downstream, not back through its source')
       .toBeGreaterThan(sourceBox.x + sourceBox.width + 80)
+
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
+    await expect(nodes).toHaveCount(1)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(0)
+    await page.getByRole('button', { name: 'Redo', exact: true }).click()
+    await expect(nodes).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
 
     await page.reload()
     const reloadedNodes = page.locator('.react-flow__node')
@@ -1056,7 +1035,6 @@ test.describe('Data Playground canvas', () => {
     const minimap = page.locator('.react-flow__minimap')
     const toolbar = page.getByTestId('toolbar')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
-    const viewControls = page.getByTestId('toolbar-view-controls')
     await expect(minimap).toBeVisible()
     await expect(toolbar).toBeVisible()
     await expect(viewportControls).toBeVisible()
@@ -1076,38 +1054,33 @@ test.describe('Data Playground canvas', () => {
     }
     await expectLayout('expanded')
 
-    await viewControls.getByRole('button', { name: 'Hide Inspector' }).click()
-    await expect(viewControls.getByRole('button', { name: 'Show Inspector' })).toBeVisible()
+    await page.getByRole('button', { name: 'Collapse Inspector', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Expand Inspector', exact: true })).toBeVisible()
     await expectLayout('collapsed')
     await viewportControls.getByRole('button', { name: 'Fit view' }).hover()
     await expect(page.getByRole('tooltip')).toHaveText('Fit view')
   })
 
-  test('toolbar keeps Inspector separate from icon-only viewport controls', async ({ page }) => {
+  test('toolbar stays global and keeps disclosure state out of category tooltips', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
 
     const addControls = page.getByTestId('toolbar-add-controls')
-    const viewControls = page.getByTestId('toolbar-view-controls')
     const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expect(addControls).toHaveAttribute('role', 'group')
-    await expect(viewControls).toHaveAttribute('role', 'group')
     await expect(viewportControls).toHaveAttribute('role', 'group')
     await expect(addControls.getByText('Add', { exact: true })).toBeVisible()
-    await expect(viewControls.getByText('View', { exact: true })).toBeVisible()
-    await expect(viewControls.getByRole('group', { name: 'Viewport controls' })).toHaveCount(0)
+    await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveText('')
     const fitView = viewportControls.getByRole('button', { name: 'Fit view' })
     await expect(fitView).toBeVisible()
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
-
-    const inspector = viewControls.getByRole('button', { name: 'Hide Inspector' })
-    await expect(inspector).toHaveAttribute('aria-pressed', 'true')
-    await inspector.hover()
-    await expect(page.getByRole('tooltip')).toHaveText('Inspector — shown')
-    await inspector.click()
-    await expect(viewControls.getByRole('button', { name: 'Show Inspector' })).toHaveAttribute('aria-pressed', 'false')
+    await expect(page.getByRole('button', { name: 'Collapse Inspector', exact: true })).toBeVisible()
 
     const shape = addControls.getByRole('button', { name: 'Shape', exact: true })
+    await shape.hover()
+    await expect(page.getByRole('tooltip')).toHaveText('Shape')
     await shape.click()
     await expect(shape).toHaveAttribute('aria-expanded', 'true')
     await expect(shape).toHaveAttribute('aria-pressed', 'true')

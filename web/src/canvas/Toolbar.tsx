@@ -9,9 +9,8 @@ import { Popover } from '../ui/Popover'
 import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { locateNode } from './locateNode'
-import { uniqueNextStepConnection } from './nextStep'
 import { cn } from '@/lib/utils'
-import { toolbarRevealDelta, toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
+import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 import { canvasFitOptions } from './viewportFit'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
@@ -22,15 +21,10 @@ const CATEGORY_LABEL: Record<Category, string> = {
 }
 
 // Bottom toolbar — auto-populated from the node registry, grouped by category (FR-C2a).
-export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
-  inspectorCollapsed: boolean
-  onInspectorToggle: () => void
-}) {
+export function Toolbar() {
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
   const doc = useStore((s) => s.doc)
-  const selectedIds = useStore((s) => s.selectedIds)
   const addNode = useStore((s) => s.addNode)
-  const addConnectedNode = useStore((s) => s.addConnectedNode)
   const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
@@ -72,45 +66,8 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
     setOperationFinderOpen(false)
   }
 
-  const selectedNode = selectedIds.length === 1
-    ? doc.nodes.find((node) => node.id === selectedIds[0]) ?? null
-    : null
-  const nextStepKinds = new Set(selectedNode
-    ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind, doc.edges)).map((spec) => spec.kind)
-    : [])
-  const nextStepSource = nextStepKinds.size ? selectedNode : null
-  const toolbarDensity = useToolbarDensity(toolbarRef, !!nextStepSource)
+  const toolbarDensity = useToolbarDensity(toolbarRef)
   const labelsVisible = toolbarDensity !== 'icons'
-  const compact = toolbarDensity === 'compact'
-  const addNext = (kind: string, asNextStep?: boolean) => {
-    if (!asNextStep) { add(kind); return }
-    // Re-evaluate at activation time: a remote edit or a changed selection must never turn the
-    // explicit next-step affordance into a guessed connection.
-    const current = useStore.getState().doc
-    const currentSelection = useStore.getState().selectedIds
-    const source = currentSelection.length === 1
-      ? current.nodes.find((node) => node.id === currentSelection[0]) ?? null
-      : null
-    const connection = source && uniqueNextStepConnection(source, kind, current.edges)
-    if (!source || !connection) return
-    const bounds = toolbarBounds()
-    const pos = bounds ? toolbarSafePosition(
-      current.nodes,
-      { x: source.position.x + 300, y: source.position.y },
-      bounds,
-    ) : { x: source.position.x + 300, y: source.position.y }
-    const added = addConnectedNode(kind, pos, { source: source.id, ...connection })
-    const surface = toolbarRef.current?.parentElement?.getBoundingClientRect()
-    const reveal = added?.data.autoPlaced && bounds ? toolbarRevealDelta(added.position, bounds) : null
-    if (surface && reveal) {
-      const center = screenToFlowPosition({
-        x: surface.left + surface.width / 2,
-        y: surface.top + surface.height / 2,
-      })
-      void setCenter(center.x + reveal.x, center.y + reveal.y, { zoom: getZoom(), duration: 0 })
-    }
-    setOperationFinderOpen(false)
-  }
 
   const locate = (id: string) => {
     select(id)
@@ -127,13 +84,10 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
         </div>
       )}
       {doc.nodes.length > 0 && <CanvasViewportControls />}
-      <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
-        <div className={cn(
-          'flex max-w-[calc(100vw-24px)] items-center rounded-2xl border border-border bg-card shadow-lg',
-          compact ? 'gap-0.5 p-1' : 'gap-1 p-1.5',
-        )}>
-          {canEdit && (
-            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className={cn('flex min-w-0 items-center', compact ? 'gap-0.5' : 'gap-1')}>
+      {canEdit && (
+        <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
+          <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-2xl border border-border bg-card p-1.5 shadow-lg">
+            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className="flex min-w-0 items-center gap-1">
               {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Add</span>}
               {cats.map((cat) => (
                 <CategoryButton
@@ -147,9 +101,9 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
                 />
               ))}
 
-              <div className={cn('h-[22px] w-px bg-border', compact ? 'mx-0.5' : 'mx-1')} />
+              <div className="mx-1 h-[22px] w-px bg-border" />
 
-              <ToolbarIconButton label={nextStepSource ? 'Add next step' : 'Add operation'} icon="plus" showLabel={!!nextStepSource} onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
+              <ToolbarIconButton label="Add operation" icon="plus" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }} />
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }} />
 
               <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
@@ -157,10 +111,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
                   type="button"
                   aria-pressed={agentOpen}
                   onClick={() => setAgentOpen(!agentOpen)}
-                  className={cn(
-                    'inline-flex items-center gap-[7px] rounded-lg py-[7px] text-[12.5px] font-semibold',
-                    compact ? 'px-2.5' : 'px-3.5',
-                  )}
+                  className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
                   // Agent brand accent (violet) — no design token expresses it; matches the AgentDock it opens.
                   style={{ background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6' }}
                 >
@@ -168,44 +119,26 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
                 </button>
               </Tooltip>
             </div>
-          )}
-
-          {canEdit && <div aria-hidden className={cn('h-[22px] w-px bg-border', compact ? 'mx-0.5' : 'mx-1')} />}
-          <CanvasViewControls
-            inspectorCollapsed={inspectorCollapsed}
-            onInspectorToggle={onInspectorToggle}
-            labelsVisible={labelsVisible}
-          />
+          </div>
         </div>
-      </div>
-      {operationFinderOpen && nextStepSource && <NodeFinder
-        specs={specs}
-        nextStepKinds={nextStepKinds}
-        nextStepLabel={nextStepSource.data.title}
-        onPick={addNext}
-        onClose={() => setOperationFinderOpen(false)}
-      />}
-      {operationFinderOpen && !nextStepSource && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
+      )}
+      {operationFinderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </>
   )
 }
 
-// The ordinary labelled toolbar measures about 860px with the current registry. A contextual
-// Add-next-step label needs a compact labelled density at the 980px Canvas region created by either
-// a 1280px viewport with its Inspector open or a 1024px viewport with it collapsed. The Canvas
-// region changes with the Inspector, so these thresholds use that region, not the browser window.
+// The Canvas region changes with the Inspector, so this threshold uses that region rather than
+// the browser window. Narrow Canvases keep every global action but hide decorative group labels.
 const LABELLED_TOOLBAR_MIN_WIDTH = 900
-const COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH = 1024
-type ToolbarDensity = 'icons' | 'compact' | 'comfortable'
+type ToolbarDensity = 'icons' | 'comfortable'
 
-export function toolbarDensityForWidth(width: number, hasNextStepLabel: boolean): ToolbarDensity {
+export function toolbarDensityForWidth(width: number): ToolbarDensity {
   if (width < LABELLED_TOOLBAR_MIN_WIDTH) return 'icons'
-  if (hasNextStepLabel && width < COMFORTABLE_NEXT_STEP_TOOLBAR_MIN_WIDTH) return 'compact'
   return 'comfortable'
 }
 
-function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLabel: boolean) {
+function useToolbarDensity(ref: RefObject<HTMLDivElement | null>) {
   const [regionWidth, setRegionWidth] = useState(0)
 
   useLayoutEffect(() => {
@@ -218,9 +151,7 @@ function useToolbarDensity(ref: RefObject<HTMLDivElement | null>, hasNextStepLab
     return () => observer.disconnect()
   }, [ref])
 
-  // Selection can expose Add next step without changing the region width. Deriving here prevents
-  // one paint with the previous (wider) density before an effect catches up.
-  return toolbarDensityForWidth(regionWidth, hasNextStepLabel)
+  return toolbarDensityForWidth(regionWidth)
 }
 
 export function CanvasViewportControls() {
@@ -238,28 +169,6 @@ export function CanvasViewportControls() {
       <ToolbarIconButton label="Zoom in" icon="plus" onClick={() => { void zoomIn() }} disabled={zoom >= 2.5} />
       <ToolbarIconButton label="Zoom out" icon="minus" onClick={() => { void zoomOut() }} disabled={zoom <= 0.2} />
       <ToolbarIconButton label="Fit view" icon="maximize" onClick={() => { void fitView(canvasFitOptions(nodeCount)) }} />
-    </div>
-  )
-}
-
-export function CanvasViewControls({ inspectorCollapsed, onInspectorToggle, labelsVisible = false }: {
-  inspectorCollapsed: boolean
-  onInspectorToggle: () => void
-  labelsVisible?: boolean
-}) {
-  return (
-    <div data-testid="toolbar-view-controls" role="group" aria-label="View controls" className="flex items-center gap-1">
-      {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">View</span>}
-      <div role="group" aria-label="Panel controls" className="flex items-center gap-1">
-        <ToolbarIconButton
-          label={inspectorCollapsed ? 'Show Inspector' : 'Hide Inspector'}
-          tooltip={`Inspector — ${inspectorCollapsed ? 'hidden' : 'shown'}`}
-          icon="eye"
-          onClick={onInspectorToggle}
-          pressed={!inspectorCollapsed}
-          showLabel={labelsVisible}
-        />
-      </div>
     </div>
   )
 }
@@ -301,7 +210,7 @@ function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {
   const ref = useRef<HTMLButtonElement>(null)
   return (
     <>
-      <Tooltip label={`${CATEGORY_LABEL[cat]} — ${open ? 'expanded' : 'collapsed'}`}>
+      <Tooltip label={CATEGORY_LABEL[cat]}>
         <button
           type="button"
           ref={ref}

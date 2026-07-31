@@ -253,7 +253,10 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     }
   }, [open, candidate, confirming])
 
-  if (!context || !sourceIdentity || !canEdit) return null
+  // Related-data discovery is a selected-Source Inspector task. Keep the Canvas-card shortcut only
+  // for an incomplete Join, where the missing input is local and explicit.
+  if (!context || !sourceIdentity || !canEdit
+      || (surface === 'canvas' && selectedNode?.type === 'source')) return null
 
   const confirm = async (expectedVersion?: number) => {
     if (!candidate || !page) return

@@ -8,7 +8,6 @@ const toolbarState = vi.hoisted(() => ({
   selectedIds: [],
   specs: [] as Array<{ kind: string; title: string; category: string; inputs: []; outputs: []; canBypass: boolean; blurb: string }>,
   addNode: vi.fn(),
-  addConnectedNode: vi.fn(),
   select: vi.fn(),
   setAgentOpen: vi.fn(),
   agentOpen: false,
@@ -30,22 +29,13 @@ vi.mock('../store/graph', () => ({
 
 vi.mock('../nodes', () => ({ allSpecs: () => toolbarState.specs }))
 vi.mock('../theme/tokens', () => ({ categoryOrder: [], color: {}, kindAccent: {} }))
-vi.mock('./nextStep', () => ({
-  uniqueNextStepConnection: (source: { id: string }, targetKind: string) => (
-    source.id === 'source-1' && targetKind === 'transform'
-      ? { sourceHandle: 'out', targetHandle: 'in', wire: 'dataset' }
-      : null
-  ),
-}))
-
-import { CanvasViewportControls, CanvasViewControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
+import { CanvasViewportControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
 
 describe('toolbarDensityForWidth', () => {
-  it('keeps all three densities reachable from the actual Canvas width', () => {
-    expect(toolbarDensityForWidth(899, false)).toBe('icons')
-    expect(toolbarDensityForWidth(980, false)).toBe('comfortable')
-    expect(toolbarDensityForWidth(980, true)).toBe('compact')
-    expect(toolbarDensityForWidth(1024, true)).toBe('comfortable')
+  it('switches labels from the actual Canvas width', () => {
+    expect(toolbarDensityForWidth(899)).toBe('icons')
+    expect(toolbarDensityForWidth(900)).toBe('comfortable')
+    expect(toolbarDensityForWidth(1024)).toBe('comfortable')
   })
 })
 
@@ -103,39 +93,21 @@ describe('Canvas controls', () => {
     expect(screen.getByRole('button', { name: 'Zoom out' })).toBeDisabled()
   })
 
-  it('keeps the Inspector in the centred toolbar group', () => {
-    const toggleInspector = vi.fn()
+  it('keeps viewport controls available without rendering an empty view-only toolbar', () => {
     render(
       <TooltipProvider delayDuration={0}>
-        <CanvasViewControls labelsVisible inspectorCollapsed onInspectorToggle={toggleInspector} />
-      </TooltipProvider>,
-    )
-
-    const controls = screen.getByRole('group', { name: 'View controls' })
-    expect(controls).toContainElement(screen.getByRole('group', { name: 'Panel controls' }))
-    expect(within(controls).queryByRole('group', { name: 'Viewport controls' })).not.toBeInTheDocument()
-    expect(within(controls).getByText('View', { exact: true })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Show Inspector' })).toHaveAttribute('aria-pressed', 'false')
-    fireEvent.click(screen.getByRole('button', { name: 'Show Inspector' }))
-    expect(toggleInspector).toHaveBeenCalledOnce()
-  })
-
-  it('keeps viewport and Inspector controls available to a view-only canvas', () => {
-    render(
-      <TooltipProvider delayDuration={0}>
-        <Toolbar inspectorCollapsed={false} onInspectorToggle={vi.fn()} />
+        <Toolbar />
       </TooltipProvider>,
     )
 
     expect(screen.getByTestId('view-only-badge')).toHaveTextContent('View-only canvas')
     expect(screen.queryByTestId('toolbar-add-controls')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('toolbar')).not.toBeInTheDocument()
     expect(screen.getByTestId('canvas-viewport-controls')).toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
-    expect(screen.getByTestId('toolbar-view-controls')).not.toContainElement(screen.getByRole('button', { name: 'Zoom in' }))
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Hide Inspector' })).toBeEnabled()
   })
 
-  it('shows a visible Add next step label only for an unambiguous selected source', () => {
+  it('keeps global Add operation icon-only when selection changes', () => {
     toolbarState.canvasRole = 'owner'
     toolbarState.selectedIds = ['source-1']
     toolbarState.specs = [{
@@ -143,17 +115,18 @@ describe('Canvas controls', () => {
     }]
     const { rerender } = render(
       <TooltipProvider delayDuration={0}>
-        <Toolbar inspectorCollapsed={false} onInspectorToggle={vi.fn()} />
+        <Toolbar />
       </TooltipProvider>,
     )
 
-    const contextualAdd = screen.getByRole('button', { name: 'Add next step' })
-    expect(contextualAdd).toHaveTextContent('Add next step')
+    expect(screen.queryByRole('button', { name: 'Add next step' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add operation' })).not.toHaveTextContent('Add operation')
+    expect(screen.queryByRole('button', { name: /Inspector/ })).not.toBeInTheDocument()
 
     toolbarState.selectedIds = []
     rerender(
       <TooltipProvider delayDuration={0}>
-        <Toolbar inspectorCollapsed={false} onInspectorToggle={vi.fn()} />
+        <Toolbar />
       </TooltipProvider>,
     )
     expect(screen.getByRole('button', { name: 'Add operation' })).not.toHaveTextContent('Add operation')
