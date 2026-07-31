@@ -677,8 +677,50 @@ describe('Transform exact processor labels', () => {
     expect(runEditorPreview).toHaveBeenCalledTimes(1)
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
 
+    fireEvent.click(screen.getByRole('button', { name: 'Test code' }))
+    expect(runEditorPreview).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    await act(async () => {
+      const state = useStore.getState()
+      useStore.setState({ editorPreviews: { transform: {
+        canvasId: state.doc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(state.doc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: editorPreviewGeneration,
+        offset: 0,
+        result: {
+          columns: [], rows: [{ tested_again: true }], truncated: false,
+          editorTestInput: {
+            runId: 'upstream-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
+          },
+        },
+      } } } as any)
+    })
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+
     useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test code' }))
+    await act(async () => {
+      const state = useStore.getState()
+      useStore.setState({ editorPreviews: { transform: {
+        canvasId: state.doc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(state.doc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: editorPreviewGeneration,
+        offset: 0,
+        result: {
+          columns: [], rows: [{ unrelated: true }], truncated: false,
+          editorTestInput: {
+            runId: 'unrelated-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
+          },
+        },
+      } } } as any)
+    })
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
 
     await act(async () => {
       useStore.setState({ runs: { sample: { phase: 'failed', error: 'upstream fixture failed' } } } as any)
