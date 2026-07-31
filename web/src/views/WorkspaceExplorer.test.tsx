@@ -14,6 +14,7 @@ const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
   workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
   workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
+  clearWorkspaceDatasetViewerState: vi.fn(),
   workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
   setWorkspaceResource: vi.fn(), openFile: vi.fn(), select: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
@@ -223,11 +224,9 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByText('Detail back: Back to Canvas')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
 
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('datasets', {
-      resourceId: null,
-      datasetQuery: '',
-    })
     await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('canvas-1', { skipViewportFit: true }))
+    expect(store.clearWorkspaceDatasetViewerState).toHaveBeenCalledWith('')
+    expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
     expect(store.select).toHaveBeenCalledWith('write')
     expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
   })

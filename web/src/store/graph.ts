@@ -1331,6 +1331,8 @@ interface Store {
     searchQuery?: string
     datasetQuery?: string
   }) => void
+  /** Clear a temporary Dataset viewer after Canvas navigation without publishing a Workspace route. */
+  clearWorkspaceDatasetViewerState: (listQuery: string) => void
   workspaceDatasetQuery: string
   setWorkspaceDatasetQuery: (query: string) => void
   jobsQuery: string
@@ -1824,6 +1826,12 @@ export const useStore = create<Store>((set, get) => ({
       ...(context?.datasetQuery !== undefined ? { workspaceDatasetQuery: context.datasetQuery } : {}),
       view: 'workspace',
     })
+  },
+  clearWorkspaceDatasetViewerState: (workspaceDatasetQuery) => {
+    // This cleanup belongs to a completed viewer → Canvas handoff. Refuse to publish its hidden
+    // Workspace state before the Canvas is active; doing so would insert a phantom history entry.
+    if (get().view !== 'canvas') return
+    set({ workspaceResourceId: null, workspaceDatasetQuery })
   },
   workspaceDatasetQuery: '',
   setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {

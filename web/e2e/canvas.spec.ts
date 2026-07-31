@@ -2405,6 +2405,21 @@ test.describe('Data Playground canvas', () => {
       const inspector = page.getByTestId('inspector')
       await expect(inspector).toContainText('DATASET')
       await expect(inspector).toContainText(`Exact version ${exact.revisionId}`)
+
+      await page.goBack()
+      await expect(page).toHaveURL(
+        new RegExp(
+          `#\\/workspace\\/dataset%3A${encodeURIComponent(exact.datasetId)}`
+          + `\\?scope=datasets&revision=${encodeURIComponent(exact.revisionId)}`
+          + `&revisionDataset=${encodeURIComponent(exact.datasetId)}`
+          + `&returnCanvas=${encodeURIComponent(canvasId)}&returnNode=source$`,
+        ),
+      )
+      await expect(page.getByTestId('dataset-viewer').getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
+
+      await page.goForward()
+      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
+      await expect(page.getByTestId('inspector')).toContainText(`Exact version ${exact.revisionId}`)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }

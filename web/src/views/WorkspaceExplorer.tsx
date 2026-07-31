@@ -955,6 +955,7 @@ function WorkspaceDatasets() {
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
   const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
+  const clearWorkspaceDatasetViewerState = useStore((state) => state.clearWorkspaceDatasetViewerState)
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
 
@@ -1153,18 +1154,18 @@ function WorkspaceDatasets() {
           if (!table && origin === 'route' && returningToCanvas.current) return
           setSelectedWorkspaceTable(table)
           if (!table && origin === 'user' && viewerCanvasReturn) {
-            // Canvas-origin viewers are a temporary detour. Clear the exact Dataset route before
-            // returning so the next ordinary Workspace visit restores its dataset list instead of
-            // reopening this receipt; the explicit node route restores Inspector selection.
+            // Canvas-origin viewers are a temporary detour. After returning, retain only the list
+            // query so the next ordinary Workspace visit does not reopen this receipt; the
+            // explicit node route restores Inspector selection.
             returningToCanvas.current = true
-            switchWorkspaceScope('datasets', {
-              resourceId: null,
-              datasetQuery: serializeWorkspaceDatasetQuery(query),
-            })
-            // Use the product navigation action so the store and hash router settle on the same
-            // Canvas. Writing location.hash directly races the Workspace state update above.
+            const listQuery = serializeWorkspaceDatasetQuery(query)
+            // Open the Canvas first so the router publishes one atomic destination. Cleaning the
+            // retained Workspace viewer state before this resolves would insert a phantom
+            // Workspace history entry between the exact Dataset viewer and its Canvas.
             void openFile(viewerCanvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
-              if (opened && viewerCanvasReturn.nodeId) select(viewerCanvasReturn.nodeId)
+              if (!opened) return
+              clearWorkspaceDatasetViewerState(listQuery)
+              if (viewerCanvasReturn.nodeId) select(viewerCanvasReturn.nodeId)
             }).finally(() => { returningToCanvas.current = false })
             return
           }
