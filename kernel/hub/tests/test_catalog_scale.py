@@ -131,12 +131,13 @@ def test_example_source_resolution_requires_one_current_local_registration():
     prefix = f"{_SCALE}example-resolution/"
     unique_name = f"example_unique_{uuid.uuid4().hex}"
     duplicate_name = f"example_duplicate_{uuid.uuid4().hex}"
-    exact_uri = f"{prefix}exact"
+    exact_uri = f"example_exact_{uuid.uuid4().hex}"
     entries = [
         _doc(unique_name, f"{prefix}unique"),
         _doc(duplicate_name, f"{prefix}duplicate-a"),
         _doc(duplicate_name, f"{prefix}duplicate-b"),
         _doc("different-display-name", exact_uri),
+        _doc(exact_uri, f"{prefix}same-name-as-exact-uri"),
     ]
     metadb.catalog_bulk_seed(entries)
     try:
@@ -157,6 +158,21 @@ def test_example_source_resolution_requires_one_current_local_registration():
         }
     finally:
         metadb.catalog_delete_prefix(prefix)
+        metadb.catalog_delete_prefix(exact_uri)
+
+
+def test_example_source_resolution_refuses_an_external_catalog_provider(monkeypatch):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    class ExternalCatalog(InMemoryCatalog):
+        pass
+
+    monkeypatch.setattr(get_deps(), "catalog", object.__new__(ExternalCatalog))
+    response = client.post("/api/catalog/example-sources/resolve", json={"refs": ["events"]})
+    assert response.status_code == 501
+    assert response.json()["detail"] == (
+        "the active Catalog provider does not expose local example bindings"
+    )
 
 
 def test_five_thousand_dataset_discovery_stays_bounded():
