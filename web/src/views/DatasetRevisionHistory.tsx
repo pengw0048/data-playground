@@ -20,7 +20,10 @@ const statusOf = (error: unknown) => error instanceof KernelError ? error.status
 function timestamp(value?: string | null) {
   if (!value) return 'Commit time not provided'
   const parsed = new Date(value)
-  return Number.isNaN(parsed.valueOf()) ? value : parsed.toISOString().replace('.000Z', 'Z')
+  if (Number.isNaN(parsed.valueOf())) return value
+  return `${new Intl.DateTimeFormat('en', {
+    dateStyle: 'medium', timeStyle: 'medium', timeZone: 'UTC',
+  }).format(parsed)} UTC`
 }
 
 function bytes(value?: number | null) {
@@ -233,32 +236,56 @@ export function DatasetRevisionHistory({
     {availability === 'supported' && <>
       {items.length === 0 ? <div className="text-[11px] text-muted-foreground">No retained revisions are available.</div>
         : <div className="max-h-[188px] overflow-y-auto rounded-md border border-border">
-          {items.map((revision) => {
+          {items.map((revision, index) => {
             const active = detailsInViewer
               ? initialRevisionDatasetId === revision.datasetId && initialRevisionId === revision.revisionId
               : selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
+            const current = index === 0
+            const versionTime = timestamp(revision.committedAt)
+            const state = active ? current ? 'Current · exact' : 'Exact' : current ? 'Current' : 'Historical'
             const content = <>
               <span className="min-w-0 flex-1">
-                <span className="dp-mono block break-all text-[10.5px] font-semibold text-foreground">{revision.revisionId}</span>
-                <span className="block text-[9.5px] text-muted-foreground">{timestamp(revision.committedAt)}</span>
+                <span className="block text-[10.5px] font-semibold text-foreground">Version from {versionTime}</span>
+                <span className="block text-[9.5px] text-muted-foreground">{active ? 'Selected exact version' : current ? 'Latest retained version' : 'Retained historical version'}</span>
               </span>
-              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[9px] text-muted-foreground">retained by {revision.retentionOwner}</span>
+              <span className="flex shrink-0 flex-col items-end gap-0.5">
+                <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-semibold text-muted-foreground">{state}</span>
+                <span className="text-[9px] font-semibold text-primary">{detailsInViewer ? 'Open data →' : 'Inspect →'}</span>
+              </span>
             </>
-            const className = `flex w-full items-start gap-2 border-b border-border/60 px-2 py-1.5 text-left last:border-0 hover:bg-accent ${active ? 'bg-accent' : ''}`
-            return detailsInViewer
-              ? <a key={`${revision.datasetId}:${revision.revisionId}`}
+            const className = `flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`
+            const openControl = detailsInViewer
+              ? <a
+                  data-testid={`revision-open-${revision.revisionId}`}
                   href={datasetViewerHash(revision.datasetId, revision.revisionId, viewerReturn)}
-                  aria-label={`Open revision ${revision.revisionId}`} className={className}>
+                  aria-label={`Open data from ${versionTime}`} className={className}>
                   {content}
                 </a>
-              : <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
-                  aria-label={`Open revision ${revision.revisionId}`} onClick={() => {
+              : <button type="button"
+                  data-testid={`revision-open-${revision.revisionId}`}
+                  aria-label={`Inspect version from ${versionTime}`} onClick={() => {
                     navigateRevision(revision)
                     void openRevision(revision)
                   }}
                   className={className}>
                   {content}
                 </button>
+            return <div key={`${revision.datasetId}:${revision.revisionId}`}
+              className="flex items-stretch border-b border-border/60 last:border-0">
+              {openControl}
+              <details data-testid={`revision-technical-details-${revision.revisionId}`}
+                className="group shrink-0 border-l border-border/60 px-2 py-1.5 text-[9.5px] text-muted-foreground">
+                <summary className="cursor-pointer list-none rounded px-1 py-0.5 font-semibold hover:bg-accent [&::-webkit-details-marker]:hidden">
+                  Technical details
+                </summary>
+                <dl className="mt-1 grid max-w-[300px] grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-0.5 rounded bg-muted/40 p-2">
+                  <dt>Dataset</dt><dd className="dp-mono break-all text-foreground">{revision.datasetId}</dd>
+                  <dt>Revision</dt><dd className="dp-mono break-all text-foreground">{revision.revisionId}</dd>
+                  <dt>Retention</dt><dd className="text-foreground">{revision.retentionOwner}</dd>
+                  <dt>Committed</dt><dd className="dp-mono break-all text-foreground">{revision.committedAt ?? 'not provided'}</dd>
+                </dl>
+              </details>
+            </div>
           })}
         </div>}
       {hasMore && <div className="flex items-center justify-between gap-2 text-[10.5px] text-muted-foreground">
@@ -306,19 +333,27 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
   /** The full-page dataset viewer already owns the exact bounded row preview. */
   showPreview?: boolean
 }) {
-  if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
+  if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact version…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
   if (!detail) return null
   const compatibility = parent ? compareSchemas(parent.preview.columns, detail.preview.columns) : null
   const notableFields = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
+  const current = detail.revisionId === headRevisionId
+  const schemaFields = detail.preview.columns.length
   return <div className="flex flex-col gap-2 border-t border-border pt-2" data-testid="revision-detail">
     <div className="flex items-start gap-2">
       <div className="min-w-0 flex-1">
-      <div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">Exact revision {detail.revisionId}</div>
-      <div className="text-[9.5px] text-muted-foreground">Dataset {detail.datasetId} · {timestamp(detail.committedAt)} · retained by {detail.retentionOwner}</div>
-      <div className="text-[9.5px] text-muted-foreground">Parent {detail.parentRevisionId ?? 'not evidenced'} · producer {detail.producerOperation ?? 'not provided'}</div>
+        <div className="text-[10.5px] font-semibold text-foreground">{current ? 'Current exact version' : 'Historical exact version'}</div>
+        <div className="text-[12px] font-semibold text-foreground">{timestamp(detail.committedAt)}</div>
+        <div className="text-[9.5px] text-muted-foreground">
+          {number(detail.summary.rowCount)} rows · {schemaFields.toLocaleString()} schema {schemaFields === 1 ? 'field' : 'fields'}
+        </div>
       </div>
       <div className="flex shrink-0 flex-col gap-1">
+        {showPreview && <a href={datasetViewerHash(detail.datasetId, detail.revisionId)}
+          className="rounded-md bg-primary px-2 py-1 text-center text-[10.5px] font-semibold text-primary-foreground hover:opacity-90">
+          Open data
+        </a>}
         {canSave && <button type="button" onClick={() => onSave(detail)}
           className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
           Save view
@@ -330,6 +365,18 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
           </button>}
       </div>
     </div>
+    <details data-testid="revision-technical-details"
+      className="rounded-md border border-border px-2 py-1.5 text-[9.5px] text-muted-foreground">
+      <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+      <dl className="mt-1.5 grid grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-1">
+        <dt>Dataset ID</dt><dd className="dp-mono break-all text-foreground">{detail.datasetId}</dd>
+        <dt>Revision ID</dt><dd className="dp-mono break-all text-foreground">{detail.revisionId}</dd>
+        <dt>Parent revision</dt><dd className="dp-mono break-all text-foreground">{detail.parentRevisionId ?? 'not evidenced'}</dd>
+        <dt>Retention owner</dt><dd className="text-foreground">{detail.retentionOwner}</dd>
+        <dt>Producer</dt><dd className="text-foreground">{detail.producerOperation ?? 'not provided'}</dd>
+        <dt>Committed evidence</dt><dd className="dp-mono break-all text-foreground">{detail.committedAt ?? 'not provided'}</dd>
+      </dl>
+    </details>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
       : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">No retained parent evidence is available; schema and summary changes are unknown.</div>
