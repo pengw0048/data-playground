@@ -139,7 +139,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await page.getByText('Run history', { exact: true }).click()
     const history = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Run history' }) })
     await expect(history.getByRole('button', { name: 'View in Jobs' })).toHaveCount(1)
-    await history.getByRole('button', { name: /Admitted inputs/ }).click()
+    await history.getByRole('button', { name: /Admitted Sources/ }).click()
     await expect(history.getByText(`Exact revision ${admittedInput!.revision_id}`)).toBeVisible()
     await history.getByRole('button', { name: 'View in Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${runId}$`))

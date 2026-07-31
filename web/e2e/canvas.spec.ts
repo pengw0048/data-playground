@@ -2227,8 +2227,10 @@ test.describe('Data Playground canvas', () => {
 
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
+    await expect(page.getByText(digest)).toHaveCount(0)
     await page.getByRole('button', { name: /Execution manifest/ }).click()
 
+    await expect(page.getByText(digest)).toBeVisible()
     await expect(page.getByText('Submitted graph')).toBeVisible()
     await expect(page.getByText(/events@revision-1/)).toBeVisible()
     await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
@@ -2836,6 +2838,9 @@ test.describe('Data Playground canvas', () => {
       await page.getByTestId('app-menu').click()
       await page.getByText('Run history', { exact: true }).click()
       const historyReceipt = page.getByLabel(/Write receipt for run/).first()
+      await expect(historyReceipt).not.toHaveAttribute('open')
+      await expect(historyReceipt.getByText('durable revision 3')).not.toBeVisible()
+      await historyReceipt.locator('summary').click()
       await expect(historyReceipt).toContainText('durable revision 3')
       await expect(historyReceipt).toContainText('parent 2')
       await expect(historyReceipt).toContainText(/backend \d/)
