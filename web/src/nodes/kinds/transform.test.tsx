@@ -54,7 +54,9 @@ describe('Transform exact processor labels', () => {
     apiMocks.installedProcessorSource.mockReset()
       .mockRejectedValue(Object.assign(new Error('source unavailable'), { status: 404 }))
     useStore.setState({
-      canvasRole: 'owner', fullscreenCode: null, previews: {},
+      canvasRole: 'owner', view: 'canvas', fullscreenCode: null, previews: {},
+      transformResourceId: null, transformVersion: null,
+      transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
       doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [node], edges: [] },
       canvasTransformReferences: [],
       processors: [{
@@ -78,18 +80,81 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByText('select processor')).not.toBeInTheDocument()
   })
 
-  it('opens a visible exact Canvas/node upgrade context only from Manage', () => {
+  it('resolves a configured exact processor that is missing from the Library', () => {
     const Transform = getComponent('transform')!
+    useStore.setState({
+      canvasTransformReferences: [{
+        id: PROCESSOR_ID,
+        version: 'v1',
+        availability: 'missing',
+        descriptor: {
+          id: PROCESSOR_ID, version: 'v1', title: 'Unavailable processor', mode: 'map',
+          category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+          paramsSchema: {}, previewable: true, blurb: '', provenance: 'promoted',
+        },
+      }],
+    } as any)
     render(
       <TooltipProvider><ReactFlowProvider>
         <Transform id={node.id} data={node.data} />
       </ReactFlowProvider></TooltipProvider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: /Manage/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Resolve/ }))
     expect(useStore.getState()).toMatchObject({
       view: 'transforms', transformResourceId: PROCESSOR_ID, transformVersion: 'v1',
       transformUpgradeCanvasId: 'canvas', transformUpgradeNodeId: 'transform',
+      fullscreenCode: null,
+    })
+  })
+
+  it('opens an available exact processor definition without leaving the Canvas', () => {
+    const Transform = getComponent('transform')!
+    useStore.setState({
+      processors: [{
+        id: PROCESSOR_ID, version: 'v1', title: 'Pinned processor', mode: 'map',
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+        paramsSchema: {}, previewable: true, blurb: 'The exact available definition.',
+        provenance: 'promoted',
+      }],
+    } as any)
+    render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={node.id} data={node.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /View definition/ }))
+    expect(useStore.getState()).toMatchObject({
+      view: 'canvas',
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+      transformResourceId: null, transformVersion: null,
+    })
+  })
+
+  it('offers to choose a processor when the Library Transform is unconfigured', () => {
+    const Transform = getComponent('transform')!
+    const unconfigured = {
+      ...node,
+      data: { ...node.data, config: { source: 'library', mode: 'map', code: null } },
+    }
+    useStore.setState({
+      doc: {
+        id: 'canvas', name: 'canvas', version: 1, requirements: [],
+        nodes: [unconfigured], edges: [],
+      },
+    } as any)
+    render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={unconfigured.id} data={unconfigured.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Choose/ }))
+    expect(useStore.getState()).toMatchObject({
+      view: 'transforms', transformResourceId: null, transformVersion: null,
+      transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      fullscreenCode: null,
     })
   })
 

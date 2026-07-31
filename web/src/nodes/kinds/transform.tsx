@@ -31,6 +31,10 @@ function Transform({ id, data }: NodeComponentProps) {
     ?? reference?.descriptor ?? undefined
   const configuredRef = configuredProcessorRef(
     data.config.processor, data.config.version)
+  const referenceUnavailable = reference?.availability === 'deleted'
+    || reference?.availability === 'missing'
+  const canViewDefinition = Boolean(proc && !referenceUnavailable)
+  const libraryAction = canViewDefinition ? 'View definition' : configuredRef ? 'Resolve' : 'Choose'
 
   const meta = src === 'library'
     ? (reference?.availability === 'deleted' ? `${configuredRef} · deleted`
@@ -58,6 +62,10 @@ function Transform({ id, data }: NodeComponentProps) {
             <button
               onClick={(e) => {
                 e.stopPropagation()
+                if (canViewDefinition) {
+                  openFullscreen(id, 'code', 'python')
+                  return
+                }
                 setTransformResource(
                   typeof data.config.processor === 'string' ? data.config.processor : null,
                   typeof data.config.version === 'string' ? data.config.version : null,
@@ -75,7 +83,7 @@ function Transform({ id, data }: NodeComponentProps) {
                 {proc?.title ?? configuredRef ?? 'select processor'}
               </span>
               {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
-              <span className="text-[10px] font-semibold text-primary">Manage</span>
+              <span className="text-[10px] font-semibold text-primary">{libraryAction}</span>
             </button>
           </div>
         ) : (

@@ -51,24 +51,21 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await expect(node).toHaveCount(1)
   await expect(node).toContainText(transform.version)
 
-  await page.getByRole('button', { name: 'View processor definition' }).click()
+  const canvasUrl = page.url()
+  await node.getByText('View definition', { exact: true }).click()
+  await expect(page).toHaveURL(canvasUrl)
   const canvasDefinition = page.getByRole('region', { name: 'Library processor definition' })
   await expect(canvasDefinition).toContainText(sourceCode)
   await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).not.toBeVisible()
   await canvasDefinition.getByText('Technical details').click()
   await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).toBeVisible()
   await page.getByRole('button', { name: 'Close' }).click()
+  await expect(page).toHaveURL(canvasUrl)
 
   const canvasResponse = await request.get(`/api/canvas/${encodeURIComponent(canvasId)}`, { headers })
   expect(canvasResponse.ok()).toBe(true)
   const canvas = await canvasResponse.json() as { nodes: Array<{ id: string }> }
   expect(canvas.nodes).toHaveLength(1)
-  await node.getByText('Manage', { exact: true }).click()
-  await expect(page).toHaveURL(new RegExp(`#\/transforms\/${transform.id}`))
-  const managed = new URLSearchParams(new URL(page.url()).hash.split('?')[1])
-  expect(managed.get('version')).toBe(transform.version)
-  expect(managed.get('canvas')).toBe(canvasId)
-  expect(managed.get('node')).toBe(canvas.nodes[0].id)
 
   expect((await request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`, { headers })).ok()).toBe(true)
   expect((await request.delete(
