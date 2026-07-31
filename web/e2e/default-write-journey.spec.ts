@@ -271,20 +271,39 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       `exact revision ${dataset!.datasetId}@${dataset!.revisionId}`,
     )
 
-    // 8. Reopen that same revision through Jobs technical evidence too.
-    await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
-    await page.getByText('Technical evidence', { exact: true }).click()
-    await page.getByRole('button', { name: 'Open exact revision' }).click()
-    await expect(page.getByLabel('Exact revision detail')).toBeVisible()
+    // 8. Reopen that same revision through Jobs technical evidence in the shared viewer.
+    const jobUrl = `/#/jobs?run=${encodeURIComponent(runId)}`
+    await page.goto(jobUrl)
+    const technicalEvidence = page.getByText('Technical evidence', { exact: true }).locator('..')
+    await technicalEvidence.locator('summary').click()
+    const jobsDatasetLink = technicalEvidence.getByRole('link', { name: 'Open dataset' })
+    const exactDatasetHref = `#/workspace/${encodeURIComponent(`dataset:${dataset!.datasetId}`)}?${new URLSearchParams({
+      scope: 'datasets',
+      revision: dataset!.revisionId,
+      revisionDataset: dataset!.datasetId,
+    })}`
+    await expect(jobsDatasetLink).toHaveAttribute(
+      'href',
+      exactDatasetHref,
+    )
+    await jobsDatasetLink.click()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText(
+      `exact revision ${dataset!.datasetId}@${dataset!.revisionId}`,
+    )
     const detail = await ok<{ revisionId: string; name: string; committedAt: string; preview: { columns: Array<{ name: string }> } }>(
       await page.request.get(`/api/catalog/revisions/${encodeURIComponent(dataset!.datasetId)}/${encodeURIComponent(dataset!.revisionId)}`),
       'reopen exact published revision')
     expect(detail.revisionId).toBe(dataset!.revisionId)
     expect(detail.name).toBe(dataset!.name)
     offsetInstant(detail.committedAt, 'exact revision committedAt')
-    const localRevisionTime = await page.evaluate((stamp) => new Date(stamp).toLocaleString(), detail.committedAt)
-    await expect(page.getByLabel('Exact revision detail')).toContainText(localRevisionTime)
     expect(detail.preview.columns.map((column) => column.name)).toEqual(['id', 'user_id', 'amount'])
+    await page.goBack()
+    await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(runId)}$`))
+    await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+    await page.goForward()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText(
+      `exact revision ${dataset!.datasetId}@${dataset!.revisionId}`,
+    )
     await shoot(page, 'light', 'revision')
 
     // Dark-theme pass over the same certified surfaces for the visual-review matrix.
@@ -304,10 +323,13 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await shoot(page, 'dark', 'canvas')
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    await page.getByText('Technical evidence', { exact: true }).click()
-    await page.getByRole('button', { name: 'Open exact revision' }).click()
-    await expect(page.getByLabel('Exact revision detail')).toBeVisible()
+    const darkTechnicalEvidence = page.getByText('Technical evidence', { exact: true }).locator('..')
+    await darkTechnicalEvidence.locator('summary').click()
     await shoot(page, 'dark', 'jobs')
+    await darkTechnicalEvidence.getByRole('link', { name: 'Open dataset' }).click()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText(
+      `exact revision ${dataset!.datasetId}@${dataset!.revisionId}`,
+    )
     await shoot(page, 'dark', 'revision')
     visualReview.push({ viewport: '1440x900', theme: 'dark', consoleOrPageErrors: consoleErrors.slice(darkStart) })
 

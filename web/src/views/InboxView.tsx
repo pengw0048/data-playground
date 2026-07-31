@@ -270,7 +270,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                         size="sm"
                         asChild
                       >
-                        <a href={item.datasetContext.deepLink ?? datasetViewerHash(item.datasetContext.datasetId)}
+                        <a href={item.datasetContext.deepLink ?? datasetViewerHash(item.datasetContext.datasetId, item.datasetContext.revisionId ?? undefined)}
                            onClick={() => void markRead(item)}>
                           Open dataset
                         </a>

@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   workspaceJobs: vi.fn(), executionManifest: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
   cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(),
-  cancelManagedSidecarMergeTask: vi.fn(), retryManagedSidecarMergeTask: vi.fn(), datasetRevision: vi.fn(),
+  cancelManagedSidecarMergeTask: vi.fn(), retryManagedSidecarMergeTask: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">result</div> }))
@@ -34,7 +34,6 @@ describe('JobsView', () => {
     mocks.retryMergeColumnsTask.mockResolvedValue(undefined)
     mocks.cancelManagedSidecarMergeTask.mockResolvedValue(undefined)
     mocks.retryManagedSidecarMergeTask.mockResolvedValue(undefined)
-    mocks.datasetRevision.mockResolvedValue({})
     mocks.listCanvases.mockResolvedValue([])
     useStore.setState({ view: 'jobs', jobsQuery: '', files: [], toasts: [] } as never)
   })
@@ -490,7 +489,10 @@ describe('JobsView', () => {
     expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
       'dataset dataset-1 · revision revision-7 · 12 rows',
     )
-    expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
+    )
   })
 
   it('shows exact durable task state and requests cancellation from Jobs', async () => {
@@ -568,18 +570,18 @@ describe('JobsView', () => {
     expect(screen.queryByRole('link', { name: 'Open node' })).not.toBeInTheDocument()
   })
 
-  it('keeps a compacted exact merge receipt unavailable instead of opening latest', async () => {
+  it('routes an exact merge receipt to the immutable shared dataset viewer', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'merge-done', taskId: 'merge-done', status: 'done', error: null,
       outputReceipt: { datasetId: 'dataset-1', revisionId: 'rev-gone', rows: 2, bytes: 12, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-gone', retentionOwner: 'core' }, schema: [], partitions: [], publication: { provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'redacted', publishSequence: 1, idempotencyKey: 'merge-done' } },
     })], hasMore: false, nextCursor: null })
-    mocks.datasetRevision.mockRejectedValueOnce(new Error('gone'))
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
     openTechnicalEvidence()
-    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
-    expect(await screen.findByText(/Exact revision unavailable: gone/)).toBeVisible()
-    expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-1', 'rev-gone')
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-gone&revisionDataset=dataset-1',
+    )
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(1)
   })
 
@@ -686,18 +688,21 @@ describe('JobsView', () => {
     expect(screen.getByText('Checkpoint:').closest('div')).toHaveTextContent('checkpoint:out')
   })
 
-  it('renders a canvas-less dataset task with a revision-history deep-link', async () => {
+  it('renders a canvas-less dataset task with an exact dataset-viewer deep-link', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       id: 't:restore-1', runId: 'restore-1', status: 'done', canvasId: null, canvasName: null,
       taskId: 'restore-1', nodeLabel: 'Climate observations', error: null,
-      datasetContext: { taskKind: 'restore_revision_write', datasetId: 'ds-logical-9', name: 'Climate observations' },
+      datasetContext: { taskKind: 'restore_revision_write', datasetId: 'ds-logical-9', revisionId: 'rev-9', name: 'Climate observations' },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
     expect(await screen.findByText('Dataset restore · Climate observations')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
     const link = screen.getByRole('link', { name: 'Open dataset' })
-    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9?scope=datasets')
+    expect(link).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Ads-logical-9?scope=datasets&revision=rev-9&revisionDataset=ds-logical-9',
+    )
   })
 
 })

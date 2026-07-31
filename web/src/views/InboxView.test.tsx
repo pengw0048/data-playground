@@ -261,10 +261,10 @@ describe('InboxView', () => {
     expect(onUnreadChange).toHaveBeenCalledTimes(1)
   })
 
-  it('renders a canvas-less dataset item with a revision-history deep-link', async () => {
+  it('renders a canvas-less dataset item with an exact dataset-viewer deep-link', async () => {
     mocks.inboxList.mockResolvedValue({ items: [item({
       taskKind: 'keyed_upsert_write', canvasId: null, canvasName: null, readAt: '2026-07-17T12:05:00Z',
-      datasetContext: { taskKind: 'keyed_upsert_write', datasetId: 'ds-logical-7', name: 'Sensor upserts' },
+      datasetContext: { taskKind: 'keyed_upsert_write', datasetId: 'ds-logical-7', revisionId: 'rev-7', name: 'Sensor upserts' },
     })], hasMore: false, nextCursor: null })
     render(<InboxView />)
     await screen.findByText('Sensor upserts')
@@ -273,7 +273,10 @@ describe('InboxView', () => {
     expect(screen.queryByText('Dataset ds-logical-7')).toBeNull()
     expect(screen.queryByText(/authorization revoked/i)).toBeNull()
     const link = screen.getByRole('link', { name: 'Open dataset' })
-    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7?scope=datasets')
+    expect(link).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Ads-logical-7?scope=datasets&revision=rev-7&revisionDataset=ds-logical-7',
+    )
   })
 
 })
