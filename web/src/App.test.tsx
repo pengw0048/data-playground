@@ -17,7 +17,7 @@ vi.mock('./canvas/TopBar', () => ({ TopBar: () => null }))
 vi.mock('./canvas/Toolbar', () => ({ Toolbar: () => null }))
 vi.mock('./panels/AgentDock', () => ({ AgentDock: () => null }))
 vi.mock('./panels/Inspector', () => ({ Inspector: () => null }))
-vi.mock('./panels/CodeFullscreen', () => ({ CodeFullscreen: () => null }))
+vi.mock('./panels/CodeFullscreen', () => ({ CodeFullscreen: () => <div data-testid="code-fullscreen">Code fullscreen</div> }))
 vi.mock('./views/Shell', () => ({ Shell: () => <div>Shell</div> }))
 vi.mock('./views/Login', () => ({ Login: () => <div data-testid="login">Login</div> }))
 vi.mock('./ui/Toaster', () => ({ Toaster: () => null }))
@@ -82,6 +82,27 @@ describe('App auth bootstrap', () => {
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
     expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(useStore.getState().authEnabled).toBe(false)
+  })
+
+  it('unmounts and clears a Canvas-only fullscreen surface when navigation leaves Canvas', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    useStore.setState({
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+      editorPreviews: { transform: { phase: 'done' } },
+    } as never)
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('code-fullscreen')).toBeVisible()
+    useStore.setState({ view: 'jobs' })
+
+    expect(await screen.findByText('Shell')).toBeVisible()
+    expect(screen.queryByTestId('code-fullscreen')).not.toBeInTheDocument()
+    await waitFor(() => expect(useStore.getState()).toMatchObject({
+      fullscreenCode: null,
+      editorPreviews: {},
+    }))
   })
 
   it('keeps a bare entry neutral until bootstrap determines the destination', async () => {

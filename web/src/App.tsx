@@ -122,6 +122,11 @@ export default function App() {
       })
     }
   }, [auth, booted, bootstrap])
+  useEffect(() => {
+    if (view !== 'canvas' && useStore.getState().fullscreenCode) {
+      useStore.getState().closeCodeFullscreen()
+    }
+  }, [view])
 
   if (auth.kind === 'checking') return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
   if (auth.kind === 'unavailable') return <AuthBootstrapUnavailable state={auth} onRetry={() => void checkAuth()} />
@@ -154,7 +159,7 @@ export default function App() {
         ) : (
           <Shell />
         )}
-        <CodeFullscreen />
+        {view === 'canvas' && <CodeFullscreen />}
         <HubLiveness />
         <Toaster />
       </ErrorBoundary>
