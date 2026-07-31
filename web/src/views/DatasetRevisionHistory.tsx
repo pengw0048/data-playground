@@ -280,7 +280,7 @@ export function DatasetRevisionHistory({
         parent={parent} loading={viewerLoading} error={viewerError} parentError={parentError}
         onRetry={onViewerRetry ?? (() => {})}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
-        onRestore={setRestoreDetail} />}
+        onRestore={setRestoreDetail} showPreview={false} />}
     </>}
     {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
     {restoreDetail && <RestoreRevisionDialog detail={restoreDetail} headRevisionId={items[0]?.revisionId ?? ''}
@@ -302,13 +302,15 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
 }
 
 function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave,
-  headRevisionId, onRestore }: {
+  headRevisionId, onRestore, showPreview = true }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
+  /** The full-page dataset viewer already owns the exact bounded row preview. */
+  showPreview?: boolean
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
@@ -348,7 +350,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
               </div>)}
             </div> : <div className="mt-1 text-[9.5px] text-muted-foreground">No schema field changes.</div>}
           </div>}
-    <ExactPreview detail={detail} />
+    {showPreview && <ExactPreview detail={detail} />}
   </div>
 }
 

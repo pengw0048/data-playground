@@ -153,6 +153,13 @@ describe('Catalog discovery request and mutation truth', () => {
 
   it('renders exact revision rows as the full-page primary view without reading latest rows', async () => {
     const onUseTables = vi.fn()
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [{
+        datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
+        committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
+      }],
+      nextCursor: null, hasMore: false,
+    })
     mocks.datasetRevision.mockResolvedValue({
       datasetId: 'logical-receipt-id', revisionId: 'rev-receipt',
       committedAt: '2026-07-30T12:00:00Z', retentionOwner: 'core',
@@ -181,6 +188,8 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(viewer).not.toHaveClass('w-[420px]')
     expect(within(viewer).getByRole('button', { name: 'Back to Workspace' })).toBeVisible()
     expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
+    expect(within(viewer).getAllByRole('table')).toHaveLength(1)
+    expect(within(viewer).queryByText('Exact revision preview')).not.toBeInTheDocument()
     expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Published version')
     expect(screen.getByTestId('dataset-version-context')).not.toHaveTextContent('rev-receipt')
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Published version')

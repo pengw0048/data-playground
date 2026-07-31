@@ -156,6 +156,20 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
+  it('does not duplicate the exact row preview owned by the full-page dataset viewer', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer
+      initialRevisionId="rev-2" initialRevisionDatasetId="dataset-stable"
+      viewerDetail={detail('rev-2')} />)
+
+    expect(await screen.findByText('Exact revision rev-2')).toBeInTheDocument()
+    expect(screen.getByText('Rows')).toBeInTheDocument()
+    expect(screen.queryByText('Exact revision preview')).not.toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
   it('preserves Canvas return context when the full-page viewer switches revisions', async () => {
     store.workspaceDatasetQuery = new URLSearchParams({
       revision: 'rev-current',
