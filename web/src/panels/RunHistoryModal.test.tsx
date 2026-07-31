@@ -177,7 +177,7 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted inputs/i }))
+    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
     const list = screen.getByRole('list')
     const items = within(list).getAllByRole('listitem')
     expect(items).toHaveLength(2)
@@ -208,7 +208,7 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted inputs/i }))
+    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
     expect(await screen.findByText('permission lost')).toBeInTheDocument()
     expect(screen.getByText('provider offline')).toBeInTheDocument()
     expect(screen.getByText(/missing or compacted.*Latest was not substituted/i)).toBeInTheDocument()
@@ -252,9 +252,11 @@ describe('execution manifest inspection', () => {
     render(<RunHistoryModal onClose={() => {}} />)
 
     const toggle = await screen.findByRole('button', { name: /Execution manifest/ })
+    expect(screen.queryByText(digest)).not.toBeInTheDocument()
     expect(apiMock.executionManifest).not.toHaveBeenCalled()
     await user.click(toggle)
 
+    expect(await screen.findByText(digest)).toBeVisible()
     expect(await screen.findByText('Submitted graph')).toBeVisible()
     expect(screen.getByText('Admitted write intent')).toBeVisible()
     expect(screen.getByText('Runtime descriptor snapshot')).toBeVisible()
@@ -551,7 +553,7 @@ describe('durable full results', () => {
     render(<RunHistoryModal onClose={() => {}} />)
 
     expect(await screen.findByText('12 rows written')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Open published dataset' }))
+    await user.click(screen.getByRole('button', { name: 'Open dataset' }))
 
     expect(await screen.findByTestId('full-result-status')).toHaveTextContent(
       'Published dataset · row count unknown',
@@ -567,6 +569,12 @@ describe('durable full results', () => {
   })
 
   it('reloads the durable Lance append receipt from persisted run history', async () => {
+    useStore.setState({ doc: {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'write', type: 'write', position: { x: 0, y: 0 },
+        data: { title: 'Publish filtered events', status: 'latest', config: {}, history: [] },
+      }],
+    } } as any)
     apiMock.listRuns.mockResolvedValue([{
       id: 'lance-write-history', runId: 'lance-write-run', status: 'done',
       targetNodeId: 'write', rows: 3, outputs: [{
@@ -581,8 +589,16 @@ describe('durable full results', () => {
 
     render(<RunHistoryModal onClose={() => {}} />)
 
+    expect(await screen.findByText('Publish filtered events')).toBeVisible()
+    expect(screen.getByText('existing')).toBeVisible()
+    expect(screen.getByText('published')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Open dataset' })).toBeVisible()
     const receipt = await screen.findByLabelText('Write receipt for run lance-write-history')
-    expect(receipt).toHaveTextContent(/durable revision 8/i)
+    expect(receipt).not.toHaveAttribute('open')
+    expect(within(receipt).getByText(/durable revision 8/i)).not.toBeVisible()
+    fireEvent.click(within(receipt).getByText('Technical receipt'))
+    expect(receipt).toHaveAttribute('open')
+    expect(within(receipt).getByText(/durable revision 8/i)).toBeVisible()
     expect(receipt).toHaveTextContent(/dataset dataset-lance/i)
     expect(receipt).toHaveTextContent(/parent 7/i)
     expect(receipt).toHaveTextContent(/backend 8\.0\.0/i)

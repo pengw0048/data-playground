@@ -565,7 +565,7 @@ test.describe('provider Workspace Source acceptance', () => {
       has: page.getByRole('heading', { name: 'Run history' }),
     })
     await expect(history.getByText('2 rows', { exact: true }).first()).toBeVisible()
-    await history.getByRole('button', { name: /Admitted inputs/ }).click()
+    await history.getByRole('button', { name: /Admitted Sources/ }).click()
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
     await history.getByRole('button', { name: /Execution manifest/ }).click()
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()

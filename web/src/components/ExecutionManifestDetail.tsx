@@ -77,9 +77,9 @@ export function ExecutionManifestDetail({
       <span className="font-semibold text-foreground">Execution manifest</span>
       {schemaVersion != null && <Badge variant="outline" className="h-5 px-1.5 text-[9px]">v{schemaVersion}</Badge>}
       <Badge variant="secondary" className="h-5 px-1.5 text-[9px]">{availabilityLabel[activeAvailability]}</Badge>
-      {digest && <span className="dp-mono min-w-0 truncate text-[9.5px] text-muted-foreground" title={digest}>{digest}</span>}
     </button>
     {open && <div className="grid gap-3 border-t border-border/60 px-4 py-3 text-[10.5px]">
+      {digest && <div><strong>Digest:</strong> <span className="dp-mono break-all">{digest}</span></div>}
       {!detail && !error && <div role="status" className="text-muted-foreground">Loading the retained manifest…</div>}
       {error && <div role="alert" className="text-destructive">
         Couldn’t inspect the retained manifest: {error}{' '}
@@ -103,7 +103,6 @@ function ManifestDocument({ detail, onClone }: { detail: ExecutionManifestDetail
   return <>
     {onClone && <button type="button" className="w-fit rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" onClick={onClone}>Clone as new Canvas…</button>}
     <div className="grid gap-1">
-      <div><strong>Digest:</strong> <span className="dp-mono break-all">{detail.sha256}</span></div>
       <div><strong>Schema:</strong> version {detail.schemaVersion}</div>
       <div><strong>Target:</strong> <span className="dp-mono">{target}</span></div>
     </div>

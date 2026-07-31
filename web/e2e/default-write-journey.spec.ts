@@ -237,8 +237,8 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       has: page.getByRole('heading', { name: 'Run history' }),
     })
     await expect(historyDialog).toContainText(localHistoryTime)
-    await historyDialog.getByRole('button', { name: /Admitted inputs/ }).click()
-    await expect(historyDialog.getByText('ordered exact bindings')).toBeVisible()
+    await historyDialog.getByRole('button', { name: /Admitted Sources/ }).click()
+    await expect(historyDialog.getByText('used for this run')).toBeVisible()
     await expect(historyDialog.getByText(`Exact revision ${admittedInput!.revision_id}`)).toBeVisible()
     await expect(historyDialog.getByText('No admitted input manifest was recorded for this legacy run.')).toHaveCount(0)
     await historyDialog.getByRole('button', { name: 'Close' }).click()
@@ -286,6 +286,8 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       scope: 'datasets',
       revision: dataset!.revisionId,
       revisionDataset: dataset!.datasetId,
+      returnView: 'jobs',
+      returnQuery: `run=${runId}`,
     })}`
     await expect(jobsDatasetLink).toHaveAttribute(
       'href',
@@ -293,6 +295,9 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     )
     await jobsDatasetLink.click()
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    const exactDatasetUrl = page.url()
+    const backToJobs = page.getByRole('button', { name: 'Back to Jobs' })
+    await expect(backToJobs).toBeVisible()
     const detail = await ok<{ revisionId: string; name: string; committedAt: string; preview: { columns: Array<{ name: string }> } }>(
       await page.request.get(`/api/catalog/revisions/${encodeURIComponent(dataset!.datasetId)}/${encodeURIComponent(dataset!.revisionId)}`),
       'reopen exact published revision')
@@ -300,11 +305,16 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     expect(detail.name).toBe(dataset!.name)
     offsetInstant(detail.committedAt, 'exact revision committedAt')
     expect(detail.preview.columns.map((column) => column.name)).toEqual(['id', 'user_id', 'amount'])
-    await page.goBack()
+    await backToJobs.click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(runId)}$`))
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    await page.goForward()
+    await page.goBack()
+    await expect(page).toHaveURL(exactDatasetUrl)
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await page.goForward()
+    await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(runId)}$`))
+    await page.goBack()
+    await expect(page).toHaveURL(exactDatasetUrl)
     await shoot(page, 'light', 'revision')
 
     // Dark-theme pass over the same certified surfaces for the visual-review matrix.

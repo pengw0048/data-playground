@@ -16,6 +16,7 @@ import { CanvasCopyModal, type CanvasCopySource } from './CanvasCopyModal'
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
 export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   const canvasId = useStore((s) => s.doc.id)
+  const canvasNodes = useStore((s) => s.doc.nodes)
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const [runs, setRuns] = useState<RunRecordDto[] | null>(null)
   const [err, setErr] = useState('')
@@ -28,7 +29,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
 
   return <>
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
-      <DialogContent className="dp-modal-overlay flex max-h-[80vh] w-[620px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
+      <DialogContent className="dp-modal-overlay flex max-h-[80vh] w-[820px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <span className="text-muted-foreground"><Icon name="clock" size={15} /></span>
           <DialogTitle className="text-sm font-semibold text-foreground">Run history</DialogTitle>
@@ -46,6 +47,8 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
               const hasNodes = !!r.perNode && r.perNode.length > 0
               const isOpen = open === r.id
               const jobRunId = r.runId ?? null
+              const targetNode = r.targetNodeId ? canvasNodes.find((node) => node.id === r.targetNodeId) : null
+              const targetLabel = targetNode?.data.title?.trim() || (r.targetNodeId ? 'Removed node' : 'Whole Canvas')
               return (
                 <div key={r.id} className="border-b border-border">
                   <div
@@ -57,7 +60,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
                     <Badge variant="outline" className="w-[54px] justify-center capitalize">{r.jobType}</Badge>
                     <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
-                      {r.targetNodeId ?? '—'}
+                      {targetLabel}
                       {r.jobType === 'profile' && r.targetPortId && (
                         <span className="text-muted-foreground">:{r.targetPortId}</span>
                       )}
@@ -158,13 +161,13 @@ function RunInputManifest({ historyId, manifest }: {
       This run admitted no Source inputs.
     </div>
   }
-  return <div aria-label={`Admitted inputs for run ${historyId}`} className="border-t border-border bg-muted/20">
+  return <div aria-label={`Admitted Sources for run ${historyId}`} className="border-t border-border bg-muted/20">
     <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
       className="flex w-full items-center gap-2 px-4 py-2 text-left text-[11px] hover:bg-muted/40">
       <span className="text-muted-foreground">{open ? '▾' : '▸'}</span>
-      <span className="font-semibold text-foreground">Admitted inputs</span>
+      <span className="font-semibold text-foreground">Admitted Sources</span>
       <Badge variant="outline" className="h-5 px-1.5 text-[9px]">{manifest.length}</Badge>
-      <span className="text-muted-foreground">ordered exact bindings</span>
+      <span className="text-muted-foreground">used for this run</span>
     </button>
     {open && <div className="border-t border-border/60 px-4 py-2">
       <ol className="flex flex-col gap-2">
@@ -249,16 +252,17 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
         const readable = output.outcome === 'committed' && !!output.uri
         const label = output.portLabel || output.portId
         const publishedDataset = output.publicationKind === 'catalog'
+        const displayLabel = publishedDataset && output.table ? output.table : label
+        const outcomeLabel = output.outcome === 'committed'
+          ? publishedDataset ? 'published' : 'ready'
+          : output.outcome
         return (
           <div key={`${output.nodeId}:${output.portId}`} className="border-b border-border/60 last:border-b-0">
             <div className="flex items-center gap-2 px-4 py-2 text-[11px]">
               <span className="dp-mono min-w-0 max-w-36 overflow-hidden text-ellipsis whitespace-nowrap font-semibold text-foreground"
-                title={`${output.nodeId}:${output.portId}`}>{label}</span>
-              <Badge variant="outline" className="h-5 px-1.5 text-[9px] uppercase">{output.outcome}</Badge>
-              <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground"
-                title={output.table || output.uri || undefined}>
-                {output.table ? `→ ${output.table}` : output.uri ? `→ ${output.uri}` : output.publicationKind}
-              </span>
+                title={`${output.nodeId}:${output.portId}`}>{displayLabel}</span>
+              <Badge variant="outline" className="h-5 px-1.5 text-[9px] uppercase">{outcomeLabel}</Badge>
+              <span className="min-w-0 flex-1" />
               {output.rows != null && (
                 <span className="shrink-0 text-muted-foreground">
                   {output.rows.toLocaleString()} rows{output.publicationKind === 'catalog' ? ' written' : ''}
@@ -270,19 +274,22 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
                   {openKey === key
                     ? publishedDataset ? 'Hide dataset' : 'Hide result'
                     : outputs.length === 1
-                      ? publishedDataset ? 'Open published dataset' : 'Open full result'
+                      ? publishedDataset ? 'Open dataset' : 'Open full result'
                       : `Open ${label}`}
                 </Button>
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
             {output.writeReceipt && (
-              <div aria-label={`Write receipt for run ${historyId}`} className="px-4 pb-2 text-[10.5px] text-muted-foreground">
-                <span className="font-semibold text-foreground">durable revision {output.writeReceipt.revisionId}</span>
-                {' · '}dataset {output.writeReceipt.datasetId}
-                {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
-                {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
-              </div>
+              <details aria-label={`Write receipt for run ${historyId}`} className="mx-4 mb-2 text-[10.5px] text-muted-foreground">
+                <summary className="w-fit cursor-pointer font-semibold text-foreground">Technical receipt</summary>
+                <div className="dp-mono mt-1 break-all">
+                  durable revision {output.writeReceipt.revisionId}
+                  {' · '}dataset {output.writeReceipt.datasetId}
+                  {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
+                  {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
+                </div>
+              </details>
             )}
             {output.sampleProvenance && <div className="px-4 pb-2"><SampleProvenanceSummary provenance={output.sampleProvenance} /></div>}
             {openKey === key && readable && (
