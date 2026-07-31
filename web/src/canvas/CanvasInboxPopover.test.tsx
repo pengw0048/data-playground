@@ -37,6 +37,7 @@ vi.mock('../store/graph', () => ({
 
 import { CanvasInboxPopover } from './CanvasInboxPopover'
 import type { InboxItemDto } from '../api/client'
+import { datasetViewerHash } from '../router'
 
 function item(overrides: Partial<InboxItemDto> = {}): InboxItemDto {
   return {
@@ -135,6 +136,31 @@ describe('CanvasInboxPopover', () => {
 
     expect(mocks.setJobsQuery).toHaveBeenCalledWith('run=task-1')
     await waitFor(() => expect(mocks.inboxMarkRead).toHaveBeenCalledWith('item-1'))
+  })
+
+  it('opens dataset outcomes in the canonical exact viewer when no deep link is supplied', async () => {
+    mocks.inboxList.mockResolvedValue({
+      items: [item({
+        datasetContext: {
+          taskKind: 'restore_revision_write',
+          datasetId: 'dataset/with spaces',
+          revisionId: 'revision 9',
+          name: 'Restored orders',
+          deepLink: null,
+        },
+      })],
+      nextCursor: null,
+      hasMore: false,
+    })
+    const user = userEvent.setup()
+    render(<CanvasInboxPopover />)
+    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' }))
+    const preview = await screen.findByRole('dialog', { name: 'Inbox preview' })
+
+    expect(within(preview).getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      datasetViewerHash('dataset/with spaces', 'revision 9'),
+    )
   })
 
   it('keeps the last confirmed count when loading the preview fails', async () => {
