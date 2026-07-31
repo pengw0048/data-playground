@@ -78,6 +78,7 @@ export function FileDialog(props:
     try {
       const r = await api.browseDestination(destId, path)
       if (s !== browseRequest.current) return
+      if (r.path !== path) setPath(r.path)
       setEntries(r.entries)
       setBrowseError(r.error ?? null)
       setWritable(r.writable !== false)
@@ -121,10 +122,11 @@ export function FileDialog(props:
   }
   const createFolder = async () => {
     if (mode !== 'save' || !dest || makingFolder) return
-    const name = newFolderName.trim()
-    const invalid = !name || name === '.' || name === '..' || /[\\/]/.test(name)
+    const name = newFolderName
+    const invalid = !name || name !== name.trim() || name === '.' || name === '..'
+      || /[\\/]/.test(name) || [...name].some((char) => char.charCodeAt(0) < 32)
     if (invalid) {
-      setFolderError('Use one folder name without slashes, “.”, or “..”.')
+      setFolderError('Use one exact folder name without surrounding spaces, slashes, control characters, “.”, or “..”.')
       return
     }
     setMakingFolder(true)

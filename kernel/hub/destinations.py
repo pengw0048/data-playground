@@ -30,9 +30,10 @@ class LocalBackend:
 
     def browse(self, root: str, path: str, cred_id: str | None = None) -> dict:
         top = os.path.realpath(root)
-        base = os.path.realpath(os.path.join(top, path.lstrip("/")))
-        if not (base == top or base.startswith(top + os.sep)):  # never escape the destination root
-            base, path = top, ""
+        try:
+            base = self._safe(root, path)
+        except ValueError as e:
+            return {"path": path, "entries": [], "error": str(e), "writable": False}
         try:
             names = sorted(os.listdir(base))
         except OSError as e:
@@ -42,6 +43,8 @@ class LocalBackend:
             if fn.startswith("."):
                 continue
             p = os.path.join(base, fn)
+            if not _within_local_root(top, os.path.realpath(p)):
+                continue
             # a `.lance` dir is a dataset (a "file"), not a folder to descend into
             is_dir = os.path.isdir(p) and not fn.endswith(".lance")
             entries.append({"name": fn, "kind": "dir" if is_dir else "file", "uri": p})
@@ -53,7 +56,9 @@ class LocalBackend:
     def _safe(self, root: str, path: str) -> str:
         top = os.path.realpath(root)
         base = os.path.realpath(os.path.join(top, path.lstrip("/")))
-        return base if (base == top or base.startswith(top + os.sep)) else top  # never escape the root
+        if not _within_local_root(top, base):
+            raise ValueError("destination path must stay within its configured root")
+        return base
 
     def mkdir(self, root: str, path: str, name: str) -> None:
         os.mkdir(os.path.join(self._safe(root, path), _folder_name(name)))
@@ -121,6 +126,10 @@ class ObjectStoreBackend:
 _BACKENDS: dict[str, DestinationBackend] = {
     "local": LocalBackend(), "s3": ObjectStoreBackend("s3"), "gs": ObjectStoreBackend("gs"),
 }
+
+
+def _within_local_root(root: str, candidate: str) -> bool:
+    return candidate == root or candidate.startswith(root + os.sep)
 
 
 def register_backend(b: DestinationBackend) -> None:
@@ -197,7 +206,7 @@ def browse(workspace: str, dest_id: str, path: str) -> dict:
     if not b:
         return {"path": path, "entries": [], "error": f"no backend for '{d.get('backend')}'"}
     res = b.browse(d.get("root", ""), path or "", d.get("credId"))
-    res["writable"] = True  # both local and object-store backends can write
+    res.setdefault("writable", True)  # a backend may fail closed for an unsafe selected path
     return res
 
 

@@ -4799,6 +4799,32 @@ def test_local_destination_mkdir_is_one_contained_new_child(tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
+def test_local_destination_symlink_escape_fails_closed(tmp_path):
+    from hub import destinations
+
+    root = tmp_path / "outputs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.parquet").write_bytes(b"not destination data")
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+    backend = destinations.LocalBackend()
+
+    listing = backend.browse(str(root), "")
+    assert "escape" not in {entry["name"] for entry in listing["entries"]}
+
+    rejected = backend.browse(str(root), "escape")
+    assert rejected["path"] == "escape"
+    assert rejected["entries"] == []
+    assert rejected["writable"] is False
+    assert "configured root" in rejected["error"]
+    with pytest.raises(ValueError, match="configured root"):
+        backend.target_uri(str(root), "escape", "result.parquet")
+    with pytest.raises(ValueError, match="configured root"):
+        backend.mkdir(str(root), "escape", "child")
+    assert not (outside / "child").exists()
+
+
 def test_object_store_feather_roundtrip(tmp_path, object_store_cred):
     # Arrow/Feather (IPC) has no DuckDB file reader/writer, so it goes through pyarrow's own S3
     # filesystem. Previously a raw "s3://…" string was handed to pyarrow.feather → it wrote/read a

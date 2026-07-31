@@ -16,7 +16,9 @@ describe('FileDialog request and open-mutation truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.destinations.mockResolvedValue(DESTINATIONS)
-    mocks.browseDestination.mockResolvedValue(BROWSE)
+    mocks.browseDestination.mockImplementation(async (_destinationId: string, path: string) => ({
+      ...BROWSE, path,
+    }))
     mocks.mkdirDestination.mockResolvedValue({ ok: true })
   })
   afterEach(() => cleanup())
@@ -122,6 +124,29 @@ describe('FileDialog request and open-mutation truth', () => {
     })
   })
 
+  it('uses the backend-resolved folder instead of retaining a stale requested path', async () => {
+    mocks.browseDestination.mockImplementation(async (_destinationId: string, path: string) => (
+      path === 'alias'
+        ? { path: '', entries: [], writable: true }
+        : {
+            path: '',
+            entries: [{ name: 'alias', kind: 'dir' as const, uri: 'file:///data/alias' }],
+            writable: true,
+          }
+    ))
+    const pick = vi.fn()
+    render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={pick} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'alias' }))
+    await waitFor(() => expect(mocks.browseDestination).toHaveBeenCalledWith('local', 'alias'))
+    await waitFor(() => expect(mocks.browseDestination).toHaveBeenLastCalledWith('local', ''))
+    fireEvent.click(screen.getByRole('button', { name: 'Save here' }))
+
+    expect(pick).toHaveBeenCalledWith({
+      destId: 'local', destName: 'Workspace', path: '', filename: 'results',
+    })
+  })
+
   it('keeps invalid-name and create-folder failures inline and recoverable', async () => {
     mocks.mkdirDestination
       .mockResolvedValueOnce({ error: 'folder already exists' })
@@ -131,9 +156,14 @@ describe('FileDialog request and open-mutation truth', () => {
     await screen.findByText('orders.csv')
     fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
     const input = screen.getByRole('textbox', { name: 'New folder name' })
+    fireEvent.change(input, { target: { value: ' padded ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByText(/one exact folder name/i)).toBeVisible()
+    expect(mocks.mkdirDestination).not.toHaveBeenCalled()
+
     fireEvent.change(input, { target: { value: '../outside' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    expect(await screen.findByText(/without slashes/i)).toBeVisible()
+    expect(await screen.findByText(/one exact folder name/i)).toBeVisible()
     expect(mocks.mkdirDestination).not.toHaveBeenCalled()
 
     fireEvent.change(input, { target: { value: 'daily' } })
