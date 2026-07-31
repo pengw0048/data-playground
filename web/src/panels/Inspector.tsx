@@ -122,9 +122,8 @@ function isUnboundSource(config: Record<string, unknown>): boolean {
 }
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
-// generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
-// multi-selection) is selected it shows a hint. The canvas cards still work; this is the persistent
-// place to inspect/edit one node.
+// generic editor), a code snippet with "open editor", its ports, and actions. Without one valid
+// selected node there is nothing to inspect, so the Canvas keeps the full layout width.
 export function Inspector({ collapsed = false, onToggle }: { collapsed?: boolean; onToggle?: () => void }) {
   const selectedIds = useStore((s) => s.selectedIds)
   const nodes = useStore((s) => s.doc.nodes)
@@ -132,6 +131,8 @@ export function Inspector({ collapsed = false, onToggle }: { collapsed?: boolean
   const canEdit = roleCanEdit(canvasRole)
   const id = selectedIds.length === 1 ? selectedIds[0] : null
   const node = id ? nodes.find((n) => n.id === id) : null
+
+  if (!node) return null
 
   if (collapsed) {
     return (
@@ -167,17 +168,8 @@ export function Inspector({ collapsed = false, onToggle }: { collapsed?: boolean
           {canvasRole === 'viewer' ? 'View-only access' : 'Editing disabled until access is known'}
         </div>
       )}
-      {node ? <NodeInspector key={node.id} nodeId={node.id} />
-        : <Empty text={selectedIds.length > 1 ? `${selectedIds.length} nodes selected` : 'Select a node to see its properties'} />}
+      <NodeInspector key={node.id} nodeId={node.id} />
     </aside>
-  )
-}
-
-function Empty({ text }: { text: string }) {
-  return (
-    <div className="grid flex-1 place-items-center p-6 text-center text-xs leading-relaxed text-muted-foreground">
-      {text}
-    </div>
   )
 }
 

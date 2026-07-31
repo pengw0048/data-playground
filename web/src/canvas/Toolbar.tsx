@@ -70,8 +70,11 @@ export function Toolbar() {
   const labelsVisible = toolbarDensity !== 'icons'
 
   const locate = (id: string) => {
+    const nodes = useStore.getState().doc.nodes
+    if (!nodes.some((node) => node.id === id)) return
     select(id)
-    if (locateNode(useStore.getState().doc.nodes, id, { setCenter, getZoom })) setLocatorOpen(false)
+    setLocatorOpen(false)
+    void locateNode(nodes, id, { setCenter, getZoom })
   }
 
   const canEdit = roleCanEdit(canvasRole)

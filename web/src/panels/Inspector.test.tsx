@@ -193,6 +193,64 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
   })
 })
 
+describe('Inspector — selection-owned layout', () => {
+  const node = {
+    id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+    data: { title: 'Transform', status: 'draft', history: [], config: {} },
+  }
+
+  const select = (selectedIds: string[]) => {
+    useStore.setState({
+      selectedIds,
+      selectedId: selectedIds[selectedIds.length - 1] ?? null,
+      canvasRole: 'owner',
+      doc: {
+        id: 'selection-layout', name: 'Selection layout', version: 1,
+        requirements: [], edges: [], nodes: [node],
+      },
+      runs: {},
+      schemas: {},
+      previews: {},
+      catalog: [],
+      processors: [],
+      canvasTransformReferences: [],
+      numericParamDrafts: {},
+      openPanels: {},
+    } as any)
+  }
+
+  it.each([
+    ['no selection', []],
+    ['multiple nodes selected', ['transform', 'other']],
+    ['a selection that no longer resolves to a node', ['missing']],
+  ])('leaves the full Canvas width for %s', (_case, selectedIds) => {
+    select(selectedIds)
+
+    render(<Inspector />)
+
+    expect(screen.queryByTestId('inspector')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Select a node/i)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['expanded', false, '300px', 'Collapse Inspector'],
+    ['collapsed', true, '44px', 'Expand Inspector'],
+  ])('restores the %s preference after the selection is cleared', (_case, collapsed, width, action) => {
+    select(['transform'])
+    render(<Inspector collapsed={collapsed} onToggle={vi.fn()} />)
+
+    expect(screen.getByTestId('inspector')).toHaveStyle({ width })
+    expect(screen.getByRole('button', { name: action })).toBeInTheDocument()
+
+    act(() => useStore.setState({ selectedIds: [], selectedId: null }))
+    expect(screen.queryByTestId('inspector')).not.toBeInTheDocument()
+
+    act(() => useStore.setState({ selectedIds: ['transform'], selectedId: 'transform' }))
+    expect(screen.getByTestId('inspector')).toHaveStyle({ width })
+    expect(screen.getByRole('button', { name: action })).toBeInTheDocument()
+  })
+})
+
 describe('Inspector — effective named outputs', () => {
   const selectNode = (type: string, outputs: string[] | undefined) => {
     useStore.setState({

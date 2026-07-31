@@ -40,9 +40,7 @@ async function createCanvas(page: Page, name: string, suffix: string) {
 
 async function openCanvas(page: Page, canvasId: string) {
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
-  const expandInspector = page.getByRole('button', { name: 'Expand Inspector' })
-  if (await expandInspector.isVisible()) await expandInspector.click()
-  await expect(page.getByTestId('inspector')).toBeVisible()
+  await expect(page.getByTestId('inspector')).toHaveCount(0)
   await expect(page.getByTestId('canvas-title')).toBeVisible()
   await expect(page.getByTestId('kernel-badge')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Rerun all' })).toBeVisible()
