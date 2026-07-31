@@ -69,8 +69,7 @@ function Transform({ id, data }: NodeComponentProps) {
                 setTransformResource(
                   typeof data.config.processor === 'string' ? data.config.processor : null,
                   typeof data.config.version === 'string' ? data.config.version : null,
-                  typeof data.config.processor === 'string'
-                    ? { canvasId, nodeId: id } : null,
+                  { canvasId, nodeId: id },
                 )
               }}
               className={cn(
