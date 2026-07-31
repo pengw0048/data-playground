@@ -42,7 +42,7 @@ async function openHistory(page: import('@playwright/test').Page) {
   await page.goto('/#/workspace')
   await (await workspaceResource(page, 'dataset', dataset.name)).click()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
-  await page.getByRole('link', { name: 'Open revision rev-old' }).click()
+  await page.getByTestId('revision-open-rev-old').click()
   await expectExactRevision(page, 'rev-old')
 }
 
