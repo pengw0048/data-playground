@@ -11,6 +11,7 @@ import type {
 import type { CanvasDoc, CanvasNode } from '../types/graph'
 import { compareSchemas } from '../lib/schemaCompatibility'
 import { Icon } from '../ui/Icon'
+import { routeHash } from '../router'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 25
@@ -35,6 +36,7 @@ export function TransformsLibrary() {
   const setResource = useStore((state) => state.setTransformResource)
   const [items, setItems] = useState<TransformLibraryEntry[]>([])
   const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [resolvedListSignature, setResolvedListSignature] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -64,13 +66,18 @@ export function TransformsLibrary() {
   const targetContext = upgradeCanvasId && upgradeNodeId
     ? { canvasId: upgradeCanvasId, nodeId: upgradeNodeId }
     : null
+  const hasFilters = Boolean(
+    filters.q.trim() || filters.source !== 'all' || filters.mode.trim() || filters.category.trim(),
+  )
 
   useEffect(() => {
     let live = true
     setLoading(true); setLoadingMore(false); setError(null); setItems([]); setNextCursor(null)
+    setResolvedListSignature(null)
     void api.transformLibrary({ ...filters, limit: PAGE_SIZE }).then((page) => {
       if (!live) return
       setItems(page.items); setNextCursor(page.nextCursor ?? null)
+      setResolvedListSignature(listSignature)
     }).catch((caught) => { if (live) setError(errorMessage(caught)) })
       .finally(() => { if (live) setLoading(false) })
     return () => { live = false }
@@ -107,27 +114,51 @@ export function TransformsLibrary() {
   )) ?? null
   const requestedMissing = !!selectedVersion && !!detail
     && !detail.versions.some((version) => version.version === selectedVersion)
+  const selectedOutsideFilteredResults = Boolean(
+    hasFilters && selectedId && !loading && !error && resolvedListSignature === listSignature
+      && nextCursor === null
+      && !items.some((item) => item.id === selectedId),
+  )
 
   return <div className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col px-5 py-5 sm:px-7">
-    <header className="flex flex-wrap items-end gap-3 border-b border-border pb-4">
-      <div className="min-w-[220px] flex-1">
-        <h1 className="text-xl font-bold text-foreground">Transforms</h1>
-        <p className="mt-1 text-[12px] text-muted-foreground">Pinned, immutable compute definitions for repeatable data work.</p>
+    <header data-testid="transforms-library-header" className="border-b border-border pb-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-[220px] flex-1">
+          <h1 className="text-xl font-bold text-foreground">Transforms</h1>
+          <p className="mt-1 text-[12px] text-muted-foreground">Pinned, immutable compute definitions for repeatable data work.</p>
+        </div>
+        {targetContext && <a
+          data-testid="transform-return-canvas"
+          href={routeHash('canvas', targetContext.canvasId, undefined, undefined, undefined, targetContext.nodeId)}
+          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-semibold text-foreground hover:bg-accent"
+        >
+          <Icon name="chevronLeft" size={14} /> Back to Canvas
+        </a>}
       </div>
-      <input aria-label="Search Transforms" value={filters.q} onChange={(event) => setFilter('q', event.target.value)} placeholder="Search title, description, category…" className="dp-input w-full sm:w-[300px]" />
-      <select aria-label="Transform source" value={filters.source} onChange={(event) => setFilter('source', event.target.value)} className="dp-input w-[130px]">
-        <option value="all">All sources</option><option value="promoted">Promoted</option><option value="plugin">Plugin</option>
-      </select>
-      <input aria-label="Transform mode" value={filters.mode} onChange={(event) => setFilter('mode', event.target.value)} placeholder="Mode" className="dp-input w-[105px]" />
-      <input aria-label="Transform category" value={filters.category} onChange={(event) => setFilter('category', event.target.value)} placeholder="Category" className="dp-input w-[120px]" />
+      <div
+        data-testid="transform-filter-toolbar"
+        role="group"
+        aria-label="Transform filters"
+        className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1fr)_130px_105px_120px]"
+      >
+        <input aria-label="Search Transforms" value={filters.q} onChange={(event) => setFilter('q', event.target.value)} placeholder="Search title, description, category…" className="dp-input min-w-0" />
+        <select aria-label="Transform source" value={filters.source} onChange={(event) => setFilter('source', event.target.value)} className="dp-input min-w-0">
+          <option value="all">All sources</option><option value="promoted">Promoted</option><option value="plugin">Plugin</option>
+        </select>
+        <input aria-label="Transform mode" value={filters.mode} onChange={(event) => setFilter('mode', event.target.value)} placeholder="Mode" className="dp-input min-w-0" />
+        <input aria-label="Transform category" value={filters.category} onChange={(event) => setFilter('category', event.target.value)} placeholder="Category" className="dp-input min-w-0" />
+      </div>
     </header>
 
     <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 pt-5 lg:grid-cols-[minmax(360px,0.9fr)_minmax(460px,1.1fr)]">
       <section aria-label="Transform library" className="min-w-0">
         {loading && <div className="rounded-lg border border-border p-5 text-sm text-muted-foreground">Loading Transform library…</div>}
-        {!loading && !items.length && !error && <div className="rounded-lg border border-dashed border-border p-6 text-sm text-muted-foreground">
-          No matching Transforms. Promote a tested ad-hoc Transform from a Canvas, or adjust these filters.
-        </div>}
+        {!loading && !items.length && !error && (selectedOutsideFilteredResults
+          ? <FilteredSelectionNotice onClear={() => setRouteQuery('')} empty />
+          : <div className="rounded-lg border border-dashed border-border p-6 text-sm text-muted-foreground">
+              No matching Transforms. Promote a tested ad-hoc Transform from a Canvas, or adjust these filters.
+            </div>)}
+        {!!items.length && selectedOutsideFilteredResults && <FilteredSelectionNotice onClear={() => setRouteQuery('')} />}
         <div className="grid gap-2">
           {items.map((item) => <button key={`${item.id}@${item.version}`} onClick={() => setResource(
             item.id, item.version, targetContext,
@@ -160,6 +191,23 @@ export function TransformsLibrary() {
       </section>
     </div>
     {useEntry && <TransformUseDialog entry={useEntry} onClose={() => setUseEntry(null)} />}
+  </div>
+}
+
+function FilteredSelectionNotice({ onClear, empty = false }: {
+  onClear: () => void
+  empty?: boolean
+}) {
+  return <div
+    data-testid="selected-transform-filter-context"
+    role="status"
+    className={`${empty ? '' : 'mb-3 '}rounded-lg border border-border bg-muted/30 p-4 text-[12px] text-muted-foreground`}
+  >
+    <strong className="text-foreground">The selected Transform remains open.</strong>{' '}
+    {empty ? 'No list results match the current filters.' : 'It is outside the current filtered results.'}
+    <button type="button" onClick={onClear} className="ml-2 font-semibold text-primary hover:underline">
+      Clear filters
+    </button>
   </div>
 }
 

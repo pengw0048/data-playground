@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -209,6 +209,68 @@ describe('TransformsLibrary', () => {
     expect(store.setTransformResource).toHaveBeenLastCalledWith(
       'tr_exact', 'v2', { canvasId: 'target', nodeId: 'node-1' },
     )
+  })
+
+  it('keeps an exact Canvas node return visible while filters exclude the selected Transform', async () => {
+    store.transformLibraryQuery = 'q=no-such-transform'
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    mocks.transformLibrary.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+    mocks.getCanvas.mockResolvedValue(blankTargetDoc())
+
+    render(<TransformsLibrary />)
+
+    expect(screen.getByRole('link', { name: 'Back to Canvas' })).toHaveAttribute(
+      'href', '#/canvas/target?node=node-1',
+    )
+    const notice = await screen.findByTestId('selected-transform-filter-context')
+    expect(notice).toHaveTextContent('The selected Transform remains open.')
+    expect(notice).toHaveTextContent('No list results match the current filters.')
+    expect(screen.queryByText(/Promote a tested ad-hoc Transform/)).not.toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Robot scorer' })).toBeVisible()
+
+    fireEvent.click(within(notice).getByRole('button', { name: 'Clear filters' }))
+    expect(store.setTransformLibraryQuery).toHaveBeenCalledWith('')
+  })
+
+  it('does not misreport a Unicode casefold match returned by the server', async () => {
+    const strasse = { ...entry(), title: 'Straße scorer' }
+    store.transformLibraryQuery = 'q=STRASSE'
+    mocks.transformLibrary.mockResolvedValue({ items: [strasse], hasMore: false, nextCursor: null })
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: strasse.id, provenance: 'promoted', requestedVersion: strasse.version, versions: [strasse],
+    })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('button', { name: /Straße scorer/ })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Straße scorer' })).toBeVisible()
+    expect(screen.queryByTestId('selected-transform-filter-context')).not.toBeInTheDocument()
+  })
+
+  it('does not claim a selection is filtered out before pagination is exhausted', async () => {
+    store.transformLibraryQuery = 'q=other'
+    mocks.transformLibrary.mockResolvedValue({
+      items: [{ ...entry(), id: 'tr_other', title: 'Other scorer' }],
+      hasMore: true,
+      nextCursor: 'cursor-2',
+    })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('button', { name: /Other scorer/ })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Robot scorer' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeVisible()
+    expect(screen.queryByTestId('selected-transform-filter-context')).not.toBeInTheDocument()
+  })
+
+  it('keeps the four filter controls in one responsive toolbar contract', () => {
+    render(<TransformsLibrary />)
+
+    const toolbar = screen.getByRole('group', { name: 'Transform filters' })
+    expect(toolbar).toHaveClass('xl:grid-cols-[minmax(220px,1fr)_130px_105px_120px]')
+    expect(within(toolbar).getAllByRole('textbox')).toHaveLength(3)
+    expect(within(toolbar).getByRole('combobox', { name: 'Transform source' })).toBeVisible()
   })
 
   it('configures an explicit blank Transform in place without opening the generic chooser', async () => {
