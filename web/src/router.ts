@@ -4,7 +4,7 @@
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation, type NavigationToken } from './navigationOwnership'
 
-export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string }
+export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string; canonicalHash?: string }
 
 const DATASET_QUERY_KEYS = [
   'dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match',
@@ -77,6 +77,7 @@ export function parseHash(): Route {
     nodeId: params.get('node') || undefined,
   }
   if (seg === 'workspace') {
+    if (id !== undefined && !decodedId) return { view: 'workspace', canonicalHash: '#/workspace' }
     const workspaceScope = params.get('scope') === 'datasets' ? 'datasets' : 'all'
     const datasetParams = new URLSearchParams()
     for (const key of workspaceScope === 'datasets' ? DATASET_QUERY_KEYS : DATASET_VIEWER_QUERY_KEYS) {
@@ -108,6 +109,7 @@ export function parseHash(): Route {
   if (seg === 'jobs') return { view: 'jobs', jobsQuery: params.toString() }
   if (seg === 'inbox') return { view: 'inbox', inboxQuery: params.toString() }
   if (seg === 'transforms') {
+    if (id !== undefined && !decodedId) return { view: 'transforms', canonicalHash: '#/transforms' }
     const transformVersion = params.get('version') || undefined
     const transformCanvasId = params.get('canvas') || undefined
     const transformNodeId = params.get('node') || undefined
@@ -124,7 +126,10 @@ export function parseHash(): Route {
   }
   if (seg === 'relationships') return { view: seg }
   // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id).
-  return { view: 'canvas' }
+  if (path === '' && !rawQuery) return { view: 'canvas' }
+  // An unrecognized route must never borrow the last Canvas and make an invalid URL look editable.
+  // Recover to a truthful shell destination and replace the bad history entry in initRouter.
+  return { view: 'workspace', canonicalHash: '#/workspace' }
 }
 
 export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string): string {
@@ -271,7 +276,12 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
           current.pushToast('The requested node is no longer in this Canvas.', 'info')
           if (ownsNavigation(navigationToken)) history.replaceState(null, '', hashFor(store.getState()))
         }
-      } else if (ownsNavigation(navigationToken)) st.applyRoute(r, navigationToken)
+      } else if (ownsNavigation(navigationToken)) {
+        if (r.canonicalHash && location.hash !== r.canonicalHash) {
+          history.replaceState(null, '', r.canonicalHash)
+        }
+        st.applyRoute(r, navigationToken)
+      }
     } finally {
       if (applyingToken === navigationToken) applyingToken = null
     }
