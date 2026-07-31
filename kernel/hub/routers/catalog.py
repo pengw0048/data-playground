@@ -50,6 +50,8 @@ from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
     CatalogEdit,
+    CatalogExampleSourceResolveRequest,
+    CatalogExampleSourceResolveResponse,
     CatalogFolder,
     CatalogMetadata,
     CatalogPage,
@@ -246,6 +248,23 @@ def list_tables(
     """A filtered, sorted, paginated catalog page with its window and total in the response body."""
     query = _catalog_query(q, folder, tags, owner, has_columns, sort, order, limit, offset, uris=uris)
     return get_deps().catalog.list_page(query)
+
+
+@router.post("/catalog/example-sources/resolve", response_model=CatalogExampleSourceResolveResponse)
+def resolve_example_sources(
+    req: CatalogExampleSourceResolveRequest,
+) -> CatalogExampleSourceResolveResponse:
+    """Upgrade seeded example refs only when the built-in local Catalog proves an exact identity.
+
+    External Workspace provider placements use their canonical-dataset endpoints instead; this
+    narrow resolver must not absorb those identities into the local Catalog namespace.
+    """
+    from hub.plugins.catalog import InMemoryCatalog
+    if type(get_deps().catalog) is not InMemoryCatalog:
+        raise HTTPException(501, "the active Catalog provider does not expose local example bindings")
+    return CatalogExampleSourceResolveResponse(
+        resolutions=metadb.catalog_resolve_example_sources(req.refs),
+    )
 
 
 @router.get("/catalog/facets", response_model=Facets)

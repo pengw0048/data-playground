@@ -7,6 +7,7 @@ const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
+  resolveExampleSources: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   executionManifest: vi.fn(),
@@ -37,6 +38,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.getCanvas
         : property === 'canvasTransformReferences'
           ? apiMocks.canvasTransformReferences
+        : property === 'resolveExampleSources'
+          ? apiMocks.resolveExampleSources
         : property === 'createCanvas'
           ? apiMocks.createCanvas
           : property === 'saveCanvas'
@@ -186,6 +189,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.exampleRowsEditorPreview.mockReset()
     apiMocks.getCanvas.mockReset()
     apiMocks.canvasTransformReferences.mockReset().mockResolvedValue([])
+    apiMocks.resolveExampleSources.mockReset().mockResolvedValue({ resolutions: [] })
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
       { ok: true, id: doc.id, created: true }
     ))
@@ -4698,7 +4702,9 @@ describe('graph store — core authority ops', () => {
         uri: '/workspace/data/events.parquet', rowCount: 2000, columns: [],
       }
       let persisted: CanvasDoc | null = null
-      useStore.setState({ catalog: [table] })
+      apiMocks.resolveExampleSources.mockResolvedValueOnce({
+        resolutions: [{ ref: 'events', state: 'resolved', table }],
+      })
       apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
         persisted = structuredClone(doc)
         return { ok: true, id: doc.id, created: true }
@@ -4727,12 +4733,10 @@ describe('graph store — core authority ops', () => {
       id: 'tbl-exact', registrationId: 'registration-exact', name: 'seeded-events',
       uri: 'events', rowCount: 2000, columns: [],
     }
-    const sameName: CatalogTable = {
-      id: 'tbl-same-name', registrationId: 'registration-same-name', name: 'events',
-      uri: '/workspace/data/other-events.parquet', rowCount: 10, columns: [],
-    }
     let persisted: CanvasDoc | null = null
-    useStore.setState({ catalog: [sameName, exact] })
+    apiMocks.resolveExampleSources.mockResolvedValueOnce({
+      resolutions: [{ ref: 'events', state: 'resolved', table: exact }],
+    })
     apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
       persisted = structuredClone(doc)
       return { ok: true, id: doc.id, created: true }
@@ -4745,16 +4749,10 @@ describe('graph store — core authority ops', () => {
   })
 
   it('keeps the bare example Source when its Catalog name is ambiguous', async () => {
-    const first: CatalogTable = {
-      id: 'tbl-events-one', registrationId: 'registration-events-one', name: 'events',
-      uri: '/workspace/data/events-one.parquet', rowCount: 10, columns: [],
-    }
-    const second: CatalogTable = {
-      id: 'tbl-events-two', registrationId: 'registration-events-two', name: 'events',
-      uri: '/workspace/data/events-two.parquet', rowCount: 20, columns: [],
-    }
     let persisted: CanvasDoc | null = null
-    useStore.setState({ catalog: [first, second] })
+    apiMocks.resolveExampleSources.mockResolvedValueOnce({
+      resolutions: [{ ref: 'events', state: 'ambiguous', table: null }],
+    })
     apiMocks.createCanvas.mockImplementationOnce(async (doc: CanvasDoc) => {
       persisted = structuredClone(doc)
       return { ok: true, id: doc.id, created: true }
@@ -4766,6 +4764,7 @@ describe('graph store — core authority ops', () => {
   })
 
   it('keeps the runnable bare Source URI when Catalog identity is unavailable offline', async () => {
+    apiMocks.resolveExampleSources.mockRejectedValueOnce(new TypeError('offline'))
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
 
     expect(await useStore.getState().newFromExample('purchases')).toMatchObject({
@@ -4774,6 +4773,28 @@ describe('graph store — core authority ops', () => {
 
     const source = useStore.getState().doc.nodes.find((node) => node.type === 'source')
     expect(source?.data.config).toEqual({ uri: 'events' })
+  })
+
+  it('keeps an edit made while example Source identity is resolving', async () => {
+    const blank = emptyTestDoc('resolve-wait-blank')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    apiMocks.listRuns.mockResolvedValue([])
+    let finishResolution!: (result: { resolutions: never[] }) => void
+    apiMocks.resolveExampleSources.mockReturnValue(new Promise((resolve) => {
+      finishResolution = resolve
+    }))
+
+    const creation = useStore.getState().newFromExample('purchases', 'replace-pristine')
+    await vi.waitFor(() => expect(apiMocks.resolveExampleSources).toHaveBeenCalledOnce())
+    useStore.getState().setRequirements(['duckdb>=1'])
+    finishResolution({ resolutions: [] })
+
+    expect(await creation).toEqual({ ok: false })
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().doc.requirements).toEqual(['duckdb>=1'])
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('your edit was kept')
   })
 
   it('creates a separate example when an otherwise blank Canvas has run history', async () => {

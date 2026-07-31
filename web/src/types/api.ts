@@ -329,6 +329,16 @@ export interface CatalogPage {
   limit: number
   hasMore: boolean
 }
+
+export interface CatalogExampleSourceResolution {
+  ref: string
+  state: 'resolved' | 'ambiguous' | 'absent'
+  table: CatalogTable | null
+}
+
+export interface CatalogExampleSourceResolveResponse {
+  resolutions: CatalogExampleSourceResolution[]
+}
 export interface FacetValue { value: string; count: number }
 export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: FacetValue[]; semanticAvailable?: boolean }
 export interface FolderNode { name: string; path: string; tableCount: number }

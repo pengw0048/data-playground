@@ -234,6 +234,13 @@ test.describe('Data Playground canvas', () => {
       const nodes = page.locator('.react-flow__node')
       await expect(nodes).toHaveCount(5)
       exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      const persisted = await canvasFor(page, exampleId)
+      const source = persisted.nodes.find((node) => (node as { type?: string }).type === 'source') as {
+        data?: { config?: { uri?: string; tableId?: string; registrationId?: string } }
+      } | undefined
+      expect(source?.data?.config?.uri).not.toBe('events')
+      expect(source?.data?.config?.tableId).toBeTruthy()
+      expect(source?.data?.config?.registrationId).toBeTruthy()
 
       const allNodesInsideFlow = async () => {
         const flow = await page.locator('.react-flow').boundingBox()
@@ -1176,7 +1183,8 @@ test.describe('Data Playground canvas', () => {
       await addNode(page, category, title)
       const addedNode = page.locator('.react-flow__node').last()
       await expect(addedNode.getByText(title, { exact: true }).first()).toBeVisible()
-      const shelf = addedNode.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'Output versions' }).locator('..')
+      const action = title === 'source' ? 'More' : title === 'transform' ? 'Edit code' : 'Output versions'
+      const shelf = addedNode.getByRole('button', { name: action }).locator('..')
       await expect(shelf).toBeVisible()
       const shelfBox = await boxOf(shelf)
       expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the visible Canvas`).toBe(true)
