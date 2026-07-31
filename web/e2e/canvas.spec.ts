@@ -1198,7 +1198,9 @@ test.describe('Data Playground canvas', () => {
       ['Compute', 'transform'],
     ] as const) {
       await addNode(page, category, title)
-      const shelf = page.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'Output versions' }).locator('..')
+      const addedNode = page.locator('.react-flow__node').last()
+      await expect(addedNode.getByText(title, { exact: true }).first()).toBeVisible()
+      const shelf = addedNode.getByRole('button', { name: title === 'transform' ? 'Edit code' : 'Output versions' }).locator('..')
       const shelfBox = await boxOf(shelf)
       expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the reference Canvas`).toBe(true)
       expect(overlaps(shelfBox, await boxOf(page.getByTestId('toolbar'))), `${title} action shelf overlaps the reference toolbar`).toBe(false)
