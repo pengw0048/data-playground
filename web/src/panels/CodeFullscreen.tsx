@@ -168,9 +168,13 @@ export function CodeFullscreen() {
   const preview = isTransform ? editorPreviews[fs.nodeId] : previews[fs.nodeId]
   const syntaxErrorLine = preview?.result?.failureCategory === 'syntax_error'
     ? preview.result.syntaxError?.line : undefined
+  const selectedEditorInputRunId = preview?.result?.editorTestInput?.runId
   const freshUpstreamResultReady = Boolean(
-    freshUpstreamRunDone && upstreamRunId
-    && preview?.result?.editorTestInput?.runId === upstreamRunId,
+    requestIsCurrent && !upstreamRequest?.cancelled
+    && upstreamRun?.phase !== 'failed'
+    && preview && previewIsCurrent(preview, doc, fs.nodeId)
+    && selectedEditorInputRunId
+    && selectedEditorInputRunId !== upstreamRequest?.baselineRunId,
   )
   const upstreamSelectionFailed = Boolean(
     freshUpstreamRunDone && refreshedUpstreamRunId.current === upstreamRunId
@@ -941,6 +945,10 @@ function EditorUpstreamRunStatus({
   const upstreamLabel = useStore((s) => s.doc.nodes.find((node) => node.id === nodeId)?.data.title ?? nodeId)
   const rows = estimate?.rows == null ? 'an unknown number of rows' : `${estimate.rows.toLocaleString()} rows`
 
+  // A server-owned editor input is stronger evidence than a lagging run-status event. The graph
+  // may already expose the retained result while the initiating surface still says "running".
+  if (resultReady) return null
+
   if (phase === 'confirm') return (
     <section aria-label="Confirm upstream run" className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px]">
       <div className="font-semibold text-foreground">Confirm upstream run</div>
@@ -963,10 +971,6 @@ function EditorUpstreamRunStatus({
       <div className="font-semibold text-destructive">Upstream run failed</div>
       <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{run?.error ?? 'The upstream result could not be produced.'}</p>
     </section>
-  )
-
-  if (phase === 'done' && resultReady) return (
-    null
   )
 
   if (phase === 'done' && selectionFailed) return (

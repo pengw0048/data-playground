@@ -556,7 +556,8 @@ describe('Transform exact processor labels', () => {
       doc,
       kernelUp: true,
       fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
-      requestRun, run, runEditorPreview, runs: {},
+      requestRun, run, runEditorPreview,
+      runs: { sample: { phase: 'done', status: { runId: 'baseline-run' } } },
     } as any)
 
     render(<CodeFullscreen />)
@@ -570,6 +571,27 @@ describe('Transform exact processor labels', () => {
     expect(screen.getByTestId('code-editor')).toBeInTheDocument()
     expect(screen.queryByRole('status', { name: 'Upstream run cancelled' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+
+    await act(async () => {
+      useStore.setState({ editorPreviews: { transform: {
+        canvasId: doc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(doc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: 1,
+        offset: 0,
+        result: {
+          columns: [], rows: [], truncated: false,
+          editorTestInput: {
+            runId: 'baseline-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
+          },
+        },
+      } } } as any)
+    })
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    await act(async () => {
+      useStore.setState({ editorPreviews: {} } as any)
+    })
 
     await act(async () => {
       useStore.setState({ runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } } } as any)
@@ -622,6 +644,18 @@ describe('Transform exact processor labels', () => {
     })
     expect(screen.queryByRole('status', { name: 'Upstream result ready' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+
+    // The retained editor input is authoritative even if the run-status channel lags behind the
+    // graph result. A real provider run can reach this state until the dialog is reopened.
+    await act(async () => {
+      useStore.setState({ runs: { sample: {
+        phase: 'running',
+        status: { runId: 'upstream-run', rowsProcessed: 8, totalRows: 8, progress: 1 },
+      } } } as any)
+    })
+    expect(screen.queryByRole('status', { name: 'Upstream run progress' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+
     useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
 
