@@ -225,7 +225,7 @@ test.describe('minimum viewport support', () => {
     await runPanel.getByTitle('Close').click()
     await expect(runPanel).toHaveCount(0)
 
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const runHistory = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Run history' }) })
     await expectFullyInViewport(page, runHistory, 'run history')
@@ -472,9 +472,13 @@ test.describe('minimum viewport support', () => {
     await page.getByTestId('app-menu').click()
     const appMenu = page.getByRole('menu', { name: 'Data Playground menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
-    for (const detail of ['runs and background tasks', 'my background task results', 'runs from this Canvas']) {
+    for (const detail of ['runs and background tasks', 'my background task results']) {
       await expect(appMenu.getByText(detail, { exact: true })).toBeVisible()
     }
+    await page.keyboard.press('Escape')
+    await page.getByTestId('canvas-menu').click()
+    await expectFullyInViewport(page, page.getByRole('menu', { name: 'Canvas actions' }), '1024px Canvas actions menu')
+    await expect(page.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Expand Inspector', exact: true }).click()
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)

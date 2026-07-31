@@ -43,7 +43,7 @@ async function openCanvas(page: Page, canvasId: string) {
   const expandInspector = page.getByRole('button', { name: 'Expand Inspector' })
   if (await expandInspector.isVisible()) await expandInspector.click()
   await expect(page.getByTestId('inspector')).toBeVisible()
-  await expect(page.getByTestId('file-menu')).toBeVisible()
+  await expect(page.getByTestId('canvas-title')).toBeVisible()
   await expect(page.getByTestId('kernel-badge')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Rerun all' })).toBeVisible()
   await expect(page.getByTestId('share-btn')).toBeVisible()
@@ -51,8 +51,8 @@ async function openCanvas(page: Page, canvasId: string) {
 }
 
 async function expectRunControlsOperable(page: Page, fullName: string) {
-  await page.getByTestId('file-menu').click()
-  await expect(page.getByPlaceholder('untitled')).toHaveValue(fullName)
+  await page.getByTestId('canvas-title').click()
+  await expect(page.getByRole('textbox', { name: 'Canvas name' })).toHaveValue(fullName)
   await page.keyboard.press('Escape')
 
   await page.getByTestId('kernel-badge').click()
@@ -76,7 +76,7 @@ test('keeps long Canvas titles clear of independently operable run controls at d
     const canvasId = await createCanvas(page, LONG_CANVAS_NAME, `${viewport.width}`)
     try {
       await openCanvas(page, canvasId)
-      const title = page.getByTestId('file-menu')
+      const title = page.getByTestId('canvas-title')
       const runControls = page.getByTestId('canvas-run-controls')
       const titleBox = await boxOf(title)
       const runBox = await boxOf(runControls)
@@ -87,7 +87,7 @@ test('keeps long Canvas titles clear of independently operable run controls at d
         `${viewport.width} title must end before run controls begin`,
       ).toBeLessThanOrEqual(runBox.x + 0.5)
       expect(titleBox.x + titleBox.width).toBeLessThanOrEqual(runBox.x + 0.5)
-      await expect(title).toHaveAttribute('title', LONG_CANVAS_NAME)
+      await expect(title).toHaveAttribute('title', `${LONG_CANVAS_NAME} — click to rename`)
       await expectRunControlsOperable(page, LONG_CANVAS_NAME)
     } finally {
       expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBeTruthy()
@@ -101,14 +101,14 @@ test('preserves the compact short-title layout', async ({ page }) => {
   const canvasId = await createCanvas(page, shortName, 'short')
   try {
     await openCanvas(page, canvasId)
-    const title = page.getByTestId('file-menu')
+    const title = page.getByTestId('canvas-title')
     const titleMetrics = await title.evaluate((element) => ({
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
     }))
     expect(titleMetrics.scrollWidth).toBe(titleMetrics.clientWidth)
     await expect(title).toContainText(shortName)
-    await expect(title).toHaveAttribute('title', shortName)
+    await expect(title).toHaveAttribute('title', `${shortName} — click to rename`)
   } finally {
     expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBeTruthy()
   }

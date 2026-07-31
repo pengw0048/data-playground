@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import { roleCanEdit, useStore } from '../store/graph'
-import { examples } from '../examples'
 import { Icon, type IconName } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import {
@@ -9,6 +8,11 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { SettingsModal } from '../panels/SettingsModal'
@@ -18,13 +22,11 @@ import { RunHistoryModal } from '../panels/RunHistoryModal'
 import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
-import { resolvedTheme, toggleTheme } from '../theme/mode'
+import { getThemeMode, setThemeMode, type ThemeMode } from '../theme/mode'
 import { KernelBadge } from './KernelBadge'
-import { CanvasDraftMenu } from './LocalDrafts'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
-import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 import { CanvasInboxPopover } from './CanvasInboxPopover'
 
@@ -109,15 +111,23 @@ export function TopBar() {
       <div data-layout-region="canvas-top-chrome"
         style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden">
-          <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && kernelUp && saved && !currentDraftId} />
+          <AppMenu onWorkspace={() => navigateToWorkspace(null)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} />
           <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
-          <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
+          <CanvasTitle />
+          <CanvasOverflowMenu
+            onShowInWorkspace={() => navigateToWorkspace(workspaceReturnDestination)}
+            onCanvasSettings={() => setCanvasSettingsOpen(true)}
+            onRunHistory={() => setRunsOpen(true)}
+            onVersionHistory={() => setVersionsOpen(true)}
+            onNativeExport={() => { void exportCanvas() }}
+            onCopy={() => setCopyOpen(true)}
+            copyable={!!canvasRole && kernelUp && saved && !currentDraftId}
+          />
           <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
             <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
             <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
-            <ThemeToggle />
           </span>
         </div>
         <div data-testid="canvas-run-controls" className="flex items-center gap-2.5">
@@ -132,7 +142,7 @@ export function TopBar() {
         </div>
       </div>
       <div data-layout-region="canvas-top-chrome"
-        style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
+        style={{ position: 'absolute', top: kernelUp ? 50 : 82, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
         <CanvasWorkspaceLocation onReturnDestination={setWorkspaceReturnDestination} onNavigate={navigateToWorkspace} />
       </div>
       {settingsOpen && <SettingsModal onClose={closeSettings} initialCategory={settingsCategory} />}
@@ -167,27 +177,35 @@ function PeerAvatars() {
   )
 }
 
-// The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
-export function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onWorkspace: () => void; onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
+// Global destinations and preferences live here. Current-Canvas actions belong to CanvasOverflowMenu.
+export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
+  onWorkspace: () => void
+  onSettings: () => void
+  onImport: () => void
+  onNativeImport: () => void
+}) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
   const inboxQuery = useStore((s) => s.inboxQuery)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
+  const [themeMode, setVisibleThemeMode] = useState<ThemeMode>(getThemeMode)
+  useEffect(() => {
+    const sync = () => setVisibleThemeMode(getThemeMode())
+    window.addEventListener('dp-theme-change', sync)
+    return () => window.removeEventListener('dp-theme-change', sync)
+  }, [])
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button data-testid="app-menu" title="Data Playground menu" aria-label="Data Playground menu"
-          className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-bold text-foreground">
-          <span className="grid h-5 w-5 place-items-center rounded-[5px] bg-foreground text-xs font-bold text-background" aria-hidden>D</span>
-          <span className="text-muted-foreground" aria-hidden><Icon name="chevronDown" size={12} /></span>
+          className="grid h-7 w-7 cursor-pointer place-items-center rounded-md border-0 bg-transparent text-foreground hover:bg-accent">
+          <Icon name="menu" size={17} />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">
         <DropdownMenuItem onSelect={onWorkspace}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
-        <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
-        <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New Canvas</DropdownMenuItem>
         <DropdownMenuItem data-testid="import-native-canvas" onSelect={() => setTimeout(onNativeImport)}><Icon name="import" size={14} /> Import native Canvas…</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
@@ -195,9 +213,17 @@ export function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistor
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setInboxQuery(inboxQuery)}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my background task results" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> <MenuDestination label="Run history" detail="runs from this Canvas" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
         <DropdownMenuSeparator />
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger><Icon name="sun" size={14} /> Appearance</DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+            <DropdownMenuRadioGroup value={themeMode}>
+              <DropdownMenuRadioItem value="system" onSelect={() => setThemeMode('system')}>System</DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="light" onSelect={() => setThemeMode('light')}>Light</DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="dark" onSelect={() => setThemeMode('dark')}>Dark</DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -211,80 +237,110 @@ function MenuDestination({ label, detail }: { label: string; detail: string }) {
   </span>
 }
 
-export function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
-  const [open, setOpen] = useState(false)
+export function CanvasTitle() {
   const doc = useStore((s) => s.doc)
-  const files = useStore((s) => s.files)
-  const openFile = useStore((s) => s.openFile)
-  const newFile = useStore((s) => s.newFile)
-  const newFromExample = useStore((s) => s.newFromExample)
   const renameFile = useStore((s) => s.renameFile)
-  const deleteFile = useStore((s) => s.deleteFile)
-  const discardLocalDraft = useStore((s) => s.discardLocalDraft)
-  const currentDraftId = useStore((s) => s.currentDraftId)
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
-  const exampleIntent = useExampleCreationIntent(open && canEdit)
-  const exampleCreatesSeparate = exampleIntent === 'create-separate'
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(doc.name ?? '')
+  const original = useRef(doc.name ?? '')
+  const input = useRef<HTMLInputElement | null>(null)
 
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
-      <DropdownMenuTrigger asChild>
-        <button
-          data-testid="file-menu"
-          title={doc.name ?? 'untitled'}
-          className="inline-flex min-w-0 cursor-pointer items-center gap-1 overflow-hidden rounded-md border-0 bg-transparent px-1 py-0.5 text-[13.5px] font-semibold text-foreground"
-        >
-          <span className="min-w-0 truncate">{doc.name ?? 'untitled'}</span>
-          <span className="shrink-0 text-muted-foreground"><Icon name="chevronDown" size={12} /></span>
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-[240px]">
-        {/* stop keydown here so the menu's typeahead / arrow-nav doesn't steal focus from the rename box */}
-        <div className="px-2 py-1.5" onKeyDown={(e) => e.stopPropagation()}>
-          <input
-            value={doc.name ?? ''}
-            disabled={!canEdit}
-            onChange={(e) => renameFile(e.target.value)}
-            placeholder="untitled"
-            className="w-full rounded-md border border-border bg-background px-2 py-1 text-[12.5px] font-semibold text-foreground outline-none"
-          />
-        </div>
-        <div className="px-2.5 py-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">Files</div>
-        <div className="max-h-[220px] overflow-y-auto">
-          {files.map((f) => (
-            <button
-              key={f.id}
-              onClick={() => { openFile(f.id); setOpen(false) }}
-              className={cn(
-                'flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-foreground hover:bg-accent',
-                f.id === doc.id && 'bg-accent',
-              )}
-            >
-              <span className="text-muted-foreground"><Icon name="grid" size={12} /></span>
-              <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{f.name || 'untitled'}</span>
-            </button>
-          ))}
-          {files.length === 0 && <div className="p-2.5 text-[11.5px] text-muted-foreground">No files yet.</div>}
-        </div>
-        <CanvasDraftMenu close={() => setOpen(false)} />
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
-        <div className="px-2.5 pb-1 pt-1.5 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
-          {exampleCreatesSeparate ? 'Create example Canvas' : 'New from example'}
-        </div>
-        {examples.map((ex) => (
-          <DropdownMenuItem key={ex.key} onSelect={() => { setOpen(false); void newFromExample(ex.key, exampleIntent) }} title={ex.blurb}
-            aria-label={exampleCreatesSeparate ? `Create example Canvas: ${ex.name}` : ex.name}>
-            <Icon name="grid" size={14} /> {ex.name}
-          </DropdownMenuItem>
-        ))}
-        {canvasRole === 'owner' && <DropdownMenuSeparator />}
-        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this file'}</DropdownMenuItem>}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
+  useEffect(() => {
+    if (!editing) setDraft(doc.name ?? '')
+  }, [doc.id, doc.name, editing])
+
+  useEffect(() => {
+    if (!editing) return
+    input.current?.focus()
+    input.current?.select()
+  }, [editing])
+
+  const begin = () => {
+    if (!canEdit) return
+    original.current = doc.name ?? ''
+    setDraft(doc.name ?? '')
+    setEditing(true)
+  }
+  const cancel = () => {
+    renameFile(original.current)
+    setDraft(original.current)
+    setEditing(false)
+  }
+
+  if (editing) {
+    return <input
+      ref={input}
+      data-testid="canvas-title-input"
+      aria-label="Canvas name"
+      value={draft}
+      onChange={(event) => {
+        setDraft(event.target.value)
+        renameFile(event.target.value)
+      }}
+      onBlur={() => setEditing(false)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          event.currentTarget.blur()
+        } else if (event.key === 'Escape') {
+          event.preventDefault()
+          cancel()
+        }
+      }}
+      className="h-7 w-[clamp(120px,32vw,420px)] min-w-0 rounded-md border border-primary bg-background px-1.5 text-[13.5px] font-semibold text-foreground outline-none"
+    />
+  }
+
+  const name = doc.name || 'untitled'
+  return <button
+    type="button"
+    data-testid="canvas-title"
+    title={canEdit ? `${name} — click to rename` : `${name} — view only`}
+    aria-label={canEdit ? `Rename Canvas ${name}` : `Canvas ${name}, view only`}
+    disabled={!canEdit}
+    onClick={begin}
+    className="min-w-0 max-w-[min(42vw,520px)] truncate rounded-md px-1 py-0.5 text-left text-[13.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-default disabled:hover:bg-transparent"
+  >
+    {name}
+  </button>
+}
+
+export function CanvasOverflowMenu({ onShowInWorkspace, onCanvasSettings, onRunHistory, onVersionHistory, onNativeExport, onCopy, copyable }: {
+  onShowInWorkspace: () => void
+  onCanvasSettings: () => void
+  onRunHistory: () => void
+  onVersionHistory: () => void
+  onNativeExport: () => void
+  onCopy: () => void
+  copyable: boolean
+}) {
+  const doc = useStore((s) => s.doc)
+  const currentDraftId = useStore((s) => s.currentDraftId)
+  const canvasRole = useStore((s) => s.canvasRole)
+  const deleteFile = useStore((s) => s.deleteFile)
+  const discardLocalDraft = useStore((s) => s.discardLocalDraft)
+
+  return <DropdownMenu modal={false}>
+    <DropdownMenuTrigger asChild>
+      <Button data-testid="canvas-menu" variant="ghost" size="icon" aria-label="Canvas actions" title="Canvas actions" className="h-7 w-7 shrink-0">
+        <Icon name="more" size={15} />
+      </Button>
+    </DropdownMenuTrigger>
+    <DropdownMenuContent align="start" className="w-[210px]">
+      <DropdownMenuItem onSelect={onShowInWorkspace}><Icon name="grid" size={14} /> Show in Workspace</DropdownMenuItem>
+      <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
+      <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
+      <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
+      {canvasRole === 'owner' && <DropdownMenuSeparator />}
+      {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
+    </DropdownMenuContent>
+  </DropdownMenu>
 }
 
 function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: string; onClick: () => void; disabled?: boolean }) {
@@ -296,17 +352,4 @@ function IconBtn({ name, label, onClick, disabled }: { name: IconName; label: st
       <Icon name={name} size={14} />
     </Button>
   )
-}
-
-function ThemeToggle() {
-  const [dark, setDark] = useState(() => resolvedTheme() === 'dark')
-  useEffect(() => {
-    const sync = () => setDark(resolvedTheme() === 'dark')
-    window.addEventListener('dp-theme-change', sync)
-    const mql = window.matchMedia('(prefers-color-scheme: dark)')
-    mql.addEventListener('change', sync)  // reflect OS changes while in 'system' mode
-    return () => { window.removeEventListener('dp-theme-change', sync); mql.removeEventListener('change', sync) }
-  }, [])
-  // moon = "switch to dark" (shown in light); sun = "switch to light" (shown in dark)
-  return <IconBtn name={dark ? 'sun' : 'moon'} label={dark ? 'Switch to light theme' : 'Switch to dark theme'} onClick={toggleTheme} />
 }

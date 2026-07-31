@@ -58,8 +58,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
   async function setTheme(page: Page, theme: Theme): Promise<void> {
     const html = page.locator('html')
     const isDark = (await html.getAttribute('data-theme')) === 'dark'
-    if (theme === 'dark' && !isDark) await page.getByRole('button', { name: 'Switch to dark theme' }).click()
-    if (theme === 'light' && isDark) await page.getByRole('button', { name: 'Switch to light theme' }).click()
+    if ((theme === 'dark') !== isDark) {
+      await page.getByTestId('app-menu').click()
+      await page.getByRole('menuitem', { name: 'Appearance' }).hover()
+      await page.getByRole('menuitemradio', { name: theme === 'dark' ? 'Dark' : 'Light' }).click()
+    }
     if (theme === 'dark') await expect(html).toHaveAttribute('data-theme', 'dark')
     else await expect(html).not.toHaveAttribute('data-theme', 'dark')
   }
@@ -210,7 +213,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const [localJobsTime, localHistoryTime] = await page.evaluate(
       (stamps) => stamps.map((stamp) => new Date(stamp).toLocaleString()), [job!.createdAt, historyRow.createdAt],
     )
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const historyDialog = page.getByRole('dialog').filter({
       has: page.getByRole('heading', { name: 'Run history' }),

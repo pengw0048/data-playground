@@ -13,8 +13,8 @@ async function fresh(page: Page) {
   if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('file-menu').click()
-  await page.getByText('New file').click()
+  await page.getByTestId('app-menu').click()
+  await page.getByText('New Canvas').click()
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }
@@ -35,9 +35,8 @@ async function openSettings(page: Page) {
  *  `color-contrast` is excluded: muted 9.5–11px labels fail AA by design today and are deferred with
  *  the typography follow-up called out in #118. Semantics / names / focus / nested-interactive stay gated. */
 async function expectNoSeriousAxe(page: Page, label: string, opts: { keepOverlay?: boolean } = {}) {
-  // File / app menus are radix `role="menu"` with a rename <input> and plain <button> rows — that fails
-  // aria-required-children while open. Escape them closed before scanning, unless the surface under
-  // test IS an overlay (Settings dialog, error toast).
+  // Radix menus are transient overlays. Escape them closed before scanning, unless the surface under
+  // test is itself an overlay (Settings dialog, error toast).
   if (!opts.keepOverlay) {
     await page.keyboard.press('Escape')
     await expect.poll(() => page.locator('[role="menu"]').count()).toBe(0)
@@ -145,12 +144,12 @@ test.describe('accessibility gate @ux-smoke', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     // Rename so the Workspace Open control is unambiguous (many untitled canvases accumulate per e2e DB).
     const canvasName = `a11y-keyboard-${Date.now()}`
-    await page.getByTestId('file-menu').click()
-    const nameInput = page.getByPlaceholder('untitled')
+    await page.getByTestId('canvas-title').click()
+    const nameInput = page.getByRole('textbox', { name: 'Canvas name' })
     await expect(nameInput).toBeVisible()
     await nameInput.fill(canvasName)
-    await page.keyboard.press('Escape') // close menu
-    await expect(page.getByTestId('file-menu')).toContainText(canvasName)
+    await page.keyboard.press('Enter')
+    await expect(page.getByTestId('canvas-title')).toContainText(canvasName)
     await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
     const canvasHash = await page.evaluate(() => location.hash)
     await backToWorkspace(page)
@@ -184,8 +183,7 @@ test.describe('accessibility gate @ux-smoke', () => {
   })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
-    // Build the target canvas via the API so the keyboard assertion doesn't ride the fragile
-    // file-menu rename, which flakes when a just-created canvas re-renders the menu away.
+    // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
     const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
     if (await firstRun.isVisible().catch(() => false)) await firstRun.click()

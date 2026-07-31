@@ -29,8 +29,8 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to Workspace').click()
+    await page.getByTestId('canvas-menu').click()
+    await page.getByText('Show in Workspace').click()
 
     await page.getByRole('navigation', { name: 'Workspace path' }).getByRole('button', { name: parent }).click()
     await page.getByRole('button', { name: `More actions for ${child}` }).click()
@@ -69,8 +69,8 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.getByLabel('Canvas name').fill(canvas)
     await page.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to Workspace').click()
+    await page.getByTestId('canvas-menu').click()
+    await page.getByText('Show in Workspace').click()
 
     await page.getByRole('button', { name: `More actions for ${canvas}` }).click()
     await page.getByRole('menuitem', { name: 'Move' }).click()

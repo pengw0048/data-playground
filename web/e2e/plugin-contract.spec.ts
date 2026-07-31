@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test'
 
 test('the installed descriptor fixture survives registration, editing, reload, and preview', async ({ page, request }) => {
   // The default E2E user is shared across workers. A worker opening its newest canvas can otherwise
-  // briefly join this contract canvas and race its own "New file" transition into the same Yjs room.
+  // briefly join this contract canvas and race its own "New Canvas" transition into the same Yjs room.
   const createdUser = await request.post('/api/users', {
     data: { name: `Descriptor contract ${Date.now()}` },
     headers: { 'X-DP-User': 'local' },

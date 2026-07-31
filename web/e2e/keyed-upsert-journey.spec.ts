@@ -46,8 +46,11 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
   async function setTheme(page: Page, theme: Theme): Promise<void> {
     const html = page.locator('html')
     const isDark = (await html.getAttribute('data-theme')) === 'dark'
-    if (theme === 'dark' && !isDark) await page.getByRole('button', { name: 'Switch to dark theme' }).click()
-    if (theme === 'light' && isDark) await page.getByRole('button', { name: 'Switch to light theme' }).click()
+    if ((theme === 'dark') !== isDark) {
+      await page.getByTestId('app-menu').click()
+      await page.getByRole('menuitem', { name: 'Appearance' }).hover()
+      await page.getByRole('menuitemradio', { name: theme === 'dark' ? 'Dark' : 'Light' }).click()
+    }
     if (theme === 'dark') await expect(html).toHaveAttribute('data-theme', 'dark')
     else await expect(html).not.toHaveAttribute('data-theme', 'dark')
   }

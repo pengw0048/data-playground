@@ -77,23 +77,31 @@ test('reports a stopped hub within 5s and recovers the local draft after restart
       .toHaveAttribute('aria-disabled', 'true')
 
     const recoveredName = `Issue 844 recovered ${Date.now()}`
-    await page.getByTestId('file-menu').click()
-    await page.getByPlaceholder('untitled').fill(recoveredName)
+    await page.getByTestId('canvas-title').click()
+    await page.getByRole('textbox', { name: 'Canvas name' }).fill(recoveredName)
+    await page.keyboard.press('Enter')
     await expect(page.getByTestId('autosave')).toContainText(/offline/i)
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
     const retry = page.getByRole('button', { name: `Retry local draft ${recoveredName}` })
     await expect(retry).toBeDisabled()
 
     await startHub()
 
-    await expect(page.getByText('Kernel offline — your work is cached locally.')).toBeHidden({ timeout: 5_000 })
-    await expect(page.getByTestId('autosave')).toHaveText(/saved locally/)
     await expect(retry).toBeEnabled()
     await retry.click()
+    await expect(retry).toHaveCount(0, { timeout: 8_000 })
+    await expect.poll(async () => {
+      const response = await page.request.get(`${base}/api/canvas/${canvasId}`)
+      return response.ok() ? ((await response.json()) as { name: string }).name : null
+    }).toBe(recoveredName)
+    await page.goto(`${base}/#/canvas/${encodeURIComponent(canvasId)}`)
+    await expect(page.getByTestId('canvas-title')).toContainText(recoveredName)
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
     await expect(page.getByRole('button', { name: 'Rerun all' })).toBeEnabled()
 
     await page.reload()
-    await expect(page.getByTestId('file-menu')).toContainText(recoveredName)
+    await expect(page.getByTestId('canvas-title')).toContainText(recoveredName)
     await expect(source).toBeVisible()
   } finally {
     await killHub()

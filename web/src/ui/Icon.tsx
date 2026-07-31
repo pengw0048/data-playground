@@ -8,8 +8,10 @@ export type IconName =
   | 'duplicate' | 'export' | 'import' | 'trash' | 'search' | 'sparkle' | 'grid'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
   | 'minus' | 'link' | 'settings' | 'undo' | 'redo' | 'sun' | 'moon' | 'users' | 'bell' | 'maximize' | 'minimize'
+  | 'menu'
 
 const P: Record<IconName, JSX.Element> = {
+  menu: <><path d="M3 4h10M3 8h10M3 12h10" /></>,
   sun: <><circle cx="8" cy="8" r="3.1" /><path d="M8 1v1.8M8 13.2V15M15 8h-1.8M2.8 8H1M12.9 3.1l-1.3 1.3M4.4 11.6l-1.3 1.3M12.9 12.9l-1.3-1.3M4.4 4.4 3.1 3.1" /></>,
   moon: <path d="M13.5 9.3A5.6 5.6 0 1 1 6.7 2.5 4.4 4.4 0 0 0 13.5 9.3Z" />,
   users: <><circle cx="6" cy="5.4" r="2.4" /><path d="M1.6 13.4c0-2.5 2-4 4.4-4s4.4 1.5 4.4 4" /><path d="M10.8 3.3a2.3 2.3 0 0 1 0 4.3M14.4 13.4c0-2-1-3.2-2.7-3.8" /></>,
