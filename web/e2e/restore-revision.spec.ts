@@ -14,6 +14,14 @@ const DETAIL = (revisionId: string, rows: number) => ({
   },
 })
 
+async function expectExactRevision(page: import('@playwright/test').Page, revisionId: string) {
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  const details = page.getByTestId('detail-dataset-details')
+  const identity = details.getByTestId('dataset-version-identity')
+  if (!await identity.isVisible()) await details.locator('summary').click()
+  await expect(identity).toContainText(`stable-dataset@${revisionId}`)
+}
+
 async function openHistory(page: import('@playwright/test').Page) {
   const catalog = await page.request.get('/api/catalog/tables?limit=1')
   expect(catalog.ok()).toBe(true)
@@ -35,9 +43,7 @@ async function openHistory(page: import('@playwright/test').Page) {
   await (await workspaceResource(page, 'dataset', dataset.name)).click()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
   await page.getByRole('link', { name: 'Open revision rev-old' }).click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText(
-    'exact revision stable-dataset@rev-old',
-  )
+  await expectExactRevision(page, 'rev-old')
 }
 
 test('restores an old revision as a new head and reopens the exact result', async ({ page }) => {
@@ -57,9 +63,7 @@ test('restores an old revision as a new head and reopens the exact result', asyn
   await dialog.getByTestId('restore-revision-confirm').click()
 
   // Completion reopens the exact new revision through the ordinary Catalog surface.
-  await expect(page.getByLabel('Dataset preview scope')).toContainText(
-    'exact revision stable-dataset@rev-new',
-  )
+  await expectExactRevision(page, 'rev-new')
   await expect(dialog).toBeHidden()
 })
 
@@ -76,7 +80,6 @@ test('reports a moving-head conflict and publishes nothing', async ({ page }) =>
   const dialog = page.getByRole('dialog', { name: 'Restore revision as new head' })
   await dialog.getByTestId('restore-revision-confirm').click()
   await expect(dialog.getByRole('alert')).toContainText(/current head changed/i)
-  await expect(page.getByLabel('Dataset preview scope')).not.toContainText(
-    'exact revision stable-dataset@rev-new',
-  )
+  await expectExactRevision(page, 'rev-old')
+  await expect(page.getByTestId('dataset-version-identity')).not.toContainText('stable-dataset@rev-new')
 })

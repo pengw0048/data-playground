@@ -163,8 +163,11 @@ test('certifies the real Write Inspector merge journey and exact revision histor
       })}`,
     )
     await exactDataset.click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText(
-      `exact revision ${final!.datasetId}@${final!.revisionId}`,
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    const datasetDetails = page.getByTestId('detail-dataset-details')
+    await datasetDetails.locator('summary').click()
+    await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
+      `${final!.datasetId}@${final!.revisionId}`,
     )
     await expect(page.getByTestId('revision-detail')).toContainText(`Parent ${base.revisionId}`)
 

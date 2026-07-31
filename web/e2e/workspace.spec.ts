@@ -285,8 +285,11 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByText('rev-1')).toBeVisible()
 
   await page.getByRole('link', { name: 'Open revision rev-2' }).click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText(
-    'exact revision stable-dataset@rev-2',
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  const datasetDetails = page.getByTestId('detail-dataset-details')
+  await datasetDetails.locator('summary').click()
+  await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
+    'stable-dataset@rev-2',
   )
   const technicalRevision = page.getByTestId('revision-detail')
   await expect(technicalRevision.getByText(/Parent rev-1 · producer append/)).toBeVisible()
