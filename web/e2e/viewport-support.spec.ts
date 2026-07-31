@@ -472,9 +472,8 @@ test.describe('minimum viewport support', () => {
     await page.getByTestId('app-menu').click()
     const appMenu = page.getByRole('menu', { name: 'Data Playground menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
-    for (const detail of ['runs and background tasks', 'my background task results']) {
-      await expect(appMenu.getByText(detail, { exact: true })).toBeVisible()
-    }
+    await expect(appMenu.getByText('runs and background tasks', { exact: true })).toBeVisible()
+    await expect(appMenu.getByRole('menuitem', { name: 'Inbox', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
     await page.getByTestId('canvas-menu').click()
     await expectFullyInViewport(page, page.getByRole('menu', { name: 'Canvas actions' }), '1024px Canvas actions menu')

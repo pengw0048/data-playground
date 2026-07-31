@@ -6,8 +6,6 @@ const themeValues = new Map<string, string>()
 
 const state = vi.hoisted(() => ({
   setJobsQuery: vi.fn(),
-  setInboxQuery: vi.fn(),
-  inboxQuery: '',
   newFile: vi.fn(),
   kernelInfo: { capabilities: [] as string[] },
   doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' },
@@ -64,16 +62,12 @@ describe('AppMenu', () => {
     expect(trigger.querySelector('svg')).not.toBeNull()
     await user.click(trigger)
 
-    for (const [label, detail] of [
-      ['Jobs', 'runs and background tasks'],
-      ['Inbox', 'my background task results'],
-    ] as const) {
-      expect(screen.getByRole('menuitem', { name: label })).toBeInTheDocument()
-      const explanation = screen.getByText(detail)
-      expect(explanation).toHaveAttribute('aria-hidden', 'true')
-      expect(explanation).toHaveClass('whitespace-normal')
-      expect(explanation).not.toHaveClass('truncate')
-    }
+    expect(screen.getByRole('menuitem', { name: 'Jobs' })).toBeInTheDocument()
+    const explanation = screen.getByText('runs and background tasks')
+    expect(explanation).toHaveAttribute('aria-hidden', 'true')
+    expect(explanation).toHaveClass('whitespace-normal')
+    expect(explanation).not.toHaveClass('truncate')
+    expect(screen.queryByRole('menuitem', { name: 'Inbox' })).not.toBeInTheDocument()
     expect(screen.queryByText(/terminal outcomes/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/audit trail/i)).not.toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Back to Workspace' })).toBeInTheDocument()
@@ -148,11 +142,13 @@ describe('CanvasTitle', () => {
     await user.type(staleInput, 'Canvas A in progress')
 
     state.doc = { id: 'canvas-b', name: 'Canvas B original' }
+    state.renameFile.mockClear()
+    fireEvent.change(staleInput, { target: { value: 'Late stale Canvas A edit' } })
+    expect(state.renameFile).not.toHaveBeenCalled()
     rerender(<CanvasTitle />)
 
     expect(screen.queryByRole('textbox', { name: 'Canvas name' })).not.toBeInTheDocument()
     expect(screen.getByTestId('canvas-title')).toHaveTextContent('Canvas B original')
-    state.renameFile.mockClear()
     fireEvent.keyDown(staleInput, { key: 'Escape' })
     expect(state.renameFile).not.toHaveBeenCalled()
   })

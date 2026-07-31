@@ -185,8 +185,6 @@ export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
   onNativeImport: () => void
 }) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
-  const setInboxQuery = useStore((s) => s.setInboxQuery)
-  const inboxQuery = useStore((s) => s.inboxQuery)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   const [themeMode, setVisibleThemeMode] = useState<ThemeMode>(getThemeMode)
@@ -212,7 +210,6 @@ export function AppMenu({ onWorkspace, onSettings, onImport, onNativeImport }: {
         {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setInboxQuery(inboxQuery)}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my background task results" /></DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>
           <DropdownMenuSubTrigger><Icon name="sun" size={14} /> Appearance</DropdownMenuSubTrigger>
@@ -247,6 +244,11 @@ export function CanvasTitle() {
   const original = useRef(doc.name ?? '')
   const editingCanvasId = useRef(doc.id)
   const input = useRef<HTMLInputElement | null>(null)
+  const renderedCanvasId = doc.id
+  const ownsActiveCanvas = () => (
+    editingCanvasId.current === renderedCanvasId
+    && useStore.getState().doc.id === renderedCanvasId
+  )
 
   useEffect(() => {
     if (editingCanvasId.current !== doc.id) {
@@ -278,22 +280,26 @@ export function CanvasTitle() {
   const cancel = () => {
     // A stale input event can arrive after navigation but before React removes the old element.
     // It must not rename the newly active Canvas.
-    if (editingCanvasId.current === doc.id) renameFile(original.current)
+    if (!ownsActiveCanvas()) return
+    renameFile(original.current)
     setDraft(doc.name ?? '')
     setEditing(false)
   }
 
-  if (editing) {
+  if (editing && editingCanvasId.current === renderedCanvasId) {
     return <input
       ref={input}
       data-testid="canvas-title-input"
       aria-label="Canvas name"
       value={draft}
       onChange={(event) => {
+        if (!ownsActiveCanvas()) return
         setDraft(event.target.value)
         renameFile(event.target.value)
       }}
-      onBlur={() => setEditing(false)}
+      onBlur={() => {
+        if (ownsActiveCanvas()) setEditing(false)
+      }}
       onKeyDown={(event) => {
         if (event.key === 'Enter') {
           event.preventDefault()
