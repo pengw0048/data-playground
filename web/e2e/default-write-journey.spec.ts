@@ -17,6 +17,10 @@ import { createServer } from 'node:net'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
+import {
+  settleAcceptanceScreenshot,
+  type AcceptanceScreenshotSurface,
+} from './support/acceptance-screenshot'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
@@ -67,7 +71,12 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     else await expect(html).not.toHaveAttribute('data-theme', 'dark')
   }
 
-  async function shoot(page: Page, theme: Theme, surface: string): Promise<void> {
+  async function shoot(
+    page: Page,
+    theme: Theme,
+    surface: AcceptanceScreenshotSurface,
+  ): Promise<void> {
+    await settleAcceptanceScreenshot(page, surface)
     await mkdir(SCREENSHOT_DIR, { recursive: true })
     await page.screenshot({ path: path.join(SCREENSHOT_DIR, `1440x900-${theme}-${surface}.png`) })
   }
