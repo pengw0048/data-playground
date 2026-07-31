@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, KernelError, type CanvasFile } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
-import type { SchemaCompatibility, TransformLibraryDetail, TransformLibraryEntry, WorkspaceResource } from '../types/api'
+import type {
+  InstalledProcessorSource,
+  SchemaCompatibility,
+  TransformLibraryDetail,
+  TransformLibraryEntry,
+  WorkspaceResource,
+} from '../types/api'
 import type { CanvasDoc, CanvasNode } from '../types/graph'
 import { compareSchemas } from '../lib/schemaCompatibility'
 import { Icon } from '../ui/Icon'
@@ -168,6 +174,35 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
   const [target, setTarget] = useState<{ doc: CanvasDoc; node: CanvasNode; file: CanvasFile } | null>(null)
   const [targetError, setTargetError] = useState<string | null>(null)
   const [targetEpoch, setTargetEpoch] = useState(0)
+  const sourceKey = selected ? `${detail.id}\u0000${selected.version}` : ''
+  const [installedSource, setInstalledSource] = useState<{
+    key: string
+    value?: InstalledProcessorSource
+    loading: boolean
+    error: string
+  }>({ key: '', loading: false, error: '' })
+  useEffect(() => {
+    if (!sourceKey || !selected || detail.provenance !== 'plugin') {
+      setInstalledSource({ key: sourceKey, loading: false, error: '' })
+      return
+    }
+    let live = true
+    setInstalledSource({ key: sourceKey, loading: true, error: '' })
+    void api.installedProcessorSource(detail.id, selected.version).then((value) => {
+      if (live) setInstalledSource({ key: sourceKey, value, loading: false, error: '' })
+    }).catch((caught) => {
+      if (!live) return
+      setInstalledSource({
+        key: sourceKey,
+        loading: false,
+        error: caught instanceof KernelError && caught.status === 404 ? '' : errorMessage(caught),
+      })
+    })
+    return () => { live = false }
+  }, [detail.id, detail.provenance, selected?.version, sourceKey])
+  const exactSource = installedSource.key === sourceKey
+    ? installedSource
+    : { key: sourceKey, loading: detail.provenance === 'plugin', error: '' }
   useEffect(() => {
     let live = true
     setTarget(null); setTargetError(null)
@@ -261,6 +296,11 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
     <SchemaBlock label="Output schema" columns={selected.outputSchema} />
     <section className="mt-4"><h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Requirements</h3>
       <div className="mt-1.5 rounded-md border border-border bg-background p-2 font-mono text-[11px] text-foreground">{selected.requirements.length ? selected.requirements.join('\n') : 'None'}</div></section>
+    <ImplementationSource
+      source={exactSource.value}
+      loading={exactSource.loading}
+      error={exactSource.error}
+    />
     {detail.provenance === 'promoted' && <section className="mt-4"><h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Retention</h3>
       <p className="mt-1 text-[11px] text-muted-foreground">{totalRetention ? `${totalRetention} durable references prevent deletion` : 'No retained Canvas, snapshot, or execution manifest references.'}</p>
       <div className="mt-1 grid grid-cols-3 gap-1 text-center text-[10px]"><span className="rounded bg-muted p-1.5">Canvas {selected.retention.canvas}</span><span className="rounded bg-muted p-1.5">Snapshots {selected.retention.canvasVersion}</span><span className="rounded bg-muted p-1.5">Runs {selected.retention.executionManifest}</span></div>
@@ -312,6 +352,41 @@ function VersionList({ versions, selected, onSelect }: { versions: TransformLibr
 function SchemaBlock({ label, columns }: { label: string; columns: TransformLibraryEntry['inputSchema'] }) {
   return <section className="mt-4"><h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">{label}</h3>
     <div className="mt-1.5 max-h-40 overflow-auto rounded-md border border-border bg-background">{columns.length ? columns.map((column) => <div key={column.fieldId ?? column.name} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-border px-2 py-1.5 text-[11px] last:border-b-0"><span className="truncate font-mono">{column.name}</span><span className="text-muted-foreground">{column.type}{column.nullable === false ? ' · required' : ''}</span></div>) : <div className="p-2 text-[11px] text-muted-foreground">No schema declared.</div>}</div>
+  </section>
+}
+
+function ImplementationSource({
+  source,
+  loading,
+  error,
+}: {
+  source?: InstalledProcessorSource
+  loading: boolean
+  error: string
+}) {
+  return <section aria-label="Implementation source" className="mt-4">
+    <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
+      Implementation source
+    </h3>
+    {source ? <div className="mt-1.5 rounded-md border border-border bg-background p-2">
+      <pre className="max-h-80 overflow-auto text-[11px] leading-relaxed text-foreground">
+        <code>{source.source}</code>
+      </pre>
+      <details className="mt-2 border-t border-border pt-2 text-[10.5px] text-muted-foreground">
+        <summary className="cursor-pointer font-medium text-foreground">Source integrity</summary>
+        <div className="mt-1">
+          <span className="mr-2 uppercase">{source.language}</span>
+          <span className="break-all font-mono">SHA-256 {source.sha256}</span>
+        </div>
+      </details>
+    </div> : loading ? <div role="status" className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
+      Loading exact implementation source…
+    </div> : error ? <div role="alert" className="mt-1.5 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">
+      <strong>Implementation source could not be loaded.</strong> {error}
+    </div> : <div className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
+      <strong className="text-foreground">Implementation source unavailable.</strong>{' '}
+      This exact registry version does not publish implementation source.
+    </div>}
   </section>
 }
 

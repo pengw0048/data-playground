@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   transformLibrary: vi.fn(), transformLibraryDetail: vi.fn(), workspaceBrowse: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceAddTransform: vi.fn(), deleteTransformVersion: vi.fn(),
-  getCanvas: vi.fn(),
+  installedProcessorSource: vi.fn(), getCanvas: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   transformLibraryQuery: '', transformResourceId: 'tr_exact', transformVersion: 'v1',
@@ -70,6 +70,90 @@ describe('TransformsLibrary', () => {
     mocks.deleteTransformVersion.mockResolvedValue({ ok: true, deleted: true })
   })
   afterEach(() => cleanup())
+
+  it('shows the exact source published by an installed Luma plugin version', async () => {
+    const luma = {
+      ...entry('v2'),
+      id: 'luma.lax.add-height-width',
+      title: 'Add Height/Width',
+      provenance: 'plugin' as const,
+    }
+    store.transformResourceId = luma.id
+    store.transformVersion = luma.version
+    mocks.transformLibrary.mockResolvedValue({ items: [luma], hasMore: false, nextCursor: null })
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: luma.id, provenance: 'plugin', requestedVersion: luma.version, versions: [luma],
+    })
+    mocks.installedProcessorSource.mockResolvedValue({
+      processorId: luma.id,
+      version: luma.version,
+      language: 'python',
+      source: 'def processor_factory(params):\n    return add_height_width',
+      sha256: 'a'.repeat(64),
+    })
+
+    render(<TransformsLibrary />)
+
+    await screen.findByText('def processor_factory(params)', { exact: false })
+    const source = screen.getByRole('region', { name: 'Implementation source' })
+    expect(source).toHaveTextContent('def processor_factory(params)')
+    expect(source).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)
+    expect(mocks.installedProcessorSource).toHaveBeenCalledWith(luma.id, luma.version)
+  })
+
+  it('states when an exact plugin version does not publish implementation source', async () => {
+    const plugin = { ...entry(), id: 'plugin.no-source', provenance: 'plugin' as const }
+    store.transformResourceId = plugin.id
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: plugin.id, provenance: 'plugin', requestedVersion: plugin.version, versions: [plugin],
+    })
+    mocks.installedProcessorSource.mockRejectedValue(new KernelError(404, 'not found'))
+
+    render(<TransformsLibrary />)
+
+    await screen.findByText('Implementation source unavailable.')
+    const source = screen.getByRole('region', { name: 'Implementation source' })
+    expect(source).toHaveTextContent('Implementation source unavailable.')
+    expect(source).toHaveTextContent('This exact registry version does not publish implementation source.')
+    expect(source).not.toHaveTextContent('not found')
+  })
+
+  it('never displays source from the previously selected exact version', async () => {
+    let resolveV2: ((value: {
+      processorId: string; version: string; language: string; source: string; sha256: string
+    }) => void) | undefined
+    const plugin = (version: string) => ({
+      ...entry(version),
+      id: 'plugin.versioned',
+      provenance: 'plugin' as const,
+    })
+    store.transformResourceId = 'plugin.versioned'
+    mocks.transformLibraryDetail.mockImplementation((_id: string, version: string) => Promise.resolve({
+      id: 'plugin.versioned', provenance: 'plugin', requestedVersion: version, versions: [plugin(version)],
+    }))
+    mocks.installedProcessorSource.mockImplementation((_id: string, version: string) => (
+      version === 'v1'
+        ? Promise.resolve({
+            processorId: 'plugin.versioned', version, language: 'python',
+            source: 'SOURCE_FROM_V1', sha256: '1'.repeat(64),
+          })
+        : new Promise((resolve) => { resolveV2 = resolve })
+    ))
+    const { rerender } = render(<TransformsLibrary />)
+    expect(await screen.findByText('SOURCE_FROM_V1')).toBeVisible()
+
+    store.transformVersion = 'v2'
+    rerender(<TransformsLibrary />)
+
+    expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
+    expect(await screen.findByText('Loading exact implementation source…')).toBeVisible()
+    resolveV2?.({
+      processorId: 'plugin.versioned', version: 'v2', language: 'python',
+      source: 'SOURCE_FROM_V2', sha256: '2'.repeat(64),
+    })
+    expect(await screen.findByText('SOURCE_FROM_V2')).toBeVisible()
+    expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
+  })
 
   it('uses only an explicitly selected editable Canvas and focuses after server confirmation', async () => {
     render(<TransformsLibrary />)
