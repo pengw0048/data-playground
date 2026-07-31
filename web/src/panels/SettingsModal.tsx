@@ -66,6 +66,21 @@ type ConflictRecovery = {
 type PluginEdits = Record<string, Record<string, unknown>>
 type CanonicalPluginValue = { valid: true; value: unknown } | { valid: false }
 
+function destinationRootError(backend: string, value: string): string {
+  const root = value.trim()
+  if (!root) return ''
+  if (backend === 'local') {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(root)
+      ? 'Enter a local filesystem path, not a URI.'
+      : ''
+  }
+  const scheme = backend === 's3' ? 's3' : backend === 'gs' ? 'gs' : ''
+  if (!scheme) return 'Choose a supported destination backend.'
+  return new RegExp(`^${scheme}:\\/\\/[^/\\s]+(?:\\/[^\\s]*)?$`).test(root)
+    ? ''
+    : `Enter a ${scheme}:// bucket and optional prefix.`
+}
+
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 
 const pluginState = (plugin: PluginInfo): NonNullable<PluginInfo['state']> =>
@@ -301,6 +316,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   const changesRef = useRef(changes)
   changesRef.current = changes
   const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
+  const destRootError = destinationRootError(dest.backend, dest.root)
+  const canAddDestination = Boolean(dest.name.trim() && dest.root.trim() && !destRootError)
   const destinationDraftDirty = dest.name !== '' || dest.root !== '' || dest.backend !== 'local' || dest.credId !== NO_CRED
   const originalCred = credForm.id ? creds.find((credential) => credential.id === credForm.id) : null
   const credentialDraftDirty = credForm.id
@@ -417,8 +434,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     }
   }
   const addDest = () => {
+    if (!canAddDestination) return
     const name = dest.name.trim(), root = dest.root.trim()
-    if (!name || !root) return
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.abs(Math.floor(Math.random() * 1e6))}`
     const credId = dest.backend !== 'local' && dest.credId !== NO_CRED ? dest.credId : null
     setG((prev) => ({ ...prev, destinations: [...dests, { id, name, backend: dest.backend, root, credId }] }))
@@ -782,11 +799,13 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         <SelectItem value="gs">gs</SelectItem>
                       </SelectContent>
                     </Select>
-                    <Input value={dest.root} onChange={(e) => setDest({ ...dest, root: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') addDest() }}
+                    <Input value={dest.root} onChange={(e) => setDest({ ...dest, root: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter' && canAddDestination) addDest() }}
+                      aria-label="Destination root or prefix" aria-invalid={Boolean(destRootError)} aria-describedby={destRootError ? 'destination-root-error' : undefined}
                       placeholder={dest.backend === 'local' ? '/path/to/dir' : `${dest.backend}://bucket/prefix`}
                       className="min-w-0 flex-1" />
-                    <Button onClick={addDest} className="shrink-0">Add</Button>
+                    <Button onClick={addDest} disabled={!canAddDestination} className="shrink-0">Add</Button>
                   </div>
+                  {destRootError && <div id="destination-root-error" role="alert" className="mt-1.5 text-[10.5px] text-destructive">{destRootError}</div>}
                   {dest.backend !== 'local' && (
                     <div className="mt-1.5">
                       <Select value={dest.credId} onValueChange={(v) => setDest({ ...dest, credId: v })}>

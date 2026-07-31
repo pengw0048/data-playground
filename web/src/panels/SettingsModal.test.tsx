@@ -916,4 +916,33 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByText(/Restart the Data Playground server after adding this destination/i)).toBeVisible()
     expect(screen.getByText(/restarting only the canvas kernel is not enough/i)).toBeVisible()
   })
+
+  it('labels and validates destination roots before adding them', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+
+    const name = screen.getByLabelText('Destination name')
+    const root = screen.getByLabelText('Destination root or prefix')
+    const add = screen.getByRole('button', { name: 'Add' })
+    expect(add).toBeDisabled()
+
+    fireEvent.change(name, { target: { value: 'Local exports' } })
+    fireEvent.change(root, { target: { value: '/tmp/exports' } })
+    expect(add).toBeEnabled()
+    fireEvent.change(root, { target: { value: 's3://bucket/exports' } })
+    expect(add).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Enter a local filesystem path, not a URI.')
+
+    fireEvent.click(screen.getByLabelText('Destination backend'))
+    fireEvent.click(await screen.findByRole('option', { name: 's3' }))
+    expect(add).toBeEnabled()
+    expect(screen.queryByRole('alert')).toBeNull()
+    fireEvent.change(root, { target: { value: 'gs://bucket/exports' } })
+    expect(add).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Enter a s3:// bucket and optional prefix.')
+
+    fireEvent.click(screen.getByLabelText('Destination backend'))
+    fireEvent.click(await screen.findByRole('option', { name: 'gs' }))
+    expect(add).toBeEnabled()
+  })
 })
