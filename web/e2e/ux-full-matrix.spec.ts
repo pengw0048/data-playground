@@ -21,8 +21,8 @@ async function namedTable(request: APIRequestContext, name: string) {
 async function freshSource(page: Page, uri: string) {
   await page.goto('/')
   const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('file-menu').click()
-  await page.getByText('New file').click()
+  await page.getByTestId('app-menu').click()
+  await page.getByText('New Canvas').click()
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await page.getByRole('button', { name: 'Sources & sinks', exact: true }).click()
   await page.locator('.dp-panel', { hasText: 'source' }).last().getByText('source', { exact: true }).click()
@@ -92,8 +92,8 @@ test.describe('full researcher acceptance matrix', () => {
       return route.fulfill({ status: 403, body: JSON.stringify({ detail: 'forbidden' }) })
     }
     await page.route('**/api/canvas', denyNewCanvas)
-    await page.getByTestId('file-menu').click()
-    await page.getByText('New file').click()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('New Canvas').click()
     await expect(page.getByTestId('toast').filter({ hasText: 'permission' })).toContainText('permission')
     await page.unroute('**/api/canvas', denyNewCanvas)
   })

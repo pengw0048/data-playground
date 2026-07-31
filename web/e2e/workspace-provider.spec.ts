@@ -503,7 +503,7 @@ test.describe('provider Workspace Source acceptance', () => {
       return (await response.json()).some((item: { runId?: string }) => item.runId === runId)
     }).toBe(true)
 
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const history = page.getByRole('dialog').filter({
       has: page.getByRole('heading', { name: 'Run history' }),
@@ -528,8 +528,8 @@ test.describe('provider Workspace Source acceptance', () => {
 
     // The Canvas location came from the stable overlay parent. Returning uses that opaque id and
     // never writes to the provider.
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to Workspace', { exact: true }).click()
+    await page.getByTestId('canvas-menu').click()
+    await page.getByText('Show in Workspace', { exact: true }).click()
     await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
     expect(writes).toEqual(expect.arrayContaining([
       '/api/workspace/canvases',
@@ -565,8 +565,8 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect.poll(() => unavailableIntercepted).toBe(true)
     await expect(page.getByText('Its Workspace location is unavailable.', { exact: true })).toBeVisible()
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to Workspace', { exact: true }).click()
+    await page.getByTestId('canvas-menu').click()
+    await page.getByText('Show in Workspace', { exact: true }).click()
     await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
     expect(writes).toEqual(writesBeforeUnavailableReturn)
 

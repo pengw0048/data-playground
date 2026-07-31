@@ -78,10 +78,16 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
     </p>
   }
 
+  const ancestors = displayAncestors(state.ancestors)
+  // A root-only "Workspace" row repeats the global destination without communicating location.
+  // Keep the resolver active for Show in Workspace, but render a path only when it has a named parent.
+  if (ancestors.length === 0) return null
+
   return (
     <nav aria-label="Canvas Workspace location" className="flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap text-[11px] text-muted-foreground">
+      <span aria-hidden>In</span>
       <button type="button" onClick={() => onNavigate(null)} className="shrink-0 hover:text-foreground">Workspace</button>
-      {displayAncestors(state.ancestors).map((ancestor) => <span key={ancestor.id} className="flex min-w-0 items-center gap-1">
+      {ancestors.map((ancestor) => <span key={ancestor.id} className="flex min-w-0 items-center gap-1">
         <span aria-hidden>/</span>
         <button type="button" onClick={() => onNavigate(ancestor.id)} className="truncate hover:text-foreground">{ancestor.name}</button>
       </span>)}

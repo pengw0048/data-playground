@@ -42,6 +42,7 @@ describe('CanvasWorkspaceLocation', () => {
     render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
 
     const location = await screen.findByRole('navigation', { name: 'Canvas Workspace location' })
+    expect(location).toHaveTextContent('In')
     expect(location).toHaveTextContent('Workspace/Research/Robotics')
     expect(location).not.toHaveTextContent('Purchases per user')
     expect(onReturnDestination).toHaveBeenLastCalledWith(ROBOTICS.id)
@@ -49,6 +50,17 @@ describe('CanvasWorkspaceLocation', () => {
     expect(onNavigate).toHaveBeenCalledWith(RESEARCH.id)
     fireEvent.click(screen.getByRole('button', { name: 'Workspace' }))
     expect(onNavigate).toHaveBeenLastCalledWith(null)
+  })
+
+  it('resolves the exact root destination without rendering a root-only Workspace row', async () => {
+    const rootCanvas = { ...CANVAS, parentId: ROOT.id }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: rootCanvas, ancestors: [ROOT], source: COMPLETE,
+    })
+    render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+
+    await waitFor(() => expect(onReturnDestination).toHaveBeenLastCalledWith(ROOT.id))
+    expect(screen.queryByRole('navigation', { name: 'Canvas Workspace location' })).not.toBeInTheDocument()
   })
 
   it('keeps a provider Canvas usable while exposing only the truthful unavailable recovery state', async () => {

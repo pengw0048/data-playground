@@ -135,8 +135,8 @@ async function fresh(page: Page) {
   if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('file-menu').click()
-  await page.getByText('New file').click()
+  await page.getByTestId('app-menu').click()
+  await page.getByText('New Canvas').click()
   // The previous canvas is often empty too. Waiting only for zero rendered nodes can therefore return
   // before async create + file refresh + navigation finish, and the test would mutate the old canvas.
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
@@ -419,7 +419,7 @@ test.describe('Data Playground canvas', () => {
     // durable storage; cancelling this click gives the existing autosave debounce time to finish.
     const exampleHash = await page.evaluate(() => location.hash)
     await page.getByTestId('app-menu').click()
-    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New file', exact: true }).click()
+    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(exampleHash)
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
@@ -445,20 +445,17 @@ test.describe('Data Playground canvas', () => {
     expect(await canvasesFor(page)).toHaveLength(afterBlankCount)
     await expect.poll(async () => (await canvasFor(page, blankId)).nodes.length).toBe(1)
 
-    // The edit immediately changes the displayed action to a separate create; choosing it again
-    // creates the example without replacing the now-persisted source Canvas.
+    // Examples remain on empty/first-run surfaces rather than leaking into current-Canvas actions.
     await page.unroute(`**/api/canvas/${blankId}/runs`)
-    await page.getByTestId('file-menu').click()
-    await page.getByRole('menuitem', { name: 'Create example Canvas: Purchases per user' }).click()
-    await expect(page.locator('.react-flow__node')).toHaveCount(5)
-    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).not.toBe(blankId)
-    expect(await canvasesFor(page)).toHaveLength(afterBlankCount + 1)
+    await page.getByTestId('canvas-menu').click()
+    await expect(page.getByText('Purchases per user')).toHaveCount(0)
+    await page.keyboard.press('Escape')
 
     // A lost PUT response retains a version-fenced local draft; it must not turn into a speculative create.
-    const forkedExampleHash = await page.evaluate(() => location.hash)
+    const editedHash = await page.evaluate(() => location.hash)
     await page.getByTestId('app-menu').click()
-    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New file', exact: true }).click()
-    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(forkedExampleHash)
+    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(editedHash)
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const responseLossId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     let abortedPut = false
@@ -745,17 +742,28 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
   })
 
-  test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {
+  test('the Appearance submenu switches between light and dark (and flips the tokens)', async ({ page }) => {
     await page.emulateMedia({ colorScheme: 'light' })  // deterministic default (no OS 'dark' bleed-through)
-    await page.goto('/')
+    const canvasId = `appearance-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Appearance settings', version: 1, nodes: [], edges: [],
+    } })
+    expect(created.ok(), await created.text()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.getByTestId('app-menu')).toBeVisible()
     const html = page.locator('html')
     await expect(html).not.toHaveAttribute('data-theme', 'dark')  // light is the default
-    await page.getByRole('button', { name: 'Switch to dark theme' }).click()
+    await page.getByTestId('app-menu').click()
+    await page.getByRole('menuitem', { name: 'Appearance' }).hover()
+    await page.getByRole('menuitemradio', { name: 'Dark' }).click()
     await expect(html).toHaveAttribute('data-theme', 'dark')
     // the shadcn token actually flips (not just the attribute) — proves the palette is wired
     const bg = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--background').trim())
     expect(bg).toBe('222 24% 10%')
-    await page.getByRole('button', { name: 'Switch to light theme' }).click()
+    await expect(page.getByRole('menuitem', { name: 'Appearance' })).toBeHidden()
+    await page.getByTestId('app-menu').click()
+    await page.getByRole('menuitem', { name: 'Appearance' }).hover()
+    await page.getByRole('menuitemradio', { name: 'Light' }).click()
     await expect(html).not.toHaveAttribute('data-theme', 'dark')
   })
 
@@ -1002,12 +1010,12 @@ test.describe('Data Playground canvas', () => {
       await route.continue()
     })
 
-    await page.getByTestId('file-menu').click()
-    await page.getByPlaceholder('untitled').fill(name)
+    await page.getByTestId('canvas-title').click()
+    await page.getByRole('textbox', { name: 'Canvas name' }).fill(name)
     await page.reload()
 
     await expect(page).toHaveURL(new RegExp(`#\/canvas\/${canvasId}$`))
-    await expect(page.getByTestId('file-menu')).toContainText(name)
+    await expect(page.getByTestId('canvas-title')).toContainText(name)
     await expect(page.getByTestId('autosave')).toHaveText(/saved locally/)
     await expect.poll(async () => {
       const flow = await page.locator('.react-flow').boundingBox()
@@ -1024,8 +1032,16 @@ test.describe('Data Playground canvas', () => {
     expect(unloadPuts).toBe(0)
 
     await page.unroute(canvasUrl)
-    await page.getByTestId('file-menu').click()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
     await page.getByRole('button', { name: `Retry local draft ${name}` }).click()
+    await expect(page.getByRole('button', { name: `Retry local draft ${name}` })).toHaveCount(0, { timeout: 8_000 })
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${canvasId}`)
+      return response.ok() ? ((await response.json()) as { name: string }).name : null
+    }).toBe(name)
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    await expect(page.getByTestId('canvas-title')).toContainText(name)
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
   })
 
@@ -1118,7 +1134,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Query', 'sql')
     await page.getByRole('button', { name: 'More' }).click()
-    await page.getByRole('button', { name: 'Rename' }).click()
+    await page.getByRole('button', { name: 'Rename', exact: true }).click()
     const input = page.locator('.react-flow__node input')
     await expect(input).toBeVisible()
     await input.fill('my query')
@@ -1187,13 +1203,13 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
-  test('the file menu opens a fresh (empty) canvas as a new file', async ({ page }) => {
+  test('the app menu opens a fresh empty Canvas', async ({ page }) => {
     await fresh(page) // start on a known-empty new file (shared DB persists canvases across tests)
     await addNode(page, 'Shape', 'filter')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    await page.getByTestId('file-menu').click()
-    await expect(page.getByText('New file')).toBeVisible()
-    await page.getByText('New file').click()
+    await page.getByTestId('app-menu').click()
+    await expect(page.getByText('New Canvas')).toBeVisible()
+    await page.getByText('New Canvas').click()
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
   })
 
@@ -1222,7 +1238,7 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     const original = await page.evaluate(() => location.hash)
     const sourceId = decodeURIComponent(original.split('/').pop()!)
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByTestId('copy-canvas').click()
     await page.getByLabel('New Canvas name').fill('E2E independent copy')
     await page.getByRole('button', { name: 'Review copy' }).click()
@@ -2074,14 +2090,14 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('option[value="viewer"]').first()).toBeAttached() // viewer role is assignable end-to-end
   })
 
-  test('the app menu opens canvas version history with a restore action', async ({ page }) => {
+  test('the Canvas menu opens version history with a restore action', async ({ page }) => {
     await fresh(page)
     // A server-created blank Canvas is already saved and must not be echoed back as a second
     // version. Make one real user edit so Version history has an honest snapshot to restore.
     await addNode(page, 'Shape', 'filter')
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
     await expect.poll(async () => (await canvasFor(page, canvasId)).nodes.length).toBe(1)
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Version history').click()
     await expect(page.getByRole('heading', { name: 'Version history' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Restore' }).first()).toBeVisible({ timeout: 8000 }) // a snapshot to restore
@@ -2123,7 +2139,7 @@ test.describe('Data Playground canvas', () => {
       await route.continue()
     })
     try {
-      await page.getByTestId('app-menu').click()
+      await page.getByTestId('canvas-menu').click()
       await page.getByText('Version history').click()
       await page.getByRole('button', { name: 'Restore' }).first().click()
       await expect(queued.locator('[title="stale"]')).toBeVisible()
@@ -2141,9 +2157,9 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
-  test('the app menu opens persisted run history', async ({ page }) => {
+  test('the Canvas menu opens persisted run history', async ({ page }) => {
     await fresh(page)
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Run history').click()
     await expect(page.getByRole('heading', { name: 'Run history' })).toBeVisible()
     // a brand-new file has no runs yet — the empty state renders (proves the modal + API wired)
@@ -2185,7 +2201,7 @@ test.describe('Data Playground canvas', () => {
       } })
     })
 
-    await page.getByTestId('app-menu').click()
+    await page.getByTestId('canvas-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     await page.getByRole('button', { name: /Execution manifest/ }).click()
 
@@ -2235,7 +2251,7 @@ test.describe('Data Playground canvas', () => {
     // navigate to Workspace → URL updates
     await backToWorkspace(page)
     await expect.poll(() => page.evaluate(() => location.hash))
-      .toBe('#/workspace/container%3Aworkspace-local-root')
+      .toBe('#/workspace')
     // browser Back returns to the canvas editor
     await page.goBack()
     await expect(page.getByTestId('toolbar')).toBeVisible()
@@ -2592,7 +2608,7 @@ test.describe('Data Playground canvas', () => {
       expect(new Set(submissionIds).size).toBe(1)
 
       await page.reload()
-      await page.getByTestId('app-menu').click()
+      await page.getByTestId('canvas-menu').click()
       await page.getByText('Run history', { exact: true }).click()
       const historyReceipt = page.getByLabel(/Write receipt for run/).first()
       await expect(historyReceipt).toContainText('durable revision 3')
