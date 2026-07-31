@@ -6,12 +6,20 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), relationships: vi.fn(), facets: vi.fn(), joinSuggestions: vi.fn(),
   declareKey: vi.fn(), deleteRelationship: vi.fn(), addRelationship: vi.fn(), lineage: vi.fn(),
-  fitView: vi.fn(),
+  tableByRegistration: vi.fn(), fitView: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
 const store = vi.hoisted(() => ({
-  pushToast: vi.fn(), erFocusUri: null as string | null, setView: vi.fn(),
+  pushToast: vi.fn(),
+  erFocusUri: null as string | null,
+  erFocusDatasetId: null as string | null,
+  erMode: 'joins' as 'joins' | 'lineage',
+  erReturn: null as null | { resourceId: string; scope: 'all' | 'datasets'; datasetQuery?: string },
+  setRelationshipsFocus: vi.fn(),
+  setRelationshipsMode: vi.fn(),
+  returnFromRelationships: vi.fn(),
+  setView: vi.fn(),
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 vi.mock('../theme/mode', () => ({ resolvedTheme: () => 'light' }))
@@ -43,10 +51,12 @@ vi.mock('@xyflow/react', () => ({
 import { ERDiagram } from './ERDiagram'
 
 const ORDERS: CatalogTable = {
-  id: 'orders', name: 'orders', uri: 'mem://orders', columns: [{ name: 'customer_id', type: 'int', capabilities: ['key'] }],
+  id: 'orders', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders',
+  columns: [{ name: 'customer_id', type: 'int', capabilities: ['key'] }],
 }
 const CUSTOMERS: CatalogTable = {
-  id: 'customers', name: 'customers', uri: 'mem://customers', columns: [{ name: 'id', type: 'int', capabilities: ['key'] }],
+  id: 'customers', registrationId: 'registration-customers', name: 'customers', uri: 'mem://customers',
+  columns: [{ name: 'id', type: 'int', capabilities: ['key'] }],
 }
 const PAGE = { items: [ORDERS, CUSTOMERS], total: 2, hasMore: false }
 
@@ -54,7 +64,11 @@ describe('ERDiagram request truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     store.erFocusUri = null
+    store.erFocusDatasetId = null
+    store.erMode = 'joins'
+    store.erReturn = null
     mocks.tablesPage.mockResolvedValue(PAGE)
+    mocks.tableByRegistration.mockResolvedValue(ORDERS)
     mocks.relationships.mockResolvedValue([])
     mocks.facets.mockResolvedValue({ folders: [{ value: 'sales', count: 2 }], tags: [], owners: [] })
     mocks.joinSuggestions.mockResolvedValue([])
@@ -149,5 +163,29 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByTestId('node-orders')).toHaveAttribute('data-focused', 'true')
     await waitFor(() => expect(mocks.lineage).toHaveBeenLastCalledWith(
       currentOrders.uri, 1, 60))
+  })
+
+  it('restores a routed stable focus in lineage mode and returns to its Dataset', async () => {
+    store.erFocusDatasetId = ORDERS.registrationId!
+    store.erMode = 'lineage'
+    store.erReturn = {
+      resourceId: `dataset:${ORDERS.registrationId}`,
+      scope: 'datasets',
+      datasetQuery: 'revision=revision-1&revisionDataset=logical-orders',
+    }
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [{ id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' }],
+      edges: [],
+    })
+    render(<ERDiagram />)
+
+    expect(await screen.findByText('Focused: orders')).toBeInTheDocument()
+    expect(screen.getByTestId('er-mode-lineage')).toHaveClass('bg-accent')
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith(ORDERS.registrationId)
+    await waitFor(() => expect(mocks.lineage).toHaveBeenCalledWith(ORDERS.uri, 1, 60))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to dataset' }))
+    expect(store.returnFromRelationships).toHaveBeenCalledOnce()
   })
 })

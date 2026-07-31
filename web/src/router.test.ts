@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { datasetViewerHash, initRouter, parseDatasetViewerReturn, parseHash, resetRouterForTests, routeHash } from './router'
+import {
+  datasetViewerHash,
+  initRouter,
+  parseDatasetViewerReturn,
+  parseHash,
+  relationshipsHash,
+  resetRouterForTests,
+  routeHash,
+} from './router'
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation } from './navigationOwnership'
 
@@ -169,6 +177,45 @@ describe('Workspace routes', () => {
     const query = new URLSearchParams({ filter: 'unread' }).toString()
     window.location.hash = routeHash('inbox', undefined, undefined, undefined, undefined, undefined, query)
     expect(parseHash()).toEqual({ view: 'inbox', inboxQuery: query })
+  })
+
+  it('round-trips focused lineage and its exact Dataset return without changing the global route', () => {
+    const datasetQuery = new URLSearchParams({
+      revision: 'revision 9',
+      revisionDataset: 'logical dataset',
+      returnCanvas: 'canvas 1',
+      ignored: 'must-not-return',
+    }).toString()
+    window.location.hash = relationshipsHash({
+      focusDatasetId: 'stable registration',
+      mode: 'lineage',
+      returnTo: {
+        resourceId: 'dataset:stable registration',
+        scope: 'datasets',
+        datasetQuery,
+      },
+    })
+
+    expect(parseHash()).toEqual({
+      view: 'relationships',
+      relationshipsContext: {
+        focusDatasetId: 'stable registration',
+        mode: 'lineage',
+        returnTo: {
+          resourceId: 'dataset:stable registration',
+          scope: 'datasets',
+          datasetQuery: new URLSearchParams({
+            revision: 'revision 9',
+            revisionDataset: 'logical dataset',
+            returnCanvas: 'canvas 1',
+          }).toString(),
+        },
+      },
+    })
+
+    expect(relationshipsHash()).toBe('#/relationships')
+    window.location.hash = routeHash('relationships')
+    expect(parseHash()).toEqual({ view: 'relationships' })
   })
 
   it('round-trips a canvas node deep link', () => {

@@ -935,6 +935,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
+  const workspaceResourceId = useStore((s) => s.workspaceResourceId)
+  const workspaceScope = useStore((s) => s.workspaceScope)
+  const workspaceSearchQuery = useStore((s) => s.workspaceSearchQuery)
+  const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
   const catalogSource = useStore((s) => s.kernelInfo)
   const atomicMetadataEditable = catalogSource?.capabilities?.includes('catalog.atomic_metadata_edit') ?? false
   const unregisterSupported = catalogSource?.capabilities?.includes('catalog.cas_unregister') ?? false
@@ -1457,7 +1461,16 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </> : null}
           </section>
 
-          <button onClick={() => openRelationships(table.uri)} data-testid="detail-relationships"
+          <button onClick={() => openRelationships(table.uri, {
+            focusDatasetId: table.registrationId ?? table.id,
+            mode: 'lineage',
+            returnTo: {
+              resourceId: workspaceResourceId ?? `dataset:${table.registrationId ?? table.id}`,
+              scope: workspaceScope,
+              workspaceQuery: workspaceSearchQuery,
+              datasetQuery: workspaceDatasetQuery,
+            },
+          })} data-testid="detail-relationships"
             className="inline-flex items-center gap-1.5 self-start text-[11.5px] text-primary hover:underline">
             <Icon name="lineage" size={12} /> View relationship graph →
           </button>

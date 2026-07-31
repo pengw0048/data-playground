@@ -11,7 +11,12 @@ import type {
 import { canConnect, getSpec, nodeOutputs, portWire } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
-import { parseHash, type Route } from '../router'
+import {
+  parseHash,
+  type RelationshipsMode,
+  type RelationshipsReturn,
+  type Route,
+} from '../router'
 import { ownsNavigation, startNavigation, type NavigationToken } from '../navigationOwnership'
 import { exampleDoc } from '../examples'
 import {
@@ -1365,8 +1370,18 @@ interface Store {
   setView: (v: DpView) => void
   /** Publish a route to the already loaded Canvas without replacing its in-memory document. */
   activateLoadedCanvasRoute: (canvasId: string, nodeId?: string) => boolean
-  erFocusUri: string | null                       // the table the relationship graph opens focused on (null = global)
-  openRelationships: (uri: string | null) => void
+  erFocusUri: string | null                       // resolved location for the active session; never serialized
+  erFocusDatasetId: string | null                 // stable catalog identity serialized into the route
+  erMode: RelationshipsMode
+  erReturn: RelationshipsReturn | null
+  openRelationships: (uri: string | null, options?: {
+    focusDatasetId?: string
+    mode?: RelationshipsMode
+    returnTo?: RelationshipsReturn
+  }) => void
+  setRelationshipsFocus: (table: CatalogTable | null) => void
+  setRelationshipsMode: (mode: RelationshipsMode) => void
+  returnFromRelationships: () => void
   workspaceResourceId: string | null
   setWorkspaceResource: (resourceId: string | null) => void
   workspaceSearchQuery: string
@@ -1838,6 +1853,8 @@ export const useStore = create<Store>((set, get) => ({
     set(view === 'transforms' && get().view !== 'transforms'
       ? { view, transformResourceId: null, transformVersion: null,
           transformUpgradeCanvasId: null, transformUpgradeNodeId: null }
+      : view === 'relationships' && get().view !== 'relationships'
+        ? { view, erFocusUri: null, erFocusDatasetId: null, erMode: 'joins', erReturn: null }
       : { view })
   },
   activateLoadedCanvasRoute: (canvasId, nodeId) => {
@@ -1859,10 +1876,43 @@ export const useStore = create<Store>((set, get) => ({
     return true
   },
   erFocusUri: null,
-  openRelationships: (uri) => {
+  erFocusDatasetId: null,
+  erMode: 'joins',
+  erReturn: null,
+  openRelationships: (uri, options) => {
     startNavigation()
     if (get().view !== 'relationships') _fileNavigationGeneration += 1
-    set({ erFocusUri: uri, view: 'relationships' })
+    set({
+      erFocusUri: uri,
+      erFocusDatasetId: options?.focusDatasetId ?? null,
+      erMode: options?.mode ?? 'joins',
+      erReturn: options?.returnTo ?? null,
+      view: 'relationships',
+    })
+  },
+  setRelationshipsFocus: (table) => {
+    startNavigation()
+    set({
+      erFocusUri: table?.uri ?? null,
+      erFocusDatasetId: table ? table.registrationId ?? table.id : null,
+    })
+  },
+  setRelationshipsMode: (erMode) => {
+    startNavigation()
+    set({ erMode })
+  },
+  returnFromRelationships: () => {
+    const target = get().erReturn
+    if (!target) return
+    startNavigation()
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({
+      view: 'workspace',
+      workspaceResourceId: target.resourceId,
+      workspaceScope: target.scope,
+      workspaceDatasetQuery: target.datasetQuery ?? '',
+      ...(target.scope === 'all' ? { workspaceSearchQuery: target.workspaceQuery ?? '' } : {}),
+    })
   },
   workspaceResourceId: null,
   setWorkspaceResource: (resourceId) => {
@@ -1969,6 +2019,13 @@ export const useStore = create<Store>((set, get) => ({
       transformResourceId: route.transformId ?? null, transformVersion: route.transformVersion ?? null,
       transformUpgradeCanvasId: route.transformCanvasId ?? null,
       transformUpgradeNodeId: route.transformNodeId ?? null,
+    })
+    else if (route.view === 'relationships') set({
+      view: 'relationships',
+      erFocusUri: null,
+      erFocusDatasetId: route.relationshipsContext?.focusDatasetId ?? null,
+      erMode: route.relationshipsContext?.mode ?? 'joins',
+      erReturn: route.relationshipsContext?.returnTo ?? null,
     })
     else set({ view: route.view })
   },

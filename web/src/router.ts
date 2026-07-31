@@ -4,7 +4,39 @@
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation, type NavigationToken } from './navigationOwnership'
 
-export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string; canonicalHash?: string }
+export type RelationshipsMode = 'joins' | 'lineage'
+
+export interface RelationshipsReturn {
+  resourceId: string
+  scope: 'all' | 'datasets'
+  workspaceQuery?: string
+  datasetQuery?: string
+}
+
+export interface RelationshipsContext {
+  focusDatasetId?: string
+  mode?: RelationshipsMode
+  returnTo?: RelationshipsReturn
+}
+
+export interface Route {
+  view: DpView
+  canvasId?: string
+  nodeId?: string
+  workspaceResourceId?: string
+  workspaceQuery?: string
+  workspaceScope?: 'all' | 'datasets'
+  workspaceDatasetQuery?: string
+  jobsQuery?: string
+  inboxQuery?: string
+  transformId?: string
+  transformVersion?: string
+  transformCanvasId?: string
+  transformNodeId?: string
+  transformQuery?: string
+  relationshipsContext?: RelationshipsContext
+  canonicalHash?: string
+}
 
 const DATASET_QUERY_KEYS = [
   'dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match',
@@ -37,6 +69,16 @@ function activityReturnQuery(view: 'jobs' | 'inbox', query?: string): string | u
   const source = new URLSearchParams(query)
   const safe = new URLSearchParams()
   for (const key of DATASET_VIEWER_RETURN_QUERY_KEYS[view]) {
+    const value = source.get(key)
+    if (value) safe.set(key, value)
+  }
+  return safe.toString() || undefined
+}
+
+function datasetRouteQuery(query: string | undefined, scope: 'all' | 'datasets'): string | undefined {
+  const source = new URLSearchParams(query)
+  const safe = new URLSearchParams()
+  for (const key of scope === 'datasets' ? DATASET_QUERY_KEYS : DATASET_VIEWER_QUERY_KEYS) {
     const value = source.get(key)
     if (value) safe.set(key, value)
   }
@@ -124,7 +166,26 @@ export function parseHash(): Route {
       ...(params.size ? { transformQuery: params.toString() } : {}),
     }
   }
-  if (seg === 'relationships') return { view: seg }
+  if (seg === 'relationships') {
+    const focusDatasetId = params.get('focus') || undefined
+    const mode = params.get('mode')
+    const resourceId = params.get('returnResource') || undefined
+    const scope = params.get('returnScope') === 'datasets' ? 'datasets' : 'all'
+    const datasetQuery = datasetRouteQuery(params.get('returnQuery') || undefined, scope)
+    const returnTo = resourceId ? {
+      resourceId,
+      scope,
+      ...(scope === 'all' && params.get('returnQ')?.trim()
+        ? { workspaceQuery: params.get('returnQ')!.trim() } : {}),
+      ...(datasetQuery ? { datasetQuery } : {}),
+    } satisfies RelationshipsReturn : undefined
+    const context: RelationshipsContext = {
+      ...(focusDatasetId ? { focusDatasetId } : {}),
+      ...(mode === 'lineage' || mode === 'joins' ? { mode } : {}),
+      ...(returnTo ? { returnTo } : {}),
+    }
+    return { view: seg, ...(Object.keys(context).length ? { relationshipsContext: context } : {}) }
+  }
   // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id).
   if (path === '' && !rawQuery) return { view: 'canvas' }
   // An unrecognized route must never borrow the last Canvas and make an invalid URL look editable.
@@ -167,6 +228,25 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
   return path + query
 }
 
+export function relationshipsHash(context?: RelationshipsContext): string {
+  const params = new URLSearchParams()
+  if (context?.focusDatasetId) params.set('focus', context.focusDatasetId)
+  if (context?.mode && (context.focusDatasetId || context.mode !== 'joins')) {
+    params.set('mode', context.mode)
+  }
+  if (context?.returnTo?.resourceId) {
+    const { returnTo } = context
+    params.set('returnResource', returnTo.resourceId)
+    params.set('returnScope', returnTo.scope)
+    if (returnTo.scope === 'all' && returnTo.workspaceQuery?.trim()) {
+      params.set('returnQ', returnTo.workspaceQuery.trim())
+    }
+    const query = datasetRouteQuery(returnTo.datasetQuery, returnTo.scope)
+    if (query) params.set('returnQuery', query)
+  }
+  return `#/relationships${params.size ? `?${params}` : ''}`
+}
+
 /** One canonical route for opening either the latest dataset or one immutable revision. */
 export function datasetViewerHash(
   datasetId: string,
@@ -200,14 +280,19 @@ export function canvasLink(id: string): string {
 }
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
-interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
+interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string; erFocusDatasetId?: string | null; erMode?: RelationshipsMode; erReturn?: RelationshipsReturn | null }
 interface RouterStore {
   getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; requestViewportFit: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken; skipViewportFit?: boolean }) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => () => void
 }
 
-const hashFor = (s: RouterState) =>
-  routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined,
+const hashFor = (s: RouterState) => s.view === 'relationships'
+  ? relationshipsHash({
+      focusDatasetId: s.erFocusDatasetId ?? undefined,
+      mode: s.erMode ?? 'joins',
+      returnTo: s.erReturn ?? undefined,
+    })
+  : routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined,
     s.view === 'workspace' ? s.workspaceResourceId ?? undefined : undefined,
     s.view === 'workspace' ? s.workspaceSearchQuery : undefined,
     s.view === 'jobs' ? s.jobsQuery : undefined,
@@ -303,9 +388,10 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
     if (location.hash !== want) {
       // Node focus is a deep-linkable selection inside one canvas, not a new destination. Keep the
       // current history entry shareable without making Back walk through every inspector click.
-      const sameCanvas = location.hash.split('?', 1)[0] === want.split('?', 1)[0]
-        && want.startsWith('#/canvas/')
-      if (sameCanvas) history.replaceState(null, '', want)
+      const samePath = location.hash.split('?', 1)[0] === want.split('?', 1)[0]
+      const replaceRouteState = (samePath && want.startsWith('#/canvas/'))
+        || (samePath && want.startsWith('#/relationships'))
+      if (replaceRouteState) history.replaceState(null, '', want)
       // State-owned navigation must not emit hashchange and make the router claim a competing token.
       // pushState preserves Back/Forward; popstate above is the router's history entrypoint.
       else history.pushState(null, '', want)

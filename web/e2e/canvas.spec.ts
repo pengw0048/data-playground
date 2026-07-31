@@ -1957,15 +1957,31 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
   })
 
-  test('the relationships graph opens focused from a table and widens to the catalog', async ({ page }) => {
+  test('the relationships graph preserves Dataset lineage context and widens to the catalog', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
     await fresh(page)
     await backToWorkspace(page)
     await openWorkspaceDataset(page, 'events')
     await page.getByTestId('detail-relationships').click()
-    // the graph mounts focused on that table (its columns are visible on the entity)
+    // Dataset lineage owns a stable, shareable route rather than opening the global join graph.
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
+    await expect(page).toHaveURL(/#\/relationships\?.*focus=.*&mode=lineage.*returnResource=/)
     const entities = page.locator('.react-flow__node')
     await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
+
+    const focusedHash = new URL(page.url()).hash
+    await page.reload()
+    await expect(page).toHaveURL((url) => url.hash === focusedHash)
+    await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
+    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
+
+    await page.getByRole('button', { name: 'Back to dataset' }).click()
+    await expect(page.getByTestId('dataset-viewer')).toBeVisible()
+    await expect(page.getByRole('region', { name: 'events' })).toBeVisible()
+
+    await page.getByTestId('detail-relationships').click()
+    await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
     // "show all" widens to the whole catalog. Assert against the selected fixture profile so the
     // normal PR smoke keeps its starter-data contract while the full matrix proves the large catalog.
     await page.getByTestId('er-clear-focus').click()
@@ -1996,6 +2012,7 @@ test.describe('Data Playground canvas', () => {
       await backToWorkspace(page)
       await openWorkspaceDataset(page, 'events')
       await page.getByTestId('detail-relationships').click()
+      await page.getByTestId('er-mode-joins').click()
       await expect(page.getByTestId('er-clear-focus')).toBeVisible({ timeout: 10_000 })
       const focusedEntity = page.locator('.react-flow__node').filter({ hasText: 'events' }).first()
       await expect.poll(async () => (await boxOf(focusedEntity)).width).toBeGreaterThanOrEqual(200)
