@@ -254,6 +254,9 @@ test('long shared-prefix Canvas names keep their suffixes visible without wideni
 })
 
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
+  const catalog = await page.request.get('/api/catalog/tables?limit=1')
+  expect(catalog.ok()).toBe(true)
+  const template = (await catalog.json()).items[0] as Record<string, unknown>
   const mergeJob = {
     id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
     canvasId: 'canvas-merge', canvasName: 'Column enrichment', targetNodeId: 'write',
@@ -266,12 +269,26 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.route('**/api/canvas', async (route) => route.fulfill({ json: [{ id: 'canvas-merge', name: 'Column enrichment', version: 1, role: 'editor' }] }))
   await page.route('**/api/jobs?*', async (route) => route.fulfill({ json: { items: [mergeJob], nextCursor: null, hasMore: false } }))
   await page.route('**/api/canvas/canvas-merge/runs/merge-task-1/manifest', async (route) => route.fulfill({ json: { availability: 'not_recorded' } }))
+  await page.route('**/api/catalog/tables/dataset-1?registration=true', async (route) => route.fulfill({
+    json: { ...template, id: 'dataset-1', name: 'Published column enrichment' },
+  }))
   await page.route('**/api/catalog/revision-details', async (route) => {
     expect(route.request().method()).toBe('POST')
-    expect(route.request().postDataJSON()).toEqual({ datasetId: 'dataset-1', revisionId: 'rev-published' })
+    const request = route.request().postDataJSON() as { datasetId: string; revisionId: string }
+    expect(request.datasetId).toBe('dataset-1')
+    expect(['rev-published', 'rev-base']).toContain(request.revisionId)
     await route.fulfill({ json: {
-      datasetId: 'dataset-1', revisionId: 'rev-published', committedAt: '2026-07-19T12:01:00Z', retentionOwner: 'core', parentRevisionId: 'rev-base', producerOperation: 'merge-columns',
-      summary: { rowCount: 2, dataFileCount: 1, totalBytes: 120, fragmentCount: 1 }, preview: { columns: [{ name: 'id', type: 'BIGINT' }, { name: 'score', type: 'DOUBLE' }], rows: [{ id: 1, score: 0.8 }], hasMore: true, rowLimit: 100 },
+      datasetId: 'dataset-1', revisionId: request.revisionId,
+      committedAt: request.revisionId === 'rev-published' ? '2026-07-19T12:01:00Z' : '2026-07-19T12:00:00Z',
+      retentionOwner: 'core',
+      parentRevisionId: request.revisionId === 'rev-published' ? 'rev-base' : null,
+      producerOperation: request.revisionId === 'rev-published' ? 'merge-columns' : 'write',
+      summary: { rowCount: 2, dataFileCount: 1, totalBytes: 120, fragmentCount: 1 },
+      preview: {
+        columns: [{ name: 'id', type: 'BIGINT', capabilities: [] }, { name: 'score', type: 'DOUBLE', capabilities: [] }],
+        rows: [{ id: 1, score: request.revisionId === 'rev-published' ? 0.8 : 0.5 }],
+        hasMore: request.revisionId === 'rev-published', rowLimit: 100,
+      },
     } })
   })
 
@@ -281,7 +298,17 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.getByText('Technical evidence', { exact: true }).click()
   await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
   await expect(page.getByText('rev-published')).toBeVisible()
-  await page.getByRole('button', { name: 'Open exact revision' }).click()
-  await expect(page.getByLabel('Exact revision detail')).toContainText('Parent rev-base')
-  await expect(page.getByText('Preview is bounded; this remains the exact published revision.')).toBeVisible()
+  const exactDataset = page.getByRole('link', { name: 'Open dataset' })
+  await expect(exactDataset).toHaveAttribute(
+    'href',
+    '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1',
+  )
+  await exactDataset.click()
+  await expect(page.getByLabel('Dataset preview scope')).toContainText(
+    'exact revision dataset-1@rev-published',
+  )
+  const viewer = page.getByRole('dialog', { name: 'Published column enrichment' })
+  await expect(viewer).toContainText('Exact revision rev-published')
+  await expect(viewer).toContainText('Exact revision is view-only')
+  await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()
 })
