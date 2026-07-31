@@ -972,6 +972,12 @@ function WorkspaceDatasets() {
     const datasetId = params.get('revisionDataset') || undefined
     return revisionId && datasetId ? { revisionId, datasetId } : undefined
   }, [encodedQuery])
+  const viewerCanvasReturn = useMemo(() => {
+    const params = new URLSearchParams(encodedQuery)
+    const canvasId = params.get('returnCanvas') || undefined
+    const nodeId = params.get('returnNode') || undefined
+    return canvasId ? { canvasId, nodeId } : undefined
+  }, [encodedQuery])
   const initialRevisionId = exactRevision?.revisionId
   const initialRevisionDatasetId = exactRevision?.datasetId
   const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
@@ -984,6 +990,7 @@ function WorkspaceDatasets() {
   const [destinationError, setDestinationError] = useState<string | null>(null)
   const [destinationRevision, setDestinationRevision] = useState(0)
   const [selectedWorkspaceTable, setSelectedWorkspaceTable] = useState<CatalogTable | null>(null)
+  const returningToCanvas = useRef(false)
   const [detailResolutionRevision, setDetailResolutionRevision] = useState(0)
   const detailResolutionSeq = useRef(0)
   const selectedWorkspaceKey = selectedWorkspaceTable?.registrationId
@@ -1125,17 +1132,42 @@ function WorkspaceDatasets() {
         title="Local catalog" queryState={query}
         initialRevisionId={initialRevisionId}
         initialRevisionDatasetId={initialRevisionDatasetId}
+        detailBackLabel={viewerCanvasReturn ? 'Back to Canvas' : 'Back to Workspace'}
         onQueryStateChange={(next) => {
           const params = new URLSearchParams(serializeWorkspaceDatasetQuery(next))
           if (hasExactRevision) {
             params.set('revision', initialRevisionId)
             params.set('revisionDataset', initialRevisionDatasetId)
           }
+          if (viewerCanvasReturn) {
+            params.set('returnCanvas', viewerCanvasReturn.canvasId)
+            if (viewerCanvasReturn.nodeId) params.set('returnNode', viewerCanvasReturn.nodeId)
+          }
           setEncodedQuery(params.toString())
         }}
         selectedRegistrationId={selectedRegistrationId}
         onSelectedTableChange={(table, origin = 'user') => {
+          // Clearing the exact Workspace route below causes CatalogDiscovery to report its own
+          // route selection as null. That acknowledgement must not start a competing Workspace
+          // navigation while the explicit Canvas return is still loading.
+          if (!table && origin === 'route' && returningToCanvas.current) return
           setSelectedWorkspaceTable(table)
+          if (!table && origin === 'user' && viewerCanvasReturn) {
+            // Canvas-origin viewers are a temporary detour. Clear the exact Dataset route before
+            // returning so the next ordinary Workspace visit restores its dataset list instead of
+            // reopening this receipt; the explicit node route restores Inspector selection.
+            returningToCanvas.current = true
+            switchWorkspaceScope('datasets', {
+              resourceId: null,
+              datasetQuery: serializeWorkspaceDatasetQuery(query),
+            })
+            // Use the product navigation action so the store and hash router settle on the same
+            // Canvas. Writing location.hash directly races the Workspace state update above.
+            void openFile(viewerCanvasReturn.canvasId, { skipViewportFit: true }).then((opened) => {
+              if (opened && viewerCanvasReturn.nodeId) select(viewerCanvasReturn.nodeId)
+            }).finally(() => { returningToCanvas.current = false })
+            return
+          }
           // Exact revision navigation belongs to the selected route as an atomic pair. A user
           // close or user-selected replacement leaves that route, while route resolution itself
           // (including a transient null) must preserve it.

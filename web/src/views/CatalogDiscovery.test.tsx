@@ -176,6 +176,7 @@ describe('Catalog discovery request and mutation truth', () => {
     const viewer = await screen.findByTestId('dataset-viewer')
     expect(viewer).toHaveClass('absolute', 'inset-0')
     expect(viewer).not.toHaveClass('w-[420px]')
+    expect(within(viewer).getByRole('button', { name: 'Back to Workspace' })).toBeVisible()
     expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
     expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Published version')
     expect(screen.getByTestId('dataset-version-context')).not.toHaveTextContent('rev-receipt')
@@ -199,6 +200,16 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact revision is view-only')
     expect(screen.queryByTestId('detail-use')).not.toBeInTheDocument()
     expect(onUseTables).not.toHaveBeenCalled()
+  })
+
+  it('uses the routed Canvas destination as the full-page viewer Back label', async () => {
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-orders" detailBackLabel="Back to Canvas"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+
+    const viewer = await screen.findByTestId('dataset-viewer')
+    expect(within(viewer).getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
+    expect(within(viewer).queryByRole('button', { name: 'Close' })).not.toBeInTheDocument()
   })
 
   it('preserves the exact route when catalog metadata is saved from the viewer', async () => {

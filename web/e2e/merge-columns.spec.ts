@@ -159,6 +159,8 @@ test('certifies the real Write Inspector merge journey and exact revision histor
         scope: 'datasets',
         revision: final!.revisionId,
         revisionDataset: final!.datasetId,
+        returnCanvas: canvasId,
+        returnNode: 'write',
       })}`,
     )
     await control.getByRole('button', { name: 'Open in Jobs' }).click()

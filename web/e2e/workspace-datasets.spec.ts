@@ -81,7 +81,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(search).toHaveValue(registeredName)
     await page.goForward()
     await expect(page.getByRole('dialog', { name: registeredName })).toBeVisible()
-    await page.getByRole('button', { name: 'Close' }).click()
+    await page.getByRole('button', { name: 'Back to Workspace' }).click()
     await search.fill('issue497_')
     await expect(page.getByRole('button', { name: `Open dataset ${registeredName}` })).toBeVisible()
     await expect(page.getByRole('button', { name: `Open dataset ${uploaded.name}` })).toBeVisible()

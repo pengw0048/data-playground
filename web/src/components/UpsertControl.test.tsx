@@ -101,7 +101,7 @@ describe('UpsertControl', () => {
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('dataset-1@rev-2')
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-2&revisionDataset=dataset-1',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-2&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
     )
     expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })

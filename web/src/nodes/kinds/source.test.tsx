@@ -159,7 +159,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Aprovider-orders?scope=datasets&revision=empty-r7&revisionDataset=provider-orders',
+      '#/workspace/dataset%3Aprovider-orders?scope=datasets&revision=empty-r7&revisionDataset=provider-orders&returnCanvas=c&returnNode=s1',
     )
   })
 

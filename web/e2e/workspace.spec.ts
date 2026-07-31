@@ -32,7 +32,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await page.reload()
       await expect(page.getByRole('dialog', { name: dataset.name })).toBeVisible()
       await expect(search).toHaveValue(dataset.name)
-      await page.getByRole('button', { name: 'Close' }).click()
+      await page.getByRole('button', { name: 'Back to Workspace' }).click()
       await page.getByRole('button', { name: 'Clear Workspace search' }).click()
 
       await (await workspaceResource(page, 'canvas', canvasName)).click()

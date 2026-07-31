@@ -145,7 +145,7 @@ test.describe('minimum viewport support', () => {
     const detail = page.getByRole('dialog', { name: process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events' })
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
-    await expectFullyInViewport(page, detail.getByRole('button', { name: 'Close' }), 'dataset detail close')
+    await expectFullyInViewport(page, detail.getByRole('button', { name: 'Back to Workspace' }), 'dataset detail back')
     const datasetDetails = detail.getByTestId('detail-dataset-details')
     await expect(datasetDetails).not.toHaveAttribute('open', '')
     await expect(datasetDetails).toContainText('Dataset details')
@@ -164,7 +164,7 @@ test.describe('minimum viewport support', () => {
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
     await keyAction.scrollIntoViewIfNeeded()
     await expectFullyInViewport(page, keyAction, 'column key action')
-    await detail.getByRole('button', { name: 'Close' }).click()
+    await detail.getByRole('button', { name: 'Back to Workspace' }).click()
 
     // Canvas with at least one node, inspector, data panel, run controls.
     await openCanvasWithSource(page)
@@ -448,7 +448,7 @@ test.describe('minimum viewport support', () => {
     const detail = page.getByRole('dialog', { name: tableName })
     await expectFullyInViewport(page, detail, '1024px dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), '1024px dataset use action')
-    await detail.getByRole('button', { name: 'Close' }).click()
+    await detail.getByRole('button', { name: 'Back to Workspace' }).click()
 
     await page.getByTestId('rail-collapse').click()
     await expect(page.getByRole('button', { name: 'Collapse navigation' })).toBeVisible()

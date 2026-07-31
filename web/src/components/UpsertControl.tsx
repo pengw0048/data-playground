@@ -90,6 +90,7 @@ function EvidenceSummary({ evidence, base, expectedHead, keys, schema, eligible 
  */
 export function UpsertControl({ nodeId }: { nodeId: string }) {
   const node = useStore((state) => state.doc.nodes.find((item) => item.id === nodeId))
+  const canvasId = useStore((state) => state.doc.id)
   const edges = useStore((state) => state.doc.edges)
   const nodes = useStore((state) => state.doc.nodes)
   const updateConfig = useStore((state) => state.updateConfig)
@@ -299,7 +300,8 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
       </div>}
     </div>}
     {task?.receipt && <div className="mt-2 text-[10.5px]">
-      <PublishedDatasetResult receipt={task.receipt} />
+      <PublishedDatasetResult receipt={task.receipt}
+        returnToCanvas={{ canvasId, nodeId }} />
     </div>}
 
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">

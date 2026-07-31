@@ -10,6 +10,7 @@ import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import type { DatasetViewerCanvasReturn } from '../router'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -20,6 +21,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
+  const returnToCanvas = { canvasId: doc.id, nodeId }
   const target = doc.nodes.find((node) => node.id === nodeId)
   const isWrite = target?.type === 'write'
   const mergeRules = target?.data.config.mergeColumns
@@ -136,7 +138,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </div>
             <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
               isWrite={isWrite} outputName={outputName} destination={destination}
-              admission={writeAdmission} receipt={receipt ?? undefined} />
+              admission={writeAdmission} receipt={receipt ?? undefined}
+              returnToCanvas={returnToCanvas} />
           </> : <>
             <Label>ESTIMATE</Label>
             <div className="mt-0.5 flex items-baseline gap-2">
@@ -145,7 +148,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               </span>
             </div>
             {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
-            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
+            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
+              admission={writeAdmission} receipt={receipt} returnToCanvas={returnToCanvas} />}
           </>}
           {!isWrite && exactRunReadiness?.ready === false && (
             <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
@@ -207,7 +211,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <PerNode st={st} />
           {isManagedWrite
             ? <WritePublicationSummary compact outputName={outputName} destination={destination}
-                admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing />
+                admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing
+                returnToCanvas={returnToCanvas} />
             : <RunOutputs outputs={st.outputs} />}
           <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} disabled={!canEdit} title={canEdit ? 'Stop this run' : 'View-only canvas'} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop
@@ -219,7 +224,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         isManagedWrite ? <>
           <Label>MANAGED REVISION PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
-            outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed />
+            outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed
+            returnToCanvas={returnToCanvas} />
           <PerNode st={st} compact />
         </> : <>
           <Label>DONE</Label>
@@ -455,7 +461,7 @@ function confirmationCopy(estimate: RunEstimate, admission?: WriteAdmission): st
 }
 
 function ConfirmationTechnicalDetails({
-  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt,
+  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt, returnToCanvas,
 }: {
   estimate: RunEstimate
   pinnedInputs: { nodeId: string; title: string; ref: DatasetRef }[]
@@ -464,6 +470,7 @@ function ConfirmationTechnicalDetails({
   destination: string
   admission?: WriteAdmission
   receipt?: WriteReceipt
+  returnToCanvas: DatasetViewerCanvasReturn
 }) {
   const reasons = confirmationReasons(estimate, admission)
   return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
@@ -479,7 +486,7 @@ function ConfirmationTechnicalDetails({
         </div>
       })}
       {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
-        admission={admission} receipt={receipt} />}
+        admission={admission} receipt={receipt} returnToCanvas={returnToCanvas} />}
     </div>
   </details>
 }

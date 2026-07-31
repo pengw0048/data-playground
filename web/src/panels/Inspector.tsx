@@ -578,6 +578,7 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
 // The Write destination. Admission decides whether the selected execution publishes a managed revision.
 function WriteDestination({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
+  const canvasId = useStore((s) => s.doc.id)
   const updateConfig = useStore((s) => s.updateConfig)
   const canManageDestinations = useStore(
     (s) => s.currentUser?.capabilities?.includes('global_settings') === true,
@@ -604,7 +605,8 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
     <Section title="Output">
       <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
         outcomeAdmission={outcomeAdmission} receipt={publicationReceipt}
-        outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'} />
+        outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'}
+        returnToCanvas={{ canvasId, nodeId }} />
       <div className="mt-2">
         <CodeBtn icon="export" label="Choose destination…" onClick={() => setDlg(true)} />
       </div>

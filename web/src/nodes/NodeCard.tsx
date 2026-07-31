@@ -150,7 +150,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
             </div>
 
             {/* meta */}
-            <div className="mt-[5px] min-h-4 truncate text-[11.5px] text-muted-foreground">
+            <div data-testid="node-meta" className="mt-[5px] min-h-4 truncate text-[11.5px] text-muted-foreground">
               {metaOverride ?? data.meta ?? ''}
             </div>
 

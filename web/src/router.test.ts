@@ -65,6 +65,23 @@ describe('Workspace routes', () => {
         revisionDataset: 'dataset/with spaces',
       }).toString(),
     })
+
+    window.location.hash = datasetViewerHash(
+      'dataset/with spaces',
+      'revision 9',
+      { canvasId: 'canvas 1', nodeId: 'write 1' },
+    )
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:dataset/with spaces',
+      workspaceScope: 'datasets',
+      workspaceDatasetQuery: new URLSearchParams({
+        revision: 'revision 9',
+        revisionDataset: 'dataset/with spaces',
+        returnCanvas: 'canvas 1',
+        returnNode: 'write 1',
+      }).toString(),
+    })
   })
 
   it('deliberately redirects former Recents and Tables URLs to Workspace', () => {

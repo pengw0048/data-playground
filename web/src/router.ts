@@ -6,7 +6,15 @@ import { ownsNavigation, startNavigation, type NavigationToken } from './navigat
 
 export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string }
 
-const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match', 'revision', 'revisionDataset'] as const
+const DATASET_QUERY_KEYS = [
+  'dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match',
+  'revision', 'revisionDataset', 'returnCanvas', 'returnNode',
+] as const
+
+export interface DatasetViewerCanvasReturn {
+  canvasId: string
+  nodeId?: string
+}
 
 function decodeRouteSegment(value: string | undefined): string | undefined {
   if (!value) return undefined
@@ -110,10 +118,21 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
 }
 
 /** One canonical route for opening either the latest dataset or one immutable revision. */
-export function datasetViewerHash(datasetId: string, revisionId?: string): string {
-  const datasetQuery = revisionId
-    ? new URLSearchParams({ revision: revisionId, revisionDataset: datasetId }).toString()
-    : undefined
+export function datasetViewerHash(
+  datasetId: string,
+  revisionId?: string,
+  returnToCanvas?: DatasetViewerCanvasReturn,
+): string {
+  const params = new URLSearchParams()
+  if (revisionId) {
+    params.set('revision', revisionId)
+    params.set('revisionDataset', datasetId)
+  }
+  if (returnToCanvas?.canvasId) {
+    params.set('returnCanvas', returnToCanvas.canvasId)
+    if (returnToCanvas.nodeId) params.set('returnNode', returnToCanvas.nodeId)
+  }
+  const datasetQuery = params.size ? params.toString() : undefined
   return routeHash(
     'workspace', undefined, `dataset:${datasetId}`, undefined, undefined, undefined,
     undefined, 'datasets', datasetQuery,

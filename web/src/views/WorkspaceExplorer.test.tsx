@@ -36,7 +36,7 @@ vi.mock('./CatalogDiscovery', () => ({
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
   AddDataModal: ({ onClose }: { onClose: () => void }) => <div role="dialog" aria-label="Add data"><span>Upload a local file</span><span>Register an accessible path or URI</span><button onClick={onClose}>Close</button></div>,
   CatalogDiscovery: ({ title, onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
-    initialRevisionId, initialRevisionDatasetId,
+    initialRevisionId, initialRevisionDatasetId, detailBackLabel,
     onOpenInWorkspace, workspaceLocation, onRetryWorkspaceLocation }: {
     title: string
     onUseTables: (tables: { id: string; registrationId: string; name: string; uri: string; columns: never[] }[]) => void
@@ -45,6 +45,7 @@ vi.mock('./CatalogDiscovery', () => ({
     selectedRegistrationId?: string | null
     initialRevisionId?: string
     initialRevisionDatasetId?: string
+    detailBackLabel?: string
     onOpenInWorkspace?: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] }) => void
     workspaceLocation?: { state: 'resolving' | 'available' | 'unavailable'; reason?: string; retryable?: boolean }
     onRetryWorkspaceLocation?: () => void
@@ -52,6 +53,7 @@ vi.mock('./CatalogDiscovery', () => ({
     <span>Catalog title: {title}</span>
     <span>Selected registration: {selectedRegistrationId ?? 'none'}</span>
     <span>Exact deep link: {initialRevisionDatasetId ?? 'none'}@{initialRevisionId ?? 'none'}</span>
+    <span>Detail back: {detailBackLabel ?? 'default'}</span>
     <button onClick={() => onUseTables([
       { id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] },
       { id: 't2', registrationId: 'dataset-2', name: 'actions', uri: 'file:///actions.parquet', columns: [] },
@@ -133,7 +135,10 @@ describe('WorkspaceExplorer', () => {
       rows: [{ frame_id: 9 }], rowCount: 1, hasMore: false, rowLimit: 100, sampleProvenance: null,
     })
   })
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    window.location.hash = ''
+  })
 
   it('resolves a stable dataset URL into server-provided breadcrumbs and the existing detail surface', async () => {
     store.workspaceResourceId = DATASET.id
@@ -203,9 +208,28 @@ describe('WorkspaceExplorer', () => {
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
     render(<WorkspaceExplorer />)
 
+    expect(screen.getByText('Detail back: Back to Workspace')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
     await waitFor(() => expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(''))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(null)
+  })
+
+  it('returns a Canvas-origin exact viewer to its original selected node', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt&returnCanvas=canvas-1&returnNode=write'
+    render(<WorkspaceExplorer />)
+
+    expect(screen.getByText('Detail back: Back to Canvas')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+
+    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('datasets', {
+      resourceId: null,
+      datasetQuery: '',
+    })
+    await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('canvas-1', { skipViewportFit: true }))
+    expect(store.select).toHaveBeenCalledWith('write')
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
   })
 
   it('continues a bounded page only when the user requests more', async () => {

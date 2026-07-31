@@ -150,6 +150,8 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
         scope: 'datasets',
         revision: receipt!.revisionId,
         revisionDataset: receipt!.datasetId,
+        returnCanvas: canvasId,
+        returnNode: 'write',
       })}`,
     )
     await exactDataset.click()

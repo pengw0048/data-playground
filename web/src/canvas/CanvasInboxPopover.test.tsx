@@ -29,9 +29,11 @@ vi.mock('../store/graph', () => ({
   useStore: (selector: (state: {
     setInboxQuery: typeof mocks.setInboxQuery
     setJobsQuery: typeof mocks.setJobsQuery
+    doc: { id: string }
   }) => unknown) => selector({
     setInboxQuery: mocks.setInboxQuery,
     setJobsQuery: mocks.setJobsQuery,
+    doc: { id: 'canvas-1' },
   }),
 }))
 
@@ -159,7 +161,7 @@ describe('CanvasInboxPopover', () => {
 
     expect(within(preview).getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      datasetViewerHash('dataset/with spaces', 'revision 9'),
+      datasetViewerHash('dataset/with spaces', 'revision 9', { canvasId: 'canvas-1' }),
     )
   })
 

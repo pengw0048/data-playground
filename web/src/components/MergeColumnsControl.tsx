@@ -93,6 +93,7 @@ function requestKey(request: MergeColumnsRequest): string {
  */
 export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: string; compact?: boolean }) {
   const node = useStore((state) => state.doc.nodes.find((item) => item.id === nodeId))
+  const canvasId = useStore((state) => state.doc.id)
   const doc = useStore((state) => state.doc)
   const updateConfig = useStore((state) => state.updateConfig)
   const canEdit = useStore((state) => roleCanEdit(state.canvasRole))
@@ -360,7 +361,8 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
         {task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}</div>}
     </div>}
     {receipt && <div className="mt-2 text-[10.5px]">
-      <PublishedDatasetResult receipt={receipt} />
+      <PublishedDatasetResult receipt={receipt}
+        returnToCanvas={{ canvasId, nodeId }} />
     </div>}
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">Tracked durable Task</div>

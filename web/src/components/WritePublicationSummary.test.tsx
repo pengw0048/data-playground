@@ -158,4 +158,14 @@ describe('WritePublicationSummary task-first output states', () => {
       '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
     )
   })
+
+  it('keeps the originating Canvas and node in an Inspector receipt link', () => {
+    render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
+      receipt={receipt} completed returnToCanvas={{ canvasId: 'canvas-1', nodeId: 'write' }} />)
+
+    expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href',
+      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
+    )
+  })
 })

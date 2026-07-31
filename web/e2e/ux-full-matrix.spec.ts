@@ -49,7 +49,7 @@ test.describe('full researcher acceptance matrix', () => {
     const declared = await page.request.post('/api/catalog/relationships', { data: relation })
     expect(declared.ok()).toBeTruthy()
 
-    await page.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.getByRole('button', { name: 'Back to Workspace', exact: true }).click()
     await openWorkspaceTable(page, left.name)
     await page.getByTestId('detail-relationships').click()
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible()

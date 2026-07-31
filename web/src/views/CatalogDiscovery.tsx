@@ -63,6 +63,8 @@ export interface CatalogDiscoveryProps {
   initialRevisionId?: string
   /** Authoritative logical dataset identity paired with the requested revision. */
   initialRevisionDatasetId?: string
+  /** Accessible Back destination for a routed full-page detail. */
+  detailBackLabel?: string
 }
 
 export interface CatalogDiscoveryQueryState {
@@ -84,7 +86,7 @@ export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
   queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange, onOpenInWorkspace,
   workspaceLocation, onRetryWorkspaceLocation,
-  initialRevisionId, initialRevisionDatasetId,
+  initialRevisionId, initialRevisionDatasetId, detailBackLabel,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -519,6 +521,7 @@ export function CatalogDiscovery({
 
       {selected && (
         <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
+          backLabel={detailBackLabel}
           initialRevisionId={initialRevisionId}
           initialRevisionDatasetId={initialRevisionDatasetId}
           onChanged={(t) => {
@@ -912,6 +915,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
   folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
+  backLabel = 'Back to Workspace',
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
@@ -921,6 +925,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   onFolderRetry?: () => void
   initialRevisionId?: string
   initialRevisionDatasetId?: string
+  backLabel?: string
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1204,7 +1209,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       <div role="dialog" aria-label={table.name}
         className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
         <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
-          <button ref={closeRef} onClick={requestClose} aria-label="Close"
+          <button ref={closeRef} onClick={requestClose} aria-label={backLabel}
             className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
             <Icon name="chevronLeft" size={14} /> Back
           </button>
