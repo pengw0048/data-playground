@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { routeHash } from '../router'
+import { datasetRevisionTimeLabel } from '../lib/revisionTime'
 import type { DatasetViewDefinition, DistributionReportBucketExamples, DistributionReportComparison, DistributionReportDocument, DistributionReportEnvelope, DistributionReportEstimate, DistributionReportSection } from '../types/api'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -248,8 +249,9 @@ function ReportDocument({ report, view, onExamples }: { report: DistributionRepo
 }
 
 function Evidence({ report, view, coverage, sampling }: { report: DistributionReportDocument; view: DatasetViewDefinition; coverage: Extract<DistributionReportSection, { kind: 'coverage_schema' }> | undefined; sampling: string }) {
+  const committedAt = datasetRevisionTimeLabel(view.datasetRef.lastKnown?.committedAt, view.retentionOwner)
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before distributions</div>
-    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Exact revision:</strong> {view.datasetRef.lastKnown?.committedAt ? `committed ${date(view.datasetRef.lastKnown.committedAt)}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
+    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Exact revision:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
     {report.sampleProvenance && <div className="rounded border border-border bg-background p-2"><strong>Sample evidence:</strong> {count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div>}
     {report.limitations.length > 0 && <ul className="list-disc pl-4 text-muted-foreground">{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul>}
     <ReportTechnicalEvidence report={report} view={view} />

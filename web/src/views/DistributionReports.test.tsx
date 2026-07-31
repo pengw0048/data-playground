@@ -20,7 +20,7 @@ import { DistributionReportLauncher, DistributionReportPage } from './Distributi
 
 const view: DatasetViewDefinition = {
   schemaVersion: 1, id: 'view-1', creatorId: 'local', name: 'Exact observations',
-  datasetRef: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-1' },
+  datasetRef: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-1', lastKnown: { committedAt: '2026-07-17T12:00:00' } },
   placement: { containerId: 'root', placementId: 'placement-1', sourceRegistrationId: 'registration-1' },
   selectedColumns: ['number', 'category', 'when', 'blob'], predicate: null, sampling: { kind: 'reservoir', size: 10, seed: 7 },
   sampleProvenance: { strategy: 'reservoir', seed: 7, requestedRows: 10, scannedRows: 100, returnedRows: 10, totalRows: 100, identity: 'sample-7', limitations: ['Deterministic sample.'] },
@@ -62,6 +62,9 @@ describe('DistributionReportPage', () => {
     expect(screen.getByText(/Non-finite 1/)).toBeVisible()
     expect(screen.getByText(/scanned 100/)).toBeVisible()
     expect(screen.getByText(/Min \/ max 1e-9 \/ 8/)).toBeVisible()
+    expect(screen.getByText(`Exact revision:`).parentElement).toHaveTextContent(
+      `committed ${new Date('2026-07-17T12:00:00Z').toLocaleString()}`,
+    )
     expect(screen.getByText('Value: Other')).toBeVisible()
     expect(screen.getByText('Other (top-K remainder)')).toBeVisible()
   })
