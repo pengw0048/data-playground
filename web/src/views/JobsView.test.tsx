@@ -235,9 +235,25 @@ describe('JobsView', () => {
     expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
     expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
     expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
-    expect(screen.getByLabelText('Filter jobs by canvas id (exact)')).toHaveValue('not-accessible')
-    expect(screen.getByLabelText('Filter jobs by node id (exact)')).toHaveValue('exact-node')
-    expect(screen.getByLabelText('Filter jobs by backend id (exact)')).toHaveValue('exact-backend')
+    expect(screen.queryByLabelText(/Filter jobs by canvas id \(exact\)/i)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/Filter jobs by node id \(exact\)/i)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/Filter jobs by backend id \(exact\)/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps a standalone exact node filter visible and clearable', async () => {
+    useStore.setState({ jobsQuery: 'node=orphan-node' } as never)
+    render(<JobsView />)
+
+    openAdvancedFilters()
+    expect(await screen.findByRole('option', { name: 'Exact node ID: orphan-node' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by node'))
+      .toHaveValue(JSON.stringify([null, 'orphan-node']))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: undefined, nodeId: 'orphan-node', limit: 50,
+    })))
+
+    fireEvent.change(screen.getByLabelText('Filter jobs by node'), { target: { value: '' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe(''))
   })
 
   it('preserves completed pages when a load-more request fails', async () => {

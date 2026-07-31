@@ -291,9 +291,9 @@ export function JobsView() {
       update('node', '')
       return
     }
-    const [canvasId, nodeId] = JSON.parse(value) as [string, string]
+    const [canvasId, nodeId] = JSON.parse(value) as [string | null, string]
     const next = new URLSearchParams(params)
-    next.set('canvas', canvasId)
+    if (canvasId) next.set('canvas', canvasId); else next.delete('canvas')
     next.set('node', nodeId)
     clearSelectionParams(next)
     setJobsQuery(next.toString())
@@ -374,11 +374,6 @@ export function JobsView() {
             <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
           <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
         </section>
-        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <Filter label="Canvas ID (exact)" name="canvas" value={params.get('canvas') ?? ''} onChange={update} />
-          <Filter label="Node ID (exact)" name="node" value={params.get('node') ?? ''} onChange={update} />
-          <Filter label="Backend ID (exact)" name="backend" value={params.get('backend') ?? ''} onChange={update} />
-        </div>
       </details>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
@@ -433,7 +428,7 @@ function canvasLabel(canvas: CanvasFile): string {
 }
 
 function nodeChoiceValue(canvasId: string | null, nodeId: string | null): string {
-  return canvasId && nodeId ? JSON.stringify([canvasId, nodeId]) : ''
+  return nodeId ? JSON.stringify([canvasId || null, nodeId]) : ''
 }
 
 function currentPageNodeChoices(items: WorkspaceJobDto[]) {
