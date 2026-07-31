@@ -97,6 +97,16 @@ describe('TransformsLibrary', () => {
   })
   afterEach(() => cleanup())
 
+  it('recovers from an unavailable Transform deep link', async () => {
+    mocks.transformLibraryDetail.mockRejectedValue(new KernelError(404, 'Transform not found'))
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Transform not found')
+    fireEvent.click(screen.getByRole('button', { name: 'Back to Transforms' }))
+    expect(store.setTransformResource).toHaveBeenCalledWith(null)
+  })
+
   it('shows the exact user-authored source for a promoted version', async () => {
     mocks.installedProcessorSource.mockResolvedValue({
       processorId: 'tr_exact',

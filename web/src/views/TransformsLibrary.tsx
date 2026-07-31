@@ -182,7 +182,13 @@ export function TransformsLibrary() {
       <section aria-label="Transform detail" className="min-w-0 rounded-xl border border-border bg-card p-5 lg:sticky lg:top-5 lg:self-start">
         {!selectedId && <div className="py-12 text-center text-sm text-muted-foreground">Select a Transform to inspect its exact versions and use it.</div>}
         {selectedId && !detail && !detailError && <div className="py-12 text-center text-sm text-muted-foreground">Loading exact versions…</div>}
-        {detailError && <div role="alert" className="text-sm text-destructive">{detailError}</div>}
+        {detailError && <div role="alert" className="grid gap-3 text-sm text-destructive">
+          <span>{detailError}</span>
+          <button type="button" onClick={() => setResource(null)}
+            className="inline-flex w-fit items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-[12px] font-semibold text-foreground hover:bg-accent">
+            <Icon name="chevronLeft" size={14} /> Back to Transforms
+          </button>
+        </div>}
         {detail && <TransformDetail detail={detail} selected={activeVersion} requestedMissing={requestedMissing}
           onSelectVersion={(version) => setResource(
             detail.id, version, targetContext,
