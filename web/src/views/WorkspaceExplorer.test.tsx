@@ -530,6 +530,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.contextMenu(await screen.findByRole('button', { name: /Open dataset observations from Connected source/ }))
+    expect(screen.queryByRole('menuitem', { name: /Remove unavailable/ })).not.toBeInTheDocument()
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove dataset…' }))
     const dialog = screen.getByRole('dialog', { name: 'Remove observations from warehouse' })
     expect(dialog).toHaveTextContent('underlying data stays in its storage')

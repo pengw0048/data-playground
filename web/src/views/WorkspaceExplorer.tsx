@@ -2078,7 +2078,7 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
     actions.push({ label: 'No bulk actions available', disabled: true })
   } else if (contextSelectionCount === 1 && resource.kind === 'container' && !onDeleteFolder && resource.folderMutationUnavailableReason) {
     actions.push({ label: 'Delete unavailable', disabled: true, hint: resource.folderMutationUnavailableReason })
-  } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && isExternal(resource)) {
+  } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && isExternal(resource) && !onRemoveDataset) {
     actions.push({
       label: 'Remove unavailable', disabled: true,
       hint: `${resource.mountId ?? 'This connected source'} did not expose dataset removal.`,
