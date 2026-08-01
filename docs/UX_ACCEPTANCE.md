@@ -22,6 +22,53 @@ Every acceptance run follows this workflow:
 8. Inspect and export a complete artifact.
 9. Leave and return through a durable, shareable link without losing context.
 
+## Cold-start comprehension gate
+
+Functional browser tests answer whether a known control still works. They do not answer whether a
+first-time researcher can discover the control, predict its effect, or decide which information can
+be ignored. Every release candidate therefore starts with one cold UI-only pass before the reviewer
+may inspect source code, test selectors, network traffic, logs, or API responses.
+
+Use a fresh database and browser profile. Run the pass at 1280×720 and 1440×900, first with one item,
+then with at least 50 items. The reviewer receives a research goal, never menu names, routes, control
+labels, or implementation terms. Before every action they record:
+
+1. the result they are trying to achieve;
+2. the visible clue that suggests this action;
+3. the result they expect after taking it;
+4. the actual result and whether any product knowledge or guessing was required.
+
+Stop and record a blocker when no evidence-based next step is visible within 30 seconds, or after two
+guesses. Reaching the end through persistence does not turn a blocked or confusing path into a pass.
+Each visible sentence must help a researcher choose an action, understand a result, or recover from a
+failure. Internal identity, placement, runner, integrity, and scheduler evidence belongs in
+Diagnostics unless it changes one of those decisions.
+
+Use this baseline prompt for an independent browser reviewer:
+
+> You are a data researcher opening Data Playground for the first time. Start on the home page and
+> use only visible UI. Find the built-in events data, create and name a Canvas, keep only purchase
+> events, add a Python Transform that creates amount_with_tax, confirm its output columns, run it,
+> and save the result. Leave the Canvas, find the result from Workspace or Jobs, reopen the same
+> Transform, and continue editing. Before each click, state your goal, the visible clue for that
+> action, and what you expect to happen. Do not inspect source code, tests, DOM test IDs, developer
+> tools, network requests, or APIs; do not enter a deep link. If the next step is not clear within
+> 30 seconds or two guesses, stop and record a blocker. Record every unexplained term, unnecessary
+> click, missing feedback, and failed recovery. Finally change the upstream filter and verify that an
+> old result is not presented as current.
+
+The report separates task completion from comprehension. It includes the decision log, screenshots
+for every blocker, time to first useful action, total clicks, backtracks, unsupported guesses, and
+P0/P1/P2 issues with the smallest product correction. Only after this report is frozen may an
+engineer use APIs and logs to diagnose causes.
+
+Automated `@cold-user` coverage should enforce observable parts of this contract: no API-created
+Canvas or deep-link setup, visible data-entry choices on an empty Canvas, one continuous dataset-to-
+Source flow, normal-language version labels, no editable fields whose values execution ignores, no
+native browser prompts, and a journey that runs work, consumes its artifact, leaves, reopens, mutates
+upstream state, and verifies invalidation or recovery. Locators must not encode the product path as a
+substitute for the independent cold review.
+
 ## Deterministic fixtures
 
 Build fixtures with the product environment so they use the same starter-data formats as a real local

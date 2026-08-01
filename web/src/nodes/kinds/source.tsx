@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useNodeTransientSurface } from '../nodeTransientSurface'
@@ -59,15 +60,25 @@ const localDatasetBinding = (table: CatalogTable) => ({
 
 export type SourceEntryAction = 'select' | 'upload' | 'browse'
 
+const pendingEntryActions = new Map<string, SourceEntryAction>()
+
 // The Inspector uses the same picker that powers the Source card. Keeping the action at the
 // Source component preserves the existing catalog, upload, and destination-registration paths.
 export function requestSourceEntryAction(nodeId: string, action: SourceEntryAction) {
+  pendingEntryActions.set(nodeId, action)
   window.dispatchEvent(new CustomEvent<SourceEntryAction>(`dataplay:source-entry:${nodeId}`, { detail: action }))
+  window.setTimeout(() => {
+    if (pendingEntryActions.get(nodeId) === action) pendingEntryActions.delete(nodeId)
+  }, 5000)
 }
 
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const [registerUri, setRegisterUri] = useState('')
+  const [registering, setRegistering] = useState(false)
+  const [registerError, setRegisterError] = useState<string | null>(null)
   const [workspaceDialog, setWorkspaceDialog] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [q, setQ] = useState('')
@@ -119,19 +130,27 @@ function Source({ id, data }: NodeComponentProps) {
   }, [selectedExact?.datasetId, selectedExact?.revisionId, exactDetailRequest])
 
   useEffect(() => {
-    if (!canEdit) { setOpen(false); setDialog(false); setWorkspaceDialog(false) }
+    if (!canEdit) { setOpen(false); setDialog(false); setRegisterOpen(false); setWorkspaceDialog(false) }
   }, [canEdit])
 
   useEffect(() => {
     const eventName = `dataplay:source-entry:${id}`
-    const handleEntryAction = (event: Event) => {
-      const action = (event as CustomEvent<SourceEntryAction>).detail
+    const applyEntryAction = (action: SourceEntryAction) => {
       if (!canEdit) return
       if (action === 'select') setOpen(true)
       if (action === 'upload') fileRef.current?.click()
-      if (action === 'browse') { setOpen(false); setDialog(true) }
+      if (action === 'browse') { setOpen(false); setRegisterError(null); setRegisterOpen(true) }
+    }
+    const handleEntryAction = (event: Event) => {
+      pendingEntryActions.delete(id)
+      applyEntryAction((event as CustomEvent<SourceEntryAction>).detail)
     }
     window.addEventListener(eventName, handleEntryAction)
+    const pending = pendingEntryActions.get(id)
+    if (pending) {
+      pendingEntryActions.delete(id)
+      applyEntryAction(pending)
+    }
     return () => window.removeEventListener(eventName, handleEntryAction)
   }, [canEdit, id])
 
@@ -190,12 +209,21 @@ function Source({ id, data }: NodeComponentProps) {
     if (!canEdit) return
     const t = await api.registerFile(uri)
     rememberTables([t]); replaceSourceBinding(id, t.name, localDatasetBinding(t))
-    setDialog(false); setOpen(false)
+    setDialog(false); setRegisterOpen(false); setOpen(false)
+  }
+
+  const registerPath = async () => {
+    const uri = registerUri.trim()
+    if (!uri || registering) return
+    setRegistering(true); setRegisterError(null)
+    try { await pickFile(uri); setRegisterUri('') }
+    catch (error) { setRegisterError(error instanceof Error ? error.message : String(error)) }
+    finally { setRegistering(false) }
   }
 
   // A card is for choosing and orienting.  It deliberately names one source, one version state,
   // and one count/schema summary; opaque identities belong in Inspector → Connection details.
-  const sourceLabel = providerBinding ? data.config.providerName ?? 'Provider' : 'Local catalog'
+  const sourceLabel = providerBinding ? data.config.providerName ?? 'Provider' : 'Datasets'
   const meta = datasetParameter
     ? `${sourceLabel} · Run-time dataset parameter · Rows and columns vary by run`
     : selectedExact
@@ -213,7 +241,7 @@ function Source({ id, data }: NodeComponentProps) {
       : table
         ? `${sourceLabel} · Current version · ${countSummary(table.rowCount, table.columns.length)}`
         : providerBinding
-          ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Exact version not selected' : 'Current version'} · Rows and columns unknown`
+          ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Version not selected' : 'Current version'} · Rows and columns unknown`
           : 'Choose a dataset'
 
   return (
@@ -247,10 +275,10 @@ function Source({ id, data }: NodeComponentProps) {
       )}
 
       <Popover anchorRef={btnRef} open={open} onClose={() => setOpen(false)} width={250}>
-        <div className="px-[9px] pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Local catalog</div>
+        <div className="px-[9px] pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Datasets</div>
         {/* Search the local catalog server-side (it can be thousands of tables). */}
         <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} onClick={(e) => e.stopPropagation()}
-          placeholder="Search local datasets…" data-testid="source-search"
+          placeholder="Search datasets…" data-testid="source-search"
           className="mb-1 w-full rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] outline-none focus:border-primary" />
         {resultsError && kernelUp && (
           <div role="alert" className="m-1 flex items-center justify-between gap-2 rounded-md border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
@@ -290,7 +318,7 @@ function Source({ id, data }: NodeComponentProps) {
           className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
           <Icon name="search" size={12} /> Browse Workspace catalog…
         </button>
-        <button onClick={(e) => { e.stopPropagation(); setOpen(false); setDialog(true) }}
+        <button onClick={(e) => { e.stopPropagation(); setOpen(false); setRegisterError(null); setRegisterOpen(true) }}
           className="flex w-full items-center gap-[7px] rounded-md px-[9px] py-[7px] text-left text-xs text-primary hover:bg-accent">
           <Icon name="search" size={12} /> Register accessible path / URI…
         </button>
@@ -299,7 +327,10 @@ function Source({ id, data }: NodeComponentProps) {
           <Icon name="export" size={12} /> Upload local file…
         </button>
       </Popover>
-      {workspaceDialog && <WorkspaceProviderPicker onClose={() => setWorkspaceDialog(false)} onPick={pickWorkspaceProvider} />}
+      {workspaceDialog && createPortal(
+        <WorkspaceProviderPicker onClose={() => setWorkspaceDialog(false)} onPick={pickWorkspaceProvider} />,
+        document.body,
+      )}
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
       {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
         disabled={!canEdit} onChange={(event) => updateConfig(id, {
@@ -313,6 +344,28 @@ function Source({ id, data }: NodeComponentProps) {
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
+      {registerOpen && createPortal(<div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!registering) setRegisterOpen(false) }}>
+        <form role="dialog" aria-modal="true" aria-label="Register path or URL"
+          className="grid w-[500px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl"
+          onSubmit={(event) => { event.preventDefault(); void registerPath() }} onClick={(event) => event.stopPropagation()}>
+          <div className="flex items-center gap-2">
+            <h2 className="flex-1 text-[15px] font-bold text-foreground">Register path or URL</h2>
+            <button type="button" onClick={() => setRegisterOpen(false)} disabled={registering} aria-label="Close"><Icon name="close" size={15} /></button>
+          </div>
+          <p className="text-[11.5px] leading-relaxed text-muted-foreground">Enter a file path or storage URL that Data Playground can access.</p>
+          <input autoFocus aria-label="Dataset path or URL" value={registerUri} onChange={(event) => setRegisterUri(event.target.value)}
+            placeholder="/data/events.parquet or s3://bucket/key" className="dp-input" />
+          {registerError && <div role="alert" className="text-[11.5px] text-destructive">Couldn't register this dataset: {registerError}</div>}
+          <div className="flex flex-wrap justify-end gap-2">
+            <button type="button" onClick={() => { setRegisterOpen(false); setDialog(true) }} disabled={registering}
+              className="mr-auto rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground">Browse storage</button>
+            <button type="button" onClick={() => setRegisterOpen(false)} disabled={registering}
+              className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+            <button type="submit" disabled={!registerUri.trim() || registering}
+              className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{registering ? 'Registering…' : 'Register'}</button>
+          </div>
+        </form>
+      </div>, document.body)}
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}
     </NodeCard>
   )
@@ -514,7 +567,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
       if (kernelErrorStatus(error) === 410) {
         setAsOfError('No retained revision exists at or before that instant.')
       } else if (kernelErrorStatus(error) === 409) {
-        setAsOfError('The provider could not prove one exact revision for that instant.')
+        setAsOfError('The provider could not identify one stable version for that time.')
       } else {
         setAsOfError(error instanceof Error ? error.message : String(error))
       }
@@ -562,7 +615,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
       : selected?.kind === 'as_of' ? `Change version selected as of ${formatRevisionUtc(selected.asOf)}`
         : selectedExact ? 'Change selected version'
           : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
-            : asOfAvailable ? 'Choose revision as of a time' : 'Pin exact revision'
+            : asOfAvailable ? 'Choose version by time' : 'Pin a version'
 
   if (!showControl && !selectedExact) return null
 

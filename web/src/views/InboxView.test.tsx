@@ -46,10 +46,9 @@ describe('InboxView', () => {
     useStore.setState({ view: 'inbox', inboxQuery: '', jobsQuery: '', toasts: [] } as never)
   })
 
-  it('describes Inbox scope without internal task terminology', () => {
+  it('describes Inbox as results from work the current user started', () => {
     render(<InboxView />)
-    expect(screen.queryByText('Completed background tasks assigned to you')).toBeNull()
-    expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
+    expect(screen.getByText('Results from background work you started')).toBeVisible()
     expect(screen.queryByText(/durable/i)).toBeNull()
   })
 
@@ -97,7 +96,8 @@ describe('InboxView', () => {
     await screen.findByText('external wait deadline')
     expect(screen.queryByText(/secret|traceback|boom/i)).toBeNull()
     expect(screen.getByRole('button', { name: 'Open job' })).toBeDisabled()
-    expect(screen.getByText('Canvas unavailable')).toBeInTheDocument()
+    expect(screen.getByText('Original Canvas unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/Deleted or no longer shared with you/)).toBeVisible()
   })
 
   it('never describes a failed item without a diagnostic as successful', async () => {

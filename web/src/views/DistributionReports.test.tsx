@@ -62,14 +62,14 @@ describe('DistributionReportPage', () => {
     expect(screen.getByText(/Non-finite 1/)).toBeVisible()
     expect(screen.getByText(/scanned 100/)).toBeVisible()
     expect(screen.getByText(/Min \/ max 1e-9 \/ 8/)).toBeVisible()
-    expect(screen.getByText(`Exact revision:`).parentElement).toHaveTextContent(
+    expect(screen.getByText(`Dataset version:`).parentElement).toHaveTextContent(
       `committed ${new Date('2026-07-17T12:00:00Z').toLocaleString()}`,
     )
     expect(screen.getByText('Value: Other')).toBeVisible()
     expect(screen.getByText('Other (top-K remainder)')).toBeVisible()
   })
 
-  it('keeps complete report identities behind closed technical evidence', async () => {
+  it('keeps complete report identities behind closed diagnostics', async () => {
     render(<DistributionReportPage reportId={'a'.repeat(32)} />)
 
     expect(await screen.findByText('Coverage before distributions')).toBeVisible()
@@ -79,7 +79,7 @@ describe('DistributionReportPage', () => {
     expect(within(details).getByText('dataset-1')).not.toBeVisible()
     expect(within(details).getByText('revision-1')).not.toBeVisible()
 
-    fireEvent.click(within(details).getByText('Technical evidence'))
+    fireEvent.click(within(details).getByText('Diagnostics'))
     expect(details).toHaveAttribute('open')
     expect(within(details).getByText('dataset-1')).toBeVisible()
     expect(within(details).getByText('revision-1')).toBeVisible()
@@ -274,7 +274,7 @@ describe('DistributionReportPage', () => {
     mocks.distributionReportBucketExamples.mockRejectedValue(new KernelError(410, 'sanitized', 'resource_gone', false))
     render(<DistributionReportPage reportId={'a'.repeat(32)} />)
     fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
-    expect(await screen.findByRole('dialog', { name: 'Bucket examples' })).toHaveTextContent('exact revision is no longer available')
+    expect(await screen.findByRole('dialog', { name: 'Bucket examples' })).toHaveTextContent('dataset version is no longer available')
     expect(screen.getByText('Coverage before distributions')).toBeVisible()
   })
 
@@ -342,7 +342,7 @@ describe('DistributionReportPage', () => {
     await act(async () => { newCompare(comparison('new', true, 'new-revision')) })
     await act(async () => { oldCompare(comparison('old', true, 'old-revision')); await Promise.resolve() })
     const comparisonEvidence = await screen.findByTestId('comparison-technical-evidence')
-    fireEvent.click(within(comparisonEvidence).getByText('Technical evidence'))
+    fireEvent.click(within(comparisonEvidence).getByText('Diagnostics'))
     expect(within(comparisonEvidence).getByText('new-revision')).toBeVisible()
     expect(within(comparisonEvidence).queryByText('old-revision')).not.toBeInTheDocument()
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} />)
@@ -357,7 +357,7 @@ describe('DistributionReportPage', () => {
     const exampleEvidence = screen.getByTestId('examples-technical-evidence')
     expect(exampleEvidence).not.toHaveAttribute('open')
     expect(within(exampleEvidence).getByText('top')).not.toBeVisible()
-    fireEvent.click(within(exampleEvidence).getByText('Technical evidence'))
+    fireEvent.click(within(exampleEvidence).getByText('Diagnostics'))
     expect(within(exampleEvidence).getByText('top')).toBeVisible()
     expect(within(exampleEvidence).getByText('dataset-1')).toBeVisible()
     expect(within(exampleEvidence).getByText('revision-1')).toBeVisible()

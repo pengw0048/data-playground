@@ -145,7 +145,7 @@ describe('Transform exact processor labels', () => {
       </ReactFlowProvider></TooltipProvider>,
     )
 
-    expect(screen.getByLabelText('Selected exact processor')).toHaveTextContent('Pinned processor')
+    expect(screen.getByLabelText('Selected processor version')).toHaveTextContent('Pinned processor')
     expect(screen.queryByRole('button', { name: /View definition/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'View processor definition' }))
     expect(useStore.getState()).toMatchObject({
@@ -181,6 +181,38 @@ describe('Transform exact processor labels', () => {
       transformUpgradeCanvasId: 'canvas', transformUpgradeNodeId: 'transform',
       fullscreenCode: null,
     })
+  })
+
+  it('resets unsupported Library modes for Ad-hoc code and removes stale schema overrides on return', () => {
+    const Transform = getComponent('transform')!
+    const configured = {
+      ...node,
+      data: { ...node.data, config: {
+        source: 'library', processor: PROCESSOR_ID, version: 'v1', mode: 'callable', code: null,
+        outputSchema: [{ name: 'legacy', type: 'string', capabilities: [] }], enforceSchema: true,
+      } },
+    }
+    useStore.setState({
+      doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [configured], edges: [] },
+    } as any)
+    const view = render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={configured.id} data={configured.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ad-hoc' }))
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ source: 'adhoc', mode: 'map' })
+
+    const latest = useStore.getState().doc.nodes[0]
+    view.rerender(<TooltipProvider><ReactFlowProvider>
+      <Transform id={latest.id} data={latest.data} />
+    </ReactFlowProvider></TooltipProvider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }))
+    const config = useStore.getState().doc.nodes[0].data.config as Record<string, unknown>
+    expect(config.source).toBe('library')
+    expect(config.outputSchema).toBeUndefined()
+    expect(config.enforceSchema).toBeUndefined()
   })
 
   it('configures the originating blank node through the rendered exact-version flow', async () => {
@@ -271,7 +303,7 @@ describe('Transform exact processor labels', () => {
 
     render(<TransformsLibrary />)
     fireEvent.click(await screen.findByRole('button', { name: /Exact scorer/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
 
     await waitFor(() => expect(apiMocks.workspaceAddTransform).toHaveBeenCalledWith('canvas', {
       transformId: PROCESSOR_ID, transformVersion: 'v1',
@@ -407,7 +439,7 @@ describe('Transform exact processor labels', () => {
     expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
     expect(implementation).toHaveTextContent("return {**row, 'normalized': True}")
     expect(implementation).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
-    const details = screen.getByText('Technical details').closest('details')
+    const details = screen.getByText('Processor reference').closest('details')
     expect(details).not.toHaveAttribute('open')
     expect(within(details as HTMLElement).getByText(`${PROCESSOR_ID}@v1`)).not.toBeVisible()
   })
@@ -496,7 +528,7 @@ describe('Transform exact processor labels', () => {
     const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
     expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
     expect(implementation).toHaveTextContent('Installed processor source')
-    expect(implementation).toHaveTextContent('exact local implementation')
+    expect(implementation).toHaveTextContent('local implementation installed for this Canvas transform')
     expect(implementation).toHaveTextContent('does not indicate remote or distributed dispatch')
     expect(implementation).toHaveTextContent('MAX_DECODED_IMAGE_PIXELS = 50_000_000')
     expect(implementation).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)

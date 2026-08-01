@@ -471,8 +471,9 @@ test.describe('Data Playground canvas', () => {
 
     await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
     await expect.poll(() => historyRequestStarted).toBe(true)
-    await page.getByRole('button', { name: '+ Add a source' }).click()
+    await page.getByRole('button', { name: 'Choose dataset' }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByTestId('source-search')).toBeVisible()
     releaseHistory()
     await expect(page.getByText(/Canvas changed while preparing the example; your edit was kept/)).toBeVisible()
     expect((await page.evaluate(() => location.hash)).split('?')[0]).toBe(blankHash.split('?')[0])

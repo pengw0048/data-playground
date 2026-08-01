@@ -26,7 +26,7 @@ import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { requestSourceEntryAction } from '../nodes/kinds/source'
-import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
+import { configuredProcessorRef, exactProcessor, processorModeLabel } from '../nodes/processorIdentity'
 import { datasetViewerHash } from '../router'
 
 export const INSPECTOR_W = 300
@@ -203,15 +203,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const kernelUp = useStore((s) => s.kernelUp)
-  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
+  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen, updateConfig } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   const [editingDraftSourceUri, setEditingDraftSourceUri] = useState(false)
   const [advancedExecutionOpen, setAdvancedExecutionOpen] = useState(false)
-  const [advancedOutputSchemaOpen, setAdvancedOutputSchemaOpen] = useState(false)
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
   useEffect(() => setEditingDraftSourceUri(false), [nodeId])
   useEffect(() => setAdvancedExecutionOpen(false), [nodeId])
-  useEffect(() => setAdvancedOutputSchemaOpen(false), [nodeId])
   if (!node) return null
 
   const kind = node.type
@@ -245,23 +243,27 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const inspectorBlurb = sourceSummary ?? (libraryProcessor?.blurb || spec?.blurb)
   const omittedParamNames = kind === 'write'
     ? ['writeMode']
-    : kind === 'source' && !manualDelimitedSource
-      ? ['delimiter', 'header']
-      : []
+    : kind === 'transform'
+      ? (libraryTransform ? ['source', 'mode', 'batchFormat'] : ['source', 'mode'])
+      : kind === 'source' && !manualDelimitedSource
+        ? ['delimiter', 'header']
+        : []
+  const showGenericProperties = kind !== 'transform'
+    || (!libraryTransform && cfg.mode === 'map_batches')
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
-  const outputSchemaSummary = outputSchemaContractSummary(cfg)
-  const outputSchemaIsStale = schemaContractStale(kind, cfg)
   const resourceRequirements = resourceRequirementSummary(cfg)
   const checkpointed = cfg.checkpoint === true
-  const hasResourceControls = kind === 'transform' || kind === 'section'
+  const hasAutomaticCompute = kind === 'transform' || kind === 'section'
   const hasCheckpointControls = kind !== 'source' && kind !== 'note' && kind !== 'write'
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
-  const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
+  const declaredOut = !libraryTransform && Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
+  const libraryOut = libraryTransform && libraryProcessor?.outputSchema?.length
+    ? libraryProcessor.outputSchema : null
   // Runtime columns are display-only evidence. Filter stale previews first, then require the
   // observed result's effective port to match the port being rendered.
   const currentPreview = currentPreviews(doc, previews)[nodeId]
@@ -274,7 +276,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
     return columns as ColumnSchema[]
   }
   const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
-    kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(kind, cfg)
+    libraryOut && outputPorts.length === 1
+      ? libraryOut
+      : kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(kind, cfg)
       && !node.data.bypassed && outputPorts.length === 1
       ? declaredOut
       : canDeclareSchema && outputPorts.length === 1
@@ -323,7 +327,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {showDraftSourceEntry ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit}
         onUriEditingChange={setEditingDraftSourceUri} /> : <>
         {kind === 'join' ? <JoinConfigurationSummary nodeId={nodeId} canEdit={canEdit} />
-          : !boundSource && <EditOnly enabled={canEdit}>
+          : !boundSource && showGenericProperties && <EditOnly enabled={canEdit}>
           <Section title="Properties">
             <NodeParamFields nodeId={nodeId} omitNames={omittedParamNames} />
             {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
@@ -381,34 +385,46 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         <Section title="Processor definition">
           <div className="rounded-lg border border-border bg-muted/20 p-2.5">
             <div className="text-[11.5px] font-semibold text-foreground">
-              {libraryProcessor?.title ?? 'Exact Library processor'}
+              {libraryProcessor?.title ?? 'Library transform'}
             </div>
-            <div className="mt-1 text-[10.5px] text-muted-foreground">
-              Immutable version {typeof cfg.version === 'string' ? cfg.version : 'not selected'}
+            <div className="mt-1 flex flex-wrap gap-x-2 text-[10.5px] text-muted-foreground">
+              <span>Version {typeof cfg.version === 'string' ? cfg.version : 'not selected'}</span>
+              <span>· {processorModeLabel(libraryProcessor?.mode ?? cfg.mode)}</span>
             </div>
           </div>
           <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-            <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+            <summary className="cursor-pointer font-semibold text-foreground">Developer details</summary>
             <div className="mt-1.5 break-all font-mono">
               Processor reference: {libraryProcessorRef}
             </div>
           </details>
         </Section>
       )}
+      {libraryTransform && libraryProcessor && <Section title="Output columns">
+        <div className="mb-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
+          Defined by Library version {libraryProcessor.version}.
+        </div>
+        {libraryProcessor.outputSchema.length ? libraryProcessor.outputSchema.map((column) => (
+          <div key={column.name} className="flex items-center gap-2 text-[11px]">
+            <span className="dp-mono min-w-0 flex-1 truncate text-foreground">{column.name}</span>
+            <span className="dp-mono shrink-0 text-muted-foreground">{column.type}</span>
+          </div>
+        )) : <div className="text-[10.5px] text-muted-foreground">This version does not declare output columns.</div>}
+      </Section>}
 
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
       {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}
 
-      {(resourceRequirements || checkpointed) && <ExecutionSummary resourceRequirements={resourceRequirements} checkpointed={checkpointed}
-        canEdit={canEdit} onEdit={() => setAdvancedExecutionOpen(true)} />}
-      {(hasResourceControls || hasCheckpointControls) && <details open={advancedExecutionOpen}
+      {(hasAutomaticCompute || checkpointed) && <ExecutionSummary resourceRequirements={resourceRequirements}
+        automaticCompute={hasAutomaticCompute} checkpointed={checkpointed}
+        canEdit={canEdit} onRemoveComputeOverride={() => updateConfig(nodeId, { requires: undefined })}
+        onEditMaterialization={() => setAdvancedExecutionOpen(true)} />}
+      {hasCheckpointControls && <details open={advancedExecutionOpen}
         onToggle={(event) => setAdvancedExecutionOpen(event.currentTarget.open)}
         className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 p-3 text-[10.5px]">
-        <summary className="cursor-pointer font-semibold text-foreground">Advanced execution</summary>
+        <summary className="cursor-pointer font-semibold text-foreground">Materialization options</summary>
         <div className="mt-3 grid gap-3">
-          {hasResourceControls && <EditOnly enabled={canEdit}><ResourcesSection nodeId={nodeId} embedded /></EditOnly>}
-          {hasResourceControls && hasCheckpointControls && <Separator />}
-          {hasCheckpointControls && <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} embedded /></EditOnly>}
+          <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} embedded /></EditOnly>
         </div>
       </details>}
 
@@ -433,18 +449,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {kind === 'section' && <><Separator className="my-1" /><EditOnly enabled={canEdit}><OutputPortsEditor nodeId={nodeId} /></EditOnly></>}
       </Section>}
 
-      {/* Schema contracts are an advanced declaration. Once configured, keep a compact signal and a
-          direct route back to it in the normal flow. */}
-      {canDeclareSchema && <>
-        {outputSchemaSummary && <OutputSchemaSummary summary={outputSchemaSummary} stale={outputSchemaIsStale}
-          canEdit={canEdit} onEdit={() => setAdvancedOutputSchemaOpen(true)} />}
-        <details open={advancedOutputSchemaOpen}
-          onToggle={(event) => setAdvancedOutputSchemaOpen(event.currentTarget.open)}
-          className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 p-3 text-[10.5px]">
-          <summary className="cursor-pointer font-semibold text-foreground">Advanced output schema</summary>
-          <div className="mt-3"><EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} embedded /></EditOnly></div>
-        </details>
-      </>}
+      {canDeclareSchema && !libraryTransform && <EditOnly enabled={canEdit}>
+        <SchemaContract nodeId={nodeId} runnable={runnable && !invalid} />
+      </EditOnly>}
 
       {/* actions */}
       <Section title="Actions">
@@ -686,59 +693,42 @@ export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boole
 function resourceRequirementSummary(config: Record<string, unknown>): string | null {
   const requires = config.requires
   if (!requires || typeof requires !== 'object') return null
-  const { cpu, gpu, gpuType } = requires as { cpu?: unknown; gpu?: unknown; gpuType?: unknown }
+  const { cpu, mem, gpu, gpuType, labels } = requires as {
+    cpu?: unknown; mem?: unknown; gpu?: unknown; gpuType?: unknown; labels?: unknown
+  }
+  const labelSummary = labels && typeof labels === 'object' && !Array.isArray(labels)
+    ? Object.entries(labels).map(([key, value]) => `${key}=${String(value)}`).join(', ')
+    : ''
   const parts = [
     typeof gpu === 'number' ? `${gpu} GPU${gpu === 1 ? '' : 's'}` : null,
     typeof gpuType === 'string' && gpuType ? gpuType : null,
     typeof cpu === 'number' ? `${cpu} CPU${cpu === 1 ? '' : 's'}` : null,
+    typeof mem === 'string' && mem ? mem : null,
+    labelSummary || null,
   ].filter((part): part is string => part != null)
-  return parts.length ? parts.join(' · ') : null
+  return parts.length ? parts.join(' · ')
+    : Object.keys(requires).length ? 'Configured requirement' : null
 }
 
-function outputSchemaContractSummary(config: Record<string, unknown>): string | null {
-  const outputSchema = config.outputSchema
-  if (Array.isArray(outputSchema) && outputSchema.length > 0) {
-    return `${outputSchema.length} declared column${outputSchema.length === 1 ? '' : 's'}`
-  }
-  if (outputSchema && typeof outputSchema === 'object' && typeof (outputSchema as { ref?: unknown }).ref === 'string') {
-    const ref = (outputSchema as { ref: string }).ref.trim()
-    return ref ? `Named contract · ${ref}` : null
-  }
-  return null
-}
-
-function ExecutionSummary({ resourceRequirements, checkpointed, canEdit, onEdit }: {
+function ExecutionSummary({ resourceRequirements, automaticCompute, checkpointed, canEdit, onRemoveComputeOverride, onEditMaterialization }: {
   resourceRequirements: string | null
+  automaticCompute: boolean
   checkpointed: boolean
   canEdit: boolean
-  onEdit: () => void
+  onRemoveComputeOverride: () => void
+  onEditMaterialization: () => void
 }) {
   return <Section title="Execution">
     <div className="grid gap-1.5 text-[11px]">
-      {resourceRequirements && <div className="flex items-center justify-between gap-2">
-        <span><strong>Resources</strong> · {resourceRequirements}</span>
-        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit resources</Button>}
+      {automaticCompute && <div className="flex items-center justify-between gap-2">
+        <span><strong>Compute</strong> · {resourceRequirements ?? 'Automatic'}</span>
+        {resourceRequirements && canEdit && <Button variant="ghost" size="sm" onClick={onRemoveComputeOverride}
+          className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Use Automatic</Button>}
       </div>}
       {checkpointed && <div className="flex items-center justify-between gap-2">
         <span><strong>Materialization</strong> · Checkpointed output</span>
-        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>}
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEditMaterialization} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>}
       </div>}
-    </div>
-  </Section>
-}
-
-function OutputSchemaSummary({ summary, stale, canEdit, onEdit }: {
-  summary: string
-  stale: boolean
-  canEdit: boolean
-  onEdit: () => void
-}) {
-  return <Section title="Output schema">
-    <div className="grid gap-1.5 text-[11px]">
-      <div className="flex items-center justify-between gap-2">
-        <span>{summary}{stale && <span className="text-amber-700 dark:text-amber-300"> · Needs review</span>}</span>
-        {canEdit && <Button variant="ghost" size="sm" onClick={onEdit} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">{stale ? 'Review output schema' : 'Edit output schema'}</Button>}
-      </div>
     </div>
   </Section>
 }
@@ -765,33 +755,6 @@ function CheckpointToggle({ nodeId, embedded = false }: { nodeId: string; embedd
           </span>
         </span>
       </button>
-    </Section>
-  )
-}
-
-function ResourcesSection({ nodeId, embedded = false }: { nodeId: string; embedded?: boolean }) {
-  const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
-  const updateConfig = useStore((s) => s.updateConfig)
-  const req = ((node?.data.config as Record<string, unknown>)?.requires ?? {}) as { cpu?: number; gpu?: number; gpuType?: string }
-  const set = (patch: Record<string, unknown>) => {
-    const next: Record<string, unknown> = { ...req, ...patch }
-    for (const k of Object.keys(next)) if (next[k] === '' || next[k] == null) delete next[k]
-    updateConfig(nodeId, { requires: Object.keys(next).length ? next : undefined })
-  }
-  const num = (v: string) => (v === '' ? undefined : Number(v))
-  return (
-    <Section title="Resources (placement)" embedded={embedded}>
-      <div className="mb-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
-        What this step needs — the run routes to a worker that satisfies it (e.g. a GPU pool). Blank = no requirement.
-      </div>
-      <div className="grid grid-cols-3 gap-1.5">
-        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">GPUs
-          <Input type="number" min={0} className="h-7 text-[11.5px] md:text-[11.5px]" value={req.gpu ?? ''} onChange={(e) => set({ gpu: num(e.target.value) })} /></label>
-        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">GPU type
-          <Input className="h-7 text-[11.5px] md:text-[11.5px]" placeholder="a100" value={req.gpuType ?? ''} onChange={(e) => set({ gpuType: e.target.value || undefined })} /></label>
-        <label className="flex flex-col gap-0.5 text-[10px] text-muted-foreground">CPUs
-          <Input type="number" min={0} className="h-7 text-[11.5px] md:text-[11.5px]" value={req.cpu ?? ''} onChange={(e) => set({ cpu: num(e.target.value) })} /></label>
-      </div>
     </Section>
   )
 }
@@ -988,7 +951,7 @@ function sourceInspectorSummary(catalog: CatalogTable[], config: Record<string, 
   const source = provider
     ? (typeof config.providerName === 'string' ? config.providerName : 'Mounted provider')
     : hasLocalSourceIdentity(config)
-      ? 'Local catalog'
+      ? 'Datasets'
       : 'Selected dataset'
 
   if (hasBoundSourceIdentity(config)) {
@@ -996,7 +959,7 @@ function sourceInspectorSummary(catalog: CatalogTable[], config: Record<string, 
       ? `${source} · Run-time dataset parameter`
       : 'Run-time dataset parameter'
     const version = exact
-      ? exact.revisionId.length > 24 ? 'Selected exact version' : `Exact version ${exact.revisionId}`
+      ? exact.revisionId.length > 24 ? 'Selected version' : `Version ${exact.revisionId}`
       : 'Current version'
     if (!exact && table) {
       const rows = table.rowCount == null
@@ -1091,7 +1054,7 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   const sourceLabel = provider
     ? (providerName ?? 'Mounted provider')
     : local
-      ? 'Local catalog'
+      ? 'Datasets'
       : parameter
         ? 'Run-time dataset parameter'
         : selectedRef
@@ -1130,8 +1093,8 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   }
   add('Dataset location', stringValue('uri'))
   if (exact) {
-    add('Exact dataset identity', exact.datasetId)
-    add('Exact revision identity', exact.revisionId)
+    add('Dataset ID', exact.datasetId)
+    add('Revision ID', exact.revisionId)
   }
   if (selectedRef?.kind === 'as_of') add('As-of selection (UTC)', selectedRef.asOf)
 
@@ -1242,10 +1205,13 @@ export function PortRow({ dir, name, wire, schema }: {
   )
 }
 
-// Schema contract for a code op (transform / plugin / vector-search): untyped until it runs. The user
-// can DECLARE the output columns (types this port + everything downstream via a typed stand-in) or
-// INFER them from a bounded sample run. Both write config.outputSchema — declaring is just the manual
-// path, inferring auto-fills it. Clearing it returns the port to untyped (dynamic) — all fine.
+const COMMON_OUTPUT_TYPES = [
+  'string', 'int32', 'int64', 'float32', 'float64', 'boolean', 'date', 'timestamp', 'bytes', 'json',
+]
+
+// Output columns for a code op (transform / plugin / vector-search): untyped until it runs. Manual
+// edits and preview detection both write the existing config.outputSchema contract. Existing named
+// references remain readable, but creating or discovering named contracts is not a Canvas concern.
 function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string; runnable: boolean; embedded?: boolean }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
@@ -1262,23 +1228,19 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
   const code = contractText == null ? null : String(contractText)
   // the contract may be stale if the code/SQL changed since it was pinned
   const stale = schemaContractStale(node?.type ?? '', cfg)
-  const [names, setNames] = useState<string[]>([])       // named contracts available to reference
   const [refCols, setRefCols] = useState<ColumnSchema[]>([])
   const inferRequestGeneration = useRef(0)
+  const typeOptionsId = `output-column-types-${nodeId.replace(/[^A-Za-z0-9_-]/g, '-')}`
   useEffect(() => () => { inferRequestGeneration.current += 1 }, [])
-  useEffect(() => { api.listSchemas().then((s) => setNames(s.map((x) => x.name))).catch(() => {}) }, [])
   useEffect(() => {
     if (!refName) { setRefCols([]); return }
     api.listSchemas().then((s) => setRefCols(s.find((x) => x.name === refName)?.columns ?? [])).catch(() => setRefCols([]))
   }, [refName])
   const setEnforce = (on: boolean) => updateConfig(nodeId, { enforceSchema: on || undefined })
-  const reference = (name: string) => updateConfig(nodeId, { outputSchema: name ? { ref: name } : undefined, outputSchemaSource: undefined, outputSchemaCodeHash: undefined })
-  const saveAsNamed = async () => {
-    const name = window.prompt('Save these columns as a named contract:')?.trim()
-    if (!name) return
-    try { await api.saveSchema(name, declared); setNames((n) => Array.from(new Set([...n, name]))) }
-    catch (e) { setErr(e instanceof Error ? e.message : 'save failed') }
-  }
+  const unlinkReference = () => updateConfig(nodeId, {
+    outputSchema: undefined, outputSchemaSource: undefined, outputSchemaCodeHash: undefined,
+    enforceSchema: undefined,
+  })
 
   // a manual edit (no explicit src) takes ownership → 'declared'; only "Infer from sample" sets 'inferred'.
   // pin the current cell's hash alongside, so a later cell edit can flag the contract as possibly stale.
@@ -1287,6 +1249,7 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
       outputSchema: cols.length ? cols : undefined,
       outputSchemaSource: cols.length ? src : undefined,
       outputSchemaCodeHash: cols.length && code != null ? codeHash(code) : undefined,
+      enforceSchema: cols.length ? cfg.enforceSchema : undefined,
     })
 
   const infer = async () => {
@@ -1301,7 +1264,7 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
       && previewPlanIdentity(useStore.getState().doc, nodeId) === planIdentity
       && parameterBindingsIdentity(useStore.getState().runs[nodeId]?.parameterBindings) === parameterIdentity
     )
-    const changedMessage = 'The graph or parameter bindings changed while the sample was loading. Infer again for the current inputs.'
+    const changedMessage = 'The graph or parameter bindings changed while the sample was loading. Detect columns again for the current inputs.'
     try {
       let res: Awaited<ReturnType<typeof api.preview>>
       if (doc.nodes.find((candidate) => candidate.id === nodeId)?.type === 'transform') {
@@ -1329,13 +1292,13 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
       if (inferRequestGeneration.current !== requestGeneration) return
       if (!current()) {
         setErr(changedMessage)
-      } else if (res.error || res.notPreviewable) setErr(res.reason || 'could not infer — run needs a full pass')
+      } else if (res.error || res.notPreviewable) setErr(res.reason || 'Could not detect columns from a preview. Run the full step first.')
       else if (res.columns?.length) commit(res.columns as ColumnSchema[], 'inferred')
-      else setErr('no columns produced on the sample')
+      else setErr('No columns were produced by the preview.')
     } catch (e) {
       if (inferRequestGeneration.current === requestGeneration) {
         setErr(current()
-          ? e instanceof Error ? e.message : 'infer failed'
+          ? e instanceof Error ? e.message : 'Could not detect output columns.'
           : changedMessage)
       }
     } finally {
@@ -1344,11 +1307,11 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
   }
 
   return (
-    <Section title="Output schema (contract)" embedded={embedded}>
+    <Section title="Output columns" embedded={embedded}>
       {refName ? (
         <>
           <div className="text-[10.5px] leading-relaxed text-muted-foreground">
-            References the named contract <span className="dp-mono text-foreground">{refName}</span> — shared across pipelines; edit it in the schema registry.
+            Uses the saved output columns <span className="dp-mono text-foreground">{refName}</span>.
           </div>
           {refCols.map((c, i) => (
             <div key={i} className="flex items-center gap-2 text-[11px]">
@@ -1357,20 +1320,20 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
             </div>
           ))}
           <div className="mt-0.5 flex flex-wrap items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={() => reference('')}
-              className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Unlink</Button>
+            <Button variant="ghost" size="sm" onClick={unlinkReference}
+              className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Use editable columns instead</Button>
           </div>
         </>
       ) : (
         <>
           <div className="text-[10.5px] leading-relaxed text-muted-foreground">
             {declared.length
-              ? (source === 'inferred' ? 'Inferred from a sample — edit to pin it as the contract.' : 'Declared — types this port and everything downstream.')
-              : 'Untyped until it runs. Declare a contract, infer it, or reference a named one. Leave empty to stay dynamic.'}
+              ? (source === 'inferred' ? 'Detected from a preview. Edit any column to update the expected output.' : 'These columns describe this step’s output.')
+              : 'Run a preview to detect columns, or define them here. Leave this empty to accept the columns produced at runtime.'}
           </div>
           {stale && (
             <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] leading-relaxed text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
-              ⚠ The {node?.type === 'sql' ? 'SQL' : 'cell'} changed since this contract was pinned — it may be stale. Re-infer or edit to re-pin.
+              ⚠ The {node?.type === 'sql' ? 'SQL' : 'code'} changed after these output columns were saved. Detect them again or update them here.
             </div>
           )}
           {declared.map((c, i) => (
@@ -1378,45 +1341,38 @@ function SchemaContract({ nodeId, runnable, embedded = false }: { nodeId: string
               <Input value={c.name} placeholder="column"
                 onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, name: e.target.value.replace(/\s+/g, '_') } : x)))}
                 className={cn(miniInputClass, 'dp-mono min-w-0 flex-1 text-[11px] md:text-[11px]')} />
-              <Input value={c.type} placeholder="type"
+              <Input value={c.type} placeholder="type" list={typeOptionsId}
+                aria-label={`${c.name || `Column ${i + 1}`} type`}
                 onChange={(e) => commit(declared.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)))}
-                className={cn(miniInputClass, 'dp-mono w-[80px] flex-none text-[11px] md:text-[11px]')} />
+                className={cn(miniInputClass, 'dp-mono w-[100px] flex-none text-[11px] md:text-[11px]')} />
               <Button variant="ghost" size="icon" onClick={() => commit(declared.filter((_, j) => j !== i))} title="Remove column"
                 className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
             </div>
           ))}
+          <datalist id={typeOptionsId}>
+            {COMMON_OUTPUT_TYPES.map((type) => <option key={type} value={type} />)}
+          </datalist>
           <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
             <Button variant="outline" size="sm"
               onClick={() => commit([...declared, { name: `col${declared.length + 1}`, type: 'string', capabilities: [] }])}
               className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
-              <Icon name="plus" size={11} /> add column
+              <Icon name="plus" size={11} /> Add column
             </Button>
             <Button variant="outline" size="sm" disabled={busy || !runnable} onClick={infer}
-              title={runnable ? 'Run a bounded sample to resolve the output columns' : 'Wire a runnable input first'}
+              title={runnable ? 'Run a bounded preview to detect the output columns' : 'Wire a runnable input first'}
               className="h-auto gap-1 px-2 py-1 text-[10.5px] font-medium text-primary shadow-none [&_svg]:size-3">
-              <Icon name="eye" size={11} /> {busy ? 'Inferring…' : 'Infer from sample'}
+              <Icon name="eye" size={11} /> {busy ? 'Detecting…' : 'Detect from preview'}
             </Button>
             {declared.length > 0 && (
-              <Button variant="ghost" size="sm" onClick={saveAsNamed}
-                className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none" title="Save these columns as a named, versioned workspace contract">Save as named…</Button>
-            )}
-            {declared.length > 0 && (
               <Button variant="ghost" size="sm" onClick={() => commit([])}
-                className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Clear</Button>
+              className="h-auto px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none">Clear</Button>
             )}
           </div>
-          {names.length > 0 && (
-            <select value="" onChange={(e) => e.target.value && reference(e.target.value)}
-              className={cn(miniInputClass, 'mt-1 text-[10.5px] text-muted-foreground')} title="Reference a named workspace contract">
-              <option value="">Reference a named contract…</option>
-              {names.map((n) => <option key={n} value={n}>{n}</option>)}
-            </select>
-          )}
         </>
       )}
       {(declared.length > 0 || refName) && (
-        <label className="mt-1 flex items-center gap-1.5 text-[10.5px] text-muted-foreground" title="Fail the run if the actual output columns drift from this contract (missing / unexpected / retyped)">
-          <input type="checkbox" checked={enforce} onChange={(e) => setEnforce(e.target.checked)} /> Enforce (fail the run on drift)
+        <label className="mt-1 flex items-center gap-1.5 text-[10.5px] text-muted-foreground" title="Stop the run when columns are missing, unexpected, or use a different type">
+          <input type="checkbox" checked={enforce} onChange={(e) => setEnforce(e.target.checked)} /> Require these columns
         </label>
       )}
       {err && <div className="text-[10px] leading-relaxed text-amber-700 dark:text-amber-300">⚠ {err}</div>}

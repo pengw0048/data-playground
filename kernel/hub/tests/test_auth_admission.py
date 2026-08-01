@@ -481,11 +481,20 @@ def test_admin_create_hashes_initial_password_while_gate_is_held(monkeypatch):
 
     monkeypatch.setattr(auth, "hash_password", hash_while_held)
     with TestClient(app) as request_client:
+        missing_password = request_client.post(
+            "/api/users",
+            json={"name": "Cannot log in"},
+            headers={"Cookie": f"dp_session={token}"},
+        )
         response = request_client.post(
             "/api/users",
             json={"name": "Created with password", "password": "child-password"},
             headers={"Cookie": f"dp_session={token}"},
         )
+    assert missing_password.status_code == 400
+    assert missing_password.json()["detail"] == (
+        "password is required when authentication is enabled"
+    )
     assert response.status_code == 200
     assert hashed_while_held and not gate.held
     with metadb.session() as session:
@@ -775,7 +784,11 @@ def test_auth_request_bodies_are_strict_and_bound_password_bytes(monkeypatch):
         ).status_code == 401
         profile_boundary = request_client.post(
             "/api/users",
-            json={"name": exact_profile, "email": exact_profile},
+            json={
+                "name": exact_profile,
+                "email": exact_profile,
+                "password": "boundary-password",
+            },
             headers=cookie,
         )
         assert profile_boundary.status_code == 200

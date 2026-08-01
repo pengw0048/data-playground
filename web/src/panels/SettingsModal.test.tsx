@@ -33,6 +33,7 @@ const updateCred = vi.fn()
 const deleteCred = vi.fn()
 const createUser = vi.fn()
 const restartKernel = vi.fn()
+const browseDestination = vi.fn()
 vi.mock('../api/client', () => ({
   KernelError: class KernelError extends Error {
     status: number
@@ -51,6 +52,7 @@ vi.mock('../api/client', () => ({
     deleteCred: (...a: unknown[]) => deleteCred(...a),
     createUser: (...a: unknown[]) => createUser(...a),
     restartKernel: (...a: unknown[]) => restartKernel(...a),
+    browseDestination: (...a: unknown[]) => browseDestination(...a),
   },
 }))
 
@@ -78,8 +80,10 @@ describe('SettingsModal — plugin config form', () => {
     deleteCred.mockReset().mockResolvedValue({ ok: true })
     createUser.mockReset().mockResolvedValue({})
     restartKernel.mockReset().mockResolvedValue({ ok: true, restarted: true })
+    browseDestination.mockReset().mockResolvedValue({ path: '', entries: [] })
     state.kernelInfo = { runners: ['local-out-of-core'], backends: [] }
     state.currentUser.capabilities = ['global_settings']
+    state.authEnabled = false
   })
 
   it('opens directly to a requested settings category', async () => {
@@ -97,6 +101,9 @@ describe('SettingsModal — plugin config form', () => {
     // Plugins is its own pane now (master-detail) — switch to it before editing its fields
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     // the url field is pre-filled from config_values; the secret token prompts for a reference
+    const pluginCard = screen.getByTestId('plugin-status-dp_x')
+    expect(within(pluginCard).getByLabelText('URL')).toBeVisible()
+    expect(screen.getAllByText('dp_x')).toHaveLength(1)
     const url = await screen.findByDisplayValue('existing')
     const tok = screen.getByPlaceholderText(/env:VAR or file:\/path/i)
 
@@ -466,6 +473,7 @@ describe('SettingsModal — plugin config form', () => {
 
   it('protects an unsaved member draft on dismissal', async () => {
     const onClose = vi.fn()
+    state.authEnabled = true
     render(<SettingsModal onClose={onClose} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
     const input = screen.getByPlaceholderText('Name')
@@ -525,13 +533,20 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })
 
-  it('treats a plugin metadata failure as a blocking load failure for admins', async () => {
+  it('keeps unrelated Settings available when extension metadata fails', async () => {
     plugins.mockRejectedValueOnce(new Error('HTTP 500: plugin registry unavailable'))
     render(<SettingsModal onClose={vi.fn()} />)
 
+    const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
+    fireEvent.change(model, { target: { value: 'staged-model' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Plugins' }))
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Plugins request failed: HTTP 500: plugin registry unavailable')
-    expect(screen.queryByText('No plugins loaded.')).toBeNull()
+    expect(alert).toHaveTextContent('Extensions could not be loaded: HTTP 500: plugin registry unavailable')
+    expect(screen.queryByText('No extensions installed.')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByTestId('plugin-status-dp_x')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
+    expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
   })
 
   it('shows healthy, inactive, degraded, conflict, and failed plugin lifecycle states truthfully', async () => {
@@ -551,10 +566,12 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     expect(within(screen.getByTestId('plugin-status-healthy')).getByText('active')).toBeVisible()
-    expect(within(screen.getByTestId('plugin-status-healthy')).getByText('node:clean')).toBeVisible()
-    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Placement: execution')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Available in this Data Playground instance.')
+    fireEvent.click(within(screen.getByTestId('plugin-status-healthy')).getByText('Diagnostics'))
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Features: node:clean')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Starts with: execution')
     expect(within(screen.getByTestId('plugin-status-idle')).getByText('inactive')).toBeVisible()
-    expect(screen.getByTestId('plugin-status-idle')).toHaveTextContent('No effective capabilities.')
+    expect(screen.getByTestId('plugin-status-idle')).toHaveTextContent('Installed, but not currently available.')
     expect(within(screen.getByTestId('plugin-status-partial')).getByText('degraded')).toBeVisible()
     expect(screen.getByTestId('plugin-status-partial')).toHaveTextContent('The application continues without the unavailable capability.')
     expect(within(screen.getByTestId('plugin-status-collision')).getByText('conflict')).toBeVisible()
@@ -566,14 +583,14 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
-    expect(screen.getByText('No plugins discovered.')).toBeVisible()
+    expect(screen.getByText('No extensions installed.')).toBeVisible()
   })
 
   it('hides admin-only controls and saves only the user runner for a non-admin', async () => {
     state.currentUser.capabilities = []
     render(<SettingsModal onClose={vi.fn()} />)
 
-    expect(await screen.findByText('Workspace-wide settings are managed by an administrator. You can still change your runner preference.')).toBeVisible()
+    expect(await screen.findByText('Workspace-wide settings are managed by an administrator. You can still change how your own jobs run.')).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Agent' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Destinations' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Plugins' })).toBeNull()
@@ -583,8 +600,8 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByPlaceholderText('Name')).toBeNull()
     expect(plugins).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByLabelText('Runner'))
-    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
+    fireEvent.click(screen.getByLabelText('Execution mode'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
       { global: 2, user: 4 },
@@ -592,7 +609,7 @@ describe('SettingsModal — plugin config form', () => {
     ))
   })
 
-  it('explains built-in runners, keeps capacity secondary, and leaves provider runners neutral', async () => {
+  it('uses friendly execution names and does not present host capacity as runner capacity', async () => {
     state.kernelInfo = {
       runners: ['local-out-of-core', 'local-subprocess', 'kernel', 'acme-batch'],
       backends: [
@@ -613,26 +630,27 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
 
-    expect(screen.getByText('When to use each runner')).toBeVisible()
-    expect(screen.getByText(/streams and spills data/i)).toBeVisible()
-    expect(screen.getByText(/isolated in its own OS process/i)).toBeVisible()
-    expect(screen.getByText(/durable worker per Canvas/i)).toBeVisible()
-    expect(screen.getAllByText('Provider-owned runner. Its provider controls execution behavior and capacity.')).toHaveLength(2)
-    expect(screen.getAllByText(/1 worker · 8 cpu · 32GiB/)).toHaveLength(3)
-    expect(screen.getByText(/2 workers · 32 cpu · 128GiB; 64 cpu · 256GiB/)).toBeVisible()
-    expect(screen.getByText(/No workers reported/)).toBeVisible()
+    expect(screen.getByText('Available modes')).toBeVisible()
+    expect(screen.getByText('Local streaming')).toBeVisible()
+    expect(screen.getByText('Isolated local process')).toBeVisible()
+    expect(screen.getByText('Warm Canvas worker')).toBeVisible()
+    expect(screen.getByText('Acme batch')).toBeVisible()
+    expect(screen.getByText(/Runs through a provider configured for this workspace/)).toBeVisible()
+    expect(screen.queryByText(/8 cpu|32GiB|128GiB|256GiB/)).toBeNull()
+    expect(screen.queryByText('local-out-of-core')).toBeNull()
     expect(screen.queryByText('kernel:local')).toBeNull()
     expect(screen.queryByText('acme-01')).toBeNull()
 
-    fireEvent.click(screen.getByLabelText('Runner'))
-    expect(await screen.findByRole('option', { name: 'Workspace default (kernel)' })).toBeVisible()
+    fireEvent.click(screen.getByLabelText('Execution mode'))
+    expect(await screen.findByRole('option', { name: 'Automatic (recommended)' })).toBeVisible()
   })
 
-  it('does not guess the deployment runner when no workspace default is configured', async () => {
+  it('presents inherited execution as Automatic without exposing deployment internals', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Runner'))
-    expect(await screen.findByRole('option', { name: 'Workspace default (deployment default)' })).toBeVisible()
+    fireEvent.click(screen.getByLabelText('Execution mode'))
+    expect(await screen.findByRole('option', { name: 'Automatic (recommended)' })).toBeVisible()
+    expect(screen.queryByText('Workspace default (deployment default)')).toBeNull()
   })
 
   it('does not expose Restart kernel when Settings has no explicit runner selection', async () => {
@@ -714,8 +732,8 @@ describe('SettingsModal — plugin config form', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
 
     fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Runner'))
-    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
+    fireEvent.click(screen.getByLabelText('Execution mode'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenNthCalledWith(
@@ -731,8 +749,8 @@ describe('SettingsModal — plugin config form', () => {
       target: { value: 'edited-model' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Runner'))
-    fireEvent.click(await screen.findByRole('option', { name: 'local-out-of-core' }))
+    fireEvent.click(screen.getByLabelText('Execution mode'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
@@ -785,9 +803,11 @@ describe('SettingsModal — plugin config form', () => {
   it('shows an actionable member failure and prevents duplicate submission', async () => {
     let rejectCreate: ((reason?: unknown) => void) | undefined
     createUser.mockReturnValueOnce(new Promise((_, reject) => { rejectCreate = reject }))
+    state.authEnabled = true
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
     fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
+    fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'secret1' } })
     fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
 
     expect(screen.getByRole('button', { name: 'Adding member…' })).toBeDisabled()
@@ -797,6 +817,33 @@ describe('SettingsModal — plugin config form', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not add Taylor: name is already in use')
     expect(screen.getByPlaceholderText('Name')).toHaveValue('Taylor')
+  })
+
+  it('adds a collaboration member without asking for a password while authentication is off', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
+
+    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
+    expect(screen.queryByLabelText('Initial password')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+    await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor'))
+    expect(screen.getByText(/add a name without a password/i)).toBeVisible()
+  })
+
+  it('requires an initial password of at least six characters when authentication is on', async () => {
+    state.authEnabled = true
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
+    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
+    fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'short' } })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Password must be at least 6 characters.')
+    expect(screen.getByRole('button', { name: 'Add member' })).toBeDisabled()
+    expect(createUser).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'secret1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+    await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor', 'secret1'))
   })
 
   it('blocks removing a credential that a staged reference still selects', async () => {
@@ -915,6 +962,36 @@ describe('SettingsModal — plugin config form', () => {
     expect(await screen.findByLabelText('Destination credential')).toBeVisible()
     expect(screen.getByText(/Restart the Data Playground server after adding this destination/i)).toBeVisible()
     expect(screen.getByText(/restarting only the canvas kernel is not enough/i)).toBeVisible()
+  })
+
+  it('tests browsing for a saved destination without claiming write access', async () => {
+    getSettings.mockResolvedValue({
+      global: { destinations: [{ id: 'd1', name: 'Exports', backend: 's3', root: 's3://b/p' }] },
+      user: {},
+      revision: { global: 2, user: 4 },
+    })
+    browseDestination.mockResolvedValue({
+      path: '', entries: [{ name: 'result.parquet', kind: 'file', uri: 's3://b/p/result.parquet' }],
+    })
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Test connection to Exports' }))
+
+    await waitFor(() => expect(browseDestination).toHaveBeenCalledWith('d1', ''))
+    expect(await screen.findByText(/Browsing works · 1 item listed/)).toHaveTextContent('Write access is checked when a run starts.')
+    expect(screen.queryByText(/write access works/i)).toBeNull()
+  })
+
+  it('does not test a destination until its staged Settings are saved', async () => {
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+    fireEvent.change(screen.getByLabelText('Destination name'), { target: { value: 'Draft' } })
+    fireEvent.change(screen.getByLabelText('Destination root or prefix'), { target: { value: '/tmp/draft' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+
+    expect(screen.getByText('Save to test')).toBeVisible()
+    expect(screen.queryByRole('button', { name: /Test connection to Draft/ })).toBeNull()
+    expect(browseDestination).not.toHaveBeenCalled()
   })
 
   it('labels and validates destination roots before adding them', async () => {

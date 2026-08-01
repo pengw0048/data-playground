@@ -7,11 +7,13 @@ import { Icon } from '../../ui/Icon'
 import { CodeSnippet } from '../../ui/CodeSnippet'
 import { cn } from '@/lib/utils'
 import type { ProcessorMode, TransformSource } from '../../types/graph'
-import { configuredProcessorRef, exactProcessor } from '../processorIdentity'
+import { configuredProcessorRef, exactProcessor, processorModeLabel } from '../processorIdentity'
 
 const DEFAULT_CODE = `def fn(row):
     # edit me — runs per row
     return row`
+
+const ADHOC_MODES = new Set<ProcessorMode>(['map', 'map_batches', 'filter', 'flat_map'])
 
 // The single Python-code compute node. Code and its operator controls live in the fullscreen editor.
 function Transform({ id, data }: NodeComponentProps) {
@@ -39,7 +41,7 @@ function Transform({ id, data }: NodeComponentProps) {
   const meta = src === 'library'
     ? (reference?.availability === 'deleted' ? `${configuredRef} · deleted`
       : reference?.availability === 'missing' ? `${configuredRef} · unavailable`
-      : proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'choose in Transforms →'))
+      : proc ? `${processorModeLabel(proc.mode)} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'choose in Transforms →'))
     : `${mode} · Python`
 
   return (
@@ -50,17 +52,28 @@ function Transform({ id, data }: NodeComponentProps) {
             options={[{ value: 'library', label: 'Library' }, { value: 'adhoc', label: 'Ad-hoc' }]}
             value={src}
             accent={color.focus}
-            onChange={(v) => updateConfig(id, {
-              source: v,
-              code: v === 'adhoc' ? (data.config.code ?? DEFAULT_CODE) : data.config.code,
-            })}
+            onChange={(v) => {
+              const currentMode = data.config.mode as ProcessorMode | undefined
+              updateConfig(id, v === 'adhoc' ? {
+                source: v,
+                code: data.config.code ?? DEFAULT_CODE,
+                mode: currentMode && ADHOC_MODES.has(currentMode) ? currentMode : 'map',
+              } : {
+                source: v,
+                code: data.config.code,
+                outputSchema: undefined,
+                outputSchemaSource: undefined,
+                outputSchemaCodeHash: undefined,
+                enforceSchema: undefined,
+              })
+            }}
           />
         </div>
 
         {src === 'library' ? (
           <div>
             {canViewDefinition ? (
-              <div aria-label="Selected exact processor"
+              <div aria-label="Selected processor version"
                 className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-foreground">
                 <Icon name="fx" size={13} />
                 <span className="flex-1 truncate text-left">{proc?.title}</span>

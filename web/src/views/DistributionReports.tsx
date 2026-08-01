@@ -251,7 +251,7 @@ function ReportDocument({ report, view, onExamples }: { report: DistributionRepo
 function Evidence({ report, view, coverage, sampling }: { report: DistributionReportDocument; view: DatasetViewDefinition; coverage: Extract<DistributionReportSection, { kind: 'coverage_schema' }> | undefined; sampling: string }) {
   const committedAt = datasetRevisionTimeLabel(view.datasetRef.lastKnown?.committedAt, view.retentionOwner)
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before distributions</div>
-    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Exact revision:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
+    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Dataset version:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
     {report.sampleProvenance && <div className="rounded border border-border bg-background p-2"><strong>Sample evidence:</strong> {count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div>}
     {report.limitations.length > 0 && <ul className="list-disc pl-4 text-muted-foreground">{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul>}
     <ReportTechnicalEvidence report={report} view={view} />
@@ -260,7 +260,7 @@ function Evidence({ report, view, coverage, sampling }: { report: DistributionRe
 
 function ReportTechnicalEvidence({ report, view }: { report: DistributionReportDocument; view: DatasetViewDefinition }) {
   return <details data-testid="report-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
       <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{report.reportId}</dd>
       <dt>Task ID</dt><dd className="break-all font-mono text-foreground">{report.taskId}</dd>
@@ -306,7 +306,7 @@ function Identity({ label, identity }: { label: string; identity: DistributionRe
 
 function ComparisonTechnicalEvidence({ comparison }: { comparison: DistributionReportComparison }) {
   return <details data-testid="comparison-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
     <div className="mt-2 grid gap-3 sm:grid-cols-2">
       <ComparisonIdentityDetails label="Current report" identity={comparison.coverage.left} />
       <ComparisonIdentityDetails label="Comparison report" identity={comparison.coverage.right} />
@@ -355,7 +355,7 @@ function ExamplesDrawer({ target, examples, error, onClose, onRetry }: { target:
 
 function ExamplesTechnicalEvidence({ target, examples }: { target: ExampleTarget; examples: DistributionReportBucketExamples | null }) {
   return <details data-testid="examples-technical-evidence" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
       <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{target.reportId}</dd>
       <dt>Section ID</dt><dd className="break-all font-mono text-foreground">{target.sectionId}</dd>
@@ -375,7 +375,7 @@ function ExamplesTechnicalEvidence({ target, examples }: { target: ExampleTarget
 const signed = (value: number | null | undefined) => value == null ? 'unavailable' : `${value > 0 ? '+' : ''}${value}`
 function coverageReason(reason: DistributionReportComparison['coverage']['reason']) { return reason === 'full_sample_coverage_mismatch' ? 'one report is full coverage and the other is sampled' : reason === 'different_deterministic_samples' ? 'the reports use different deterministic samples' : reason.replaceAll('_', ' ') }
 function comparisonMessage(error: ReportFailure) { if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'The selected comparison is unavailable or not authorized.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Comparison is temporarily unavailable.'; if (error.status === 422) return 'The selected reports cannot be compared.'; return 'Comparison is currently unavailable.' }
-function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this exact revision is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the retained report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
+function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this dataset version is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the retained report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
 
 function unavailableMessage(error: ReportFailure | null): string {
   if (error?.code === 'permission_denied' || error?.status === 401 || error?.status === 403) return 'You are not authorized to open this retained report.'

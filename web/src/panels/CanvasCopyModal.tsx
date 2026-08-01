@@ -118,9 +118,9 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
       onEscapeKeyDown={(event) => { if (creating) event.preventDefault() }}
       onPointerDownOutside={(event) => { if (creating) event.preventDefault() }}
       className="dp-modal-overlay flex max-h-[86vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-3 overflow-y-auto">
-      <DialogTitle>{source.subjectId ? 'Clone retained run as new Canvas' : 'Save a copy'}</DialogTitle>
+      <DialogTitle>{source.subjectId ? 'Clone retained run as new Canvas' : 'Duplicate canvas'}</DialogTitle>
       <DialogDescription>
-        Creates a private, editable snapshot owned by you. Shares, collaborators, credentials, history, outputs, and Inbox state are not copied.
+        Create an independent, editable copy in a Workspace folder.
       </DialogDescription>
       <label className="grid gap-1 text-[11px] text-muted-foreground">New Canvas name
         <input aria-label="New Canvas name" className="dp-input" value={name} disabled={busy}
@@ -161,7 +161,7 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
         <Button variant="outline" onClick={onClose} disabled={creating}>Cancel</Button>
         {!validation ? <Button onClick={() => void validate()} disabled={!request || busy}>{busy ? 'Validating…' : 'Review copy'}</Button>
           : <Button onClick={() => void create()} disabled={busy || !validation.canImport || (validation.requiresConfirmation && !confirmed)}>
-            {busy ? 'Creating…' : 'Create and open'}
+            {busy ? 'Creating…' : source.subjectId ? 'Create and open' : 'Duplicate and open'}
           </Button>}
       </div>
     </DialogContent>

@@ -4,10 +4,11 @@ import {
   KernelError,
   type Cred,
   type CredKind,
+  type DestinationPreset,
   type SettingChange,
   type SettingsSnapshot,
 } from '../api/client'
-import type { BackendInfo, PluginConfigField, PluginInfo, ResourceSpec } from '../types/api'
+import type { PluginConfigField, PluginInfo } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -36,10 +37,19 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
 const INHERIT = '__default__'
 // Radix Select forbids an empty value — sentinels for "no credential" pickers (mapped to '' on save).
 const NO_CRED = '__none__'
-const BUILTIN_RUNNER_GUIDANCE: Record<string, string> = {
-  'local-out-of-core': 'Use for a direct local run. It streams and spills data instead of requiring it to fit in memory.',
-  'local-subprocess': 'Use when each run should be isolated in its own OS process. A failed or cancelled run does not take down the hub.',
-  kernel: 'Use for a durable worker per Canvas. It keeps warm state and can continue after a hub restart.',
+const BUILTIN_RUNNER_PRESENTATION: Record<string, { label: string; guidance: string }> = {
+  'local-out-of-core': {
+    label: 'Local streaming',
+    guidance: 'Streams larger data through this machine without requiring it all to fit in memory.',
+  },
+  'local-subprocess': {
+    label: 'Isolated local process',
+    guidance: 'Runs each job in a separate process so a failed or cancelled job does not interrupt the app.',
+  },
+  kernel: {
+    label: 'Warm Canvas worker',
+    guidance: 'Keeps one reusable worker for each Canvas and can continue after the app restarts.',
+  },
 }
 const OBJECT_STORE_FIELDS: { key: string; placeholder: string }[] = [
   { key: 'accessKeyId', placeholder: 'env:AWS_ACCESS_KEY_ID' },
@@ -92,6 +102,14 @@ const pluginStateTone: Record<NonNullable<PluginInfo['state']>, string> = {
   degraded: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
   conflict: 'bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300',
   failed: 'bg-destructive text-destructive-foreground',
+}
+
+const pluginStateCopy: Record<NonNullable<PluginInfo['state']>, string> = {
+  active: 'Available in this Data Playground instance.',
+  inactive: 'Installed, but not currently available.',
+  degraded: 'Some features are unavailable.',
+  conflict: 'Could not start because it conflicts with another extension.',
+  failed: 'Could not start.',
 }
 
 const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right)
@@ -214,6 +232,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   const [conflict, setConflict] = useState<ConflictRecovery | null>(null)
   const [savedMsg, setSavedMsg] = useState('')
   const [dest, setDest] = useState<{ name: string; backend: string; root: string; credId: string }>({ name: '', backend: 'local', root: '', credId: NO_CRED })
+  const [destinationTestingId, setDestinationTestingId] = useState<string | null>(null)
+  const [destinationNotices, setDestinationNotices] = useState<Record<string, ActionNotice>>({})
   const [creds, setCreds] = useState<Cred[]>([])
   const [credForm, setCredForm] = useState<CredForm>(emptyCredForm('object_store'))
   const [newUser, setNewUser] = useState({ name: '', password: '' })
@@ -225,6 +245,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   const [kernelRestarting, setKernelRestarting] = useState(false)
   const [kernelNotice, setKernelNotice] = useState<ActionNotice | null>(null)
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
+  const [pluginLoadError, setPluginLoadError] = useState('')
+  const [pluginReloading, setPluginReloading] = useState(false)
   const [pcfg, setPcfg] = useState<PluginEdits>({})  // pack → edited { key: value }, null = use environment/default
   const [pluginSecretTarget, setPluginSecretTarget] = useState<PluginSecretTarget | null>(null)
   const [pluginSecretClearingKey, setPluginSecretClearingKey] = useState<string | null>(null)
@@ -241,11 +263,13 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
   const addUser = async () => {
     const name = newUser.name.trim()
-    if (!name || memberAdding) return
+    const password = newUser.password
+    if (!name || (authEnabled && password.length < 6) || memberAdding) return
     setMemberAdding(true)
     setMemberNotice(null)
     try {
-      await api.createUser(name, newUser.password || undefined)
+      if (authEnabled) await api.createUser(name, password)
+      else await api.createUser(name)
       setNewUser({ name: '', password: '' })
       await refreshUsers()
       setMemberNotice({ kind: 'success', message: `Added ${name}. This applied immediately; staged Settings are unchanged.` })
@@ -261,21 +285,25 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     let cancelled = false
     setLoading(true)
     setLoadError('')
+    setPluginLoadError('')
     const settings = api.getSettings().catch((error) => {
       throw new Error(`Settings request failed: ${errorMessage(error)}`)
     })
     const pluginPacks = canGlobal
-      ? api.plugins().catch((error) => { throw new Error(`Plugins request failed: ${errorMessage(error)}`) })
-      : Promise.resolve([] as PluginInfo[])
+      ? api.plugins()
+        .then((value) => ({ value, error: '' }))
+        .catch((error) => ({ value: [] as PluginInfo[], error: errorMessage(error) }))
+      : Promise.resolve({ value: [] as PluginInfo[], error: '' })
     const credList = canGlobal
       ? api.listCreds().catch((error) => { throw new Error(`Credentials request failed: ${errorMessage(error)}`) })
       : Promise.resolve([] as Cred[])
-    Promise.all([settings, pluginPacks, credList]).then(([nextSettings, nextPlugins, nextCreds]) => {
+    Promise.all([settings, pluginPacks, credList]).then(([nextSettings, pluginResult, nextCreds]) => {
       if (cancelled) return
       setG(editableGlobal(nextSettings))
       setU(nextSettings.user)
       setBaseline(nextSettings)
-      setPlugins(nextPlugins)
+      setPlugins(pluginResult.value)
+      setPluginLoadError(pluginResult.error)
       setCreds(nextCreds)
       setPcfg({})
       setLoading(false)
@@ -301,11 +329,14 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     effectivePluginValue(field, rawPval(pack, field.key))
   const setPval = (pack: string, key: string, v: unknown) =>
     setPcfg((prev) => ({ ...prev, [pack]: { ...(prev[pack] ?? {}), [key]: v } }))
-  const configurable = plugins.filter((p) => (p.config?.length ?? 0) > 0)
-
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
-  const dests = (Array.isArray(g.destinations) ? g.destinations : []) as { id: string; name: string; backend: string; root: string; credId?: string | null }[]
+  const dests = (Array.isArray(g.destinations) ? g.destinations : []) as DestinationPreset[]
+  const savedDestinations = (Array.isArray(baseline?.global.destinations)
+    ? baseline.global.destinations : []) as DestinationPreset[]
+  const isSavedDestination = (destination: DestinationPreset) => savedDestinations.some(
+    (saved) => saved.id === destination.id && sameJson(saved, destination),
+  )
   const objectStoreCreds = creds.filter((c) => c.kind === 'object_store')
   const agentCreds = creds.filter((c) => c.kind === 'agent')
   const credName = (id?: string | null) => creds.find((c) => c.id === id)?.name
@@ -440,6 +471,35 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     const credId = dest.backend !== 'local' && dest.credId !== NO_CRED ? dest.credId : null
     setG((prev) => ({ ...prev, destinations: [...dests, { id, name, backend: dest.backend, root, credId }] }))
     setDest({ name: '', backend: 'local', root: '', credId: NO_CRED })
+  }
+  const testDestination = async (destination: DestinationPreset) => {
+    if (destinationTestingId || !isSavedDestination(destination)) return
+    setDestinationTestingId(destination.id)
+    setDestinationNotices((current) => {
+      const next = { ...current }
+      delete next[destination.id]
+      return next
+    })
+    try {
+      const result = await api.browseDestination(destination.id, '')
+      if (result.error) throw new Error(result.error)
+      const count = result.entries.length
+      const preview = result.entries.slice(0, 3).map((entry) => entry.name).join(', ')
+      setDestinationNotices((current) => ({
+        ...current,
+        [destination.id]: {
+          kind: 'success',
+          message: `Browsing works · ${count.toLocaleString()} item${count === 1 ? '' : 's'} listed${preview ? ` · ${preview}${count > 3 ? '…' : ''}` : ''}. Write access is checked when a run starts.`,
+        },
+      }))
+    } catch (error) {
+      setDestinationNotices((current) => ({
+        ...current,
+        [destination.id]: { kind: 'error', message: `Could not browse this destination: ${errorMessage(error)}` },
+      }))
+    } finally {
+      setDestinationTestingId(null)
+    }
   }
   const setCredField = (k: string, v: string) => setCredForm((p) => ({ ...p, fields: { ...p.fields, [k]: v } }))
   const editCred = (c: Cred) => setCredForm({ id: c.id, name: c.name, kind: c.kind, fields: { ...c.fields } })
@@ -607,6 +667,80 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
       setPluginSecretClearingKey(null)
     }
   }
+  const retryPlugins = async () => {
+    if (pluginReloading) return
+    setPluginReloading(true)
+    try {
+      setPlugins(await api.plugins())
+      setPluginLoadError('')
+    } catch (error) {
+      setPluginLoadError(errorMessage(error))
+    } finally {
+      setPluginReloading(false)
+    }
+  }
+  const pluginConfigFields = (plugin: PluginInfo) => plugin.config?.map((field) => {
+    const settingKey = pluginSettingKey(plugin.name, field.key)
+    const storedRef = g[settingKey]
+    const isSet = storedRef != null && storedRef !== ''
+    const stagedSecret = field.secret && pcfg[plugin.name] && hasOwn(pcfg[plugin.name], field.key)
+      ? String(pcfg[plugin.name][field.key] ?? '').trim()
+      : ''
+    const clearing = pluginSecretClearingKey === settingKey
+    const secretNotice = pluginSecretNotices[settingKey]
+    const placeholder = field.placeholder ?? (field.secret
+      ? (isSet ? String(storedRef ?? 'env:VAR or file:/path') : 'env:VAR or file:/path')
+      : (field.default != null ? String(field.default) : ''))
+    return (
+      <Field key={field.key} label={field.label}>
+        {field.type === 'select' && field.options ? (
+          <Select value={String(pval(plugin.name, field))} onValueChange={(value) => setPval(plugin.name, field.key, value)}>
+            <SelectTrigger aria-label={field.label}><SelectValue placeholder={placeholder} /></SelectTrigger>
+            <SelectContent>{field.options.map((option) => <SelectItem key={option} value={option}>{option}</SelectItem>)}</SelectContent>
+          </Select>
+        ) : field.type === 'bool' ? (
+          <Select value={String(pval(plugin.name, field))} onValueChange={(value) => setPval(plugin.name, field.key, value)}>
+            <SelectTrigger aria-label={field.label}><SelectValue /></SelectTrigger>
+            <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
+          </Select>
+        ) : (
+          <Input
+            type={field.type === 'int' || field.type === 'float' ? 'number' : 'text'}
+            disabled={field.secret && clearing}
+            value={field.secret
+              ? String(pcfg[plugin.name]?.[field.key] ?? storedRef ?? '')
+              : String(pval(plugin.name, field))}
+            placeholder={placeholder}
+            aria-label={field.label}
+            onChange={(event) => setPval(plugin.name, field.key, event.target.value)}
+          />
+        )}
+        {!field.secret && <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
+          {rawPval(plugin.name, field.key) == null || rawPval(plugin.name, field.key) === ''
+            ? <span>Using environment/default.</span>
+            : <Button variant="link" className="h-auto p-0 text-[10.5px]" onClick={() => setPval(plugin.name, field.key, null)}>Use environment/default</Button>}
+        </div>}
+        {!field.secret && pcfg[plugin.name] && hasOwn(pcfg[plugin.name], field.key) && !canonicalPluginValue(field, rawPval(plugin.name, field.key)).valid && <div className="mt-1 text-[10.5px] text-destructive">Enter a finite {field.type === 'int' ? 'integer' : 'number'}.</div>}
+        {field.secret && <>
+          <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on Save leaves the stored reference unchanged.</div>
+          <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
+            {isSet ? <Button
+              variant="link"
+              className="h-auto p-0 text-[10.5px]"
+              disabled={saving || clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
+              onClick={() => setPluginSecretTarget({ pack: plugin.name, field })}
+            >{clearing ? 'Clearing…' : 'Clear…'}</Button> : <span>Using environment/default.</span>}
+            <span>{isSet ? 'Clearing applies immediately; it does not wait for Save.' : 'No stored reference.'}</span>
+          </div>
+          {stagedSecret && isSet && <div className="mt-1 text-[10.5px] text-muted-foreground">Blank the staged replacement before clearing the stored reference.</div>}
+          {secretNotice && <div role={secretNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-1 text-[10.5px]', secretNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+            {secretNotice.message}
+          </div>}
+        </>}
+        {field.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{field.help}</div>}
+      </Field>
+    )
+  })
   const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
   // /settings carries explicit user/workspace choices, but not the deployment's DP_EXECUTION
@@ -732,18 +866,18 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   </label>
                 </Section>}
 
-                {active === 'execution' && <Section id="execution" title="Execution backend">
-                  {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change your runner preference.</div>}
-                  <Field label="Runner">
+                {active === 'execution' && <Section id="execution" title="Execution">
+                  {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change how your own jobs run.</div>}
+                  <Field label="Execution mode">
                     <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
-                      <SelectTrigger aria-label="Runner"><SelectValue /></SelectTrigger>
+                      <SelectTrigger aria-label="Execution mode"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value={INHERIT}>Workspace default{g.backend ? ` (${String(g.backend)})` : ' (deployment default)'}</SelectItem>
-                        {runners.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}
+                        <SelectItem value={INHERIT}>Automatic (recommended)</SelectItem>
+                        {runners.map((runner) => <SelectItem key={runner} value={runner}>{runnerLabel(runner)}</SelectItem>)}
                       </SelectContent>
                     </Select>
                   </Field>
-                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs. Workspace default uses the workspace choice; if it is unset, the deployment default applies.</div>
+                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Automatic uses the workspace or deployment default. Most people should leave this selected.</div>
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
@@ -754,19 +888,17 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">When to use each runner</div>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Capacity is reported beside each runner.</div>
+                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Available modes</div>
                   <div className="flex flex-col gap-1.5">
-                    {(kernelInfo?.backends ?? []).map((b) => (
-                      <div key={b.name} className="rounded-md border border-border px-2.5 py-2">
+                    {runners.map((runner) => (
+                      <div key={runner} className="rounded-md border border-border px-2.5 py-2">
                         <div className="flex items-baseline gap-1.5 text-xs font-semibold text-foreground">
-                          <Icon name="db" size={12} /> {b.name}
-                          <span className="text-[10px] font-normal text-muted-foreground">· {backendCapacitySummary(b)}</span>
+                          <Icon name="db" size={12} /> {runnerLabel(runner)}
                         </div>
-                        <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">{runnerGuidance(b.name)}</div>
+                        <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">{runnerGuidance(runner)}</div>
                       </div>
                     ))}
-                    {(kernelInfo?.backends ?? []).length === 0 && <div className="text-[11.5px] text-muted-foreground">No backends reported.</div>}
+                    {runners.length === 0 && <div className="text-[11.5px] text-muted-foreground">No execution modes are available.</div>}
                   </div>
                 </Section>}
 
@@ -776,15 +908,23 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   </p>
                   <div className="mb-2 flex flex-col gap-1">
                     {dests.map((d, i) => (
-                      <div key={d.id} className="flex items-center gap-2 text-xs text-foreground">
-                        <span className="flex items-center text-muted-foreground"><Icon name="export" size={12} /></span>
-                        <span className="font-semibold">{d.name}</span>
-                        <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{d.backend}</Badge>
-                        {d.credId && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{credName(d.credId) ?? 'credential'}</Badge>}
-                        <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">{d.root}</span>
-                        <button onClick={() => setG((prev) => ({ ...prev, destinations: dests.filter((_, j) => j !== i) }))}
-                          aria-label={`Remove destination ${d.name}`}
-                          className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="close" size={12} /></button>
+                      <div key={d.id} className="rounded-md border border-border px-2.5 py-2">
+                        <div className="flex items-center gap-2 text-xs text-foreground">
+                          <span className="flex items-center text-muted-foreground"><Icon name="export" size={12} /></span>
+                          <span className="font-semibold">{d.name}</span>
+                          <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{d.backend}</Badge>
+                          {d.credId && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{credName(d.credId) ?? 'credential'}</Badge>}
+                          <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">{d.root}</span>
+                          {isSavedDestination(d) ? <Button variant="outline" size="sm" aria-label={`Test connection to ${d.name}`} disabled={Boolean(destinationTestingId)} onClick={() => void testDestination(d)}>
+                            {destinationTestingId === d.id ? 'Testing…' : 'Test connection'}
+                          </Button> : <span className="text-[10px] text-muted-foreground">Save to test</span>}
+                          <button onClick={() => setG((prev) => ({ ...prev, destinations: dests.filter((_, j) => j !== i) }))}
+                            aria-label={`Remove destination ${d.name}`}
+                            className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="close" size={12} /></button>
+                        </div>
+                        {destinationNotices[d.id] && <div role={destinationNotices[d.id].kind === 'error' ? 'alert' : 'status'} className={cn('mt-1.5 text-[10.5px]', destinationNotices[d.id].kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+                          {destinationNotices[d.id].message}
+                        </div>}
                       </div>
                     ))}
                     {dests.length === 0 && <div className="text-[11.5px] text-muted-foreground">Only the default "Workspace outputs".</div>}
@@ -883,10 +1023,12 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {canGlobal && active === 'plugins' && <Section id="plugins" title="Plugins">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Discovered plugin packs and the capabilities that are effective in this application instance. Installed does not mean active.
-                    A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
-                    Changes take effect on the next kernel start.
+                    Installed extensions and the features currently available from each one. Extension settings apply after the relevant Data Playground process restarts.
                   </p>
+                  {pluginLoadError && <div role="alert" className="mb-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[11.5px] text-destructive">
+                    Extensions could not be loaded: {pluginLoadError}{' '}
+                    <button type="button" className="font-semibold underline disabled:opacity-50" disabled={pluginReloading} onClick={() => void retryPlugins()}>{pluginReloading ? 'Retrying…' : 'Retry'}</button>
+                  </div>}
                   <div className="mb-2.5 flex flex-col gap-2">
                     {plugins.map((p, index) => {
                       const state = pluginState(p)
@@ -896,108 +1038,42 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="flex items-center text-muted-foreground"><Icon name={state === 'active' ? 'check' : state === 'inactive' ? 'minus' : 'close'} size={12} /></span>
                           <span className="font-semibold">{p.name}</span>
-                          {p.package && p.package !== p.name && <span className="text-[10px] text-muted-foreground">package {p.package}</span>}
-                          {p.version && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{p.version}</Badge>}
-                          <span className="text-[10px] text-muted-foreground">{p.source}</span>
                           <Badge variant="outline" className={cn('rounded border-0 px-1.5 py-0 text-[10px] font-medium', pluginStateTone[state])}>{state}</Badge>
-                          {p.required && <Badge variant="outline" className="rounded px-1.5 py-0 text-[10px] font-normal">required at startup</Badge>}
                         </div>
-                        <div className="mt-2 flex flex-wrap gap-1" aria-label={`Effective capabilities for ${p.name}`}>
-                          {(p.effective_capabilities ?? []).map((capability) => (
-                            <Badge key={capability} variant="secondary" className="rounded px-1.5 py-0 text-[9.5px] font-normal">{capability}</Badge>
-                          ))}
-                          {(p.effective_capabilities?.length ?? 0) === 0 && <span className="text-[10.5px] text-muted-foreground">No effective capabilities.</span>}
+                        <div className="mt-1.5 text-[10.5px] text-muted-foreground">
+                          {pluginStateCopy[state]}
+                          {state === 'active' && (p.config?.length ?? 0) === 0 && ' There are no settings to change here.'}
                         </div>
-                        {(p.process_placement?.length ?? 0) > 0 && <div className="mt-1.5 text-[10px] text-muted-foreground">
-                          Placement: {p.process_placement!.join(', ')}
-                        </div>}
                         {failure && <div className={cn('mt-1.5 text-[10.5px]', state === 'degraded' ? 'text-amber-700 dark:text-amber-300' : 'text-destructive')}>
                           {failure} {p.failure_impact === 'optional-degradation' && 'The application continues without the unavailable capability.'}
                         </div>}
+                        {(p.config?.length ?? 0) > 0 && <div className="mt-3 border-t border-border pt-3">
+                          <div className="mb-2 flex items-center gap-1.5 text-[11.5px] font-semibold text-foreground"><Icon name="settings" size={12} /> Settings</div>
+                          {pluginConfigFields(p)}
+                        </div>}
+                        <details className="mt-2 border-t border-border pt-2 text-[10px] text-muted-foreground">
+                          <summary className="w-fit cursor-pointer select-none font-medium hover:text-foreground">Diagnostics</summary>
+                          <div className="mt-2 grid gap-1">
+                            <div>Package: {p.package || p.name}{p.version ? ` · ${p.version}` : ''}</div>
+                            <div>Source: {p.source}</div>
+                            <div>Starts with: {(p.process_placement?.length ?? 0) > 0 ? p.process_placement!.join(', ') : 'no active process'}</div>
+                            <div>Features: {(p.effective_capabilities?.length ?? 0) > 0 ? p.effective_capabilities!.join(', ') : 'none'}</div>
+                            {p.required && <div>Required when Data Playground starts.</div>}
+                          </div>
+                        </details>
                       </div>
                       )
                     })}
-                    {plugins.length === 0 && <div className="rounded-md border border-dashed border-border p-3 text-[11.5px] text-muted-foreground">No plugins discovered.</div>}
+                    {!pluginLoadError && plugins.length === 0 && <div className="rounded-md border border-dashed border-border p-3 text-[11.5px] text-muted-foreground">No extensions installed.</div>}
                   </div>
-
-                  {configurable.map((p) => (
-                    <div key={p.name} className="mt-3 rounded-md border border-border p-3">
-                      <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-foreground">
-                        <Icon name="settings" size={12} /> {p.name}
-                      </div>
-                      {p.config!.map((f) => {
-                        const settingKey = pluginSettingKey(p.name, f.key)
-                        const storedRef = g[settingKey]
-                        const isSet = storedRef != null && storedRef !== ''
-                        const stagedSecret = f.secret && pcfg[p.name] && hasOwn(pcfg[p.name], f.key)
-                          ? String(pcfg[p.name][f.key] ?? '').trim()
-                          : ''
-                        const clearing = pluginSecretClearingKey === settingKey
-                        const secretNotice = pluginSecretNotices[settingKey]
-                        const ph = f.placeholder ?? (f.secret
-                          ? (isSet ? String(storedRef ?? 'env:VAR or file:/path') : 'env:VAR or file:/path')
-                          : (f.default != null ? String(f.default) : ''))
-                        return (
-                          <Field key={f.key} label={f.label}>
-                            {f.type === 'select' && f.options ? (
-                              <Select value={String(pval(p.name, f))} onValueChange={(v) => setPval(p.name, f.key, v)}>
-                                <SelectTrigger aria-label={f.label}><SelectValue placeholder={ph} /></SelectTrigger>
-                                <SelectContent>{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
-                              </Select>
-                            ) : f.type === 'bool' ? (
-                              <Select value={String(pval(p.name, f))} onValueChange={(v) => setPval(p.name, f.key, v)}>
-                                <SelectTrigger aria-label={f.label}><SelectValue /></SelectTrigger>
-                                <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
-                              </Select>
-                            ) : (
-                              <Input
-                                type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
-                                disabled={f.secret && clearing}
-                                value={f.secret
-                                  ? String(pcfg[p.name]?.[f.key] ?? storedRef ?? '')
-                                  : String(pval(p.name, f))}
-                                placeholder={ph}
-                                aria-label={f.label}
-                                onChange={(e) => setPval(p.name, f.key, e.target.value)}
-                              />
-                            )}
-                            {!f.secret && <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
-                              {rawPval(p.name, f.key) == null || rawPval(p.name, f.key) === ''
-                                ? <span>Using environment/default.</span>
-                                : <Button variant="link" className="h-auto p-0 text-[10.5px]" onClick={() => setPval(p.name, f.key, null)}>Use environment/default</Button>}
-                            </div>}
-                            {!f.secret && pcfg[p.name] && hasOwn(pcfg[p.name], f.key) && !canonicalPluginValue(f, rawPval(p.name, f.key)).valid && <div className="mt-1 text-[10.5px] text-destructive">Enter a finite {f.type === 'int' ? 'integer' : 'number'}.</div>}
-                            {f.secret && <>
-                              <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on Save leaves the stored reference unchanged.</div>
-                              <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
-                                {isSet ? <Button
-                                  variant="link"
-                                  className="h-auto p-0 text-[10.5px]"
-                                  disabled={saving || clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
-                                  onClick={() => setPluginSecretTarget({ pack: p.name, field: f })}
-                                >{clearing ? 'Clearing…' : 'Clear…'}</Button> : <span>Using environment/default.</span>}
-                                <span>{isSet ? 'Clearing applies immediately; it does not wait for Save.' : 'No stored reference.'}</span>
-                              </div>
-                              {stagedSecret && isSet && <div className="mt-1 text-[10.5px] text-muted-foreground">Blank the staged replacement before clearing the stored reference.</div>}
-                              {secretNotice && <div role={secretNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-1 text-[10.5px]', secretNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
-                                {secretNotice.message}
-                              </div>}
-                            </>}
-                            {f.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{f.help}</div>}
-                          </Field>
-                        )
-                      })}
-                    </div>
-                  ))}
-                  {configurable.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugin declares configurable settings.</div>}
                 </Section>}
 
                 {canGlobal && active === 'members' && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    People who can sign in and be added as collaborators.
+                    People available when sharing a Canvas.
                     {authEnabled
-                      ? ' Set an initial password below; each member can then rotate their own from the account menu.'
-                      : ' Sign-in is off (no DP_AUTH_SECRET), so passwords are unused until you enable auth — anyone with the URL is trusted.'}
+                      ? ' New members need an initial password to sign in.'
+                      : ' Sign-in is off, so add a name without a password.'}
                   </p>
                   <div className="mb-2 text-[10.5px] text-muted-foreground">Adding a member applies immediately; it does not wait for Save or change other staged Settings.</div>
                   <div className="mb-2.5 flex flex-col gap-1">
@@ -1010,12 +1086,15 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     ))}
                   </div>
                   <div className="flex gap-1.5">
-                    <Input value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })} placeholder="Name" className="w-[150px] shrink-0" />
-                    <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                      onKeyDown={(e) => { if (e.key === 'Enter') addUser() }}
-                      placeholder={authEnabled ? 'Initial password (optional)' : 'Password (unused until auth is on)'} className="min-w-0 flex-1" />
-                    <Button onClick={addUser} disabled={!newUser.name.trim() || memberAdding} className="shrink-0">{memberAdding ? 'Adding member…' : 'Add member'}</Button>
+                    <Input value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })}
+                      onKeyDown={(e) => { if (e.key === 'Enter' && !authEnabled) void addUser() }}
+                      placeholder="Name" className="w-[150px] shrink-0" />
+                    {authEnabled && <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === 'Enter') void addUser() }}
+                        aria-label="Initial password" placeholder="Initial password (at least 6 characters)" className="min-w-0 flex-1" />}
+                    <Button onClick={() => void addUser()} disabled={!newUser.name.trim() || (authEnabled && newUser.password.length < 6) || memberAdding} className="shrink-0">{memberAdding ? 'Adding member…' : 'Add member'}</Button>
                   </div>
+                  {authEnabled && newUser.password.length > 0 && newUser.password.length < 6 && <div role="alert" className="mt-1.5 text-[10.5px] text-destructive">Password must be at least 6 characters.</div>}
                   {memberNotice && <div role={memberNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', memberNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
                     {memberNotice.message}
                   </div>}
@@ -1063,31 +1142,16 @@ function Section({ id, title, children }: { id: string; title: string; children:
   )
 }
 
-function capLabel(c: ResourceSpec): string {
-  const parts: string[] = []
-  if (c.gpu) parts.push(`${c.gpu}× ${c.gpuType ?? 'gpu'}`)
-  if (c.cpu) parts.push(`${c.cpu} cpu`)
-  if (c.mem) parts.push(String(c.mem))
-  return parts.join(' · ') || 'unspecified'
+function runnerLabel(name: string): string {
+  const builtin = BUILTIN_RUNNER_PRESENTATION[name]
+  if (builtin) return builtin.label
+  const words = name.replaceAll('_', ' ').replaceAll('-', ' ').trim()
+  return words ? words[0].toUpperCase() + words.slice(1) : 'Provider execution'
 }
 
 function runnerGuidance(name: string): string {
-  return BUILTIN_RUNNER_GUIDANCE[name]
-    ?? 'Provider-owned runner. Its provider controls execution behavior and capacity.'
-}
-
-function backendCapacitySummary(backend: BackendInfo): string {
-  const { workers } = backend
-  if (workers.length === 0) return 'No workers reported'
-  const workerLabel = `${workers.length} worker${workers.length === 1 ? '' : 's'}`
-  if (workers.length === 1) return `${workerLabel} · ${capLabel(workers[0].capacity)}`
-  const byCapacity = new Map<string, number>()
-  for (const worker of workers) {
-    const label = capLabel(worker.capacity)
-    byCapacity.set(label, (byCapacity.get(label) ?? 0) + 1)
-  }
-  const capacities = [...byCapacity].map(([label, count]) => count === 1 ? label : `${count}× ${label}`)
-  return `${workerLabel} · ${capacities.join('; ')}`
+  return BUILTIN_RUNNER_PRESENTATION[name]?.guidance
+    ?? 'Runs through a provider configured for this workspace.'
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

@@ -189,7 +189,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <InputDriftNotice drift={run.inputDrift} doc={doc} />
           <div className="mt-3 flex gap-2">
             <Button size="sm" onClick={() => doRun(nodeId, !!est?.needsConfirm, true)} disabled={!canEdit}
-              title={canEdit ? `${previewActionLabel} at their exact revisions` : 'View-only canvas'} className="flex-1">
+              title={canEdit ? `${previewActionLabel} using their selected versions` : 'View-only canvas'} className="flex-1">
               {previewActionLabel}
             </Button>
             <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)} disabled={!canEdit}
@@ -354,7 +354,7 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
       <input aria-label={`${label} dataset`} value={ref.datasetId ?? ''} placeholder="Dataset identity" onChange={(event) => {
         event.target.value ? setValue({ kind, datasetId: event.target.value, ...(kind === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}) }) : clear()
       }} disabled={usingDefault} className={common} />
-      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Exact revision" onChange={(event) => {
+      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Version ID" onChange={(event) => {
         event.target.value ? setValue({ kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: event.target.value }) : clear()
       }} disabled={usingDefault} className={`col-start-2 ${common}`} />}
       {usingDefault && <div className="col-span-2 flex items-center justify-between gap-2 text-muted-foreground">

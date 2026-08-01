@@ -17,7 +17,7 @@ const P: Record<IconName, JSX.Element> = {
   users: <><circle cx="6" cy="5.4" r="2.4" /><path d="M1.6 13.4c0-2.5 2-4 4.4-4s4.4 1.5 4.4 4" /><path d="M10.8 3.3a2.3 2.3 0 0 1 0 4.3M14.4 13.4c0-2-1-3.2-2.7-3.8" /></>,
   bell: <><path d="M3.3 11.5h9.4l-1.1-1.6V6.8a3.6 3.6 0 0 0-7.2 0v3.1Z" /><path d="M6.4 13a1.8 1.8 0 0 0 3.2 0" /></>,
   eye: <><path d="M1 8s2.7-5 7-5 7 5 7 5-2.7 5-7 5-7-5-7-5Z" /><circle cx="8" cy="8" r="2.2" /></>,
-  settings: <><circle cx="8" cy="8" r="2.3" /><path d="M8 1v2.2M8 12.8V15M15 8h-2.2M3.2 8H1M12.9 3.1l-1.6 1.6M4.7 11.3l-1.6 1.6M12.9 12.9l-1.6-1.6M4.7 4.7 3.1 3.1" /></>,
+  settings: <><path d="M2 4h4M10 4h4M2 8h8M13 8h1M2 12h2M8 12h6" /><circle cx="8" cy="4" r="1.5" /><circle cx="11.5" cy="8" r="1.5" /><circle cx="6" cy="12" r="1.5" /></>,
   play: <path d="M4.5 3.2v9.6l7.5-4.8-7.5-4.8Z" />,
   clock: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.6 1.6" /></>,
   code: <path d="M5.5 4 2 8l3.5 4M10.5 4 14 8l-3.5 4" />,

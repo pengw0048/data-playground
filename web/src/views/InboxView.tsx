@@ -170,6 +170,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
         <div>
           <h1 className="text-[20px] font-bold text-foreground">Inbox</h1>
+          <p className="text-[11.5px] text-muted-foreground">Results from background work you started</p>
         </div>
         <span className="flex-1" />
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Filter
@@ -244,14 +245,14 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                     <div className="mt-1 text-[13px] font-medium text-foreground">
                       {item.datasetContext
                         ? (item.datasetContext.name || item.datasetContext.datasetId)
-                        : item.canvasName ?? 'Canvas unavailable'}
+                        : item.canvasName ?? 'Original Canvas unavailable'}
                     </div>
                     <div className="mt-0.5 text-[11.5px] text-muted-foreground">{inboxOutcomeSummary(item)}</div>
                     <div className="mt-0.5 text-[11.5px] text-muted-foreground">
                       {inboxRelativeTime(item.terminalAt)}
                       {item.datasetContext && !item.datasetContext.name
                         && ` · Dataset ${item.datasetContext.datasetId}`}
-                      {item.canvasName == null && !item.datasetContext && ' · authorization revoked or canvas missing'}
+                      {item.canvasName == null && !item.datasetContext && ' · Deleted or no longer shared with you'}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">

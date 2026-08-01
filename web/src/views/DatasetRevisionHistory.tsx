@@ -158,7 +158,7 @@ export function DatasetRevisionHistory({
     void api.datasetRevision(viewerDetail.datasetId, parentRevisionId).then((next) => {
       if (request !== viewerParentRequest.current) return
       if (next.datasetId !== viewerDetail.datasetId || next.revisionId !== parentRevisionId) {
-        throw new Error('Parent response did not match the requested exact revision')
+        throw new Error('The response did not match the requested version')
       }
       setParent(next)
     }).catch((error) => {
@@ -211,8 +211,8 @@ export function DatasetRevisionHistory({
     } catch (error) {
       if (request !== detailRequest.current) return
       setDetailError(statusOf(error) === 410
-        ? 'This exact revision is no longer retained. The Catalog did not substitute latest.'
-        : `Couldn't open this exact revision: ${errorMessage(error)}`)
+        ? 'This version is no longer available. A newer version was not opened instead.'
+        : `Couldn't open this version: ${errorMessage(error)}`)
       setDetailLoading(false)
     }
   }, [])
@@ -242,11 +242,11 @@ export function DatasetRevisionHistory({
               : selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
             const current = index === 0
             const versionTime = timestamp(revision.committedAt)
-            const state = active ? current ? 'Current · exact' : 'Exact' : current ? 'Current' : 'Historical'
+            const state = active ? current ? 'Current · selected' : 'Selected' : current ? 'Current' : 'Previous'
             const content = <>
               <span className="min-w-0 flex-1">
                 <span className="block text-[10.5px] font-semibold text-foreground">Version from {versionTime}</span>
-                <span className="block text-[9.5px] text-muted-foreground">{active ? 'Selected exact version' : current ? 'Latest retained version' : 'Retained historical version'}</span>
+                <span className="block text-[9.5px] text-muted-foreground">{active ? 'Selected version' : current ? 'Current version' : 'Previous version'}</span>
               </span>
               <span className="flex shrink-0 flex-col items-end gap-0.5">
                 <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-semibold text-muted-foreground">{state}</span>
@@ -276,7 +276,7 @@ export function DatasetRevisionHistory({
               <details data-testid={`revision-technical-details-${revision.revisionId}`}
                 className="group shrink-0 border-l border-border/60 px-2 py-1.5 text-[9.5px] text-muted-foreground">
                 <summary className="cursor-pointer list-none rounded px-1 py-0.5 font-semibold hover:bg-accent [&::-webkit-details-marker]:hidden">
-                  Technical details
+                  Diagnostics
                 </summary>
                 <dl className="mt-1 grid max-w-[300px] grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-0.5 rounded bg-muted/40 p-2">
                   <dt>Dataset</dt><dd className="dp-mono break-all text-foreground">{revision.datasetId}</dd>
@@ -330,10 +330,10 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
-  /** The full-page dataset viewer already owns the exact bounded row preview. */
+  /** The full-page dataset viewer already owns the selected bounded row preview. */
   showPreview?: boolean
 }) {
-  if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact version…</div>
+  if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening version…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
   if (!detail) return null
   const compatibility = parent ? compareSchemas(parent.preview.columns, detail.preview.columns) : null
@@ -343,7 +343,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
   return <div className="flex flex-col gap-2 border-t border-border pt-2" data-testid="revision-detail">
     <div className="flex items-start gap-2">
       <div className="min-w-0 flex-1">
-        <div className="text-[10.5px] font-semibold text-foreground">{current ? 'Current exact version' : 'Historical exact version'}</div>
+        <div className="text-[10.5px] font-semibold text-foreground">{current ? 'Current version' : 'Previous version'}</div>
         <div className="text-[12px] font-semibold text-foreground">{timestamp(detail.committedAt)}</div>
         <div className="text-[9.5px] text-muted-foreground">
           {number(detail.summary.rowCount)} rows · {schemaFields.toLocaleString()} schema {schemaFields === 1 ? 'field' : 'fields'}
@@ -367,7 +367,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
     </div>
     <details data-testid="revision-technical-details"
       className="rounded-md border border-border px-2 py-1.5 text-[9.5px] text-muted-foreground">
-      <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+      <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
       <dl className="mt-1.5 grid grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-1">
         <dt>Dataset ID</dt><dd className="dp-mono break-all text-foreground">{detail.datasetId}</dd>
         <dt>Revision ID</dt><dd className="dp-mono break-all text-foreground">{detail.revisionId}</dd>
@@ -422,11 +422,11 @@ function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
   const { columns, rows, hasMore, rowLimit } = detail.preview
   return <div>
     <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
-      <span>Exact revision preview</span>
+      <span>Version preview</span>
       <span className="font-normal text-muted-foreground">{rows.length.toLocaleString()} rows</span>
     </div>
-    {hasMore && <div className="mb-1 text-[9.5px] text-muted-foreground">Preview truncated at {rowLimit} rows; every row shown is still bound to this exact revision.</div>}
-    {!columns.length ? <div className="rounded-md border border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This exact revision supplied no columns.</div>
+    {hasMore && <div className="mb-1 text-[9.5px] text-muted-foreground">Preview limited to {rowLimit} rows; every row shown comes from this version.</div>}
+    {!columns.length ? <div className="rounded-md border border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This version supplied no columns.</div>
       : <div className="max-h-[220px] overflow-auto rounded-md border border-border">
         <table className="dp-mono w-max text-[9.5px]">
           <thead><tr>{columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold"><FieldEvidenceButton column={column} marker className="dp-mono rounded px-0.5 hover:bg-accent" /></th>)}</tr></thead>
@@ -434,7 +434,7 @@ function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
             ? <MediaCellRenderer column={column.name} value={row[column.name]} mediaKind={column.mediaKind} viewport="table" />
             : cell(row[column.name])}</td>)}</tr>)}</tbody>
         </table>
-        {!rows.length && <div className="border-t border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This exact revision returned no preview rows; its retained schema remains inspectable above.</div>}
+        {!rows.length && <div className="border-t border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This version returned no preview rows; its saved schema remains available above.</div>}
       </div>}
   </div>
 }
@@ -517,11 +517,11 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
   }
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
-    <div role="dialog" aria-modal="true" aria-label="Save exact revision as view" aria-busy={busy}
+    <div role="dialog" aria-modal="true" aria-label="Save version as view" aria-busy={busy}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
       onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2">
-        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Save exact revision as view</h2>
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Save version as view</h2>
           <p className="truncate text-[10.5px] text-muted-foreground">{table.name} · revision {detail.revisionId}</p></div>
         <button onClick={onClose} disabled={busy} aria-label="Close save view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
       </div>
@@ -538,7 +538,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
                 <span className="truncate" title={column}>{column}</span>
               </label>)}
             </div>
-            <span className="text-[10px] text-muted-foreground">Output order follows the exact revision schema. Choose at least one column.</span>
+            <span className="text-[10px] text-muted-foreground">Output order follows this version's schema. Choose at least one column.</span>
           </fieldset>
           <label className="grid gap-1 text-[11px] font-semibold text-foreground">Row predicate <span className="font-normal text-muted-foreground">(optional DuckDB expression)</span>
             <textarea value={predicate} disabled={busy} rows={3} onChange={(event) => setPredicate(event.target.value)}

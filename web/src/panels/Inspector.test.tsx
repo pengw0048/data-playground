@@ -90,9 +90,7 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     } as any)
 
     render(<Inspector />)
-    expect(screen.getByText(/Needs review/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
-    expect(screen.getByText(/SQL changed since this contract was pinned/i)).toBeInTheDocument()
+    expect(screen.getByText(/SQL changed after these output columns were saved/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for actual' }))
@@ -136,9 +134,7 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     } as any)
 
     render(<Inspector />)
-    expect(screen.getByText(/Needs review/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
-    expect(screen.getByText(/changed since this contract was pinned/i)).toBeInTheDocument()
+    expect(screen.getByText(/code changed after these output columns were saved/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for copied' }))
     expect(screen.getByTestId('field-evidence-copied')).not.toHaveTextContent('Row-reference target')
@@ -267,7 +263,7 @@ describe('Inspector — effective named outputs', () => {
     } as any)
   }
 
-  it('uses the exact Library processor description instead of the generic Transform blurb', () => {
+  it('uses the selected Library processor description and fixed mode instead of generic fields', () => {
     const processorId = `tr_${'b'.repeat(29)}`
     selectNode('transform', undefined)
     useStore.setState((state) => ({
@@ -279,13 +275,16 @@ describe('Inspector — effective named outputs', () => {
             ...candidate.data,
             config: {
               source: 'library', processor: processorId, version: 'v1', mode: 'map',
+              outputSchema: [{ name: 'legacy_override', type: 'string', capabilities: [] }],
+              enforceSchema: true,
             },
           },
         })),
       },
       processors: [{
         id: processorId, version: 'v1', title: 'Normalize events', mode: 'map',
-        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [],
+        category: 'compute', inputColumns: [], inputSchema: [],
+        outputSchema: [{ name: 'library_result', type: 'int64', capabilities: [] }],
         requirements: [], paramsSchema: {}, previewable: true,
         blurb: 'Normalizes event locations for downstream training.',
         provenance: 'promoted',
@@ -298,11 +297,18 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByTitle('Normalizes event locations for downstream training.')).toBeInTheDocument()
     expect(screen.queryByText('Apply a Python transform to rows')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Open processor definition' })).not.toBeInTheDocument()
-    expect(screen.getByText('Immutable version v1')).toBeVisible()
+    expect(screen.getByText('Version v1')).toBeVisible()
+    expect(screen.getByText('· Per row')).toBeVisible()
+    expect(screen.getByText('Defined by Library version v1.')).toBeVisible()
+    expect(screen.getByText('library_result')).toBeVisible()
+    expect(screen.queryByDisplayValue('legacy_override')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Add column/i })).not.toBeInTheDocument()
+    expect(screen.queryByText('Properties')).not.toBeInTheDocument()
     expect(screen.getByText(`${processorId}@v1`, { exact: false })).not.toBeVisible()
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Developer details'))
     expect(screen.getByText(`${processorId}@v1`, { exact: false })).toBeVisible()
     expect(screen.queryByText('(empty)')).not.toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ source: 'library', mode: 'map' })
   })
 
   it('does not show processor-definition detail before an exact Library processor is selected', () => {
@@ -606,35 +612,37 @@ describe('Inspector — advanced execution', () => {
     } as any)
   }
 
-  it('keeps an unconfigured Transform free of execution controls until Advanced execution opens', () => {
+  it('uses automatic compute without exposing free-text placement controls', () => {
     selectTransform({})
     render(<Inspector />)
 
-    const advanced = screen.getByText('Advanced execution').closest('details')
+    expect(screen.getByText('Compute').parentElement).toHaveTextContent('Automatic')
+    expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('GPU type')).not.toBeInTheDocument()
+    const advanced = screen.getByText('Materialization options').closest('details')
     expect(advanced).not.toHaveAttribute('open')
-    expect(screen.getByText('Resources (placement)')).not.toBeVisible()
     expect(screen.getByText('Materialization')).not.toBeVisible()
 
-    fireEvent.click(screen.getByText('Advanced execution'))
+    fireEvent.click(screen.getByText('Materialization options'))
     expect(advanced).toHaveAttribute('open')
-    expect(screen.getByText('Resources (placement)')).toBeVisible()
     expect(screen.getByText('Materialization')).toBeVisible()
+    expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
   })
 
-  it('keeps configured resources visible as a summary and edits the existing requirements payload', () => {
-    selectTransform({ requires: { gpu: 8, gpuType: 'a100', cpu: 4 } })
+  it('keeps legacy requirements visible and lets the user return to Automatic', () => {
+    const requires = { gpu: 8, gpuType: 'a100', cpu: 4 }
+    selectTransform({ requires })
     render(<Inspector />)
 
-    expect(screen.getByText('Resources').parentElement).toHaveTextContent('8 GPUs · a100 · 4 CPUs')
-    fireEvent.click(screen.getByRole('button', { name: 'Edit resources' }))
-    const gpu = screen.getByLabelText('GPUs') as HTMLInputElement
-    expect(gpu).toHaveValue(8)
-    fireEvent.change(gpu, { target: { value: '4' } })
-    expect((useStore.getState().doc.nodes[0].data.config as any).requires).toEqual({ gpu: 4, gpuType: 'a100', cpu: 4 })
+    expect(screen.getByText('Compute').parentElement).toHaveTextContent('8 GPUs · a100 · 4 CPUs')
+    fireEvent.click(screen.getByRole('button', { name: 'Use Automatic' }))
+    expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
+    expect((useStore.getState().doc.nodes[0].data.config as any).requires).toBeUndefined()
   })
 })
 
-describe('Inspector — output schema disclosure', () => {
+describe('Inspector — output columns', () => {
   const selectTransform = (config: Record<string, unknown>) => {
     useStore.setState({
       selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: {},
@@ -645,30 +653,48 @@ describe('Inspector — output schema disclosure', () => {
     } as any)
   }
 
-  it('keeps an unconfigured contract under Advanced output schema', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('shows unconfigured output columns in the normal Inspector flow', () => {
     selectTransform({})
     render(<Inspector />)
 
-    const advanced = screen.getByText('Advanced output schema').closest('details')
-    expect(advanced).not.toHaveAttribute('open')
-    expect(screen.getByText('Output schema (contract)')).not.toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Edit output schema' })).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByText('Advanced output schema'))
-    expect(advanced).toHaveAttribute('open')
-    expect(screen.getByText('Untyped until it runs. Declare a contract, infer it, or reference a named one. Leave empty to stay dynamic.')).toBeVisible()
+    expect(screen.getByText('Output columns')).toBeVisible()
+    expect(screen.getByText(/Run a preview to detect columns/)).toBeVisible()
+    expect(screen.queryByText('Advanced output schema')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save as named…' })).not.toBeInTheDocument()
   })
 
-  it('summarizes a configured contract and opens its editor directly', () => {
+  it('edits configured columns with common suggestions while accepting custom types', () => {
     selectTransform({ outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }] })
     render(<Inspector />)
 
-    expect(screen.getByText('1 declared column')).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Edit output schema' }))
     expect(screen.getByDisplayValue('clean_id')).toBeVisible()
+    const type = screen.getByLabelText('clean_id type')
+    expect(type).toHaveAttribute('list', 'output-column-types-transform')
+    expect(document.querySelector('#output-column-types-transform option[value="string"]')).not.toBeNull()
+    expect(document.querySelector('#output-column-types-transform option[value="timestamp"]')).not.toBeNull()
+
+    fireEvent.change(type, { target: { value: 'list<struct<id: int64>>' } })
+    expect((useStore.getState().doc.nodes[0].data.config.outputSchema as ColumnSchema[])[0].type)
+      .toBe('list<struct<id: int64>>')
   })
 
-  it('keeps a stale contract discoverable and directly reviewable', () => {
+  it('turns off required-column enforcement when the last output column is cleared', () => {
+    selectTransform({
+      outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
+      enforceSchema: true,
+    })
+    render(<Inspector />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
+    const config = useStore.getState().doc.nodes[0].data.config as Record<string, unknown>
+    expect(config.outputSchema).toBeUndefined()
+    expect(config.enforceSchema).toBeUndefined()
+    expect(screen.queryByText('Require these columns')).not.toBeInTheDocument()
+  })
+
+  it('keeps stale output columns directly reviewable', () => {
     selectTransform({
       code: 'return current_input',
       outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
@@ -676,13 +702,38 @@ describe('Inspector — output schema disclosure', () => {
     })
     render(<Inspector />)
 
-    expect(screen.getByText(/Needs review/)).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
-    expect(screen.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
+    expect(screen.getByText(/code changed after these output columns were saved/i)).toBeVisible()
     expect(screen.getByDisplayValue('clean_id')).toBeVisible()
   })
 
-  it('keeps configured summaries informative without offering viewer-only edit actions', () => {
+  it('reads an existing named reference without offering registry creation or discovery', async () => {
+    vi.spyOn(api, 'listSchemas').mockResolvedValue([{
+      name: 'shared_events', columns: [{ name: 'event_id', type: 'string', capabilities: [] }],
+    }] as any)
+    selectTransform({ outputSchema: { ref: 'shared_events' } })
+    render(<Inspector />)
+
+    expect(await screen.findByText('event_id')).toBeVisible()
+    expect(screen.getByText(/Uses the saved output columns/)).toHaveTextContent('shared_events')
+    expect(screen.queryByText(/schema registry/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save as named…' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Reference a named contract…')).not.toBeInTheDocument()
+  })
+
+  it('turns off required-column enforcement when a saved column reference is unlinked', async () => {
+    vi.spyOn(api, 'listSchemas').mockResolvedValue([{
+      name: 'shared_events', columns: [{ name: 'event_id', type: 'string', capabilities: [] }],
+    }] as any)
+    selectTransform({ outputSchema: { ref: 'shared_events' }, enforceSchema: true })
+    render(<Inspector />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use editable columns instead' }))
+    const config = useStore.getState().doc.nodes[0].data.config as Record<string, unknown>
+    expect(config.outputSchema).toBeUndefined()
+    expect(config.enforceSchema).toBeUndefined()
+  })
+
+  it('keeps imported execution and output details visible but disabled for viewers', () => {
     selectTransform({
       code: 'return current_input',
       requires: { gpu: 8, gpuType: 'a100' },
@@ -695,10 +746,10 @@ describe('Inspector — output schema disclosure', () => {
 
     expect(screen.getByText(/8 GPUs · a100/)).toBeVisible()
     expect(screen.getByText(/Checkpointed output/)).toBeVisible()
-    expect(screen.getByText(/Needs review/)).toBeVisible()
+    expect(screen.getByText(/code changed after these output columns were saved/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Edit materialization' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Review output schema' })).not.toBeInTheDocument()
+    expect(screen.getByDisplayValue('clean_id')).toBeDisabled()
   })
 })
 
@@ -744,12 +795,10 @@ describe('Inspector — output schema inference input', () => {
 
   const openAndInfer = () => {
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Advanced output schema'))
-    fireEvent.click(screen.getByRole('button', { name: 'Infer from sample' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Detect from preview' }))
   }
 
   beforeEach(() => {
-    vi.spyOn(api, 'listSchemas').mockResolvedValue([])
     vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] })
   })
 
@@ -966,7 +1015,7 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Advanced execution'))
+    fireEvent.click(screen.getByText('Materialization options'))
     const toggle = screen.getByTestId('checkpoint-toggle')
     expect(toggle).toBeEnabled()
     fireEvent.click(toggle)
@@ -990,7 +1039,7 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Advanced execution'))
+    fireEvent.click(screen.getByText('Materialization options'))
     expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
     expect(screen.getByText('Checkpoints are available only for Source → Select → Write.')).toBeInTheDocument()
   })
@@ -1058,7 +1107,7 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Advanced execution'))
+    fireEvent.click(screen.getByText('Materialization options'))
     expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
   })
 })
@@ -1223,7 +1272,7 @@ describe('Inspector — draft Source entry', () => {
       uri: table.uri, tableId: table.id, registrationId: table.registrationId,
     }, [table])
     render(<Inspector />)
-    expect(screen.getByTitle('Local catalog · Current version · 2,000 rows · 2 columns')).toBeInTheDocument()
+    expect(screen.getByTitle('Datasets · Current version · 2,000 rows · 2 columns')).toBeInTheDocument()
     expect(screen.queryByTitle('Choose a registered dataset')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
@@ -1234,7 +1283,7 @@ describe('Inspector — draft Source entry', () => {
     expect(screen.getByLabelText('Source connection details')).toHaveTextContent('dataset:events')
   })
 
-  it('shows the real Workspace provider exact Source as bound without manual parsing controls', () => {
+  it('shows the selected Workspace provider version as bound without manual parsing controls', () => {
     selectSource({
       uri: 'provider+dataset://mount/source-binding',
       providerResourceRef: 'dataset:external/orders',
@@ -1249,7 +1298,7 @@ describe('Inspector — draft Source entry', () => {
       },
     })
     render(<Inspector />)
-    expect(screen.getByTitle('Luma Data API · Exact version provider-revision-7')).toBeInTheDocument()
+    expect(screen.getByTitle('Luma Data API · Version provider-revision-7')).toBeInTheDocument()
     expect(screen.queryByTitle('Choose a registered dataset')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
@@ -1264,7 +1313,7 @@ describe('Inspector — draft Source entry', () => {
     ['exact', {
       uri: 'file:///data/exact.csv',
       datasetRef: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-3' },
-    }, 'Selected dataset · Exact version revision-3'],
+    }, 'Selected dataset · Version revision-3'],
     ['as-of', {
       uri: 'file:///data/as-of.csv',
       datasetRef: {
@@ -1274,7 +1323,7 @@ describe('Inspector — draft Source entry', () => {
           committedAt: '2026-07-23T23:00:00Z', retentionOwner: 'provider', selector: 'as_of',
         },
       },
-    }, 'Selected dataset · Exact version revision-4'],
+    }, 'Selected dataset · Version revision-4'],
     ['run-time parameter', {
       uri: 'file:///data/runtime.csv',
       datasetRef: { parameterRef: 'runtime_dataset' },
@@ -1338,7 +1387,7 @@ describe('Inspector — draft Source entry', () => {
       uri: table.uri, tableId: table.id, registrationId: table.registrationId,
     }, [table])
     render(<Inspector />)
-    expect(screen.getByTitle(/Local catalog · Current version/)).toBeInTheDocument()
+    expect(screen.getByTitle(/Datasets · Current version/)).toBeInTheDocument()
 
     act(() => {
       useStore.setState((state) => ({
@@ -1364,7 +1413,7 @@ describe('Inspector — draft Source entry', () => {
         },
       }))
     })
-    expect(screen.getByTitle('Luma Data API · Exact version provider-revision-7')).toBeInTheDocument()
+    expect(screen.getByTitle('Luma Data API · Version provider-revision-7')).toBeInTheDocument()
     expect(screen.queryByText('Choose data')).not.toBeInTheDocument()
 
     act(() => {

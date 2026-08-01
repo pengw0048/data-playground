@@ -27,6 +27,7 @@ import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 import { canvasFitOptions } from './viewportFit'
+import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -109,9 +110,10 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
     if (!canEdit) return
     api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false))
   }, [canEdit])
-  const add = () => {
+  const add = (action: SourceEntryAction) => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
-    addNode('source', { x: c.x - 116, y: c.y - 40 })
+    const node = addNode('source', { x: c.x - 116, y: c.y - 40 })
+    if (node) requestSourceEntryAction(node.id, action)
   }
   return (
     <div className="pointer-events-none absolute inset-0 grid place-items-center">
@@ -121,10 +123,17 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
           {canEdit ? 'Add a dataset source to begin — or open a runnable example.' : 'You have view-only access to this canvas.'}
         </div>
         {canEdit && (
-          <div className="mt-3.5 flex justify-center gap-2">
-            <Button variant="outline" onClick={add} className="rounded-lg text-[12.5px] text-muted-foreground">+ Add a source</Button>
-            {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
-          </div>
+          <>
+            <div className="mt-3.5 flex flex-wrap justify-center gap-2">
+              <Button variant="outline" onClick={() => add('select')} className="rounded-lg text-[12.5px] text-muted-foreground">Choose dataset</Button>
+              <Button variant="outline" onClick={() => add('upload')} className="rounded-lg text-[12.5px] text-muted-foreground">Upload file</Button>
+              <Button variant="outline" onClick={() => add('browse')} className="rounded-lg text-[12.5px] text-muted-foreground">Register path or URL</Button>
+              {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
+            </div>
+            <div className="mt-2 text-[10.5px] text-muted-foreground/80">
+              Or drop a Parquet, CSV, JSON, or Arrow file here.
+            </div>
+          </>
         )}
         {/* runnable starters on the seeded data — a first-timer never opens the file menu to find them */}
         {canEdit && <div className="mx-auto mt-6 grid max-w-[460px] gap-2">

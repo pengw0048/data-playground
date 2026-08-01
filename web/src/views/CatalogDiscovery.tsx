@@ -15,8 +15,8 @@ import type {
 } from '../types/api'
 
 // The Workspace dataset discovery surface is built to browse thousands of datasets. Nothing is loaded up front: a left
-// FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
-// (infinite scroll), and a right FACET RAIL (tags/owners with counts). A search box (debounced) and a
+// FOLDER TREE (lazy), a center VIRTUALIZED list fed by one explicit server-side page, and a right
+// FACET RAIL (tags/owners with counts). A search box (debounced) and a
 // sort control drive the same query; clicking a row opens the shared dataset viewer to inspect rows,
 // columns, revisions, and lineage
 // and curate the dataset's folder/tags/owner/description.
@@ -36,6 +36,20 @@ const sameRevision = (
   && left.datasetId === right.datasetId && left.revisionId === right.revisionId
 const revisionLabel = (revision: { datasetId: string; revisionId: string }) =>
   `${revision.datasetId}@${revision.revisionId}`
+
+function friendlyColumnType(type: string): string {
+  const normalized = type.trim().toLowerCase()
+  if (/^(u?int|integer|bigint|smallint|tinyint)/.test(normalized)) return 'Integer'
+  if (/^(float|double|decimal|numeric)/.test(normalized)) return 'Number'
+  if (/^(utf8|string|varchar|text)/.test(normalized)) return 'Text'
+  if (/^(bool|boolean)/.test(normalized)) return 'Boolean'
+  if (/^(timestamp|datetime)/.test(normalized)) return 'Timestamp'
+  if (/^date/.test(normalized)) return 'Date'
+  if (/^(binary|blob)/.test(normalized)) return 'Binary'
+  if (/^(list|array|fixed_size_list)/.test(normalized)) return 'List'
+  if (/^(struct|map)/.test(normalized)) return 'Object'
+  return type
+}
 
 /**
  * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
@@ -122,22 +136,24 @@ export function CatalogDiscovery({
   const [items, setItems] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
   const [hasMore, setHasMore] = useState(false)
+  const [pageSize, setPageSize] = useState(PAGE)
+  const [pageIndex, setPageIndex] = useState(0)
+  const [retryPage, setRetryPage] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [loadingMoreState, setLoadingMoreState] = useState(false)
-  const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const [facets, setFacets] = useState<Facets>({ folders: [], tags: [], owners: [] })
   const [selected, setSelected] = useState<CatalogTable | null>(null)
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const [selectionRevision, setSelectionRevision] = useState(0)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [confirmBatchUnregister, setConfirmBatchUnregister] = useState(false)
+  const [batchUnregistering, setBatchUnregistering] = useState(false)
   const [unregisterResult, setUnregisterResult] = useState<{
     response: CatalogUnregisterResult; names: Record<string, string>
   } | null>(null)
   const [catalogRevision, setCatalogRevision] = useState(0)
   const seq = useRef(0)
-  const loadingMore = useRef(false)
   const selectionSeq = useRef(0)
   // The displayed table and the identity used to resolve it are distinct during exact-revision
   // navigation: a receipt logical id can resolve to a current registration id.
@@ -156,14 +172,13 @@ export function CatalogDiscovery({
   }, [rawQ, q])
 
   const params = useMemo<CatalogQueryParams>(
-    () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, hasColumns, sort, order, limit: PAGE }),
-    [q, folder, tags, owner, hasColumns, sort, order])
+    () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, hasColumns, sort, order, limit: pageSize }),
+    [q, folder, tags, owner, hasColumns, sort, order, pageSize])
   const semantic = match === 'meaning' && !!q  // "meaning" mode: ranked hybrid search instead of paging
 
-  const loadFirst = useCallback(async () => {
+  const loadPage = useCallback(async (targetPage: number) => {
     const s = ++seq.current
-    loadingMore.current = false
-    setLoading(true); setError(null); setLoadingMoreState(false); setLoadMoreError(null)
+    setLoading(true); setError(null)
     // A changed filter must not leave the previous query's rows/facets visible while the new
     // request is in flight. The loading state below is the only claim we can make until it returns.
     setItems([]); setTotal(0); setHasMore(false); setSelectedIds(new Set())  // a new query invalidates the old selection
@@ -182,19 +197,24 @@ export function CatalogDiscovery({
         fc = rankedResultFacets(hits)
       } else {
         [page, fc] = await Promise.all([
-          api.tablesPage({ ...params, offset: 0 }),
+          api.tablesPage({ ...params, offset: targetPage * pageSize }),
           api.facets(params),
         ])
       }
       if (s !== seq.current) return  // a newer query superseded this one
       setItems(page.items); setTotal(page.total); setHasMore(page.hasMore); setFacets(fc)
+      setPageIndex(semantic ? 0 : targetPage)
+      setRetryPage(semantic ? 0 : targetPage)
     } catch (e) {
       if (s !== seq.current) return
+      setRetryPage(targetPage)
       setItems([]); setTotal(0); setHasMore(false); setError((e as Error).message)  // never show stale results under new filters
     } finally {
       if (s === seq.current) setLoading(false)
     }
-  }, [params, semantic, q])
+  }, [params, semantic, q, pageSize])
+
+  const loadFirst = useCallback(() => loadPage(0), [loadPage])
 
   useEffect(() => { void loadFirst() }, [loadFirst])
 
@@ -244,31 +264,6 @@ export function CatalogDiscovery({
     return () => { selectionSeq.current += 1 }
   }, [selectedRegistrationId, initialRevisionId, initialRevisionDatasetId, selectionRevision])
 
-  const loadMore = useCallback(async () => {
-    if (!hasMore || loading || loadingMore.current) return
-    loadingMore.current = true
-    setLoadingMoreState(true); setLoadMoreError(null)
-    const s = seq.current
-    try {
-      const page = await api.tablesPage({ ...params, offset: items.length })
-      if (s !== seq.current) return
-      // dedupe by id: offsets drift when the catalog changes between pages
-      setItems((cur) => {
-        const seen = new Set(cur.map((t) => t.id))
-        const fresh = page.items.filter((t) => !seen.has(t.id))
-        return fresh.length ? [...cur, ...fresh] : cur
-      })
-      setHasMore(page.hasMore)
-    } catch (e) {
-      if (s === seq.current) setLoadMoreError(errorMessage(e))
-    } finally {
-      if (s === seq.current) {
-        loadingMore.current = false
-        setLoadingMoreState(false)
-      }
-    }
-  }, [hasMore, loading, params, items.length])
-
   const toggleTag = (t: string) => setTags((cur) => cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t])
   const clearFilters = () => {
     setRawQ('')
@@ -308,19 +303,21 @@ export function CatalogDiscovery({
     onUseTables(ts)
     clearSelection()
   }
+  const selectedTables = items.filter((table) => selectedIds.has(table.id))
+  const requestDeleteSelected = () => {
+    if (!selectedTables.length) return
+    if (selectedTables.some((table) => !table.metadataRevision || !table.registrationId)) {
+      pushToast('Reload before removing: at least one dataset has no version precondition', 'error')
+      return
+    }
+    setConfirmBatchUnregister(true)
+  }
   const deleteSelected = async () => {
     const tables = items.filter((table) => selectedIds.has(table.id)); if (!tables.length) return
     const targets = tables.flatMap((table) => table.metadataRevision && table.registrationId
       ? [{ id: table.id, expectedRegistrationId: table.registrationId, expectedRevision: table.metadataRevision }] : [])
-    if (targets.length !== tables.length) {
-      pushToast('Reload before removing: at least one dataset has no version precondition', 'error')
-      return
-    }
-    if (!window.confirm(
-      `Unregister ${targets.length} dataset${targets.length === 1 ? '' : 's'}? `
-      + 'This removes catalog registrations, not underlying data. '
-      + 'The operation is best effort: each item is version-checked and the result may be partial.',
-    )) return
+    if (targets.length !== tables.length || batchUnregistering) return
+    setBatchUnregistering(true)
     try {
       const result = await api.unregisterTables(targets)
       setUnregisterResult({
@@ -338,6 +335,7 @@ export function CatalogDiscovery({
         failures ? 'info' : 'success',
       )
     } catch (e) { pushToast(errorMessage(e), 'error') }
+    finally { setBatchUnregistering(false); setConfirmBatchUnregister(false) }
     clearSelection(); setCatalogRevision((v) => v + 1); await loadFirst()
   }
   const onUpload = async (f?: File) => {
@@ -459,7 +457,7 @@ export function CatalogDiscovery({
           <button onClick={useSelected} className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-primary hover:bg-accent">
             <Icon name="plus" size={11} /> Use
           </button>
-          <button onClick={() => void deleteSelected()} data-testid="catalog-delete-selected"
+          <button onClick={requestDeleteSelected} data-testid="catalog-delete-selected"
             disabled={!catalogSource?.capabilities?.includes('catalog.cas_unregister')}
             className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-destructive hover:bg-accent">
             <Icon name="trash" size={11} /> Unregister
@@ -499,7 +497,7 @@ export function CatalogDiscovery({
             <div className="grid flex-1 place-items-center px-3 py-2">
               <div className="flex flex-col items-center gap-2 text-[13px] text-muted-foreground">
                 <span>Couldn't load the catalog: {error}</span>
-                <button onClick={() => void loadFirst()} data-testid="catalog-retry"
+                <button onClick={() => void loadPage(retryPage)} data-testid="catalog-retry"
                   className="rounded-md border border-border bg-card px-3 py-1 text-[12px] font-semibold text-foreground hover:bg-accent">Retry</button>
               </div>
             </div>
@@ -507,27 +505,31 @@ export function CatalogDiscovery({
             <VirtualList
               items={items}
               rowHeight={ROW_H}
-              onEndReached={semantic || loadMoreError ? undefined : loadMore}
               resetKey={semantic ? `meaning:${q}` : params}
               className="flex-1 px-3 py-2"
               emptyNote={<div className="grid h-full place-items-center text-[13px] text-muted-foreground">
                 {loading ? 'Loading…' : hasFilters ? 'No datasets match these filters.' : 'No datasets registered — add one above.'}
               </div>}
-              renderRow={(t) => <TableRow t={t} selected={selectedIds.has(t.id)} selectionActive={selectedIds.size > 0}
+              renderRow={(t) => <TableRow t={t} selected={selectedIds.has(t.id)}
                 onToggleSelect={() => toggleSelect(t.id)} onOpen={() => selectTable(t)} onUse={() => use(t)} onFolder={setFolder} />}
             />
           )}
-          <div className="border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
-            {loadMoreError ? (
-              <span role="alert" className="inline-flex items-center gap-2 text-destructive">
-                Couldn't load more: {loadMoreError}
-                <button onClick={() => void loadMore()} data-testid="catalog-load-more-retry"
-                  className="font-semibold underline">Retry</button>
-              </span>
-            ) : loadingMoreState ? 'Loading more…'
-              : semantic
-                ? `Top ${items.length.toLocaleString()} by relevance`
-                : `Showing ${items.length.toLocaleString()} of ${total.toLocaleString()}${hasMore ? ' — scroll for more' : ''}`}
+          <div className="flex min-h-10 items-center gap-2 border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
+            {semantic ? <span>{`Top ${items.length.toLocaleString()} by relevance`}</span> : <>
+              <span>Showing {total ? (pageIndex * pageSize + 1).toLocaleString() : 0}–{Math.min(total, pageIndex * pageSize + items.length).toLocaleString()} of {total.toLocaleString()}</span>
+              <span className="flex-1" />
+              <label className="inline-flex items-center gap-1.5">Rows
+                <select aria-label="Datasets per page" value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}
+                  className="rounded border border-border bg-card px-1.5 py-1 text-[11px] text-foreground">
+                  {[25, 50, 100].map((size) => <option key={size} value={size}>{size}</option>)}
+                </select>
+              </label>
+              <button type="button" data-testid="catalog-previous-page" onClick={() => void loadPage(pageIndex - 1)}
+                disabled={pageIndex === 0 || loading} className="rounded border border-border bg-card px-2 py-1 font-semibold text-foreground disabled:opacity-45">Previous</button>
+              <span className="min-w-14 text-center">Page {pageIndex + 1}</span>
+              <button type="button" data-testid="catalog-next-page" onClick={() => void loadPage(pageIndex + 1)}
+                disabled={!hasMore || loading} className="rounded border border-border bg-card px-2 py-1 font-semibold text-foreground disabled:opacity-45">Next</button>
+            </>}
           </div>
         </div>
 
@@ -555,6 +557,18 @@ export function CatalogDiscovery({
       </div>
 
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
+      {confirmBatchUnregister && <CatalogModal label={`Unregister ${selectedTables.length} dataset${selectedTables.length === 1 ? '' : 's'}`} onClose={batchUnregistering ? () => undefined : () => setConfirmBatchUnregister(false)}>
+        <p className="text-[12px] leading-5 text-muted-foreground">
+          Remove these entries from the catalog? The underlying data is not deleted. Each entry is checked separately, so some may remain if they changed.
+        </p>
+        <ul className="max-h-32 list-disc overflow-y-auto pl-5 text-[12px] text-foreground">
+          {selectedTables.map((table) => <li key={table.id}>{table.name}</li>)}
+        </ul>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={() => setConfirmBatchUnregister(false)} disabled={batchUnregistering} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+          <button type="button" onClick={() => void deleteSelected()} disabled={batchUnregistering} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{batchUnregistering ? 'Removing…' : 'Unregister'}</button>
+        </div>
+      </CatalogModal>}
 
       {/* Facets stay bounded with the active query. Empty folders remain discoverable through
           the lazy folder tree rather than forcing every folder into the page. */}
@@ -613,8 +627,8 @@ function FacetRow({ label, count, active, onClick }: { label: string; count: num
   )
 }
 
-function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse, onFolder }: {
-  t: CatalogTable; selected: boolean; selectionActive: boolean; onToggleSelect: () => void
+function TableRow({ t, selected, onToggleSelect, onOpen, onUse, onFolder }: {
+  t: CatalogTable; selected: boolean; onToggleSelect: () => void
   onOpen: () => void; onUse: () => void; onFolder: (f: string) => void
 }) {
   // Checkbox / Open / folder / Use are sibling controls — a single role=button wrapping nested buttons
@@ -624,7 +638,7 @@ function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse,
       className={`group mx-1 flex h-[54px] items-center gap-2 rounded-lg border bg-card pr-2 hover:border-primary/40 hover:bg-accent ${selected ? 'border-primary/60' : 'border-border'}`}
       style={{ opacity: t.missing ? 0.55 : 1 }}>
       <label onClick={(e) => e.stopPropagation()}
-        className={`flex h-full shrink-0 cursor-pointer items-center pl-2.5 ${!selected && !selectionActive ? 'opacity-0 group-hover:opacity-100 focus-within:opacity-100' : ''}`}>
+        className="flex h-full shrink-0 cursor-pointer items-center pl-2.5">
         <input type="checkbox" checked={selected} onChange={onToggleSelect} aria-label={`Select ${t.name}`}
           className="h-3.5 w-3.5 cursor-pointer accent-primary" />
       </label>
@@ -668,9 +682,119 @@ interface FolderActions {
   onDeleted: (path: string) => void
 }
 
+function CatalogModal({ label, onClose, children }: {
+  label: string; onClose: () => void; children: React.ReactNode
+}) {
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
+    <div role="dialog" aria-modal="true" aria-label={label}
+      className="grid w-[460px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl"
+      onClick={(event) => event.stopPropagation()}>
+      <div className="flex items-center gap-2">
+        <h2 className="flex-1 text-[15px] font-bold text-foreground">{label}</h2>
+        <button type="button" onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button>
+      </div>
+      {children}
+    </div>
+  </div>
+}
+
+function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const pushToast = useStore((state) => state.pushToast)
+  const [path, setPath] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const create = async () => {
+    const next = path.trim()
+    if (!next || busy) return
+    setBusy(true); setError(null)
+    try {
+      await api.createFolder(next)
+      pushToast(`Created folder “${next}”`, 'success')
+      onCreated()
+      onClose()
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <CatalogModal label="Create folder" onClose={onClose}>
+    <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
+      <input autoFocus aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
+        placeholder="prod/images" className="dp-input" />
+    </label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2">
+      <button type="button" onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button type="button" onClick={() => void create()} disabled={!path.trim() || busy}
+        className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating…' : 'Create'}</button>
+    </div>
+  </CatalogModal>
+}
+
+function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
+  path: string; onClose: () => void; onRenamed: (next: string) => void
+}) {
+  const pushToast = useStore((state) => state.pushToast)
+  const [name, setName] = useState(path)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const rename = async () => {
+    const next = name.trim()
+    if (!next || next === path || busy) return
+    setBusy(true); setError(null)
+    try {
+      await api.renameFolder(path, next)
+      pushToast('Folder renamed', 'success')
+      onRenamed(next)
+      onClose()
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <CatalogModal label={`Rename ${path}`} onClose={onClose}>
+    <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
+      <input autoFocus aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+    </label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2">
+      <button type="button" onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button type="button" onClick={() => void rename()} disabled={!name.trim() || name.trim() === path || busy}
+        className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button>
+    </div>
+  </CatalogModal>
+}
+
+function CatalogFolderDeleteDialog({ node, onClose, onDeleted }: {
+  node: FolderNode; onClose: () => void; onDeleted: () => void
+}) {
+  const pushToast = useStore((state) => state.pushToast)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const parent = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : ''
+  const remove = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try {
+      await api.deleteFolder(node.path)
+      pushToast('Folder deleted', 'success')
+      onDeleted()
+      onClose()
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <CatalogModal label={`Delete ${node.path}`} onClose={onClose}>
+    <p className="text-[12px] leading-5 text-muted-foreground">
+      Delete this folder? Its {node.tableCount} dataset{node.tableCount === 1 ? '' : 's'} and any subfolders move to {parent ? `“${parent}”` : 'the top level'}. The datasets are not deleted.
+    </p>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2">
+      <button type="button" onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+      <button type="button" onClick={() => void remove()} disabled={busy}
+        className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button>
+    </div>
+  </CatalogModal>
+}
+
 function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revision, sourceIdentity, mutable }:
   { selected: string; onSelect: (f: string) => void; revision: number; sourceIdentity: KernelInfo | null; mutable: boolean } & FolderActions) {
-  const pushToast = useStore((s) => s.pushToast)
+  const [createOpen, setCreateOpen] = useState(false)
   const [root, setRoot] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -711,12 +835,6 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
     void loadRoot()
     return () => { request.current += 1 }
   }, [loadRoot, revision])
-  const create = async () => {
-    const path = window.prompt('New folder path (e.g. prod/images):', '')?.trim()
-    if (!path) return
-    try { await api.createFolder(path); onCreated(); pushToast(`Created folder “${path}”`, 'success') }
-    catch (e) { pushToast(errorMessage(e), 'error') }
-  }
   return (
     <div className="flex flex-col gap-px text-[12.5px]">
       <div className="mb-0.5 flex items-center gap-1">
@@ -725,7 +843,7 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
           <Icon name="db" size={13} /> All datasets
         </button>
         {mutable && (
-          <button onClick={() => void create()} data-testid="folder-new" aria-label="New folder" title="New folder"
+          <button onClick={() => setCreateOpen(true)} data-testid="folder-new" aria-label="New folder" title="New folder"
             className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
             <Icon name="plus" size={13} />
           </button>
@@ -742,6 +860,7 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
         onRenamed={renamed} onDeleted={deleted} mutable={mutable} revision={revision}
         sourceIdentity={sourceIdentity} expanded={expanded} onToggleExpand={toggleExpand} />)}
       {root?.length === 0 && !loading && !error && <div className="px-2 py-1 text-[11px] text-muted-foreground">No folders yet</div>}
+      {createOpen && <CatalogFolderCreateDialog onClose={() => setCreateOpen(false)} onCreated={onCreated} />}
     </div>
   )
 }
@@ -750,8 +869,9 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
   { node: FolderNode; depth: number; selected: string; onSelect: (f: string) => void; mutable: boolean; revision: number
     sourceIdentity: KernelInfo | null; expanded: Set<string>; onToggleExpand: (path: string) => void }
   & Pick<FolderActions, 'onRenamed' | 'onDeleted'>) {
-  const pushToast = useStore((s) => s.pushToast)
   const open = expanded.has(node.path)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
   const [kids, setKids] = useState<FolderNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -853,32 +973,6 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
     return invalidateChildRequest
   }, [invalidateChildRequest, loadKids, node.path, open, revision, sourceIdentity])
 
-  const rename = async () => {
-    const next = window.prompt(`Rename folder “${node.path}” to:`, node.path)?.trim()
-    if (!next || next === node.path) return
-    try {
-      await api.renameFolder(node.path, next)
-      invalidateChildRequest()
-      onRenamed(node.path, next)
-      pushToast('Folder renamed', 'success')
-    }
-    catch (e) { pushToast(errorMessage(e), 'error') }
-  }
-  const remove = async () => {
-    const parent = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : ''
-    const where = parent ? `“${parent}”` : 'the top level'
-    const n = node.tableCount
-    // honest: delete is non-destructive — the whole subtree (datasets AND subfolders) moves up one level
-    if (!window.confirm(
-      `Delete folder “${node.path}”? Its ${n} dataset${n === 1 ? '' : 's'} and any subfolders move up to ${where}. Nothing is deleted.`)) return
-    try {
-      await api.deleteFolder(node.path)
-      invalidateChildRequest()
-      onDeleted(node.path)
-      pushToast('Folder deleted', 'success')
-    }
-    catch (e) { pushToast(errorMessage(e), 'error') }
-  }
   const visibleKids = loaded.current?.path === node.path && loaded.current.sourceIdentity === sourceIdentity ? kids : null
   return (
     <div>
@@ -892,11 +986,11 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
           <span className="text-[10px] tabular-nums opacity-60">{node.tableCount.toLocaleString()}</span>
         </button>
         {mutable && (<>
-          <button onClick={() => void rename()} data-testid={`folder-rename-${node.path}`} aria-label={`Rename folder ${node.path}`} title="Rename"
+          <button onClick={() => setRenameOpen(true)} data-testid={`folder-rename-${node.path}`} aria-label={`Rename folder ${node.path}`} title="Rename"
             className="grid h-6 w-5 shrink-0 place-items-center text-muted-foreground opacity-0 hover:text-foreground group-hover/branch:opacity-100 focus:opacity-100">
             <Icon name="rename" size={11} />
           </button>
-          <button onClick={() => void remove()} data-testid={`folder-delete-${node.path}`} aria-label={`Delete folder ${node.path}`} title="Delete"
+          <button onClick={() => setDeleteOpen(true)} data-testid={`folder-delete-${node.path}`} aria-label={`Delete folder ${node.path}`} title="Delete"
             className="mr-0.5 grid h-6 w-5 shrink-0 place-items-center text-muted-foreground opacity-0 hover:text-destructive group-hover/branch:opacity-100 focus:opacity-100">
             <Icon name="trash" size={11} />
           </button>
@@ -913,6 +1007,14 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
       {open && visibleKids?.map((k) => <FolderBranch key={k.path} node={k} depth={depth + 1} selected={selected} onSelect={onSelect}
         onRenamed={onRenamed} onDeleted={onDeleted} mutable={mutable} revision={revision}
         sourceIdentity={sourceIdentity} expanded={expanded} onToggleExpand={onToggleExpand} />)}
+      {renameOpen && <CatalogFolderRenameDialog path={node.path} onClose={() => setRenameOpen(false)} onRenamed={(next) => {
+        invalidateChildRequest()
+        onRenamed(node.path, next)
+      }} />}
+      {deleteOpen && <CatalogFolderDeleteDialog node={node} onClose={() => setDeleteOpen(false)} onDeleted={() => {
+        invalidateChildRequest()
+        onDeleted(node.path)
+      }} />}
     </div>
   )
 }
@@ -953,6 +1055,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const [lineageError, setLineageError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [confirmUnregister, setConfirmUnregister] = useState(false)
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
   const [preview, setPreview] = useState<SampleResult | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
@@ -988,17 +1092,17 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       const detail = await api.datasetRevision(requested.datasetId, requested.revisionId)
       if (request !== requestedExactRequest.current) return
       if (!sameRevision(detail, requested)) {
-        throw new Error(`Exact revision response did not match ${revisionLabel(requested)}`)
+        throw new Error(`The response did not match the selected version ${revisionLabel(requested)}`)
       }
       setRequestedExactDetail(detail)
     } catch (error) {
       if (request !== requestedExactRequest.current) return
       const status = statusOf(error)
       const prefix = status === 403
-        ? 'You do not have permission to open this exact revision.'
+        ? 'You do not have permission to open this selected version.'
         : status === 404 || status === 410
-          ? 'This exact revision is unavailable or no longer retained.'
-          : `Couldn't load this exact revision: ${errorMessage(error)}.`
+          ? 'This selected version is unavailable or no longer retained.'
+          : `Couldn't load this selected version: ${errorMessage(error)}.`
       setRequestedExactError(`${prefix} Latest was not substituted.`)
     } finally {
       if (request === requestedExactRequest.current) setRequestedExactLoading(false)
@@ -1096,7 +1200,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       const next = await api.datasetRevision(target.datasetId, target.revisionId)
       if (request !== factsRequest.current) return
       if (!sameRevision(next, target)) {
-        throw new Error(`Exact revision response did not match ${revisionLabel(target)}`)
+        throw new Error(`The response did not match the selected version ${revisionLabel(target)}`)
       }
       setExactFacts(next)
       // Fence the bounded exact read with a second head resolution. If the provider advanced while
@@ -1113,11 +1217,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       pushToast('This catalog entry cannot be removed with a version precondition', 'error')
       return
     }
-    if (!window.confirm(
-      `Unregister "${table.name}"? This removes the catalog registration, not underlying data.`,
-    )) return
     setDeleting(true)
-    try { await api.unregisterTable(table.id, base.registrationId, base.metadataRevision); pushToast('Removed from catalog', 'success'); onDeleted() }
+    try { await api.unregisterTable(table.id, base.registrationId, base.metadataRevision); setConfirmUnregister(false); pushToast('Removed from catalog', 'success'); onDeleted() }
     catch (e) { pushToast(errorMessage(e), 'error') }
     finally { setDeleting(false) }
   }
@@ -1139,7 +1240,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     || !sameList(declaredPk, initialKey(base))
 
   const requestClose = useCallback(() => {
-    if (!dirty || window.confirm('Discard unsaved catalog edits?')) onClose()
+    if (dirty) setConfirmDiscard(true)
+    else onClose()
   }, [dirty, onClose])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose() }
@@ -1208,8 +1310,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const exactVersionContext = !requestedExact
     ? null
     : latestHead
-      ? sameRevision(requestedExact, latestHead) ? 'Current exact version' : 'Historical exact version'
-      : 'Exact version'
+      ? sameRevision(requestedExact, latestHead) ? 'Current version' : 'Previous version'
+      : 'Selected version'
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1274,14 +1376,14 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               </div>
 
               {requestedExactLoading ? <div role="status" className="grid h-[240px] place-items-center text-[11px] text-muted-foreground">
-                Loading exact revision preview…
+                Loading selected version preview…
               </div> : null}
               {requestedExactError ? (
                 <div role="alert" className="flex h-[240px] items-center justify-center">
                   <div className="max-w-xl rounded-lg border border-destructive/30 px-4 py-3 text-[11px] text-destructive">
                     <div>{requestedExactError}</div>
                     <button type="button" onClick={() => void loadRequestedExact()}
-                      data-testid="exact-preview-retry" className="mt-2 font-semibold underline">Retry exact revision</button>
+                      data-testid="exact-preview-retry" className="mt-2 font-semibold underline">Retry selected version</button>
                   </div>
                 </div>
               ) : null}
@@ -1289,7 +1391,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 <div role="status" aria-label="Dataset preview scope"
                   className="mb-2 rounded-md bg-muted/50 px-2 py-1 text-[10.5px] text-muted-foreground">
                   Showing {requestedExactDetail.preview.rows.length.toLocaleString()} preview
-                  {requestedExactDetail.preview.rows.length === 1 ? ' row' : ' rows'} from this exact revision.
+                  {requestedExactDetail.preview.rows.length === 1 ? ' row' : ' rows'} from this selected version.
                   {requestedExactDetail.preview.hasMore
                     ? ` More rows exist; preview capped at ${requestedExactDetail.preview.rowLimit.toLocaleString()} rows.`
                     : ''}
@@ -1318,7 +1420,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
             <details data-testid="detail-dataset-details" className="rounded-lg border border-border px-3 py-2 text-[11px]">
               <summary className="cursor-pointer font-semibold text-foreground">
-                Dataset details
+                Diagnostics
               </summary>
               <div className="mt-2 grid gap-2">
                 <div className="flex items-start gap-2">
@@ -1331,7 +1433,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 </div> : null}
                 {displayedVersion ? <div data-testid="dataset-version-identity">
                   <div className="text-[10px] text-muted-foreground">
-                    {requestedExact ? 'Exact version identity' : 'Version identity'}
+                    {requestedExact ? 'Selected version identity' : 'Version identity'}
                   </div>
                   <code className="break-all text-[10.5px] text-foreground">
                     {revisionLabel(displayedVersion)}
@@ -1371,16 +1473,23 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <div className="mb-1 flex items-baseline justify-between gap-2">
               <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</div>
               <span className="text-[10.5px] text-muted-foreground">
-                {requestedExact && !requestedExactDetail ? 'Exact revision' : `${displayColumns.length} columns`}
+                {requestedExact && !requestedExactDetail ? 'Selected version' : `${displayColumns.length} columns`}
               </span>
             </div>
             {requestedExactLoading ? <div role="status" className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
-              Loading exact revision schema…
+              Loading selected version schema…
             </div> : requestedExactError ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
-              Exact revision schema is unavailable. Latest schema was not substituted.
+              Selected version schema is unavailable. Latest schema was not substituted.
             </div> : displayColumns.length ? <div tabIndex={0} aria-label="Dataset schema columns" data-testid="detail-schema-scroll"
-              className="grid max-h-[132px] grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto overscroll-contain rounded-lg border border-border px-3 py-2 text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
-              {displayColumns.map((column) => <div key={column.name} className="flex min-w-0 items-center gap-1"><span className="min-w-0 flex-1 truncate font-mono text-foreground">{column.name}</span><span className="shrink-0 text-muted-foreground">· {column.type}</span><FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" /></div>)}
+              className="max-h-[320px] overflow-y-auto overscroll-contain rounded-lg border border-border text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+              <div className="sticky top-0 grid grid-cols-[minmax(0,1fr)_140px_auto] gap-3 border-b border-border bg-muted px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                <span>Column</span><span>Type</span><span className="sr-only">Details</span>
+              </div>
+              {displayColumns.map((column) => <div key={column.name} className="grid grid-cols-[minmax(0,1fr)_140px_auto] items-center gap-3 border-b border-border/50 px-3 py-1.5 last:border-0">
+                <span className="min-w-0 truncate font-mono text-foreground">{column.name}</span>
+                <span title={column.type} className="truncate text-muted-foreground">{friendlyColumnType(column.type)}</span>
+                <FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
+              </div>)}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
           </section>
 
@@ -1390,10 +1499,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             viewerLoading={requestedExactLoading} viewerError={requestedExactError}
             onViewerRetry={() => { void loadRequestedExact() }} />
 
-          <details className="rounded-lg border border-border p-3">
-            <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Edit catalog details</summary>
+          <section aria-labelledby="edit-dataset-title" className="rounded-lg border border-border p-3">
+            <h2 id="edit-dataset-title" className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Edit dataset</h2>
             <div className="mt-3 flex flex-col gap-2">
-            <div className="text-[11px] text-muted-foreground">Organize this catalog entry and save its metadata separately from inspecting or using the dataset.</div>
+            <div className="text-[11px] text-muted-foreground">Change how this dataset is named and organized in Data Playground.</div>
             <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
             <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} disabled={!atomicMetadataEditable} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
             <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
@@ -1407,10 +1516,10 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </div>}
             <section>
               <div className="mb-1 flex items-baseline justify-between gap-2">
-                <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Key roles</div>
+                <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Row identifier (optional)</div>
                 <span className="text-[10.5px] text-muted-foreground">{persistedDeclaredKey.length > 1 ? 'Saved composite key' : persistedDeclaredKey.length === 1 ? 'Saved key' : 'No saved key'}</span>
               </div>
-              <p className="mb-2 text-[11px] leading-snug text-muted-foreground">Select one column for a key, or several columns for one composite key. Changes apply only when you save.</p>
+              <p className="mb-2 text-[11px] leading-snug text-muted-foreground">Choose the column, or combination of columns, that uniquely identifies a row. Leave this empty when the dataset has no stable row identifier.</p>
               <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
                 {displayColumns.map((c) => {
                   const selected = declaredPk.includes(c.name)
@@ -1434,7 +1543,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save'}</button>
             </div>
             </div>
-          </details>
+          </section>
 
           {/* lineage — click a row to open that dataset */}
           <section>
@@ -1471,8 +1580,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               datasetQuery: workspaceDatasetQuery,
             },
           })} data-testid="detail-relationships"
-            className="inline-flex items-center gap-1.5 self-start text-[11.5px] text-primary hover:underline">
-            <Icon name="lineage" size={12} /> View relationship graph →
+            className="inline-flex items-center gap-2 self-start rounded-md border border-border bg-card px-3 py-2 text-[12px] font-semibold text-primary hover:bg-accent">
+            <Icon name="lineage" size={14} /> Open lineage graph
           </button>
           {folderActionVisible && (
             <div className="flex items-center gap-2">
@@ -1484,7 +1593,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 className="text-[11.5px] font-semibold text-primary hover:underline">Retry</button>}
             </div>
           )}
-          <button onClick={() => void unregister()} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
+          <button onClick={() => setConfirmUnregister(true)} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
             title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'
               : !base.registrationId || !base.metadataRevision ? 'Reload this dataset before removing it' : undefined}
             className="self-start text-[11.5px] text-destructive opacity-70 hover:underline hover:opacity-100 disabled:opacity-40">
@@ -1493,6 +1602,20 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
         </div>
         </div>
       </div>
+      {confirmUnregister && <CatalogModal label={`Remove ${table.name} from catalog`} onClose={deleting ? () => undefined : () => setConfirmUnregister(false)}>
+        <p className="text-[12px] leading-5 text-muted-foreground">Remove this entry from Data Playground? The underlying data is not deleted.</p>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={() => setConfirmUnregister(false)} disabled={deleting} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+          <button type="button" onClick={() => void unregister()} disabled={deleting} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{deleting ? 'Removing…' : 'Remove'}</button>
+        </div>
+      </CatalogModal>}
+      {confirmDiscard && <CatalogModal label="Discard unsaved changes?" onClose={() => setConfirmDiscard(false)}>
+        <p className="text-[12px] leading-5 text-muted-foreground">Your dataset edits have not been saved.</p>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={() => setConfirmDiscard(false)} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Keep editing</button>
+          <button type="button" onClick={() => { setConfirmDiscard(false); onClose() }} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground">Discard and leave</button>
+        </div>
+      </CatalogModal>}
     </div>
   )
 }
@@ -1504,11 +1627,11 @@ function DatasetPreviewTable({ columns, rows, exact = false }: {
 }) {
   if (!columns.length) {
     return <div className="grid h-[240px] place-items-center rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
-      {exact ? 'This exact revision supplied no columns.' : 'This dataset supplied no columns.'}
+      {exact ? 'This selected version supplied no columns.' : 'This dataset supplied no columns.'}
     </div>
   }
   return <div tabIndex={0} aria-label="Dataset rows" data-testid="detail-preview-scroll"
-    className="h-[52vh] min-h-[240px] max-h-[560px] overflow-auto rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+    className="max-h-[420px] overflow-auto rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
     <table className="dp-mono w-max min-w-full text-[10.5px]">
       <thead><tr>{columns.map((column) => (
         <th key={column.name}
@@ -1529,7 +1652,7 @@ function DatasetPreviewTable({ columns, rows, exact = false }: {
     </table>
     {!rows.length ? <div className="border-t border-border px-3 py-3 text-[11px] text-muted-foreground">
       {exact
-        ? 'This exact revision returned no preview rows; its retained schema remains available below.'
+        ? 'This selected version returned no preview rows; its retained schema remains available below.'
         : 'The bounded preview returned no rows.'}
     </div> : null}
   </div>
@@ -1609,7 +1732,6 @@ export function AddDataModal({
       <div className="flex items-center gap-2">
         <div className="flex-1">
           <h2 className="text-[15px] font-bold text-foreground">Add data</h2>
-          <p className="mt-0.5 text-[12px] text-muted-foreground">Choose the option that matches where the data is available.</p>
         </div>
         <button onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
       </div>
@@ -1617,10 +1739,7 @@ export function AddDataModal({
         <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="upload-local-file-title">
           <h3 id="upload-local-file-title" className="text-[13px] font-semibold text-foreground">Upload a local file</h3>
           <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground">
-            Choose a file from this browser. Its bytes are uploaded to Data Playground; the kernel does not need access to your computer first.
-          </p>
-          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-            Supports Parquet, CSV, TSV, JSON/NDJSON, Arrow, Feather, and IPC files. Uploads are single files; Lance datasets are directories and are not supported here.
+            Choose a Parquet, CSV, JSON, Arrow, Feather, or IPC file from your computer.
           </p>
           <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading}
             className="mt-3 rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">
@@ -1632,7 +1751,7 @@ export function AddDataModal({
         <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="register-accessible-title">
           <h3 id="register-accessible-title" className="text-[13px] font-semibold text-foreground">Register an accessible path or URI</h3>
           <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground">
-            Use a mounted path or object-store URI the kernel/server can already read. This does not browse files on your computer.
+            Paste a path or URL, or browse storage available to Data Playground.
           </p>
           <button type="button" onClick={() => setRegisterOpen(true)}
             className="mt-3 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground hover:bg-accent">
@@ -1699,9 +1818,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
           <h2 className="flex-1 text-[15px] font-bold text-foreground">Register an accessible path or URI</h2>
           <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
         </div>
-        <p className="text-[11.5px] leading-relaxed text-muted-foreground">
-          The kernel reads this location, not your browser. Absolute paths start on the kernel host; relative paths resolve from the kernel working directory. URI schemes such as <code>s3://</code> use the kernel’s configured storage access.
-        </p>
+        <p className="text-[11.5px] leading-relaxed text-muted-foreground">Enter a file path or storage URL that Data Playground can access.</p>
         {formError && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11.5px] text-destructive">{formError}</div>}
         <Field label="Path / URI">
           <div className="flex gap-2">
@@ -1709,7 +1826,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
               onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void submit() }}
               placeholder="/data/events.parquet or s3://bucket/key" className="dp-input min-w-0 flex-1" data-testid="register-uri" />
             <button type="button" onClick={() => setBrowseOpen(true)}
-              className="shrink-0 rounded-md border border-border bg-card px-2.5 text-[11.5px] font-semibold text-foreground hover:bg-accent">Browse kernel storage</button>
+              className="shrink-0 rounded-md border border-border bg-card px-2.5 text-[11.5px] font-semibold text-foreground hover:bg-accent">Browse storage</button>
           </div>
         </Field>
         <Field label="Name (optional)"><input value={name} onChange={(e) => setName(e.target.value)} placeholder={stem || 'defaults to the file name'} className="dp-input" /></Field>

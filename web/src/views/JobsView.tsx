@@ -52,7 +52,7 @@ const updateLabel = (updatedAt: string | null | undefined) => (
 )
 const refreshLabel = (refreshedAt: number) => new Date(refreshedAt).toLocaleTimeString()
 
-type QuickView = 'queued' | 'running' | 'failed' | 'recent' | 'all'
+type QuickView = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'recent' | 'all'
 
 function clearSelectionParams(params: URLSearchParams) {
   for (const key of SELECTION_QUERY_KEYS) params.delete(key)
@@ -65,7 +65,7 @@ function hasOrdinaryFilters(params: URLSearchParams): boolean {
 
 function selectedQuickView(params: URLSearchParams): QuickView | null {
   const status = params.get('status')
-  if (status === 'queued' || status === 'running' || status === 'failed') return status
+  if (status === 'queued' || status === 'running' || status === 'done' || status === 'failed' || status === 'cancelled') return status
   if (!status && params.get('after') && !params.get('before')) return 'recent'
   if (!status && !params.get('after') && !params.get('before')) return 'all'
   return null
@@ -231,7 +231,7 @@ export function JobsView() {
   }
   const selectQuickView = (view: QuickView) => {
     const next = new URLSearchParams(params)
-    if (view === 'queued' || view === 'running' || view === 'failed') {
+    if (view === 'queued' || view === 'running' || view === 'done' || view === 'failed' || view === 'cancelled') {
       next.set('status', view)
       next.delete('after'); next.delete('before')
     } else if (view === 'recent') {
@@ -280,24 +280,6 @@ export function JobsView() {
       setActionError(caught instanceof Error ? caught.message : String(caught))
     } finally { setActing('') }
   }
-  const nodeChoices = useMemo(() => currentPageNodeChoices(items), [items])
-  const backendChoices = useMemo(() => [...new Set(items.map((item) => item.backend).filter(Boolean))], [items])
-  const selectedNodeChoice = nodeChoiceValue(params.get('canvas'), params.get('node'))
-  const listedNode = nodeChoices.some((choice) => choice.value === selectedNodeChoice)
-  const backend = params.get('backend') ?? ''
-  const listedBackend = backendChoices.includes(backend)
-  const selectNode = (value: string) => {
-    if (!value) {
-      update('node', '')
-      return
-    }
-    const [canvasId, nodeId] = JSON.parse(value) as [string | null, string]
-    const next = new URLSearchParams(params)
-    if (canvasId) next.set('canvas', canvasId); else next.delete('canvas')
-    next.set('node', nodeId)
-    clearSelectionParams(next)
-    setJobsQuery(next.toString())
-  }
   const selectCanvas = (value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set('canvas', value); else next.delete('canvas')
@@ -344,37 +326,20 @@ export function JobsView() {
       <section aria-label="Job quick views" className="flex flex-wrap items-center gap-2 border-b border-border bg-card/60 px-4 py-3 sm:px-7">
         <span className="mr-1 text-[11.5px] text-muted-foreground">Show</span>
         {([
-          ['queued', 'Queued'], ['running', 'Running'], ['failed', 'Failed'], ['recent', 'Recent'], ['all', 'All'],
+          ['queued', 'Queued'], ['running', 'Running'], ['done', 'Completed'], ['failed', 'Failed'], ['cancelled', 'Cancelled'], ['recent', 'Recent'], ['all', 'All'],
         ] as [QuickView, string][]).map(([view, label]) => <Button key={view} size="sm" variant={quickView === view ? 'default' : 'outline'} onClick={() => selectQuickView(view)}>{label}</Button>)}
       </section>
 
-      <details className="group border-b border-border bg-card/30 px-4 py-2 text-[11.5px] xl:px-7">
-        <summary className="cursor-pointer text-muted-foreground">Advanced filters</summary>
-        <section aria-label="Job filters" className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2">
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Status
-            <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              {STATUSES.map((value) => <option key={value} value={value}>{value || 'All states'}</option>)}
-            </select></label>
-          <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Node
-            <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              <option value="">All nodes on loaded Jobs</option>
-              {!listedNode && selectedNodeChoice && <option value={selectedNodeChoice}>Exact node ID: {params.get('node')}</option>}
-              {nodeChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
-            </select></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Backend
-            <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              <option value="">All backends on loaded Jobs</option>
-              {!listedBackend && backend && <option value={backend}>Exact backend ID: {backend}</option>}
-              {backendChoices.map((backend) => <option key={backend} value={backend}>{backend}</option>)}
-            </select></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
-            <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
-            <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-          <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
-        </section>
-      </details>
+      <section aria-label="Job filters" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2 border-b border-border bg-card/30 px-4 py-3 text-[11.5px] xl:px-7">
+        <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
+        <Filter label="Node ID" name="node" value={params.get('node') ?? ''} onChange={update} placeholder="Optional node ID" />
+        <Filter label="Execution backend" name="backend" value={params.get('backend') ?? ''} onChange={update} placeholder="Optional backend" />
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
+          <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
+          <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
+      </section>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
         {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
@@ -385,9 +350,9 @@ export function JobsView() {
         {!loading && !error && items.length === 0 && !selectedRunUnavailable && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
         {items.length > 0 && <section aria-labelledby="jobs-list-heading">
           <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Runs and background tasks</h2>
-          <div className="min-w-[900px] overflow-hidden rounded-lg border border-border bg-card">
-            <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
-              <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
+          <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-card">
+            <div className="grid grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
+              <span>State</span><span>Context</span><span>Outcome</span><span className="hidden md:block">Duration</span><span className="hidden xl:block">Backend</span><span className="hidden md:block">Recorded</span>
             </div>
             {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
           </div>
@@ -425,25 +390,6 @@ function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[];
 
 function canvasLabel(canvas: CanvasFile): string {
   return `${canvas.name || 'Untitled canvas'} · ${canvas.id}`
-}
-
-function nodeChoiceValue(canvasId: string | null, nodeId: string | null): string {
-  return nodeId ? JSON.stringify([canvasId || null, nodeId]) : ''
-}
-
-function currentPageNodeChoices(items: WorkspaceJobDto[]) {
-  const choices = new Map<string, { value: string; label: string }>()
-  for (const item of items) {
-    if (!item.targetNodeId || !item.canvasId) continue
-    const value = nodeChoiceValue(item.canvasId, item.targetNodeId)
-    if (choices.has(value)) continue
-    const node = item.nodeLabel || `Node ${item.targetNodeId}`
-    choices.set(value, {
-      value,
-      label: `${node} · ${item.canvasName || 'Untitled canvas'} (${item.canvasId}) · ${item.targetNodeId}`,
-    })
-  }
-  return [...choices.values()]
 }
 
 function Filter({ label, name, value, onChange, placeholder }: { label: string; name: string; value: string; onChange: (name: string, value: string) => void; placeholder?: string }) {
@@ -485,7 +431,6 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       ? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined, { view: 'jobs', query: returnQuery })
       : null
   const active = item.status === 'queued' || item.status === 'running'
-  const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
     : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
     : item.canvasName || 'Unavailable canvas'
@@ -507,7 +452,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
-      className="grid w-full grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
+      className="grid w-full grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35 md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
       <span className="flex flex-wrap items-center gap-1.5">
         <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
         {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
@@ -519,9 +464,9 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         <span className="block truncate text-muted-foreground">{context}</span>
       </span>
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
-      <span className="text-muted-foreground">{duration}</span>
-      <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
-      <span className="whitespace-nowrap text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
+      <span className="hidden text-muted-foreground md:block">{duration}</span>
+      <span className="hidden truncate text-muted-foreground xl:block" title={item.backend}>{item.backend}</span>
+      <span className="hidden whitespace-nowrap text-[10.5px] text-muted-foreground md:block">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
@@ -529,8 +474,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
       </div>}
       <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
-        {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
-        {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
+        {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId ?? undefined)}>Open in Canvas</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
         {datasetHref && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={datasetHref}>Open dataset</a>}
         {!publishedRevision && committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
@@ -540,7 +484,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
       </div>
       <details className="sm:col-span-2 rounded-md border border-border bg-background px-3 py-2">
-        <summary className="cursor-pointer font-semibold text-muted-foreground">Technical evidence</summary>
+        <summary className="cursor-pointer font-semibold text-muted-foreground">Diagnostics</summary>
         <div className="mt-3 grid gap-2">
           <div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>
           {committed.length > 0 && <div><strong>Retained results:</strong> {committed.map((output, index) =>

@@ -12,6 +12,7 @@ import type { CanvasDoc, CanvasNode } from '../types/graph'
 import { compareSchemas } from '../lib/schemaCompatibility'
 import { Icon } from '../ui/Icon'
 import { routeHash } from '../router'
+import { processorModeLabel } from '../nodes/processorIdentity'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 25
@@ -133,7 +134,7 @@ export function TransformsLibrary() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-[220px] flex-1">
           <h1 className="text-xl font-bold text-foreground">Transforms</h1>
-          <p className="mt-1 text-[12px] text-muted-foreground">Pinned, immutable compute definitions for repeatable data work.</p>
+          <p className="mt-1 text-[12px] text-muted-foreground">Versioned transforms for repeatable data work.</p>
         </div>
         {targetContext && <a
           data-testid="transform-return-canvas"
@@ -178,7 +179,7 @@ export function TransformsLibrary() {
                 {item.availability !== 'active' && <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-destructive">{item.availability}</span>}
               </span>
               <span className="mt-1 block line-clamp-2 text-[11px] leading-4 text-muted-foreground">{item.blurb || 'No description supplied.'}</span>
-              <span className="mt-1.5 block text-[10.5px] text-muted-foreground">{item.category} · {item.mode} · {item.version}{item.versionCount > 1 ? ` · ${item.versionCount} versions` : ''}</span>
+              <span className="mt-1.5 block text-[10.5px] text-muted-foreground">{item.category} · {processorModeLabel(item.mode)} · {item.version}{item.versionCount > 1 ? ` · ${item.versionCount} versions` : ''}</span>
             </span>
             <Icon name="chevronRight" size={14} style={{ marginTop: 4 }} />
           </button>)}
@@ -188,8 +189,8 @@ export function TransformsLibrary() {
       </section>
 
       <section aria-label="Transform detail" className="min-w-0 rounded-xl border border-border bg-card p-5 lg:sticky lg:top-5 lg:self-start">
-        {!selectedId && <div className="py-12 text-center text-sm text-muted-foreground">Select a Transform to inspect its exact versions and use it.</div>}
-        {selectedId && !detail && !detailError && <div className="py-12 text-center text-sm text-muted-foreground">Loading exact versions…</div>}
+        {!selectedId && <div className="py-12 text-center text-sm text-muted-foreground">Select a Transform to inspect its versions and use it.</div>}
+        {selectedId && !detail && !detailError && <div className="py-12 text-center text-sm text-muted-foreground">Loading versions…</div>}
         {detailError && <div role="alert" className="grid gap-3 text-sm text-destructive">
           <span>{detailError}</span>
           <button type="button" onClick={recoverFromUnavailableDetail}
@@ -266,7 +267,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         setImplementationSource({
           key: sourceKey,
           loading: false,
-          error: 'The returned source does not match the selected exact version.',
+          error: 'The returned source does not match the selected version.',
         })
         return
       }
@@ -278,7 +279,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         loading: false,
         error: caught instanceof KernelError && caught.status === 404
           ? (detail.provenance === 'promoted'
-              ? 'The exact promoted definition is unavailable.'
+              ? 'The selected promoted version is unavailable.'
               : '')
           : errorMessage(caught),
       })
@@ -299,9 +300,9 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         if (!live) return
         const file = useStore.getState().files.find((candidate) => candidate.id === upgradeCanvasId)
         const node = doc.nodes.find((candidate) => candidate.id === upgradeNodeId)
-        if (!file || !roleCanEdit(file.role)) throw new Error('The exact target is no longer editable')
+        if (!file || !roleCanEdit(file.role)) throw new Error('The selected Canvas is no longer editable')
         if (!node || node.type !== 'transform' || node.data.config.source !== 'library') {
-          throw new Error('The exact target is no longer a Library Transform')
+          throw new Error('The selected node is no longer a Library Transform')
         }
         const processor = node.data.config.processor
         const version = node.data.config.version
@@ -309,10 +310,10 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         const configured = typeof processor === 'string' && processor.length > 0
           && typeof version === 'string' && version.length > 0
         if (!unconfigured && !configured) {
-          throw new Error('The exact target has an incomplete processor version reference')
+          throw new Error('The selected node has an incomplete processor version reference')
         }
         if (configured && processor !== detail.id) {
-          throw new Error('The exact target is configured with a different Transform')
+          throw new Error('The selected node is configured with a different Transform')
         }
         setTarget({ doc, node, file, intent: unconfigured ? 'configure' : 'upgrade' })
       } catch (caught) { if (live) setTargetError(errorMessage(caught)) }
@@ -395,7 +396,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
 
   if (requestedMissing) return <div>
     <button onClick={() => history.back()} className="mb-4 text-[12px] font-semibold text-primary">Back</button>
-    <h2 className="text-lg font-bold">Exact version unavailable</h2>
+    <h2 className="text-lg font-bold">Version unavailable</h2>
     <p className="mt-2 text-[12px] leading-5 text-muted-foreground">This deep link names a version that does not exist or is no longer accessible. No newer version was substituted.</p>
     <VersionList versions={detail.versions} selected={null} onSelect={onSelectVersion} />
   </div>
@@ -411,21 +412,21 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
         onClick={() => target?.intent === 'configure' ? void configure() : onUse(selected)}
         disabled={configuring || (hasTargetContext ? !canConfigure : selected.availability !== 'active')}
         className="rounded-md bg-foreground px-3 py-2 text-[12px] font-semibold text-background disabled:opacity-40"
-      >{configuring ? 'Configuring…' : `Use exact ${selected.version}`}</button>}
+      >{configuring ? 'Configuring…' : `Use ${selected.version}`}</button>}
     </div>
     <div className="mt-3 flex flex-wrap gap-1.5 text-[10.5px] text-muted-foreground">
-      <span className="rounded bg-muted px-2 py-1">{selected.provenance}</span><span className="rounded bg-muted px-2 py-1">{selected.category}</span><span className="rounded bg-muted px-2 py-1">{selected.mode}</span>
+      <span className="rounded bg-muted px-2 py-1">{selected.provenance}</span><span className="rounded bg-muted px-2 py-1">{selected.category}</span><span className="rounded bg-muted px-2 py-1">{processorModeLabel(selected.mode)}</span>
       <span className={`rounded px-2 py-1 ${selected.availability === 'active' ? 'bg-emerald-500/10 text-emerald-700' : 'bg-destructive/10 text-destructive'}`}>{selected.availability}</span>
     </div>
     {upgradeCanvasId && upgradeNodeId && <section className="mt-4 rounded-lg border border-border bg-background p-3">
       <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
-        {target?.intent === 'configure' ? 'Exact configuration target' : 'Explicit upgrade target'}
+        {target?.intent === 'configure' ? 'Canvas target' : 'Upgrade target'}
       </h3>
       {target ? <p className="mt-1 text-[12px]"><strong>{target.file.name}</strong> · {target.node.data.title || target.node.id} <span className="font-mono text-[10px] text-muted-foreground">{target.node.id}</span></p>
         : targetError ? <div role="alert" className="mt-1 text-[11px] text-destructive">{targetError}</div>
           : <p className="mt-1 text-[11px] text-muted-foreground">Confirming Canvas, node, and edit role…</p>}
       {configureError && <div role="alert" className="mt-2 text-[11px] text-destructive">{configureError}</div>}
-      <button onClick={() => setTargetEpoch((value) => value + 1)} className="mt-2 text-[11px] font-semibold text-primary">Reload exact target</button>
+      <button onClick={() => setTargetEpoch((value) => value + 1)} className="mt-2 text-[11px] font-semibold text-primary">Reload Canvas target</button>
     </section>}
     <VersionList versions={detail.versions} selected={selected.version} onSelect={onSelectVersion} />
     <SchemaBlock label="Input schema" columns={selected.inputSchema} />
@@ -445,14 +446,14 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
     </section>}
     {showUpgrade && <section className="mt-4 rounded-lg border border-primary/30 bg-primary/5 p-3">
       <h3 className="text-[12px] font-bold">Upgrade selected node from {String(cfg?.version)} to {selected.version}</h3>
-      <p className="mt-1 text-[11px] text-muted-foreground">This changes only the selected node's exact reference. Downstream results will be invalidated.</p>
+      <p className="mt-1 text-[11px] text-muted-foreground">This changes only the selected node's version. Downstream results will be invalidated.</p>
       <div className="mt-2 grid gap-2 sm:grid-cols-2">
         <SchemaDiff label="Input" diff={inputDiff} />
         <SchemaDiff label="Output" diff={outputDiff} />
       </div>
       {!canUpgrade && <p className="mt-2 text-[11px] font-medium text-destructive">Upgrade is blocked because both schema transitions must be proven compatible; unknown evidence is not treated as compatible.</p>}
       {upgradeError && <div role="alert" className="mt-2 text-[11px] text-destructive">{upgradeError}</div>}
-      <button onClick={() => void upgrade()} disabled={upgrading || !canUpgrade} className="mt-3 rounded-md bg-primary px-3 py-1.5 text-[11px] font-semibold text-primary-foreground disabled:opacity-50">{upgrading ? 'Upgrading…' : `Confirm exact upgrade to ${selected.version}`}</button>
+      <button onClick={() => void upgrade()} disabled={upgrading || !canUpgrade} className="mt-3 rounded-md bg-primary px-3 py-1.5 text-[11px] font-semibold text-primary-foreground disabled:opacity-50">{upgrading ? 'Upgrading…' : `Confirm upgrade to ${selected.version}`}</button>
     </section>}
   </div>
 }
@@ -512,21 +513,21 @@ function ImplementationSource({
         <code>{source.source}</code>
       </pre>
       <details className="mt-2 border-t border-border pt-2 text-[10.5px] text-muted-foreground">
-        <summary className="cursor-pointer font-medium text-foreground">Source integrity</summary>
+        <summary className="cursor-pointer font-medium text-foreground">Developer details</summary>
         <div className="mt-1">
           <span className="mr-2 uppercase">{source.language}</span>
           <span className="break-all font-mono">SHA-256 {source.sha256}</span>
         </div>
       </details>
     </div> : loading ? <div role="status" className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
-      Loading exact implementation source…
+      Loading implementation source…
     </div> : error ? <div role="alert" className="mt-1.5 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">
       <strong>Implementation source could not be loaded.</strong> {error}
     </div> : <div className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
       <strong className="text-foreground">Implementation source unavailable.</strong>{' '}
       {provenance === 'plugin'
-        ? 'This plugin does not publish implementation source for this exact version.'
-        : 'This exact promoted definition has no readable implementation source.'}
+        ? 'This plugin does not publish implementation source for this version.'
+        : 'This promoted version has no readable implementation source.'}
     </div>}
   </section>
 }
@@ -541,7 +542,7 @@ function DeleteVersion({ entry, onDeleted }: { entry: TransformLibraryEntry; onD
     catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <div className="mt-2">{confirm ? <div className="rounded-md border border-destructive/30 p-2 text-[11px]"><p>This tombstones {entry.version}; its number and definition cannot be reused.</p><div className="mt-2 flex gap-2"><button onClick={() => void remove()} disabled={busy} className="rounded bg-destructive px-2 py-1 font-semibold text-destructive-foreground">{busy ? 'Deleting…' : 'Delete exact version'}</button><button onClick={() => setConfirm(false)} disabled={busy}>Cancel</button></div></div> : <button onClick={() => setConfirm(true)} className="text-[11px] font-semibold text-destructive">Delete unreferenced version…</button>}{error && <div role="alert" className="mt-1 text-[11px] text-destructive">{error}</div>}</div>
+  return <div className="mt-2">{confirm ? <div className="rounded-md border border-destructive/30 p-2 text-[11px]"><p>This tombstones {entry.version}; its number and definition cannot be reused.</p><div className="mt-2 flex gap-2"><button onClick={() => void remove()} disabled={busy} className="rounded bg-destructive px-2 py-1 font-semibold text-destructive-foreground">{busy ? 'Deleting…' : 'Delete version'}</button><button onClick={() => setConfirm(false)} disabled={busy}>Cancel</button></div></div> : <button onClick={() => setConfirm(true)} className="text-[11px] font-semibold text-destructive">Delete unreferenced version…</button>}{error && <div role="alert" className="mt-1 text-[11px] text-destructive">{error}</div>}</div>
 }
 
 function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; onClose: () => void }) {
@@ -580,7 +581,7 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
     let nodeId: string | null | undefined
     try {
       if (mode === 'new') {
-        if (!root || root.version == null) throw new Error('Load the exact Workspace destination first')
+        if (!root || root.version == null) throw new Error('Load the Workspace destination first')
         const result = await api.workspaceCreateCanvas({
           containerId: identity(root), expectedContainerVersion: root.version, name: name.trim(),
           transformId: entry.id, transformVersion: entry.version,
@@ -620,8 +621,8 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={close}>
     <div role="dialog" aria-modal="true" aria-label={`Use ${entry.title}`} className="grid w-[500px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2"><h2 className="flex-1 text-[15px] font-bold">Use {entry.title} · {entry.version}</h2><button onClick={close} disabled={busy} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      <p className="text-[11px] text-muted-foreground">The Canvas stores this exact immutable version. It will never follow a newer release automatically.</p>
-      <div className="grid grid-cols-2 gap-2"><button onClick={() => setMode('new')} disabled={busy} aria-pressed={mode === 'new'} className={`rounded-lg border p-3 text-left ${mode === 'new' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Create new Canvas</strong><span className="text-[10.5px] text-muted-foreground">Create in Workspace</span></button><button onClick={() => setMode('existing')} disabled={busy} aria-pressed={mode === 'existing'} className={`rounded-lg border p-3 text-left ${mode === 'existing' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Add to Canvas</strong><span className="text-[10.5px] text-muted-foreground">Choose an exact editable target</span></button></div>
+      <p className="text-[11px] text-muted-foreground">The Canvas stores this version and will not switch to a newer release automatically.</p>
+      <div className="grid grid-cols-2 gap-2"><button onClick={() => setMode('new')} disabled={busy} aria-pressed={mode === 'new'} className={`rounded-lg border p-3 text-left ${mode === 'new' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Create new Canvas</strong><span className="text-[10.5px] text-muted-foreground">Create in Workspace</span></button><button onClick={() => setMode('existing')} disabled={busy} aria-pressed={mode === 'existing'} className={`rounded-lg border p-3 text-left ${mode === 'existing' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Add to Canvas</strong><span className="text-[10.5px] text-muted-foreground">Choose an editable Canvas</span></button></div>
       {mode === 'new' ? <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name<input aria-label="New Canvas name" value={name} onChange={(event) => setName(event.target.value)} disabled={busy} className="dp-input" /></label> : editable.length ? <>
         <label className="grid gap-1 text-[11px] text-muted-foreground">Target Canvas<select aria-label="Target Canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} disabled={busy} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
         {editable.find((file) => file.id === canvasId) && <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">

@@ -101,7 +101,7 @@ describe('DatasetViewDetail', () => {
     render(<DatasetViewDetail definition={DEFINITION} onClose={vi.fn()} onDeleted={vi.fn()} />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This exact revision is no longer available. The view did not substitute the current head.',
+      'This saved version is no longer available. The view did not open a newer version instead.',
     )
     expect(mocks.previewDatasetView).toHaveBeenCalledTimes(1)
   })

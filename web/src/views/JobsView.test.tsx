@@ -20,8 +20,7 @@ const job = (overrides = {}) => ({
   outputs: [], createdAt: '2026-07-16T12:00:00Z', ...overrides,
 })
 
-const openAdvancedFilters = () => fireEvent.click(screen.getByText('Advanced filters'))
-const openTechnicalEvidence = () => fireEvent.click(screen.getByText('Technical evidence'))
+const openTechnicalEvidence = () => fireEvent.click(screen.getByText('Diagnostics'))
 
 describe('JobsView', () => {
   beforeEach(() => {
@@ -59,10 +58,11 @@ describe('JobsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.getAllByText('destination unavailable')).toHaveLength(1)
+    expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
+    expect(screen.queryByRole('link', { name: 'Open canvas' })).not.toBeInTheDocument()
+    openTechnicalEvidence()
     expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
     expect(screen.getByText('Last durable update:').closest('div')).toHaveTextContent('Last durable update: Unavailable')
-    expect(screen.getByRole('link', { name: 'Open canvas' })).toHaveAttribute('href', '#/canvas/canvas-1')
-    expect(screen.getByRole('link', { name: 'Open node' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
   })
 
@@ -126,14 +126,16 @@ describe('JobsView', () => {
     expect(useStore.getState().jobsQuery).toContain('run=history-1')
   })
 
-  it('keeps filters in the route and passes them to the bounded API', async () => {
+  it('keeps common filters visible and passes them to the bounded API', async () => {
+    useStore.setState({ files: [{ id: 'canvas-1', name: 'Research', version: 1 }] } as never)
     render(<JobsView />)
     await screen.findByText('Alpha research')
-    openAdvancedFilters()
-    fireEvent.change(screen.getByLabelText('Filter jobs by status'), { target: { value: 'running' } })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=running'))
+    expect(screen.getByRole('region', { name: 'Job filters' })).toBeVisible()
+    expect(screen.queryByText('Advanced filters')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
-      limit: 50, status: 'running',
+      limit: 50, canvasId: 'canvas-1',
     })))
   })
 
@@ -147,6 +149,10 @@ describe('JobsView', () => {
       await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=queued'))
       expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'queued' }))
 
+      fireEvent.click(screen.getByRole('button', { name: 'Completed' }))
+      await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=done'))
+      expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'done' }))
+
       fireEvent.click(screen.getByRole('button', { name: 'Recent' }))
       await waitFor(() => expect(useStore.getState().jobsQuery).toBe('after=2026-07-14T12%3A00%3A00.000Z'))
       expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ after: '2026-07-14T12:00:00.000Z', status: undefined }))
@@ -158,12 +164,12 @@ describe('JobsView', () => {
     }
   })
 
-  it('keeps exact evidence closed until a researcher asks for it', async () => {
+  it('keeps diagnostics closed until a researcher asks for them', async () => {
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
 
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
-    const evidence = screen.getByText('Technical evidence').closest('details')!
+    const evidence = screen.getByText('Diagnostics').closest('details')!
     expect(evidence).not.toHaveAttribute('open')
     expect(screen.getByText('Current attempt:')).not.toBeVisible()
 
@@ -188,7 +194,7 @@ describe('JobsView', () => {
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(3)
   })
 
-  it('uses authorized canvas names and current-page node/backend context while retaining canonical IDs', async () => {
+  it('uses authorized canvas names and accepts direct server-side node or execution filters', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [
       job({ canvasId: 'canvas-1', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish' }),
       job({ id: 'history-2', runId: 'run-2', canvasId: 'canvas-2', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish', backend: 'ray' }),
@@ -201,19 +207,10 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     await screen.findAllByText('Research')
-    openAdvancedFilters()
     expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Publish · Research (canvas-1) · publish' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Node unlabelled · Research (canvas-2) · unlabelled' })).toBeVisible()
-
-    fireEvent.change(screen.getByLabelText('Filter jobs by node'), {
-      target: { value: JSON.stringify(['canvas-2', 'publish']) },
-    })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-2&node=publish'))
-    expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
-      canvasId: 'canvas-2', nodeId: 'publish', limit: 50,
-    }))
+    expect(screen.getByLabelText('Filter jobs by node id')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by execution backend')).toBeVisible()
 
     fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
@@ -221,38 +218,32 @@ describe('JobsView', () => {
       canvasId: 'canvas-1', nodeId: undefined, limit: 50,
     })))
 
-    fireEvent.change(screen.getByLabelText('Filter jobs by backend'), { target: { value: 'ray' } })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toContain('backend=ray'))
   })
 
-  it('keeps a deep-linked exact ID filter editable without inventing an inaccessible canvas name', async () => {
+  it('keeps deep-linked server-side filters visible and editable', async () => {
     useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
     render(<JobsView />)
 
-    openAdvancedFilters()
     expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Exact node ID: exact-node' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
-    expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
-    expect(screen.queryByLabelText(/Filter jobs by canvas id \(exact\)/i)).not.toBeInTheDocument()
-    expect(screen.queryByLabelText(/Filter jobs by node id \(exact\)/i)).not.toBeInTheDocument()
-    expect(screen.queryByLabelText(/Filter jobs by backend id \(exact\)/i)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Filter jobs by node id')).toHaveValue('exact-node')
+    expect(screen.getByLabelText('Filter jobs by execution backend')).toHaveValue('exact-backend')
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: 'not-accessible', nodeId: 'exact-node', backend: 'exact-backend', limit: 50,
+    })))
   })
 
-  it('keeps a standalone exact node filter visible and clearable', async () => {
+  it('keeps a standalone node filter visible and clearable', async () => {
     useStore.setState({ jobsQuery: 'node=orphan-node' } as never)
     render(<JobsView />)
 
-    openAdvancedFilters()
-    expect(await screen.findByRole('option', { name: 'Exact node ID: orphan-node' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node'))
-      .toHaveValue(JSON.stringify([null, 'orphan-node']))
+    const nodeFilter = await screen.findByLabelText('Filter jobs by node id')
+    expect(nodeFilter).toHaveValue('orphan-node')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: undefined, nodeId: 'orphan-node', limit: 50,
     })))
 
-    fireEvent.change(screen.getByLabelText('Filter jobs by node'), { target: { value: '' } })
+    fireEvent.change(nodeFilter, { target: { value: '' } })
+    fireEvent.blur(nodeFilter)
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe(''))
   })
 
@@ -381,7 +372,7 @@ describe('JobsView', () => {
     expect(screen.getByRole('complementary', { name: 'Retained result' })).toBeVisible()
   })
 
-  it('keeps a completed row concise and moves multiple port identities into technical evidence', async () => {
+  it('keeps a completed row concise and moves multiple port identities into diagnostics', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       status: 'done', progress: 1, error: null, rows: 1,
       outputs: [
@@ -586,8 +577,8 @@ describe('JobsView', () => {
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-stale in Alpha research', expanded: false }))
 
-    expect(screen.getByRole('link', { name: 'Re-admit in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
-    expect(screen.queryByRole('link', { name: 'Open node' })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
+    expect(screen.getAllByRole('link', { name: 'Open in Canvas' })).toHaveLength(1)
   })
 
   it('routes an exact merge receipt to the immutable shared dataset viewer', async () => {

@@ -65,7 +65,27 @@ function CatalogDiscoveryFixture() {
 }
 
 function openCatalogDetails() {
-  fireEvent.click(screen.getByText('Edit catalog details'))
+  fireEvent.click(screen.getByText('Edit dataset'))
+}
+
+function submitFolderCreate(path: string) {
+  fireEvent.click(screen.getByTestId('folder-new'))
+  const dialog = screen.getByRole('dialog', { name: 'Create folder' })
+  fireEvent.change(within(dialog).getByLabelText('Folder path'), { target: { value: path } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Create' }))
+}
+
+function submitFolderRename(path: string, next: string) {
+  fireEvent.click(screen.getByTestId(`folder-rename-${path}`))
+  const dialog = screen.getByRole('dialog', { name: `Rename ${path}` })
+  fireEvent.change(within(dialog).getByLabelText('Folder path'), { target: { value: next } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Rename' }))
+}
+
+function submitFolderDelete(path: string) {
+  fireEvent.click(screen.getByTestId(`folder-delete-${path}`))
+  const dialog = screen.getByRole('dialog', { name: `Delete ${path}` })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
 }
 
 describe('Catalog discovery request and mutation truth', () => {
@@ -112,9 +132,8 @@ describe('Catalog discovery request and mutation truth', () => {
     const onCompleted = vi.fn()
     const { container } = render(<AddDataModal onClose={vi.fn()} onUploadDataset={onUploadDataset} onCompleted={onCompleted} />)
 
-    expect(screen.getByText(/bytes are uploaded to Data Playground/i)).toBeVisible()
-    expect(screen.getByText(/Lance datasets are directories and are not supported here/i)).toBeVisible()
-    expect(screen.getByText(/kernel.server can already read/i)).toBeVisible()
+    expect(screen.getByText(/Choose a Parquet, CSV, JSON, Arrow, Feather, or IPC file/i)).toBeVisible()
+    expect(screen.getByText(/Paste a path or URL, or browse storage/i)).toBeVisible()
     fireEvent.change(container.querySelector('input[type="file"]')!, {
       target: { files: [new File(['id\n1\n'], 'local.csv', { type: 'text/csv' })] },
     })
@@ -127,8 +146,8 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<AddDataModal onClose={vi.fn()} onUploadDataset={vi.fn()} onCompleted={vi.fn()} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Register path or URI' }))
-    expect(screen.getByText(/Absolute paths start on the kernel host/i)).toBeVisible()
-    expect(screen.getByText(/relative paths resolve from the kernel working directory/i)).toBeVisible()
+    expect(screen.getByText(/Enter a file path or storage URL that Data Playground can access/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Browse storage' })).toBeVisible()
     fireEvent.change(screen.getByTestId('register-uri'), { target: { value: '/mounted/missing.parquet' } })
     fireEvent.click(screen.getByTestId('register-submit'))
 
@@ -194,18 +213,18 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByRole('cell', { name: 'exact-only-row' })).toBeVisible()
     expect(within(viewer).getAllByRole('table')).toHaveLength(1)
     expect(within(viewer).queryByText('Exact revision preview')).not.toBeInTheDocument()
-    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Current exact version'))
+    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Current version'))
     expect(screen.getByTestId('dataset-version-context')).not.toHaveTextContent('rev-receipt')
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current exact version')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('logical-receipt-id')
     expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent(
-      'from this exact revision')
+      'from this selected version')
     expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent('preview capped at 100 rows')
     expect(screen.getByLabelText('Dataset preview scope')).not.toHaveTextContent('logical-receipt-id')
     expect(screen.getByLabelText('Dataset preview scope')).not.toHaveTextContent('rev-receipt')
     const details = screen.getByTestId('detail-dataset-details')
     expect(screen.getByTestId('dataset-version-identity')).not.toBeVisible()
-    fireEvent.click(within(details).getByText('Dataset details'))
+    fireEvent.click(within(details).getByText('Diagnostics'))
     expect(screen.getByTestId('dataset-version-identity')).toBeVisible()
     expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent(
       'logical-receipt-id@rev-receipt')
@@ -213,7 +232,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
-    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Current exact version · view-only')
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Current version · view-only')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
     expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
@@ -248,17 +267,17 @@ describe('Catalog discovery request and mutation truth', () => {
       initialRevisionDatasetId="logical-receipt-id"
       onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
 
-    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Historical exact version'))
-    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Historical exact version · view-only')
-    expect(screen.getByRole('region', { name: 'Data preview' })).toHaveTextContent('Historical exact version')
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Historical exact version')
+    await waitFor(() => expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Previous version'))
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Previous version · view-only')
+    expect(screen.getByRole('region', { name: 'Data preview' })).toHaveTextContent('Previous version')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Previous version')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
     expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
 
     const technical = screen.getByTestId('detail-dataset-details')
     expect(technical).not.toHaveAttribute('open')
-    fireEvent.click(within(technical).getByText('Dataset details'))
+    fireEvent.click(within(technical).getByText('Diagnostics'))
     expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('logical-receipt-id@rev-old')
   })
 
@@ -280,8 +299,8 @@ describe('Catalog discovery request and mutation truth', () => {
 
     expect(await screen.findByRole('cell', { name: '7' })).toBeVisible()
     await waitFor(() => expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id))
-    expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Exact version')
-    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Exact version · view-only')
+    expect(screen.getByTestId('dataset-version-context')).toHaveTextContent('Selected version')
+    expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Selected version · view-only')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(screen.queryByText(/latest dataset head/i)).not.toBeInTheDocument()
   })
@@ -333,7 +352,7 @@ describe('Catalog discovery request and mutation truth', () => {
       onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This exact revision is unavailable or no longer retained. Latest was not substituted.')
+      'This selected version is unavailable or no longer retained. Latest was not substituted.')
     expect(screen.queryByTestId('detail-preview-scroll')).not.toBeInTheDocument()
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
@@ -470,9 +489,9 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.catalogTree).toHaveBeenCalledWith('')
     expect(mocks.catalogFolders).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByTestId('request-next-page'))
+    fireEvent.click(screen.getByTestId('catalog-next-page'))
     expect(await screen.findByText('customers')).toBeInTheDocument()
-    expect(mocks.tablesPage).toHaveBeenNthCalledWith(2, expect.objectContaining({ limit: 50, offset: 1 }))
+    expect(mocks.tablesPage).toHaveBeenNthCalledWith(2, expect.objectContaining({ limit: 50, offset: 50 }))
     expect(mocks.catalogFolders).not.toHaveBeenCalled()
   })
 
@@ -503,11 +522,10 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     expect(await screen.findByText('orders')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByTestId('request-next-page'))
-    expect(await screen.findByText(/Couldn't load more: Failed to fetch/i)).toBeInTheDocument()
-    expect(screen.getByText('orders')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('catalog-next-page'))
+    expect(await screen.findByText(/Couldn't load the catalog: Failed to fetch/i)).toBeInTheDocument()
 
-    fireEvent.click(screen.getByTestId('catalog-load-more-retry'))
+    fireEvent.click(screen.getByTestId('catalog-retry'))
     expect(await screen.findByText('customers')).toBeInTheDocument()
   })
 
@@ -552,7 +570,6 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.saveTableEdit
       .mockRejectedValueOnce(new Error('HTTP 409: concurrent edit'))
       .mockResolvedValueOnce({ ...TABLE, folder: 'curated/sales' })
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
@@ -580,7 +597,9 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.queryByTestId('catalog-search')).not.toBeInTheDocument()
     expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByTestId('detail-unregister'))
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
+    const removeDialog = screen.getByRole('dialog', { name: 'Remove orders from catalog' })
+    expect(removeDialog).toHaveTextContent('underlying data is not deleted')
+    fireEvent.click(within(removeDialog).getByRole('button', { name: 'Remove' }))
     await waitFor(() => expect(screen.getByTestId('catalog-search')).toBeInTheDocument())
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
   })
@@ -608,13 +627,13 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
     const details = screen.getByTestId('detail-dataset-details')
     expect(details).not.toHaveAttribute('open')
-    expect(details).toHaveTextContent('Dataset details')
+    expect(details).toHaveTextContent('Diagnostics')
     expect(screen.getByTestId('dataset-location')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Dataset details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(details).toHaveAttribute('open')
     expect(screen.getByTestId('dataset-location')).toHaveTextContent(TABLE.uri)
     expect(screen.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
-    expect(screen.getByText('Edit catalog details').parentElement).not.toHaveAttribute('open')
+    expect(screen.getByTestId('detail-name')).toBeVisible()
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
     expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
   })
@@ -735,7 +754,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getAllByText('legacy_code')).not.toHaveLength(0)
     const details = screen.getByTestId('detail-dataset-details')
     expect(screen.getByTestId('dataset-version-identity')).not.toBeVisible()
-    fireEvent.click(within(details).getByText('Dataset details'))
+    fireEvent.click(within(details).getByText('Diagnostics'))
     expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@3')
 
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
@@ -801,14 +820,15 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   afterEach(() => cleanup())
 
   it('multi-selects rows and batch-unregisters them without implying data deletion', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByLabelText('Select orders'))
     fireEvent.click(screen.getByLabelText('Select customers'))
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Unregister' })).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('catalog-delete-selected'))
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
+    const unregisterDialog = screen.getByRole('dialog', { name: 'Unregister 2 datasets' })
+    expect(unregisterDialog).toHaveTextContent('underlying data is not deleted')
+    fireEvent.click(within(unregisterDialog).getByRole('button', { name: 'Unregister' }))
     await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith([
       { id: 't1', expectedRegistrationId: 'registration-orders', expectedRevision: 'm1_orders' },
       { id: 't2', expectedRegistrationId: 'registration-customers', expectedRevision: 'm1_customers' },
@@ -901,15 +921,15 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.saveTableEdit.mockRejectedValueOnce(conflict)
     mocks.table.mockRejectedValueOnce(new Error('network down'))
       .mockResolvedValueOnce({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     openCatalogDetails()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
 
     fireEvent.keyDown(window, { key: 'Escape' })
-    expect(confirm).toHaveBeenCalledWith('Discard unsaved catalog edits?')
+    const discardDialog = screen.getByRole('dialog', { name: 'Discard unsaved changes?' })
     expect(screen.getByRole('region', { name: 'orders' })).toBeInTheDocument()
+    fireEvent.click(within(discardDialog).getByRole('button', { name: 'Keep editing' }))
 
     fireEvent.click(screen.getByTestId('detail-save'))
     expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()
@@ -920,19 +940,18 @@ describe('Catalog discovery selection, register modal, and rename', () => {
   })
 
   it('creates an empty folder from the tree', async () => {
-    vi.spyOn(window, 'prompt').mockReturnValue('archive')
     render(<CatalogDiscoveryFixture />)
-    fireEvent.click(await screen.findByTestId('folder-new'))
+    await screen.findByTestId('folder-new')
+    submitFolderCreate('archive')
     await waitFor(() => expect(mocks.createFolder).toHaveBeenCalledWith('archive'))
   })
 
   it('renames a folder from the tree and moves the selected filter with it', async () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
-    vi.spyOn(window, 'prompt').mockReturnValue('revenue')
     render(<CatalogDiscoveryFixture />)
     // select the folder first, then rename it — the filter must follow the rename, not strand
     fireEvent.click(await screen.findByText('📁 sales'))
-    fireEvent.click(screen.getByTestId('folder-rename-sales'))
+    submitFolderRename('sales', 'revenue')
     await waitFor(() => expect(mocks.renameFolder).toHaveBeenCalledWith('sales', 'revenue'))
     expect(await screen.findByText('📁 revenue')).toBeInTheDocument()
   })
@@ -948,12 +967,11 @@ describe('Catalog discovery selection, register modal, and rename', () => {
       return { prefix, folders: [{ name: 'daily', path, tableCount: 1 }], tables: [] }
     })
     mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
-    vi.spyOn(window, 'prompt').mockReturnValue('revenue')
     render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder sales' }))
     expect(await screen.findByTestId('folder-rename-sales/daily')).toBeInTheDocument()
-    fireEvent.click(screen.getByTestId('folder-rename-sales'))
+    submitFolderRename('sales', 'revenue')
 
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('revenue', expect.anything()))
     expect(await screen.findByRole('button', { name: 'Collapse folder revenue' })).toBeInTheDocument()
@@ -962,10 +980,11 @@ describe('Catalog discovery selection, register modal, and rename', () => {
 
   it('deletes a folder from the tree after confirming where its datasets go', async () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByTestId('folder-delete-sales'))
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('the top level'))
+    const dialog = screen.getByRole('dialog', { name: 'Delete sales' })
+    expect(dialog).toHaveTextContent('the top level')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
     await waitFor(() => expect(mocks.deleteFolder).toHaveBeenCalledWith('sales'))
   })
 })
@@ -1092,15 +1111,14 @@ describe('Catalog discovery folder child request identity', () => {
       if (options?.signal) revisionSignals.push(options.signal)
       return branchCalls === 2 ? revisionOne.promise : revisionTwo.promise
     })
-    vi.spyOn(window, 'prompt').mockReturnValue('created')
     render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     expect(await screen.findByText('📁 initial')).toBeInTheDocument()
-    fireEvent.click(screen.getByTestId('folder-new'))
+    submitFolderCreate('created')
     await waitFor(() => expect(branchCalls).toBe(2))
     expect(screen.getByText('Refreshing…')).toBeInTheDocument()
-    fireEvent.click(screen.getByTestId('folder-new'))
+    submitFolderCreate('created')
     await waitFor(() => expect(branchCalls).toBe(3))
     expect(revisionSignals[0].aborted).toBe(true)
 
@@ -1190,13 +1208,12 @@ describe('Catalog discovery folder child request identity', () => {
       return Promise.resolve(tree('B', ['B/current']))
     })
     mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
-    vi.spyOn(window, 'prompt').mockReturnValue('B')
     render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByText('📁 A'))
     fireEvent.click(screen.getByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(oldSignal).toBeDefined())
-    fireEvent.click(screen.getByTestId('folder-rename-A'))
+    submitFolderRename('A', 'B')
 
     await waitFor(() => expect(oldSignal?.aborted).toBe(true))
     expect(await screen.findByText('📁 current')).toBeInTheDocument()
@@ -1216,12 +1233,11 @@ describe('Catalog discovery folder child request identity', () => {
       return pending.promise
     })
     mocks.deleteFolder.mockImplementation(async () => { deleted = true; return { ok: true } })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(signal).toBeDefined())
-    fireEvent.click(screen.getByTestId('folder-delete-A'))
+    submitFolderDelete('A')
 
     await waitFor(() => expect(signal?.aborted).toBe(true))
     expect(await screen.findByText('No folders yet')).toBeInTheDocument()

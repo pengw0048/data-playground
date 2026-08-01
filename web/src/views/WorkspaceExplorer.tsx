@@ -16,12 +16,12 @@ import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
 import { examples } from '../examples'
 import { parseDatasetViewerReturn, type ParsedDatasetViewerReturn } from '../router'
+import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
 const WORKSPACE_SEARCH_PAGE_SIZE = 25
 const WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS = 100
-const CANONICAL_CONTEXT_COLUMN_LIMIT = 6
 const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
   id: `container:${LOCAL_ROOT_ID}`, kind: 'container', name: 'Workspace', detached: false, source: 'local',
 }
@@ -61,6 +61,20 @@ function providerColumnCount(count: number, kind: 'data' | 'system'): string {
 function providerRowCount(count: number | null | undefined): string {
   if (count == null) return 'Rows not reported'
   return `${count.toLocaleString()} ${count === 1 ? 'row' : 'rows'}`
+}
+
+function friendlyProviderColumnType(type: string): string {
+  const normalized = type.trim().toLowerCase()
+  if (/^(u?int|integer|bigint|smallint|tinyint)/.test(normalized)) return 'Integer'
+  if (/^(float|double|decimal|numeric)/.test(normalized)) return 'Number'
+  if (/^(utf8|string|varchar|text)/.test(normalized)) return 'Text'
+  if (/^(bool|boolean)/.test(normalized)) return 'Boolean'
+  if (/^(timestamp|datetime)/.test(normalized)) return 'Timestamp'
+  if (/^date/.test(normalized)) return 'Date'
+  if (/^(binary|blob)/.test(normalized)) return 'Binary'
+  if (/^(list|array|fixed_size_list)/.test(normalized)) return 'List'
+  if (/^(struct|map)/.test(normalized)) return 'Object'
+  return type
 }
 
 function providerSystemColumn(
@@ -315,6 +329,10 @@ function sourceCompletenessLabel(completeness: WorkspaceSourceStatus['completene
   }
 }
 
+function sourceNeedsAttention(source: WorkspaceSourceStatus): boolean {
+  return !!source.error || ['partial', 'unavailable', 'unsupported'].includes(source.completeness)
+}
+
 function sourceIsUsable(status: WorkspaceSourceStatus | null): boolean {
   return status?.completeness === 'complete' || status?.completeness === 'page'
 }
@@ -531,6 +549,10 @@ function WorkspaceMixedExplorer() {
   const [items, setItems] = useState<WorkspaceResource[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(false)
+  const [pageCursors, setPageCursors] = useState<(string | null)[]>([null])
+  const [pageIndex, setPageIndex] = useState(0)
+  const [viewMode, setViewMode] = useState<'list' | 'grid'>('list')
+  const [selectedResourceIds, setSelectedResourceIds] = useState<Set<string>>(new Set())
   const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
   const [sources, setSources] = useState<WorkspaceSourceStatus[]>([])
   const [loading, setLoading] = useState(true)
@@ -554,6 +576,8 @@ function WorkspaceMixedExplorer() {
   const [folderDeleteResource, setFolderDeleteResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[]; fromSearch?: boolean } | null>(null)
   const [canvasRenameResource, setCanvasRenameResource] = useState<WorkspaceResource | null>(null)
   const [canvasDeleteResource, setCanvasDeleteResource] = useState<WorkspaceResource | null>(null)
+  const [canvasBatchDeleteResources, setCanvasBatchDeleteResources] = useState<WorkspaceResource[] | null>(null)
+  const [canvasCopySource, setCanvasCopySource] = useState<CanvasCopySource | null>(null)
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
   const [providerDatasetAction, setProviderDatasetAction] = useState<WorkspaceResource | null>(null)
   const [canvasTargetState, setCanvasTargetState] = useState<CanvasTargetState>('loading')
@@ -582,10 +606,13 @@ function WorkspaceMixedExplorer() {
   const normalizedSearchDraft = searchDraft.trim().replace(/\s+/g, ' ')
   const searchDraftPending = normalizedSearchDraft !== searchQuery
 
-  const load = useCallback(async (targetId: string, nextCursor?: string | null) => {
+  const load = useCallback(async (
+    targetId: string, pageCursor: string | null = null, targetPage = 0,
+  ) => {
     const sequence = ++request.current
-    const more = !!nextCursor
-    if (more) { setLoadingMore(true); setLoadMoreError(null) }
+    const paging = pageCursor !== null || targetPage > 0
+    const sameContainer = targetId === loadedContainer.current
+    if (paging) { setLoadingMore(true); setLoadMoreError(null) }
     else {
       setLoading(true); setError(null); setLoadMoreError(null)
       // Keep a resolved location visible while it refreshes. Provider refreshes may return an honest
@@ -594,7 +621,7 @@ function WorkspaceMixedExplorer() {
       if (targetId !== loadedContainer.current) { setItems([]); setCursor(null); setHasMore(false); setSources([]) }
     }
     try {
-      const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
+      const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: pageCursor ?? undefined })
       if (sequence !== request.current) return
       setCompleteness(page.completeness)
       setSources(page.sources ?? [])
@@ -608,16 +635,20 @@ function WorkspaceMixedExplorer() {
       setContainerId(identity(page.container))
       loadedContainer.current = identity(page.container)
       setContainer(page.container)
-      if (!more) setCrumbs((current) => current.length && current[current.length - 1].id === page.container!.id ? current : [...current, page.container!])
-      setItems((current) => {
-        const next = more ? current : []
-        const seen = new Set(next.map((item) => item.id))
-        return [...next, ...page.items.filter((item) => !seen.has(item.id))]
+      if (!paging) setCrumbs((current) => current.length && current[current.length - 1].id === page.container!.id ? current : [...current, page.container!])
+      setItems(page.items)
+      setSelectedResourceIds(new Set())
+      setPageIndex(targetPage)
+      setPageCursors((current) => {
+        const next = sameContainer && targetPage > 0 ? current.slice(0, targetPage + 1) : [null]
+        next[targetPage] = pageCursor
+        if (page.nextCursor) next[targetPage + 1] = page.nextCursor
+        return next
       })
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
     } catch (caught) {
       if (sequence !== request.current) return
-      if (more) setLoadMoreError(errorMessage(caught))
+      if (paging) setLoadMoreError(errorMessage(caught))
       else setError(errorMessage(caught))
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
@@ -844,6 +875,34 @@ function WorkspaceMixedExplorer() {
       datasetQuery: serializeWorkspaceDatasetQuery(next),
     })
   }
+  const selectedResources = items.filter((resource) => selectedResourceIds.has(resource.id))
+  const singleSelectedResource = selectedResources.length === 1 ? selectedResources[0] ?? null : null
+  const canvasRole = (resource: WorkspaceResource) => (
+    files.find((file) => file.id === identity(resource))?.role ?? ''
+  )
+  const editableCanvas = (resource: WorkspaceResource) => resource.kind === 'canvas'
+    && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(canvasRole(resource))
+  const ownedCanvas = (resource: WorkspaceResource) => editableCanvas(resource) && canvasRole(resource) === 'owner'
+  const selectedOwnedCanvases = selectedResources.length > 0 && selectedResources.every(ownedCanvas)
+    ? selectedResources : []
+  const toggleResourceSelection = (resourceId: string) => setSelectedResourceIds((current) => {
+    const next = new Set(current)
+    if (next.has(resourceId)) next.delete(resourceId)
+    else next.add(resourceId)
+    return next
+  })
+  const startDuplicate = async (resource: WorkspaceResource) => {
+    try {
+      const doc = await api.getCanvas(identity(resource))
+      setCanvasCopySource({ canvasId: doc.id, version: doc.version, name: doc.name || resource.name })
+    } catch (caught) {
+      pushToast(`Could not prepare this Canvas copy: ${errorMessage(caught)}`, 'error')
+    }
+  }
+  const deleteSelection = () => {
+    if (selectedOwnedCanvases.length === 1) setCanvasDeleteResource(selectedOwnedCanvases[0] ?? null)
+    else if (selectedOwnedCanvases.length > 1) setCanvasBatchDeleteResources(selectedOwnedCanvases)
+  }
   const providerActionDialog = providerDatasetAction ? <ProviderDatasetActionDialog
     resource={providerDatasetAction}
     container={container}
@@ -903,14 +962,11 @@ function WorkspaceMixedExplorer() {
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <header className="flex min-h-[68px] items-center gap-3 border-b border-border px-7 py-3">
-        <div className="min-w-0">
-          <h1 className="text-[20px] font-bold text-foreground">Workspace</h1>
-          <nav aria-label="Workspace path" className="mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden text-[11.5px] text-muted-foreground">
-            <button onClick={() => setWorkspaceResource(null)} className="shrink-0 hover:text-foreground">Workspace</button>
-            {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
-          </nav>
-        </div>
+      <header className="flex min-h-[60px] items-center gap-3 border-b border-border px-7 py-2.5">
+        <nav aria-label="Workspace path" className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground">
+          <button onClick={() => setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
+          {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
+        </nav>
         <WorkspaceScopeTabs active="all" onChange={(next) => {
           if (next === 'datasets') switchToDatasets()
         }} />
@@ -936,7 +992,7 @@ function WorkspaceMixedExplorer() {
             className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New folder</button>}
           <button onClick={() => setCreateOpen(true)} disabled={!canvasDestination(container, 'create') || loading}
             title={canvasDestinationTitle(container, 'create')}
-            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">{isExternal(container) ? 'Create a local Canvas here' : 'New canvas here'}</button>
+            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">Create canvas</button>
         </div>
         <button onClick={reload} disabled={loading || loadingMore} data-testid="workspace-reload" className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
           <Icon name="refresh" size={13} /> Reload
@@ -957,15 +1013,39 @@ function WorkspaceMixedExplorer() {
           : <>Select Search to look for “{normalizedSearchDraft}”.</>}
       </div>}
 
-      {!searchQuery && (sources.some((source) => source.kind !== 'local') || completeness === 'partial')
+      {!searchQuery && (sources.some(sourceNeedsAttention) || completeness === 'partial')
         && <SourceStatusBar sources={sources} completeness={completeness} />}
-      {container?.catalogFolderState === 'current' && !container.detached && <div className="border-b border-border bg-muted/30 px-7 py-1.5 text-[11.5px] text-muted-foreground">
-        Folder organization comes from this catalog. Canvases stored here are local to Data Playground.
-      </div>}
       {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
         <span className="min-w-0 flex-1 truncate">This selection could not be fully refreshed: {resolutionError}</span>
         <button onClick={reload} disabled={loading} className="shrink-0 font-semibold underline disabled:opacity-50">Retry</button>
         {selectedProviderResource && <button onClick={() => setRelinkResource(selectedProviderResource)} className="shrink-0 font-semibold underline">Relink</button>}
+      </div>}
+
+      {!searchQuery && !loading && !error && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
+        <label className="inline-flex cursor-pointer items-center gap-2 text-muted-foreground">
+          <input type="checkbox" aria-label="Select this page"
+            checked={items.length > 0 && selectedResourceIds.size === items.length}
+            onChange={(event) => setSelectedResourceIds(event.target.checked ? new Set(items.map((item) => item.id)) : new Set())}
+            className="h-3.5 w-3.5 accent-primary" />
+          {selectedResources.length ? `${selectedResources.length} selected` : 'Select page'}
+        </label>
+        {selectedResources.length > 0 && <>
+          {singleSelectedResource && <button type="button" onClick={() => open(singleSelectedResource)}
+            className="rounded-md border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Open</button>}
+          {singleSelectedResource && editableCanvas(singleSelectedResource) && <>
+            <button type="button" onClick={() => setCanvasRenameResource(singleSelectedResource)} className="rounded-md border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Rename</button>
+            <button type="button" onClick={() => container && setMoveResource({ resource: singleSelectedResource, sourceContainer: container, sourcePath: crumbs })} className="rounded-md border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Move</button>
+            <button type="button" onClick={() => void startDuplicate(singleSelectedResource)} className="rounded-md border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Duplicate</button>
+          </>}
+          {selectedOwnedCanvases.length > 0 && <button type="button" onClick={deleteSelection}
+            className="rounded-md border border-border px-2 py-1 font-semibold text-destructive hover:bg-destructive/5">Delete</button>}
+          <button type="button" onClick={() => setSelectedResourceIds(new Set())} className="px-2 py-1 text-muted-foreground hover:text-foreground">Clear</button>
+        </>}
+        <span className="flex-1" />
+        <div role="group" aria-label="Workspace view" className="flex rounded-md border border-border bg-background p-0.5">
+          {(['list', 'grid'] as const).map((mode) => <button key={mode} type="button" aria-pressed={viewMode === mode}
+            onClick={() => setViewMode(mode)} className={`rounded px-2 py-1 text-[11px] font-semibold capitalize ${viewMode === mode ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>{mode}</button>)}
+        </div>
       </div>}
 
       <div data-testid="workspace-scroll-surface" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
@@ -973,9 +1053,11 @@ function WorkspaceMixedExplorer() {
           onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
           <button onClick={reload} className="font-semibold underline">Retry</button>
-        </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col">
-          {items.length ? <div className="grid gap-2">
+        </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : <div className="mx-auto flex min-h-full w-full max-w-[1600px] flex-col">
+          {items.length ? <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
             {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
+              viewMode={viewMode} selected={selectedResourceIds.has(resource.id)}
+              onToggleSelect={() => toggleResourceSelection(resource.id)}
               onRetry={reload}
               onNewFolder={resource.kind === 'container' && resource.canCreateFolder
                 ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
@@ -983,23 +1065,29 @@ function WorkspaceMixedExplorer() {
                 ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
               onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
                 ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
-              onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+              onMove={editableCanvas(resource)
                 ? () => container && setMoveResource({ resource, sourceContainer: container, sourcePath: crumbs }) : undefined}
-              onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+              onRenameCanvas={editableCanvas(resource)
                 ? () => setCanvasRenameResource(resource) : undefined}
-              onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
-                ? () => setCanvasDeleteResource(resource) : undefined} />)}
+              onDuplicateCanvas={editableCanvas(resource) ? () => void startDuplicate(resource) : undefined}
+              onDeleteCanvas={ownedCanvas(resource) ? () => setCanvasDeleteResource(resource) : undefined} />)}
           </div> : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
             ? 'This Workspace location is unavailable.'
-            : hasMore ? 'This page has no items yet. Load more to continue browsing this location.'
+            : hasMore ? 'This page has no items. Continue to the next page.'
             : isExternal(container) ? canvasDestination(container, 'create')
               ? 'This source-only provider location is empty. Create a locally owned Canvas here to get started.'
               : 'This source-only provider location is empty.'
               : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
-          {loadMoreError && <div role="alert" className="mt-2 self-center text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
-          {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mt-2 self-center rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
-            {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more'}
-          </button>}
+          {loadMoreError && <div role="alert" className="mt-3 self-center text-[12px] text-destructive">Couldn't load this page: {loadMoreError}</div>}
+          {(pageIndex > 0 || hasMore) && <nav aria-label="Workspace pages" className="mt-3 flex items-center justify-center gap-2 text-[12px]">
+            <button type="button" onClick={() => void load(containerId, pageCursors[pageIndex - 1] ?? null, pageIndex - 1)}
+              disabled={pageIndex === 0 || loadingMore} data-testid="workspace-previous-page"
+              className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">Previous</button>
+            <span className="min-w-16 text-center text-muted-foreground">Page {pageIndex + 1}</span>
+            <button type="button" onClick={() => void load(containerId, cursor, pageIndex + 1)}
+              disabled={!hasMore || !cursor || loadingMore} data-testid="workspace-next-page"
+              className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry' : 'Next'}</button>
+          </nav>}
         </div>}
       </div>
 
@@ -1030,7 +1118,16 @@ function WorkspaceMixedExplorer() {
       {canvasRenameResource && <CanvasRenameDialog resource={canvasRenameResource} onClose={() => setCanvasRenameResource(null)}
         onRenamed={() => { setCanvasRenameResource(null); void refreshFiles(); reload() }} />}
       {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
-        onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
+        onDeleted={() => { setCanvasDeleteResource(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload() }} />}
+      {canvasBatchDeleteResources && <CanvasBatchDeleteDialog resources={canvasBatchDeleteResources}
+        onClose={() => setCanvasBatchDeleteResources(null)} onCompleted={(deleted, failures) => {
+          setCanvasBatchDeleteResources(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload()
+          pushToast(failures.length
+            ? `Deleted ${deleted} Canvases; ${failures.length} could not be deleted.`
+            : `Deleted ${deleted} Canvases.`, failures.length ? 'info' : 'success')
+        }} />}
+      {canvasCopySource && <CanvasCopyModal source={canvasCopySource} onClose={() => setCanvasCopySource(null)}
+        onCreated={() => { setSelectedResourceIds(new Set()); reload() }} />}
       {datasetActionDialog}
       {providerActionDialog}
       {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
@@ -1050,7 +1147,7 @@ function WorkspaceScopeTabs({ active, onChange, disabled = false, disabledTitle 
   disabled?: boolean; disabledTitle?: string
 }) {
   return <div role="tablist" aria-label="Workspace scope" className="flex shrink-0 items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
-    {([['all', 'All Workspace'], ['datasets', 'Local catalog']] as const).map(([scope, label]) => (
+    {([['all', 'All'], ['datasets', 'Datasets']] as const).map(([scope, label]) => (
       <button key={scope} role="tab" aria-selected={active === scope}
         disabled={scope !== active && disabled} title={scope !== active ? disabledTitle : undefined}
         onClick={() => onChange(scope)}
@@ -1243,11 +1340,10 @@ function WorkspaceDatasets() {
       {activeFolderContext.state === 'unavailable' && activeFolderContext.retryable
         && <button type="button" onClick={() => { void switchToAll() }}
           className="text-[11px] font-semibold text-primary hover:underline">Retry Workspace location</button>}
-      <span className="ml-auto text-[11px] text-muted-foreground">Datasets registered in Data Playground. Mounted provider datasets appear in All Workspace.</span>
     </div>
     <div className="min-h-0 flex-1">
       <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
-        title="Local catalog" queryState={query}
+        title="Datasets" queryState={query}
         initialRevisionId={initialRevisionId}
         initialRevisionDatasetId={initialRevisionDatasetId}
         detailBackLabel={datasetViewerBackLabel(viewerReturn)}
@@ -1523,11 +1619,11 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
 function SourceStatusBar({ sources, completeness }: {
   sources: WorkspaceSourceStatus[]; completeness: 'complete' | 'page' | 'partial'
 }) {
-  return <section aria-label="Workspace source status" className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-7 py-2 text-[11px] ${completeness === 'partial'
-    ? 'border-amber-300/50 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100'
-    : 'border-border bg-muted/25 text-muted-foreground'}`}>
-    <span className="font-semibold">{completeness === 'partial' ? 'Some sources are incomplete' : 'Sources'}</span>
-    {sources.map((source) => {
+  const issues = sources.filter(sourceNeedsAttention)
+  if (!issues.length && completeness !== 'partial') return null
+  return <section aria-label="Workspace source status" className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[11px] text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+    <span className="font-semibold">Some Workspace sources are unavailable</span>
+    {issues.map((source) => {
       const name = source.kind === 'local' ? 'Local'
         : source.kind === 'provider' ? `Mount ${source.mountId ?? source.id}`
           : 'Mount configuration'
@@ -1537,9 +1633,6 @@ function SourceStatusBar({ sources, completeness }: {
         {name}{detail} · <strong>{sourceCompletenessLabel(source.completeness)}</strong>{message ? ` — ${message}` : ''}
       </span>
     })}
-    {sources.some((source) => source.kind === 'provider') && <span className="basis-full text-muted-foreground">
-      Connected catalogs manage their folders. Canvases created here stay local to Data Playground.
-    </span>}
   </section>
 }
 
@@ -1568,9 +1661,8 @@ function NewCanvasDialog({ container, onClose, onCreated }: {
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <Modal label="New canvas here" onClose={onClose}>
-    <p className="text-[12px] text-muted-foreground">Destination: <strong className="text-foreground">{container.name}</strong>{isExternal(container) && <span> · locally owned Canvas overlay</span>}</p>
-    {isExternal(container) && <p className="text-[11px] leading-5 text-muted-foreground">This does not change the connected catalog. The Canvas is local to Data Playground.</p>}
+  return <Modal label="Create canvas" onClose={onClose}>
+    <p className="text-[12px] text-muted-foreground">Folder: <strong className="text-foreground">{container.name}</strong></p>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
       <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
@@ -1720,6 +1812,41 @@ function CanvasDeleteDialog({ resource, onClose, onDeleted }: {
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={busy} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button></div>
+  </Modal>
+}
+
+function CanvasBatchDeleteDialog({ resources, onClose, onCompleted }: {
+  resources: WorkspaceResource[]; onClose: () => void
+  onCompleted: (deleted: number, failures: Array<{ resource: WorkspaceResource; error: string }>) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const remove = async () => {
+    if (busy) return
+    setBusy(true)
+    let deleted = 0
+    const failures: Array<{ resource: WorkspaceResource; error: string }> = []
+    for (const resource of resources) {
+      try {
+        await api.deleteCanvas(identity(resource))
+        deleted += 1
+      } catch (caught) {
+        failures.push({ resource, error: errorMessage(caught) })
+      }
+    }
+    onCompleted(deleted, failures)
+  }
+  return <Modal label={`Delete ${resources.length} Canvases`} onClose={busy ? () => undefined : onClose}>
+    <div className="space-y-2 text-[12px] text-muted-foreground">
+      <p>Delete the selected Canvases? This cannot be undone.</p>
+      <ul className="max-h-32 list-disc overflow-y-auto pl-5 text-foreground">
+        {resources.map((resource) => <li key={resource.id}>{resource.name}</li>)}
+      </ul>
+      <p>Each Canvas is deleted separately. If one fails, the others remain deleted and the Workspace refreshes.</p>
+    </div>
+    <div className="flex justify-end gap-2">
+      <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+      <button onClick={() => void remove()} disabled={busy} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete selected'}</button>
+    </div>
   </Modal>
 }
 
@@ -1903,42 +2030,58 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
   </div>
 }
 
-function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDeleteCanvas }: {
-  resource: WorkspaceResource; onOpen: () => void; onNewFolder?: () => void; onRenameFolder?: () => void; onDeleteFolder?: () => void
-  onRetry?: () => void; onMove?: () => void; onRenameCanvas?: () => void; onDeleteCanvas?: () => void
+function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResource; size: number }) {
+  if (resource.kind === 'container') return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 16 16"
+    fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1.8 4.2h4.4l1.3 1.5h6.7v6.8H1.8z" /><path d="M1.8 4.2V3h4l1.2 1.2" />
+  </svg>
+  const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : 'grid'
+  return <Icon name={icon} size={size} />
+}
+
+function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSelect, onOpen, onRetry, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDuplicateCanvas, onDeleteCanvas }: {
+  resource: WorkspaceResource; viewMode?: 'list' | 'grid'; selected?: boolean; onToggleSelect?: () => void
+  onOpen: () => void; onNewFolder?: () => void; onRenameFolder?: () => void; onDeleteFolder?: () => void
+  onRetry?: () => void; onMove?: () => void; onRenameCanvas?: () => void; onDuplicateCanvas?: () => void; onDeleteCanvas?: () => void
 }) {
   const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const menuOpen = openId === resource.id
   const unavailable = itemAvailability(resource)
   const canOpen = !unavailable || hasDetachedDatasetRecovery(resource)
-  const hasSecondaryAction = !!(onNewFolder || onRenameFolder || onDeleteFolder || onMove || onRenameCanvas || onDeleteCanvas)
-  const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
+  const hasSecondaryAction = !!(onNewFolder || onRenameFolder || onDeleteFolder || onMove || onRenameCanvas || onDuplicateCanvas || onDeleteCanvas)
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
     : isCatalogFolder(resource) ? 'Catalog organization'
       : resource.kind === 'dataset' ? 'Catalog'
-        : resource.kind === 'dataset_view' ? 'Local exact view'
+        : resource.kind === 'dataset_view' ? 'Saved dataset view'
         : resource.kind === 'canvas' ? 'Local'
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
-  return <div className={`flex min-w-0 items-center rounded-lg border border-border bg-card ${canOpen ? 'hover:border-primary/40 hover:bg-accent' : ''}`}>
+  const grid = viewMode === 'grid'
+  return <div className={`relative min-w-0 rounded-lg border bg-card ${grid ? 'flex min-h-[132px] flex-col' : 'flex items-center'} ${selected ? 'border-primary/70 bg-primary/5' : 'border-border'} ${canOpen ? 'hover:border-primary/40 hover:bg-accent' : ''}`}>
+    {onToggleSelect && <label className={grid ? 'absolute left-2 top-2 z-10 grid h-6 w-6 place-items-center' : 'grid h-full shrink-0 place-items-center pl-3'}>
+      <input type="checkbox" checked={selected} onChange={onToggleSelect} aria-label={`Select ${resource.name}`}
+        className="h-3.5 w-3.5 cursor-pointer accent-primary" />
+    </label>}
     <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!canOpen}
       title={unavailable?.reason}
-      className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left disabled:cursor-not-allowed">
-      <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached && !isDetachedLocalPlacement(resource) ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}</span>
-      {resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
+      className={grid
+        ? 'flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 pb-3 pt-8 text-center disabled:cursor-not-allowed'
+        : 'flex min-w-0 flex-1 items-center gap-2.5 px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
+      <span className="shrink-0 text-muted-foreground"><WorkspaceResourceGlyph resource={resource} size={grid ? 28 : 16} /></span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className={`flex items-center gap-2 text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
+      {!grid && resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     {resource.unavailableReason && unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
-      className="mr-2 shrink-0 font-semibold text-primary underline">Retry</button>}
+      className={grid ? 'pb-2 text-[11px] font-semibold text-primary underline' : 'mr-2 shrink-0 font-semibold text-primary underline'}>Retry</button>}
     {hasSecondaryAction && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
       <DropdownMenuTrigger asChild>
         <button type="button" aria-label={`More actions for ${resource.name}`}
           onPointerDown={(event) => {
             if (!menuOpen && event.button === 0 && !event.ctrlKey) setOpenId(resource.id)
           }}
-          className="mr-2 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground">•••</button>
+          className={grid ? 'absolute right-2 top-2 z-10 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground' : 'mr-2 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground'}>•••</button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" aria-label={`Actions for ${resource.name}`} className="min-w-40">
         {canOpen && <DropdownMenuItem onSelect={onOpen}>{resource.kind === 'dataset' ? 'Open in Workspace' : 'Open'}</DropdownMenuItem>}
@@ -1947,6 +2090,7 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
         {onDeleteFolder && <DropdownMenuItem onSelect={onDeleteFolder} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
         {onRenameCanvas && <DropdownMenuItem onSelect={onRenameCanvas}>Rename</DropdownMenuItem>}
         {onMove && <DropdownMenuItem onSelect={onMove}>Move</DropdownMenuItem>}
+        {onDuplicateCanvas && <DropdownMenuItem onSelect={onDuplicateCanvas}>Duplicate</DropdownMenuItem>}
         {onDeleteCanvas && <DropdownMenuItem onSelect={onDeleteCanvas} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>}
@@ -2098,24 +2242,31 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
             <span>· {providerColumnCount(dataColumns.length, 'data')}</span>
             {systemColumns.length > 0 && <span>· {providerColumnCount(systemColumns.length, 'system')}</span>}
           </div>
-          <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
+          <div className="order-2"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
             {exactRevision && !preview && !previewError
               ? <div className="mt-1 text-[11px] text-muted-foreground">Loading selected schema…</div>
               : dataColumns.length || systemColumns.length
-              ? <div className="mt-1 grid gap-0.5 rounded-md border border-border p-2">{dataColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
-                {dataColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
-                  && <div className="text-muted-foreground">{dataColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more data columns</div>}
-                {systemColumns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map(({ column, label, description }) => <div key={column.fieldId ?? column.name} className="flex flex-wrap items-baseline gap-1">
-                  <span className="font-mono">{column.name}</span><span>· {column.type}</span>
+              ? <div className="mt-1 max-h-[320px] overflow-y-auto rounded-md border border-border">
+                <div className="sticky top-0 grid grid-cols-[minmax(0,1fr)_140px_auto] gap-3 border-b border-border bg-muted px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  <span>Column</span><span>Type</span><span className="sr-only">Role</span>
+                </div>
+                {dataColumns.map((column) => <div key={column.fieldId ?? column.name}
+                  className="grid grid-cols-[minmax(0,1fr)_140px_auto] items-center gap-3 border-b border-border/50 px-3 py-1.5 last:border-0">
+                  <span className="truncate font-mono">{column.name}</span>
+                  <span title={column.type} className="truncate text-muted-foreground">{friendlyProviderColumnType(column.type)}</span>
+                  <span />
+                </div>)}
+                {systemColumns.map(({ column, label, description }) => <div key={column.fieldId ?? column.name}
+                  className="grid grid-cols-[minmax(0,1fr)_140px_auto] items-center gap-3 border-b border-border/50 px-3 py-1.5 last:border-0">
+                  <span className="truncate font-mono">{column.name}</span>
+                  <span title={column.type} className="truncate text-muted-foreground">{friendlyProviderColumnType(column.type)}</span>
                   <span aria-label={`${column.name}: ${description}`} title={description}
                     className="rounded bg-muted px-1 py-px text-[9.5px] font-semibold text-muted-foreground">{label}</span>
                 </div>)}
-                {systemColumns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
-                  && <div className="text-muted-foreground">{systemColumns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more system columns</div>}
               </div>
               : <div>No canonical columns were reported.</div>}
           </div>
-          {selectedRevisionId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
+          {selectedRevisionId && <div className="order-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
             {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
             {preview && (preview.preview.rows.length
               ? <div data-testid="provider-dataset-preview-scroll" tabIndex={0}
@@ -2128,6 +2279,10 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
                     </th>
                   })}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
+          <div className="order-3 rounded-md border border-border bg-card px-3 py-2">
+            <div className="inline-flex items-center gap-2 text-[11px] font-semibold text-foreground"><Icon name="lineage" size={13} /> Lineage</div>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">This connected source does not provide a lineage graph in Workspace.</div>
+          </div>
         </section>}
         {source && source.completeness !== 'complete' && !providerIssue
           && <div role="status" aria-label="Dataset source status"
@@ -2139,7 +2294,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           {(resource.lastKnown || placementState !== 'current' || canonicalUnavailable)
             && <button type="button" onClick={onRelink} className="ml-2 font-semibold underline">Relink</button>}
         </div>}
-        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Dataset details</summary>
+        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
             {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
             {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}

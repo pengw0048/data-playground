@@ -368,6 +368,8 @@ def _require_admin(uid: str) -> None:
 
 def _create_user_work(body: UserBody, uid: str) -> dict:
     _require_admin(uid)
+    if auth.auth_enabled() and body.password is None:
+        raise HTTPException(400, "password is required when authentication is enabled")
     if body.password is not None and len(body.password) < 6:
         raise HTTPException(400, "password must be at least 6 characters")
     password_hash = auth.hash_password(body.password) if body.password is not None else None

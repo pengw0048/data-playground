@@ -32,7 +32,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       if (request !== previewGeneration.current) return
       const exactUnavailable = caught instanceof KernelError && caught.status === 410
       setError(exactUnavailable
-        ? 'This exact revision is no longer available. The view did not substitute the current head.'
+        ? 'This saved version is no longer available. The view did not open a newer version instead.'
         : errorMessage(caught))
     } finally {
       if (request === previewGeneration.current) setLoading(false)

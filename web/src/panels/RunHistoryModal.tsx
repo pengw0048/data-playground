@@ -119,10 +119,10 @@ function unavailableEvidence(error: unknown, table: CatalogTable | null): Manife
   const status = errorStatus(error)
   const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
     ? (error as { code: string }).code : undefined
-  if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this exact revision was lost.' }
-  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This exact revision or its registration is missing or compacted. Latest was not substituted.' }
+  if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this saved version was lost.' }
+  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This saved version is missing or no longer retained. A newer version was not opened instead.' }
   if (code === 'service_unavailable' || status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
-  return { table, detail: null, availability: 'error', message: `Couldn't verify this exact revision: ${errorText(error)}` }
+  return { table, detail: null, availability: 'error', message: `Couldn't verify this saved version: ${errorText(error)}` }
 }
 
 function RunInputManifest({ historyId, manifest }: {
@@ -144,7 +144,7 @@ function RunInputManifest({ historyId, manifest }: {
       let next: ManifestEvidence
       try {
         const detail = await api.datasetRevision(item.dataset_id, item.revision_id)
-        next = { table, detail, availability: 'available', message: 'Exact revision is available.' }
+        next = { table, detail, availability: 'available', message: 'Saved version is available.' }
       } catch (error) { next = unavailableEvidence(error, table) }
       if (live) setEvidence((current) => current.map((value, position) => position === index ? next : value))
     }))
@@ -184,14 +184,14 @@ function RunInputManifest({ historyId, manifest }: {
                   Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.dataset_id}</span>
                   {current?.table?.name && <span className="dp-mono"> · {item.dataset_id}</span>}
                 </div>
-                <div className="dp-mono break-all text-muted-foreground">Exact revision {item.revision_id}</div>
+                <div className="dp-mono break-all text-muted-foreground">Version {item.revision_id}</div>
                 <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
                 <div className="text-muted-foreground">Reference intent was not stored; this row reports only admitted resolution evidence.</div>
               </div>
               <AvailabilityBadge availability={current?.availability ?? 'checking'} />
             </div>
             <div className={`mt-1.5 ${current?.availability === 'error' || current?.availability === 'permission' ? 'text-destructive' : 'text-muted-foreground'}`}>
-              {current?.message ?? 'Checking the exact revision without opening latest…'}
+              {current?.message ?? 'Checking the saved version without opening a newer one…'}
             </div>
             {current?.availability === 'error' || current?.availability === 'offline' ? <button type="button"
               onClick={() => setGeneration((value) => value + 1)} className="mt-1 font-semibold text-primary underline">Retry availability check</button> : null}

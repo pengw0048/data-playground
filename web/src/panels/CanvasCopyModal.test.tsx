@@ -48,7 +48,7 @@ describe('CanvasCopyModal', () => {
     }
     expect(mocks.validateCanvasCopy).toHaveBeenCalledWith(expect.objectContaining(request))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Duplicate and open' }))
     await waitFor(() => expect(openFile).toHaveBeenCalledWith('copied-canvas'))
     expect(mocks.createCanvasCopy).toHaveBeenCalledWith(expect.objectContaining({
       ...request,
@@ -88,7 +88,7 @@ describe('CanvasCopyModal', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review copy' }))
     await screen.findByText('2 nodes · 1 connections · 0 requirements')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Duplicate and open' }))
     expect(await screen.findByRole('status')).toHaveTextContent(
       'Creating your Canvas… This request has been submitted and cannot be cancelled.')
     const cancel = screen.getByRole('button', { name: 'Cancel' })

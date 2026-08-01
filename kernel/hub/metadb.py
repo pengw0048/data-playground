@@ -6522,10 +6522,6 @@ def _workspace_canvas_visible_clause(uid: str):
     ))
 
 
-def _workspace_canvas_exists_clause():
-    return exists(select(Canvas.id).where(Canvas.id == WorkspacePlacement.target_id))
-
-
 def _workspace_local_placement_visible_clause():
     """Keep hidden external anchors and all of their placements out of ordinary local navigation."""
     return ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
@@ -6564,8 +6560,6 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspaceContainer.id,
         )
           .limit(limit + 1)))
-        visible_or_missing_canvas = or_(
-            ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
         canvas_after = _workspace_after(
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
         dataset_after = _workspace_after(
@@ -6574,7 +6568,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 3, decoded)
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
-            WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            WorkspacePlacement.target_kind == "canvas", _workspace_canvas_visible_clause(uid),
             _workspace_local_placement_visible_clause(),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
@@ -6648,13 +6642,11 @@ def workspace_provider_overlay_browse(
         container = s.get(WorkspaceContainer, anchor.container_id)
         if container is None or s.get(WorkspaceProviderBinding, binding_id) is None:  # pragma: no cover - FK-protected invariant
             raise RuntimeError("Workspace provider overlay binding is incomplete")
-        visible_or_missing_canvas = or_(
-            ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
         after = _workspace_after(
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
         placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container.id,
-            WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            WorkspacePlacement.target_kind == "canvas", _workspace_canvas_visible_clause(uid),
             *([after] if after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -6696,7 +6688,7 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
         ))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
-        if s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
+        if s.get(Canvas, identity) is None or canvas_role(identity, uid) is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         anchor = s.scalar(select(WorkspaceExternalOverlayAnchor).where(
             WorkspaceExternalOverlayAnchor.container_id == placement.container_id))
@@ -6844,8 +6836,9 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
             _workspace_local_placement_visible_clause()))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
-        if kind == "canvas" and s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
-            raise KeyError(f"Workspace resource '{resource_id}' not found")
+        if kind == "canvas":
+            if s.get(Canvas, identity) is None or canvas_role(identity, uid) is None:
+                raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "dataset_view":
             view = s.get(DatasetView, identity)
             if view is None or view.owner_id != uid or view.deleted_at is not None:
@@ -10724,8 +10717,12 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
 
 
 def delete_canvas_cascade(canvas_id: str) -> None:
-    """Delete a canvas and its children (shares, run history) — FKs don't cascade (SQLite FK off,
-    Postgres would error), so clean them explicitly."""
+    """Delete a canvas, its Workspace placement, and its children.
+
+    FKs don't cascade (SQLite FK off, Postgres would error), so clean them explicitly.
+    A Canvas placement has no independent recovery value after its target is permanently
+    deleted; retaining it only leaves an unusable row in Workspace.
+    """
     with session() as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
@@ -10826,6 +10823,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         ).order_by(
             ProfileJobLatest.target_node_id, ProfileJobLatest.plan_digest,
         ).with_for_update()))
+        workspace_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "canvas",
+            WorkspacePlacement.target_id == canvas_id,
+        ).order_by(WorkspacePlacement.id).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         local_owners.extend(("durable_task", task.id) for task in durable_tasks)
         for sh in shares:
@@ -10877,6 +10878,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(latest)
         if profile_retention is not None:
             s.delete(profile_retention)
+        for placement in workspace_placements:
+            s.delete(placement)
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:

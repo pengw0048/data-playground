@@ -233,10 +233,9 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
 
     metadb.delete_canvas_cascade(workspace_scope["canvas_id"])
     with metadb.session() as session:
-        detached = session.get(metadb.WorkspacePlacement, replacement_placement["id"])
-        assert detached is not None and detached.target_id == workspace_scope["canvas_id"]
-    metadb.workspace_delete_placement(
-        replacement_placement["id"], expected_version=replacement_placement["version"])
+        assert session.get(
+            metadb.WorkspacePlacement, replacement_placement["id"]
+        ) is None
 
 
 def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
@@ -258,6 +257,30 @@ def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
         "version": "v2",
     })
     assert metadb.workspace_builtin_dataset_identity(uri) != original
+
+
+def test_historical_missing_canvas_placement_is_not_a_workspace_resource(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    container = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-orphaned-canvas"
+    )
+    metadb.workspace_create_placement(
+        container["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
+        name=f"workspace-{token}-missing-canvas",
+    )
+    # Simulate a pre-fix database where Canvas deletion left its placement behind.
+    with metadb.session() as session:
+        session.execute(delete(metadb.Canvas).where(
+            metadb.Canvas.id == workspace_scope["canvas_id"]
+        ))
+
+    assert metadb.workspace_browse(
+        container["id"], uid=metadb.DEFAULT_USER_ID
+    )["items"] == []
+    with pytest.raises(KeyError, match="not found"):
+        metadb.workspace_resolve(
+            f"canvas:{workspace_scope['canvas_id']}", uid=metadb.DEFAULT_USER_ID
+        )
 
 
 def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_overlay(workspace_scope):
