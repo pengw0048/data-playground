@@ -57,9 +57,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
-  const schemaChanges = schemaDrift?.compatibility.fields.filter((field) => (
-    field.kind !== 'unchanged' || field.status !== 'compatible'
-  )) ?? []
+  const schemaChanges = schemaDrift?.compatibility.fields.filter((field) => field.kind !== 'unchanged') ?? []
   const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">

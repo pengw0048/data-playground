@@ -110,6 +110,27 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
   })
 
+  it('does not present unchanged fields as schema changes', () => {
+    const unchangedReceipt = {
+      ...receipt,
+      schemaDrift: {
+        comparedHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
+        compatibility: { status: 'unknown', fields: [{
+          kind: 'unchanged', status: 'unknown', fieldId: null,
+          oldName: 'amount', newName: 'amount',
+          reason: 'logical type is unchanged; nullability is not proven on both versions',
+        }] },
+        requiresConfirmation: false,
+      },
+    } as any
+
+    render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
+      receipt={unchangedReceipt} completed />)
+
+    expect(screen.queryByLabelText('Schema changes')).not.toBeInTheDocument()
+    expect(screen.queryByText(/nullability is not proven/)).not.toBeInTheDocument()
+  })
+
   it('does not promise a dataset for provider-neutral output', () => {
     const admission = {
       nodeId: 'write', managed: false, provider: 'plugin-sink', mode: 'overwrite',
