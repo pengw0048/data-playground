@@ -752,7 +752,7 @@ describe('WorkspaceExplorer', () => {
       sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: "Items here come from Workspace and a connected source, whose orders cannot be compared reliably.",
+        reason: 'Mixed sources cannot share one sort order. Open a local folder to sort or filter.',
       },
     })
     render(<WorkspaceExplorer />)
@@ -762,7 +762,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
     expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'whose orders cannot be compared reliably',
+      'Mixed sources cannot share one sort order',
     )
   })
 

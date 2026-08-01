@@ -39,7 +39,7 @@ describe('Shell primary navigation', () => {
   it('opens Workspace home instead of restoring a stale resource dialog', async () => {
     render(<Shell />)
 
-    expect(screen.getByText('local mode')).toBeVisible()
+    expect(screen.queryByText('local mode')).not.toBeInTheDocument()
     expect(screen.queryByText('signed in')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('rail-collapse'))

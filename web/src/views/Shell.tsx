@@ -148,7 +148,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         <span className="grid h-6 w-6 place-items-center rounded-full bg-primary/10 text-[11px] font-bold text-primary">{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
         <div className={cn('min-w-0 flex-1', collapsed && 'sr-only')}>
           <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] font-semibold text-foreground">{currentUser?.name ?? 'local'}</div>
-          <div className="text-[10px] text-muted-foreground">{authEnabled ? 'signed in' : 'local mode'}</div>
+          {authEnabled && <div className="text-[10px] text-muted-foreground">signed in</div>}
         </div>
         {authEnabled && (
           <>

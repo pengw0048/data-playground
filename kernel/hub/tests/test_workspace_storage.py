@@ -5135,7 +5135,9 @@ def test_workspace_default_browse_mixes_local_and_connected_source_roots(
     assert not any(item["id"].startswith("container:mount.") for item in page["items"])
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
-    assert "orders cannot be compared reliably" in page["queryCapabilities"]["reason"]
+    assert page["queryCapabilities"]["reason"] == (
+        "Mixed sources cannot share one sort order. Open a local folder to sort or filter."
+    )
 
 
 def test_workspace_provider_delete_is_capability_driven_and_detaches_cached_dataset(

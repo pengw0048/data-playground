@@ -1474,8 +1474,7 @@ _PROVIDER_QUERY_REASON = (
     "This source controls the order of its results. Sorting and type filters aren't available here."
 )
 _MIXED_QUERY_REASON = (
-    "Items here come from Workspace and a connected source, whose orders cannot be compared "
-    "reliably. This view preserves each source's order; local folders can still be sorted and filtered."
+    "Mixed sources cannot share one sort order. Open a local folder to sort or filter."
 )
 
 
