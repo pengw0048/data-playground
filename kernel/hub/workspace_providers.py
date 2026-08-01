@@ -1373,10 +1373,11 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
 
 
 _PROVIDER_QUERY_REASON = (
-    "This connected source controls its own order and does not support Workspace type filters."
+    "This source controls the order of its results. Sorting and type filters aren't available here."
 )
 _MIXED_QUERY_REASON = (
-    "This page combines sources with different query capabilities. Choose a source to sort or filter."
+    "This page mixes Workspace items with connected-source results. Open a local folder to sort "
+    "and filter, or open a connected source to browse it in source order."
 )
 
 

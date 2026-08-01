@@ -12,6 +12,10 @@ import type {
 import { Icon } from '../ui/Icon'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu'
 import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
+  ContextMenuSeparator, ContextMenuTrigger,
+} from '../components/ui/context-menu'
+import {
   AddDataModal, CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
   type CatalogDiscoveryQueryState,
 } from './CatalogDiscovery'
@@ -596,6 +600,7 @@ function WorkspaceMixedExplorer() {
   const [canvasRenameResource, setCanvasRenameResource] = useState<WorkspaceResource | null>(null)
   const [canvasDeleteResource, setCanvasDeleteResource] = useState<WorkspaceResource | null>(null)
   const [canvasBatchDeleteResources, setCanvasBatchDeleteResources] = useState<WorkspaceResource[] | null>(null)
+  const [datasetRemoveResource, setDatasetRemoveResource] = useState<WorkspaceResource | null>(null)
   const [canvasCopySource, setCanvasCopySource] = useState<CanvasCopySource | null>(null)
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
   const [providerDatasetAction, setProviderDatasetAction] = useState<WorkspaceResource | null>(null)
@@ -665,7 +670,7 @@ function WorkspaceMixedExplorer() {
       setConnectedSources(page.connectedSources ?? [])
       const capabilities = page.queryCapabilities ?? (localSource
         ? LOCAL_QUERY_CAPABILITIES
-        : { sort: [], kindFilter: false, reason: 'This connected source controls its own order.' })
+        : { sort: [], kindFilter: false, reason: "This source controls the order of its results. Sorting and type filters aren't available here." })
       setQueryCapabilities(capabilities)
       if (!capabilities.sort.length && sortMode !== 'source') setSortMode('source')
       if (!capabilities.kindFilter && kindFilter !== 'all') setKindFilter('all')
@@ -856,7 +861,7 @@ function WorkspaceMixedExplorer() {
   const reload = () => setRevision((current) => current + 1)
   const searchActionRequest = useRef(0)
   useEffect(() => () => { searchActionRequest.current += 1 }, [searchQuery])
-  const startSearchAction = async (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => {
+  const startSearchAction = async (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas' | 'remove-dataset') => {
     const sequence = ++searchActionRequest.current
     try {
       const resolved = await api.workspaceResource(resource.id)
@@ -879,6 +884,9 @@ function WorkspaceMixedExplorer() {
       } else if (action === 'delete-canvas' && exact.kind === 'canvas'
         && files.find((file) => file.id === identity(exact))?.role === 'owner') {
         setCanvasDeleteResource(exact)
+      } else if (action === 'remove-dataset' && exact.kind === 'dataset'
+        && !isExternal(exact) && !exact.detached) {
+        setDatasetRemoveResource(exact)
       }
     } catch (caught) {
       if (sequence === searchActionRequest.current) pushToast(`Could not load this search result's actions: ${errorMessage(caught)}`, 'error')
@@ -936,6 +944,9 @@ function WorkspaceMixedExplorer() {
     ? selectedResources : []
   const selectedOwnedCanvases = selectedResources.length > 0 && selectedResources.every(ownedCanvas)
     ? selectedResources : []
+  const singleRemovableDataset = singleSelectedResource?.kind === 'dataset'
+    && !isExternal(singleSelectedResource) && !singleSelectedResource.detached
+    ? singleSelectedResource : null
   const toggleResourceSelection = (resourceId: string) => setSelectedResourceIds((current) => {
     const next = new Set(current)
     if (next.has(resourceId)) next.delete(resourceId)
@@ -1129,7 +1140,7 @@ function WorkspaceMixedExplorer() {
           setSelectedResourceIds(new Set())
         }} disabled={!sortSupported} title={!sortSupported ? queryCapabilities.reason ?? undefined : undefined}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
-          <option value="source">Default order</option>
+          <option value="source">{sortSupported ? 'Default order' : 'Source order'}</option>
           <option value="name-asc">Name A–Z</option>
           <option value="name-desc">Name Z–A</option>
           <option value="updated-desc">Recently updated</option>
@@ -1147,7 +1158,8 @@ function WorkspaceMixedExplorer() {
           <option value="dataset_view">Saved views</option>
         </select>
         {(!sortSupported || !kindFilterSupported) && queryCapabilities.reason
-          && <span data-testid="workspace-query-capability-note" className="text-[11px] text-muted-foreground">{queryCapabilities.reason}</span>}
+          && <span data-testid="workspace-query-capability-note"
+            className="min-w-[240px] max-w-[560px] flex-1 text-[11px] leading-snug text-muted-foreground">{queryCapabilities.reason}</span>}
         {error && (sortMode !== 'source' || kindFilter !== 'all') && <button type="button" onClick={() => {
           setSortMode('source')
           setKindFilter('all')
@@ -1173,6 +1185,8 @@ function WorkspaceMixedExplorer() {
             className="rounded-md border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Move</button>}
           {selectedOwnedCanvases.length > 0 && <button type="button" onClick={deleteSelection}
             className="rounded-md border border-border px-2 py-1 font-semibold text-destructive hover:bg-destructive/5">Delete</button>}
+          {singleRemovableDataset && <button type="button" onClick={() => setDatasetRemoveResource(singleRemovableDataset)}
+            className="rounded-md border border-border px-2 py-1 font-semibold text-destructive hover:bg-destructive/5">Remove dataset</button>}
           <button type="button" onClick={() => setSelectedResourceIds(new Set())} className="px-2 py-1 text-muted-foreground hover:text-foreground">Clear</button>
         </>}
         </>}
@@ -1183,6 +1197,8 @@ function WorkspaceMixedExplorer() {
         </div>
       </div>}
 
+      <ContextMenu>
+      <ContextMenuTrigger asChild>
       <div data-testid="workspace-scroll-surface" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {searchQuery ? <WorkspaceSearchResults query={searchQuery} revision={revision} onOpen={open}
           onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
@@ -1197,9 +1213,13 @@ function WorkspaceMixedExplorer() {
             </div>
           </section>}
           {items.length ? <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
-            {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
-              viewMode={viewMode} selected={selectedResourceIds.has(resource.id)}
+            {items.map((resource) => {
+              const rowSelected = selectedResourceIds.has(resource.id)
+              const groupSelected = rowSelected && selectedResources.length > 1
+              return <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
+              viewMode={viewMode} selected={rowSelected} contextSelectionCount={groupSelected ? selectedResources.length : 1}
               onToggleSelect={() => toggleResourceSelection(resource.id)}
+              onContextSelect={() => setSelectedResourceIds(new Set([resource.id]))}
               draggable={editableCanvas(resource) && !dropBusy}
               onDragStart={(event) => {
                 setDraggedCanvases(selectedResourceIds.has(resource.id)
@@ -1225,18 +1245,24 @@ function WorkspaceMixedExplorer() {
                 void dropCanvasInto(resource)
               } : undefined}
               onRetry={reload}
-              onNewFolder={resource.kind === 'container' && resource.canCreateFolder
+              onNewFolder={!groupSelected && resource.kind === 'container' && resource.canCreateFolder
                 ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
-              onRenameFolder={resource.kind === 'container' && resource.canRenameFolder
+              onRenameFolder={!groupSelected && resource.kind === 'container' && resource.canRenameFolder
                 ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
-              onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
+              onDeleteFolder={!groupSelected && resource.kind === 'container' && folderDeleteMode(resource)
                 ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
-              onMove={editableCanvas(resource)
-                ? () => container && setMoveResource({ resources: [resource], sourceContainer: container, sourcePath: crumbs }) : undefined}
-              onRenameCanvas={editableCanvas(resource)
+              onMove={groupSelected && selectedEditableCanvases.length === selectedResources.length
+                ? () => container && setMoveResource({ resources: selectedEditableCanvases, sourceContainer: container, sourcePath: crumbs })
+                : !groupSelected && editableCanvas(resource)
+                  ? () => container && setMoveResource({ resources: [resource], sourceContainer: container, sourcePath: crumbs }) : undefined}
+              onRenameCanvas={!groupSelected && editableCanvas(resource)
                 ? () => setCanvasRenameResource(resource) : undefined}
-              onDuplicateCanvas={editableCanvas(resource) ? () => void startDuplicate(resource) : undefined}
-              onDeleteCanvas={ownedCanvas(resource) ? () => setCanvasDeleteResource(resource) : undefined} />)}
+              onDuplicateCanvas={!groupSelected && editableCanvas(resource) ? () => void startDuplicate(resource) : undefined}
+              onDeleteCanvas={groupSelected && selectedOwnedCanvases.length === selectedResources.length
+                ? deleteSelection : !groupSelected && ownedCanvas(resource) ? () => setCanvasDeleteResource(resource) : undefined}
+              onRemoveDataset={!groupSelected && resource.kind === 'dataset' && !isExternal(resource) && !resource.detached
+                ? () => setDatasetRemoveResource(resource) : undefined} />
+            })}
           </div> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
             ? 'This Workspace location is unavailable.'
             : hasMore ? 'This page has no items. Continue to the next page.'
@@ -1256,6 +1282,22 @@ function WorkspaceMixedExplorer() {
           </nav>}
         </div>}
       </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent aria-label="Folder actions" className="w-56">
+        <ContextMenuLabel className="truncate">{container?.name ?? 'Workspace'}</ContextMenuLabel>
+        <ContextMenuItem onSelect={() => setAddDataOpen(true)}><Icon name="plus" size={13} /> Add data…</ContextMenuItem>
+        <ContextMenuItem disabled={!container?.canCreateFolder}
+          title={!container?.canCreateFolder ? container?.folderMutationUnavailableReason ?? 'New folders are unavailable here.' : undefined}
+          onSelect={() => container && setFolderCreateParent({ resource: container, path: crumbs })}>
+          <Icon name="plus" size={13} /> {container?.canCreateFolder ? 'New folder' : 'New folder unavailable'}
+        </ContextMenuItem>
+        <ContextMenuItem disabled={!canvasDestination(container, 'create')}
+          title={!canvasDestination(container, 'create') ? canvasDestinationTitle(container, 'create') : undefined}
+          onSelect={() => setCreateOpen(true)}><Icon name="grid" size={13} /> Create canvas</ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem onSelect={reload}><Icon name="refresh" size={13} /> Reload</ContextMenuItem>
+      </ContextMenuContent>
+      </ContextMenu>
 
       {selectedView && <DatasetViewDetail definition={selectedView} onClose={closeDetail} onDeleted={() => {
         setSelectedView(null)
@@ -1289,6 +1331,11 @@ function WorkspaceMixedExplorer() {
         onClose={() => setCanvasBatchDeleteResources(null)} onCompleted={(deleted) => {
           setCanvasBatchDeleteResources(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload()
           pushToast(`Deleted ${deleted} Canvases.`, 'success')
+        }} />}
+      {datasetRemoveResource && <DatasetRemoveDialog resource={datasetRemoveResource}
+        onClose={() => setDatasetRemoveResource(null)} onRemoved={() => {
+          setDatasetRemoveResource(null); setSelectedResourceIds(new Set()); reload()
+          pushToast('Dataset removed from Workspace', 'success')
         }} />}
       {canvasCopySource && <CanvasCopyModal source={canvasCopySource}
         initialDestination={container && !isExternal(container)
@@ -1604,7 +1651,7 @@ function WorkspaceDatasets() {
 
 function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
   query: string; revision: number; onOpen: (resource: WorkspaceResource) => void
-  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas' | 'remove-dataset') => void
   files: CanvasFile[]
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
@@ -1758,7 +1805,7 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
 
 function SearchSourceGroup({ group, onOpen, onAction, files }: {
   group: WorkspaceSearchGroup; onOpen: (resource: WorkspaceResource) => void
-  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas' | 'remove-dataset') => void
   files: CanvasFile[]
 }) {
   const source = group.source
@@ -1783,7 +1830,9 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
       onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
         ? () => onAction(resource, 'move-canvas') : undefined}
       onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
-        ? () => onAction(resource, 'delete-canvas') : undefined} />)}
+        ? () => onAction(resource, 'delete-canvas') : undefined}
+      onRemoveDataset={resource.kind === 'dataset' && !isExternal(resource) && !resource.detached
+        ? () => onAction(resource, 'remove-dataset') : undefined} />)}
     {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
       {source.completeness === 'complete' ? 'No matches from this source.'
         : error ?? sourceCompletenessLabel(source.completeness)}
@@ -1963,6 +2012,44 @@ function CanvasRenameDialog({ resource, onClose, onRenamed }: {
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={close} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={!name.trim() || name.trim() === resource.name || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button></div>
+  </Modal>
+}
+
+function DatasetRemoveDialog({ resource, onClose, onRemoved }: {
+  resource: WorkspaceResource; onClose: () => void; onRemoved: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const remove = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try {
+      const registrationId = identity(resource)
+      const table = await api.tableByRegistration(registrationId)
+      if (!table.registrationId || !table.metadataRevision) {
+        throw new Error('Reload this dataset before removing it')
+      }
+      await api.unregisterTable(table.id, table.registrationId, table.metadataRevision)
+      onRemoved()
+    } catch (caught) {
+      setError(errorMessage(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <Modal label={`Remove ${resource.name}`} onClose={busy ? () => undefined : onClose}>
+    <div className="space-y-2 text-[12px] leading-5 text-muted-foreground">
+      <p>Remove this dataset from Data Playground?</p>
+      <p>The source file stays on disk. Canvases that reference this dataset may show it as unavailable until it is registered again.</p>
+    </div>
+    {error && <div role="alert" className="text-[12px] text-destructive">Couldn't remove this dataset: {error}</div>}
+    <div className="flex justify-end gap-2">
+      <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+      <button onClick={() => void remove()} disabled={busy}
+        className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">
+        {busy ? 'Removing…' : 'Remove dataset'}
+      </button>
+    </div>
   </Modal>
 }
 
@@ -2266,10 +2353,27 @@ function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResourc
   return <Icon name={icon} size={size} />
 }
 
-function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSelect, onOpen, onRetry, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDuplicateCanvas, onDeleteCanvas, draggable = false, dropTarget = false, dropTargetLabel = 'Move here', onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop }: {
+type ResourceMenuAction = {
+  label: string
+  onSelect?: () => void
+  disabled?: boolean
+  danger?: boolean
+  hint?: string
+}
+
+function ResourceActionLabel({ action }: { action: ResourceMenuAction }) {
+  return <span className="flex min-w-0 flex-col">
+    <span>{action.label}</span>
+    {action.hint ? <span className="max-w-64 whitespace-normal text-[10px] font-normal leading-snug text-muted-foreground">{action.hint}</span> : null}
+  </span>
+}
+
+function ResourceRow({ resource, viewMode = 'list', selected = false, contextSelectionCount = 1, onToggleSelect, onContextSelect, onOpen, onRetry, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDuplicateCanvas, onDeleteCanvas, onRemoveDataset, draggable = false, dropTarget = false, dropTargetLabel = 'Move here', onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop }: {
   resource: WorkspaceResource; viewMode?: 'list' | 'grid'; selected?: boolean; onToggleSelect?: () => void
+  contextSelectionCount?: number; onContextSelect?: () => void
   onOpen: () => void; onNewFolder?: () => void; onRenameFolder?: () => void; onDeleteFolder?: () => void
   onRetry?: () => void; onMove?: () => void; onRenameCanvas?: () => void; onDuplicateCanvas?: () => void; onDeleteCanvas?: () => void
+  onRemoveDataset?: () => void
   draggable?: boolean; dropTarget?: boolean; dropTargetLabel?: string
   onDragStart?: (event: DragEvent<HTMLDivElement>) => void
   onDragEnd?: (event: DragEvent<HTMLDivElement>) => void
@@ -2282,7 +2386,6 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSe
   const menuOpen = openId === resource.id
   const unavailable = itemAvailability(resource)
   const canOpen = !unavailable || hasDetachedDatasetRecovery(resource)
-  const hasSecondaryAction = !!(onNewFolder || onRenameFolder || onDeleteFolder || onMove || onRenameCanvas || onDuplicateCanvas || onDeleteCanvas)
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'Saved view' : 'Dataset'
   const source = isExternal(resource) ? `Connected source ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
     : isCatalogFolder(resource) ? 'Catalog organization'
@@ -2292,8 +2395,45 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSe
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   const grid = viewMode === 'grid'
-  return <div draggable={draggable} onDragStart={onDragStart} onDragEnd={onDragEnd}
+  const actions: ResourceMenuAction[] = [
+    ...(canOpen && contextSelectionCount === 1 ? [{ label: resource.kind === 'dataset' ? 'Open in Workspace' : 'Open', onSelect: onOpen }] : []),
+    ...(onNewFolder ? [{ label: 'New folder', onSelect: onNewFolder }] : []),
+    ...(onRenameFolder ? [{ label: 'Rename', onSelect: onRenameFolder }] : []),
+    ...(onDeleteFolder ? [{ label: 'Delete', onSelect: onDeleteFolder, danger: true }] : []),
+    ...(onRenameCanvas ? [{ label: 'Rename', onSelect: onRenameCanvas }] : []),
+    ...(onMove ? [{ label: 'Move', onSelect: onMove }] : []),
+    ...(onDuplicateCanvas ? [{ label: 'Duplicate', onSelect: onDuplicateCanvas }] : []),
+    ...(onDeleteCanvas ? [{ label: 'Delete', onSelect: onDeleteCanvas, danger: true }] : []),
+    ...(onRemoveDataset ? [{ label: 'Remove dataset…', onSelect: onRemoveDataset, danger: true }] : []),
+  ]
+  if (contextSelectionCount > 1 && !actions.length) {
+    actions.push({ label: 'No bulk actions available', disabled: true })
+  } else if (contextSelectionCount === 1 && resource.kind === 'container' && !onDeleteFolder && resource.folderMutationUnavailableReason) {
+    actions.push({ label: 'Delete unavailable', disabled: true, hint: resource.folderMutationUnavailableReason })
+  } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && isExternal(resource)) {
+    actions.push({
+      label: 'Delete unavailable', disabled: true,
+      hint: `${resource.mountId ?? 'This connected source'} is read-only here. Delete the table in its source system.`,
+    })
+  } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && !onRemoveDataset) {
+    actions.push({ label: 'Remove unavailable', disabled: true, hint: 'Open this dataset to review its recovery options.' })
+  }
+  const dropdownItems = actions.map((action, index) => <DropdownMenuItem
+    key={`${action.label}:${index}`} disabled={action.disabled} title={action.hint}
+    onSelect={action.onSelect} className={action.danger ? 'text-destructive focus:text-destructive' : undefined}>
+    <ResourceActionLabel action={action} />
+  </DropdownMenuItem>)
+  const contextItems = actions.map((action, index) => <ContextMenuItem
+    key={`${action.label}:${index}`} disabled={action.disabled} title={action.hint}
+    onSelect={action.onSelect} className={action.danger ? 'text-destructive focus:text-destructive' : undefined}>
+    <ResourceActionLabel action={action} />
+  </ContextMenuItem>)
+  const hasOverflowMenu = actions.some((action) => action.label !== 'Open' && action.label !== 'Open in Workspace')
+  return <ContextMenu>
+    <ContextMenuTrigger asChild>
+    <div draggable={draggable} onDragStart={onDragStart} onDragEnd={onDragEnd}
     onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+    onContextMenu={() => { if (!selected) onContextSelect?.() }}
     className={`relative min-w-0 rounded-lg border bg-card ${grid ? 'flex min-h-[132px] flex-col' : 'flex items-center'} ${dropTarget ? 'border-primary bg-primary/10 ring-2 ring-primary/30' : selected ? 'border-primary/70 bg-primary/5' : 'border-border'} ${canOpen ? 'hover:border-primary/40 hover:bg-accent' : ''}`}>
     {dropTarget && <span role="status" className="pointer-events-none absolute right-2 top-2 z-20 rounded bg-primary px-2 py-1 text-[10px] font-semibold text-primary-foreground shadow-sm">{dropTargetLabel}</span>}
     {onToggleSelect && <label className={grid ? 'absolute left-2 top-2 z-10 grid h-6 w-6 place-items-center' : 'grid h-full shrink-0 place-items-center pl-3'}>
@@ -2303,15 +2443,15 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSe
     <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!canOpen}
       title={unavailable?.reason}
       className={grid
-        ? 'flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 pb-3 pt-8 text-center disabled:cursor-not-allowed'
-        : 'flex min-w-0 flex-1 items-center gap-2.5 px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
+        ? 'flex min-h-0 min-w-0 max-w-full flex-1 flex-col items-center justify-center gap-2 overflow-hidden px-4 pb-3 pt-8 text-center disabled:cursor-not-allowed'
+        : 'flex min-w-0 max-w-full flex-1 items-center gap-2.5 overflow-hidden px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
       <span className="shrink-0 text-muted-foreground"><WorkspaceResourceGlyph resource={resource} size={grid ? 28 : 16} /></span>
-      <span className="min-w-0 flex-1"><span title={resource.name} className={`flex items-center gap-2 text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
+      <span className="min-w-0 max-w-full flex-1 overflow-hidden"><span title={resource.name} className={`flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="min-w-0 flex-1 truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
       {!grid && resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     {resource.unavailableReason && unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
       className={grid ? 'pb-2 text-[11px] font-semibold text-primary underline' : 'mr-2 shrink-0 font-semibold text-primary underline'}>Retry</button>}
-    {hasSecondaryAction && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
+    {hasOverflowMenu && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
       <DropdownMenuTrigger asChild>
         <button type="button" aria-label={`More actions for ${resource.name}`}
           onPointerDown={(event) => {
@@ -2320,17 +2460,17 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, onToggleSe
           className={grid ? 'absolute right-2 top-2 z-10 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground' : 'mr-2 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground'}>•••</button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" aria-label={`Actions for ${resource.name}`} className="min-w-40">
-        {canOpen && <DropdownMenuItem onSelect={onOpen}>{resource.kind === 'dataset' ? 'Open in Workspace' : 'Open'}</DropdownMenuItem>}
-        {onNewFolder && <DropdownMenuItem onSelect={onNewFolder}>New folder</DropdownMenuItem>}
-        {onRenameFolder && <DropdownMenuItem onSelect={onRenameFolder}>Rename</DropdownMenuItem>}
-        {onDeleteFolder && <DropdownMenuItem onSelect={onDeleteFolder} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
-        {onRenameCanvas && <DropdownMenuItem onSelect={onRenameCanvas}>Rename</DropdownMenuItem>}
-        {onMove && <DropdownMenuItem onSelect={onMove}>Move</DropdownMenuItem>}
-        {onDuplicateCanvas && <DropdownMenuItem onSelect={onDuplicateCanvas}>Duplicate</DropdownMenuItem>}
-        {onDeleteCanvas && <DropdownMenuItem onSelect={onDeleteCanvas} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
+        {dropdownItems}
       </DropdownMenuContent>
     </DropdownMenu>}
   </div>
+  </ContextMenuTrigger>
+  <ContextMenuContent aria-label={`Actions for ${resource.name}`} className="min-w-52 max-w-72">
+    <ContextMenuLabel className="truncate">{contextSelectionCount > 1 ? `${contextSelectionCount} selected` : resource.name}</ContextMenuLabel>
+    <ContextMenuSeparator />
+    {contextItems}
+  </ContextMenuContent>
+  </ContextMenu>
 }
 
 function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exactRevision, backLabel,

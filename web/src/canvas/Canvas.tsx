@@ -15,21 +15,32 @@ import {
 } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
-import { kindAccent, color } from '../theme/tokens'
-import type { WireType } from '../theme/tokens'
+import { categoryOrder, kindAccent, color } from '../theme/tokens'
+import type { Category, WireType } from '../theme/tokens'
 import type { CanvasNode } from '../types/graph'
 import { NodeFinder, type ScreenRect } from './NodeFinder'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
+import { Icon } from '../ui/Icon'
 import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 import { canvasFitOptions } from './viewportFit'
 import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
+import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
+  ContextMenuSeparator, ContextMenuShortcut, ContextMenuSub, ContextMenuSubContent,
+  ContextMenuSubTrigger, ContextMenuTrigger,
+} from '@/components/ui/context-menu'
 
 const edgeTypes = { wire: WireEdge }
+
+const CONTEXT_CATEGORY_LABEL: Record<Category, string> = {
+  io: 'Sources & sinks', shape: 'Shape', compute: 'Compute', query: 'Query',
+  inspect: 'Inspect', control: 'Control flow',
+}
 
 function viewportNodeGeometryIdentity(nodes: readonly Node[]): string {
   return JSON.stringify(nodes.map((node) => [
@@ -162,6 +173,8 @@ export function Canvas() {
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
+  const canUndo = useStore((s) => s.past.length > 0)
+  const canRedo = useStore((s) => s.future.length > 0)
   const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
   const acknowledgeNodeReveal = useStore((s) => s.acknowledgeNodeReveal)
   const viewportFitRequest = useStore((s) => s.viewportFitRequest)
@@ -203,6 +216,7 @@ export function Canvas() {
     wire: WireType
     source: { nodeId: string; handleId: string | null }
   } | null>(null)
+  const [contextPosition, setContextPosition] = useState({ x: 0, y: 0 })
 
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
@@ -570,10 +584,25 @@ export function Canvas() {
     return () => window.removeEventListener('keydown', onKey)
   }, [removeSelected, bypass, disable])
 
+  const addNodeAtContext = (kind: string) => {
+    if (!canEdit) return
+    const base = { x: contextPosition.x - 116, y: contextPosition.y - 40 }
+    const position = freePosition(useStore.getState().doc.nodes, base)
+    useStore.getState().addNode(kind, position, undefined, undefined, { autoPlaced: false })
+  }
+  const contextSpecs = allSpecs()
+
   return (
+    <ContextMenu>
+    <ContextMenuTrigger asChild>
     <div ref={canvasRef}
       data-node-reveal-pending={nodeRevealRequest?.canvasId === doc.id ? 'true' : 'false'}
       style={{ position: 'absolute', inset: 0 }}
+      onContextMenu={(event) => {
+        setContextPosition(screenToFlowPosition({ x: event.clientX, y: event.clientY }))
+        select(null)
+        setFinder(null)
+      }}
       onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
       onDragOver={onDragOverFiles} onDragLeave={onDragLeaveFiles} onDrop={onDropFiles}>
       <ArrowDefs />
@@ -613,7 +642,8 @@ export function Canvas() {
         panOnScroll
         connectOnClick={false}
         selectionOnDrag
-        panOnDrag={[1, 2]}
+        // Keep right-click available for the product menu; middle-drag still pans the Canvas.
+        panOnDrag={[1]}
         selectionKeyCode={null}
         multiSelectionKeyCode={['Meta', 'Shift']}
         deleteKeyCode={null}
@@ -687,5 +717,42 @@ export function Canvas() {
         />
       )}
     </div>
+    </ContextMenuTrigger>
+    <ContextMenuContent aria-label="Canvas actions" className="w-[220px]">
+      <ContextMenuLabel>Canvas</ContextMenuLabel>
+      {canEdit && <>
+        <ContextMenuItem disabled={!canUndo} onSelect={() => useStore.getState().undo()}>
+          <Icon name="undo" /> Undo <ContextMenuShortcut>⌘Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuItem disabled={!canRedo} onSelect={() => useStore.getState().redo()}>
+          <Icon name="redo" /> Redo <ContextMenuShortcut>⇧⌘Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        {categoryOrder.map((category) => {
+          const specs = contextSpecs.filter((spec) => spec.category === category)
+          if (!specs.length) return null
+          return <ContextMenuSub key={category}>
+            <ContextMenuSubTrigger>Add {CONTEXT_CATEGORY_LABEL[category]}</ContextMenuSubTrigger>
+            <ContextMenuSubContent className="max-h-80 w-56 overflow-y-auto">
+              {specs.map((spec) => <ContextMenuItem key={spec.kind} onSelect={() => addNodeAtContext(spec.kind)}>
+                <span className="h-3.5 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[spec.kind] ?? color.text3 }} />
+                <span className="min-w-0 truncate">{spec.title}</span>
+              </ContextMenuItem>)}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+        })}
+        <ContextMenuItem onSelect={() => useStore.getState().paste()}>
+          <Icon name="duplicate" /> Paste <ContextMenuShortcut>⌘V</ContextMenuShortcut>
+        </ContextMenuItem>
+      </>}
+      <ContextMenuItem disabled={!doc.nodes.length} onSelect={() => useStore.getState().selectAll()}>
+        <Icon name="check" /> Select all <ContextMenuShortcut>⌘A</ContextMenuShortcut>
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem disabled={!doc.nodes.length} onSelect={() => { void fitView(canvasFitOptions(doc.nodes.length)) }}>
+        <Icon name="maximize" /> Fit canvas
+      </ContextMenuItem>
+    </ContextMenuContent>
+    </ContextMenu>
   )
 }

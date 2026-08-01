@@ -10,6 +10,10 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
+import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator,
+  ContextMenuShortcut, ContextMenuTrigger,
+} from '@/components/ui/context-menu'
 import { cn } from '@/lib/utils'
 import { Port } from './Port'
 import { useNodeTransientSurface } from './nodeTransientSurface'
@@ -96,7 +100,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const tag = (spec?.tag ?? kind).toUpperCase()
 
   return (
+    <ContextMenu>
+    <ContextMenuTrigger asChild>
     <div className={cn('dp-no-select relative w-[232px]', off && 'opacity-45')}
+      onContextMenu={(event) => {
+        event.stopPropagation()
+        if (!useStore.getState().selectedIds.includes(id)) useStore.getState().select(id)
+      }}
       onMouseEnter={enterHover} onMouseLeave={leaveHover}>
       {/* input ports */}
       {(spec?.inputs ?? []).map((p, i) => (
@@ -252,6 +262,10 @@ export function NodeCard({ id, data, children, metaOverride }: {
         </div>
       )}
     </div>
+    </ContextMenuTrigger>
+    <NodeContextActions id={id} kind={kind} canEdit={canEdit} disabled={disabled}
+      bypassed={bypassed} kernelUp={kernelUp} runnable={runnable} invalid={invalid} />
+    </ContextMenu>
   )
 }
 
@@ -385,4 +399,45 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
       </DropdownMenuContent>
     </DropdownMenu>
   )
+}
+
+function NodeContextActions({ id, kind, canEdit, disabled, bypassed, kernelUp, runnable, invalid }: {
+  id: string; kind: string; canEdit: boolean; disabled: boolean; bypassed: boolean
+  kernelUp: boolean; runnable: boolean; invalid: string | null
+}) {
+  const renameRequested = useRef(false)
+  const canBypass = getSpec(kind)?.canBypass
+  const requestRename = () => { renameRequested.current = true }
+  const item = (
+    icon: IconName, label: string, action: () => void,
+    options: { disabled?: boolean; danger?: boolean; shortcut?: string } = {},
+  ) => <ContextMenuItem disabled={options.disabled} onSelect={action}
+    className={cn(options.danger && 'text-destructive focus:text-destructive')}>
+    <Icon name={icon} /> {label}
+    {options.shortcut ? <ContextMenuShortcut>{options.shortcut}</ContextMenuShortcut> : null}
+  </ContextMenuItem>
+
+  return <ContextMenuContent aria-label="Node actions" className="dp-panel w-[220px]"
+    onCloseAutoFocus={(event) => {
+      event.preventDefault()
+      if (!renameRequested.current) return
+      renameRequested.current = false
+      const node = useStore.getState().doc.nodes.find((candidate) => candidate.id === id)
+      if (node) useStore.getState().startRename(id, node.data.title)
+    }}>
+    {canEdit && item('rename', 'Rename', requestRename)}
+    {item('eye', 'Preview data', () => { void useStore.getState().runPreview(id) }, {
+      disabled: !kernelUp || !runnable || !!invalid,
+    })}
+    {item('play', 'Run details', () => useStore.getState().openPanel(id, 'run'))}
+    {item('lineage', 'Lineage', () => useStore.getState().openPanel(id, 'lineage'))}
+    <ContextMenuSeparator />
+    {item('duplicate', 'Copy', () => useStore.getState().copySelection(), { shortcut: '⌘C' })}
+    {canEdit && item('duplicate', 'Cut', () => useStore.getState().cutSelection(), { shortcut: '⌘X' })}
+    {canEdit && item('duplicate', 'Duplicate', () => useStore.getState().duplicateSelected(), { shortcut: '⌘D' })}
+    {canEdit && canBypass && item('power', bypassed ? 'Un-bypass' : 'Bypass', () => useStore.getState().bypass(id))}
+    {canEdit && item('mute', disabled ? 'Enable' : 'Disable', () => useStore.getState().disable(id))}
+    {canEdit && <ContextMenuSeparator />}
+    {canEdit && item('trash', 'Delete', () => useStore.getState().removeSelected(), { danger: true, shortcut: '⌫' })}
+  </ContextMenuContent>
 }

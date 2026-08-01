@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -65,6 +65,24 @@ describe('NodeCard result summary', () => {
     )
 
     expect(screen.queryByRole('button', { name: 'Output versions' })).not.toBeInTheDocument()
+  })
+
+  it('opens the product node menu on right-click and applies actions to that node', async () => {
+    const data = useStore.getState().doc.nodes[0].data
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    fireEvent.contextMenu(screen.getByText('target'))
+    const menu = await screen.findByRole('menu', { name: 'Node actions' })
+    for (const name of ['Rename', 'Preview data', 'Run details', 'Lineage', 'Copy', 'Cut', 'Duplicate', 'Disable', 'Delete']) {
+      expect(within(menu).getByRole('menuitem', { name: new RegExp(name) })).toBeVisible()
+    }
+    fireEvent.click(screen.getByRole('menuitem', { name: /Duplicate/ }))
+
+    expect(useStore.getState().doc.nodes).toHaveLength(2)
   })
 
   it('names retained successful snapshots as output versions on output nodes', () => {

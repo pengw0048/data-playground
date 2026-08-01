@@ -5106,7 +5106,9 @@ def test_workspace_legacy_mixed_browse_declares_queries_unsupported(workspace_sc
     assert page["connectedSources"] == []
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
-    assert "different query capabilities" in page["queryCapabilities"]["reason"]
+    assert "mixes Workspace items with connected-source results" in (
+        page["queryCapabilities"]["reason"]
+    )
 
 
 def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope):

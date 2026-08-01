@@ -6,6 +6,7 @@ import { KernelError } from '../api/client'
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
+  unregisterTable: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
@@ -148,6 +149,7 @@ describe('WorkspaceExplorer', () => {
     mocks.table.mockResolvedValue({ id: 'dataset-1', registrationId: 'dataset-1', name: 'events', uri: 'file:///events.parquet', columns: [] })
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
+    mocks.unregisterTable.mockResolvedValue({ ok: true })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
     mocks.previewDatasetView.mockResolvedValue({
       columns: [{ fieldId: 'frame_id', name: 'frame_id', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
@@ -381,7 +383,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(healthy.id)
   })
 
-  it('keeps read-only rows to one Open affordance and labels a recoverable missing local dataset', async () => {
+  it('keeps recovery opening available and exposes truthful dataset removal menus', async () => {
     const missing = {
       ...DATASET,
       id: 'dataset:missing-dataset',
@@ -402,7 +404,7 @@ describe('WorkspaceExplorer', () => {
       'The local dataset is no longer available. Open it to view recovery details.',
     )
     expect(rows[1].parentElement).not.toHaveTextContent('detached')
-    expect(screen.queryByRole('button', { name: /More actions for observations/ })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /More actions for observations/ })).toHaveLength(2)
 
     fireEvent.click(rows[1])
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(missing.id)
@@ -445,6 +447,64 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.workspaceCreateFolder).toHaveBeenCalledWith(expect.objectContaining({
       parentId: 'folder-1', expectedParentVersion: 1, name: 'Child', requestId: expect.any(String),
     })))
+  })
+
+  it('opens item and folder actions from the right-click location', async () => {
+    const root = { ...ROOT, canCreateFolder: true }
+    const localFolder = { ...FOLDER, canCreateFolder: true, canRenameFolder: true, canDeleteFolder: true }
+    mocks.workspaceBrowse.mockResolvedValue({ container: root, items: [localFolder, CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByLabelText('Select Analysis'))
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Open folder Research' }), {
+      clientX: 120, clientY: 180,
+    })
+    const itemMenu = await screen.findByRole('menu', { name: 'Actions for Research' })
+    expect(itemMenu).toHaveTextContent('OpenNew folderRenameDelete')
+    expect(screen.getByLabelText('Select Research')).toBeChecked()
+    expect(screen.getByLabelText('Select Analysis')).not.toBeChecked()
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    fireEvent.contextMenu(screen.getByTestId('workspace-scroll-surface'), { clientX: 700, clientY: 500 })
+    const folderMenu = await screen.findByRole('menu', { name: 'Folder actions' })
+    for (const name of ['Add data…', 'New folder', 'Create canvas', 'Reload']) {
+      expect(within(folderMenu).getByRole('menuitem', { name })).toBeVisible()
+    }
+  })
+
+  it('removes a local dataset from its right-click menu without claiming to delete the source file', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.tableByRegistration.mockResolvedValue({
+      id: 'table-1', registrationId: 'dataset-1', metadataRevision: 'metadata-7',
+      name: 'observations', uri: 'file:///observations.parquet', columns: [],
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Open dataset observations' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove dataset…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Remove observations' })
+    expect(dialog).toHaveTextContent('The source file stays on disk.')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove dataset' }))
+
+    await waitFor(() => expect(mocks.unregisterTable).toHaveBeenCalledWith(
+      'table-1', 'dataset-1', 'metadata-7',
+    ))
+    expect(store.pushToast).toHaveBeenCalledWith('Dataset removed from Workspace', 'success')
+  })
+
+  it('explains provider dataset deletion as a read-only source limitation', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    store.workspaceResourceId = EXTERNAL_FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_FOLDER, ancestors: [ROOT], source: PROVIDER_COMPLETE })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: /Open dataset observations from Connected source/ }))
+    const unavailable = await screen.findByRole('menuitem', { name: /Delete unavailable/ })
+    expect(unavailable).toHaveAttribute('data-disabled')
+    expect(unavailable).toHaveTextContent('warehouse is read-only here')
   })
 
   it('keeps non-empty local Folder deletion non-destructive and offers opening the Folder instead', async () => {
@@ -612,15 +672,16 @@ describe('WorkspaceExplorer', () => {
       completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: 'This connected source controls its own order.',
+        reason: "This source controls the order of its results. Sorting and type filters aren't available here.",
       },
     })
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
+    expect(screen.getByRole('option', { name: 'Source order' })).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'This connected source controls its own order.',
+      "This source controls the order of its results. Sorting and type filters aren't available here.",
     )
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
@@ -676,7 +737,13 @@ describe('WorkspaceExplorer', () => {
 
     fireEvent.click(await screen.findByLabelText('Select Analysis'))
     fireEvent.click(screen.getByLabelText('Select Second analysis'))
-    fireEvent.click(screen.getByRole('button', { name: 'Move' }))
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Open canvas Analysis' }))
+    const menu = await screen.findByRole('menu', { name: 'Actions for Analysis' })
+    expect(menu).toHaveTextContent('2 selected')
+    expect(within(menu).queryByRole('menuitem', { name: 'Open' })).not.toBeInTheDocument()
+    expect(within(menu).queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(within(menu).queryByRole('menuitem', { name: 'Duplicate' })).not.toBeInTheDocument()
+    fireEvent.click(within(menu).getByRole('menuitem', { name: 'Move' }))
     expect(await screen.findByRole('dialog', { name: 'Move 2 Canvases' })).toHaveTextContent(
       'If any one changed or cannot be moved, none are moved.',
     )
