@@ -7,7 +7,6 @@ import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { FullResult } from '../panels/DataPanel'
 import { fmtMs } from '../panels/RunHistoryModal'
-import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -77,11 +76,18 @@ const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
   merge_columns_write: 'Column merge',
 }
 
-function jobPhase(item: WorkspaceJobDto): string | null {
-  if (item.mergeColumns) return `Column merge · ${readable(item.mergeColumns.phase)}`
-  if (item.externalWait) return `External wait · ${readable(item.externalWait.phase)}`
-  if (item.checkpoint) return `Checkpoint · ${readable(item.checkpoint.phase)}`
-  if (item.boundedFanout) return `Fan-out · ${readable(item.boundedFanout.stage)}`
+function jobStep(item: WorkspaceJobDto): string | null {
+  if (item.mergeColumns) return item.mergeColumns.phase === 'failed' ? 'Column merge failed' : 'Merging columns'
+  if (item.externalWait) {
+    if (item.externalWait.phase === 'downloading') return 'Downloading data'
+    return `Waiting for external work · ${readable(item.externalWait.phase)}`
+  }
+  if (item.checkpoint) {
+    return item.checkpoint.phase === 'materializing'
+      ? 'Saving result for reuse'
+      : `Preparing reusable result · ${readable(item.checkpoint.phase)}`
+  }
+  if (item.boundedFanout) return 'Processing partitions'
   return null
 }
 
@@ -459,7 +465,6 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const publishedRevision = managedWriteRevisionReceipt(item, committed)
   const rows = item.rows ?? item.profile?.rowCount ?? null
-  const phase = jobPhase(item)
   const report = item.distributionReport
   const dataset = item.datasetContext
   const datasetHref = publishedRevision
@@ -486,6 +491,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
                     : 'In progress'
   const outcomeDetail = item.error ? 'Open for failure details' : !report && rows != null ? rowLabel(rows) : null
   const duration = item.ms != null ? fmtMs(item.ms) : active ? 'In progress' : 'Unavailable'
+  const step = jobStep(item)
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
@@ -506,6 +512,10 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       <span className="hidden whitespace-nowrap text-[10.5px] text-muted-foreground md:block">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
+      {step && <div role="status" aria-label="Job progress" className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground sm:col-span-2">
+        <span><strong className="text-foreground">Current step</strong> · {step}</span>
+        {item.boundedFanout && <span>{item.boundedFanout.completedPartitions} of {item.boundedFanout.partitionCount} partitions complete</span>}
+      </div>}
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
         {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
         {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
@@ -519,31 +529,8 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         </button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
+        {onClone && <Button size="sm" variant="outline" onClick={onClone}>Duplicate Canvas</Button>}
       </div>
-      <details className="sm:col-span-2 rounded-md border border-border bg-background px-3 py-2">
-        <summary className="cursor-pointer font-semibold text-muted-foreground">Diagnostics</summary>
-        <div className="mt-3 grid gap-2">
-          <div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>
-          {committed.length > 0 && <div><strong>Saved results:</strong> {committed.map((output, index) =>
-            `Result ${index + 1} · ${output.nodeId}:${output.portId}`).join(', ')}</div>}
-          {item.canvasId && <ExecutionManifestDetail canvasId={item.canvasId} subjectId={item.id} summary={item} onClone={onClone} />}
-          {item.taskId && <>
-            {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}
-            {item.externalWait && <div><strong>External provider:</strong> {item.externalWait.providerKind} · provider attempt #{item.externalWait.attemptNumber}</div>}
-            {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
-            {item.boundedFanout && <div><strong>Fan-out:</strong> {item.boundedFanout.completedPartitions}/{item.boundedFanout.partitionCount ?? '—'} partitions{item.boundedFanout.failedPartitions ? ` · ${item.boundedFanout.failedPartitions} failed` : ''} · checkpoint {item.boundedFanout.checkpoint} · gather {item.boundedFanout.gather}{item.boundedFanout.diagnosticCode ? ` · ${item.boundedFanout.diagnosticCode}` : ''}</div>}
-            {item.mergeColumns && <div><strong>Column merge:</strong> {readable(item.mergeColumns.phase)} · candidate {item.mergeColumns.candidate}{item.mergeColumns.reused ? ' (reused)' : ''}{item.mergeColumns.candidateRows != null ? ` · ${item.mergeColumns.candidateRows.toLocaleString()} rows` : ''}{item.mergeColumns.diagnosticCode ? ` · ${item.mergeColumns.diagnosticCode}` : ''}</div>}
-            <div><strong>Input versions:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
-            {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
-            {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="w-fit rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
-          </>}
-          {publishedRevision && <ExactRevisionReceipt receipt={publishedRevision} />}
-        </div>
-      </details>
     </div>}
   </article>
-}
-
-function ExactRevisionReceipt({ receipt }: { receipt: WriteReceipt }) {
-  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
 }

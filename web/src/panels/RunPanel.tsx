@@ -9,7 +9,7 @@ import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
-import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import type { CanvasDoc, CanvasParameterDeclaration } from '../types/graph'
 import type { DatasetViewerCanvasReturn } from '../router'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
@@ -49,7 +49,6 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
   const st = run?.status
-  const pinnedInputs = pinnedSourceInputs(doc, nodeId)
   const writeAdmission = run?.writeAdmission
     ?? (run?.phase === 'done' ? run.writeOutcomeAdmission : undefined)
   const writeSubmissionUnresolved = Boolean(
@@ -146,10 +145,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
               {confirmationCopy(est, writeAdmission, visibleRows)}
             </div>
-            <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
-              isWrite={isWrite} outputName={outputName} destination={destination}
+            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
               admission={writeAdmission} receipt={receipt ?? undefined}
-              returnToCanvas={returnToCanvas} />
+              returnToCanvas={returnToCanvas} />}
           </> : <>
             <Label>ESTIMATE</Label>
             <div className="mt-0.5 flex items-baseline gap-2">
@@ -417,31 +415,6 @@ function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc })
   </div>
 }
 
-function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: string; title: string; ref: DatasetRef }[] {
-  const byId = new Map(doc.nodes.map((node) => [node.id, node]))
-  const incoming = new Map<string, string[]>()
-  const children = new Map<string, string[]>()
-  for (const edge of doc.edges) incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source])
-  for (const node of doc.nodes) {
-    if (node.parentId) children.set(node.parentId, [...(children.get(node.parentId) ?? []), node.id])
-  }
-  const selected = new Set<string>()
-  const pending = byId.has(targetNodeId) ? [targetNodeId] : []
-  while (pending.length) {
-    const current = pending.pop()!
-    if (selected.has(current)) continue
-    selected.add(current)
-    pending.push(...(incoming.get(current) ?? []))
-    if (byId.get(current)?.type === 'section') pending.push(...(children.get(current) ?? []))
-  }
-  return doc.nodes.flatMap((node) => {
-    const ref = node.data.config.datasetRef
-    return selected.has(node.id) && node.type === 'source' && ref && !isParameterRef(ref)
-      ? [{ nodeId: node.id, title: node.data.title, ref }]
-      : []
-  })
-}
-
 type ConfirmationReason = NonNullable<RunEstimate['confirmationReasons']>[number]
 
 function confirmationReasons(estimate: RunEstimate, admission?: WriteAdmission): ConfirmationReason[] {
@@ -472,37 +445,6 @@ function confirmationCopy(
               ? 'Data size is not available, and this input is above the small-run limit.'
               : 'This run needs your explicit confirmation.'
   return `${cost} ${risk}`
-}
-
-function ConfirmationTechnicalDetails({
-  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt, returnToCanvas,
-}: {
-  estimate: RunEstimate
-  pinnedInputs: { nodeId: string; title: string; ref: DatasetRef }[]
-  isWrite: boolean
-  outputName: string
-  destination: string
-  admission?: WriteAdmission
-  receipt?: WriteReceipt
-  returnToCanvas: DatasetViewerCanvasReturn
-}) {
-  const reasons = confirmationReasons(estimate, admission)
-  return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-    <div className="mt-2 grid gap-1 break-all">
-      {estimate.breakdown && <div>{estimate.breakdown}</div>}
-      {reasons.length > 0 && <div>Confirmation reason{reasons.length === 1 ? '' : 's'}: {reasons.join(', ').replaceAll('_', ' ')}</div>}
-      {pinnedInputs.map((input) => {
-        const exact = datasetRefIdentity(input.ref)
-        return <div key={input.nodeId}>
-          {input.title} · dataset {exact.datasetId} · revision {exact.revisionId}
-          {input.ref.kind === 'as_of' ? ` · as of ${new Date(input.ref.asOf).toLocaleString()}` : ''}
-        </div>
-      })}
-      {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
-        admission={admission} receipt={receipt} returnToCanvas={returnToCanvas} />}
-    </div>
-  </details>
 }
 
 function formatByteEstimate(value: number): string {

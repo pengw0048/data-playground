@@ -158,7 +158,7 @@ describe('admitted run inputs', () => {
     preview: { columns: [], rows: [{ value: 1 }], hasMore: false, rowLimit: 100 as const },
   })
 
-  it('preserves manifest order and opens the admitted exact revision through Catalog', async () => {
+  it('preserves input order and shows useful saved-version facts without internal identities', async () => {
     useStore.setState({ doc: {
       id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [
         { id: 'source-b', type: 'source', position: { x: 0, y: 0 }, data: { title: 'Customers', status: 'latest', config: {}, history: [] } },
@@ -184,13 +184,11 @@ describe('admitted run inputs', () => {
     expect(within(items[0]).getByText('Source Orders')).toBeInTheDocument()
     expect(within(items[1]).getByText('Source Customers')).toBeInTheDocument()
     expect(await within(items[0]).findByText('Orders dataset')).toBeInTheDocument()
-    const diagnostics = within(items[0]).getByText('Diagnostics').closest('details')!
-    expect(within(diagnostics).getByText('Saved version ID revision-a')).not.toBeVisible()
-    await user.click(within(diagnostics).getByText('Diagnostics'))
-    expect(within(diagnostics).getByText('Saved version ID revision-a')).toBeVisible()
-    expect(within(diagnostics).getByText(/original reference choice was not recorded/)).toBeVisible()
+    expect(within(items[0]).queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(within(items[0]).queryByText('revision-a')).not.toBeInTheDocument()
     await user.click(within(items[0]).getByRole('button', { name: 'Show saved version details' }))
     expect(within(items[0]).getByText('12')).toBeInTheDocument()
+    expect(within(items[0]).queryByText('parent-1')).not.toBeInTheDocument()
     expect(apiMock.datasetRevision).toHaveBeenCalledWith('dataset-a', 'revision-a')
   })
 
@@ -455,10 +453,8 @@ describe('durable full results', () => {
     render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
     expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Diagnostics' }))
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/run-direct/)
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/target:out/)
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/Statecommitted/)
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('run-direct')).not.toBeInTheDocument()
   })
 
   it('does not mislabel an authorization failure as expiration', async () => {
@@ -477,17 +473,14 @@ describe('durable full results', () => {
       completeness: 'unknown', wire: 'dataset', notPreviewable: false, ...response,
     })
 
-    const user = userEvent.setup()
     render(<FullResult uri="/outputs/opaque.parquet" total={105} {...fullIdentity} />)
 
     expect(await screen.findByText(title)).toBeInTheDocument()
     expect(screen.getByText(response.reason)).toBeInTheDocument()
     expect(screen.queryByText(/Complete artifact/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Export all rows' })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Diagnostics' }))
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(
-      /run-direct.*target:out.*Statecommitted/s,
-    )
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('run-direct')).not.toBeInTheDocument()
   })
 
   it('lets HEAD preflight decide exportability for a result URI without a file suffix', async () => {
@@ -596,16 +589,9 @@ describe('durable full results', () => {
     expect(screen.getByText('existing')).toBeVisible()
     expect(screen.getByText('published')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open dataset' })).toBeVisible()
-    const receipt = await screen.findByLabelText('Write receipt for run lance-write-history')
-    expect(receipt).not.toHaveAttribute('open')
-    expect(within(receipt).getByText(/durable revision 8/i)).not.toBeVisible()
-    fireEvent.click(within(receipt).getByText('Diagnostics'))
-    expect(receipt).toHaveAttribute('open')
-    expect(within(receipt).getByText(/durable revision 8/i)).toBeVisible()
-    expect(receipt).toHaveTextContent(/dataset dataset-lance/i)
-    expect(receipt).toHaveTextContent(/parent 7/i)
-    expect(receipt).toHaveTextContent(/backend 8\.0\.0/i)
-    expect(receipt).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('dataset-lance')).not.toBeInTheDocument()
+    expect(screen.queryByText('8.0.0')).not.toBeInTheDocument()
   })
 
   it('renders typed user-code exceptions with an edit action and no full-pass retry', async () => {
@@ -1276,15 +1262,8 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
       'failed-named-output-run', 'target', 'pass', 50, 0,
     ))
-    const trigger = screen.getByRole('button', { name: 'Diagnostics' })
-    expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    await user.click(trigger)
-    expect(trigger).toHaveAttribute('aria-expanded', 'true')
-    const details = screen.getByTestId('full-result-technical-details')
-    expect(details).toHaveTextContent(/failed-named-output-run/)
-    expect(details).toHaveTextContent(/target:pass/)
-    expect(within(details).getByText('State')).toBeInTheDocument()
-    expect(within(details).getByText('committed')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('failed-named-output-run')).not.toBeInTheDocument()
   })
 
   it('does not carry a same-named port selection across a nodeId change', () => {

@@ -77,6 +77,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
     && typeof data.config.version === 'string' && data.config.version.length > 0
   const accent = kindAccent[kind] ?? '#8a8f98'
   const st = statusTok[data.status] ?? statusTok.draft
+  const showRunStatus = data.status === 'queued' || data.status === 'running' || data.status === 'failed'
   const bypassed = !!data.bypassed
   const disabled = !!data.disabled
   const off = disabled || offDownstream  // dimmed either way; only self-disabled shows the badge
@@ -125,13 +126,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
           <div className="min-w-0 flex-1 pt-[11px] pr-3 pb-3 pl-2.5">
             {/* header */}
             <div className="flex items-center gap-[7px]">
-              <span
+              {showRunStatus && <span
                 className={cn('w-3 text-center text-xs leading-none', data.status === 'running' && 'dp-running-glyph')}
                 style={{ color: st.color }}
                 title={st.label}
               >
                 {st.glyph}
-              </span>
+              </span>}
               <EditableTitle id={id} title={data.title} selected={selected} canEdit={canEdit} />
               <span className="flex-1" />
               {disabled && (
@@ -145,7 +146,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
                 </span>
               )}
               {(data.config as Record<string, unknown>)?.checkpoint ? (
-                <span className="shrink-0 text-[9px] leading-none text-primary" title="Checkpointed — output materialized (inspectable + reused across runs)">●</span>
+                <span className="shrink-0 text-[9px] leading-none text-primary" title="This step’s result is saved for reuse">●</span>
               ) : null}
               <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">
                 {tag}

@@ -109,7 +109,6 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
                 : preview ? <PreviewTable preview={preview} /> : null}
           </section>
           <DistributionReportLauncher definition={definition} />
-          <DatasetViewTechnicalDetails definition={definition} />
         </div>
       </div>
       <footer className="border-t border-border p-4">
@@ -122,27 +121,6 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       </footer>
     </div>
   </div>
-}
-
-function DatasetViewTechnicalDetails({ definition }: { definition: DatasetViewDefinition }) {
-  return <details data-testid="dataset-view-technical-details" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
-      <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.datasetId}</dd>
-      <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.revisionId}</dd>
-      <dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{definition.id}</dd>
-      {definition.sampling.kind === 'reservoir' && <><dt>Sampling seed</dt><dd className="font-mono text-foreground">{definition.sampling.seed}</dd></>}
-      <dt>Semantic SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.semanticSha256}</dd>
-      <dt>Definition SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.definitionSha256}</dd>
-      {definition.sampleProvenance && <><dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{definition.sampleProvenance.identity}</dd></>}
-      <dt>Retention owner</dt><dd className="font-mono text-foreground">{definition.retentionOwner}</dd>
-      <dt>Creator ID</dt><dd className="break-all font-mono text-foreground">{definition.creatorId}</dd>
-      <dt>Schema version</dt><dd className="font-mono text-foreground">{definition.schemaVersion}</dd>
-      <dt>Container ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.containerId}</dd>
-      <dt>Placement ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.placementId}</dd>
-      <dt>Source registration ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.sourceRegistrationId}</dd>
-    </dl>
-  </details>
 }
 
 function PreviewTable({ preview }: { preview: DatasetViewPreview }) {

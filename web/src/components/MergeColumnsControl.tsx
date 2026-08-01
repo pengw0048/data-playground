@@ -40,7 +40,14 @@ function newSubmissionId(): string {
 
 function cleanError(caught: unknown): string {
   const message = caught instanceof Error ? caught.message : String(caught)
-  // API diagnostics are already sanitized.  Do not decorate them with request or storage detail.
+  if (/identityColumns/i.test(message) && /rules/i.test(message)) {
+    return 'Choose at least one identity column and add at least one column mapping.'
+  }
+  if (/identityColumns/i.test(message)) return 'Choose at least one identity column.'
+  if (/rules/i.test(message)) return 'Add at least one column mapping.'
+  if (/^\s*[\[{]/.test(message)) {
+    return 'Column merge setup is incomplete. Review the identity columns and column mappings.'
+  }
   return message || 'Column merge could not be admitted.'
 }
 
@@ -389,15 +396,10 @@ function PreflightSummary({ value }: { value: MergeColumnsPreflight }) {
   const c = value.coverage
   return <div aria-label="Merge check" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
     <div className="font-semibold text-foreground">{value.eligible ? 'Ready to merge saved versions' : 'Not ready to merge'}</div>
-    <div className="mt-0.5 break-all font-mono">base {value.base.datasetId}@{value.base.revisionId}</div>
-    <div>Identity order: <span className="font-mono">{value.identityColumns.join(', ') || 'none'}</span></div>
-    <div>Declared key suggestion (not verified): {value.declaredKey.length ? <span className="font-mono">{value.declaredKey.join(', ')}</span> : 'none'}</div>
-    <div>Base coverage: {countLabel(c.base.rows)} rows · {countLabel(c.base.uniqueIdentities)} unique · {countLabel(c.base.nullRows)} null · {countLabel(c.base.duplicateGroups)} duplicate groups ({countLabel(c.base.duplicateRows)} rows)</div>
-    <div>Candidate coverage: {countLabel(c.candidate.rows)} rows · {countLabel(c.candidate.uniqueIdentities)} unique · {countLabel(c.candidate.nullRows)} null · {countLabel(c.candidate.duplicateGroups)} duplicate groups ({countLabel(c.candidate.duplicateRows)} rows)</div>
-    <div>Coverage: {c.status} · {countLabel(c.matchedIdentities)} matched · {countLabel(c.missingIdentities)} missing · {countLabel(c.extraIdentities)} extra</div>
-    <div>Mapping: {value.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div>
-    <div>Checked destination version: <span className="font-mono">{value.expectedHead.revisionId}</span></div>
-    <div>Output schema: {value.outputSchema.length ? value.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'no fields'}</div>
-    <div>Evidence: {value.provenance.producer} · {value.provenance.source === 'exact' ? 'saved version' : value.provenance.source} · {value.provenance.selectKind} v{value.provenance.selectVersion}</div>
+    <div className="mt-0.5">Identity columns: <span className="font-mono">{value.identityColumns.join(', ') || 'none'}</span></div>
+    <div>Rows checked: current dataset {countLabel(c.base.rows)} · selected data {countLabel(c.candidate.rows)}</div>
+    <div>Identity matches: {countLabel(c.matchedIdentities)} matched · {countLabel(c.missingIdentities)} missing · {countLabel(c.extraIdentities)} extra</div>
+    <div>Column changes: {value.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div>
+    <div>Result columns: {value.outputSchema.length ? value.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'no fields'}</div>
   </div>
 }

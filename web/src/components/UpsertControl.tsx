@@ -292,7 +292,7 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
       expectedHead={preflight.expectedHead.revisionId} keys={preflight.keys} schema={preflight.outputSchema} eligible={preflight.eligible} />}
 
     {task && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-      <div className="font-semibold text-foreground">{task.status}{task.diagnosticCode ? ` · ${task.diagnosticCode === 'stale_expected_head' ? 'destination has a newer version' : task.diagnosticCode.replaceAll('_', ' ')}` : ''}</div>
+      <div className="font-semibold text-foreground">{task.status}{task.diagnosticCode === 'stale_expected_head' ? ' · destination has a newer version' : ''}</div>
       {task.evidence && <div className="mt-0.5">{countLabel(task.evidence.matched)} matched · {countLabel(task.evidence.inserted)} inserted · {countLabel(task.evidence.unchanged)} unchanged</div>}
       {(task.canCancel || task.canRetry) && <div className="mt-1 flex gap-1">
         {task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}

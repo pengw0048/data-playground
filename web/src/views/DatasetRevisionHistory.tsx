@@ -273,18 +273,6 @@ export function DatasetRevisionHistory({
             return <div key={`${revision.datasetId}:${revision.revisionId}`}
               className="flex items-stretch border-b border-border/60 last:border-0">
               {openControl}
-              <details data-testid={`revision-technical-details-${revision.revisionId}`}
-                className="group shrink-0 border-l border-border/60 px-2 py-1.5 text-[9.5px] text-muted-foreground">
-                <summary className="cursor-pointer list-none rounded px-1 py-0.5 font-semibold hover:bg-accent [&::-webkit-details-marker]:hidden">
-                  Diagnostics
-                </summary>
-                <dl className="mt-1 grid max-w-[300px] grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-0.5 rounded bg-muted/40 p-2">
-                  <dt>Dataset</dt><dd className="dp-mono break-all text-foreground">{revision.datasetId}</dd>
-                  <dt>Revision</dt><dd className="dp-mono break-all text-foreground">{revision.revisionId}</dd>
-                  <dt>Retention</dt><dd className="text-foreground">{revision.retentionOwner}</dd>
-                  <dt>Committed</dt><dd className="dp-mono break-all text-foreground">{revision.committedAt ?? 'not provided'}</dd>
-                </dl>
-              </details>
             </div>
           })}
         </div>}
@@ -355,8 +343,9 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
           Open data
         </a>}
         {canSave && <button type="button" onClick={() => onSave(detail)}
+          aria-label="Create reusable view"
           className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
-          Save view
+          Create view
         </button>}
         {detail.retentionOwner === 'core' && detail.revisionId !== headRevisionId
           && <button type="button" data-testid="restore-revision" onClick={() => onRestore(detail)}
@@ -365,18 +354,6 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
           </button>}
       </div>
     </div>
-    <details data-testid="revision-technical-details"
-      className="rounded-md border border-border px-2 py-1.5 text-[9.5px] text-muted-foreground">
-      <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-      <dl className="mt-1.5 grid grid-cols-[auto,minmax(0,1fr)] gap-x-2 gap-y-1">
-        <dt>Dataset ID</dt><dd className="dp-mono break-all text-foreground">{detail.datasetId}</dd>
-        <dt>Revision ID</dt><dd className="dp-mono break-all text-foreground">{detail.revisionId}</dd>
-        <dt>Parent revision</dt><dd className="dp-mono break-all text-foreground">{detail.parentRevisionId ?? 'not evidenced'}</dd>
-        <dt>Retention owner</dt><dd className="text-foreground">{detail.retentionOwner}</dd>
-        <dt>Producer</dt><dd className="text-foreground">{detail.producerOperation ?? 'not provided'}</dd>
-        <dt>Committed evidence</dt><dd className="dp-mono break-all text-foreground">{detail.committedAt ?? 'not provided'}</dd>
-      </dl>
-    </details>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
       : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">The previous version is unavailable, so schema and summary changes are unknown.</div>
@@ -505,7 +482,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
       })
       if (request !== generation.current) return
       submission.current = { fingerprint: '', id: '' }
-      pushToast(`Saved “${created.name}” beside its source in Workspace`, 'success')
+      pushToast(`Created “${created.name}” beside its source in Workspace`, 'success')
       onClose()
       switchWorkspaceScope('all')
       setWorkspaceResource(`dataset_view:${created.id}`)
@@ -517,14 +494,17 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
   }
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
-    <div role="dialog" aria-modal="true" aria-label="Save version as view" aria-busy={busy}
+    <div role="dialog" aria-modal="true" aria-label="Create a reusable view" aria-busy={busy}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
       onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2">
-        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Save version as view</h2>
-          <p className="truncate text-[10.5px] text-muted-foreground">{table.name} · revision {detail.revisionId}</p></div>
-        <button onClick={onClose} disabled={busy} aria-label="Close save view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Create a reusable view</h2>
+          <p className="truncate text-[10.5px] text-muted-foreground">{table.name} · selected version</p></div>
+        <button onClick={onClose} disabled={busy} aria-label="Close create view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
       </div>
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        A view remembers this version, the selected columns, filters, and sampling without copying the dataset.
+      </p>
       <div className="min-h-0 overflow-y-auto pr-1">
         <div className="grid gap-3">
           <label className="grid gap-1 text-[11px] font-semibold text-foreground">Name
@@ -550,7 +530,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
             <label className="flex items-start gap-2 rounded-md border border-border p-2 text-[11px]"><input type="radio" name="view-sampling" checked={sampling === 'all'} onChange={() => setSampling('all')} />
               <span><strong>All matching rows</strong><span className="block text-[10px] text-muted-foreground">The definition stays lazy; previews remain bounded to 100 rows.</span></span></label>
             <label className="flex items-start gap-2 rounded-md border border-border p-2 text-[11px]"><input type="radio" name="view-sampling" checked={sampling === 'reservoir'} onChange={() => setSampling('reservoir')} />
-              <span className="min-w-0 flex-1"><strong>Deterministic reservoir</strong><span className="block text-[10px] text-muted-foreground">Saving scans the complete filtered local revision to establish evidence. Each preview replays that full scan; the rows are not materialized.</span>
+              <span className="min-w-0 flex-1"><strong>Deterministic reservoir</strong><span className="block text-[10px] text-muted-foreground">Creating the view scans the complete filtered version. The view stores this setup, not another copy of the rows.</span>
                 {sampling === 'reservoir' && <span className="mt-2 grid grid-cols-2 gap-2">
                   <label className="grid gap-1 text-[10px] text-muted-foreground">Rows<input aria-label="Reservoir rows" type="number" min="1" max="100000" value={size} onChange={(event) => setSize(event.target.value)} className="dp-input text-foreground" /></label>
                   <label className="grid gap-1 text-[10px] text-muted-foreground">Seed<input aria-label="Reservoir seed" type="number" min="0" max={MAX_RESERVOIR_SEED} value={seed} onChange={(event) => setSeed(event.target.value)} className="dp-input text-foreground" /></label>
@@ -559,11 +539,11 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
           </fieldset>
         </div>
       </div>
-      {error && <div role="alert" className="text-[11px] text-destructive">Couldn't save this view: {error}</div>}
+      {error && <div role="alert" className="text-[11px] text-destructive">Couldn't create this view: {error}</div>}
       <div className="flex justify-end gap-2">
         <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
         <button onClick={() => void submit()} disabled={busy || !name.trim() || !selected.length}
-          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Saving view…' : 'Save view'}</button>
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating view…' : 'Create view'}</button>
       </div>
     </div>
   </div>

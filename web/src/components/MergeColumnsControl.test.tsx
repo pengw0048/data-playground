@@ -69,6 +69,20 @@ describe('MergeColumnsControl', () => {
     expect(mocks.submit.mock.calls[0][0].graph.nodes.map((node: any) => node.id)).toEqual(['source', 'select', 'write'])
   })
 
+  it('turns structured validation errors into an actionable setup message', async () => {
+    mocks.preflight.mockRejectedValue(new Error(
+      '[{"loc":["body","identityColumns"],"msg":"List should have at least 1 item"},{"loc":["body","rules"],"msg":"List should have at least 1 item"}]',
+    ))
+    render(<MergeColumnsControl nodeId="write" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Choose at least one identity column and add at least one column mapping.',
+    )
+    expect(screen.queryByText(/"loc"/)).not.toBeInTheDocument()
+  })
+
   it('invalidates preflight when a destination-fallback Write title changes', async () => {
     const write = mocks.state.doc.nodes.find((node: any) => node.id === 'write')
     delete write.data.config.filename

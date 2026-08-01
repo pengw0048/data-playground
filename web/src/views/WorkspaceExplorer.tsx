@@ -2342,13 +2342,16 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   onRetry: () => void; onUse: () => void; onOpenLineageDataset: (catalogId: string) => void; onRelink: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const openRelationships = useStore((state) => state.openRelationships)
+  const workspaceScope = useStore((state) => state.workspaceScope)
+  const workspaceSearchQuery = useStore((state) => state.workspaceSearchQuery)
+  const workspaceDatasetQuery = useStore((state) => state.workspaceDatasetQuery)
   const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
   const [canonicalContextError, setCanonicalContextError] = useState<string | null>(null)
   const [canonicalContextRevision, setCanonicalContextRevision] = useState(0)
   const [preview, setPreview] = useState<DatasetRevisionDetail | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [previewRevision, setPreviewRevision] = useState(0)
-  const placementId = providerPlacementId(resource)
   const placementPath = providerPlacementObservations.placementPath(resource)
   const alternatePlacements = providerPlacementObservations.alternatePlacements(resource)
   const placementState = resource.referenceState ?? (resource.detached ? 'detached' : 'current')
@@ -2392,6 +2395,18 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
     setCanonicalContextRevision((current) => current + 1)
     setPreviewRevision((current) => current + 1)
     onRetry()
+  }
+  const openLineageGraph = () => {
+    if (!canonicalContext?.sourceUri) return
+    openRelationships(canonicalContext.sourceUri, {
+      mode: 'lineage',
+      returnTo: {
+        resourceId: resource.id,
+        scope: workspaceScope,
+        workspaceQuery: workspaceSearchQuery,
+        datasetQuery: workspaceDatasetQuery,
+      },
+    })
   }
   useEffect(() => {
     const controller = new AbortController()
@@ -2441,7 +2456,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   return <section aria-label={resource.name}
     className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
     data-testid="provider-dataset-viewer">
-      <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
+      <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-card px-5 py-3">
         <button onClick={onClose} aria-label={backLabel}
           className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
           <Icon name="chevronLeft" size={14} /> Back
@@ -2451,6 +2466,11 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
           <div className="truncate text-[10.5px] text-muted-foreground">Mounted dataset · {resource.provider ?? resource.mountId ?? 'external source'}</div>
         </div>
+        <button type="button" onClick={openLineageGraph} disabled={!canonicalContext?.sourceUri}
+          title={!canonicalContext?.sourceUri ? 'Lineage becomes available after this dataset connection is verified.' : undefined}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-45">
+          <Icon name="lineage" size={12} /> Lineage
+        </button>
         <button onClick={onRetry} aria-label="Reload dataset"
           className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
           <Icon name="refresh" size={12} /> Reload
@@ -2464,6 +2484,10 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Location</div>
           <div className="break-words">Connected source <strong>{resource.mountId ?? 'external'}</strong>{placementPath ? ` / ${placementPath}` : ''}</div>
           {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
+          {alternatePlacements.length > 0 && <div className="mt-1 grid gap-1 text-[11px] text-muted-foreground">
+            <div className="font-semibold text-foreground">Other locations</div>
+            {alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}
+          </div>}
         </section>
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
           <div className="text-[11px] text-muted-foreground">{selectedRevisionId
@@ -2517,7 +2541,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
                   })}</tr></thead><tbody>{preview.preview.rows.map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[280px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
               : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
           <div className="order-3">
-            <DatasetLineageSummary uri={canonicalContext?.datasetIdentity} name={resource.name}
+            <DatasetLineageSummary uri={canonicalContext?.sourceUri} name={resource.name}
               onOpenDataset={onOpenLineageDataset} />
           </div>
         </section>}
@@ -2531,18 +2555,6 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           {(resource.lastKnown || placementState !== 'current' || canonicalUnavailable)
             && <button type="button" onClick={onRelink} className="ml-2 font-semibold underline">Relink</button>}
         </div>}
-        <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-          <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
-            {resource.providerDatasetId && <div><div className="text-muted-foreground">Provider dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
-            {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}
-            {(canonicalContext || exactRevision) && <div><div className="text-muted-foreground">Dataset ID</div><div className="break-all font-mono">{selectedDatasetId}</div>{selectedRevisionId && <><div className="mt-1 text-muted-foreground">Version ID</div><div className="break-all font-mono">{selectedRevisionId}</div></>}<div className="mt-1 text-muted-foreground">Version selection</div><div>{exactRevision || canonicalContext?.readMode === 'exact' ? 'Selected version' : 'Follow latest'}</div></div>}
-            <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
-            {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Dataset status · {canonicalState.replace('_', ' ')}</div>}
-            {resource.lastKnown && <div className="text-muted-foreground">Retained placement facts{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
-            {source && <div className="text-muted-foreground">Provider result state · {source.completeness}</div>}
-            {alternatePlacements.length > 0 && <div><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1 text-muted-foreground">Only placements already loaded in this Workspace session are shown.</div></div>}
-          </div>
-        </details>
         </div>
       </div>
   </section>

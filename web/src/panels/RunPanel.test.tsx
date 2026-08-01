@@ -207,10 +207,8 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByText(revisionId)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run 2,001 rows' })).toBeVisible()
 
-    const technicalDetails = screen.getByText('Diagnostics').parentElement!
-    expect(technicalDetails).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(technicalDetails).toHaveAttribute('open')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Binary column/)).not.toBeInTheDocument()
   })
 
   it.each([
@@ -256,9 +254,8 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getAllByText('Run 2,000 rows')).toHaveLength(2)
     expect(screen.getByText(/This full run will process 2,000 rows/)).toBeVisible()
-    const details = screen.getByText('Diagnostics').closest('details')!
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(details).toHaveTextContent('size unknown · retained input was not reopened during admission')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('size unknown · retained input was not reopened during admission')).not.toBeInTheDocument()
   })
 
   it.each(['bounded', 'unknown'])(
@@ -424,10 +421,8 @@ describe('RunPanel typed parameter gate', () => {
     } }
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByLabelText('Schema comparison')).toHaveTextContent(
-      'dataset-1@revision-1')
-    expect(screen.getByLabelText('Schema comparison')).toHaveTextContent(
-      'Structural schema drift requires explicit confirmation')
+    expect(screen.getByLabelText('Schema changes')).toHaveTextContent('extra: nullable field was added')
+    expect(screen.getByLabelText('Schema changes')).not.toHaveTextContent('dataset-1@revision-1')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
       'Review schema changes before running.')
     fireEvent.click(screen.getByRole('button', { name: 'Publish a new version' }))
@@ -510,14 +505,9 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
     expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
-    const details = screen.getByText('Diagnostics').closest('details')!
-    expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('committed · catalog · dataset')
-    expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('managed://dataset-1')
-    expect(publication).toHaveTextContent('file:///revision-9.parquet')
-    expect(publication).toHaveTextContent('catalog-9')
-    expect(publication).toHaveTextContent('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(publication).not.toHaveTextContent('file:///revision-9.parquet')
+    expect(publication).not.toHaveTextContent('catalog-9')
   })
 
   it.each([

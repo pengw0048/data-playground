@@ -217,6 +217,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const cfg = node.data.config as Record<string, unknown>
   const bspec = getBackendSpec(kind)
   const st = statusTok[node.data.status] ?? statusTok.draft
+  const showRunStatus = node.data.status === 'queued'
+    || node.data.status === 'running'
+    || node.data.status === 'failed'
   const libraryTransform = kind === 'transform' && cfg.source === 'library'
   const codeParams = (bspec?.params ?? []).filter((p) => (
     p.type === 'code' && !libraryTransform
@@ -259,9 +262,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const runtimeRequirement = resourceSpecSummary(bspec?.requires ?? spec?.requires)
   const legacyRequirementOverride = resourceSpecSummary(cfg.requires)
   const checkpointed = cfg.checkpoint === true
+  const checkpointAvailable = canEnableLinearCheckpoint(doc, nodeId)
   const hasAutomaticCompute = kind === 'transform' || kind === 'section'
   const showsCompute = hasAutomaticCompute || Boolean(runtimeRequirement) || Boolean(legacyRequirementOverride)
-  const hasCheckpointControls = kind !== 'source' && kind !== 'note' && kind !== 'write'
+  const hasCheckpointControls = checkpointed || checkpointAvailable
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
@@ -323,8 +327,10 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
           {/* a note is an annotation — it never runs, so a run status (draft/stale/…) is meaningless */}
           {kind === 'note' ? <span>annotation</span>
-            : <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</>}
-          {inspectorBlurb && <span title={inspectorBlurb} className="min-w-0 leading-relaxed text-muted-foreground/70">· {inspectorBlurb}</span>}
+            : showRunStatus ? <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</> : null}
+          {inspectorBlurb && <span title={inspectorBlurb} className="min-w-0 leading-relaxed text-muted-foreground/70">
+            {kind === 'note' || showRunStatus ? '· ' : ''}{inspectorBlurb}
+          </span>}
         </div>
       </div>
 
@@ -358,12 +364,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {configuredManagedSidecarMerge ? <ManagedSidecarMergeControl nodeId={nodeId} />
           : configuredMerge ? <MergeColumnsControl nodeId={nodeId} />
           : configuredUpsert ? <UpsertControl nodeId={nodeId} />
-            : <details className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
-              <summary className="cursor-pointer font-semibold text-foreground">Advanced write operations</summary>
-              <ManagedSidecarMergeControl nodeId={nodeId} />
-              <MergeColumnsControl nodeId={nodeId} />
-              <UpsertControl nodeId={nodeId} />
-            </details>}
+            : null}
       </>}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
@@ -427,7 +428,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {hasCheckpointControls && <details open={advancedExecutionOpen}
         onToggle={(event) => setAdvancedExecutionOpen(event.currentTarget.open)}
         className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 p-3 text-[10.5px]">
-        <summary className="cursor-pointer font-semibold text-foreground">Materialization options</summary>
+        <summary className="cursor-pointer font-semibold text-foreground">Run behavior</summary>
         <div className="mt-3 grid gap-3">
           <EditOnly enabled={canEdit}><CheckpointToggle nodeId={nodeId} embedded /></EditOnly>
         </div>
@@ -740,8 +741,8 @@ function ExecutionSummary({ runtimeRequirement, legacyRequirementOverride, showC
         </div>
       </div>}
       {checkpointed && <div className="flex items-center justify-between gap-2">
-        <span><strong>Materialization</strong> · Checkpointed output</span>
-        {canEdit && <Button variant="ghost" size="sm" onClick={onEditMaterialization} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Edit materialization</Button>}
+        <span><strong>Saved result</strong> · Reused by later runs</span>
+        {canEdit && <Button variant="ghost" size="sm" onClick={onEditMaterialization} className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Change</Button>}
       </div>}
     </div>
   </Section>
@@ -755,17 +756,17 @@ function CheckpointToggle({ nodeId, embedded = false }: { nodeId: string; embedd
   const available = canEnableLinearCheckpoint(doc, nodeId)
   const disabled = !available && !on
   return (
-    <Section title="Materialization" embedded={embedded}>
+    <Section title="Reuse this result" embedded={embedded}>
       <button data-testid="checkpoint-toggle" disabled={disabled}
         onClick={() => updateConfig(nodeId, { checkpoint: on ? undefined : true })}
         className="flex w-full items-start gap-2 rounded-md border border-border px-2.5 py-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
         <span className={cn('mt-[3px] h-2.5 w-2.5 shrink-0 rounded-full', on ? 'bg-primary' : 'border border-muted-foreground')} />
         <span className="min-w-0 flex-1">
-          <span className="block text-[11.5px] font-medium text-foreground">{on ? 'Checkpointed' : 'Checkpoint here'}</span>
+          <span className="block text-[11.5px] font-medium text-foreground">{on ? 'Result saved for reuse' : 'Reuse this result'}</span>
           <span className="mt-0.5 block text-[10.5px] leading-snug text-muted-foreground">
-            {on ? 'Output materialized — inspectable and reused across runs.'
-              : available ? 'Materialize this step’s output.'
-                : 'Checkpoints are available only for Source → Select → Write.'}
+            {on ? 'Later runs can start from this saved result.'
+              : available ? 'Save this step’s result so later runs can start here.'
+                : 'This is available only in a simple Source → Select → Write flow.'}
           </span>
         </span>
       </button>
@@ -928,7 +929,7 @@ function RunPlan({ nodeId }: { nodeId: string }) {
                 <span className="rounded bg-muted px-1.5 py-px text-[9px]" title="declared resource requirement">needs {r.requires}</span>
               )}
               {multi && i < regions.length - 1 && r.tier && (
-                <span className="rounded bg-muted px-1.5 py-px text-[9px]" title="materialization tier for the handoff">→ {r.tier}</span>
+                <span className="rounded bg-muted px-1.5 py-px text-[9px]" title="storage used between execution regions">→ {r.tier}</span>
               )}
             </div>
           ))}

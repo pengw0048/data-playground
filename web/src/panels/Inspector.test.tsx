@@ -454,10 +454,9 @@ describe('Inspector — effective named outputs', () => {
     expect(publication).toHaveTextContent('Workspace outputs')
     expect(publication).toHaveTextContent(label)
     expect(publication).toHaveTextContent('Ready to run')
-    expect(screen.getByText('Diagnostics').closest('details')).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(publication).toHaveTextContent('managed-local-file')
-    expect(publication).toHaveTextContent('dataset-1@rev-1')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(publication).not.toHaveTextContent('managed-local-file')
+    expect(publication).not.toHaveTextContent('dataset-1@rev-1')
   })
 
   it('returns from destination Settings with the picker draft intact and destinations reloaded', async () => {
@@ -572,9 +571,8 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
     expect(screen.getByText('Mode').parentElement).toHaveTextContent('Append to the selected dataset')
     expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@7')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write publication')).not.toHaveTextContent('dataset-lance@8')
   })
 
   it('does not invent an exact result when no receipt exists', () => {
@@ -590,14 +588,11 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Run finished, but the published dataset could not be confirmed.')
   })
 
-  it('keeps merge and upsert controls out of the ordinary Write flow until Advanced opens', () => {
+  it('keeps specialized merge and upsert controls out of an ordinary Write', () => {
     selectNode('write', undefined)
     render(<Inspector />)
-    const advanced = screen.getByText('Advanced write operations').closest('details')
-    expect(advanced).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Advanced write operations'))
-    expect(advanced).toHaveAttribute('open')
-    expect(screen.getByLabelText('Column merge setup')).toBeInTheDocument()
+    expect(screen.queryByText('Advanced write operations')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Column merge setup')).not.toBeInTheDocument()
   })
 })
 
@@ -620,13 +615,8 @@ describe('Inspector — advanced execution', () => {
     expect(screen.queryByText('Legacy override')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPU type')).not.toBeInTheDocument()
-    const advanced = screen.getByText('Materialization options').closest('details')
-    expect(advanced).not.toHaveAttribute('open')
-    expect(screen.getByText('Materialization')).not.toBeVisible()
-
-    fireEvent.click(screen.getByText('Materialization options'))
-    expect(advanced).toHaveAttribute('open')
-    expect(screen.getByText('Materialization')).toBeVisible()
+    expect(screen.queryByText('Run behavior')).not.toBeInTheDocument()
+    expect(screen.queryByText('Materialization')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
   })
 
@@ -774,10 +764,10 @@ describe('Inspector — output columns', () => {
     render(<Inspector />)
 
     expect(screen.getByText(/8 GPUs · a100/)).toBeVisible()
-    expect(screen.getByText(/Checkpointed output/)).toBeVisible()
+    expect(screen.getByText(/Saved result/).parentElement).toHaveTextContent('Reused by later runs')
     expect(screen.getByText(/code changed after these output columns were saved/i)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Edit materialization' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Change' })).not.toBeInTheDocument()
     expect(screen.getByDisplayValue('clean_id')).toBeDisabled()
   })
 })
@@ -1044,15 +1034,15 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Materialization options'))
+    fireEvent.click(screen.getByText('Run behavior'))
     const toggle = screen.getByTestId('checkpoint-toggle')
     expect(toggle).toBeEnabled()
     fireEvent.click(toggle)
     expect((useStore.getState().doc.nodes.find((node) => node.id === 'select')?.data.config as any).checkpoint).toBe(true)
-    expect(screen.getByRole('button', { name: 'Edit materialization' }).parentElement).toHaveTextContent('Checkpointed output')
+    expect(screen.getByRole('button', { name: 'Change' }).parentElement).toHaveTextContent('Saved result · Reused by later runs')
   })
 
-  it('disables an unsupported checkpoint where a researcher encounters it', () => {
+  it('hides unsupported result reuse from an unrelated transform', () => {
     const source = { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', history: [], config: {} } }
     const filter = { id: 'filter', type: 'filter', position: { x: 0, y: 0 }, data: { title: 'filter', status: 'draft', history: [], config: {} } }
     const transform = { id: 'transform', type: 'transform', position: { x: 0, y: 0 }, data: { title: 'transform', status: 'draft', history: [], config: {} } }
@@ -1068,9 +1058,8 @@ describe('Inspector — linear checkpoint availability', () => {
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Materialization options'))
-    expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
-    expect(screen.getByText('Checkpoints are available only for Source → Select → Write.')).toBeInTheDocument()
+    expect(screen.queryByText('Run behavior')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('checkpoint-toggle')).not.toBeInTheDocument()
   })
 
   it.each([
@@ -1129,15 +1118,15 @@ describe('Inspector — linear checkpoint availability', () => {
         { id: 'select-write', source: 'select', sourceHandle: 'out', target: 'write', targetHandle: 'in' },
       ],
     }],
-  ])('disables a checkpoint for %s', (_case, doc) => {
+  ])('hides result reuse for %s', (_case, doc) => {
     useStore.setState({
       selectedIds: ['select'], canvasRole: 'owner', runs: {}, schemas: {},
       doc: { id: 'checkpoint', version: 1, requirements: [], ...doc },
     } as any)
 
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Materialization options'))
-    expect(screen.getByTestId('checkpoint-toggle')).toBeDisabled()
+    expect(screen.queryByText('Run behavior')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('checkpoint-toggle')).not.toBeInTheDocument()
   })
 })
 
@@ -1180,7 +1169,8 @@ describe('Inspector — Source connection details', () => {
     expect(details).toHaveTextContent('revision:an-intentionally-long-opaque-identity')
     expect(await screen.findByText('Field evidence · 1 column')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
-    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
+    expect(await screen.findByTestId('field-evidence-customer_id')).not.toHaveTextContent('selected exact schema')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(exact).toHaveBeenCalledWith('provider:dataset:an-intentionally-long-opaque-identity', 'revision:an-intentionally-long-opaque-identity')
     exact.mockRestore()
   })
@@ -1704,7 +1694,7 @@ describe('Inspector — execution-plan hierarchy', () => {
     expect(screen.getByText('source-9342868352a9')).toBeVisible()
     expect(screen.getByText('join-5-33741')).toBeVisible()
     expect(screen.getByText('ray-data')).toBeVisible()
-    expect(screen.getByTitle('materialization tier for the handoff')).toHaveTextContent('object')
+    expect(screen.getByTitle('storage used between execution regions')).toHaveTextContent('object')
   })
 
   it('does not present parallel branches as a serial backend path', async () => {

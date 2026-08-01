@@ -32,10 +32,8 @@ describe('FieldEvidenceButton', () => {
     expect(screen.getByText('customer-r7')).toBeVisible()
     expect(screen.getByText('Logical type')).toBeVisible()
     expect(screen.getByText('Nullable')).toBeVisible()
-    expect(screen.getByText('owned by the orders provider')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(screen.getByText('owned by the orders provider')).toBeVisible()
-    expect(screen.getByText('utf8')).toBeVisible()
+    expect(screen.queryByText('owned by the orders provider')).not.toBeInTheDocument()
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('Customers (renamed)')).toBeVisible())
     expect(screen.getByRole('link', { name: 'Open current catalog entry' })).toHaveAttribute('href', '#/workspace/dataset%3Acustomers%20registration%2F1')
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('customers-logical')
@@ -52,7 +50,7 @@ describe('FieldEvidenceButton', () => {
     expect(screen.queryByRole('link', { name: 'Open current catalog entry' })).toBeNull()
   })
 
-  it('omits unavailable reference and annotation copy from a field without evidence', async () => {
+  it('omits unavailable reference and raw annotation copy from a field without evidence', async () => {
     const absent: ColumnSchema = { name: 'legacy_row_id', type: 'int', capabilities: [], provenance: 'inferred' }
     render(<FieldEvidenceButton column={absent} />)
 

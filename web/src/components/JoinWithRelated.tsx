@@ -531,16 +531,6 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                     {['inner', 'left', 'right', 'outer'].map((item) => <option key={item}>{item}</option>)}
                   </select>
                 </div>
-                <details className="text-[10px] text-muted-foreground">
-                  <summary>Details</summary>
-                  <div className="mt-1">Evidence detail: {candidate.reason}</div>
-                  <div className="mt-1 break-all font-mono">
-                    Selected binding: {sourceFallback}<br />
-                    Related binding: {candidateIdentity}
-                  </div>
-                  {revisionError && <div className="mt-1 break-all font-mono">Diagnostic: {revisionError}</div>}
-                  {error && <div className="mt-1 break-all font-mono">Diagnostic: {error}</div>}
-                </details>
               </div>
               {error && <div role="alert" className="mt-3 rounded border border-destructive/30 p-2 text-[11px] text-destructive">
                 {friendlyActionError(error)}

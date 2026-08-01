@@ -625,11 +625,6 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
       <div className="grid grid-cols-2 gap-2"><button onClick={() => setMode('new')} disabled={busy} aria-pressed={mode === 'new'} className={`rounded-lg border p-3 text-left ${mode === 'new' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Create new Canvas</strong><span className="text-[10.5px] text-muted-foreground">Create in Workspace</span></button><button onClick={() => setMode('existing')} disabled={busy} aria-pressed={mode === 'existing'} className={`rounded-lg border p-3 text-left ${mode === 'existing' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Add to Canvas</strong><span className="text-[10.5px] text-muted-foreground">Choose an editable Canvas</span></button></div>
       {mode === 'new' ? <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name<input aria-label="New Canvas name" value={name} onChange={(event) => setName(event.target.value)} disabled={busy} className="dp-input" /></label> : editable.length ? <>
         <label className="grid gap-1 text-[11px] text-muted-foreground">Target Canvas<select aria-label="Target Canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} disabled={busy} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
-        {editable.find((file) => file.id === canvasId) && <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-          <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-          <div className="mt-1.5 break-all font-mono">Canvas ID: {canvasId}</div>
-          <div className="mt-1">Version {editable.find((file) => file.id === canvasId)?.version}</div>
-        </details>}
       </> : <div role="status" className="text-[12px] text-muted-foreground">No editable Canvas is available. Create a new Canvas instead.</div>}
       {destinationError && mode === 'new' && <div role="alert" className="text-[12px] text-destructive">Couldn't load Workspace: {destinationError}</div>}
       {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}

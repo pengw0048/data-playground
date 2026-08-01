@@ -182,16 +182,6 @@ function RunInputManifest({ historyId, manifest }: {
                 <div className="mt-1 break-all text-muted-foreground">
                   Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? 'Dataset from this run'}</span>
                 </div>
-                <details className="mt-1 text-[9.5px] text-muted-foreground">
-                  <summary className="w-fit cursor-pointer font-medium hover:text-foreground">Diagnostics</summary>
-                  <div className="mt-1 grid gap-0.5 rounded bg-muted/30 p-1.5">
-                    {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all">Canvas step {item.node_id}</div>}
-                    <div className="dp-mono break-all">Dataset ID {item.dataset_id}</div>
-                    <div className="dp-mono break-all">Saved version ID {item.revision_id}</div>
-                    <div>Source type {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
-                    <div>The original reference choice was not recorded for this older run.</div>
-                  </div>
-                </details>
               </div>
               <AvailabilityBadge availability={current?.availability ?? 'checking'} />
             </div>
@@ -226,8 +216,6 @@ function ExactRevisionFacts({ detail }: { detail: DatasetRevisionDetail }) {
     </button>
     {open && <div data-testid="run-input-revision-detail" className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 rounded bg-muted/40 p-2 text-muted-foreground">
       <span>Committed</span><span>{detail.committedAt ? formatManifestTime(detail.committedAt) : 'not provided'}</span>
-      <span>Retention</span><span>{detail.retentionOwner}</span>
-      <span>Parent</span><span className="dp-mono break-all">{detail.parentRevisionId ?? 'not evidenced'}</span>
       <span>Rows</span><span>{detail.summary.rowCount == null ? 'unknown' : detail.summary.rowCount.toLocaleString()}</span>
       <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} row{detail.preview.rows.length === 1 ? '' : 's'} from this saved version{detail.preview.hasMore ? ' (truncated)' : ''}</span>
     </div>}
@@ -285,17 +273,6 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
-            {output.writeReceipt && (
-              <details aria-label={`Write receipt for run ${historyId}`} className="mx-4 mb-2 text-[10.5px] text-muted-foreground">
-                <summary className="w-fit cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-                <div className="dp-mono mt-1 break-all">
-                  durable revision {output.writeReceipt.revisionId}
-                  {' · '}dataset {output.writeReceipt.datasetId}
-                  {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
-                  {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
-                </div>
-              </details>
-            )}
             {output.sampleProvenance && <div className="px-4 pb-2"><SampleProvenanceSummary provenance={output.sampleProvenance} /></div>}
             {openKey === key && readable && (
               <div className="border-t border-border">
@@ -353,10 +330,10 @@ export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
   return (
     <div className="bg-muted/30 px-3 py-2.5">
       {/* honest label (DATA-05): this is the time to BUILD each node's lazy plan step, not to
-          materialize it — the out-of-core engine defers the heavy work to the target's single pass,
+          execute it — the out-of-core engine defers the heavy work to the target's single pass,
           so don't read these as each node's share of the run. */}
       <div className="mb-1.5 text-[11px] text-muted-foreground"
-           title="Time to build each node's lazy plan step — not its materialization time (the engine defers the heavy work to the target's single pass).">
+           title="Time to build each node's plan step, not the time spent processing its data.">
         Plan build time per node
       </div>
       <div className="flex flex-col gap-1">

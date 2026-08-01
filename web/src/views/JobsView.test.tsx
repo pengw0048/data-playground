@@ -20,8 +20,6 @@ const job = (overrides = {}) => ({
   outputs: [], createdAt: '2026-07-16T12:00:00Z', ...overrides,
 })
 
-const openTechnicalEvidence = () => fireEvent.click(screen.getByText('Diagnostics'))
-
 describe('JobsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -60,9 +58,8 @@ describe('JobsView', () => {
     expect(screen.getAllByText('destination unavailable')).toHaveLength(1)
     expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
     expect(screen.queryByRole('link', { name: 'Open canvas' })).not.toBeInTheDocument()
-    openTechnicalEvidence()
-    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
-    expect(screen.getByText('Last durable update:').closest('div')).toHaveTextContent('Last durable update: Unavailable')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('Last durable update:')).not.toBeInTheDocument()
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
   })
 
@@ -164,18 +161,14 @@ describe('JobsView', () => {
     }
   })
 
-  it('keeps diagnostics closed until a researcher asks for them', async () => {
+  it('keeps internal run evidence out of the user-facing Job detail', async () => {
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
 
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
-    const evidence = screen.getByText('Diagnostics').closest('details')!
-    expect(evidence).not.toHaveAttribute('open')
-    expect(screen.getByText('Current attempt:')).not.toBeVisible()
-
-    openTechnicalEvidence()
-    expect(screen.getByText('Current attempt:')).toBeVisible()
-    expect(screen.getByText('Run:').closest('div')).toHaveTextContent('run-1')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('Current attempt:')).not.toBeInTheDocument()
+    expect(screen.queryByText('Run:')).not.toBeInTheDocument()
   })
 
   it('rechecks the same unavailable deep link after returning to Jobs', async () => {
@@ -448,7 +441,7 @@ describe('JobsView', () => {
     expect(screen.getByRole('complementary', { name: 'Saved result' })).toBeVisible()
   })
 
-  it('keeps a completed row concise and moves multiple port identities into diagnostics', async () => {
+  it('keeps a completed row concise and exposes multiple results as direct actions', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       status: 'done', progress: 1, error: null, rows: 1,
       outputs: [
@@ -477,10 +470,8 @@ describe('JobsView', () => {
     expect(screen.queryByText('Rows:', { exact: true })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Open result 1' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open result 2' })).toBeVisible()
-    openTechnicalEvidence()
-    expect(screen.getByText('Saved results:', { exact: true }).closest('div')).toHaveTextContent(
-      'Result 1 · transform-1:clean, Result 2 · transform-1:rejected',
-    )
+    expect(screen.queryByText('transform-1:clean')).not.toBeInTheDocument()
+    expect(screen.queryByText('transform-1:rejected')).not.toBeInTheDocument()
   })
 
   it('keeps progress visible for active work without adding a second status signal', async () => {
@@ -575,14 +566,11 @@ describe('JobsView', () => {
       '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dwrite-run',
     )
     expect(screen.queryByRole('button', { name: 'Open result' })).not.toBeInTheDocument()
-    openTechnicalEvidence()
-    expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
-      'dataset dataset-1 · revision revision-7 · 12 rows',
-    )
+    expect(screen.queryByText('Receipt:')).not.toBeInTheDocument()
     expect(screen.getAllByRole('link', { name: 'Open dataset' })).toHaveLength(1)
   })
 
-  it('shows exact durable task state and requests cancellation from Jobs', async () => {
+  it('shows useful durable task progress and requests cancellation from Jobs', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'task-1', taskId: 'task-1', status: 'running', error: null,
       progress: 0.5, updatedAt: '2026-07-16T12:00:30Z',
@@ -596,12 +584,9 @@ describe('JobsView', () => {
       name: 'Open run task-1 in Alpha research', expanded: false,
     }))
 
-    openTechnicalEvidence()
-    expect(screen.getByText(/dataset-1@revision-7/)).toBeVisible()
-    expect(screen.getByText(/#1 running/).closest('li')).toHaveTextContent('Progress 50%')
-    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: 50%')
-    expect(screen.getByText('Last durable update:').closest('div')).not.toHaveTextContent('Unavailable')
-    expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Open run task-1 in Alpha research' })).toHaveTextContent('50%')
+    expect(screen.queryByText(/dataset-1@revision-7/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/expected head head-6/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
   })
@@ -613,8 +598,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
-    openTechnicalEvidence()
-    expect(screen.getByText('Column merge:', { exact: true })).toBeVisible()
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Merging columns')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelMergeColumnsTask).toHaveBeenCalledWith('merge-1'))
     expect(mocks.cancelRun).not.toHaveBeenCalledWith('merge-1')
@@ -664,7 +648,6 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
-    openTechnicalEvidence()
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
@@ -672,7 +655,7 @@ describe('JobsView', () => {
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(1)
   })
 
-  it('loads the selected durable task manifest through its current Canvas subject', async () => {
+  it('offers a direct Duplicate Canvas recovery action without exposing the saved manifest', async () => {
     const digest = 'b'.repeat(64)
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       id: 't:task-manifest', runId: 'task-manifest', taskId: 'task-manifest', error: null,
@@ -694,14 +677,10 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run task-manifest in Alpha research', expanded: false,
     }))
-    openTechnicalEvidence()
     expect(mocks.executionManifest).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: /Saved run setup/ }))
-
-    expect(await screen.findByText('Submitted graph')).toBeVisible()
-    expect(screen.getByText(/"threshold"/)).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
-    expect(mocks.executionManifest).toHaveBeenCalledWith('canvas-1', 't:task-manifest')
+    expect(screen.getByRole('button', { name: 'Duplicate Canvas' })).toBeVisible()
+    expect(screen.queryByText('Submitted graph')).not.toBeInTheDocument()
+    expect(screen.queryByText(digest)).not.toBeInTheDocument()
   })
 
   it('reuses one retry action id after an ambiguous request failure', async () => {
@@ -717,8 +696,8 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run task-2 in Alpha research', expanded: false,
     }))
-    expect(screen.getByText(/#1 fenced/).closest('li')).toHaveTextContent('Progress Unavailable')
-    expect(screen.getByText(/#2 failed/).closest('li')).toHaveTextContent('Progress Unavailable')
+    expect(screen.queryByText('attempt-1')).not.toBeInTheDocument()
+    expect(screen.queryByText('attempt-2')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
     expect(await screen.findByText(/Job action failed: response lost/)).toBeVisible()
     const actionId = mocks.retryRun.mock.calls[0][1]
@@ -727,7 +706,7 @@ describe('JobsView', () => {
     expect(mocks.retryRun.mock.calls[1]).toEqual(['task-2', actionId])
   })
 
-  it('renders parent-only bounded fan-out stage and partition progress', async () => {
+  it('renders bounded partition progress in plain language', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'fan-1', taskId: 'fan-1', status: 'running', error: null,
       boundedFanout: {
@@ -745,13 +724,14 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run fan-1 in Alpha research', expanded: false,
     }))
-    const fanout = screen.getByText('Fan-out:').closest('div')
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Fan-out · running partitions')
-    expect(fanout).toHaveTextContent('Fan-out: 2/4 partitions · checkpoint reused · gather pending')
+    const progress = screen.getByRole('status', { name: 'Job progress' })
+    expect(progress).toHaveTextContent('Current step · Processing partitions')
+    expect(progress).toHaveTextContent('2 of 4 partitions complete')
+    expect(progress).not.toHaveTextContent('checkpoint reused')
     expect(screen.queryByText(/unitId|planDigest|range/i)).not.toBeInTheDocument()
   })
 
-  it('renders existing external-wait and checkpoint phases without inventing a generic phase', async () => {
+  it('renders external and reusable-result work in plain language', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [
       job({
         id: 'external-history', runId: 'external-1', taskId: 'external-1', status: 'running',
@@ -767,12 +747,12 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Open run external-1 in Alpha research', expanded: false }))
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: External wait · downloading')
-    expect(screen.getByText('External provider:').closest('div')).toHaveTextContent('fixture-local · provider attempt #2')
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Downloading data')
+    expect(screen.queryByText('fixture-local')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Open run checkpoint-1 in Alpha research', expanded: false }))
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Checkpoint · materializing')
-    expect(screen.getByText('Checkpoint:').closest('div')).toHaveTextContent('checkpoint:out')
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Saving result for reuse')
+    expect(screen.queryByText('materializing')).not.toBeInTheDocument()
   })
 
   it('renders a canvas-less dataset task with an exact dataset-viewer deep-link', async () => {

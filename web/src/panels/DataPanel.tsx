@@ -1322,7 +1322,6 @@ export function FullResult({
   const previousOffsets = useRef<number[]>([])
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
-  const [technicalOpen, setTechnicalOpen] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
   const pageSize = presentation?.kind === 'chart' ? CHART_DISPLAY_LIMIT : PAGE
   const publishedDataset = publicationKind === 'catalog'
@@ -1335,7 +1334,6 @@ export function FullResult({
   useEffect(() => {
     previousOffsets.current = []
     setOffset(0)
-    setTechnicalOpen(false)
   }, [uri, runId, nodeId, portId])
   useEffect(() => {
     let live = true
@@ -1377,25 +1375,10 @@ export function FullResult({
       {exporting ? 'Preparing export…' : 'Export all rows'}
     </Button>
   ) : undefined
-  const technicalTrigger = hasRunIdentity ? (
-    <button type="button" aria-label="Diagnostics" aria-expanded={technicalOpen}
-      onClick={() => setTechnicalOpen((open) => !open)}
-      className="shrink-0 rounded px-1 py-0.5 text-[10.5px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
-      Diagnostics
-    </button>
-  ) : undefined
-  const technicalPanel = hasRunIdentity && technicalOpen ? (
-    <FullResultEvidence runId={runId!} nodeId={nodeId!} portId={portId!}
-      state={publishedDataset ? 'published' : 'committed'} />
-  ) : undefined
-  const technicalChrome = hasRunIdentity ? (
-    <>
-      <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-[11px] py-2">
-        {modeToggle}
-        {technicalTrigger}
-      </div>
-      {technicalPanel}
-    </>
+  const modeChrome = hasRunIdentity ? (
+    <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-[11px] py-2">
+      {modeToggle}
+    </div>
   ) : undefined
 
   if (!hasRunIdentity) return (
@@ -1409,23 +1392,23 @@ export function FullResult({
     </Button>
   ) : undefined
 
-  if (err) return <ArtifactUnavailable error={err} chrome={technicalChrome}
+  if (err) return <ArtifactUnavailable error={err} chrome={modeChrome}
     label={viewLabel} action={exportAction} missingAction={runAction}
     onRetry={() => setRetry((n) => n + 1)} currentResult={currentResult} />
   if (!data) return <div className="dp-dark text-foreground">
-    {technicalChrome}
+    {modeChrome}
     <Skeleton />
   </div>
   if (data.error) return (
     <FullResultMessage title={`Couldn’t read ${viewLabel.toLowerCase()}`}
       reason={data.reason ?? 'The kernel reported an error while reading this run output.'}
-      chrome={technicalChrome} action={exportAction}
+      chrome={modeChrome} action={exportAction}
       onRetry={() => setRetry((n) => n + 1)} />
   )
   if (data.notPreviewable) return (
     <FullResultMessage title={`${viewLabel} cannot be previewed`}
       reason={data.reason ?? 'This artifact adapter does not provide a bounded interactive preview.'}
-      chrome={technicalChrome} action={exportAction} />
+      chrome={modeChrome} action={exportAction} />
   )
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
@@ -1449,7 +1432,6 @@ export function FullResult({
             {' · '}{reportedTotal == null ? 'row count unknown' : `${reportedTotal.toLocaleString()} ${reportedTotal === 1 ? 'row' : 'rows'}`}
           </span>
           {modeToggle}
-          {technicalTrigger}
           {detail != null && (
             <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
               <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
@@ -1479,7 +1461,6 @@ export function FullResult({
           </div>
         )}
       </div>
-      {technicalPanel}
       {(data.completeness === 'capped' || data.limitScope || data.limitReason || data.sampleProvenance) && (
         <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
           unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
@@ -1496,25 +1477,6 @@ export function FullResult({
             : <RowsTable columns={cols} rows={rows} onRowClick={setDetail}
               fillAvailableHeight={fillAvailableHeight} />}
     </div>
-  )
-}
-
-function FullResultEvidence({ runId, nodeId, portId, state }: {
-  runId: string
-  nodeId: string
-  portId: string
-  state: 'committed' | 'published'
-}) {
-  return (
-    <dl data-testid="full-result-technical-details"
-      className="grid min-w-0 grid-cols-[44px_minmax(0,1fr)] gap-x-2 gap-y-1 border-b border-border bg-muted/20 px-[11px] py-2 text-[10.5px] text-muted-foreground">
-      <dt className="font-medium text-foreground">Run</dt>
-      <dd className="dp-mono min-w-0 break-all">{runId}</dd>
-      <dt className="font-medium text-foreground">Output</dt>
-      <dd className="dp-mono min-w-0 break-all">{nodeId}:{portId}</dd>
-      <dt className="font-medium text-foreground">State</dt>
-      <dd>{state}</dd>
-    </dl>
   )
 }
 

@@ -10,7 +10,7 @@ import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { MediaCellRenderer } from '../components/MediaCellRenderer'
 import { PreviewDetails, PreviewSummary } from '../components/PreviewPresentation'
 import type {
-  CatalogQueryParams, CatalogTable, CatalogUnregisterResult, DatasetRevisionDetail,
+  CatalogFolder, CatalogQueryParams, CatalogTable, CatalogUnregisterResult, DatasetRevisionDetail,
   DatasetRevisionResolution, Facets, FolderNode, KernelInfo, LineageResult, SampleResult,
 } from '../types/api'
 
@@ -591,11 +591,6 @@ export function CatalogDiscovery({
         </div>
       </CatalogModal>}
 
-      {/* Facets stay bounded with the active query. Empty folders remain discoverable through
-          the lazy folder tree rather than forcing every folder into the page. */}
-      <datalist id="dp-folder-options">
-        {facets.folders.map((item) => <option key={item.value} value={item.value} />)}
-      </datalist>
     </div>
   )
 }
@@ -1279,16 +1274,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     resetTo(base)
     pushToast('Discarded unsaved catalog edits', 'info')
   }
-  const copyLocation = async () => {
-    if (!navigator.clipboard?.writeText) {
-      pushToast('Copy is not available in this browser', 'error')
-      return
-    }
-    try {
-      await navigator.clipboard.writeText(table.uri)
-      pushToast('Dataset location copied', 'success')
-    } catch (e) { pushToast(`Couldn't copy dataset location: ${errorMessage(e)}`, 'error') }
-  }
   const save = async (against = base) => {
     if (!atomicMetadataEditable) return
     if (!against.metadataRevision) {
@@ -1326,7 +1311,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     ? requestedExactDetail?.preview.columns ?? []
     : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
-  const displayedVersion = requestedExact ?? exactFacts ?? latestHead
   const exactVersionContext = !requestedExact
     ? null
     : latestHead
@@ -1338,12 +1322,22 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     setDeclaredPk(next)
   }
   const persistedDeclaredKey = initialKey(base)
+  const openLineageGraph = () => openRelationships(table.uri, {
+    focusDatasetId: table.registrationId ?? table.id,
+    mode: 'lineage',
+    returnTo: {
+      resourceId: workspaceResourceId ?? `dataset:${table.registrationId ?? table.id}`,
+      scope: workspaceScope,
+      workspaceQuery: workspaceSearchQuery,
+      datasetQuery: workspaceDatasetQuery,
+    },
+  })
 
   return (
     <div className="absolute inset-0 z-30 flex overflow-hidden bg-background" data-testid="dataset-viewer">
       <div role="region" aria-label={table.name}
         className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background">
-        <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-5 py-3">
+        <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-card px-5 py-3">
           <button ref={closeRef} onClick={requestClose} aria-label={backLabel}
             className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">
             <Icon name="chevronLeft" size={14} /> Back
@@ -1355,6 +1349,17 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               {exactVersionContext ?? 'Latest dataset'}
             </div>
           </div>
+          <button type="button" onClick={openLineageGraph} data-testid="detail-relationships"
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
+            <Icon name="lineage" size={12} /> Lineage
+          </button>
+          {folderActionVisible && <button type="button" onClick={() => onFolder(table.folder ?? '')}
+            disabled={folderActionDisabled} title={folderActionTitle}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-45">
+            <Icon name="external" size={12} /> {folderActionLabel}
+          </button>}
+          {onFolderRetry && <button type="button" onClick={onFolderRetry}
+            className="shrink-0 text-[11.5px] font-semibold text-primary hover:underline">Retry</button>}
           {requestedExact
             ? <span data-testid="detail-use-unavailable"
               className="shrink-0 rounded-md bg-muted px-2.5 py-1 text-[11.5px] font-semibold text-muted-foreground">
@@ -1390,7 +1395,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               </div>
               <div className="mt-3 grid gap-2 md:grid-cols-2">
                 <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
-                <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} disabled={!atomicMetadataEditable} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
+                <Field label="Folder"><CatalogFolderSelect value={folder} onChange={setFolder}
+                  disabled={!atomicMetadataEditable} testId="detail-folder" /></Field>
                 <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
                 <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
                 <div className="md:col-span-2"><Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field></div>
@@ -1461,30 +1467,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 </div> : null}
               </>}
             </section>
-
-            <details data-testid="detail-dataset-details" className="rounded-lg border border-border px-3 py-2 text-[11px]">
-              <summary className="cursor-pointer font-semibold text-foreground">
-                Diagnostics
-              </summary>
-              <div className="mt-2 grid gap-2">
-                <div className="flex items-start gap-2">
-                  <code data-testid="dataset-location" className="min-w-0 flex-1 break-all text-[10.5px] text-muted-foreground">{table.uri}</code>
-                  <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
-                </div>
-                {table.registrationId ? <div>
-                  <div className="text-[10px] text-muted-foreground">Registration ID</div>
-                  <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
-                </div> : null}
-                {displayedVersion ? <div data-testid="dataset-version-identity">
-                  <div className="text-[10px] text-muted-foreground">
-                    {requestedExact ? 'Selected version ID' : 'Version ID'}
-                  </div>
-                  <code className="break-all text-[10.5px] text-foreground">
-                    {revisionLabel(displayedVersion)}
-                  </code>
-                </div> : null}
-              </div>
-            </details>
 
           {!requestedExact && headChecking && !latestHead ? (
             <div role="status" className="text-[11px] text-muted-foreground">Checking the latest dataset version…</div>
@@ -1591,29 +1573,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </> : null}
           </section>
 
-          <button onClick={() => openRelationships(table.uri, {
-            focusDatasetId: table.registrationId ?? table.id,
-            mode: 'lineage',
-            returnTo: {
-              resourceId: workspaceResourceId ?? `dataset:${table.registrationId ?? table.id}`,
-              scope: workspaceScope,
-              workspaceQuery: workspaceSearchQuery,
-              datasetQuery: workspaceDatasetQuery,
-            },
-          })} data-testid="detail-relationships"
-            className="inline-flex items-center gap-2 self-start rounded-md border border-border bg-card px-3 py-2 text-[12px] font-semibold text-primary hover:bg-accent">
-            <Icon name="lineage" size={14} /> Open lineage graph
-          </button>
-          {folderActionVisible && (
-            <div className="flex items-center gap-2">
-              <button onClick={() => onFolder(table.folder ?? '')} disabled={folderActionDisabled} title={folderActionTitle}
-                className="self-start text-[11.5px] text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-45">
-                {folderActionLabel}{table.folder ? ` “${table.folder}”` : ''} →
-              </button>
-              {onFolderRetry && <button type="button" onClick={onFolderRetry}
-                className="text-[11.5px] font-semibold text-primary hover:underline">Retry</button>}
-            </div>
-          )}
           <button onClick={() => setConfirmUnregister(true)} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
             title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'
               : !base.registrationId || !base.metadataRevision ? 'Reload this dataset before removing it' : undefined}
@@ -1784,8 +1743,50 @@ export function AddDataModal({
   </div>
 }
 
-// Register modal — the URI is required; name/folder/tags/owner/description are all optional curation
-// the backend register already accepts. Folder autocompletes from the shared #dp-folder-options list.
+function CatalogFolderSelect({ value, onChange, disabled = false, testId }: {
+  value: string
+  onChange: (value: string) => void
+  disabled?: boolean
+  testId?: string
+}) {
+  const [folders, setFolders] = useState<CatalogFolder[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const generation = useRef(0)
+  const load = useCallback(async () => {
+    const request = ++generation.current
+    setLoading(true); setLoadError(null)
+    try {
+      const next = await api.catalogFolders()
+      if (request === generation.current) setFolders(next)
+    } catch (error) {
+      if (request === generation.current) setLoadError(errorMessage(error))
+    } finally {
+      if (request === generation.current) setLoading(false)
+    }
+  }, [])
+  useEffect(() => {
+    void load()
+    return () => { generation.current += 1 }
+  }, [load])
+  const options = useMemo(() => [...new Set([
+    ...folders.map((folder) => folder.path.trim()).filter(Boolean),
+    ...(value.trim() ? [value.trim()] : []),
+  ])].sort((left, right) => left.localeCompare(right)), [folders, value])
+  return <div className="grid gap-1">
+    <select value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled}
+      className="dp-input" data-testid={testId}>
+      <option value="">No folder</option>
+      {options.map((path) => <option key={path} value={path}>{path}</option>)}
+    </select>
+    {loading ? <span className="text-[10px] text-muted-foreground">Loading folders…</span> : null}
+    {loadError ? <span role="alert" className="text-[10px] text-destructive">
+      Couldn't load folders. <button type="button" onClick={() => void load()} className="font-semibold underline">Retry</button>
+    </span> : null}
+  </div>
+}
+
+// Register modal — the URI is required; name/folder/tags/owner/description are all optional curation.
 function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegistered: (t: CatalogTable) => void }) {
   const pushToast = useStore((s) => s.pushToast)
   const [uri, setUri] = useState('')
@@ -1851,7 +1852,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
           </div>
         </Field>
         <Field label="Name (optional)"><input value={name} onChange={(e) => setName(e.target.value)} placeholder={stem || 'defaults to the file name'} className="dp-input" /></Field>
-        <Field label="Folder (optional)"><input value={folder} onChange={(e) => setFolder(e.target.value)} list="dp-folder-options" placeholder="prod/images" className="dp-input" /></Field>
+        <Field label="Folder (optional)"><CatalogFolderSelect value={folder} onChange={setFolder} /></Field>
         <Field label="Tags (optional)"><input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
         <Field label="Owner (optional)"><input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="team or person" className="dp-input" /></Field>
         <Field label="Description (optional)"><textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="dp-input resize-y" /></Field>

@@ -361,7 +361,8 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByTestId('confirm-related-join'))
     await screen.findByRole('button', { name: 'Refresh review' })
     fireEvent.click(screen.getByRole('button', { name: 'Refresh review' }))
-    await screen.findByText(/refreshed review base/)
+    await waitFor(() => expect(mocks.related).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText(/refreshed review base/)).not.toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenLastCalledWith(
       page.source, expect.objectContaining({ reason: 'refreshed review base' }), 'rev-2', expect.any(Object),
@@ -380,7 +381,7 @@ describe('JoinWithRelated', () => {
     expect(screen.getByTestId('confirm-related-join')).toBeEnabled()
   })
 
-  it('keeps opaque bindings and diagnostic codes out of the default review', async () => {
+  it('keeps opaque bindings and diagnostic codes out of the related-data review', async () => {
     mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
@@ -389,12 +390,9 @@ describe('JoinWithRelated', () => {
     await waitFor(() => expect(mocks.relatedRevisions).toHaveBeenCalled())
     expect(screen.getByText('Not measured')).toBeVisible()
     expect(screen.queryByText('Version history is unavailable for this dataset.')).toBeNull()
-    const details = screen.getByText('Details').parentElement!
-    expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Details'))
-    expect(details).toHaveAttribute('open')
-    expect(details).toHaveTextContent('reg-users@current')
-    expect(details).toHaveTextContent('related_dataset_revision_history_unavailable')
+    expect(screen.queryByText('Details')).not.toBeInTheDocument()
+    expect(screen.queryByText('reg-users@current')).not.toBeInTheDocument()
+    expect(screen.queryByText('related_dataset_revision_history_unavailable')).not.toBeInTheDocument()
   })
 
   it('loads retained revision pages without losing the selected exact revision', async () => {

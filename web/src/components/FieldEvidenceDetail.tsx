@@ -71,16 +71,6 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
     return () => { live = false }
   }, [reference?.target.datasetId, reference?.target.kind, reference?.target.kind === 'exact' ? reference.target.revisionId : undefined])
 
-  const technicalFacts: Array<[string, string]> = [
-    ...(column.physicalType != null ? [['Physical type', column.physicalType]] as Array<[string, string]> : []),
-    ...(column.hasDefault != null ? [['Has default', fact(column.hasDefault)]] as Array<[string, string]> : []),
-    ...(column.fieldId != null ? [['Stable field identity', column.fieldId]] as Array<[string, string]> : []),
-    ...(column.provenance != null ? [['Schema provenance', column.provenance]] as Array<[string, string]> : []),
-    ...(reference ? [['Reference provenance', reference.provenance]] as Array<[string, string]> : []),
-    ...(target ? [['Current catalog identity', target.registrationId ?? target.id]] as Array<[string, string]> : []),
-  ]
-  const annotations = column.annotations ?? []
-
   return <div data-testid={`field-evidence-${column.name}`} className="grid gap-3 p-2 text-[10.5px]">
     <div>
       <div className="dp-mono break-all text-[12px] font-semibold text-foreground">{column.name}</div>
@@ -107,18 +97,6 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
           <a href={`#/workspace/${encodeURIComponent(`dataset:${target.registrationId ?? target.id}`)}`} className="mt-1 inline-block font-semibold text-primary underline">Open current catalog entry</a>
         </div>}
     </EvidenceSection>}
-
-    {(technicalFacts.length || annotations.length) ? <details className="rounded border border-border bg-muted/20 p-1.5">
-      <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
-      <div className="mt-2 grid gap-3">
-        {technicalFacts.length ? <EvidenceSection title="Schema metadata"><Facts values={technicalFacts} /></EvidenceSection> : null}
-        {annotations.length ? <EvidenceSection title="Raw annotations"><div className="grid gap-1.5">{annotations.map((annotation) => <div key={annotation.key} className="rounded border border-border bg-muted/20 p-1.5">
-          <div className="flex flex-wrap gap-x-2 text-[9.5px] text-muted-foreground"><span>{annotation.provenance}</span><span>{annotation.encoding}</span></div>
-          <div className="mt-0.5 break-all font-mono font-semibold text-foreground">{annotation.key}</div>
-          <div className="max-h-24 overflow-auto break-all font-mono text-[9.5px] text-foreground">{annotation.value}</div>
-        </div>)}</div></EvidenceSection> : null}
-      </div>
-    </details> : null}
   </div>
 }
 

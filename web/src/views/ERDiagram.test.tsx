@@ -192,6 +192,28 @@ describe('ERDiagram request truth', () => {
       currentOrders.uri, 1, 60))
   })
 
+  it('keeps a provider dataset visible when it is not registered in the local Catalog', async () => {
+    const providerUri = 'luma-data-exact://table/1437/revision/451'
+    store.erFocusUri = providerUri
+    store.erMode = 'lineage'
+    mocks.lineage.mockResolvedValue({
+      rootUri: providerUri,
+      nodes: [
+        { id: 'provider-1437', name: 'raw_video_v2', uri: providerUri, kind: 'table' },
+        { id: CUSTOMERS.id, name: CUSTOMERS.name, uri: CUSTOMERS.uri, kind: 'table' },
+      ],
+      edges: [{ parent: providerUri, child: CUSTOMERS.uri, factCount: 1 }],
+    })
+    mocks.tablesPage.mockResolvedValue({ items: [CUSTOMERS], total: 1, hasMore: false })
+    render(<ERDiagram />)
+
+    expect(await screen.findByText('Focused: raw_video_v2')).toBeInTheDocument()
+    expect(screen.getByText('raw_video_v2')).toBeInTheDocument()
+    expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveAttribute('data-focused', 'true')
+    expect(screen.getByText('customers')).toBeInTheDocument()
+    expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
+  })
+
   it('restores a routed stable focus in lineage mode and returns to its Dataset', async () => {
     store.erFocusDatasetId = ORDERS.registrationId!
     store.erMode = 'lineage'

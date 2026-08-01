@@ -222,12 +222,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByLabelText('Dataset preview scope')).toHaveTextContent('preview capped at 100 rows')
     expect(screen.getByLabelText('Dataset preview scope')).not.toHaveTextContent('logical-receipt-id')
     expect(screen.getByLabelText('Dataset preview scope')).not.toHaveTextContent('rev-receipt')
-    const details = screen.getByTestId('detail-dataset-details')
-    expect(screen.getByTestId('dataset-version-identity')).not.toBeVisible()
-    fireEvent.click(within(details).getByText('Diagnostics'))
-    expect(screen.getByTestId('dataset-version-identity')).toBeVisible()
-    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent(
-      'logical-receipt-id@rev-receipt')
+    expect(screen.queryByText('logical-receipt-id@rev-receipt')).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledWith('logical-receipt-id', 'rev-receipt')
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.sample).not.toHaveBeenCalled()
@@ -275,10 +270,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
     expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
 
-    const technical = screen.getByTestId('detail-dataset-details')
-    expect(technical).not.toHaveAttribute('open')
-    fireEvent.click(within(technical).getByText('Diagnostics'))
-    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('logical-receipt-id@rev-old')
+    expect(screen.queryByText('logical-receipt-id@rev-old')).not.toBeInTheDocument()
   })
 
   it('keeps an exact version neutral when the current head cannot be resolved', async () => {
@@ -471,7 +463,7 @@ describe('Catalog discovery request and mutation truth', () => {
       onOpenInWorkspace={onOpenInWorkspace} workspaceLocation={{ state: 'available' }} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Open dataset customers' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace →' })
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
     expect(open).toBeEnabled()
     fireEvent.click(open)
     expect(onOpenInWorkspace).toHaveBeenCalledWith(rootTable)
@@ -576,6 +568,7 @@ describe('Catalog discovery request and mutation truth', () => {
   })
 
   it('surfaces detail failures, preserves edits after a failed save, and restores a refreshed list after delete', async () => {
+    mocks.catalogFolders.mockResolvedValue([folder('curated/sales')])
     mocks.lineage
       .mockRejectedValueOnce(new Error('HTTP 503: lineage unavailable'))
       .mockResolvedValueOnce({ rootUri: TABLE.uri, nodes: [], edges: [] })
@@ -604,11 +597,12 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByText('Showing 1 preview row.')).toBeInTheDocument()
 
     openCatalogDetails()
-    const folder = screen.getByTestId('detail-folder') as HTMLInputElement
-    fireEvent.change(folder, { target: { value: 'curated/sales' } })
+    const folderSelect = screen.getByTestId('detail-folder') as HTMLSelectElement
+    await within(folderSelect).findByRole('option', { name: 'curated/sales' })
+    fireEvent.change(folderSelect, { target: { value: 'curated/sales' } })
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith('HTTP 409: concurrent edit', 'error'))
-    expect(folder.value).toBe('curated/sales')
+    expect(folderSelect.value).toBe('curated/sales')
     expect(mocks.catalogTree).toHaveBeenCalledTimes(1)
 
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -639,19 +633,13 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('detail-preview-scroll').querySelector('th')).toHaveClass('sticky', 'top-0')
   })
 
-  it('keeps default schema evidence and scrollable preview inspection keyboard reachable', async () => {
+  it('keeps default schema and scrollable preview inspection keyboard reachable without diagnostics', async () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
-    const details = screen.getByTestId('detail-dataset-details')
-    expect(details).not.toHaveAttribute('open')
-    expect(details).toHaveTextContent('Diagnostics')
-    expect(screen.getByTestId('dataset-location')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Diagnostics'))
-    expect(details).toHaveAttribute('open')
-    expect(screen.getByTestId('dataset-location')).toHaveTextContent(TABLE.uri)
-    expect(screen.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText(TABLE.uri)).not.toBeInTheDocument()
     expect(screen.getByTestId('detail-name')).toBeVisible()
     expect(screen.getByTestId('dataset-detail-content')).toHaveAttribute('tabindex', '0')
     expect(await screen.findByTestId('detail-preview-scroll')).toHaveAttribute('tabindex', '0')
@@ -771,10 +759,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
     expect(screen.getAllByText('legacy_code')).not.toHaveLength(0)
-    const details = screen.getByTestId('detail-dataset-details')
-    expect(screen.getByTestId('dataset-version-identity')).not.toBeVisible()
-    fireEvent.click(within(details).getByText('Diagnostics'))
-    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@3')
+    expect(screen.queryByText('orders-dataset@3')).not.toBeInTheDocument()
 
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
     expect(await screen.findByText(/header and columns describe an earlier version/i)).toBeInTheDocument()
@@ -789,12 +774,12 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')
     expect(screen.getByTestId('dataset-facts-stale')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    await waitFor(() => expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4'))
+    await waitFor(() => expect(screen.getByText('4 rows')).toBeInTheDocument())
     expect(screen.getByText('4 rows')).toBeInTheDocument()
     expect(screen.getByText('· 2 cols')).toBeInTheDocument()
     expect(screen.queryByText('legacy_code')).not.toBeInTheDocument()
     expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
-    expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4')
+    expect(screen.queryByText('orders-dataset@4')).not.toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@4')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(1, 'orders-dataset', '3')

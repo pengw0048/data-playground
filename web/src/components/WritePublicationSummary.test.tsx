@@ -85,7 +85,7 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
   })
 
-  it('reloads exact schema comparison evidence from the receipt alone', () => {
+  it('shows only user-facing schema changes from a saved receipt', () => {
     const withDrift = {
       ...receipt,
       parentHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
@@ -103,13 +103,11 @@ describe('WritePublicationSummary task-first output states', () => {
     render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
       receipt={withDrift} completed />)
 
-    const details = screen.getByText('Diagnostics').closest('details')!
-    expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Diagnostics'))
-    const comparisons = screen.getAllByLabelText('Schema comparison')
-    expect(comparisons[0]).toHaveTextContent('dataset-1@revision-6')
-    expect(comparisons[0]).toHaveTextContent('changed · unknown')
-    expect(comparisons[0]).toHaveTextContent('Structural schema drift requires explicit confirmation')
+    const changes = screen.getByLabelText('Schema changes')
+    expect(changes).toHaveTextContent('amount')
+    expect(changes).toHaveTextContent('field identity is missing or changed')
+    expect(changes).not.toHaveTextContent('dataset-1@revision-6')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
   })
 
   it('does not promise a dataset for provider-neutral output', () => {

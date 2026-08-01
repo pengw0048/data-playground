@@ -253,7 +253,19 @@ export function ERDiagram() {
             const uris = [...new Set(lin.nodes.map((n) => n.uri))]
             const page = uris.length ? await api.tablesPage({ uris, limit: ER_CAP }) : { items: [], total: 0, hasMore: false }
             if (s !== dataReq.current) return
-            setTables(page.items); setTotal(page.items.length); setLinEdges(lin.edges)
+            const registered = new Map(page.items.map((table) => [table.uri, table]))
+            // Provider datasets participate in core lineage through their stable Source URI even
+            // though they are intentionally not registered in the local Catalog. Keep those nodes
+            // in the graph instead of silently dropping the root while resolving richer Catalog
+            // metadata for every node that does have a registration.
+            const lineageTables = lin.nodes.map((node) => registered.get(node.uri) ?? ({
+              id: `lineage:${node.uri}`,
+              name: node.name || node.uri.split('/').filter(Boolean).slice(-1)[0] || 'Dataset',
+              uri: node.uri,
+              columns: [],
+              missing: true,
+            } satisfies CatalogTable))
+            setTables(lineageTables); setTotal(lineageTables.length); setLinEdges(lin.edges)
             setLineageFocus({ requested: focus ?? visibleFocus, canonical: lin.rootUri })
           } else {
             const uris = joinNeighbourhood(visibleFocus, rels, hops)
