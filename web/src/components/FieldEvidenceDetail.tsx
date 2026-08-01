@@ -109,7 +109,7 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
     </EvidenceSection>}
 
     {(technicalFacts.length || annotations.length) ? <details className="rounded border border-border bg-muted/20 p-1.5">
-      <summary className="cursor-pointer font-semibold text-foreground">Technical metadata</summary>
+      <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
       <div className="mt-2 grid gap-3">
         {technicalFacts.length ? <EvidenceSection title="Schema metadata"><Facts values={technicalFacts} /></EvidenceSection> : null}
         {annotations.length ? <EvidenceSection title="Raw annotations"><div className="grid gap-1.5">{annotations.map((annotation) => <div key={annotation.key} className="rounded border border-border bg-muted/20 p-1.5">

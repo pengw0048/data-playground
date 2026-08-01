@@ -61,8 +61,8 @@ describe('MergeColumnsControl', () => {
     render(<MergeColumnsControl nodeId="write" />)
     const run = screen.getByRole('button', { name: 'Run column merge' })
     expect(run).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     await waitFor(() => expect(run).toBeEnabled())
     fireEvent.click(run)
     await waitFor(() => expect(mocks.submit).toHaveBeenCalledTimes(1))
@@ -73,8 +73,8 @@ describe('MergeColumnsControl', () => {
     const write = mocks.state.doc.nodes.find((node: any) => node.id === 'write')
     delete write.data.config.filename
     const view = render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     const run = screen.getByRole('button', { name: 'Run column merge' })
     await waitFor(() => expect(run).toBeEnabled())
     const priorSubmission = write.data.config.mergeColumns.submissionId
@@ -83,7 +83,7 @@ describe('MergeColumnsControl', () => {
     view.rerender(<MergeColumnsControl nodeId="write" />)
     await waitFor(() => expect(run).toBeDisabled())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await waitFor(() => expect(mocks.preflight).toHaveBeenCalledTimes(2))
     expect(write.data.config.mergeColumns.submissionId).not.toBe(priorSubmission)
   })
@@ -99,8 +99,8 @@ describe('MergeColumnsControl', () => {
 
   it('blocks a second admission after response loss until the same semantic request can be recovered', async () => {
     const view = render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     const first = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionId
     // Same semantic request remains eligible to replay after a lost submit response.
     mocks.submit.mockRejectedValueOnce(new Error('response lost'))
@@ -111,7 +111,7 @@ describe('MergeColumnsControl', () => {
     mocks.state.doc.nodes.find((node: any) => node.id === 'source').data.config.datasetRef.revisionId = 'rev-2'
     view.rerender(<MergeColumnsControl nodeId="write" />)
     expect(screen.getByText('Previous submission outcome is unresolved')).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Check eligibility' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Check setup' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Run column merge' })).not.toBeInTheDocument()
     expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionId).toBe(first)
 
@@ -126,26 +126,26 @@ describe('MergeColumnsControl', () => {
     let resolve: ((value: typeof preflight) => void) | undefined
     mocks.preflight.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     fireEvent.change(screen.getByLabelText('Merge identity columns'), { target: { value: 'id, frame' } })
     resolve?.(preflight)
-    await waitFor(() => expect(screen.queryByText('Eligible exact merge')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText('Ready to merge saved versions')).not.toBeInTheDocument())
 
     mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    expect(await screen.findByText(/Nothing has been retargeted/)).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Reset for a new admission' })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Use current head and recompute' })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    expect(await screen.findByText(/Nothing changed automatically/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Reset setup' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use current version and recompute' })).toBeVisible()
     expect(screen.queryByText('Re-admit current head')).not.toBeInTheDocument()
   })
 
   it('retargets Source uri and exact revision only after the explicit current-head action', async () => {
     mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText(/Nothing has been retargeted/)
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText(/Nothing changed automatically/)
     expect(mocks.state.doc.nodes.find((node: any) => node.id === 'source').data.config.datasetRef.revisionId).toBe('rev-1')
-    fireEvent.click(screen.getByRole('button', { name: 'Use current head and recompute' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use current version and recompute' }))
     await waitFor(() => expect(mocks.state.updateConfig).toHaveBeenCalledWith('source', expect.objectContaining({
       uri: 'managed://dataset-1/current.parquet', tableId: 'dataset-1',
       datasetRef: expect.objectContaining({ kind: 'exact', revisionId: 'rev-current' }),
@@ -156,18 +156,18 @@ describe('MergeColumnsControl', () => {
   it('does not infer a moved destination from unrelated stale error prose', async () => {
     mocks.preflight.mockRejectedValueOnce(new Error('source metadata cache is stale'))
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('source metadata cache is stale')
-    expect(screen.queryByRole('button', { name: 'Use current head and recompute' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Use current version and recompute' })).not.toBeInTheDocument()
   })
 
   it('freezes merge inputs while a submit outcome is unresolved and retains the returned Task', async () => {
     let resolve: ((value: any) => void) | undefined
     mocks.submit.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     expect(screen.getByLabelText('Merge identity columns')).toBeDisabled()
     fireEvent.change(screen.getByLabelText('Merge identity columns'), { target: { value: 'id, frame' } })
@@ -178,14 +178,14 @@ describe('MergeColumnsControl', () => {
 
   it('clears response-unknown state after a definitive 4xx rejection and requires a fresh preflight', async () => {
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     mocks.submit.mockRejectedValueOnce(new KernelError(409, 'merge-columns destination head must equal the exact Source revision'))
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('destination head')
+    expect(await screen.findByRole('alert')).toHaveTextContent("destination's current version")
     expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionState).toBeUndefined()
-    expect(screen.getByRole('button', { name: 'Check eligibility' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Check setup' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Run column merge' })).toBeDisabled()
   })
 
@@ -195,9 +195,9 @@ describe('MergeColumnsControl', () => {
     mocks.task.mockRejectedValueOnce(new KernelError(404, 'merge-columns task not found'))
     render(<MergeColumnsControl nodeId="write" />)
 
-    expect(await screen.findByText('Tracked durable Task')).toBeVisible()
+    expect(await screen.findByText('Submitted job')).toBeVisible()
     expect(await screen.findByRole('alert')).toHaveTextContent('task not found')
-    expect(screen.queryByRole('button', { name: 'Check eligibility' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Check setup' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Run column merge' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Open in Jobs' }))
     expect(mocks.state.setJobsQuery).toHaveBeenCalledWith('run=shared-task')
@@ -206,8 +206,8 @@ describe('MergeColumnsControl', () => {
   it('settles an immediate done replay without leaving submit busy', async () => {
     mocks.submit.mockResolvedValueOnce({ taskId: 'done-task', status: 'done', canRetry: false, canCancel: false, mergeColumns: { phase: 'done', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: true, canRetry: false, canCancel: false } })
     render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     await screen.findByText('done')
     expect(screen.queryByText('Submitting…')).not.toBeInTheDocument()
@@ -242,8 +242,8 @@ describe('MergeColumnsControl', () => {
 
   it('persists an ambiguous submission before POST and recovers the same id after reopening', async () => {
     const view = render(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible exact merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to merge saved versions')
     mocks.submit.mockRejectedValueOnce(new Error('response lost'))
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     await screen.findByRole('alert')
@@ -271,8 +271,8 @@ describe('MergeColumnsControl', () => {
       mergeColumns: { phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'rejected', reused: false,
         diagnosticCode: 'stale_expected_head', canRetry: false, canCancel: false } })
     render(<MergeColumnsControl nodeId="write" />)
-    await screen.findByText(/The destination moved/)
-    fireEvent.click(screen.getByRole('button', { name: 'Start new admission' }))
+    await screen.findByText(/The destination has a newer version/)
+    fireEvent.click(screen.getByRole('button', { name: 'Start new setup' }))
     expect(mocks.state.updateConfig).toHaveBeenLastCalledWith('write', expect.objectContaining({ mergeColumns: expect.objectContaining({
       taskId: undefined, submissionState: undefined,
     }) }))

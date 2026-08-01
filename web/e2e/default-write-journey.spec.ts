@@ -129,7 +129,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const publicationDetails = publication.locator('details')
     await expect(publicationDetails).not.toHaveAttribute('open')
     await publicationDetails.locator('summary').click()
-    await expect(publicationDetails).toContainText(/Admission:.*node write.*mode create/)
+    await expect(publicationDetails).toContainText(/Run setup:.*node write.*mode create/)
     await expect(publicationDetails).toContainText('managed-local-file')
     const runResponse = page.waitForResponse((response) =>
       response.url().endsWith('/api/run') && response.request().method() === 'POST')
@@ -212,7 +212,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     ))
     const receiptViewer = page.getByTestId('dataset-viewer')
     await expect(receiptViewer).toBeVisible()
-    await expect(receiptViewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(receiptViewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
     const datasetDetails = receiptViewer.getByTestId('detail-dataset-details')
     await datasetDetails.locator('summary').click()
     await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
@@ -246,10 +246,10 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       has: page.getByRole('heading', { name: 'Run history' }),
     })
     await expect(historyDialog).toContainText(localHistoryTime)
-    await historyDialog.getByRole('button', { name: /Admitted Sources/ }).click()
+    await historyDialog.getByRole('button', { name: /Input data/ }).click()
     await expect(historyDialog.getByText('used for this run')).toBeVisible()
-    await expect(historyDialog.getByText(`Exact revision ${admittedInput!.revision_id}`)).toBeVisible()
-    await expect(historyDialog.getByText('No admitted input manifest was recorded for this legacy run.')).toHaveCount(0)
+    await expect(historyDialog.getByText(`Version ${admittedInput!.revision_id}`)).toBeVisible()
+    await expect(historyDialog.getByText('Input data details were not saved for this older run.')).toHaveCount(0)
     await historyDialog.getByRole('button', { name: 'Close' }).click()
     await shoot(page, 'light', 'canvas')
 
@@ -280,15 +280,15 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const revisionHistory = page.getByTestId('dataset-revision-history')
     await expect(revisionHistory).toBeVisible({ timeout: 15_000 })
     await revisionHistory.getByTestId(`revision-open-${dataset!.revisionId}`).click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
 
     // 8. Reopen that same revision from Jobs' primary result action while retaining receipt evidence.
     const jobUrl = `/#/jobs?run=${encodeURIComponent(runId)}`
     await page.goto(jobUrl)
     const jobsDatasetLink = page.getByRole('link', { name: 'Open dataset' })
-    const technicalEvidence = page.getByText('Technical evidence', { exact: true }).locator('..')
-    await technicalEvidence.locator('summary').click()
-    await expect(technicalEvidence.getByText('Receipt:', { exact: true })).toBeVisible()
+    const diagnostics = page.getByText('Diagnostics', { exact: true }).locator('..')
+    await diagnostics.locator('summary').click()
+    await expect(diagnostics.getByText('Receipt:', { exact: true })).toBeVisible()
     await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
     await expect(page.getByRole('button', { name: 'Open result' })).toHaveCount(0)
     const exactDatasetHref = `#/workspace/${encodeURIComponent(`dataset:${dataset!.datasetId}`)}?${new URLSearchParams({
@@ -303,7 +303,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       exactDatasetHref,
     )
     await jobsDatasetLink.click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
     const exactDatasetUrl = page.url()
     const backToJobs = page.getByRole('button', { name: 'Back to Jobs' })
     await expect(backToJobs).toBeVisible()
@@ -319,7 +319,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
     await page.goBack()
     await expect(page).toHaveURL(exactDatasetUrl)
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
     await page.goForward()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(runId)}$`))
     await page.goBack()
@@ -343,11 +343,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await shoot(page, 'dark', 'canvas')
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    const darkTechnicalEvidence = page.getByText('Technical evidence', { exact: true }).locator('..')
-    await darkTechnicalEvidence.locator('summary').click()
+    const darkDiagnostics = page.getByText('Diagnostics', { exact: true }).locator('..')
+    await darkDiagnostics.locator('summary').click()
     await shoot(page, 'dark', 'jobs')
     await page.getByRole('link', { name: 'Open dataset' }).click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
     await shoot(page, 'dark', 'revision')
     visualReview.push({ viewport: '1440x900', theme: 'dark', consoleOrPageErrors: consoleErrors.slice(darkStart) })
 

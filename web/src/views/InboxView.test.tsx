@@ -48,14 +48,15 @@ describe('InboxView', () => {
 
   it('describes Inbox as results from work the current user started', () => {
     render(<InboxView />)
-    expect(screen.getByText('Results from background work you started')).toBeVisible()
+    expect(screen.getByText(/Only results from background work you started/)).toBeVisible()
+    expect(screen.getByText(/other people’s activity is not shown/)).toBeVisible()
     expect(screen.queryByText(/durable/i)).toBeNull()
   })
 
   it('keeps the empty-state promise limited to background tasks', async () => {
     mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
     render(<InboxView />)
-    expect(await screen.findByText('No completed background tasks yet.')).toBeInTheDocument()
+    expect(await screen.findByText('No background task results yet.')).toBeInTheDocument()
     expect(screen.queryByText(/finished runs/i)).toBeNull()
   })
 
@@ -96,6 +97,7 @@ describe('InboxView', () => {
     await screen.findByText('external wait deadline')
     expect(screen.queryByText(/secret|traceback|boom/i)).toBeNull()
     expect(screen.getByRole('button', { name: 'Open job' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Open job' })).toHaveAttribute('title', 'The linked Job is no longer available')
     expect(screen.getByText('Original Canvas unavailable')).toBeInTheDocument()
     expect(screen.getByText(/Deleted or no longer shared with you/)).toBeVisible()
   })

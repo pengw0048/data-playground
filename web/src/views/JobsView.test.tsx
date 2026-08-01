@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -191,7 +191,83 @@ describe('JobsView', () => {
 
     useStore.setState({ jobsQuery: deepLink } as never)
     expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(2, { limit: 1, runId: 'missing-run' })
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not turn a temporary direct-link lookup failure into an unavailable Job', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [], hasMore: false, nextCursor: null })
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce({
+        items: [job({ id: 'direct-history', runId: 'direct-run', status: 'running', error: null })],
+        hasMore: false,
+        nextCursor: null,
+      })
+    useStore.setState({ jobsQuery: 'status=failed&canvas=canvas-1&run=direct-run' } as never)
+    render(<JobsView />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Couldn’t open the linked Job: network unavailable')
+    expect(screen.queryByText('This Job is unavailable or you no longer have access.')).toBeNull()
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(2, { limit: 1, runId: 'direct-run' })
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('button', {
+      name: 'Open run direct-run in Alpha research', expanded: true,
+    })).toBeVisible()
+  })
+
+  it('removes a direct-link-only Job after returning to the filtered list', async () => {
+    const filtered = job({ id: 'failed-history', runId: 'failed-run', status: 'failed' })
+    const linked = job({ id: 'running-history', runId: 'running-run', status: 'running', error: null })
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [filtered], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
+    render(<JobsView />)
+
+    const linkedRow = await screen.findByRole('button', {
+      name: 'Open run running-run in Alpha research', expanded: true,
+    })
+    expect(screen.getByRole('button', {
+      name: 'Open run failed-run in Alpha research', expanded: false,
+    })).toBeVisible()
+
+    fireEvent.click(linkedRow)
+
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
+    expect(screen.queryByRole('button', {
+      name: 'Open run running-run in Alpha research', expanded: false,
+    })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Open run failed-run in Alpha research', expanded: false,
+    })).toBeVisible()
+  })
+
+  it('keeps a linked Job after a later ordinary page includes it', async () => {
+    const first = job({ id: 'first-history', runId: 'first-run', status: 'failed' })
+    const linked = job({ id: 'running-history', runId: 'running-run', status: 'running', error: null })
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [first], hasMore: true, nextCursor: 'second-page' })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
+    render(<JobsView />)
+
+    const linkedRow = await screen.findByRole('button', {
+      name: 'Open run running-run in Alpha research', expanded: true,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      cursor: 'second-page', status: 'failed',
+    })))
+
+    fireEvent.click(linkedRow)
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
+    expect(screen.getByRole('button', {
+      name: 'Open run running-run in Alpha research', expanded: false,
+    })).toBeVisible()
   })
 
   it('uses authorized canvas names and accepts direct server-side node or execution filters', async () => {
@@ -209,8 +285,8 @@ describe('JobsView', () => {
     await screen.findAllByText('Research')
     expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node id')).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by execution backend')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by canvas step id')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by run mode')).toBeVisible()
 
     fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
@@ -224,9 +300,9 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
     render(<JobsView />)
 
-    expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node id')).toHaveValue('exact-node')
-    expect(screen.getByLabelText('Filter jobs by execution backend')).toHaveValue('exact-backend')
+    expect(await screen.findByRole('option', { name: 'Canvas ID from link: not-accessible' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by canvas step id')).toHaveValue('exact-node')
+    expect(screen.getByLabelText('Filter jobs by run mode')).toHaveValue('exact-backend')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: 'not-accessible', nodeId: 'exact-node', backend: 'exact-backend', limit: 50,
     })))
@@ -236,7 +312,7 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'node=orphan-node' } as never)
     render(<JobsView />)
 
-    const nodeFilter = await screen.findByLabelText('Filter jobs by node id')
+    const nodeFilter = await screen.findByLabelText('Filter jobs by canvas step id')
     expect(nodeFilter).toHaveValue('orphan-node')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: undefined, nodeId: 'orphan-node', limit: 50,
@@ -369,7 +445,7 @@ describe('JobsView', () => {
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('output=write-1%3Aout'))
     expect(screen.getByTestId('full-result')).toBeVisible()
-    expect(screen.getByRole('complementary', { name: 'Retained result' })).toBeVisible()
+    expect(screen.getByRole('complementary', { name: 'Saved result' })).toBeVisible()
   })
 
   it('keeps a completed row concise and moves multiple port identities into diagnostics', async () => {
@@ -402,7 +478,7 @@ describe('JobsView', () => {
     expect(screen.getByRole('button', { name: 'Open result 1' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open result 2' })).toBeVisible()
     openTechnicalEvidence()
-    expect(screen.getByText('Retained results:', { exact: true }).closest('div')).toHaveTextContent(
+    expect(screen.getByText('Saved results:', { exact: true }).closest('div')).toHaveTextContent(
       'Result 1 · transform-1:clean, Result 2 · transform-1:rejected',
     )
   })
@@ -620,7 +696,7 @@ describe('JobsView', () => {
     }))
     openTechnicalEvidence()
     expect(mocks.executionManifest).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: /Execution manifest/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Saved run setup/ }))
 
     expect(await screen.findByText('Submitted graph')).toBeVisible()
     expect(screen.getByText(/"threshold"/)).toBeVisible()

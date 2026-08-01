@@ -69,6 +69,7 @@ beforeEach(() => {
   })
   state.canvasRole = 'owner'
   state.currentDraftId = null
+  state.localDrafts = []
   state.doc = {
     id: 'canvas-1',
     name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review',
@@ -110,6 +111,39 @@ describe('AppMenu', () => {
     expect(screen.queryByRole('button', { name: 'Canvas actions' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('menuitem', { name: 'Back to Workspace' }))
     expect(props.onWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('requires an in-app confirmation before deleting the current Canvas', async () => {
+    const user = userEvent.setup()
+    render(<AppMenu {...appMenuProps()} />)
+
+    await user.click(screen.getByRole('button', { name: 'Data Playground menu' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Delete this Canvas' }))
+
+    const dialog = await screen.findByRole('dialog', { name: /Delete .*July 2026 final review/ })
+    expect(dialog).toHaveTextContent('This permanently deletes the Canvas')
+    expect(state.deleteFile).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(state.deleteFile).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Data Playground menu' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Delete this Canvas' }))
+    await user.click(await screen.findByRole('button', { name: 'Delete Canvas' }))
+
+    expect(state.deleteFile).toHaveBeenCalledWith('canvas-1')
+  })
+
+  it('does not offer local-draft deletion while that draft is syncing', async () => {
+    const user = userEvent.setup()
+    state.currentDraftId = 'draft-1'
+    state.localDrafts = [{ draftId: 'draft-1', syncState: 'syncing' }]
+    render(<AppMenu {...appMenuProps()} />)
+
+    await user.click(screen.getByRole('button', { name: 'Data Playground menu' }))
+    const syncing = screen.getByRole('menuitem', { name: 'Syncing local draft…' })
+    expect(syncing).toHaveAttribute('data-disabled')
+    expect(syncing).toHaveAttribute('title', 'Wait for syncing to finish before deleting this draft')
+    expect(screen.queryByRole('menuitem', { name: 'Delete this local draft' })).not.toBeInTheDocument()
   })
 
   it('offers System, Light, and Dark as an Appearance submenu', async () => {

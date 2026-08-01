@@ -83,7 +83,7 @@ test.describe('accessibility gate @ux-smoke', () => {
   test('axe smoke: Workspace', async ({ page }) => {
     await fresh(page)
     await backToWorkspace(page)
-    await expect(page.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Create canvas' })).toBeEnabled()
     await expectNoSeriousAxe(page, 'Workspace')
   })
 
@@ -161,8 +161,9 @@ test.describe('accessibility gate @ux-smoke', () => {
     const canvasHash = await page.evaluate(() => location.hash)
     await backToWorkspace(page)
 
-    // Click the heading so the next Tab starts a keyboard session (:focus-visible applies).
-    await page.getByRole('heading', { name: 'Workspace' }).click()
+    // Focus the root breadcrumb so the next Tab starts a keyboard session (:focus-visible applies).
+    await page.getByRole('navigation', { name: 'Workspace path' })
+      .getByRole('button', { name: 'Workspace', exact: true }).focus()
     const openCard = await workspaceResource(page, 'canvas', canvasName)
     expect(await tabUntil(page, openCard)).toBe(true)
     await expect(openCard).toBeFocused()
@@ -200,7 +201,8 @@ test.describe('accessibility gate @ux-smoke', () => {
       id: canvasName, name: canvasName, version: 1, requirements: [], nodes: [], edges: [],
     } })).ok()).toBeTruthy()
     await goToWorkspace(page)
-    await page.getByRole('heading', { name: 'Workspace' }).click()
+    await page.getByRole('navigation', { name: 'Workspace path' })
+      .getByRole('button', { name: 'Workspace', exact: true }).focus()
     const openCard = await workspaceResource(page, 'canvas', canvasName)
     expect(await tabUntil(page, openCard)).toBe(true)
     await page.keyboard.press('Space')

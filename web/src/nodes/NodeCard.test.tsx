@@ -203,4 +203,29 @@ describe('NodeCard result summary', () => {
     expect(runPreview).toHaveBeenCalledWith('target')
     expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
   })
+
+  it('keeps failed run details available after the transient error toast disappears', () => {
+    useStore.setState((state) => ({
+      selectedIds: ['target'],
+      runs: { target: { phase: 'failed', error: 'Transform failed' } },
+      doc: {
+        ...state.doc,
+        nodes: state.doc.nodes.map((node) => ({
+          ...node,
+          type: 'transform',
+          data: { ...node.data, status: 'failed' },
+        })),
+      },
+    }))
+    const data = useStore.getState().doc.nodes[0].data
+
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review failure' }))
+    expect(useStore.getState().openPanels).toEqual({ target: 'run' })
+  })
 })

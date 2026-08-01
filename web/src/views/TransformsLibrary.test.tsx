@@ -341,7 +341,7 @@ describe('TransformsLibrary', () => {
     expect(screen.getByRole('option', { name: 'Exact target' })).toBeVisible()
     expect(screen.queryByRole('option', { name: /target/ })).toHaveAccessibleName('Exact target')
     expect(screen.getByText('Canvas ID: target')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(screen.getByText('Canvas ID: target')).toBeVisible()
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
@@ -371,6 +371,10 @@ describe('TransformsLibrary', () => {
       .mockResolvedValueOnce({ container: { id: 'container:workspace-local-root', name: 'Workspace', kind: 'container', version: 2 }, items: [], hasMore: false })
     render(<TransformsLibrary />)
     fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', {
+      limit: 1,
+      source: 'local',
+    })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Create and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('no other Canvas was changed')

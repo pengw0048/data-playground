@@ -700,6 +700,7 @@ with TestClient(app) as client:
     assert canonical_context["sourceBindingId"] == source_binding["sourceBindingId"]
     assert canonical_context["providerDatasetId"] == "dataset-a"
     assert canonical_context["datasetIdentity"].startswith("workspace-provider:")
+    assert canonical_context["sourceUri"].startswith("workspace-provider://")
     assert canonical_context["readMode"] == "exact"
     assert canonical_context["revisionId"] == "provider-dataset-a-v1"
     assert isinstance(canonical_context["committedAt"], str)

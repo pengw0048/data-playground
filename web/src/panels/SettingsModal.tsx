@@ -32,8 +32,7 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'members', label: 'Members', icon: 'users' },
 ]
 
-// sentinel for the runner select's "inherit the workspace default" option (Radix Select forbids an
-// empty-string value); on save it maps back to '' so the per-user setting clears the override.
+// Sentinel for the Automatic execution card; on save it maps back to an empty user override.
 const INHERIT = '__default__'
 // Radix Select forbids an empty value — sentinels for "no credential" pickers (mapped to '' on save).
 const NO_CRED = '__none__'
@@ -105,11 +104,49 @@ const pluginStateTone: Record<NonNullable<PluginInfo['state']>, string> = {
 }
 
 const pluginStateCopy: Record<NonNullable<PluginInfo['state']>, string> = {
-  active: 'Available in this Data Playground instance.',
+  active: 'Ready to use in this Data Playground instance.',
   inactive: 'Installed, but not currently available.',
   degraded: 'Some features are unavailable.',
   conflict: 'Could not start because it conflicts with another extension.',
   failed: 'Could not start.',
+}
+
+const CAPABILITY_KIND_LABELS: Record<string, string> = {
+  adapter: 'Data connection',
+  catalog: 'Catalog',
+  'external-wait': 'External task provider',
+  node: 'Canvas step',
+  'pipeline-importer': 'Pipeline import',
+  processor: 'Transform',
+  runner: 'Execution mode',
+  telemetry: 'Monitoring',
+}
+
+function capabilityLabel(capability: string): string {
+  const [kind, ...rest] = capability.split(':')
+  const detail = rest.join(':').replace(/[._/-]+/g, ' ').trim()
+  const kindLabel = CAPABILITY_KIND_LABELS[kind] ?? kind.replace(/[._/-]+/g, ' ')
+  if (!detail) return kindLabel.charAt(0).toUpperCase() + kindLabel.slice(1)
+  return `${kindLabel}: ${detail}`
+}
+
+function pluginActionCopy(plugin: PluginInfo, state: NonNullable<PluginInfo['state']>): string {
+  const configurable = (plugin.config?.length ?? 0) > 0
+  if (state === 'active') {
+    if (configurable) return 'Action: change the setup below, Save, then restart the affected Data Playground process.'
+    const kinds = new Set((plugin.effective_capabilities ?? []).map((capability) => capability.split(':')[0]))
+    const actions: string[] = []
+    if (kinds.has('catalog') || kinds.has('adapter')) actions.push('browse its data connections in Workspace')
+    if (kinds.has('node') || kinds.has('processor')) actions.push('add its steps from a Canvas')
+    if (kinds.has('pipeline-importer')) actions.push('import a supported pipeline from Transforms')
+    if (kinds.has('runner')) actions.push('choose its mode in Execution')
+    return actions.length > 0
+      ? `Next: ${actions.join('; ')}.`
+      : 'This extension works in the background; there is nothing to configure in Settings.'
+  }
+  return configurable
+    ? 'Next: review the setup below, Save, then restart the affected Data Playground process.'
+    : 'This cannot be repaired in Settings. Open Installation details, fix the server installation or configuration, then restart Data Playground.'
 }
 
 const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right)
@@ -483,13 +520,14 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     try {
       const result = await api.browseDestination(destination.id, '')
       if (result.error) throw new Error(result.error)
+      if (result.writable === false) throw new Error('This path cannot be used as a destination.')
       const count = result.entries.length
       const preview = result.entries.slice(0, 3).map((entry) => entry.name).join(', ')
       setDestinationNotices((current) => ({
         ...current,
         [destination.id]: {
           kind: 'success',
-          message: `Browsing works · ${count.toLocaleString()} item${count === 1 ? '' : 's'} listed${preview ? ` · ${preview}${count > 3 ? '…' : ''}` : ''}. Write access is checked when a run starts.`,
+          message: `Preview loaded · ${count.toLocaleString()} item${count === 1 ? '' : 's'} found${preview ? ` · ${preview}${count > 3 ? '…' : ''}` : ''}. This checks listing only; a real write is verified when a run saves output.`,
         },
       }))
     } catch (error) {
@@ -868,16 +906,6 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {active === 'execution' && <Section id="execution" title="Execution">
                   {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change how your own jobs run.</div>}
-                  <Field label="Execution mode">
-                    <Select value={(u.backend ? String(u.backend) : INHERIT)} onValueChange={(v) => setU((p) => ({ ...p, backend: v }))}>
-                      <SelectTrigger aria-label="Execution mode"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={INHERIT}>Automatic (recommended)</SelectItem>
-                        {runners.map((runner) => <SelectItem key={runner} value={runner}>{runnerLabel(runner)}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </Field>
-                  <div className="-mt-1 text-[10.5px] text-muted-foreground">Automatic uses the workspace or deployment default. Most people should leave this selected.</div>
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
@@ -888,15 +916,49 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Available modes</div>
-                  <div className="flex flex-col gap-1.5">
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Choose how your jobs run</div>
+                  <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
+                    Leave Automatic selected unless you need a specific isolation or worker behavior.
+                  </p>
+                  <div role="group" aria-label="Execution mode" className="flex flex-col gap-1.5">
+                    <button
+                      type="button"
+                      aria-label="Use Automatic execution"
+                      aria-pressed={!u.backend || u.backend === INHERIT}
+                      onClick={() => setU((current) => ({ ...current, backend: INHERIT }))}
+                      className={cn(
+                        'rounded-md border px-2.5 py-2 text-left transition-colors hover:bg-accent/50',
+                        !u.backend || u.backend === INHERIT ? 'border-foreground bg-accent/40' : 'border-border',
+                      )}
+                    >
+                      <div className="flex items-baseline gap-1.5 text-xs font-semibold text-foreground">
+                        <Icon name="sparkle" size={12} /> Automatic
+                        {!u.backend || u.backend === INHERIT
+                          ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Recommended</Badge>
+                          : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
+                      </div>
+                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the default configured for Data Playground. Most people should leave this selected.</div>
+                    </button>
                     {runners.map((runner) => (
-                      <div key={runner} className="rounded-md border border-border px-2.5 py-2">
+                      <button
+                        key={runner}
+                        type="button"
+                        aria-label={`Use ${runnerLabel(runner)}`}
+                        aria-pressed={String(u.backend ?? '') === runner}
+                        onClick={() => setU((current) => ({ ...current, backend: runner }))}
+                        className={cn(
+                          'rounded-md border px-2.5 py-2 text-left transition-colors hover:bg-accent/50',
+                          String(u.backend ?? '') === runner ? 'border-foreground bg-accent/40' : 'border-border',
+                        )}
+                      >
                         <div className="flex items-baseline gap-1.5 text-xs font-semibold text-foreground">
                           <Icon name="db" size={12} /> {runnerLabel(runner)}
+                          {String(u.backend ?? '') === runner
+                            ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Selected</Badge>
+                            : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
                         </div>
                         <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">{runnerGuidance(runner)}</div>
-                      </div>
+                      </button>
                     ))}
                     {runners.length === 0 && <div className="text-[11.5px] text-muted-foreground">No execution modes are available.</div>}
                   </div>
@@ -905,6 +967,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                 {canGlobal && active === 'destinations' && <Section id="destinations" title="Destinations">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
+                  </p>
+                  <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
+                    Preview files confirms that the saved location can be listed with its configured credential. It does not create a test file or prove write access.
                   </p>
                   <div className="mb-2 flex flex-col gap-1">
                     {dests.map((d, i) => (
@@ -915,9 +980,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                           <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{d.backend}</Badge>
                           {d.credId && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{credName(d.credId) ?? 'credential'}</Badge>}
                           <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-muted-foreground">{d.root}</span>
-                          {isSavedDestination(d) ? <Button variant="outline" size="sm" aria-label={`Test connection to ${d.name}`} disabled={Boolean(destinationTestingId)} onClick={() => void testDestination(d)}>
-                            {destinationTestingId === d.id ? 'Testing…' : 'Test connection'}
-                          </Button> : <span className="text-[10px] text-muted-foreground">Save to test</span>}
+                          {isSavedDestination(d) ? <Button variant="outline" size="sm" aria-label={`Preview files in ${d.name}`} disabled={Boolean(destinationTestingId)} onClick={() => void testDestination(d)}>
+                            {destinationTestingId === d.id ? 'Loading preview…' : 'Preview files'}
+                          </Button> : <span className="text-[10px] text-muted-foreground">Save to preview</span>}
                           <button onClick={() => setG((prev) => ({ ...prev, destinations: dests.filter((_, j) => j !== i) }))}
                             aria-label={`Remove destination ${d.name}`}
                             className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="close" size={12} /></button>
@@ -1023,7 +1088,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {canGlobal && active === 'plugins' && <Section id="plugins" title="Plugins">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Installed extensions and the features currently available from each one. Extension settings apply after the relevant Data Playground process restarts.
+                    See what each extension adds and complete any setup it exposes. Extension settings apply after the relevant Data Playground process restarts.
                   </p>
                   {pluginLoadError && <div role="alert" className="mb-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[11.5px] text-destructive">
                     Extensions could not be loaded: {pluginLoadError}{' '}
@@ -1033,6 +1098,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {plugins.map((p, index) => {
                       const state = pluginState(p)
                       const failure = p.failure_summary ?? p.error
+                      const capabilities = p.effective_capabilities ?? []
                       return (
                       <div key={`${p.source}:${p.name}:${index}`} data-testid={`plugin-status-${p.name}`} className="rounded-md border border-border p-2.5 text-xs text-foreground">
                         <div className="flex flex-wrap items-center gap-2">
@@ -1042,17 +1108,23 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         </div>
                         <div className="mt-1.5 text-[10.5px] text-muted-foreground">
                           {pluginStateCopy[state]}
-                          {state === 'active' && (p.config?.length ?? 0) === 0 && ' There are no settings to change here.'}
                         </div>
-                        {failure && <div className={cn('mt-1.5 text-[10.5px]', state === 'degraded' ? 'text-amber-700 dark:text-amber-300' : 'text-destructive')}>
-                          {failure} {p.failure_impact === 'optional-degradation' && 'The application continues without the unavailable capability.'}
+                        {capabilities.length > 0 && <div className="mt-2">
+                          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Available features</div>
+                          <div className="flex flex-wrap gap-1">
+                            {capabilities.map((capability) => <Badge key={capability} variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{capabilityLabel(capability)}</Badge>)}
+                          </div>
                         </div>}
+                        {failure && <div className={cn('mt-1.5 text-[10.5px]', state === 'degraded' ? 'text-amber-700 dark:text-amber-300' : 'text-destructive')}>
+                          {failure} {p.failure_impact === 'optional-degradation' && 'Other parts of Data Playground still work.'}
+                        </div>}
+                        <div className="mt-2 text-[10.5px] font-medium text-foreground">{pluginActionCopy(p, state)}</div>
                         {(p.config?.length ?? 0) > 0 && <div className="mt-3 border-t border-border pt-3">
-                          <div className="mb-2 flex items-center gap-1.5 text-[11.5px] font-semibold text-foreground"><Icon name="settings" size={12} /> Settings</div>
+                          <div className="mb-2 flex items-center gap-1.5 text-[11.5px] font-semibold text-foreground"><Icon name="settings" size={12} /> Setup</div>
                           {pluginConfigFields(p)}
                         </div>}
                         <details className="mt-2 border-t border-border pt-2 text-[10px] text-muted-foreground">
-                          <summary className="w-fit cursor-pointer select-none font-medium hover:text-foreground">Diagnostics</summary>
+                          <summary className="w-fit cursor-pointer select-none font-medium hover:text-foreground">Installation details</summary>
                           <div className="mt-2 grid gap-1">
                             <div>Package: {p.package || p.name}{p.version ? ` · ${p.version}` : ''}</div>
                             <div>Source: {p.source}</div>
@@ -1070,12 +1142,16 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {canGlobal && active === 'members' && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    People available when sharing a Canvas.
+                    People available from a Canvas&apos;s Share dialog.
                     {authEnabled
-                      ? ' New members need an initial password to sign in.'
-                      : ' Sign-in is off, so add a name without a password.'}
+                      ? ' Creating a member also creates their sign-in account.'
+                      : ' Sign-in is off, so these are collaboration identities rather than password accounts.'}
                   </p>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Adding a member applies immediately; it does not wait for Save or change other staged Settings.</div>
+                  <div className="mb-2 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                    {authEnabled
+                      ? 'Set the person’s first password here. They can change it after signing in. Account creation applies immediately and does not wait for Save.'
+                      : 'No password is created. Anyone who can reach this trusted server can act as a listed identity, so names here must not be treated as authentication. Adding an identity applies immediately.'}
+                  </div>
                   <div className="mb-2.5 flex flex-col gap-1">
                     {users.map((usr) => (
                       <div key={usr.id} className="flex items-center gap-2 text-xs text-foreground">
@@ -1088,11 +1164,11 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   <div className="flex gap-1.5">
                     <Input value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })}
                       onKeyDown={(e) => { if (e.key === 'Enter' && !authEnabled) void addUser() }}
-                      placeholder="Name" className="w-[150px] shrink-0" />
+                      aria-label="Member name" placeholder="Name" className="w-[150px] shrink-0" />
                     {authEnabled && <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
                         onKeyDown={(e) => { if (e.key === 'Enter') void addUser() }}
                         aria-label="Initial password" placeholder="Initial password (at least 6 characters)" className="min-w-0 flex-1" />}
-                    <Button onClick={() => void addUser()} disabled={!newUser.name.trim() || (authEnabled && newUser.password.length < 6) || memberAdding} className="shrink-0">{memberAdding ? 'Adding member…' : 'Add member'}</Button>
+                    <Button onClick={() => void addUser()} disabled={!newUser.name.trim() || (authEnabled && newUser.password.length < 6) || memberAdding} className="shrink-0">{memberAdding ? 'Adding…' : authEnabled ? 'Create account' : 'Add identity'}</Button>
                   </div>
                   {authEnabled && newUser.password.length > 0 && newUser.password.length < 6 && <div role="alert" className="mt-1.5 text-[10.5px] text-destructive">Password must be at least 6 characters.</div>}
                   {memberNotice && <div role={memberNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', memberNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>

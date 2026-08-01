@@ -566,14 +566,16 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     expect(within(screen.getByTestId('plugin-status-healthy')).getByText('active')).toBeVisible()
-    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Available in this Data Playground instance.')
-    fireEvent.click(within(screen.getByTestId('plugin-status-healthy')).getByText('Diagnostics'))
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Ready to use in this Data Playground instance.')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Canvas step: clean')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Next: add its steps from a Canvas.')
+    fireEvent.click(within(screen.getByTestId('plugin-status-healthy')).getByText('Installation details'))
     expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Features: node:clean')
     expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Starts with: execution')
     expect(within(screen.getByTestId('plugin-status-idle')).getByText('inactive')).toBeVisible()
     expect(screen.getByTestId('plugin-status-idle')).toHaveTextContent('Installed, but not currently available.')
     expect(within(screen.getByTestId('plugin-status-partial')).getByText('degraded')).toBeVisible()
-    expect(screen.getByTestId('plugin-status-partial')).toHaveTextContent('The application continues without the unavailable capability.')
+    expect(screen.getByTestId('plugin-status-partial')).toHaveTextContent('Other parts of Data Playground still work.')
     expect(within(screen.getByTestId('plugin-status-collision')).getByText('conflict')).toBeVisible()
     expect(within(screen.getByTestId('plugin-status-broken')).getByText('failed')).toBeVisible()
   })
@@ -600,8 +602,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByPlaceholderText('Name')).toBeNull()
     expect(plugins).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByLabelText('Execution mode'))
-    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
       { global: 2, user: 4 },
@@ -630,7 +631,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
 
-    expect(screen.getByText('Available modes')).toBeVisible()
+    expect(screen.getByText('Choose how your jobs run')).toBeVisible()
     expect(screen.getByText('Local streaming')).toBeVisible()
     expect(screen.getByText('Isolated local process')).toBeVisible()
     expect(screen.getByText('Warm Canvas worker')).toBeVisible()
@@ -641,16 +642,38 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByText('kernel:local')).toBeNull()
     expect(screen.queryByText('acme-01')).toBeNull()
 
-    fireEvent.click(screen.getByLabelText('Execution mode'))
-    expect(await screen.findByRole('option', { name: 'Automatic (recommended)' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toBeVisible()
   })
 
   it('presents inherited execution as Automatic without exposing deployment internals', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Execution mode'))
-    expect(await screen.findByRole('option', { name: 'Automatic (recommended)' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('Leave Automatic selected unless you need a specific isolation or worker behavior.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the default configured for Data Playground.')
+    expect(screen.queryByText(/Uses the mode chosen for this Workspace/)).toBeNull()
     expect(screen.queryByText('Workspace default (deployment default)')).toBeNull()
+  })
+
+  it('lets a researcher choose an execution mode from its explanation card', async () => {
+    state.kernelInfo = {
+      runners: ['local-out-of-core', 'local-subprocess'],
+      backends: [],
+    } as typeof state.kernelInfo
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+
+    const isolated = screen.getByRole('button', { name: 'Use Isolated local process' })
+    expect(isolated).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(isolated)
+    expect(isolated).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('group', { name: 'Execution mode' })).toHaveTextContent('Isolated local process')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'user', key: 'backend', value: 'local-subprocess' }],
+    ))
   })
 
   it('does not expose Restart kernel when Settings has no explicit runner selection', async () => {
@@ -732,8 +755,7 @@ describe('SettingsModal — plugin config form', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
 
     fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Execution mode'))
-    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenNthCalledWith(
@@ -749,8 +771,7 @@ describe('SettingsModal — plugin config form', () => {
       target: { value: 'edited-model' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
-    fireEvent.click(screen.getByLabelText('Execution mode'))
-    fireEvent.click(await screen.findByRole('option', { name: 'Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
@@ -808,10 +829,10 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
     fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
     fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'secret1' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }))
 
-    expect(screen.getByRole('button', { name: 'Adding member…' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Adding member…' }))
+    expect(screen.getByRole('button', { name: 'Adding…' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Adding…' }))
     expect(createUser).toHaveBeenCalledOnce()
     rejectCreate?.(new Error('name is already in use'))
 
@@ -825,9 +846,10 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
     expect(screen.queryByLabelText('Initial password')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add identity' }))
     await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor'))
-    expect(screen.getByText(/add a name without a password/i)).toBeVisible()
+    expect(screen.getByText(/collaboration identities rather than password accounts/i)).toBeVisible()
+    expect(screen.getByText(/must not be treated as authentication/i)).toBeVisible()
   })
 
   it('requires an initial password of at least six characters when authentication is on', async () => {
@@ -838,11 +860,11 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'short' } })
 
     expect(screen.getByRole('alert')).toHaveTextContent('Password must be at least 6 characters.')
-    expect(screen.getByRole('button', { name: 'Add member' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Create account' })).toBeDisabled()
     expect(createUser).not.toHaveBeenCalled()
 
     fireEvent.change(screen.getByLabelText('Initial password'), { target: { value: 'secret1' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }))
     await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor', 'secret1'))
   })
 
@@ -975,10 +997,11 @@ describe('SettingsModal — plugin config form', () => {
     })
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Test connection to Exports' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview files in Exports' }))
 
     await waitFor(() => expect(browseDestination).toHaveBeenCalledWith('d1', ''))
-    expect(await screen.findByText(/Browsing works · 1 item listed/)).toHaveTextContent('Write access is checked when a run starts.')
+    expect(await screen.findByText(/Preview loaded · 1 item found/)).toHaveTextContent('This checks listing only; a real write is verified when a run saves output.')
+    expect(screen.getByText(/does not create a test file or prove write access/i)).toBeVisible()
     expect(screen.queryByText(/write access works/i)).toBeNull()
   })
 
@@ -989,8 +1012,8 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(screen.getByLabelText('Destination root or prefix'), { target: { value: '/tmp/draft' } })
     fireEvent.click(screen.getByRole('button', { name: 'Add' }))
 
-    expect(screen.getByText('Save to test')).toBeVisible()
-    expect(screen.queryByRole('button', { name: /Test connection to Draft/ })).toBeNull()
+    expect(screen.getByText('Save to preview')).toBeVisible()
+    expect(screen.queryByRole('button', { name: /Preview files in Draft/ })).toBeNull()
     expect(browseDestination).not.toHaveBeenCalled()
   })
 

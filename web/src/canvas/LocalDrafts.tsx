@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { useStore } from '../store/graph'
-import type { LocalCanvasDraft } from '../store/canvasDrafts'
+import { UNAVAILABLE_DRAFT_BASE_MESSAGE, type LocalCanvasDraft } from '../store/canvasDrafts'
 import { Icon } from '../ui/Icon'
 import { cn } from '@/lib/utils'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 function statusLabel(draft: LocalCanvasDraft): string {
   if (draft.syncState === 'syncing') return 'syncing…'
-  if (draft.syncState === 'conflict') return 'conflict'
+  if (draft.syncState === 'conflict') return 'needs attention'
   if (draft.syncState === 'error') return 'sync blocked'
   return draft.baseCanvasId === null ? 'local only' : 'saved locally'
 }
@@ -18,9 +19,12 @@ function DraftActions({ draft, close }: { draft: LocalCanvasDraft; close?: () =>
   const discard = useStore((state) => state.discardLocalDraft)
   const exportDraft = useStore((state) => state.exportLocalDraft)
   const openFile = useStore((state) => state.openFile)
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false)
+  const serverCopyKnownUnavailable = draft.lastError === UNAVAILABLE_DRAFT_BASE_MESSAGE
+  const syncing = draft.syncState === 'syncing'
   const actionClass = 'rounded px-1.5 py-0.5 text-[10.5px] font-semibold hover:bg-accent disabled:opacity-50'
-  return <div className="flex shrink-0 items-center gap-0.5">
-    {draft.syncState === 'conflict' && draft.baseCanvasId && (
+  return <><div className="flex shrink-0 items-center gap-0.5">
+    {draft.syncState === 'conflict' && draft.baseCanvasId && !serverCopyKnownUnavailable && (
       <button aria-label={`Open server copy for ${draft.name}`} title={!kernelUp ? 'Hub offline — reconnect before opening the server copy' : undefined}
         className={actionClass} disabled={!kernelUp} onClick={() => { void openFile(draft.baseCanvasId!, { serverCopy: true }); close?.() }}>Open server</button>
     )}
@@ -32,10 +36,26 @@ function DraftActions({ draft, close }: { draft: LocalCanvasDraft; close?: () =>
         className={actionClass} disabled={!kernelUp || draft.syncState === 'syncing'} onClick={() => void retry(draft.draftId)}>Retry</button>
     )}
     <button aria-label={`Export local draft ${draft.name}`} className={actionClass} onClick={() => exportDraft(draft.draftId)}>Export</button>
-    <button aria-label={`Delete local draft ${draft.name}`} title="Delete local draft" className={cn(actionClass, 'text-destructive')} onClick={() => void discard(draft.draftId)}>
+    <button aria-label={`Delete local draft ${draft.name}`}
+      title={syncing ? 'Wait for syncing to finish before deleting this draft' : 'Delete local draft'}
+      disabled={syncing} className={cn(actionClass, 'text-destructive')}
+      onClick={() => setConfirmingDiscard(true)}>
       <Icon name="trash" size={11} />
     </button>
   </div>
+  <ConfirmationDialog
+    open={confirmingDiscard}
+    title={`Delete local draft “${draft.name || 'untitled'}”?`}
+    description="This permanently deletes the changes saved only in this browser. It does not delete a server Canvas. This cannot be undone."
+    confirmLabel="Delete local draft"
+    onCancel={() => setConfirmingDiscard(false)}
+    onConfirm={() => {
+      setConfirmingDiscard(false)
+      close?.()
+      void discard(draft.draftId)
+    }}
+  />
+  </>
 }
 
 export function WorkspaceLocalDrafts() {
@@ -54,10 +74,12 @@ export function WorkspaceLocalDrafts() {
     {expanded && <div className="grid gap-1 border-t border-amber-300/30 px-7 py-2">
       {errors.map((error, index) => <div key={`${index}-${error}`} role="alert" className="text-[11px] text-destructive">{error}</div>)}
       {drafts.map((draft) => <div key={draft.draftId} data-testid="local-draft-row" data-draft-id={draft.draftId} className="flex min-w-0 items-center gap-2 rounded-md bg-background/70 px-2 py-1.5 text-[11.5px]">
-        <button className="min-w-0 flex-1 truncate text-left font-semibold hover:underline" onClick={() => openDraft(draft.draftId)}>{draft.name || 'untitled'}</button>
+        <button className="min-w-0 flex-1 text-left hover:underline" onClick={() => openDraft(draft.draftId)}>
+          <span className="block truncate font-semibold">{draft.name || 'untitled'}</span>
+          {draft.lastError && <span className="block truncate text-[10px] font-normal text-muted-foreground" title={draft.lastError}>{draft.lastError}</span>}
+        </button>
         <span className={cn('shrink-0 text-[10.5px]', draft.syncState === 'conflict' || draft.syncState === 'error' ? 'text-destructive' : 'text-muted-foreground')}>{statusLabel(draft)}</span>
         <DraftActions draft={draft} />
-        {draft.lastError && <span className="sr-only">{draft.lastError}</span>}
       </div>)}
     </div>}
   </section>

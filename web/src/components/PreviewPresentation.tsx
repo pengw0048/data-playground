@@ -96,7 +96,7 @@ export function PreviewDetails({ provenance, stale = false }: {
     <details className="text-[10.5px] text-muted-foreground" data-testid="preview-details">
       <summary className="cursor-pointer select-none py-1 font-medium hover:text-foreground">Preview details</summary>
       <div className="space-y-0.5 pb-1">
-        {stale && <div>These retained rows are from the bound version below, not a refreshed preview.</div>}
+        {stale && <div>These saved rows are from the version below, not a refreshed preview.</div>}
         <div>{counts}</div>
         <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
         {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}

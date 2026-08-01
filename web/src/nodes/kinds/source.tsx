@@ -565,7 +565,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
     } catch (error) {
       if (generation !== historyGeneration.current) return
       if (kernelErrorStatus(error) === 410) {
-        setAsOfError('No retained revision exists at or before that instant.')
+        setAsOfError('No saved version exists at or before that time.')
       } else if (kernelErrorStatus(error) === 409) {
         setAsOfError('The provider could not identify one stable version for that time.')
       } else {
@@ -614,7 +614,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
     : !controlAvailable ? 'Revision selection unavailable'
       : selected?.kind === 'as_of' ? `Change version selected as of ${formatRevisionUtc(selected.asOf)}`
         : selectedExact ? 'Change selected version'
-          : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
+          : availability === 'available' && asOfAvailable ? 'Choose a saved or as-of version'
             : asOfAvailable ? 'Choose version by time' : 'Pin a version'
 
   if (!showControl && !selectedExact) return null
@@ -640,7 +640,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
           Selected version is missing or compacted. Selection preserved; latest was not substituted.
           {staleLastKnown}{' '}
           {registrationReplaced && 'The current catalog registration has a different dataset identity. '}
-          {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another retained revision</button>}
+          {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another saved version</button>}
           {controlAvailable && ' or '}
           {table ? <><button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow current latest explicitly</button>.</>
             : 'Choose a new dataset above to create a new binding.'}
@@ -665,14 +665,14 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
         </div>
       )}
       {showControl && <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
-        <div className="px-2 py-1 text-[10px] text-muted-foreground">Select one retained version. This Source will not switch to latest automatically.</div>
+        <div className="px-2 py-1 text-[10px] text-muted-foreground">Select one saved version. This Source will not switch to latest automatically.</div>
         {selected && (
           <button type="button" onClick={() => { onChange(undefined); setOpen(false) }}
             className="w-full rounded-md px-2 py-1.5 text-left text-[11px] font-semibold text-primary hover:bg-accent">
             Follow latest instead
           </button>
         )}
-        {availability === 'available' && revisions.length === 0 && <div className="px-2 py-2 text-[11px] text-muted-foreground">No retained revisions.</div>}
+        {availability === 'available' && revisions.length === 0 && <div className="px-2 py-2 text-[11px] text-muted-foreground">No saved versions.</div>}
         {revisions.map((revision, index) => {
           const active = selectedExact?.datasetId === revision.datasetId && selectedExact.revisionId === revision.revisionId
           return (
@@ -684,7 +684,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
                 }); setOpen(false)
               }} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`}>
               <span className="dp-mono min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground">{revision.revisionId}</span>
-              {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest retained</span>}
+              {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest saved</span>}
               <span className="shrink-0 text-[9px] text-muted-foreground">{revision.committedAt ? formatRevisionUtc(revision.committedAt) : 'time unknown'}</span>
             </button>
           )
@@ -692,7 +692,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
         {hasMore && (
           <button type="button" disabled={loadingMore} onClick={() => void loadMore()}
             className="w-full rounded-md px-2 py-1.5 text-center text-[10.5px] font-semibold text-primary hover:bg-accent disabled:opacity-50">
-            {loadingMore ? 'Loading…' : historyError ? 'Retry loading more' : 'Load more retained revisions'}
+            {loadingMore ? 'Loading…' : historyError ? 'Retry loading more' : 'Load more saved versions'}
           </button>
         )}
         {asOfAvailable && <div className="mt-1 border-t border-border px-2 pt-2">

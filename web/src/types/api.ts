@@ -360,6 +360,8 @@ export interface WorkspaceResource {
   parentId?: string | null
   placementId?: string | null
   version?: number | null
+  /** Canvas document CAS token. Workspace placement mutations continue to use `version`. */
+  canvasVersion?: number | null
   /** Stable built-in Catalog folder binding when this local container is a folder projection. */
   catalogFolderId?: string | null
   catalogFolderState?: 'current' | 'detached' | null
@@ -401,9 +403,17 @@ export interface WorkspaceSourceStatus {
   error?: string | null
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
 }
+export interface WorkspaceQueryCapabilities {
+  sort: Array<'name' | 'updated'>
+  kindFilter: boolean
+  reason?: string | null
+}
 export interface WorkspaceBrowsePage {
   container: WorkspaceResource | null
   items: WorkspaceResource[]
+  /** Configured provider roots are explicit source folders, not sortable local children. */
+  connectedSources?: WorkspaceResource[]
+  queryCapabilities?: WorkspaceQueryCapabilities
   nextCursor?: string | null
   hasMore: boolean
   completeness: 'complete' | 'page' | 'partial'
@@ -422,6 +432,8 @@ export interface WorkspaceCanonicalDatasetContext {
   providerDatasetId: string
   /** Placement-independent identity used by the eventual Source admission. */
   datasetIdentity: string
+  /** Stable non-sensitive Source URI used for core lineage recorded by Data Playground runs. */
+  sourceUri: string
   readMode: 'exact' | 'current'
   revisionId?: string | null
   committedAt?: string | null

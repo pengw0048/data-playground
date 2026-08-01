@@ -159,7 +159,7 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     await waitForCompletedReport(page, secondKnownSmall.reportId)
     const compareUrl = `/#/distribution-reports/${encodeURIComponent(knownSmall.reportId)}?compare=${encodeURIComponent(secondKnownSmall.reportId)}`
     await page.goto(compareUrl)
-    await expect(page.getByLabel('Compare with retained report')).toHaveValue(secondKnownSmall.reportId)
+    await expect(page.getByLabel('Compare with saved report')).toHaveValue(secondKnownSmall.reportId)
     await expect(page.getByText('Coverage before comparison')).toBeVisible()
     await expect(page.getByText('Server-authorized deltas (comparison − current)').first()).toBeVisible()
 
@@ -175,7 +175,7 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     const drawer = page.getByRole('dialog', { name: 'Bucket examples' })
     await expect(drawer).toContainText(`${examples.bucketKind} bucket`)
     await expect(drawer).toContainText(`Showing ${examples.returnedRows} of up to ${examples.rowLimit} bounded example rows`)
-    await drawer.getByText('Technical evidence').click()
+    await drawer.getByText('Diagnostics').click()
     await expect(drawer).toContainText(knownSmall.reportId)
     await expect(drawer).toContainText(view.id)
     await expect(drawer).toContainText(examples.datasetId)
@@ -230,7 +230,7 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
       needsConfirmation: true,
       reason: 'large_scan',
     })
-    await expect(page.getByRole('dialog', { name: 'Confirm distribution report' })).toContainText('exceeds the confirmation scan threshold')
+    await expect(page.getByRole('dialog', { name: 'Confirm distribution report' })).toContainText('exceeds the automatic scan limit')
     const confirmedSubmission = page.waitForResponse((response) =>
       response.url().endsWith(`/api/dataset-views/${largeView!.id}/distribution-reports`)
       && response.request().method() === 'POST')
@@ -240,7 +240,7 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     expect(JSON.parse(confirmedResponse.request().postData() ?? '{}')).toMatchObject({ confirmed: true })
     await openTerminalReport(page, confirmed.reportId, largeViewName)
     await page.goto(`/#/distribution-reports/${encodeURIComponent(knownSmall.reportId)}?compare=${encodeURIComponent(confirmed.reportId)}`)
-    const crossViewSelect = page.getByLabel('Compare with retained report')
+    const crossViewSelect = page.getByLabel('Compare with saved report')
     await expect(crossViewSelect).toHaveValue(confirmed.reportId)
     await expect(crossViewSelect.locator('option:checked')).toHaveText(/^Linked report · /)
     await expect(page.getByText('Coverage before comparison')).toBeVisible()

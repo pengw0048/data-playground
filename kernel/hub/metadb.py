@@ -30,7 +30,7 @@ from urllib.parse import unquote, urlsplit
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
     Integer, LargeBinary, String, Text, UniqueConstraint, and_, case, cast, create_engine, delete, exists,
-    func, literal, or_, select, text, tuple_, update,
+    func, literal, or_, select, text, tuple_, union_all, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -3196,7 +3196,7 @@ def _workspace_external_overlay_anchor_for_container(
 
 
 def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceContainer:
-    """Lock a destination and reject writes anywhere below a detached Catalog tombstone."""
+    """Lock a destination and reject writes below any terminally detached source."""
     destination = _workspace_container_locked(s, container_id)
     current: WorkspaceContainer | None = destination
     visited: set[str] = set()
@@ -3206,6 +3206,14 @@ def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceCon
         visited.add(current.id)
         if current.catalog_folder_state == "detached":
             raise ValueError("a deleted Catalog folder subtree is a read-only Workspace tombstone")
+        anchor = s.scalar(select(WorkspaceExternalOverlayAnchor).where(
+            WorkspaceExternalOverlayAnchor.container_id == current.id).with_for_update())
+        if anchor is not None:
+            binding = s.get(WorkspaceProviderBinding, anchor.binding_id, with_for_update=True)
+            if binding is None:  # pragma: no cover - foreign key protected invariant
+                raise RuntimeError("external Workspace overlay anchor binding is missing")
+            if binding.state == "detached":
+                raise ValueError("a detached provider location cannot accept local Canvas changes")
         current = (s.get(WorkspaceContainer, current.parent_id, with_for_update=True)
                    if current.parent_id is not None else None)
     return destination
@@ -3524,16 +3532,15 @@ def _workspace_sync_dataset_folder_in_session(
     placement.container_id = container_id
 
 
-def _workspace_ensure_root_placement_in_session(
-        s, *, target_kind: str, target_id: str, name: str) -> None:
-    """Give a local resource its canonical root placement without moving an existing one."""
+def _workspace_ensure_placement_in_session(
+        s, *, container_id: str, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource one canonical placement without moving an existing one."""
     if target_kind not in {"canvas", "dataset"}:
         raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
-    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
-    if root is None or not root.is_root:
-        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    if s.get(WorkspaceContainer, container_id) is None:
+        raise RuntimeError("Workspace placement destination is missing")
     values = {
-        "id": _uid(), "container_id": LOCAL_WORKSPACE_ROOT_ID,
+        "id": _uid(), "container_id": container_id,
         "target_kind": target_kind, "target_id": target_id,
         "name": _workspace_name(name), "ordinal": 0, "version": 1,
     }
@@ -3546,6 +3553,21 @@ def _workspace_ensure_root_placement_in_session(
         raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
     s.execute(dialect_insert(WorkspacePlacement).values(**values).on_conflict_do_nothing(
         index_elements=[WorkspacePlacement.target_kind, WorkspacePlacement.target_id]))
+
+
+def _workspace_ensure_root_placement_in_session(
+        s, *, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource its canonical root placement without moving an existing one."""
+    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
+    if root is None or not root.is_root:
+        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    _workspace_ensure_placement_in_session(
+        s,
+        container_id=LOCAL_WORKSPACE_ROOT_ID,
+        target_kind=target_kind,
+        target_id=target_id,
+        name=name,
+    )
 
 
 def import_native_canvas(
@@ -4589,6 +4611,108 @@ def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_versio
             "ok": True,
             "resource": _workspace_public_placement_resource(s, placement, detached=False),
             "previousContainer": _workspace_public_container_resource(s, previous),
+            "container": _workspace_public_container_resource(s, destination),
+        }
+
+
+def workspace_batch_action(*, uid: str, action: str, items: list[dict],
+                           container_id: str | None = None,
+                           expected_container_version: int | None = None) -> dict:
+    """Validate and apply one bounded Workspace mutation as a single database transaction.
+
+    The current writable placement model deliberately exposes only Canvas moves. Dataset
+    placements are Catalog-owned and immutable DatasetView placements own their lifecycle.
+    Every placement and permission is checked before the first write; any later failure still
+    rolls the surrounding transaction back.
+    """
+    if action not in {"delete_canvases", "move"}:
+        raise ValueError("unsupported Workspace batch action")
+    if not items or len(items) > 50:
+        raise ValueError("Workspace batch must contain between 1 and 50 items")
+    normalized: list[tuple[str, int, int | None]] = []
+    seen: set[str] = set()
+    for item in items:
+        placement_id = str(item.get("placementId", "")).strip()
+        expected_version = item.get("expectedVersion")
+        expected_canvas_version = item.get("expectedCanvasVersion")
+        if not placement_id or placement_id in seen:
+            raise ValueError("Workspace batch contains an invalid or duplicate placement")
+        if (isinstance(expected_version, bool) or not isinstance(expected_version, int)
+                or expected_version < 1):
+            raise ValueError("Workspace batch expected version must be a positive integer")
+        if action == "delete_canvases" and (
+                isinstance(expected_canvas_version, bool)
+                or not isinstance(expected_canvas_version, int)
+                or expected_canvas_version < 1):
+            raise ValueError(
+                "Workspace batch delete expected Canvas version must be a positive integer")
+        seen.add(placement_id)
+        normalized.append((placement_id, expected_version, expected_canvas_version))
+
+    with _workspace_write_session() as s:
+        destination: WorkspaceContainer | None = None
+        if action == "move":
+            if not container_id or expected_container_version is None:
+                raise ValueError("Workspace batch move requires a versioned destination")
+            destination = _workspace_container_at_version(
+                s, container_id, expected_container_version)
+        elif container_id is not None or expected_container_version is not None:
+            raise ValueError("Workspace batch delete does not accept a destination")
+
+        validated: list[tuple[WorkspacePlacement, Canvas]] = []
+        for placement_id, expected_version, expected_canvas_version in sorted(
+                normalized, key=lambda item: item[0]):
+            placement = _workspace_placement_locked(s, placement_id)
+            if placement.target_kind != "canvas":
+                raise ValueError("only Canvas placements can be changed by this Workspace batch")
+            if placement.version != expected_version:
+                _workspace_version_conflict("placement", placement_id, expected_version)
+            canvas = s.get(Canvas, placement.target_id, with_for_update=True)
+            if canvas is None:
+                raise KeyError(f"canvas '{placement.target_id}' not found")
+            if (action == "delete_canvases"
+                    and canvas.version != expected_canvas_version):
+                _workspace_version_conflict(
+                    "canvas", canvas.id, int(expected_canvas_version))
+            role = _workspace_canvas_role_in_session(s, canvas, uid)
+            allowed = role == "owner" if action == "delete_canvases" else role in ("owner", "editor")
+            if not allowed:
+                verb = "delete" if action == "delete_canvases" else "move"
+                raise PermissionError(f"you don't have permission to {verb} this canvas")
+            if destination is not None and placement.container_id == destination.id:
+                raise ValueError(f"canvas '{canvas.id}' is already in that Workspace container")
+            validated.append((placement, canvas))
+
+        # Lock in a deterministic order, but keep the response aligned with the caller's bounded
+        # selection. A client must never need to infer which result belongs to which request item.
+        validated_by_placement = {
+            placement.id: (placement, canvas) for placement, canvas in validated
+        }
+        validated = [validated_by_placement[placement_id]
+                     for placement_id, _version, _canvas_version in normalized]
+
+        if action == "delete_canvases":
+            deleted_ids = [canvas.id for _placement, canvas in validated]
+            for canvas_id in deleted_ids:
+                delete_canvas_cascade(canvas_id, db_session=s)
+            return {"ok": True, "action": action, "deletedCanvasIds": deleted_ids, "items": []}
+
+        assert destination is not None
+        moved: list[dict] = []
+        for placement, _canvas in validated:
+            changed = s.execute(update(WorkspacePlacement).where(
+                WorkspacePlacement.id == placement.id,
+                WorkspacePlacement.version == placement.version,
+            ).values(
+                container_id=destination.id,
+                version=WorkspacePlacement.version + 1,
+            ).execution_options(synchronize_session=False))
+            if changed.rowcount != 1:
+                _workspace_version_conflict("placement", placement.id, placement.version)
+            s.refresh(placement)
+            moved.append(_workspace_public_placement_resource(s, placement, detached=False))
+        return {
+            "ok": True, "action": action, "items": moved,
             "container": _workspace_public_container_resource(s, destination),
         }
 
@@ -5693,11 +5817,15 @@ def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
     }
 
 
-def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) -> dict:
+def _workspace_placement_resource(
+        row: WorkspacePlacement, *, detached: bool,
+        canvas_version: int | None = None) -> dict:
     return {
         "id": _workspace_ref(row.target_kind, row.target_id), "kind": row.target_kind,
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
+        **({"canvasVersion": canvas_version}
+           if row.target_kind == "canvas" and canvas_version is not None else {}),
     }
 
 
@@ -5762,7 +5890,12 @@ def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
 
 def _workspace_public_placement_resource(
         s, row: WorkspacePlacement, *, detached: bool) -> dict:
-    resource = _workspace_placement_resource(row, detached=detached)
+    canvas_version = (
+        s.scalar(select(Canvas.version).where(Canvas.id == row.target_id))
+        if row.target_kind == "canvas" else None
+    )
+    resource = _workspace_placement_resource(
+        row, detached=detached, canvas_version=canvas_version)
     container = s.get(WorkspaceContainer, row.container_id)
     if container is None:  # pragma: no cover - foreign key protected invariant
         raise RuntimeError("Workspace placement parent is missing")
@@ -6536,10 +6669,328 @@ def _workspace_dataset_view_visible_clause(uid: str):
     ))
 
 
+_WORKSPACE_QUERY_CURSOR_VERSION = 3
+_WORKSPACE_BROWSE_KINDS = frozenset({"container", "canvas", "dataset", "dataset_view"})
+
+
+@dataclass(frozen=True)
+class _WorkspaceQueryCursor:
+    name: str
+    kind_rank: int
+    row_id: str
+    null_rank: int | None = None
+    updated_at: datetime.datetime | None = None
+
+
+def _workspace_query_cursor_encode(*, container_id: str, sort: str, order: str,
+                                   kinds: frozenset[str],
+                                   name: str, kind_rank: int, row_id: str,
+                                   updated_at: datetime.datetime | None) -> str:
+    payload: list[object] = [
+        _WORKSPACE_QUERY_CURSOR_VERSION, container_id, sort, order, sorted(kinds),
+    ]
+    if sort == "name":
+        payload.extend((name, kind_rank, row_id))
+    else:
+        null_rank = 1 if updated_at is None else 0
+        payload.extend((
+            null_rank,
+            updated_at.isoformat() if updated_at is not None else None,
+            name,
+            kind_rank,
+            row_id,
+        ))
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_query_cursor_decode(cursor: str | None, *, container_id: str,
+                                   sort: str, order: str,
+                                   kinds: frozenset[str]) -> _WorkspaceQueryCursor | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Workspace query cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+    except (binascii.Error, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid Workspace query cursor") from exc
+    if not isinstance(payload, list) or len(payload) < 5:
+        raise ValueError("invalid Workspace query cursor")
+    version, cursor_container_id, cursor_sort, cursor_order, cursor_kinds = payload[:5]
+    if (version != _WORKSPACE_QUERY_CURSOR_VERSION
+            or cursor_container_id != container_id
+            or cursor_sort != sort or cursor_order != order
+            or cursor_kinds != sorted(kinds)):
+        raise ValueError("Workspace query cursor does not match this folder, sort, and filter")
+    values = payload[5:]
+    if sort == "name":
+        if len(values) != 3:
+            raise ValueError("invalid Workspace query cursor")
+        name, kind_rank, row_id = values
+        null_rank = None
+        updated_at = None
+    else:
+        if len(values) != 5:
+            raise ValueError("invalid Workspace query cursor")
+        null_rank, raw_updated_at, name, kind_rank, row_id = values
+        if (isinstance(null_rank, bool) or not isinstance(null_rank, int)
+                or null_rank not in (0, 1)
+                or (null_rank == 0 and not isinstance(raw_updated_at, str))
+                or (null_rank == 1 and raw_updated_at is not None)):
+            raise ValueError("invalid Workspace query cursor")
+        try:
+            updated_at = (
+                datetime.datetime.fromisoformat(raw_updated_at)
+                if isinstance(raw_updated_at, str) else None
+            )
+        except ValueError as exc:
+            raise ValueError("invalid Workspace query cursor") from exc
+    if (not isinstance(name, str)
+            or isinstance(kind_rank, bool) or not isinstance(kind_rank, int)
+            or kind_rank not in (0, 1, 2, 3)
+            or not isinstance(row_id, str) or not row_id):
+        raise ValueError("invalid Workspace query cursor")
+    return _WorkspaceQueryCursor(
+        name=name,
+        kind_rank=kind_rank,
+        row_id=row_id,
+        null_rank=null_rank,
+        updated_at=updated_at,
+    )
+
+
+def _workspace_query_name_after(name_column, kind_column, id_column,
+                                cursor: _WorkspaceQueryCursor, *, descending: bool):
+    name_after = name_column < cursor.name if descending else name_column > cursor.name
+    return or_(
+        name_after,
+        and_(name_column == cursor.name, or_(
+            kind_column > cursor.kind_rank,
+            and_(kind_column == cursor.kind_rank, id_column > cursor.row_id),
+        )),
+    )
+
+
+def _workspace_query_updated_after(updated_column, null_column, name_column,
+                                   kind_column, id_column,
+                                   cursor: _WorkspaceQueryCursor, *, descending: bool):
+    name_after = _workspace_query_name_after(
+        name_column, kind_column, id_column, cursor, descending=False)
+    if cursor.null_rank == 1:
+        return and_(null_column == 1, name_after)
+    if cursor.updated_at is None:  # pragma: no cover - cursor validation guarantees this
+        raise ValueError("invalid Workspace query cursor")
+    updated_after = (
+        updated_column < cursor.updated_at
+        if descending else updated_column > cursor.updated_at
+    )
+    return or_(
+        null_column > 0,
+        and_(null_column == 0, or_(
+            updated_after,
+            and_(updated_column == cursor.updated_at, name_after),
+        )),
+    )
+
+
+def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
+                            cursor: str | None, sort: str, order: str,
+                            kinds: frozenset[str]) -> dict:
+    """Run one filtered and globally ordered local Workspace page in the metadata database.
+
+    ``updated`` uses the authoritative target timestamp where the current model has one: Canvas
+    ``updated_at``, Catalog entry ``updated_at``, and immutable DatasetView ``created_at``. Local
+    Folder rows and detached Dataset placements have no timestamp column and therefore sort as
+    unknown after timestamped resources, with a deterministic name/kind/id tie-break.
+    """
+    if sort not in {"name", "updated"}:
+        raise ValueError("Workspace sort must be 'name' or 'updated'")
+    if order not in {"asc", "desc"}:
+        raise ValueError("Workspace order must be 'asc' or 'desc'")
+    if not kinds or not kinds <= _WORKSPACE_BROWSE_KINDS:
+        raise ValueError("Workspace type filter is invalid")
+    decoded = _workspace_query_cursor_decode(
+        cursor, container_id=container_id, sort=sort, order=order, kinds=kinds)
+    with session() as s:
+        container = s.get(WorkspaceContainer, container_id)
+        if container is None:
+            raise KeyError(f"workspace container '{container_id}' not found")
+        if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
+            raise KeyError(f"workspace container '{container_id}' not found")
+
+        streams = []
+        missing_timestamp = cast(literal(None), DateTime(timezone=True))
+        missing_canvas_version = cast(literal(None), Integer)
+        if "container" in kinds:
+            streams.append(select(
+                WorkspaceContainer.id.label("row_id"),
+                literal("container").label("kind"),
+                literal(0).label("kind_rank"),
+                WorkspaceContainer.name.label("name"),
+                missing_timestamp.label("updated_at"),
+                missing_canvas_version.label("canvas_version"),
+            ).where(
+                WorkspaceContainer.parent_id == container_id,
+                ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+                    WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
+            ))
+        if "canvas" in kinds:
+            streams.append(select(
+                WorkspacePlacement.id.label("row_id"),
+                literal("canvas").label("kind"),
+                literal(1).label("kind_rank"),
+                WorkspacePlacement.name.label("name"),
+                Canvas.updated_at.label("updated_at"),
+                Canvas.version.label("canvas_version"),
+            ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).where(
+                WorkspacePlacement.container_id == container_id,
+                WorkspacePlacement.target_kind == "canvas",
+                or_(
+                    Canvas.owner_id == uid,
+                    Canvas.visibility.in_(("workspace", "workspace_view")),
+                    exists(select(CanvasShare.id).where(
+                        CanvasShare.canvas_id == Canvas.id,
+                        CanvasShare.user_id == uid,
+                    ).correlate(Canvas)),
+                ),
+                _workspace_local_placement_visible_clause(),
+            ))
+        if "dataset" in kinds:
+            streams.append(select(
+                WorkspacePlacement.id.label("row_id"),
+                literal("dataset").label("kind"),
+                literal(2).label("kind_rank"),
+                WorkspacePlacement.name.label("name"),
+                CatalogEntry.updated_at.label("updated_at"),
+                missing_canvas_version.label("canvas_version"),
+            ).outerjoin(
+                CatalogEntry,
+                CatalogEntry.registration_id == WorkspacePlacement.target_id,
+            ).where(
+                WorkspacePlacement.container_id == container_id,
+                WorkspacePlacement.target_kind == "dataset",
+                _workspace_local_placement_visible_clause(),
+            ))
+        if "dataset_view" in kinds:
+            streams.append(select(
+                WorkspacePlacement.id.label("row_id"),
+                literal("dataset_view").label("kind"),
+                literal(3).label("kind_rank"),
+                WorkspacePlacement.name.label("name"),
+                DatasetView.created_at.label("updated_at"),
+                missing_canvas_version.label("canvas_version"),
+            ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).where(
+                WorkspacePlacement.container_id == container_id,
+                WorkspacePlacement.target_kind == "dataset_view",
+                DatasetView.owner_id == uid,
+                DatasetView.deleted_at.is_(None),
+                _workspace_local_placement_visible_clause(),
+            ))
+
+        listing = union_all(*streams).subquery()
+        name_order = _workspace_name_order(func.lower(listing.c.name))
+        null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
+        if sort == "name":
+            primary = name_order.asc() if order == "asc" else name_order.desc()
+            ordering = [primary, listing.c.kind_rank.asc(), listing.c.row_id.asc()]
+            after = (
+                _workspace_query_name_after(
+                    name_order, listing.c.kind_rank, listing.c.row_id, decoded,
+                    descending=order == "desc",
+                )
+                if decoded is not None else None
+            )
+        else:
+            primary = (listing.c.updated_at.asc() if order == "asc"
+                       else listing.c.updated_at.desc())
+            ordering = [
+                null_order.asc(),
+                primary, name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
+            ]
+            after = (
+                _workspace_query_updated_after(
+                    listing.c.updated_at, null_order, name_order,
+                    listing.c.kind_rank, listing.c.row_id, decoded,
+                    descending=order == "desc",
+                )
+                if decoded is not None else None
+            )
+        query = select(
+            listing.c.row_id,
+            listing.c.kind,
+            listing.c.kind_rank,
+            name_order.label("sort_name"),
+            listing.c.updated_at,
+            listing.c.canvas_version,
+        ).order_by(*ordering).limit(limit + 1)
+        if after is not None:
+            query = query.where(after)
+        rows = list(s.execute(query).all())
+        page_rows = rows[:limit]
+        container_ids = [row.row_id for row in page_rows if row.kind == "container"]
+        placement_ids = [row.row_id for row in page_rows if row.kind != "container"]
+        containers = {
+            row.id: row for row in s.scalars(select(WorkspaceContainer).where(
+                WorkspaceContainer.id.in_(container_ids)))
+        } if container_ids else {}
+        placements = {
+            row.id: row for row in s.scalars(select(WorkspacePlacement).where(
+                WorkspacePlacement.id.in_(placement_ids)))
+        } if placement_ids else {}
+        dataset_ids = [
+            row.target_id for row in placements.values() if row.target_kind == "dataset"]
+        live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
+            CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
+        items: list[dict] = []
+        for row in page_rows:
+            if row.kind == "container":
+                resource = containers.get(row.row_id)
+                if resource is not None:
+                    items.append(_workspace_container_resource(s, resource))
+                continue
+            placement = placements.get(row.row_id)
+            if placement is not None:
+                items.append(_workspace_placement_resource(
+                    placement,
+                    detached=(placement.target_kind == "dataset"
+                              and placement.target_id not in live_datasets),
+                    canvas_version=row.canvas_version,
+                ))
+        has_more = len(rows) > limit
+        last_row = page_rows[-1] if page_rows else None
+        next_cursor = (
+            _workspace_query_cursor_encode(
+                container_id=container_id,
+                sort=sort,
+                order=order,
+                kinds=kinds,
+                name=last_row.sort_name,
+                kind_rank=last_row.kind_rank,
+                row_id=last_row.row_id,
+                updated_at=last_row.updated_at,
+            )
+            if has_more and last_row is not None else None
+        )
+        return {
+            "container": _workspace_container_resource(s, container),
+            "items": items, "nextCursor": next_cursor, "hasMore": has_more,
+            "completeness": "page" if has_more else "complete",
+        }
+
+
 def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
-                     cursor: str | None = None) -> dict:
+                     cursor: str | None = None, sort: str | None = None,
+                     order: str = "asc", kinds: set[str] | frozenset[str] | None = None) -> dict:
     """Read one bounded mixed local Workspace page without calling a catalog provider."""
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    if sort is not None or kinds is not None:
+        return _workspace_browse_query(
+            container_id, uid=uid, limit=limit, cursor=cursor,
+            sort=sort or "name", order=order,
+            kinds=frozenset(kinds or _WORKSPACE_BROWSE_KINDS),
+        )
     decoded = _workspace_cursor_decode(cursor)
     with session() as s:
         container = s.get(WorkspaceContainer, container_id)
@@ -6602,17 +7053,20 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         canvas_ids = [row.target_id for row in placements if row.target_kind == "canvas"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
-        live_canvases = set(s.scalars(select(Canvas.id).where(Canvas.id.in_(canvas_ids)))) if canvas_ids else set()
+        canvas_versions = dict(s.execute(select(Canvas.id, Canvas.version).where(
+            Canvas.id.in_(canvas_ids))).all()) if canvas_ids else {}
 
         rows: list[tuple[tuple, dict]] = []
         for row in containers:
             rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(s, row)))
         for row in placements:
             rank = {"canvas": 1, "dataset": 2, "dataset_view": 3}[row.target_kind]
-            live = (row.target_id in live_canvases if row.target_kind == "canvas" else
+            live = (row.target_id in canvas_versions if row.target_kind == "canvas" else
                     row.target_id in live_datasets if row.target_kind == "dataset" else True)
             rows.append(((row.ordinal, rank, row.name, row.id),
-                         _workspace_placement_resource(row, detached=not live)))
+                         _workspace_placement_resource(
+                             row, detached=not live,
+                             canvas_version=canvas_versions.get(row.target_id))))
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
         has_more = len(rows) > limit
@@ -6765,6 +7219,9 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             WorkspacePlacement.target_id,
         ).limit(limit + 1)))
 
+        canvas_ids = [row.target_id for row in canvas_placements]
+        canvas_versions = dict(s.execute(select(Canvas.id, Canvas.version).where(
+            Canvas.id.in_(canvas_ids))).all()) if canvas_ids else {}
         dataset_ids = [row.target_id for row in dataset_placements]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
@@ -6775,7 +7232,9 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         )
         rows.extend(
             ((row.name.lower(), 1, row.target_id),
-             _workspace_placement_resource(row, detached=False))
+             _workspace_placement_resource(
+                 row, detached=False,
+                 canvas_version=canvas_versions.get(row.target_id)))
             for row in canvas_placements
         )
         rows.extend(
@@ -6848,7 +7307,8 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
             live = (s.get(Canvas, identity) is not None if kind == "canvas" else
                     s.scalar(select(CatalogEntry.uri).where(
                         CatalogEntry.registration_id == identity)) is not None)
-        return {"resource": _workspace_placement_resource(placement, detached=not live),
+        return {"resource": _workspace_public_placement_resource(
+                    s, placement, detached=not live),
                 "ancestors": _workspace_ancestors(s, placement.container_id)}
 
 
@@ -10716,14 +11176,14 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
         )
 
 
-def delete_canvas_cascade(canvas_id: str) -> None:
+def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
     """Delete a canvas, its Workspace placement, and its children.
 
     FKs don't cascade (SQLite FK off, Postgres would error), so clean them explicitly.
     A Canvas placement has no independent recovery value after its target is permanently
     deleted; retaining it only leaves an unusable row in Workspace.
     """
-    with session() as s:
+    with (session() if db_session is None else contextlib.nullcontext(db_session)) as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
             return

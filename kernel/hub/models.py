@@ -1264,6 +1264,7 @@ class WorkspaceResource(Wire):
     parent_id: str | None = None
     placement_id: str | None = None
     version: int | None = None
+    canvas_version: int | None = Field(default=None, ge=1)
     catalog_folder_id: str | None = None
     catalog_folder_state: Literal["current", "detached"] | None = None
     catalog_folder_path: str | None = None
@@ -1314,9 +1315,18 @@ class WorkspaceSourceStatus(Wire):
     ] | None = None
 
 
+class WorkspaceQueryCapabilities(Wire):
+    """Queries that are truthful for every item returned by this browse lens."""
+    sort: list[Literal["name", "updated"]] = []
+    kind_filter: bool = False
+    reason: str | None = Field(default=None, max_length=256)
+
+
 class WorkspaceBrowsePage(Wire):
     container: WorkspaceResource | None
     items: list[WorkspaceResource] = []
+    connected_sources: list[WorkspaceResource] = []
+    query_capabilities: WorkspaceQueryCapabilities = WorkspaceQueryCapabilities()
     next_cursor: str | None = None
     has_more: bool = False
     completeness: Literal["complete", "page", "partial"] = "complete"
@@ -1344,6 +1354,7 @@ class WorkspaceCanonicalDatasetContext(Wire):
     source_binding_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     provider_dataset_id: str = Field(min_length=1, max_length=512)
     dataset_identity: str = Field(min_length=1, max_length=512)
+    source_uri: str = Field(pattern=r"^workspace-provider://[A-Za-z0-9_-]+$", max_length=1024)
     read_mode: Literal["exact", "current"]
     revision_id: str | None = Field(default=None, min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None

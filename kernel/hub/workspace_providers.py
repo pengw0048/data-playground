@@ -29,8 +29,14 @@ from hub.catalog_provider import (
 )
 
 _EXTERNAL_PREFIX = "external."
+_MOUNT_CONTAINER_PREFIX = "mount."
 _PROVIDER_DATASET_URI_PREFIX = "workspace-provider://"
 _CURSOR_VERSION = 3
+_LOCAL_LENS_CURSOR_VERSION = 1
+_LOCAL_LENS_CURSOR_PREFIX = "local."
+_CONNECTED_LENS_CURSOR_VERSION = 1
+_CONNECTED_LENS_CURSOR_PREFIX = "provider."
+_MAX_CONNECTED_SEEN_BYTES = 2048
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
 _MAX_MISSING_PLACEMENT_PROBES = 8
@@ -157,6 +163,117 @@ def is_configured_mount_container(container_id: str) -> bool:
     """Whether operator configuration reserves this local Folder as a provider mount point."""
     mounts, _invalid = _configured_mounts()
     return any(mounted.container_id == container_id for mounted in mounts)
+
+
+def mount_container_identity(mount_id: str) -> str:
+    """Stable, URL-safe identity for one configured source root."""
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or "\x00" in mount_id):
+        raise ValueError("invalid catalog mount identity")
+    encoded = base64.urlsafe_b64encode(mount_id.encode()).decode().rstrip("=")
+    return f"{_MOUNT_CONTAINER_PREFIX}{encoded}"
+
+
+def _decode_mount_container_identity(identity: str) -> str:
+    if not identity.startswith(_MOUNT_CONTAINER_PREFIX):
+        raise KeyError("invalid connected source reference")
+    try:
+        encoded = identity.removeprefix(_MOUNT_CONTAINER_PREFIX)
+        mount_id = base64.urlsafe_b64decode(
+            encoded + "=" * (-len(encoded) % 4)).decode()
+    except (UnicodeDecodeError, binascii.Error) as exc:
+        raise KeyError("invalid connected source reference") from exc
+    try:
+        if mount_container_identity(mount_id) != identity:
+            raise ValueError
+    except ValueError as exc:
+        raise KeyError("invalid connected source reference") from exc
+    return mount_id
+
+
+def is_connected_source_container(container_id: str) -> bool:
+    """Whether an identity belongs to the reserved connected-source namespace."""
+    return container_id.startswith(_MOUNT_CONTAINER_PREFIX)
+
+
+def _local_lens_cursor_encode(container_id: str, cursor: str) -> str:
+    raw = json.dumps(
+        [_LOCAL_LENS_CURSOR_VERSION, container_id, cursor], separators=(",", ":")
+    ).encode()
+    return _LOCAL_LENS_CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _local_lens_cursor_decode(container_id: str, cursor: str | None) -> str | None:
+    if cursor is None:
+        return None
+    if not cursor.startswith(_LOCAL_LENS_CURSOR_PREFIX) or len(cursor) > 16_384:
+        raise ValueError("invalid local Workspace cursor")
+    encoded = cursor.removeprefix(_LOCAL_LENS_CURSOR_PREFIX)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        version, bound_container, inner = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid local Workspace cursor") from exc
+    if (version != _LOCAL_LENS_CURSOR_VERSION or bound_container != container_id
+            or not isinstance(inner, str) or not inner or len(inner) > 16_384):
+        raise ValueError("invalid local Workspace cursor")
+    return inner
+
+
+def _connected_lens_cursor_encode(
+    identity: str,
+    fingerprint: str,
+    provider_cursor: str,
+    seen_placement_ids: list[str] | None,
+) -> str:
+    raw = json.dumps([
+        _CONNECTED_LENS_CURSOR_VERSION,
+        identity,
+        fingerprint,
+        provider_cursor,
+        seen_placement_ids,
+    ], separators=(",", ":")).encode()
+    encoded = (
+        _CONNECTED_LENS_CURSOR_PREFIX
+        + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    )
+    if len(encoded) > 4096:
+        raise ValueError("connected source cursor state is too large")
+    return encoded
+
+
+def _connected_lens_cursor_decode(
+    identity: str,
+    fingerprint: str,
+    cursor: str | None,
+) -> tuple[str | None, list[str] | None]:
+    if cursor is None:
+        return None, []
+    if not cursor.startswith(_CONNECTED_LENS_CURSOR_PREFIX) or len(cursor) > 4096:
+        raise ValueError("invalid connected source cursor")
+    encoded = cursor.removeprefix(_CONNECTED_LENS_CURSOR_PREFIX)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        version, bound_identity, bound_fingerprint, provider_cursor, seen = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid connected source cursor") from exc
+    valid_seen = (
+        seen is None
+        or isinstance(seen, list)
+        and all(isinstance(item, str) and item and len(item) <= 512 for item in seen)
+        and len(seen) == len(set(seen))
+        and len(json.dumps(seen, separators=(",", ":")).encode())
+        <= _MAX_CONNECTED_SEEN_BYTES
+    )
+    if (version != _CONNECTED_LENS_CURSOR_VERSION
+            or bound_identity != identity
+            or bound_fingerprint != fingerprint
+            or not isinstance(provider_cursor, str)
+            or not provider_cursor
+            or len(provider_cursor) > 512
+            or not valid_seen):
+        raise ValueError("invalid connected source cursor")
+    return provider_cursor, seen
 
 
 @functools.lru_cache(maxsize=64)
@@ -536,6 +653,7 @@ def provider_dataset_context(resource_ref: str, *, uid: str,
         "sourceBindingId": canonical["sourceBindingId"],
         "providerDatasetId": canonical["providerDatasetId"],
         "datasetIdentity": dataset_identity,
+        "sourceUri": uri,
         "readMode": read_mode,
         "revisionId": exact.get("revisionId") if exact is not None else None,
         "committedAt": (
@@ -1254,16 +1372,226 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     }
 
 
+_PROVIDER_QUERY_REASON = (
+    "This connected source controls its own order and does not support Workspace type filters."
+)
+_MIXED_QUERY_REASON = (
+    "This page combines sources with different query capabilities. Choose a source to sort or filter."
+)
+
+
+def _connected_source_resource(mounted: _MountedProvider) -> dict:
+    identity = mount_container_identity(mounted.mount.id)
+    return {
+        "id": f"container:{identity}",
+        "kind": "container",
+        "name": mounted.mount.id,
+        "parentId": f"container:{mounted.container_id}",
+        "source": "provider",
+        "mountId": mounted.mount.id,
+        "provider": mounted.mount.provider,
+        "referenceState": "current",
+        "localPlacement": None,
+        "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "folderMutationUnavailableReason": (
+            "This connected source is read-only and does not support Folder changes."
+        ),
+    }
+
+
+def _configured_connected_source(identity: str) -> _MountedProvider:
+    mount_id = _decode_mount_container_identity(identity)
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None:
+        raise KeyError("connected Workspace source is not configured")
+    return mounted
+
+
+def browse_local_source(
+    container_id: str,
+    *,
+    uid: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    sort: str | None = None,
+    order: str = "asc",
+    kinds: set[str] | frozenset[str] | None = None,
+    bind_cursor: bool = True,
+) -> dict:
+    """Browse only durable local metadata and discover configured provider roots separately."""
+    inner_cursor = (
+        _local_lens_cursor_decode(container_id, cursor) if bind_cursor else cursor
+    )
+    page = metadb.workspace_browse(
+        container_id,
+        uid=uid,
+        limit=limit,
+        cursor=inner_cursor,
+        sort=sort,
+        order=order,
+        kinds=kinds,
+    )
+    mounts, invalid = _configured_mounts()
+    connected_sources = [
+        _connected_source_resource(item)
+        for item in mounts
+        if item.container_id == container_id
+    ]
+    sources = [{
+        "id": "local",
+        "kind": "local",
+        "completeness": "page" if page["hasMore"] else "complete",
+    }]
+    if invalid:
+        sources.append(_source_status(
+            _Source("configuration"), "unavailable", _configured_source_error()))
+    next_cursor = page["nextCursor"]
+    return {
+        **page,
+        "nextCursor": (
+            _local_lens_cursor_encode(container_id, next_cursor)
+            if bind_cursor and next_cursor is not None else next_cursor
+        ),
+        "connectedSources": connected_sources,
+        "queryCapabilities": {
+            "sort": ["name", "updated"],
+            "kindFilter": True,
+            "reason": None,
+        },
+        "sources": sources,
+    }
+
+
+def browse_connected_source(
+    identity: str, *, uid: str, limit: int = 50, cursor: str | None = None,
+) -> dict:
+    """Browse exactly one configured mount root using only its opaque list cursor."""
+    mounted = _configured_connected_source(identity)
+    # A mount whose configured local parent no longer exists is not a reachable Workspace source.
+    metadb.workspace_resolve(f"container:{mounted.container_id}", uid=uid)
+    source = _Source("provider", mounted)
+    root = _connected_source_resource(mounted)
+    fingerprint = _mount_fingerprint([mounted], False)
+    provider_cursor, seen_placement_ids = _connected_lens_cursor_decode(
+        identity, fingerprint, cursor)
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception:  # noqa: BLE001 -- activation details/configuration stay private
+        status = _source_status(source, "unavailable", _activation_error())
+        return {
+            "container": root,
+            "items": [],
+            "connectedSources": [],
+            "queryCapabilities": {
+                "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+            },
+            "nextCursor": None,
+            "hasMore": False,
+            "completeness": "partial",
+            "sources": [status],
+        }
+    page = bounded_list_children(
+        provider,
+        mounted.mount,
+        None,
+        limit=max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT)),
+        cursor=provider_cursor,
+        timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    items = [
+        {
+            **_workspace_resource(item, mounted),
+            "parentId": f"container:{identity}",
+        }
+        for item in page.items
+    ]
+    seen_placement_ids = _extend_reconciliation_placements(
+        seen_placement_ids, page.items)
+    if (seen_placement_ids is not None
+            and len(json.dumps(
+                seen_placement_ids, separators=(",", ":")).encode()
+            ) > _MAX_CONNECTED_SEEN_BYTES):
+        seen_placement_ids = None
+    reconciliation_incomplete = False
+    if page.state == "ready" and page.next_cursor is None:
+        reconciliation_incomplete = (
+            seen_placement_ids is None
+            or _reconcile_complete_children(
+                provider,
+                mounted,
+                parent_provider_placement_id=None,
+                seen_provider_placement_ids=set(seen_placement_ids or []),
+            )
+        )
+    source_completeness = (
+        "page" if page.state == "ready" and page.next_cursor is not None
+        else "partial" if page.state == "ready" and reconciliation_incomplete
+        else "complete" if page.state == "ready"
+        else page.state
+    )
+    status = _source_status(
+        source,
+        source_completeness,
+        ("some missing placements could not be refreshed"
+         if reconciliation_incomplete else page.reason),
+    )
+    next_cursor = (
+        _connected_lens_cursor_encode(
+            identity,
+            fingerprint,
+            page.next_cursor,
+            seen_placement_ids,
+        )
+        if page.next_cursor is not None else None
+    )
+    return {
+        "container": root,
+        "items": items,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+        },
+        "nextCursor": next_cursor,
+        "hasMore": next_cursor is not None,
+        "completeness": (
+            "partial" if page.state != "ready" or reconciliation_incomplete
+            else "page" if next_cursor is not None
+            else "complete"
+        ),
+        "sources": [status],
+    }
+
+
+def mixed_browse_contract(page: dict) -> dict:
+    """Add explicit query truthfulness to the backward-compatible mixed page."""
+    return {
+        **page,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": [], "kindFilter": False, "reason": _MIXED_QUERY_REASON,
+        },
+    }
+
+
 def browse(container_id: str, *, uid: str, limit: int = 50,
            cursor: str | None = None) -> dict:
     """Browse local and mounted providers with one bounded, source-stable cursor."""
     limit = max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT))
     mounts, invalid = _configured_mounts()
+    if is_connected_source_container(container_id):
+        return browse_connected_source(
+            container_id, uid=uid, limit=limit, cursor=cursor)
     if container_id.startswith(_EXTERNAL_PREFIX):
-        return _remote_page(container_id, uid=uid, limit=limit, cursor=cursor,
-                            mounts=mounts, invalid=invalid)
-    return _mixed_page(container_id, uid=uid, limit=limit, cursor=cursor,
-                       mounts=mounts, invalid=invalid)
+        return mixed_browse_contract(_remote_page(
+            container_id, uid=uid, limit=limit, cursor=cursor,
+            mounts=mounts, invalid=invalid))
+    return mixed_browse_contract(_mixed_page(
+        container_id, uid=uid, limit=limit, cursor=cursor,
+        mounts=mounts, invalid=invalid))
 
 
 def _unavailable_resolution(source: _Source, completeness: str, error: str | None) -> dict:
@@ -1297,9 +1625,12 @@ def _cached_resolution(
         _binding_resource(item, mounted)
         for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
     ]
+    connected_root = (
+        [_connected_source_resource(mounted)] if source.kind == "provider" else []
+    )
     return {
         "resource": _binding_resource(binding, mounted),
-        "ancestors": [*local_ancestors, *cached_ancestors],
+        "ancestors": [*local_ancestors, *connected_root, *cached_ancestors],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
         "canonicalSourceBinding": metadb.workspace_provider_source_binding(
@@ -1322,11 +1653,32 @@ def _overlay_cached_resolution(
         _binding_resource(item, mounted)
         for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
     ]
+    connected_root = (
+        [_connected_source_resource(mounted)] if source.kind == "provider" else []
+    )
     return {
         "resource": resource,
-        "ancestors": [*local_ancestors, *cached_ancestors, _binding_resource(binding, mounted)],
+        "ancestors": [
+            *local_ancestors,
+            *connected_root,
+            *cached_ancestors,
+            _binding_resource(binding, mounted),
+        ],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
+    }
+
+
+def resolve_connected_source(identity: str, *, uid: str) -> dict:
+    """Resolve a virtual mount root and its durable local parent ancestry without provider I/O."""
+    mounted = _configured_connected_source(identity)
+    local_parent = metadb.workspace_resolve(
+        f"container:{mounted.container_id}", uid=uid)
+    source = _Source("provider", mounted)
+    return {
+        "resource": _connected_source_resource(mounted),
+        "ancestors": [*local_parent["ancestors"], local_parent["resource"]],
+        "source": _source_status(source, "complete"),
     }
 
 
@@ -1336,6 +1688,8 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         kind, identity = resource_ref.split(":", 1)
     except ValueError as exc:
         raise KeyError("invalid Workspace resource reference") from exc
+    if kind == "container" and is_connected_source_container(identity):
+        return resolve_connected_source(identity, uid=uid)
     if kind not in {"container", "dataset"} or not identity.startswith(_EXTERNAL_PREFIX):
         try:
             return metadb.workspace_resolve(resource_ref, uid=uid)
@@ -1471,7 +1825,10 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         ]
         current = {**current, "lastKnown": True}
     combined = [
-        *local_parent["ancestors"], local_parent["resource"], *provider_resources,
+        *local_parent["ancestors"],
+        local_parent["resource"],
+        _connected_source_resource(mounted),
+        *provider_resources,
     ]
     return {
         "resource": current,

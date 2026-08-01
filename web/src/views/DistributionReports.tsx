@@ -71,16 +71,16 @@ export function DistributionReportLauncher({ definition }: { definition: Dataset
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-3">
     <div className="flex items-center gap-2"><div className="flex-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Distribution reports</div>
       <Button size="sm" variant="outline" onClick={() => void start()} disabled={busy}>{busy ? 'Preparing…' : 'Inspect distributions'}</Button></div>
-    <p className="text-[10.5px] text-muted-foreground">Creates a bounded retained report for this exact DatasetView; the preview Stats remain separate.</p>
+    <p className="text-[10.5px] text-muted-foreground">Creates a bounded saved report for this view; the quick Stats preview remains separate.</p>
     {estimate && <div role="dialog" aria-label="Confirm distribution report" className="grid gap-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px]">
       <strong>Confirmation required</strong>
-      <span>{estimate.reason === 'unknown_size' ? 'The retained metadata does not prove the scan size.' : 'This exact view exceeds the confirmation scan threshold.'} Estimated rows: {estimate.estimatedScanRows == null ? 'unknown' : count(estimate.estimatedScanRows)}; bytes: {estimate.estimatedScanBytes == null ? 'unknown' : count(estimate.estimatedScanBytes)}.</span>
+      <span>{estimate.reason === 'unknown_size' ? 'The saved report does not include a reliable scan size.' : 'This saved view exceeds the automatic scan limit.'} Estimated rows: {estimate.estimatedScanRows == null ? 'unknown' : count(estimate.estimatedScanRows)}; bytes: {estimate.estimatedScanBytes == null ? 'unknown' : count(estimate.estimatedScanBytes)}.</span>
       <span>Bounded to {estimate.limits.reportedColumns} columns, {estimate.limits.topCategories} categories and {estimate.limits.histogramBuckets} buckets per section; deadline {estimate.limits.deadlineSeconds}s.</span>
       <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => setEstimate(null)} disabled={busy}>Cancel</Button><Button size="sm" onClick={() => void submit(true)} disabled={busy}>Confirm and start</Button></div>
     </div>}
     {error && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">{prepareMessage(error)} <button className="font-semibold underline" onClick={() => void load()}>Retry list</button></div>}
-    {loading ? <span className="text-[11px] text-muted-foreground">Loading retained reports…</span>
-      : reports.length === 0 ? <span className="text-[11px] text-muted-foreground">No retained reports yet.</span>
+    {loading ? <span className="text-[11px] text-muted-foreground">Loading saved reports…</span>
+      : reports.length === 0 ? <span className="text-[11px] text-muted-foreground">No saved reports yet.</span>
         : <ol className="grid gap-1">{reports.map((item) => <li key={item.reportId} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border bg-background px-2 py-1.5 text-[10.5px]">
           <Badge variant="secondary" className="capitalize">{item.task.status}</Badge><span>{item.report ? `${count(item.report.measuredRows)} measured rows · ${item.report.complete ? 'complete' : 'sample'}` : 'No validated report document yet'}</span>
           <a className="font-semibold text-primary underline" href={reportHash(item.reportId)}>Open report</a><span className="ml-auto text-muted-foreground">{date(item.updatedAt)}</span>
@@ -147,7 +147,7 @@ export function DistributionReportPage({ reportId, compareReportId, backHref = r
     }
   }
 
-  if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading exact retained report…</div>
+  if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading saved report…</div>
   if (!envelope) return <div role="alert" className="m-4 grid gap-3 rounded border border-destructive/30 bg-destructive/10 p-4 text-[12px] text-destructive">
     <span>{unavailableMessage(refreshError)} <button className="font-semibold underline" onClick={() => void load(reportId, true)}>Retry</button></span>
     <a href={backHref} onClick={onClose ? (event) => {
@@ -161,12 +161,12 @@ export function DistributionReportPage({ reportId, compareReportId, backHref = r
   </div>
   const { task, report, viewSnapshot } = envelope
   return <div className="mx-auto grid max-w-6xl gap-4 p-4 sm:p-7">
-    <header className="flex flex-wrap items-start gap-3 border-b border-border pb-4"><div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Retained distribution report</div><h1 className="text-[20px] font-bold">{viewSnapshot.name}</h1><div className="mt-1 flex flex-wrap gap-2 text-[11px] text-muted-foreground"><Badge variant="secondary" className="capitalize">{task.status}</Badge><span>Updated {date(envelope.updatedAt)}</span>{task.progress != null && <span>{Math.round(task.progress * 100)}% complete</span>}</div></div>
+    <header className="flex flex-wrap items-start gap-3 border-b border-border pb-4"><div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Saved distribution report</div><h1 className="text-[20px] font-bold">{viewSnapshot.name}</h1><div className="mt-1 flex flex-wrap gap-2 text-[11px] text-muted-foreground"><Badge variant="secondary" className="capitalize">{task.status}</Badge><span>Updated {date(envelope.updatedAt)}</span>{task.progress != null && <span>{Math.round(task.progress * 100)}% complete</span>}</div></div>
       <a className="rounded-md border border-border bg-background px-2 py-1 text-[11px] font-semibold hover:bg-accent" href={routeHash('jobs', undefined, undefined, undefined, `run=${encodeURIComponent(task.id)}`)}>Open Jobs</a>
       {onClose && <Button size="sm" variant="outline" onClick={onClose}>Close</Button>}</header>
     {refreshError && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-3 text-[11px] text-destructive">{refreshMessage(refreshError)} Showing the last validated report. <button className="font-semibold underline" onClick={() => void load(reportId)}>Retry</button></div>}
     {actionError && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-3 text-[11px] text-destructive">Report action failed: {actionError}</div>}
-    {!report && <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[12px]"><strong>{task.status === 'failed' ? task.attempts.length >= task.maxAttempts ? 'Report failed and retries are exhausted before a validated document was retained.' : 'Report failed before a validated document was retained.' : task.status === 'cancelled' ? 'Report was cancelled before a validated document was retained.' : 'Computing exact retained report…'}</strong><span className="text-muted-foreground">Attempt {task.attempts.length} of {task.maxAttempts}{task.cancelRequested ? ' · cancellation requested' : ''}.</span>{task.error && <span role="alert" className="text-destructive">{taskErrorMessage(task.error)}</span>}<Actions task={task} busy={acting} onAction={act} /></section>}
+    {!report && <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[12px]"><strong>{task.status === 'failed' ? task.attempts.length >= task.maxAttempts ? 'Report failed and retries are exhausted before a validated document was saved.' : 'Report failed before a validated document was saved.' : task.status === 'cancelled' ? 'Report was cancelled before a validated document was saved.' : 'Computing saved report…'}</strong><span className="text-muted-foreground">Attempt {task.attempts.length} of {task.maxAttempts}{task.cancelRequested ? ' · cancellation requested' : ''}.</span>{task.error && <span role="alert" className="text-destructive">{taskErrorMessage(task.error)}</span>}<Actions task={task} busy={acting} onAction={act} /></section>}
     {report && <ReportPresentation key={reportId} report={report} view={viewSnapshot} compareReportId={compareReportId} />}
   </div>
 }
@@ -221,14 +221,14 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
   }
   return <>
     <section className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/20 p-3 text-[11px]">
-      <label htmlFor="compare-retained-report" className="font-semibold">Compare with retained report</label>
+      <label htmlFor="compare-retained-report" className="font-semibold">Compare with saved report</label>
       <select id="compare-retained-report" value={compareReportId ?? ''} onChange={(event) => { location.hash = reportHash(report.reportId, event.target.value || undefined) }} className="min-w-64 rounded border border-border bg-background px-2 py-1">
         <option value="">No comparison</option>
         {compareReportId && !reports.some((item) => item.reportId === compareReportId) && <option value={compareReportId}>{comparison ? `Linked report · ${count(comparison.coverage.right.measuredRows)} measured rows · ${comparison.coverage.right.complete ? 'complete' : 'sample'}` : 'Linked report · loading details'}</option>}
-        {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'retained report'}</option>)}
+        {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'saved report'}</option>)}
       </select><span className="text-muted-foreground">Completed reports for this DatasetView only.</span>
       {compareReportId && !comparison && <details data-testid="linked-report-technical-evidence" className="basis-full rounded border border-border bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-        <summary className="cursor-pointer font-semibold text-foreground">Linked report technical details</summary>
+        <summary className="cursor-pointer font-semibold text-foreground">Linked report diagnostics</summary>
         <div className="mt-1">Report ID <span className="break-all font-mono text-foreground">{compareReportId}</span></div>
       </details>}
     </section>
@@ -375,36 +375,36 @@ function ExamplesTechnicalEvidence({ target, examples }: { target: ExampleTarget
 const signed = (value: number | null | undefined) => value == null ? 'unavailable' : `${value > 0 ? '+' : ''}${value}`
 function coverageReason(reason: DistributionReportComparison['coverage']['reason']) { return reason === 'full_sample_coverage_mismatch' ? 'one report is full coverage and the other is sampled' : reason === 'different_deterministic_samples' ? 'the reports use different deterministic samples' : reason.replaceAll('_', ' ') }
 function comparisonMessage(error: ReportFailure) { if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'The selected comparison is unavailable or not authorized.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Comparison is temporarily unavailable.'; if (error.status === 422) return 'The selected reports cannot be compared.'; return 'Comparison is currently unavailable.' }
-function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this dataset version is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the retained report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
+function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this dataset version is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the saved report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
 
 function unavailableMessage(error: ReportFailure | null): string {
-  if (error?.code === 'permission_denied' || error?.status === 401 || error?.status === 403) return 'You are not authorized to open this retained report.'
-  if (error?.code === 'resource_gone' || error?.status === 410) return 'The exact retained revision required by this report is no longer available.'
-  if (error?.code === 'internal_error') return 'The retained report state could not be validated because it is corrupt.'
-  if (error?.code === 'service_unavailable' || error?.status != null && error.status >= 500) return 'The retained report service is temporarily unavailable.'
-  if (error?.code === 'not_found' || error?.status === 404) return 'This retained report does not exist, was deleted, or is not visible to you.'
-  return 'This retained report is currently unavailable.'
+  if (error?.code === 'permission_denied' || error?.status === 401 || error?.status === 403) return 'You are not authorized to open this saved report.'
+  if (error?.code === 'resource_gone' || error?.status === 410) return 'The saved dataset version required by this report is no longer available.'
+  if (error?.code === 'internal_error') return 'The saved report could not be opened because its data is invalid.'
+  if (error?.code === 'service_unavailable' || error?.status != null && error.status >= 500) return 'Saved reports are temporarily unavailable.'
+  if (error?.code === 'not_found' || error?.status === 404) return 'This saved report does not exist, was deleted, or is not visible to you.'
+  return 'This saved report is currently unavailable.'
 }
 
 function prepareMessage(error: ReportFailure): string {
-  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'You are not authorized to inspect distributions for this exact view.'
-  if (error.code === 'resource_gone' || error.status === 410) return 'The exact retained revision is no longer available; no new report was started.'
-  if (error.code === 'internal_error') return 'The retained report state failed server validation; no new report was started.'
-  if (error.code === 'not_found' || error.status === 404) return 'This exact view no longer exists or is not visible to you.'
+  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'You are not authorized to inspect distributions for this saved view.'
+  if (error.code === 'resource_gone' || error.status === 410) return 'The saved dataset version is no longer available; no new report was started.'
+  if (error.code === 'internal_error') return 'The saved report could not be validated; no new report was started.'
+  if (error.code === 'not_found' || error.status === 404) return 'This saved view no longer exists or is not visible to you.'
   return `Couldn’t prepare the report: ${error.detail}`
 }
 
 function refreshMessage(error: ReportFailure): string {
-  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'Permission to refresh this retained report was lost.'
-  if (error.code === 'resource_gone' || error.status === 410) return 'The exact retained revision is no longer available for refresh.'
-  if (error.code === 'internal_error') return 'The retained report state failed validation during refresh.'
+  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'Permission to refresh this saved report was lost.'
+  if (error.code === 'resource_gone' || error.status === 410) return 'The saved dataset version is no longer available for refresh.'
+  if (error.code === 'internal_error') return 'The saved report could not be validated during refresh.'
   return `Couldn’t refresh this report: ${error.detail}.`
 }
 
 function taskErrorMessage(error: string): string {
-  if (error === 'distribution report revision unavailable') return 'The exact retained revision became unavailable before this report finished.'
-  if (error === 'distribution report snapshot invalid') return 'The retained report state failed validation before computation finished.'
+  if (error === 'distribution report revision unavailable') return 'The saved dataset version became unavailable before this report finished.'
+  if (error === 'distribution report snapshot invalid') return 'The saved report could not be validated before computation finished.'
   if (error === 'distribution report deadline') return 'Report computation exceeded its bounded deadline.'
-  if (error === 'distribution report computation failed') return 'Report computation failed before a validated document was retained.'
+  if (error === 'distribution report computation failed') return 'Report computation failed before a valid report could be saved.'
   return error
 }

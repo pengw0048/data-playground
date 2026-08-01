@@ -29,6 +29,7 @@ import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 import { CanvasInboxPopover } from './CanvasInboxPopover'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 type OpenSettingsDetail = HTMLElement | {
   category?: string
@@ -216,16 +217,23 @@ export function AppMenu({
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   const doc = useStore((s) => s.doc)
   const currentDraftId = useStore((s) => s.currentDraftId)
+  const currentDraftSyncing = useStore((s) => s.localDrafts.some((draft) => (
+    draft.draftId === s.currentDraftId && draft.syncState === 'syncing'
+  )))
   const canvasRole = useStore((s) => s.canvasRole)
   const deleteFile = useStore((s) => s.deleteFile)
   const discardLocalDraft = useStore((s) => s.discardLocalDraft)
   const [themeMode, setVisibleThemeMode] = useState<ThemeMode>(getThemeMode)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    canvasId: string; draftId: string | null; name: string
+  } | null>(null)
   useEffect(() => {
     const sync = () => setVisibleThemeMode(getThemeMode())
     window.addEventListener('dp-theme-change', sync)
     return () => window.removeEventListener('dp-theme-change', sync)
   }, [])
   return (
+    <>
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button data-testid="app-menu" title="Data Playground menu" aria-label="Data Playground menu"
@@ -261,9 +269,31 @@ export function AppMenu({
         </DropdownMenuSub>
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
         {canvasRole === 'owner' && <DropdownMenuSeparator />}
-        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
+        {canvasRole === 'owner' && <DropdownMenuItem disabled={currentDraftSyncing}
+          title={currentDraftSyncing ? 'Wait for syncing to finish before deleting this draft' : undefined}
+          onSelect={() => {
+          const target = { canvasId: doc.id, draftId: currentDraftId, name: doc.name || 'untitled' }
+          setTimeout(() => setDeleteTarget(target))
+        }} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftSyncing ? 'Syncing local draft…' : currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>
+    <ConfirmationDialog
+      open={deleteTarget !== null}
+      title={deleteTarget?.draftId ? `Delete local draft “${deleteTarget.name}”?` : `Delete “${deleteTarget?.name ?? 'this Canvas'}”?`}
+      description={deleteTarget?.draftId
+        ? 'This permanently deletes the changes saved only in this browser. It does not delete a server Canvas. This cannot be undone.'
+        : 'This permanently deletes the Canvas for everyone who can access it. This cannot be undone.'}
+      confirmLabel={deleteTarget?.draftId ? 'Delete local draft' : 'Delete Canvas'}
+      onCancel={() => setDeleteTarget(null)}
+      onConfirm={() => {
+        const target = deleteTarget
+        setDeleteTarget(null)
+        if (!target) return
+        if (target.draftId) void discardLocalDraft(target.draftId)
+        else void deleteFile(target.canvasId)
+      }}
+    />
+    </>
   )
 }
 

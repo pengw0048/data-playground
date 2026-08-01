@@ -16,6 +16,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 import { useCollapsibleRegion } from '../layoutPreferences'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 // The non-canvas shell keeps local resources in one Workspace explorer. Transforms and relationship
 // inspection remain their existing secondary surfaces.
@@ -260,6 +261,7 @@ function FilesContent() {
   const newFile = useStore((s) => s.newFile)
   const deleteFile = useStore((s) => s.deleteFile)
   const newFromExample = useStore((s) => s.newFromExample)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
   return (
     <>
       <ViewHeader title="Recents" action={
@@ -285,7 +287,7 @@ function FilesContent() {
                 {meta && <div style={{ fontSize: 11, color: color.text3, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta}</div>}
               </div>
             </button>
-            {f.role === 'owner' && <button type="button" title="Delete" aria-label={`Delete ${title}`} onClick={() => deleteFile(f.id)}
+            {f.role === 'owner' && <button type="button" title="Delete" aria-label={`Delete ${title}`} onClick={() => setDeleteTarget({ id: f.id, name: title })}
               style={{ position: 'absolute', right: 10, bottom: 12, border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2, zIndex: 1 }}><Icon name="trash" size={13} /></button>}
           </div>
           )
@@ -312,6 +314,18 @@ function FilesContent() {
           </>
         )}
       </div>
+      <ConfirmationDialog
+        open={deleteTarget !== null}
+        title={`Delete “${deleteTarget?.name ?? 'this Canvas'}”?`}
+        description="This permanently deletes the Canvas for everyone who can access it. This cannot be undone."
+        confirmLabel="Delete Canvas"
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          const target = deleteTarget
+          setDeleteTarget(null)
+          if (target) void deleteFile(target.id)
+        }}
+      />
     </>
   )
 }

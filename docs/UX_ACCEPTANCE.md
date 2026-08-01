@@ -12,15 +12,17 @@ and a user returning to a failed, cancelled, or recovered job.
 
 Every acceptance run follows this workflow:
 
-1. Discover or register a dataset.
-2. Inspect a sample and profile.
-3. Explore relationships and lineage.
-4. Add the dataset to an explicitly chosen canvas.
-5. Build and preview a transformation.
-6. Change the graph and see prior results invalidated.
-7. Estimate, run, monitor, cancel, or recover full work.
-8. Inspect and export a complete artifact.
-9. Leave and return through a durable, shareable link without losing context.
+1. Create a named project folder and work inside it.
+2. Discover or register a dataset.
+3. Inspect a sample and profile.
+4. Explore relationships and lineage.
+5. Add the dataset to an explicitly chosen canvas.
+6. Build and preview a transformation.
+7. Change the graph and see prior results invalidated.
+8. Estimate, run, monitor, cancel, or recover full work.
+9. Inspect and export a complete artifact.
+10. Create a related Canvas or example and confirm it stays in the current folder.
+11. Leave and return through a durable, shareable link without losing context or location.
 
 ## Cold-start comprehension gate
 
@@ -30,7 +32,7 @@ be ignored. Every release candidate therefore starts with one cold UI-only pass 
 may inspect source code, test selectors, network traffic, logs, or API responses.
 
 Use a fresh database and browser profile. Run the pass at 1280×720 and 1440×900, first with one item,
-then with at least 50 items. The reviewer receives a research goal, never menu names, routes, control
+then with more than 50 items. The reviewer receives a research goal, never menu names, routes, control
 labels, or implementation terms. Before every action they record:
 
 1. the result they are trying to achieve;
@@ -47,11 +49,13 @@ Diagnostics unless it changes one of those decisions.
 Use this baseline prompt for an independent browser reviewer:
 
 > You are a data researcher opening Data Playground for the first time. Start on the home page and
-> use only visible UI. Find the built-in events data, create and name a Canvas, keep only purchase
-> events, add a Python Transform that creates amount_with_tax, confirm its output columns, run it,
+> use only visible UI. Create a folder named Research, find the built-in events data, create and name
+> a Canvas in Research, keep only purchase events, add a Python Transform that creates
+> amount_with_tax, confirm its output columns, run it,
 > and save the result. Leave the Canvas, find the result from Workspace or Jobs, reopen the same
-> Transform, and continue editing. Before each click, state your goal, the visible clue for that
-> action, and what you expect to happen. Do not inspect source code, tests, DOM test IDs, developer
+> Transform, and continue editing. From that Canvas, create one runnable example and verify both the
+> original and the example remain in Research. Before each click, state your goal, the visible clue
+> for that action, and what you expect to happen. Do not inspect source code, tests, DOM test IDs, developer
 > tools, network requests, or APIs; do not enter a deep link. If the next step is not clear within
 > 30 seconds or two guesses, stop and record a blocker. Record every unexplained term, unnecessary
 > click, missing feedback, and failed recovery. Finally change the upstream filter and verify that an
@@ -66,8 +70,13 @@ Automated `@cold-user` coverage should enforce observable parts of this contract
 Canvas or deep-link setup, visible data-entry choices on an empty Canvas, one continuous dataset-to-
 Source flow, normal-language version labels, no editable fields whose values execution ignores, no
 native browser prompts, and a journey that runs work, consumes its artifact, leaves, reopens, mutates
-upstream state, and verifies invalidation or recovery. Locators must not encode the product path as a
-substitute for the independent cold review.
+upstream state, and verifies invalidation or recovery. It must also create from a nested folder,
+exercise page navigation in a folder containing more than 50 resources, move multiple selected
+Canvases from one page, and verify that a new Canvas or example inherits the current folder. A
+configured provider must appear as one explicit Connected source folder; opening it must preserve
+the source in Back/breadcrumb navigation, and unsupported sort/filter controls must be disabled with
+a reason before the user tries them. Locators must not encode the product path as a substitute for
+the independent cold review.
 
 ## Deterministic fixtures
 

@@ -14,6 +14,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import type { CatalogTable, Relationship, JoinSuggestion, Cardinality, LineageEdge } from '../types/api'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 // The relationship graph: entities are catalog datasets, declared joins are solid edges labelled with
 // cardinality. It opens FOCUSED on one table (reached from a table's detail drawer) and shows that
@@ -174,6 +175,8 @@ export function ERDiagram() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [relsError, setRelsError] = useState<string | null>(null)
+  const [relationshipToRemove, setRelationshipToRemove] = useState<Relationship | null>(null)
+  const [removingRelationship, setRemovingRelationship] = useState(false)
   const [pending, setPending] = useState<{
     left: CatalogTable; right: CatalogTable; suggestions: JoinSuggestion[]
     suggestionsLoading: boolean; suggestionsError: string | null
@@ -346,11 +349,21 @@ export function ERDiagram() {
     void loadSuggestions(s, t)
   }, [visible, loadSuggestions])
 
-  const onEdgeClick = useCallback(async (_e: React.MouseEvent, edge: Edge) => {
+  const onEdgeClick = useCallback((_e: React.MouseEvent, edge: Edge) => {
     const rel = (edge.data as { rel?: Relationship } | undefined)?.rel
-    if (!rel || !window.confirm(`Remove declared relationship ${rel.leftColumns.join('+')} = ${rel.rightColumns.join('+')}?`)) return
-    try { setRels(await api.deleteRelationship(rel)) } catch (e) { pushToast(errorMessage(e), 'error') }
-  }, [pushToast])
+    if (rel) setRelationshipToRemove(rel)
+  }, [])
+
+  const removeRelationship = async () => {
+    const rel = relationshipToRemove
+    if (!rel) return
+    setRemovingRelationship(true)
+    try {
+      setRels(await api.deleteRelationship(rel))
+      setRelationshipToRemove(null)
+    } catch (e) { pushToast(errorMessage(e), 'error') }
+    finally { setRemovingRelationship(false) }
+  }
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     setPositions((p) => {
@@ -474,6 +487,17 @@ export function ERDiagram() {
           onClose={() => setPending(null)}
           onDeclared={(next) => { setRels(next); setPending(null) }} />
       )}
+      <ConfirmationDialog
+        open={relationshipToRemove !== null}
+        title="Remove relationship?"
+        description={relationshipToRemove
+          ? `Remove the declared relationship ${relationshipToRemove.leftColumns.join(' + ')} = ${relationshipToRemove.rightColumns.join(' + ')}?`
+          : ''}
+        confirmLabel="Remove relationship"
+        busy={removingRelationship}
+        onCancel={() => setRelationshipToRemove(null)}
+        onConfirm={() => { void removeRelationship() }}
+      />
     </div>
   )
 }

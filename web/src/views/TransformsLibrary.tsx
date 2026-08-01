@@ -440,7 +440,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
       provenance={detail.provenance}
     />
     {detail.provenance === 'promoted' && <section className="mt-4"><h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Retention</h3>
-      <p className="mt-1 text-[11px] text-muted-foreground">{totalRetention ? `${totalRetention} durable references prevent deletion` : 'No retained Canvas, snapshot, or execution manifest references.'}</p>
+      <p className="mt-1 text-[11px] text-muted-foreground">{totalRetention ? `${totalRetention} saved references prevent deletion` : 'No Canvas, snapshot, or run references prevent deletion.'}</p>
       <div className="mt-1 grid grid-cols-3 gap-1 text-center text-[10px]"><span className="rounded bg-muted p-1.5">Canvas {selected.retention.canvas}</span><span className="rounded bg-muted p-1.5">Snapshots {selected.retention.canvasVersion}</span><span className="rounded bg-muted p-1.5">Runs {selected.retention.executionManifest}</span></div>
       {selected.availability === 'active' && !totalRetention && <DeleteVersion entry={selected} onDeleted={onRefresh} />}
     </section>}
@@ -563,7 +563,7 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
     setDestinationError(null)
     try {
       const [, page] = await Promise.all([
-        refreshFiles(), api.workspaceBrowse(LOCAL_ROOT_ID, { limit: 1 }),
+        refreshFiles(), api.workspaceBrowse(LOCAL_ROOT_ID, { limit: 1, source: 'local' }),
       ])
       if (!page.container) throw new Error('Workspace root is unavailable')
       setRoot(page.container)
@@ -626,7 +626,7 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
       {mode === 'new' ? <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name<input aria-label="New Canvas name" value={name} onChange={(event) => setName(event.target.value)} disabled={busy} className="dp-input" /></label> : editable.length ? <>
         <label className="grid gap-1 text-[11px] text-muted-foreground">Target Canvas<select aria-label="Target Canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} disabled={busy} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
         {editable.find((file) => file.id === canvasId) && <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-          <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+          <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
           <div className="mt-1.5 break-all font-mono">Canvas ID: {canvasId}</div>
           <div className="mt-1">Version {editable.find((file) => file.id === canvasId)?.version}</div>
         </details>}

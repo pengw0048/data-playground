@@ -313,7 +313,7 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByRole('option', { name: /Retained version 1/ })
+    await screen.findByRole('option', { name: /Saved version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenCalledWith(
       page.source, page.candidates[0], 'rev-2', expect.any(Object),
@@ -327,7 +327,7 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByRole('option', { name: /Retained version 1/ })
+    await screen.findByRole('option', { name: /Saved version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
 
     await screen.findByText(/Version history could not be loaded/)
@@ -355,7 +355,7 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByRole('option', { name: /Retained version 1/ })
+    await screen.findByRole('option', { name: /Saved version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByTestId('confirm-related-join'))
@@ -415,14 +415,14 @@ describe('JoinWithRelated', () => {
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
-    await screen.findByRole('option', { name: /Retained version 1/ })
+    await screen.findByRole('option', { name: /Saved version 1/ })
     fireEvent.change(screen.getByLabelText('Related dataset version'), { target: { value: 'rev-2' } })
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByRole('button', { name: 'Load more versions' }))
     await waitFor(() => expect(mocks.relatedRevisions).toHaveBeenLastCalledWith(
       page.candidates[0].identity, { limit: 20, cursor: 'next-page' },
     ))
-    expect(screen.getByRole('option', { name: /Retained version 1/ })).toBeVisible()
+    expect(screen.getByRole('option', { name: /Saved version 1/ })).toBeVisible()
   })
 
   it('closes with Escape and restores focus to the opener', async () => {

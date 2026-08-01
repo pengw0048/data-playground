@@ -719,7 +719,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.resolveDatasetRevision.mockResolvedValue(resolved)
     render1(source.data)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Choose exact or as-of revision' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose a saved or as-of version' }))
     expect(screen.getByText(/latest provider commit at or before this UTC instant \(inclusive\)/i)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('As-of UTC date and time'), { target: { value: localIntent } })
     fireEvent.click(screen.getByRole('button', { name: 'Resolve once' }))

@@ -35,14 +35,14 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await expect(page.getByRole('heading', { name: title })).toBeVisible()
   const implementation = page.getByRole('region', { name: 'Implementation source' })
   await expect(implementation).toContainText("row['score'] = 1.0")
-  await implementation.getByText('Source integrity').click()
+  await implementation.getByText('Developer details').click()
   await expect(implementation).toContainText(
     `SHA-256 ${createHash('sha256').update(sourceCode).digest('hex')}`,
   )
-  await expect(page.getByRole('button', { name: `Use exact ${transform.version}` })).toBeEnabled()
+  await expect(page.getByRole('button', { name: `Use ${transform.version}` })).toBeEnabled()
   expect(new URL(page.url()).hash).toContain(`version=${transform.version}`)
 
-  await page.getByRole('button', { name: `Use exact ${transform.version}` }).click()
+  await page.getByRole('button', { name: `Use ${transform.version}` }).click()
   await page.getByLabel('New Canvas name').fill(`Exact ${title}`)
   await page.getByRole('button', { name: 'Create and open' }).click()
   await expect(page).toHaveURL(/#\/canvas\/[^?]+\?node=[^&]+$/)
@@ -59,7 +59,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   const canvasDefinition = page.getByRole('region', { name: 'Library processor definition' })
   await expect(canvasDefinition).toContainText(sourceCode)
   await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).not.toBeVisible()
-  await canvasDefinition.getByText('Technical details').click()
+  await canvasDefinition.getByText('Version details').click()
   await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).toBeVisible()
   await page.getByRole('button', { name: 'Close' }).click()
   await expect(page).toHaveURL(canvasUrl)

@@ -120,7 +120,7 @@ function unavailableEvidence(error: unknown, table: CatalogTable | null): Manife
   const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
     ? (error as { code: string }).code : undefined
   if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this saved version was lost.' }
-  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This saved version is missing or no longer retained. A newer version was not opened instead.' }
+  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This saved version is no longer available. A newer version was not opened instead.' }
   if (code === 'service_unavailable' || status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
   return { table, detail: null, availability: 'error', message: `Couldn't verify this saved version: ${errorText(error)}` }
 }
@@ -153,19 +153,19 @@ function RunInputManifest({ historyId, manifest }: {
 
   if (manifest == null) {
     return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-      No admitted input manifest was recorded for this legacy run.
+      Input data details were not saved for this older run.
     </div>
   }
   if (manifest.length === 0) {
     return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-      This run admitted no Source inputs.
+      This run did not use any dataset inputs.
     </div>
   }
-  return <div aria-label={`Admitted Sources for run ${historyId}`} className="border-t border-border bg-muted/20">
+  return <div aria-label={`Input data for run ${historyId}`} className="border-t border-border bg-muted/20">
     <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
       className="flex w-full items-center gap-2 px-4 py-2 text-left text-[11px] hover:bg-muted/40">
       <span className="text-muted-foreground">{open ? '▾' : '▸'}</span>
-      <span className="font-semibold text-foreground">Admitted Sources</span>
+      <span className="font-semibold text-foreground">Input data</span>
       <Badge variant="outline" className="h-5 px-1.5 text-[9px]">{manifest.length}</Badge>
       <span className="text-muted-foreground">used for this run</span>
     </button>
@@ -179,14 +179,19 @@ function RunInputManifest({ historyId, manifest }: {
               <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-muted text-[9px] font-semibold text-muted-foreground">{index + 1}</span>
               <div className="min-w-0 flex-1">
                 <div className="font-semibold text-foreground">Source {source?.data.title || item.node_id}</div>
-                {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all text-[9.5px] text-muted-foreground">node {item.node_id}</div>}
                 <div className="mt-1 break-all text-muted-foreground">
-                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.dataset_id}</span>
-                  {current?.table?.name && <span className="dp-mono"> · {item.dataset_id}</span>}
+                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? 'Dataset from this run'}</span>
                 </div>
-                <div className="dp-mono break-all text-muted-foreground">Version {item.revision_id}</div>
-                <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
-                <div className="text-muted-foreground">Reference intent was not stored; this row reports only admitted resolution evidence.</div>
+                <details className="mt-1 text-[9.5px] text-muted-foreground">
+                  <summary className="w-fit cursor-pointer font-medium hover:text-foreground">Diagnostics</summary>
+                  <div className="mt-1 grid gap-0.5 rounded bg-muted/30 p-1.5">
+                    {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all">Canvas step {item.node_id}</div>}
+                    <div className="dp-mono break-all">Dataset ID {item.dataset_id}</div>
+                    <div className="dp-mono break-all">Saved version ID {item.revision_id}</div>
+                    <div>Source type {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
+                    <div>The original reference choice was not recorded for this older run.</div>
+                  </div>
+                </details>
               </div>
               <AvailabilityBadge availability={current?.availability ?? 'checking'} />
             </div>
@@ -217,14 +222,14 @@ function ExactRevisionFacts({ detail }: { detail: DatasetRevisionDetail }) {
   const [open, setOpen] = useState(false)
   return <div className="mt-2 border-t border-border/60 pt-1.5">
     <button type="button" onClick={() => setOpen((value) => !value)} className="font-semibold text-primary underline">
-      {open ? 'Hide Catalog revision detail' : 'Open Catalog revision detail'}
+      {open ? 'Hide saved version details' : 'Show saved version details'}
     </button>
     {open && <div data-testid="run-input-revision-detail" className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 rounded bg-muted/40 p-2 text-muted-foreground">
       <span>Committed</span><span>{detail.committedAt ? formatManifestTime(detail.committedAt) : 'not provided'}</span>
       <span>Retention</span><span>{detail.retentionOwner}</span>
       <span>Parent</span><span className="dp-mono break-all">{detail.parentRevisionId ?? 'not evidenced'}</span>
       <span>Rows</span><span>{detail.summary.rowCount == null ? 'unknown' : detail.summary.rowCount.toLocaleString()}</span>
-      <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} exact row{detail.preview.rows.length === 1 ? '' : 's'}{detail.preview.hasMore ? ' (truncated)' : ''}</span>
+      <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} row{detail.preview.rows.length === 1 ? '' : 's'} from this saved version{detail.preview.hasMore ? ' (truncated)' : ''}</span>
     </div>}
   </div>
 }
@@ -282,7 +287,7 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
             {output.writeReceipt && (
               <details aria-label={`Write receipt for run ${historyId}`} className="mx-4 mb-2 text-[10.5px] text-muted-foreground">
-                <summary className="w-fit cursor-pointer font-semibold text-foreground">Technical receipt</summary>
+                <summary className="w-fit cursor-pointer font-semibold text-foreground">Diagnostics</summary>
                 <div className="dp-mono mt-1 break-all">
                   durable revision {output.writeReceipt.revisionId}
                   {' · '}dataset {output.writeReceipt.datasetId}

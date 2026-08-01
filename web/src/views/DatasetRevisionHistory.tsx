@@ -164,7 +164,7 @@ export function DatasetRevisionHistory({
     }).catch((error) => {
       if (request === viewerParentRequest.current) {
         setParentError(statusOf(error) === 410
-          ? 'The parent revision is no longer retained; schema and summary comparison are unavailable.'
+          ? 'The parent version is no longer available; schema and summary comparison are unavailable.'
           : `Couldn't load the parent comparison: ${errorMessage(error)}`)
       }
     })
@@ -205,7 +205,7 @@ export function DatasetRevisionHistory({
       } catch (error) {
         if (request !== detailRequest.current) return
         setParentError(statusOf(error) === 410
-          ? 'The parent revision is no longer retained; schema and summary comparison are unavailable.'
+          ? 'The parent version is no longer available; schema and summary comparison are unavailable.'
           : `Couldn't load the parent comparison: ${errorMessage(error)}`)
       }
     } catch (error) {
@@ -228,13 +228,13 @@ export function DatasetRevisionHistory({
     : null
   return <section data-testid="dataset-revision-history" className="flex flex-col gap-2 rounded-lg border border-border p-3">
     <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
-      <Icon name="clock" size={12} /> Revision history
+      <Icon name="clock" size={12} /> Version history
     </div>
-    {availability === 'checking' && <div role="status" className="text-[11px] text-muted-foreground">Checking revision history availability…</div>}
-    {availability === 'unavailable' && <div className="text-[11px] text-muted-foreground">Revision history is unavailable for this registration. No latest revision was substituted.</div>}
-    {availability === 'error' && <HistoryFailure message={`Couldn't load revision history: ${historyError}`} onRetry={loadFirst} />}
+    {availability === 'checking' && <div role="status" className="text-[11px] text-muted-foreground">Checking version history…</div>}
+    {availability === 'unavailable' && <div className="text-[11px] text-muted-foreground">Version history is unavailable for this dataset. The latest version was not opened instead.</div>}
+    {availability === 'error' && <HistoryFailure message={`Couldn't load version history: ${historyError}`} onRetry={loadFirst} />}
     {availability === 'supported' && <>
-      {items.length === 0 ? <div className="text-[11px] text-muted-foreground">No retained revisions are available.</div>
+      {items.length === 0 ? <div className="text-[11px] text-muted-foreground">No saved versions are available.</div>
         : <div className="max-h-[188px] overflow-y-auto rounded-md border border-border">
           {items.map((revision, index) => {
             const active = detailsInViewer
@@ -289,7 +289,7 @@ export function DatasetRevisionHistory({
           })}
         </div>}
       {hasMore && <div className="flex items-center justify-between gap-2 text-[10.5px] text-muted-foreground">
-        <span>More retained revisions are available through the bounded history cursor.</span>
+        <span>More saved versions are available.</span>
         <button onClick={() => void loadMore()} disabled={loadingMore} data-testid="revision-history-load-more" className="shrink-0 font-semibold text-primary underline disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry' : 'Load more'}</button>
       </div>}
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
@@ -379,7 +379,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
     </details>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
-      : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">No retained parent evidence is available; schema and summary changes are unknown.</div>
+      : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">The previous version is unavailable, so schema and summary changes are unknown.</div>
         : !parent ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading parent comparison…</div>
           : <div className="rounded-md border border-border p-2">
             <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
@@ -543,7 +543,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
           <label className="grid gap-1 text-[11px] font-semibold text-foreground">Row predicate <span className="font-normal text-muted-foreground">(optional DuckDB expression)</span>
             <textarea value={predicate} disabled={busy} rows={3} onChange={(event) => setPredicate(event.target.value)}
               placeholder={"status = 'ready' AND score >= 0.8"} className="dp-input resize-y font-mono font-normal" />
-            <span className="text-[10px] font-normal text-muted-foreground">Evaluated against the exact source before columns are projected.</span>
+            <span className="text-[10px] font-normal text-muted-foreground">Evaluated against this saved dataset version before columns are selected.</span>
           </label>
           <fieldset disabled={busy} className="grid gap-2">
             <legend className="text-[11px] font-semibold text-foreground">Rows</legend>
@@ -563,16 +563,16 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
       <div className="flex justify-end gap-2">
         <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
         <button onClick={() => void submit()} disabled={busy || !name.trim() || !selected.length}
-          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Saving exact view…' : 'Save view'}</button>
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Saving view…' : 'Save view'}</button>
       </div>
     </div>
   </div>
 }
 
 const restoreFailure = (task: RestoreRevisionTask) => task.diagnosticCode === 'stale_expected_head'
-  ? 'The current head changed before this restore published. Reload the history and try again.'
+  ? 'The current version changed before this restore finished. Reload the history and try again.'
   : task.diagnosticCode === 'revision_unavailable'
-    ? 'The source revision is no longer retained, so it cannot be restored.'
+    ? 'The source version is no longer available, so it cannot be restored.'
     : 'The restore did not publish. Reload the history and try again.'
 
 function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: {
@@ -620,8 +620,8 @@ function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: 
       if (request !== generation.current) return
       const status = statusOf(caught)
       setError(status === 409
-        ? 'The current head changed. Reload the history and try again.'
-        : status === 410 ? 'The source revision is no longer retained, so it cannot be restored.'
+        ? 'The current version changed. Reload the history and try again.'
+        : status === 410 ? 'The source version is no longer available, so it cannot be restored.'
           : `Couldn't restore this revision: ${errorMessage(caught)}`)
     } finally {
       if (request === generation.current) setBusy(false)
@@ -644,9 +644,9 @@ function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: 
           <div className="text-[9.5px] text-muted-foreground">{number(detail.summary.rowCount)} rows · {bytes(detail.summary.totalBytes)} · {timestamp(detail.committedAt)}</div>
         </div>
         <div className="rounded-md border border-border p-2">
-          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Over the current head</div>
-          {headError ? <div role="alert" className="text-[10.5px] text-destructive">Couldn't load the current head: {headError}</div>
-            : !head ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading current head…</div>
+          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Replacing the current version</div>
+          {headError ? <div role="alert" className="text-[10.5px] text-destructive">Couldn't load the current version: {headError}</div>
+            : !head ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading current version…</div>
               : <><div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">{head.revisionId}</div>
                 <div className="text-[9.5px] text-muted-foreground">{number(head.summary.rowCount)} rows · {bytes(head.summary.totalBytes)} · {timestamp(head.committedAt)}</div></>}
         </div>

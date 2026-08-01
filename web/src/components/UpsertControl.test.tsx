@@ -59,9 +59,9 @@ describe('UpsertControl', () => {
     render(<UpsertControl nodeId="write" />)
     const run = screen.getByRole('button', { name: 'Run keyed upsert' })
     expect(run).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible keyed upsert')
-    expect(screen.getByLabelText('Upsert projection')).toHaveTextContent('2 matched · 1 inserted · 1 unchanged')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to run keyed upsert')
+    expect(screen.getByLabelText('Upsert check')).toHaveTextContent('2 matched · 1 inserted · 1 unchanged')
     await waitFor(() => expect(run).toBeEnabled())
     fireEvent.click(run)
     await waitFor(() => expect(mocks.submit).toHaveBeenCalledTimes(1))
@@ -78,7 +78,7 @@ describe('UpsertControl', () => {
   it('renders a fail-closed typed error from preflight without submitting', async () => {
     mocks.preflight.mockRejectedValue(new Error('upsert rejected null or duplicate keys (rejected=0, duplicate=1, conflict=0)'))
     render(<UpsertControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await screen.findByText(/duplicate=1/)
     expect(mocks.submit).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Run keyed upsert' })).toBeDisabled()
@@ -88,8 +88,8 @@ describe('UpsertControl', () => {
     mocks.state = baseState({ keys: ['id'], taskId: 'task-1' })
     mocks.task.mockResolvedValue({ taskId: 'task-1', status: 'failed', datasetId: 'dataset-1', expectedHeadRevisionId: 'rev-1', payloadDatasetId: 'payload-1', payloadRevisionId: 'prev-1', diagnosticCode: 'stale_expected_head', canCancel: false, canRetry: false })
     render(<UpsertControl nodeId="write" />)
-    await screen.findByText(/The destination moved/)
-    expect(screen.getByRole('button', { name: 'Start new admission' })).toBeEnabled()
+    await screen.findByText(/The destination has a newer version/)
+    expect(screen.getByRole('button', { name: 'Start new setup' })).toBeEnabled()
   })
 
   it('shows the published evidence and exact revision after a done run', async () => {

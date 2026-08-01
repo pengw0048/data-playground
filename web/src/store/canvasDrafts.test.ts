@@ -56,6 +56,19 @@ describe('principal-scoped Canvas draft storage', () => {
     expect(readCanvasDrafts('alice').drafts).toMatchObject([{ draftId: 'a', name: 'renamed' }])
   })
 
+  it('round-trips an optional placement hint while keeping older records readable', () => {
+    const legacy = draft('alice', 'legacy', 1)
+    const placed = { ...draft('alice', 'placed', 2), besideCanvasId: 'folder-neighbor' }
+    expect(writeCanvasDraft(legacy).ok).toBe(true)
+    expect(writeCanvasDraft(placed).ok).toBe(true)
+
+    const recovered = readCanvasDrafts('alice').drafts
+    expect(recovered.find((item) => item.draftId === 'placed')).toMatchObject({
+      besideCanvasId: 'folder-neighbor',
+    })
+    expect(recovered.find((item) => item.draftId === 'legacy')).not.toHaveProperty('besideCanvasId')
+  })
+
   it('enforces a visible bound without evicting an existing draft', () => {
     for (let index = 0; index < MAX_LOCAL_CANVAS_DRAFTS; index += 1) {
       expect(writeCanvasDraft(draft('alice', `draft-${index}`, index)).ok).toBe(true)

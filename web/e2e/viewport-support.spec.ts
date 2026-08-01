@@ -151,7 +151,7 @@ test.describe('minimum viewport support', () => {
       'Transform filter toolbar should not consume multiple rows at the desktop viewport',
     ).toBeLessThanOrEqual(48)
     await page.getByTestId('rail-workspace').click()
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
 
     // Settings from the rail.
     await page.getByTestId('rail-settings').click()
@@ -169,7 +169,7 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Back to Workspace' }), 'dataset detail back')
     const datasetDetails = detail.getByTestId('detail-dataset-details')
     await expect(datasetDetails).not.toHaveAttribute('open', '')
-    await expect(datasetDetails).toContainText('Dataset details')
+    await expect(datasetDetails).toContainText('Diagnostics')
     await datasetDetails.locator('summary').click()
     await expect(datasetDetails).toHaveAttribute('open', '')
     await expect(datasetDetails.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
@@ -179,9 +179,7 @@ test.describe('minimum viewport support', () => {
       hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
     })).toBeVisible({ timeout: 15_000 })
     await expect(detail.getByTestId('detail-relationships')).toBeVisible()
-    const maintenance = detail.getByText('Edit catalog details', { exact: true })
-    await expect(maintenance.locator('..')).not.toHaveAttribute('open', '')
-    await maintenance.click()
+    await expect(detail.getByRole('heading', { name: 'Dataset details' })).toBeVisible()
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
     await keyAction.scrollIntoViewIfNeeded()
     await expectFullyInViewport(page, keyAction, 'column key action')
@@ -209,7 +207,7 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
     // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
-    await expect(node).toContainText(/Local catalog · Current version · \d[\d,]* rows? · \d+ columns?/)
+    await expect(node).toContainText(/Datasets · Current version · \d[\d,]* rows? · \d+ columns?/)
     await expect(node.getByText(/Field evidence/i)).toHaveCount(0)
     const connectionDetails = page.getByTestId('inspector').getByText('Connection details', { exact: true })
     await expectFullyInViewport(page, connectionDetails, 'source connection details')
@@ -364,17 +362,17 @@ test.describe('minimum viewport support', () => {
     await expect(columnSummary).toContainText('120 data columns')
     await expect(columnSummary).toContainText('1 system column')
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
-    await expect(detail.getByText('114 more data columns', { exact: true })).toBeVisible()
+    await expect(detail.getByText('provider_column_119', { exact: true })).toBeVisible()
     await expect(detail.getByText('System row ID').first()).toHaveAttribute(
-      'title', /not a canonical data column/,
+      'title', /not a data column/,
     )
     await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
     await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })
-    const datasetDetails = detail.getByText('Dataset details', { exact: true })
+    const datasetDetails = detail.getByText('Diagnostics', { exact: true })
     await expect(datasetDetails.locator('..')).not.toHaveAttribute('open', '')
     await datasetDetails.click()
-    await expect(detail.getByText('Source dataset identity', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Dataset ID', { exact: true })).toBeVisible()
     await expect(page.getByTestId('workspace-scroll-surface')).toHaveCount(0)
 
     const contentSize = await content.evaluate((element) => ({

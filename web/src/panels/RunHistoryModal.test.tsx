@@ -177,16 +177,19 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
+    await user.click(await screen.findByRole('button', { name: /Input data/i }))
     const list = screen.getByRole('list')
     const items = within(list).getAllByRole('listitem')
     expect(items).toHaveLength(2)
     expect(within(items[0]).getByText('Source Orders')).toBeInTheDocument()
     expect(within(items[1]).getByText('Source Customers')).toBeInTheDocument()
     expect(await within(items[0]).findByText('Orders dataset')).toBeInTheDocument()
-    expect(within(items[0]).getByText('Version revision-a')).toBeInTheDocument()
-    expect(within(items[0]).getByText(/Reference intent was not stored/)).toBeInTheDocument()
-    await user.click(within(items[0]).getByRole('button', { name: 'Open Catalog revision detail' }))
+    const diagnostics = within(items[0]).getByText('Diagnostics').closest('details')!
+    expect(within(diagnostics).getByText('Saved version ID revision-a')).not.toBeVisible()
+    await user.click(within(diagnostics).getByText('Diagnostics'))
+    expect(within(diagnostics).getByText('Saved version ID revision-a')).toBeVisible()
+    expect(within(diagnostics).getByText(/original reference choice was not recorded/)).toBeVisible()
+    await user.click(within(items[0]).getByRole('button', { name: 'Show saved version details' }))
     expect(within(items[0]).getByText('12')).toBeInTheDocument()
     expect(apiMock.datasetRevision).toHaveBeenCalledWith('dataset-a', 'revision-a')
   })
@@ -208,12 +211,12 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
+    await user.click(await screen.findByRole('button', { name: /Input data/i }))
     expect(await screen.findByText('permission lost')).toBeInTheDocument()
     expect(screen.getByText('provider offline')).toBeInTheDocument()
-    expect(screen.getByText(/missing or no longer retained.*newer version was not opened/i)).toBeInTheDocument()
+    expect(screen.getByText(/no longer available.*newer version was not opened/i)).toBeInTheDocument()
     expect(screen.getByText(/provider is offline or unavailable/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Open Catalog revision detail' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show saved version details' })).not.toBeInTheDocument()
   })
 
   it('labels a pre-manifest run as legacy evidence', async () => {
@@ -222,7 +225,7 @@ describe('admitted run inputs', () => {
     }])
     render(<RunHistoryModal onClose={() => {}} />)
 
-    expect(await screen.findByText('No admitted input manifest was recorded for this legacy run.')).toBeInTheDocument()
+    expect(await screen.findByText('Input data details were not saved for this older run.')).toBeInTheDocument()
     expect(apiMock.datasetRevision).not.toHaveBeenCalled()
   })
 })
@@ -251,7 +254,7 @@ describe('execution manifest inspection', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    const toggle = await screen.findByRole('button', { name: /Execution manifest/ })
+    const toggle = await screen.findByRole('button', { name: /Saved run setup/ })
     expect(screen.queryByText(digest)).not.toBeInTheDocument()
     expect(apiMock.executionManifest).not.toHaveBeenCalled()
     await user.click(toggle)
@@ -452,7 +455,7 @@ describe('durable full results', () => {
     render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
     expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Technical details' }))
+    await user.click(screen.getByRole('button', { name: 'Diagnostics' }))
     expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/run-direct/)
     expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/target:out/)
     expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/Statecommitted/)
@@ -481,7 +484,7 @@ describe('durable full results', () => {
     expect(screen.getByText(response.reason)).toBeInTheDocument()
     expect(screen.queryByText(/Complete artifact/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Export all rows' })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Technical details' }))
+    await user.click(screen.getByRole('button', { name: 'Diagnostics' }))
     expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(
       /run-direct.*target:out.*Statecommitted/s,
     )
@@ -596,7 +599,7 @@ describe('durable full results', () => {
     const receipt = await screen.findByLabelText('Write receipt for run lance-write-history')
     expect(receipt).not.toHaveAttribute('open')
     expect(within(receipt).getByText(/durable revision 8/i)).not.toBeVisible()
-    fireEvent.click(within(receipt).getByText('Technical receipt'))
+    fireEvent.click(within(receipt).getByText('Diagnostics'))
     expect(receipt).toHaveAttribute('open')
     expect(within(receipt).getByText(/durable revision 8/i)).toBeVisible()
     expect(receipt).toHaveTextContent(/dataset dataset-lance/i)
@@ -1273,7 +1276,7 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
       'failed-named-output-run', 'target', 'pass', 50, 0,
     ))
-    const trigger = screen.getByRole('button', { name: 'Technical details' })
+    const trigger = screen.getByRole('button', { name: 'Diagnostics' })
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
     await user.click(trigger)
     expect(trigger).toHaveAttribute('aria-expanded', 'true')
@@ -1453,7 +1456,7 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
     expect(screen.getByText('sum(count) vs task')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('chart-exact-run', 'target', 'out', 2_000, 0)
@@ -1493,7 +1496,7 @@ describe('durable full results', () => {
 
     const { container } = render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
     expect(container.querySelectorAll('svg rect')).toHaveLength(1)
     expect(screen.getByText('3 Y values omitted because they were null, blank, or non-numeric.')).toBeInTheDocument()
     expect(screen.getByText('valid-valu')).toBeInTheDocument()

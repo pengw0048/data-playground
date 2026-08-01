@@ -12241,6 +12241,93 @@
         "title": "WorkspaceAddTransformBody",
         "type": "object"
       },
+      "WorkspaceBatchBody": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "delete_canvases",
+              "move"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "containerId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Containerid"
+          },
+          "expectedContainerVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expectedcontainerversion"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceBatchItem"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "items"
+        ],
+        "title": "WorkspaceBatchBody",
+        "type": "object"
+      },
+      "WorkspaceBatchItem": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedCanvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expectedcanvasversion"
+          },
+          "expectedVersion": {
+            "minimum": 1.0,
+            "title": "Expectedversion",
+            "type": "integer"
+          },
+          "placementId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Placementid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "placementId",
+          "expectedVersion"
+        ],
+        "title": "WorkspaceBatchItem",
+        "type": "object"
+      },
       "WorkspaceBrowsePage": {
         "properties": {
           "completeness": {
@@ -12252,6 +12339,14 @@
             ],
             "title": "Completeness",
             "type": "string"
+          },
+          "connectedSources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceResource"
+            },
+            "title": "Connectedsources",
+            "type": "array"
           },
           "container": {
             "anyOf": [
@@ -12286,6 +12381,13 @@
               }
             ],
             "title": "Nextcursor"
+          },
+          "queryCapabilities": {
+            "$ref": "#/components/schemas/WorkspaceQueryCapabilities",
+            "default": {
+              "kindFilter": false,
+              "sort": []
+            }
           },
           "sources": {
             "default": [],
@@ -12368,6 +12470,12 @@
             "pattern": "^[0-9a-f]{32}$",
             "title": "Sourcebindingid",
             "type": "string"
+          },
+          "sourceUri": {
+            "maxLength": 1024,
+            "pattern": "^workspace-provider://[A-Za-z0-9_-]+$",
+            "title": "Sourceuri",
+            "type": "string"
           }
         },
         "required": [
@@ -12375,6 +12483,7 @@
           "sourceBindingId",
           "providerDatasetId",
           "datasetIdentity",
+          "sourceUri",
           "readMode"
         ],
         "title": "WorkspaceCanonicalDatasetContext",
@@ -12675,6 +12784,42 @@
         "title": "WorkspaceProviderSource",
         "type": "object"
       },
+      "WorkspaceQueryCapabilities": {
+        "description": "Queries that are truthful for every item returned by this browse lens.",
+        "properties": {
+          "kindFilter": {
+            "default": false,
+            "title": "Kindfilter",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "sort": {
+            "default": [],
+            "items": {
+              "enum": [
+                "name",
+                "updated"
+              ],
+              "type": "string"
+            },
+            "title": "Sort",
+            "type": "array"
+          }
+        },
+        "title": "WorkspaceQueryCapabilities",
+        "type": "object"
+      },
       "WorkspaceRenameFolderBody": {
         "additionalProperties": false,
         "properties": {
@@ -12743,6 +12888,18 @@
               }
             ],
             "title": "Canonicalreferencestate"
+          },
+          "canvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvasversion"
           },
           "catalogFolderId": {
             "anyOf": [
@@ -14769,6 +14926,24 @@
       "post": {
         "operationId": "create_canvas_api_canvas_post",
         "parameters": [
+          {
+            "in": "query",
+            "name": "besideCanvasId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Besidecanvasid"
+            }
+          },
           {
             "in": "header",
             "name": "x-dp-user",
@@ -27662,6 +27837,91 @@
         "summary": "Version"
       }
     },
+    "/api/workspace/batch": {
+      "post": {
+        "description": "Atomically validate and apply one bounded Canvas delete or move selection.",
+        "operationId": "mutate_workspace_batch_api_workspace_batch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBatchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mutate Workspace Batch Api Workspace Batch Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Mutate Workspace Batch"
+      }
+    },
     "/api/workspace/canvases": {
       "post": {
         "description": "Create at one exact local destination; an optional dataset is resolved by stable identity.",
@@ -27935,7 +28195,7 @@
     },
     "/api/workspace/containers/{container_id}": {
       "get": {
-        "description": "One bounded mixed Workspace page across local and configured read-only provider sources.",
+        "description": "One bounded local, connected-source, or legacy mixed Workspace page.",
         "operationId": "browse_workspace_container_api_workspace_containers__container_id__get",
         "parameters": [
           {
@@ -27953,6 +28213,8 @@
             "required": false,
             "schema": {
               "default": 50,
+              "maximum": 100,
+              "minimum": 1,
               "title": "Limit",
               "type": "integer"
             }
@@ -27964,6 +28226,7 @@
             "schema": {
               "anyOf": [
                 {
+                  "maxLength": 4096,
                   "type": "string"
                 },
                 {
@@ -27971,6 +28234,79 @@
                 }
               ],
               "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "local",
+                    "provider"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "name",
+                    "updated"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sort"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "enum": [
+                  "container",
+                  "canvas",
+                  "dataset",
+                  "dataset_view"
+                ],
+                "type": "string"
+              },
+              "title": "Kind",
+              "type": "array"
             }
           },
           {

@@ -1064,7 +1064,7 @@ function EditorUpstreamRunStatus({
   if (phase === 'done' && selectionFailed) return (
     <section aria-label="Upstream result unavailable" role="alert" className="border-b border-destructive/30 bg-destructive/10 px-3 py-2.5 text-[11px]">
       <div className="font-semibold text-destructive">Fresh upstream result unavailable</div>
-      <p className="mt-1 text-muted-foreground">The run finished, but its retained result could not be selected for this editor. Retry the input or run {upstreamLabel} again.</p>
+      <p className="mt-1 text-muted-foreground">The run finished, but its saved result could not be opened in this editor. Retry the input or run {upstreamLabel} again.</p>
     </section>
   )
 

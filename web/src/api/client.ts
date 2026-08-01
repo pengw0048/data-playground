@@ -6,7 +6,7 @@ import type {
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
-  WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResource, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
@@ -284,10 +284,21 @@ export const api = {
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`, {
       signal: options?.signal,
     }),
-  workspaceBrowse: (containerId: string, params?: { cursor?: string; limit?: number }) => {
+  workspaceBrowse: (containerId: string, params?: {
+    cursor?: string
+    limit?: number
+    source?: 'local' | 'provider'
+    sort?: 'name' | 'updated'
+    order?: 'asc' | 'desc'
+    kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
+  }) => {
     const query = new URLSearchParams()
     if (params?.cursor) query.set('cursor', params.cursor)
     if (params?.limit) query.set('limit', String(params.limit))
+    if (params?.source) query.set('source', params.source)
+    if (params?.sort) query.set('sort', params.sort)
+    if (params?.order) query.set('order', params.order)
+    for (const kind of params?.kinds ?? []) query.append('kind', kind)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
   workspaceResource: (resourceId: string, options?: { signal?: AbortSignal }) =>
@@ -332,6 +343,18 @@ export const api = {
     req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+  workspaceBatch: (body: {
+    action: 'delete_canvases' | 'move'
+    items: Array<{ placementId: string; expectedVersion: number; expectedCanvasVersion?: number }>
+    containerId?: string
+    expectedContainerVersion?: number
+  }) => req<{
+    ok: boolean
+    action: 'delete_canvases' | 'move'
+    items: WorkspaceResource[]
+    deletedCanvasIds?: string[]
+    container?: WorkspaceResource
+  }>('/workspace/batch', { method: 'POST', body: JSON.stringify(body) }),
   workspaceCreateFolder: (body: { parentId: string; expectedParentVersion: number; name: string; requestId: string }) =>
     req<WorkspaceFolderActionResult>('/workspace/folders', { method: 'POST', body: JSON.stringify(body) }),
   workspaceRenameFolder: (containerId: string, body: { expectedVersion: number; name: string }) =>
@@ -718,10 +741,12 @@ export const api = {
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
-  createCanvas: (doc: CanvasDoc) =>
-    req<{ ok: boolean; id: string; created: boolean }>('/canvas', {
+  createCanvas: (doc: CanvasDoc, options?: { besideCanvasId?: string }) =>
+    req<{ ok: boolean; id: string; created: boolean }>(
+      `/canvas${options?.besideCanvasId ? `?besideCanvasId=${encodeURIComponent(options.besideCanvasId)}` : ''}`, {
       method: 'POST', body: JSON.stringify(doc),
-    }),
+      },
+    ),
   saveCanvas: (doc: CanvasDoc, keepalive = false, expectedVersion?: number) => {  // keepalive: let the PUT survive a tab-close flush
     const query = expectedVersion == null ? '' : `?expectedVersion=${encodeURIComponent(expectedVersion)}`
     return req<{ ok: boolean; id: string; version: number }>(`/canvas/${doc.id}${query}`, {

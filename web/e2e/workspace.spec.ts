@@ -18,7 +18,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
     try {
       await page.goto('/#/workspace')
-      await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+      await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
       await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
       await expect(await workspaceResource(page, 'dataset', dataset.name)).toBeVisible()
 
@@ -55,7 +55,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     }
   })
 
-  test('makes an All Workspace query explicit and clears old rows after a submitted no-match search', async ({ page }) => {
+  test('makes an All query explicit and clears old rows after a submitted no-match search', async ({ page }) => {
     const canvasId = `workspace-search-${Date.now()}`
     const canvasName = 'Workspace search candidate'
     const created = await page.request.post('/api/canvas', {
@@ -98,9 +98,10 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
     try {
       await page.goto('/#/workspace')
-      await page.getByRole('button', { name: 'New canvas here' }).click()
-      await page.getByLabel('Canvas name').fill(emptyName)
       await page.getByRole('button', { name: 'Create canvas' }).click()
+      const createCanvas = page.getByRole('dialog', { name: 'Create canvas' })
+      await createCanvas.getByLabel('Canvas name').fill(emptyName)
+      await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
       await expect(page).toHaveURL(/#\/canvas\//)
       emptyCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
 
@@ -309,9 +310,9 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(historicalTechnicalDetails.getByText('rev-1', { exact: true })).toBeVisible()
 
   await page.getByTestId('revision-open-rev-2').click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
-  await expect(page.getByTestId('dataset-version-context')).toHaveText('Current exact version')
-  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Current exact version · view-only')
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Current version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Current version · view-only')
   const datasetDetails = page.getByTestId('detail-dataset-details')
   await datasetDetails.locator('summary').click()
   await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
@@ -336,9 +337,9 @@ test('browses and opens one exact retained dataset revision without drifting to 
 
   await page.getByTestId('revision-history-load-more').click()
   await page.getByTestId('revision-open-rev-1').click()
-  await expect(page.getByTestId('dataset-version-context')).toHaveText('Historical exact version')
-  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Historical exact version · view-only')
-  await expect(page.getByRole('region', { name: 'Data preview' })).toContainText('Historical exact version')
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Previous version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Previous version · view-only')
+  await expect(page.getByRole('region', { name: 'Data preview' })).toContainText('Previous version')
   await expect(dataPreview.getByRole('cell', { name: '1', exact: true })).toBeVisible()
   await expect(dataPreview.getByRole('cell', { name: '2', exact: true })).toHaveCount(0)
   expect(historyRequests).toBeGreaterThanOrEqual(2)
@@ -390,10 +391,10 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     await page.goto(`/#/canvas/${canvasId}`)
     const node = page.locator('.react-flow__node', { hasText: 'Pinned source' })
     await expect(node).toBeVisible()
-    await page.getByRole('button', { name: 'Pin exact revision' }).click()
-    const revisionPicker = page.getByText('Select one retained version. This Source will not switch to latest automatically.').locator('..')
+    await page.getByRole('button', { name: 'Pin a version' }).click()
+    const revisionPicker = page.getByText('Select one saved version. This Source will not switch to latest automatically.').locator('..')
     await revisionPicker.getByText('1', { exact: true }).click()
-    await expect(node).toContainText('Local catalog · Version 1 · 1 row · 1 column')
+    await expect(node).toContainText('Datasets · Version 1 · 1 row · 1 column')
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${canvasId}`)
       return (await response.json()).nodes[0].data.config.datasetRef
@@ -406,7 +407,7 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     const control = page.getByRole('button', { name: 'Change selected version' })
     await expect(control).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: 'Pinned source' })).toContainText(
-      'Local catalog · Version 1 · 1 row · 1 column')
+      'Datasets · Version 1 · 1 row · 1 column')
     const box = await control.boundingBox()
     expect(box).not.toBeNull()
     expect(box!.x).toBeGreaterThanOrEqual(0)
@@ -478,7 +479,7 @@ test('keeps an exact Source binding through provider outage and retries at the s
     providerAvailable = true
     await page.getByRole('button', { name: 'Retry provider' }).click()
     await expect(page.locator('.react-flow__node', { hasText: 'Recoverable source' })).toContainText(
-      'Local catalog · Version 1 · 1 row · 1 column')
+      'Datasets · Version 1 · 1 row · 1 column')
     const response = await page.request.get(`/api/canvas/${canvasId}`)
     expect((await response.json()).nodes[0].data.config.datasetRef).toEqual(selected)
   } finally {

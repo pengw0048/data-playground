@@ -16,6 +16,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
   const graphSize = useStore((s) => s.sizes[nodeId])
   const estimate = useStore((s) => s.estimate)
+  const requestRun = useStore((s) => s.requestRun)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
   const refreshPreviewInputs = useStore((s) => s.refreshPreviewInputs)
@@ -85,30 +86,30 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
     ? 'Publish a new version'
     : visibleRows == null ? 'Run with unknown row count' : `Run ${visibleRows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
-    ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
-    : exactRunReady ? 'Run' : 'Exact input registration required'
+    ? exactRunReady ? 'Publish version' : 'Register inputs to publish'
+    : exactRunReady ? 'Run' : 'Register inputs to run'
   const previewActionLabel = isManagedWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
   if (isConfiguredManagedSidecarMerge) return (
     <div className="p-3.5">
-      <Label>MANAGED SIDECAR MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges an already-published exact sidecar into a selected current base head. The server certifies every coverage and publication fact.</div>
+      <Label>SIDECAR COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges an already-published sidecar version into the selected current base. The server verifies coverage before publishing.</div>
       <ManagedSidecarMergeControl nodeId={nodeId} />
     </div>
   )
 
   if (isConfiguredMerge) return (
     <div className="p-3.5">
-      <Label>CERTIFIED COLUMN MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware column merge rather than an ordinary overwrite run.</div>
+      <Label>COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write uses a version-aware column merge rather than an ordinary overwrite.</div>
       <MergeColumnsControl nodeId={nodeId} />
     </div>
   )
 
   if (isConfiguredUpsert) return (
     <div className="p-3.5">
-      <Label>CERTIFIED KEYED UPSERT</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware keyed upsert rather than an ordinary overwrite run.</div>
+      <Label>KEYED UPSERT</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write uses a version-aware keyed upsert rather than an ordinary overwrite.</div>
       <UpsertControl nodeId={nodeId} />
     </div>
   )
@@ -161,8 +162,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               admission={writeAdmission} receipt={receipt} returnToCanvas={returnToCanvas} />}
           </>}
           {!isWrite && exactRunReadiness?.ready === false && (
-            <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
-              <strong>Not exact-run-ready:</strong> {exactRunReadiness.message}
+            <div aria-label="Run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
+              <strong>Not ready to run:</strong> {exactRunReadiness.message}
             </div>
           )}
           {phase === 'confirm' ? (
@@ -184,7 +185,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <Label>PREVIEW INPUTS MOVED</Label>
           <div className="mt-1 text-[11px] text-muted-foreground">
-            Latest changed after this preview. The full run will keep the preview's exact inputs unless you explicitly refresh.
+            The inputs changed after this preview. The full run will keep the versions shown here unless you refresh.
           </div>
           <InputDriftNotice drift={run.inputDrift} doc={doc} />
           <div className="mt-3 flex gap-2">
@@ -267,7 +268,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved
                 ? doRun(nodeId, !!est?.needsConfirm)
-                : estimate(nodeId)}
+                : requestRun(nodeId)}
+              disabled={!canEdit}
+              title={canEdit ? 'Retry this run' : 'View-only canvas'}
               className="flex-1">Retry</Button>
             {(run?.inputDrift || hasRetainedPreviewBinding) && <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)}
               disabled={!canEdit} className="flex-1">Refresh to latest</Button>}
@@ -318,7 +321,7 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
     if (!value || typeof value !== 'object' || !['exact', 'latest'].includes(String(ref.kind))
         || typeof ref.datasetId !== 'string' || !ref.datasetId
         || isBuiltInSecretRef(ref.datasetId)
-        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose latest or exact and provide the dataset identity and revision.'
+        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose Follow latest or Selected version, then provide the dataset and version IDs.'
   }
   if ((declaration.type === 'integer' || declaration.type === 'float') && typeof value === 'number') {
     if (declaration.constraints?.minimum != null && value < declaration.constraints.minimum) return `Minimum is ${declaration.constraints.minimum}.`
@@ -350,7 +353,7 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
     control = <div className="grid grid-cols-[92px_1fr] gap-1.5">
       <select aria-label={`${label} selection`} value={kind} onChange={(event) => setValue({
         kind: event.target.value, datasetId: ref.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}),
-      })} disabled={usingDefault} className={common}><option value="exact">Exact</option><option value="latest">Follow latest</option></select>
+      })} disabled={usingDefault} className={common}><option value="exact">Selected version</option><option value="latest">Follow latest</option></select>
       <input aria-label={`${label} dataset`} value={ref.datasetId ?? ''} placeholder="Dataset identity" onChange={(event) => {
         event.target.value ? setValue({ kind, datasetId: event.target.value, ...(kind === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}) }) : clear()
       }} disabled={usingDefault} className={common} />
@@ -485,7 +488,7 @@ function ConfirmationTechnicalDetails({
 }) {
   const reasons = confirmationReasons(estimate, admission)
   return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
     <div className="mt-2 grid gap-1 break-all">
       {estimate.breakdown && <div>{estimate.breakdown}</div>}
       {reasons.length > 0 && <div>Confirmation reason{reasons.length === 1 ? '' : 's'}: {reasons.join(', ').replaceAll('_', ' ')}</div>}

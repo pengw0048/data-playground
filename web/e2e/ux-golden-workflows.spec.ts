@@ -43,7 +43,7 @@ async function expectBoundedFullResultEvidence(
   runId: string,
   output: string,
 ) {
-  const trigger = surface.getByRole('button', { name: 'Technical details' })
+  const trigger = surface.getByRole('button', { name: 'Diagnostics' })
   await expect(trigger).toHaveAttribute('aria-expanded', 'false')
   await trigger.click()
   await expect(trigger).toHaveAttribute('aria-expanded', 'true')
@@ -306,7 +306,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     const job = page.getByRole('button', { name: new RegExp(`Open run ${runId}`) })
     await expect(job).toHaveAttribute('aria-expanded', 'true')
     await page.getByRole('button', { name: 'Open result' }).click()
-    const jobsResult = page.getByRole('complementary', { name: 'Retained result' })
+    const jobsResult = page.getByRole('complementary', { name: 'Saved result' })
     for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
       await page.setViewportSize(viewport)
       await expectCompactFullResult(jobsResult, viewport.height === 720 ? 190 : 250)

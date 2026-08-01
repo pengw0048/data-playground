@@ -11,6 +11,38 @@ afterEach(() => {
 })
 
 describe('API error recovery contract', () => {
+  it('keeps local Workspace sorting and filtering in the local source lens', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({ container: null, items: [], hasMore: false, completeness: 'complete', sources: [] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await api.workspaceBrowse('folder/one', {
+      limit: 50, cursor: 'next page', source: 'local',
+      sort: 'updated', order: 'desc', kinds: ['canvas', 'dataset'],
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace/containers/folder%2Fone?cursor=next+page&limit=50&source=local&sort=updated&order=desc&kind=canvas&kind=dataset',
+      expect.objectContaining({}),
+    )
+  })
+
+  it('can create a Canvas beside the currently open Canvas', async () => {
+    const doc: CanvasDoc = { id: 'new-canvas', name: 'New Canvas', version: 1, nodes: [], edges: [] }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({ ok: true, id: doc.id, version: 1, created: true }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await expect(api.createCanvas(doc, { besideCanvasId: 'current/canvas' }))
+      .resolves.toMatchObject({ created: true })
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/canvas?besideCanvasId=current%2Fcanvas',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify(doc) }),
+    )
+  })
+
   it('asks the server to resolve example Sources in one authoritative local batch', async () => {
     const payload = { resolutions: [{
       ref: 'events', state: 'resolved',

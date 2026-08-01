@@ -26,16 +26,21 @@ vi.mock('../theme/mode', () => ({ resolvedTheme: () => 'light' }))
 
 // React Flow's canvas geometry is irrelevant here; expose connection and Fit View deterministically.
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: ({ nodes, onConnect, children }: {
+  ReactFlow: ({ nodes, edges, onConnect, onEdgeClick, children }: {
     nodes: { id: string; data: {
       table: CatalogTable; focused: boolean; onFocus: () => void
     } }[]
+    edges: { id: string; data?: { rel?: unknown } }[]
     onConnect: (connection: { source: string; target: string }) => void
+    onEdgeClick: (event: unknown, edge: { id: string; data?: { rel?: unknown } }) => void
     children?: ReactNode
   }) => <div data-testid="flow">
     {nodes.map((node) => <button key={node.id} data-testid={`node-${node.id}`}
       data-focused={String(node.data.focused)} onClick={node.data.onFocus}>{node.data.table.name}</button>)}
     <button disabled={nodes.length < 2} onClick={() => onConnect({ source: nodes[0].id, target: nodes[1].id })}>connect tables</button>
+    {edges.filter((edge) => edge.data?.rel).map((edge) => (
+      <button key={edge.id} data-testid={`edge-${edge.id}`} onClick={(event) => onEdgeClick(event, edge)}>relationship edge</button>
+    ))}
     {children}
   </div>,
   Background: () => null,
@@ -128,6 +133,28 @@ describe('ERDiagram request truth', () => {
 
     expect(await screen.findByText(/Open a dataset from Workspace, then declare a primary key in its detail drawer/)).toBeVisible()
     expect(screen.queryByText(/Tables.*detail drawer/i)).toBeNull()
+  })
+
+  it('requires an in-app confirmation before removing a declared relationship', async () => {
+    const relationship = {
+      leftUri: ORDERS.uri, leftColumns: ['customer_id'],
+      rightUri: CUSTOMERS.uri, rightColumns: ['id'],
+      cardinality: 'N:1' as const, confidence: 'declared' as const,
+    }
+    mocks.relationships.mockResolvedValue([relationship])
+    render(<ERDiagram />)
+
+    fireEvent.click(await screen.findByTestId('edge-d0'))
+    const dialog = screen.getByRole('dialog', { name: 'Remove relationship?' })
+    expect(dialog).toHaveTextContent('customer_id = id')
+    expect(mocks.deleteRelationship).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(mocks.deleteRelationship).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId('edge-d0'))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove relationship' }))
+
+    await waitFor(() => expect(mocks.deleteRelationship).toHaveBeenCalledWith(relationship))
   })
 
   it('uses the same safe insets for the React Flow Fit View control', async () => {

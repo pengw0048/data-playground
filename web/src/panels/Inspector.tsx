@@ -253,9 +253,14 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
-  const resourceRequirements = resourceRequirementSummary(cfg)
+  // Runtime/plugin requirements come from the authoritative /nodes descriptor. A per-node
+  // config.requires is an older override contract: keep it visible for imported Canvases, but do
+  // not offer another free-text placement editor.
+  const runtimeRequirement = resourceSpecSummary(bspec?.requires ?? spec?.requires)
+  const legacyRequirementOverride = resourceSpecSummary(cfg.requires)
   const checkpointed = cfg.checkpoint === true
   const hasAutomaticCompute = kind === 'transform' || kind === 'section'
+  const showsCompute = hasAutomaticCompute || Boolean(runtimeRequirement) || Boolean(legacyRequirementOverride)
   const hasCheckpointControls = kind !== 'source' && kind !== 'note' && kind !== 'write'
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
@@ -415,9 +420,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* catalog-driven join hints: suggested keys (measured cardinality) + a fan-out warning */}
       {kind === 'join' && <EditOnly enabled={canEdit}><JoinHints nodeId={nodeId} /></EditOnly>}
 
-      {(hasAutomaticCompute || checkpointed) && <ExecutionSummary resourceRequirements={resourceRequirements}
-        automaticCompute={hasAutomaticCompute} checkpointed={checkpointed}
-        canEdit={canEdit} onRemoveComputeOverride={() => updateConfig(nodeId, { requires: undefined })}
+      {(showsCompute || checkpointed) && <ExecutionSummary runtimeRequirement={runtimeRequirement}
+        legacyRequirementOverride={legacyRequirementOverride} showCompute={showsCompute} checkpointed={checkpointed}
+        canEdit={canEdit} onRemoveLegacyOverride={() => updateConfig(nodeId, { requires: undefined })}
         onEditMaterialization={() => setAdvancedExecutionOpen(true)} />}
       {hasCheckpointControls && <details open={advancedExecutionOpen}
         onToggle={(event) => setAdvancedExecutionOpen(event.currentTarget.open)}
@@ -690,40 +695,49 @@ export function canEnableLinearCheckpoint(doc: CanvasDoc, nodeId: string): boole
     && (writeIn.targetHandle == null || writeIn.targetHandle === 'in')
 }
 
-function resourceRequirementSummary(config: Record<string, unknown>): string | null {
-  const requires = config.requires
+function resourceSpecSummary(requires: unknown): string | null {
   if (!requires || typeof requires !== 'object') return null
   const { cpu, mem, gpu, gpuType, labels } = requires as {
     cpu?: unknown; mem?: unknown; gpu?: unknown; gpuType?: unknown; labels?: unknown
   }
   const labelSummary = labels && typeof labels === 'object' && !Array.isArray(labels)
-    ? Object.entries(labels).map(([key, value]) => `${key}=${String(value)}`).join(', ')
+    ? Object.entries(labels).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${String(value)}`).join(', ')
     : ''
+  const gpuCount = typeof gpu === 'number' && gpu > 0
+    ? gpu
+    : typeof gpuType === 'string' && gpuType ? 1 : null
   const parts = [
-    typeof gpu === 'number' ? `${gpu} GPU${gpu === 1 ? '' : 's'}` : null,
+    gpuCount != null ? `${gpuCount} GPU${gpuCount === 1 ? '' : 's'}` : null,
     typeof gpuType === 'string' && gpuType ? gpuType : null,
-    typeof cpu === 'number' ? `${cpu} CPU${cpu === 1 ? '' : 's'}` : null,
+    typeof cpu === 'number' && cpu > 0 ? `${cpu} CPU${cpu === 1 ? '' : 's'}` : null,
     typeof mem === 'string' && mem ? mem : null,
     labelSummary || null,
   ].filter((part): part is string => part != null)
-  return parts.length ? parts.join(' · ')
-    : Object.keys(requires).length ? 'Configured requirement' : null
+  return parts.length ? parts.join(' · ') : null
 }
 
-function ExecutionSummary({ resourceRequirements, automaticCompute, checkpointed, canEdit, onRemoveComputeOverride, onEditMaterialization }: {
-  resourceRequirements: string | null
-  automaticCompute: boolean
+function ExecutionSummary({ runtimeRequirement, legacyRequirementOverride, showCompute, checkpointed, canEdit, onRemoveLegacyOverride, onEditMaterialization }: {
+  runtimeRequirement: string | null
+  legacyRequirementOverride: string | null
+  showCompute: boolean
   checkpointed: boolean
   canEdit: boolean
-  onRemoveComputeOverride: () => void
+  onRemoveLegacyOverride: () => void
   onEditMaterialization: () => void
 }) {
   return <Section title="Execution">
     <div className="grid gap-1.5 text-[11px]">
-      {automaticCompute && <div className="flex items-center justify-between gap-2">
-        <span><strong>Compute</strong> · {resourceRequirements ?? 'Automatic'}</span>
-        {resourceRequirements && canEdit && <Button variant="ghost" size="sm" onClick={onRemoveComputeOverride}
-          className="h-auto px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Use Automatic</Button>}
+      {showCompute && <div><strong>Runtime requirement</strong> · {runtimeRequirement ?? 'Automatic'}</div>}
+      {legacyRequirementOverride && <div className="rounded-md border border-amber-300/70 bg-amber-50/60 p-2 dark:border-amber-500/30 dark:bg-amber-500/10">
+        <div className="flex items-center justify-between gap-2">
+          <span><strong>Legacy override</strong> · {legacyRequirementOverride}</span>
+          {canEdit && <Button variant="ghost" size="sm" onClick={onRemoveLegacyOverride}
+            className="h-auto shrink-0 px-2 py-1 text-[10.5px] font-medium text-primary shadow-none">Use runtime default</Button>}
+        </div>
+        <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">
+          This older Canvas override is currently used instead of the runtime requirement.
+        </div>
       </div>}
       {checkpointed && <div className="flex items-center justify-between gap-2">
         <span><strong>Materialization</strong> · Checkpointed output</span>
@@ -820,7 +834,7 @@ function JoinHints({ nodeId }: { nodeId: string }) {
       )}
       {analysis?.blockingCode && (
         <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-destructive">
-          {analysis.blockingCode}: this configured key targets a different retained dataset. Cardinality cannot make it safe.
+          This configured key targets a different saved dataset version. Cardinality cannot make it safe.
         </div>
       )}
       {suggestions.length === 0 ? (

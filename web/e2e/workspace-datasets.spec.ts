@@ -25,8 +25,8 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
   await writeFile(registeredPath, 'id,value\n1,registered\n2,ready\n', 'utf8')
   try {
     await page.goto('/#/workspace')
-    await page.getByRole('tab', { name: 'Local catalog' }).click()
-    await expect(page.getByRole('tab', { name: 'Local catalog' })).toHaveAttribute('aria-selected', 'true')
+    await page.getByRole('tab', { name: 'Datasets' }).click()
+    await expect(page.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/#\/workspace\?scope=datasets/)
 
     await page.getByTestId('register-dataset').click()
@@ -41,9 +41,9 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     expect(registered.registrationId).toBeTruthy()
     expect(registered.metadataRevision).toBeTruthy()
 
-    await page.getByRole('tab', { name: 'All Workspace' }).click()
+    await page.getByRole('tab', { name: 'All' }).click()
     const catalogRoot = await workspaceResource(page, 'catalog folder', 'research')
-    await expect(catalogRoot.locator('..')).toContainText('Folder · Catalog organization')
+    await expect(catalogRoot.locator('..')).not.toContainText('Catalog organization')
     await catalogRoot.click()
     const projectedFolder = await workspaceResource(page, 'catalog folder', `issue-497-${suffix}`)
     await projectedFolder.click()
@@ -51,7 +51,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page).toHaveURL(/#\/workspace\/container%3A/)
     await page.reload()
     await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
-    await page.getByRole('tab', { name: 'Local catalog' }).click()
+    await page.getByRole('tab', { name: 'Datasets' }).click()
     await page.getByRole('button', { name: 'All datasets' }).click()
 
     const uploadedResponse = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upload') && response.request().method() === 'POST')
@@ -92,8 +92,8 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByRole('button', { name: /Open in Workspace/ }).click()
     await expect(page).toHaveURL(/#\/workspace\/container%3A/)
     await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
-    await expect(page.getByText('Folder organization comes from this catalog. Canvases stored here are local to Data Playground.')).toBeVisible()
-    await page.getByRole('tab', { name: 'Local catalog' }).click()
+    await expect(page.getByText(/Folder organization comes from this catalog/)).toHaveCount(0)
+    await page.getByRole('tab', { name: 'Datasets' }).click()
     const folderQuery = `folder=${encodeURIComponent(registeredFolder)}`
     await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
     await page.reload()
@@ -170,19 +170,25 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' })).toHaveCount(0)
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
-    await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByRole('tab', { name: 'All' })).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/#\/workspace$/)
-    await page.getByRole('tab', { name: 'Local catalog' }).click()
+    await page.getByRole('tab', { name: 'Datasets' }).click()
     await expect(search).toHaveValue('')
     await search.fill('issue497_')
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()
     await page.getByRole('checkbox', { name: `Select ${uploaded.name}` }).check()
-    page.once('dialog', (dialog) => dialog.accept())
     await page.getByTestId('catalog-delete-selected').click()
+    const unregisterDialog = page.getByRole('dialog', { name: 'Unregister 2 datasets' })
+    await expect(unregisterDialog).toBeVisible()
+    // The delayed search commit clears the visible selection, but must not change the reviewed
+    // deletion targets or their version checks while the confirmation is open.
+    await expect(page).toHaveURL(/dq=issue497_/)
+    await expect(unregisterDialog).toBeVisible()
+    await unregisterDialog.getByRole('button', { name: 'Unregister', exact: true }).click()
     const result = page.getByTestId('catalog-unregister-result')
-    await expect(result).toContainText('Best-effort unregister result')
-    await expect(result).toContainText(`${registeredName}: unregistered`)
-    await expect(result.locator('span').filter({ hasText: ': unregistered' })).toHaveCount(2)
+    await expect(result).toContainText('2 datasets removed')
+    await expect(result).toContainText(`${registeredName}: removed`)
+    await expect(result.locator('span').filter({ hasText: ': removed' })).toHaveCount(2)
   } finally {
     if (registered) {
       await page.request.delete(`/api/catalog/tables/${encodeURIComponent(registered.id)}`, { params: {

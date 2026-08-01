@@ -454,8 +454,8 @@ describe('Inspector — effective named outputs', () => {
     expect(publication).toHaveTextContent('Workspace outputs')
     expect(publication).toHaveTextContent(label)
     expect(publication).toHaveTextContent('Ready to run')
-    expect(screen.getByText('Technical details').closest('details')).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Technical details'))
+    expect(screen.getByText('Diagnostics').closest('details')).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(publication).toHaveTextContent('managed-local-file')
     expect(publication).toHaveTextContent('dataset-1@rev-1')
   })
@@ -572,7 +572,7 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
     expect(screen.getByText('Mode').parentElement).toHaveTextContent('Append to the selected dataset')
     expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@7')
   })
@@ -597,7 +597,7 @@ describe('Inspector — effective named outputs', () => {
     expect(advanced).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Advanced write operations'))
     expect(advanced).toHaveAttribute('open')
-    expect(screen.getByLabelText('Certified column merge')).toBeInTheDocument()
+    expect(screen.getByLabelText('Column merge setup')).toBeInTheDocument()
   })
 })
 
@@ -616,7 +616,8 @@ describe('Inspector — advanced execution', () => {
     selectTransform({})
     render(<Inspector />)
 
-    expect(screen.getByText('Compute').parentElement).toHaveTextContent('Automatic')
+    expect(screen.getByText('Runtime requirement').parentElement).toHaveTextContent('Automatic')
+    expect(screen.queryByText('Legacy override')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPU type')).not.toBeInTheDocument()
     const advanced = screen.getByText('Materialization options').closest('details')
@@ -629,16 +630,44 @@ describe('Inspector — advanced execution', () => {
     expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
   })
 
-  it('keeps legacy requirements visible and lets the user return to Automatic', () => {
+  it('keeps a legacy override visible and lets the user return to the runtime default', () => {
     const requires = { gpu: 8, gpuType: 'a100', cpu: 4 }
     selectTransform({ requires })
     render(<Inspector />)
 
-    expect(screen.getByText('Compute').parentElement).toHaveTextContent('8 GPUs · a100 · 4 CPUs')
-    fireEvent.click(screen.getByRole('button', { name: 'Use Automatic' }))
+    expect(screen.getByText('Runtime requirement').parentElement).toHaveTextContent('Automatic')
+    expect(screen.getByText('Legacy override').parentElement).toHaveTextContent('8 GPUs · a100 · 4 CPUs')
+    expect(screen.getByText(/older Canvas override is currently used instead of the runtime requirement/i)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Use runtime default' }))
     expect(screen.queryByRole('button', { name: 'Edit resources' })).not.toBeInTheDocument()
     expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
     expect((useStore.getState().doc.nodes[0].data.config as any).requires).toBeUndefined()
+  })
+
+  it('shows the runtime requirement declared by a plugin node descriptor without an editor', () => {
+    const kind = 'runtime-requirement-plugin-inspector'
+    registerGenericNodes([{
+      kind, title: 'Runtime processor', category: 'compute', tag: 'runtime',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }], params: [],
+      canBypass: false, previewable: true, blurb: '', source: 'plugin:runtime-fixture',
+      requires: { gpu: 1, gpuType: 'l4', cpu: 2, labels: { pool: 'inference' } },
+    }])
+    useStore.setState({
+      selectedIds: ['runtime-node'], canvasRole: 'owner', runs: {}, schemas: {},
+      doc: { id: 'runtime-requirement', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'runtime-node', type: kind, position: { x: 0, y: 0 },
+        data: { title: 'Runtime processor', status: 'draft', history: [], config: {} },
+      }] },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.getByText('Runtime requirement').parentElement)
+      .toHaveTextContent('1 GPU · l4 · 2 CPUs · pool=inference')
+    expect(screen.queryByText('Legacy override')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Use runtime default' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('GPUs')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('GPU type')).not.toBeInTheDocument()
   })
 })
 
@@ -1624,7 +1653,8 @@ describe('Inspector — Join hints', () => {
       schemas: { left: { out: cols }, right: { out: cols }, join: { out: cols } },
     } as any)
     render(<Inspector />)
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('row_reference_target_mismatch'))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('different saved dataset version'))
+    expect(screen.getByRole('alert')).not.toHaveTextContent('row_reference_target_mismatch')
     expect(screen.getByText('reference match')).toBeInTheDocument()
     expect(screen.getByText('reference unknown')).toBeInTheDocument()
     expect(screen.queryByText(/reference safe/i)).not.toBeInTheDocument()

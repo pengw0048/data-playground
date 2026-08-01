@@ -65,7 +65,7 @@ function CatalogDiscoveryFixture() {
 }
 
 function openCatalogDetails() {
-  fireEvent.click(screen.getByText('Edit dataset'))
+  expect(screen.getByRole('heading', { name: 'Dataset details' })).toBeVisible()
 }
 
 function submitFolderCreate(path: string) {
@@ -352,7 +352,7 @@ describe('Catalog discovery request and mutation truth', () => {
       onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This selected version is unavailable or no longer retained. Latest was not substituted.')
+      'This selected version is no longer available. Latest was not substituted.')
     expect(screen.queryByTestId('detail-preview-scroll')).not.toBeInTheDocument()
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
@@ -556,6 +556,25 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('downstream'))
   })
 
+  it('shows unregistered lineage endpoints without a broken Catalog link', async () => {
+    const currentRoot = 'mem://orders-current'
+    mocks.lineage.mockResolvedValue({
+      rootUri: currentRoot,
+      nodes: [
+        { id: TABLE.id, name: TABLE.name, uri: currentRoot, kind: 'table' },
+        { id: 'mem://raw-orders', name: 'raw_orders', uri: 'mem://raw-orders', kind: 'table' },
+      ],
+      edges: [{ parent: 'mem://raw-orders', child: currentRoot, factCount: 1 }],
+    })
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    const raw = await screen.findByText('raw_orders')
+    expect(raw.closest('button')).toBeNull()
+    fireEvent.click(raw)
+    expect(mocks.table).not.toHaveBeenCalled()
+  })
+
   it('surfaces detail failures, preserves edits after a failed save, and restores a refreshed list after delete', async () => {
     mocks.lineage
       .mockRejectedValueOnce(new Error('HTTP 503: lineage unavailable'))
@@ -744,10 +763,10 @@ describe('Catalog discovery request and mutation truth', () => {
 
     expect(await screen.findByText(/refresh to show header and column facts for the latest version/i)).toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@3')
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Latest version')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
-    await waitFor(() => expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts'))
+    await waitFor(() => expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version'))
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
@@ -760,21 +779,21 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
     expect(await screen.findByText(/header and columns describe an earlier version/i)).toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@4')
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@3')
     expect(screen.getByText('3 rows')).toBeInTheDocument()
     expect(screen.getByText('· 1 cols')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
     expect(await screen.findByText("Couldn't refresh the latest dataset facts: provider offline")).toBeInTheDocument()
-    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Versioned facts')
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')
     expect(screen.getByTestId('dataset-facts-stale')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
     await waitFor(() => expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4'))
     expect(screen.getByText('4 rows')).toBeInTheDocument()
     expect(screen.getByText('· 2 cols')).toBeInTheDocument()
     expect(screen.queryByText('legacy_code')).not.toBeInTheDocument()
-    expect(screen.getByText('· verified latest head')).toBeInTheDocument()
+    expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
     expect(screen.getByTestId('dataset-version-identity')).toHaveTextContent('orders-dataset@4')
     expect(screen.getByTestId('dataset-facts-source')).not.toHaveTextContent('orders-dataset@4')
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
@@ -834,9 +853,30 @@ describe('Catalog discovery selection, register modal, and rename', () => {
       { id: 't2', expectedRegistrationId: 'registration-customers', expectedRevision: 'm1_customers' },
     ]))
     const result = await screen.findByTestId('catalog-unregister-result')
-    expect(result).toHaveTextContent('Best-effort unregister result')
-    expect(result).toHaveTextContent('orders: unregistered')
-    expect(result).toHaveTextContent('customers: unregistered')
+    expect(result).toHaveTextContent('2 datasets removed')
+    expect(result).toHaveTextContent('orders: removed')
+    expect(result).toHaveTextContent('customers: removed')
+  })
+
+  it('keeps the reviewed unregister targets when a debounced search replaces the page', async () => {
+    render(<CatalogDiscoveryFixture />)
+    const search = await screen.findByLabelText('Search datasets')
+    fireEvent.change(search, { target: { value: 'new query' } })
+    fireEvent.click(screen.getByLabelText('Select orders'))
+    fireEvent.click(screen.getByLabelText('Select customers'))
+    fireEvent.click(screen.getByTestId('catalog-delete-selected'))
+    expect(screen.getByRole('dialog', { name: 'Unregister 2 datasets' })).toBeVisible()
+
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
+
+    const dialog = screen.getByRole('dialog', { name: 'Unregister 2 datasets' })
+    expect(dialog).toHaveTextContent('orders')
+    expect(dialog).toHaveTextContent('customers')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Unregister' }))
+    await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith([
+      { id: 't1', expectedRegistrationId: 'registration-orders', expectedRevision: 'm1_orders' },
+      { id: 't2', expectedRegistrationId: 'registration-customers', expectedRevision: 'm1_customers' },
+    ]))
   })
 
   it('registers a dataset through the modal with the full payload', async () => {

@@ -835,8 +835,8 @@ def _exact_run_readiness(
             ready=False,
             reason="registration_required",
             source_node_ids=unregistered,
-            message=("Register this local input through the Source data picker before exact execution. "
-                     "Preview, schema, and estimate do not create its immutable run binding."),
+            message=("Register this local input through the Source data picker before running. "
+                     "Preview, schema, and estimate do not create the saved input version required by a full run."),
         )
     return ExactRunReadiness(ready=True, reason="ready")
 
@@ -1180,7 +1180,7 @@ def _write_admission_for_graph(
         except RuntimeError as exc:
             if supplied is not None:
                 raise HTTPException(
-                    409, "write admission cannot reopen the exact destination schema metadata"
+                    409, "the destination schema could not be loaded for this write"
                 ) from exc
             return response(
                 node_id=node_id,
@@ -1191,7 +1191,7 @@ def _write_admission_for_graph(
                 expected_schema=normalized_schema,
                 partitions=partitions,
                 expected_head=expected_head,
-                blocker="the exact destination head has no valid retained schema metadata",
+                blocker="the destination's saved schema is unavailable",
             )
         schema_drift = _managed_file_schema_drift(
             expected_head, previous_schema, normalized_schema)

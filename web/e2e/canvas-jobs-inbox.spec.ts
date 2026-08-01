@@ -74,7 +74,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     const publicationDetails = publication.locator('details')
     await expect(publicationDetails).not.toHaveAttribute('open')
     await publicationDetails.locator('summary').click()
-    await expect(publicationDetails).toContainText(/Admission:.*node write.*mode create/)
+    await expect(publicationDetails).toContainText(/Run setup:.*node write.*mode create/)
     await expect(publicationDetails).toContainText('managed-local-file')
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const runPanel = page.getByTestId('panel-run')
@@ -114,9 +114,9 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${runId}$`))
     const jobRow = page.getByRole('button', { name: `Open run ${runId} in Canvas Jobs and Inbox` })
     await expect(jobRow).toHaveAttribute('aria-expanded', 'true')
-    const openNode = page.getByRole('link', { name: 'Open node' })
-    await expect(openNode).toHaveAttribute('href', `#/canvas/${canvasId}?node=write`)
-    await openNode.click()
+    const openInCanvas = page.getByRole('link', { name: 'Open in Canvas' })
+    await expect(openInCanvas).toHaveAttribute('href', `#/canvas/${canvasId}?node=write`)
+    await openInCanvas.click()
     await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}\\?node=write$`))
     const selectedWrite = page.locator('.react-flow__node.selected[data-id="write"]')
     await expect(selectedWrite).toBeVisible()
@@ -139,8 +139,8 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await page.getByText('Run history', { exact: true }).click()
     const history = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Run history' }) })
     await expect(history.getByRole('button', { name: 'View in Jobs' })).toHaveCount(1)
-    await history.getByRole('button', { name: /Admitted Sources/ }).click()
-    await expect(history.getByText(`Exact revision ${admittedInput!.revision_id}`)).toBeVisible()
+    await history.getByRole('button', { name: /Input data/ }).click()
+    await expect(history.getByText(`Version ${admittedInput!.revision_id}`)).toBeVisible()
     await history.getByRole('button', { name: 'View in Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${runId}$`))
 
@@ -163,7 +163,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
   } finally { /* no shared execution settings are changed by this journey */ }
 })
 
-test('an ordinary sampled ad-hoc Transform publishes its full runtime schema without opening Advanced', async ({ page }) => {
+test('an ordinary sampled ad-hoc Transform publishes its full runtime schema without extra setup', async ({ page }) => {
   test.setTimeout(60_000)
   const stamp = Date.now()
   const canvasId = `runtime-schema-write-${stamp}`
@@ -191,8 +191,8 @@ test('an ordinary sampled ad-hoc Transform publishes its full runtime schema wit
     const inspector = page.getByTestId('inspector')
     await page.getByText('Add stable field', { exact: true }).click()
     await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
-    const advanced = inspector.getByText('Advanced output schema').locator('..')
-    await expect(advanced).not.toHaveAttribute('open')
+    await expect(inspector.getByText('Output columns', { exact: true })).toBeVisible()
+    await expect(inspector.getByText(/Run a preview to detect columns, or define them here/)).toBeVisible()
 
     await page.getByText('Managed Write', { exact: true }).click()
     const publication = inspector.getByLabel('Write publication')

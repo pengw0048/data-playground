@@ -1162,7 +1162,7 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
       : null
   const ariaScope = completeness === 'capped'
     ? `showing ${pts.length} capped ${units}`
-    : scope === 'preview' ? `${units}, preview sample` : 'retained result'
+    : scope === 'preview' ? `${units}, preview sample` : 'saved result'
 
   return (
     <div className="p-3">
@@ -1378,10 +1378,10 @@ export function FullResult({
     </Button>
   ) : undefined
   const technicalTrigger = hasRunIdentity ? (
-    <button type="button" aria-label="Technical details" aria-expanded={technicalOpen}
+    <button type="button" aria-label="Diagnostics" aria-expanded={technicalOpen}
       onClick={() => setTechnicalOpen((open) => !open)}
       className="shrink-0 rounded px-1 py-0.5 text-[10.5px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
-      Details
+      Diagnostics
     </button>
   ) : undefined
   const technicalPanel = hasRunIdentity && technicalOpen ? (

@@ -130,11 +130,11 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     const writeCard = page.locator('.react-flow__node[data-id="write"]')
     await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
-    const control = inspector.getByLabel('Certified column merge')
+    const control = inspector.getByLabel('Column merge setup')
     await expect(control).toBeVisible()
-    await control.getByRole('button', { name: 'Check eligibility' }).click()
-    const preflight = control.getByLabel('Merge preflight')
-    await expect(preflight).toContainText('Eligible exact merge')
+    await control.getByRole('button', { name: 'Check setup' }).click()
+    const preflight = control.getByLabel('Merge check')
+    await expect(preflight).toContainText('Ready to merge saved versions')
     await expect(preflight).toContainText('replacement → replace_me (replace); addition → added_numeric (add)')
     await expect(preflight).toContainText('Output schema: id: int, untouched_text: string, untouched_numeric: float, replace_me: string, added_numeric: float')
 
@@ -168,7 +168,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
     const job = page.getByRole('button', { name: `Open run ${task.taskId} in Issue 585 exact merge canvas` })
     await expect(job).toBeVisible()
-    await page.getByText('Technical evidence', { exact: true }).click()
+    await page.getByText('Diagnostics', { exact: true }).click()
     await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
     const exactDataset = page.getByRole('link', { name: 'Open dataset' })
     await expect(exactDataset).toHaveAttribute(
@@ -182,7 +182,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
       })}`,
     )
     await exactDataset.click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
     const datasetDetails = page.getByTestId('detail-dataset-details')
     await datasetDetails.locator('summary').click()
     await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(

@@ -100,7 +100,9 @@ import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
 import type { CatalogTable, CanvasTransformReference } from '../types/api'
 import type { CanvasDoc } from '../types/graph'
-import { writeCanvasDraft } from './canvasDrafts'
+import {
+  READ_ONLY_DRAFT_BASE_MESSAGE, UNAVAILABLE_DRAFT_BASE_MESSAGE, writeCanvasDraft,
+} from './canvasDrafts'
 
 const storage = new Map<string, string>()
 Object.defineProperty(globalThis, 'localStorage', {
@@ -230,6 +232,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: true,
+      files: [{ id: 'c', name: 'test', version: 1, role: 'owner' }],
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
       serverVersion: 1, saved: true, viewportFitRequest: null, catalog: [],
     })
@@ -1580,7 +1583,7 @@ describe('graph store — core authority ops', () => {
       rows: 2, placement: 'local', needsConfirm: false,
       exactRunReadiness: {
         ready: false, reason: 'registration_required', sourceNodeIds: ['source'],
-        message: 'Register this local input through the Source data picker before exact execution.',
+        message: 'Register this local input through the Source data picker before running.',
       },
     })
 
@@ -2278,7 +2281,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).not.toHaveBeenCalled()
     expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
     expect(useStore.getState().openPanels).toEqual({ write: 'run' })
-    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Column merge uses its certified admission flow.')).toBe(true)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Review the column merge setup before running.')).toBe(true)
   })
 
   it('routes even an empty managed-sidecar merge draft to its certified panel instead of ordinary Write execution', async () => {
@@ -2298,7 +2301,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).not.toHaveBeenCalled()
     expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
     expect(useStore.getState().openPanels).toEqual({ write: 'run' })
-    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Managed sidecar merge uses its certified admission flow.')).toBe(true)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Review the sidecar merge setup before running.')).toBe(true)
   })
 
   it('fails closed to the managed-sidecar panel when an imported draft is malformed', async () => {
@@ -2332,7 +2335,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).not.toHaveBeenCalled()
     expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
     expect(useStore.getState().openPanels).toEqual({ write: 'run' })
-    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Keyed upsert uses its certified admission flow.')).toBe(true)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Review the upsert setup before running.')).toBe(true)
   })
 
   it('runs the exact managed-local intent shown by write admission', async () => {
@@ -2968,9 +2971,15 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().run('write')
 
     expect(useStore.getState().runs.write).toMatchObject({
-      phase: 'failed', error: expect.stringContaining('write admission is stale'),
+      phase: 'failed',
+      error: 'Destination changed before this run started. Review the latest version and try again.',
     })
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().toasts).toContainEqual(expect.objectContaining({
+      kind: 'error',
+      msg: 'Destination changed before this run started. Review the latest version and try again.',
+    }))
+    expect(useStore.getState().toasts.some(({ msg }) => msg.includes('write admission is stale'))).toBe(false)
 
     const fresh = {
       nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace',
@@ -4534,6 +4543,8 @@ describe('graph store — core authority ops', () => {
     const fit = useStore.getState().viewportFitRequest
     expect(fit).toMatchObject({ canvasId: doc.id })
     expect(fit?.documentIdentity).toBe(canvasViewportDocumentIdentity(doc))
+    expect(apiMocks.activeRuns).toHaveBeenCalledWith(doc.id)
+    expect(apiMocks.profileJobs).toHaveBeenCalledWith(doc.id)
 
     useStore.getState().acknowledgeViewportFit(fit!.id)
     expect(await useStore.getState().openFile(doc.id, { skipViewportFit: true })).toBe(true)
@@ -4645,6 +4656,46 @@ describe('graph store — core authority ops', () => {
     expect(localStorage.getItem('dp-canvas-role-alice-shared')).toBe('owner')
   })
 
+  it('shows a visible error and keeps local authority when Canvas deletion fails', async () => {
+    useStore.setState({ view: 'canvas', agentOpen: true })
+    apiMocks.deleteCanvas.mockRejectedValueOnce(new TypeError('hub offline'))
+
+    await useStore.getState().deleteFile('c')
+
+    expect(useStore.getState()).toMatchObject({
+      view: 'canvas', canvasRole: 'owner', agentOpen: true,
+      files: [{ id: 'c', role: 'owner' }],
+    })
+    expect(useStore.getState().toasts).toContainEqual(expect.objectContaining({
+      kind: 'error', msg: 'Could not delete the Canvas: hub offline',
+    }))
+  })
+
+  it('revokes a deleted Canvas immediately and never reopens it when list refresh fails', async () => {
+    useStore.setState({ view: 'canvas', agentOpen: true })
+    localStorage.setItem('dp-canvas-role-alice-c', 'owner')
+    let rejectRefresh!: (error: Error) => void
+    apiMocks.listCanvases.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectRefresh = reject
+    }))
+
+    const deleting = useStore.getState().deleteFile('c')
+    await vi.waitFor(() => expect(apiMocks.listCanvases).toHaveBeenCalledOnce())
+
+    expect(useStore.getState()).toMatchObject({
+      view: 'canvas', canvasRole: null, agentOpen: false, files: [],
+    })
+    expect(localStorage.getItem('dp-canvas-role-alice-c')).toBeNull()
+
+    rejectRefresh(new TypeError('list offline'))
+    await deleting
+
+    expect(apiMocks.getCanvas).not.toHaveBeenCalledWith('c')
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace', canvasRole: null, files: [], firstRunChoice: false,
+    })
+  })
+
   it('opens fail-closed when the document loads but its fresh role cannot be confirmed', async () => {
     const doc = emptyTestDoc('shared')
     useStore.getState().loadDoc(doc, 'owner')
@@ -4696,7 +4747,11 @@ describe('graph store — core authority ops', () => {
     const blank = emptyTestDoc('pristine')
     blank.name = 'untitled'
     useStore.getState().loadDoc(blank, 'owner')
-    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    useStore.setState({
+      serverVersion: 1,
+      currentDraftId: null,
+      files: [{ id: blank.id, name: blank.name, version: 1, role: 'owner' }],
+    })
     apiMocks.listRuns.mockResolvedValue([])
     apiMocks.saveCanvas.mockResolvedValue({ ok: true, id: 'pristine', version: 2 })
 
@@ -4794,6 +4849,51 @@ describe('graph store — core authority ops', () => {
     expect(source?.data.config).toEqual({ uri: 'events' })
   })
 
+  it.each(['transport', '5xx'] as const)(
+    'keeps separate-example folder placement through a %s create failure and retry',
+    async (failure) => {
+      apiMocks.createCanvas.mockRejectedValueOnce(failure === 'transport'
+        ? new TypeError('response lost')
+        : new KernelError(502, 'proxy lost the hub response'))
+
+      const created = await useStore.getState().newFromExample('purchases', 'create-separate')
+      expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+      if (!created.ok) throw new Error('expected a local example draft')
+      const draft = useStore.getState().localDrafts.find((item) => item.draftId === created.canvasId)!
+      expect(draft).toMatchObject({ besideCanvasId: 'c', createAttemptDoc: draft.doc })
+
+      apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: true })
+      await useStore.getState().retryLocalDraft(draft.draftId)
+
+      expect(apiMocks.createCanvas.mock.calls[1]).toEqual([
+        draft.doc,
+        { besideCanvasId: 'c' },
+      ])
+      expect(useStore.getState().localDrafts).toEqual([])
+    },
+  )
+
+  it('reuses separate-example placement when a committed create response was lost', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+    const created = await useStore.getState().newFromExample('purchases', 'create-separate')
+    if (!created.ok) throw new Error('expected a local example draft')
+    const draft = useStore.getState().localDrafts.find((item) => item.draftId === created.canvasId)!
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: false })
+    apiMocks.listCanvases.mockResolvedValueOnce([{
+      id: draft.canvasId, name: draft.name, version: 1, role: 'owner',
+    }])
+    apiMocks.getCanvas.mockResolvedValueOnce(draft.createAttemptDoc)
+
+    await useStore.getState().retryLocalDraft(draft.draftId)
+
+    expect(apiMocks.createCanvas.mock.calls[1]).toEqual([
+      draft.doc,
+      { besideCanvasId: 'c' },
+    ])
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().localDrafts).toEqual([])
+  })
+
   it('keeps an edit made while example Source identity is resolving', async () => {
     const blank = emptyTestDoc('resolve-wait-blank')
     blank.name = 'untitled'
@@ -4820,13 +4920,18 @@ describe('graph store — core authority ops', () => {
     const blank = emptyTestDoc('ran-blank')
     blank.name = 'untitled'
     useStore.getState().loadDoc(blank, 'owner')
-    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    useStore.setState({
+      serverVersion: 1,
+      currentDraftId: null,
+      files: [{ id: blank.id, name: blank.name, version: 1, role: 'owner' }],
+    })
     apiMocks.listRuns.mockResolvedValue([{ runId: 'durable-user-work' }])
 
     expect(await useStore.getState().newFromExample('purchases', 'replace-pristine')).toMatchObject({ ok: true })
     expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
     expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
     expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+    expect(apiMocks.createCanvas.mock.calls[0][1]).toEqual({ besideCanvasId: blank.id })
   })
 
   it('keeps an in-place example replacement as a version-fenced draft when its save response is lost', async () => {
@@ -4990,9 +5095,11 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().canvasRole).toBe('owner')
     expect(useStore.getState().view).toBe('canvas')
     expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+    expect(apiMocks.createCanvas.mock.calls[0][1]).toEqual({ besideCanvasId: beforeId })
     expect(useStore.getState().localDrafts).toMatchObject([{
       canvasId: useStore.getState().doc.id,
       baseVersion: null,
+      besideCanvasId: beforeId,
       syncState: 'dirty',
     }])
   })
@@ -5007,6 +5114,7 @@ describe('graph store — core authority ops', () => {
       canvasId: useStore.getState().doc.id,
       createAttemptDoc: useStore.getState().doc,
       baseVersion: null,
+      besideCanvasId: 'c',
       syncState: 'dirty',
     }])
   })
@@ -5021,7 +5129,7 @@ describe('graph store — core authority ops', () => {
 
     await useStore.getState().retryLocalDraft(draft.draftId)
 
-    expect(apiMocks.createCanvas).toHaveBeenLastCalledWith(draft.doc)
+    expect(apiMocks.createCanvas).toHaveBeenLastCalledWith(draft.doc, { besideCanvasId: 'c' })
     expect(useStore.getState().localDrafts).toEqual([])
     expect(useStore.getState().currentDraftId).toBeNull()
     expect(useStore.getState().serverVersion).toBe(1)
@@ -5041,6 +5149,7 @@ describe('graph store — core authority ops', () => {
 
     await useStore.getState().retryLocalDraft(draft.draftId)
 
+    expect(apiMocks.createCanvas.mock.calls[1][1]).toEqual({ besideCanvasId: 'c' })
     expect(apiMocks.saveCanvas).toHaveBeenCalledWith(edited.doc, false, 1)
     expect(useStore.getState().localDrafts).toEqual([])
     expect(useStore.getState().doc.version).toBe(2)
@@ -5087,6 +5196,33 @@ describe('graph store — core authority ops', () => {
       syncState: 'conflict',
       doc,
     })
+  })
+
+  it.each([
+    ['New Canvas', () => useStore.getState().newFile()],
+    ['example Canvas', () => useStore.getState().newFromExample('purchases', 'create-separate')],
+  ])('creates a %s at the Workspace root from a draft whose server base is unavailable', async (_label, create) => {
+    const doc = { ...emptyTestDoc('unavailable-base'), name: 'recovered work' }
+    expect(writeCanvasDraft({
+      draftId: doc.id,
+      principalId: 'alice',
+      canvasId: doc.id,
+      baseCanvasId: doc.id,
+      baseVersion: 1,
+      name: doc.name,
+      doc,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-18T12:00:00.000Z',
+    }).ok).toBe(true)
+    useStore.getState().refreshLocalDrafts()
+    useStore.setState({ files: [] })
+    expect(useStore.getState().openLocalDraft(doc.id)).toBe(true)
+
+    expect(await create()).toMatchObject({ ok: true, persistence: 'remote' })
+
+    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
+    expect(apiMocks.createCanvas.mock.calls[0]).toHaveLength(1)
   })
 
   it('offers one actionable recovery notification for a concurrent Canvas edit', async () => {
@@ -5151,14 +5287,90 @@ describe('graph store — core authority ops', () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
     await useStore.getState().newFile()
     const draft = useStore.getState().localDrafts[0]
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
 
     await useStore.getState().discardLocalDraft(draft.draftId)
-    confirm.mockRestore()
 
     expect(useStore.getState().localDrafts).toEqual([])
     expect(apiMocks.deleteCanvas).not.toHaveBeenCalled()
     expect(useStore.getState().doc.id).not.toBe(draft.canvasId)
+  })
+
+  it('creates a fresh Canvas when every stale fallback fails after discarding a draft', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    apiMocks.getCanvas.mockRejectedValueOnce(new KernelError(404, 'gone'))
+    apiMocks.listCanvases.mockResolvedValueOnce([])
+
+    await useStore.getState().discardLocalDraft(draft.draftId)
+
+    expect(apiMocks.getCanvas).toHaveBeenCalledWith('c')
+    expect(apiMocks.createCanvas).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().doc.id).not.toBe(draft.canvasId)
+    expect(useStore.getState().doc.id).not.toBe('c')
+    expect(useStore.getState().currentDraftId).toBeNull()
+  })
+
+  it('does not let Alice\'s discarded draft fallback navigate or create for Bob', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    let finishFallback!: (doc: CanvasDoc) => void
+    apiMocks.getCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishFallback = resolve }))
+
+    const discarding = useStore.getState().discardLocalDraft(draft.draftId)
+    await vi.waitFor(() => expect(apiMocks.getCanvas).toHaveBeenCalledWith('c'))
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    finishFallback(emptyTestDoc('c'))
+    await discarding
+
+    expect(useStore.getState().currentUser?.id).toBe('bob')
+    expect(apiMocks.createCanvas).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().doc.id).toBe(draft.canvasId)
+  })
+
+  it('does not let a discarded draft fallback overwrite newer navigation', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    let finishFallback!: (doc: CanvasDoc) => void
+    apiMocks.getCanvas.mockImplementationOnce(() => new Promise((resolve) => { finishFallback = resolve }))
+
+    const discarding = useStore.getState().discardLocalDraft(draft.draftId)
+    await vi.waitFor(() => expect(apiMocks.getCanvas).toHaveBeenCalledWith('c'))
+    useStore.getState().setJobsQuery('status=failed')
+    finishFallback(emptyTestDoc('c'))
+    await discarding
+
+    expect(useStore.getState()).toMatchObject({ view: 'jobs', jobsQuery: 'status=failed' })
+    expect(apiMocks.createCanvas).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().doc.id).toBe(draft.canvasId)
+  })
+
+  it('keeps a local draft until its in-flight sync has settled', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    let finishRetry!: (result: { ok: boolean; id: string; created: boolean }) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRetry = resolve
+    }))
+
+    const retrying = useStore.getState().retryLocalDraft(draft.draftId)
+    expect(useStore.getState().localDrafts[0]?.syncState).toBe('syncing')
+
+    await useStore.getState().discardLocalDraft(draft.draftId)
+
+    expect(useStore.getState().localDrafts).toContainEqual(expect.objectContaining({
+      draftId: draft.draftId, syncState: 'syncing',
+    }))
+    expect(useStore.getState().toasts).toContainEqual(expect.objectContaining({
+      kind: 'info', msg: 'Wait for this local draft to finish syncing before deleting it',
+    }))
+
+    finishRetry({ ok: true, id: draft.canvasId, created: true })
+    await retrying
+    expect(useStore.getState().localDrafts).toEqual([])
   })
 
   it('does not reintroduce a previous principal draft when an in-flight retry settles', async () => {
@@ -5259,7 +5471,8 @@ describe('graph store — core authority ops', () => {
 
     const creating = useStore.getState().newFile({ signal: controller.signal })
     const pendingDoc = apiMocks.createCanvas.mock.calls[0][0] as { id: string }
-    expect(apiMocks.createCanvas.mock.calls[0]).toHaveLength(1)
+    expect(apiMocks.createCanvas.mock.calls[0]).toHaveLength(2)
+    expect(apiMocks.createCanvas.mock.calls[0][1]).toEqual({ besideCanvasId: 'c' })
     controller.abort()
     finishCreate({ ok: true, id: pendingDoc.id, created: true })
 
@@ -5612,6 +5825,226 @@ describe('graph store — core authority ops', () => {
       { name: 'Newer edit while saving', keepalive: false, expectedVersion: 2 },
     ])
     expect(useStore.getState().toasts.filter((toast) => toast.kind === 'success')).toEqual([])
+  })
+
+  it('keeps a draft whose server base disappeared in Workspace instead of reopening a dead Canvas', async () => {
+    const stale = {
+      ...emptyTestDoc('deleted-canvas'),
+      name: 'Recovered work',
+      nodes: [NODE('source')],
+    }
+    expect(writeCanvasDraft({
+      draftId: stale.id,
+      principalId: 'alice',
+      canvasId: stale.id,
+      baseCanvasId: stale.id,
+      baseVersion: 2,
+      name: stale.name,
+      doc: stale,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-08-01T12:00:00.000Z',
+    }).ok).toBe(true)
+    localStorage.setItem('dp-open-alice', stale.id)
+    localStorage.setItem(`dp-canvas-role-alice-${stale.id}`, 'owner')
+    window.history.replaceState(null, '', `#/canvas/${stale.id}`)
+    apiMocks.getCanvas.mockRejectedValueOnce(new KernelError(404, 'canvas not found'))
+    useStore.setState({
+      doc: emptyTestDoc('bootstrap-placeholder'),
+      view: 'canvas',
+      currentDraftId: null,
+      firstRunChoice: false,
+    })
+
+    await useStore.getState().bootstrap()
+
+    expect(apiMocks.getCanvas).toHaveBeenCalledOnce()
+    expect(apiMocks.getCanvas).toHaveBeenCalledWith(stale.id)
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace',
+      currentDraftId: null,
+      firstRunChoice: false,
+      doc: { id: 'bootstrap-placeholder' },
+      localDrafts: [{
+        canvasId: stale.id,
+        syncState: 'conflict',
+        lastError: expect.stringContaining('local draft is preserved'),
+      }],
+    })
+    expect(localStorage.getItem(`dp-canvas-role-alice-${stale.id}`)).toBeNull()
+    expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+    expect(apiMocks.profileJobs).not.toHaveBeenCalled()
+
+    // The preserved graph remains explicitly inspectable without probing server execution endpoints.
+    expect(useStore.getState().openLocalDraft(stale.id)).toBe(true)
+    expect(useStore.getState()).toMatchObject({
+      view: 'canvas',
+      currentDraftId: stale.id,
+      doc: { id: stale.id, name: stale.name },
+      canvasRole: null,
+    })
+    expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+    expect(apiMocks.profileJobs).not.toHaveBeenCalled()
+    window.history.replaceState(null, '', '#/workspace')
+  })
+
+  it('re-enables only an availability conflict when the server Canvas is shared again', async () => {
+    const recovered = { ...emptyTestDoc('shared-again'), name: 'Shared again', nodes: [NODE('source')] }
+    const versionConflict = { ...emptyTestDoc('version-conflict'), name: 'Concurrent edit' }
+    for (const [doc, lastError, lastLocalEditAt] of [
+      [recovered, UNAVAILABLE_DRAFT_BASE_MESSAGE, '2026-08-01T14:00:00.000Z'],
+      [versionConflict, 'The server Canvas changed. Your local draft is preserved.', '2026-08-01T13:00:00.000Z'],
+    ] as const) {
+      expect(writeCanvasDraft({
+        draftId: doc.id,
+        principalId: 'alice',
+        canvasId: doc.id,
+        baseCanvasId: doc.id,
+        baseVersion: 2,
+        name: doc.name,
+        doc,
+        createAttemptDoc: null,
+        syncState: 'conflict',
+        lastLocalEditAt,
+        lastError,
+      }).ok).toBe(true)
+    }
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: recovered.id, name: recovered.name, version: 2, role: 'editor' },
+      { id: versionConflict.id, name: versionConflict.name, version: 3, role: 'editor' },
+    ])
+    localStorage.setItem('dp-open-alice', recovered.id)
+    window.history.replaceState(null, '', '#/workspace')
+
+    await useStore.getState().bootstrap()
+
+    expect(useStore.getState().localDrafts.find((draft) => draft.draftId === recovered.id)).toMatchObject({
+      syncState: 'dirty',
+      lastError: undefined,
+    })
+    expect(useStore.getState().localDrafts.find((draft) => draft.draftId === versionConflict.id)).toMatchObject({
+      syncState: 'conflict',
+      lastError: 'The server Canvas changed. Your local draft is preserved.',
+    })
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace',
+      currentDraftId: recovered.id,
+      doc: { id: recovered.id },
+      canvasRole: 'editor',
+    })
+    expect(apiMocks.activeRuns).toHaveBeenCalledWith(recovered.id)
+    expect(apiMocks.profileJobs).toHaveBeenCalledWith(recovered.id)
+
+    // The reverse transition is durable across a browser-style draft reload.
+    useStore.getState().refreshLocalDrafts()
+    const reloaded = useStore.getState().localDrafts.find((draft) => draft.draftId === recovered.id)
+    expect(reloaded).toMatchObject({ syncState: 'dirty' })
+    expect(reloaded).not.toHaveProperty('lastError')
+    window.history.replaceState(null, '', '#/workspace')
+  })
+
+  it('keeps viewer re-shares and downgrades as readable recovery choices until edit access returns', async () => {
+    const reshared = { ...emptyTestDoc('viewer-reshare'), name: 'Viewer re-share', nodes: [NODE('source')] }
+    const downgraded = { ...emptyTestDoc('viewer-downgrade'), name: 'Viewer downgrade' }
+    const versionConflict = { ...emptyTestDoc('viewer-version-conflict'), name: 'Concurrent edit' }
+    for (const [doc, syncState, lastError, lastLocalEditAt] of [
+      [reshared, 'conflict', UNAVAILABLE_DRAFT_BASE_MESSAGE, '2026-08-01T17:00:00.000Z'],
+      [downgraded, 'dirty', undefined, '2026-08-01T16:00:00.000Z'],
+      [versionConflict, 'conflict', 'The server Canvas changed. Your local draft is preserved.', '2026-08-01T15:00:00.000Z'],
+    ] as const) {
+      expect(writeCanvasDraft({
+        draftId: doc.id,
+        principalId: 'alice',
+        canvasId: doc.id,
+        baseCanvasId: doc.id,
+        baseVersion: 2,
+        name: doc.name,
+        doc,
+        createAttemptDoc: null,
+        syncState,
+        lastLocalEditAt,
+        lastError,
+      }).ok).toBe(true)
+    }
+    const viewerFiles = [reshared, downgraded, versionConflict].map((doc) => ({
+      id: doc.id, name: doc.name, version: 2, role: 'viewer' as const,
+    }))
+    apiMocks.listCanvases.mockResolvedValue(viewerFiles)
+    localStorage.setItem('dp-open-alice', reshared.id)
+    window.history.replaceState(null, '', '#/workspace')
+
+    await useStore.getState().bootstrap()
+
+    for (const id of [reshared.id, downgraded.id]) {
+      expect(useStore.getState().localDrafts.find((draft) => draft.draftId === id)).toMatchObject({
+        syncState: 'conflict',
+        lastError: READ_ONLY_DRAFT_BASE_MESSAGE,
+      })
+    }
+    expect(useStore.getState().localDrafts.find((draft) => draft.draftId === versionConflict.id)).toMatchObject({
+      syncState: 'conflict',
+      lastError: 'The server Canvas changed. Your local draft is preserved.',
+    })
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace',
+      currentDraftId: reshared.id,
+      canvasRole: 'viewer',
+    })
+    expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+    expect(apiMocks.profileJobs).not.toHaveBeenCalled()
+
+    apiMocks.listCanvases.mockResolvedValue(viewerFiles.map((file) => ({ ...file, role: 'editor' as const })))
+    await useStore.getState().bootstrap()
+
+    for (const id of [reshared.id, downgraded.id]) {
+      expect(useStore.getState().localDrafts.find((draft) => draft.draftId === id)).toMatchObject({
+        syncState: 'dirty',
+        lastError: undefined,
+      })
+    }
+    expect(useStore.getState().localDrafts.find((draft) => draft.draftId === versionConflict.id)).toMatchObject({
+      syncState: 'conflict',
+      lastError: 'The server Canvas changed. Your local draft is preserved.',
+    })
+    expect(useStore.getState().canvasRole).toBe('editor')
+    expect(apiMocks.activeRuns).toHaveBeenCalledWith(reshared.id)
+    expect(apiMocks.profileJobs).toHaveBeenCalledWith(reshared.id)
+    window.history.replaceState(null, '', '#/workspace')
+  })
+
+  it('still restores a never-synced local-only draft without server recovery probes', async () => {
+    const localOnly = {
+      ...emptyTestDoc('local-only'),
+      name: 'Offline work',
+      nodes: [NODE('source')],
+    }
+    expect(writeCanvasDraft({
+      draftId: localOnly.id,
+      principalId: 'alice',
+      canvasId: localOnly.id,
+      baseCanvasId: null,
+      baseVersion: null,
+      name: localOnly.name,
+      doc: localOnly,
+      createAttemptDoc: localOnly,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-08-01T13:00:00.000Z',
+    }).ok).toBe(true)
+    localStorage.setItem('dp-open-alice', localOnly.id)
+    window.history.replaceState(null, '', `#/canvas/${localOnly.id}`)
+
+    await useStore.getState().bootstrap()
+
+    expect(useStore.getState()).toMatchObject({
+      view: 'canvas',
+      currentDraftId: localOnly.id,
+      doc: { id: localOnly.id, name: localOnly.name },
+      canvasRole: 'owner',
+    })
+    expect(apiMocks.getCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+    expect(apiMocks.profileJobs).not.toHaveBeenCalled()
+    window.history.replaceState(null, '', '#/workspace')
   })
 })
 

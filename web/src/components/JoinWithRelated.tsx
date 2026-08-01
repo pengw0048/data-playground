@@ -56,7 +56,7 @@ function relationshipSummary(candidate: RelatedDatasetCandidate): string {
 }
 
 function revisionLabel(index: number, committedAt?: string | null) {
-  return `Retained version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
+  return `Saved version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
 }
 
 function friendlyRevisionError(error: string) {
@@ -510,7 +510,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                         {revisionLabel(index, revision.committedAt)}
                       </option>)}
                     </select>
-                    {loadingRevisions && <span className="ml-2 text-muted-foreground">Loading retained versions…</span>}
+                    {loadingRevisions && <span className="ml-2 text-muted-foreground">Loading saved versions…</span>}
                     {revising && <span className="ml-2 text-muted-foreground">Reviewing selected version…</span>}
                     {revisions?.hasMore && <Button type="button" size="sm" variant="outline"
                       className="ml-2 h-7" disabled={loadingMoreRevisions || revising}

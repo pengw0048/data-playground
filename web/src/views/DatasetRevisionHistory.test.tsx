@@ -113,19 +113,19 @@ describe('DatasetRevisionHistory', () => {
   it('distinguishes empty, unavailable, and provider-error history states', async () => {
     mocks.datasetRevisions.mockResolvedValueOnce({ items: [], nextCursor: null, hasMore: false })
     const first = render(<DatasetRevisionHistory table={TABLE} />)
-    expect(await screen.findByText('No retained revisions are available.')).toBeInTheDocument()
+    expect(await screen.findByText('No saved versions are available.')).toBeInTheDocument()
     first.unmount()
 
     mocks.datasetRevisions.mockRejectedValueOnce(new KernelError(410, 'gone'))
     const second = render(<DatasetRevisionHistory table={TABLE} />)
-    expect(await screen.findByText(/Revision history is unavailable.*No latest revision was substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Version history is unavailable.*latest version was not opened instead/i)).toBeInTheDocument()
     second.unmount()
 
     mocks.datasetRevisions.mockRejectedValueOnce(new KernelError(503, 'provider offline'))
       .mockResolvedValueOnce({ items: [], nextCursor: null, hasMore: false })
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
-    expect(await screen.findByText('No retained revisions are available.')).toBeInTheDocument()
+    expect(await screen.findByText('No saved versions are available.')).toBeInTheDocument()
   })
 
   it('uses the opaque cursor and keeps already loaded revisions on a load-more failure', async () => {
@@ -449,7 +449,7 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(screen.getByTestId('restore-revision'))
     const dialog = await screen.findByRole('dialog', { name: 'Restore revision as new head' })
     fireEvent.click(within(dialog).getByTestId('restore-revision-confirm'))
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/current head changed/i)
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/current version changed/i)
     expect(store.pushToast).not.toHaveBeenCalled()
   })
 

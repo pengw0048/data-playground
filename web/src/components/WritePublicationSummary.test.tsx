@@ -103,9 +103,9 @@ describe('WritePublicationSummary task-first output states', () => {
     render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
       receipt={withDrift} completed />)
 
-    const details = screen.getByText('Technical details').closest('details')!
+    const details = screen.getByText('Diagnostics').closest('details')!
     expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     const comparisons = screen.getAllByLabelText('Schema comparison')
     expect(comparisons[0]).toHaveTextContent('dataset-1@revision-6')
     expect(comparisons[0]).toHaveTextContent('changed · unknown')

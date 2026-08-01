@@ -2,7 +2,7 @@ import { expect, type Locator, type Page } from '@playwright/test'
 
 export async function goToWorkspace(page: Page) {
   await page.goto('/#/workspace')
-  await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
 }
 
 export async function backToWorkspace(page: Page) {
@@ -14,7 +14,7 @@ export async function backToWorkspace(page: Page) {
   await page.getByTestId('app-menu').click()
   await expect(menu).toBeVisible()
   await menu.getByRole('menuitem', { name: 'Back to Workspace', exact: true }).click()
-  await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
 }
 
 export async function workspaceResource(
@@ -22,8 +22,8 @@ export async function workspaceResource(
   kind: 'canvas' | 'dataset' | 'container' | 'catalog folder',
   name: string,
 ): Promise<Locator> {
-  // Catalog-managed folders are one user-facing Folder model in All Workspace. Their authority is
-  // visible in supporting copy, not encoded in a separate accessible resource kind.
+  // Catalog-managed folders share the user-facing Folder kind in All; the opaque target retains
+  // their authority without exposing another resource kind to assistive technology.
   const resourceKind = kind === 'catalog folder' ? 'folder' : kind
   const resource = page.getByRole('button', { name: `Open ${resourceKind} ${name}`, exact: true })
   const loadMore = page.getByTestId('workspace-load-more')

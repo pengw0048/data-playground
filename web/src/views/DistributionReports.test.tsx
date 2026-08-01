@@ -172,7 +172,7 @@ describe('DistributionReportPage', () => {
     const page = render(<DistributionReportPage reportId="old" />)
     await waitFor(() => expect(mocks.distributionReport).toHaveBeenCalledWith('old'))
     page.rerender(<DistributionReportPage reportId="new" />)
-    expect(screen.getByText('Loading exact retained report…')).toBeVisible()
+    expect(screen.getByText('Loading saved report…')).toBeVisible()
     expect(screen.queryByText(/currently unavailable/)).not.toBeInTheDocument()
     const latest = { ...envelope('c'.repeat(32)), viewSnapshot: { ...view, name: 'New exact report' } }
     const stale = { ...envelope('d'.repeat(32)), viewSnapshot: { ...view, name: 'Stale exact report' } }
@@ -182,7 +182,7 @@ describe('DistributionReportPage', () => {
     await waitFor(() => expect(mocks.distributionReport).toHaveBeenCalledWith('new'))
     expect(screen.getByText('New exact report')).toBeVisible()
     expect(screen.queryByText('Stale exact report')).not.toBeInTheDocument()
-    expect(screen.queryByText('Loading exact retained report…')).not.toBeInTheDocument()
+    expect(screen.queryByText('Loading saved report…')).not.toBeInTheDocument()
   })
 
   it.each([
@@ -229,10 +229,10 @@ describe('DistributionReportPage', () => {
   })
 
   it.each([
-    { status: 410, code: 'resource_gone', expected: 'exact retained revision required by this report is no longer available' },
-    { status: 500, code: 'internal_error', expected: 'report state could not be validated because it is corrupt' },
+    { status: 410, code: 'resource_gone', expected: 'saved dataset version required by this report is no longer available' },
+    { status: 500, code: 'internal_error', expected: 'saved report could not be opened because its data is invalid' },
     { status: 404, code: undefined, expected: 'does not exist, was deleted, or is not visible to you' },
-    { status: 403, code: 'permission_denied', expected: 'not authorized to open this retained report' },
+    { status: 403, code: 'permission_denied', expected: 'not authorized to open this saved report' },
   ])('classifies a $status report load from stable API status and code', async ({ status, code, expected }) => {
     mocks.distributionReport.mockRejectedValue(new KernelError(status, 'sanitized API detail', code, false))
     const onClose = vi.fn()
@@ -254,7 +254,7 @@ describe('DistributionReportPage', () => {
     })
     render(<DistributionReportPage reportId="revision-gone" />)
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'The exact retained revision became unavailable before this report finished.',
+      'The saved dataset version became unavailable before this report finished.',
     )
   })
 
@@ -313,7 +313,7 @@ describe('DistributionReportPage', () => {
     const linkedDetails = screen.getByTestId('linked-report-technical-evidence')
     expect(linkedDetails).not.toHaveAttribute('open')
     expect(within(linkedDetails).getByText('c'.repeat(32))).not.toBeVisible()
-    fireEvent.click(within(linkedDetails).getByText('Linked report technical details'))
+    fireEvent.click(within(linkedDetails).getByText('Linked report diagnostics'))
     expect(within(linkedDetails).getByText('c'.repeat(32))).toBeVisible()
     await act(async () => { resolve(comparison('c'.repeat(32))) })
     expect(await screen.findByText('Coverage before comparison')).toBeVisible()
@@ -379,9 +379,9 @@ describe('DistributionReportLauncher', () => {
     mocks.estimateDistributionReport.mockResolvedValue({ schemaVersion: 1, datasetViewId: view.id, viewDefinitionSha256: view.definitionSha256, estimatedScanRows: null, estimatedScanBytes: null, selectedColumnCount: 4, needsConfirmation: true, reason: 'unknown_size', limits: { reportedColumns: 64, topCategories: 20, histogramBuckets: 20, deadlineSeconds: 30 } })
     mocks.submitDistributionReport.mockResolvedValue(envelope())
     render(<DistributionReportLauncher definition={view} />)
-    await screen.findByText('No retained reports yet.')
+    await screen.findByText('No saved reports yet.')
     fireEvent.click(screen.getByRole('button', { name: 'Inspect distributions' }))
-    expect(await screen.findByRole('dialog', { name: 'Confirm distribution report' })).toHaveTextContent('does not prove the scan size')
+    expect(await screen.findByRole('dialog', { name: 'Confirm distribution report' })).toHaveTextContent('does not include a reliable scan size')
     expect(mocks.submitDistributionReport).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }))
     await waitFor(() => expect(mocks.submitDistributionReport).toHaveBeenCalledWith(view.id, expect.any(String), true))
@@ -393,10 +393,10 @@ describe('DistributionReportLauncher', () => {
       410, 'sanitized API detail', 'resource_gone', false,
     ))
     render(<DistributionReportLauncher definition={view} />)
-    await screen.findByText('No retained reports yet.')
+    await screen.findByText('No saved reports yet.')
     fireEvent.click(screen.getByRole('button', { name: 'Inspect distributions' }))
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'The exact retained revision is no longer available; no new report was started.',
+      'The saved dataset version is no longer available; no new report was started.',
     )
   })
 })

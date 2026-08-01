@@ -15,7 +15,7 @@ const DETAIL = (revisionId: string, rows: number) => ({
 })
 
 async function expectExactRevision(page: import('@playwright/test').Page, revisionId: string) {
-  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
   const details = page.getByTestId('detail-dataset-details')
   const identity = details.getByTestId('dataset-version-identity')
   if (!await identity.isVisible()) await details.locator('summary').click()
@@ -79,7 +79,7 @@ test('reports a moving-head conflict and publishes nothing', async ({ page }) =>
   await page.getByTestId('restore-revision').click()
   const dialog = page.getByRole('dialog', { name: 'Restore revision as new head' })
   await dialog.getByTestId('restore-revision-confirm').click()
-  await expect(dialog.getByRole('alert')).toContainText(/current head changed/i)
+  await expect(dialog.getByRole('alert')).toContainText(/current version changed/i)
   await expectExactRevision(page, 'rev-old')
   await expect(page.getByTestId('dataset-version-identity')).not.toContainText('stable-dataset@rev-new')
 })

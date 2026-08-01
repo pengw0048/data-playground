@@ -5,8 +5,8 @@ import { KernelError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
-  workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
+  workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
 }))
@@ -89,7 +89,7 @@ const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const,
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
 const CATALOG_FOLDER = { ...FOLDER, id: 'container:catalog-robotics', name: 'robotics', catalogFolderId: 'folder-stable-robotics', catalogFolderState: 'current' as const, catalogFolderPath: 'robotics' }
 const DATASET = { id: 'dataset:dataset-1', kind: 'dataset' as const, name: 'observations', parentId: FOLDER.id, placementId: 'dataset-placement', version: 1, detached: false }
-const CANVAS = { id: 'canvas:canvas-1', kind: 'canvas' as const, name: 'Analysis', parentId: ROOT.id, placementId: 'canvas-placement', version: 3, detached: false }
+const CANVAS = { id: 'canvas:canvas-1', kind: 'canvas' as const, name: 'Analysis', parentId: ROOT.id, placementId: 'canvas-placement', version: 3, canvasVersion: 17, detached: false }
 const DATASET_VIEW = { id: 'dataset_view:view-1', kind: 'dataset_view' as const, name: 'robot interactions', parentId: FOLDER.id, placementId: 'view-placement', version: 1, detached: false }
 const VIEW_DEFINITION: DatasetViewDefinition = {
   schemaVersion: 1, id: 'view-1', creatorId: 'local', name: 'robot interactions',
@@ -99,6 +99,7 @@ const VIEW_DEFINITION: DatasetViewDefinition = {
   retentionOwner: 'provider', createdAt: '2026-07-18T12:00:00Z', semanticSha256: 'a'.repeat(64), definitionSha256: 'b'.repeat(64),
 }
 const EXTERNAL_LOCAL_PLACEMENT = { writable: true, canCreateCanvas: true, canMoveCanvas: true, containerId: 'local-overlay-anchor', containerVersion: 7, recoveryState: 'ready' as const }
+const CONNECTED_SOURCE = { id: 'container:mount.d2FyZWhvdXNl', kind: 'container' as const, name: 'warehouse', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: null, providerPlacementId: null, localPlacement: null }
 const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder', providerPlacementId: 'remote-folder', localPlacement: EXTERNAL_LOCAL_PLACEMENT, providerMutation: false }
 const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset', providerPlacementId: 'remote-dataset', parentProviderPlacementId: 'remote-folder', providerDatasetId: 'canonical-observations', referenceState: 'current' as const, canonicalReferenceState: 'current' as const }
 const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mountId: 'warehouse', provider: 'fixture', completeness: 'complete' as const, error: null }
@@ -107,6 +108,7 @@ const CANONICAL_DATASET_CONTEXT = {
   ...CANONICAL_SOURCE_BINDING,
   providerDatasetId: 'canonical-observations',
   datasetIdentity: 'workspace-provider:canonical-source',
+  sourceUri: 'workspace-provider://canonical-source',
   readMode: 'exact' as const,
   revisionId: 'revision-7',
   committedAt: '2026-07-23T12:00:00Z',
@@ -137,6 +139,12 @@ describe('WorkspaceExplorer', () => {
       summary: { rowCount: 2, dataFileCount: null, totalBytes: null, fragmentCount: null },
       preview: { columns: CANONICAL_DATASET_CONTEXT.columns, rows: [{ value: 1 }, { value: 2 }], hasMore: false, rowLimit: 100 },
     })
+    mocks.lineage.mockResolvedValue({
+      rootUri: CANONICAL_DATASET_CONTEXT.datasetIdentity,
+      nodes: [{ id: 'canonical-observations', name: 'observations', uri: CANONICAL_DATASET_CONTEXT.datasetIdentity, kind: 'dataset' }],
+      edges: [], truncated: false,
+    })
+    mocks.table.mockResolvedValue({ id: 'dataset-1', registrationId: 'dataset-1', name: 'events', uri: 'file:///events.parquet', columns: [] })
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
@@ -163,7 +171,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('button', { name: 'Open dataset observations' })).not.toBeInTheDocument()
     expect(screen.queryByTestId('first-run-canvas-choice')).not.toBeInTheDocument()
     expect(screen.queryByText('local draft warning')).not.toBeInTheDocument()
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined, source: 'local' })
   })
 
   it('exposes both add-data choices directly from All Workspace', async () => {
@@ -188,14 +196,14 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'robot interactions' })
-    expect(detail).toHaveTextContent('Pinned to the saved revision')
+    expect(detail).toHaveTextContent('keeps using the saved version')
     const technicalDetails = within(detail).getByTestId('dataset-view-technical-details')
     expect(technicalDetails).not.toHaveAttribute('open')
-    fireEvent.click(within(technicalDetails).getByText('Technical details'))
+    fireEvent.click(within(technicalDetails).getByText('Diagnostics'))
     expect(within(technicalDetails).getByText('rev-7')).toBeVisible()
     expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
-    expect(screen.getByRole('button', { name: 'Open datasetview robot interactions' }).parentElement)
-      .toHaveTextContent('DatasetView')
+    expect(screen.getByRole('button', { name: 'Open saved view robot interactions' }).parentElement)
+      .toHaveTextContent('Saved view')
     expect(mocks.datasetView).toHaveBeenCalledWith('view-1')
     await waitFor(() => expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1'))
   })
@@ -295,7 +303,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByTestId('workspace-next-page'))
-    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2' }))
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2', source: 'local' }))
     expect(await screen.findByText('observations')).toBeInTheDocument()
     expect(screen.queryByText('Research')).not.toBeInTheDocument()
   })
@@ -311,7 +319,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByText('observations')).toBeVisible()
     expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', {
-      limit: 50, cursor: 'sparse-page-2',
+      limit: 50, cursor: 'sparse-page-2', source: 'local',
     })
   })
 
@@ -344,10 +352,10 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const unavailableOpen = await screen.findByRole('button', {
-      name: 'Open dataset cold observations from Source-only mount warehouse · fixture',
+      name: 'Open dataset cold observations from Connected source warehouse · fixture',
     })
     const unsupportedOpen = screen.getByRole('button', {
-      name: 'Open folder archived folder from Source-only mount warehouse · fixture',
+      name: 'Open folder archived folder from Connected source warehouse · fixture',
     })
     expect(unavailableOpen).toBeDisabled()
     expect(unsupportedOpen).toBeDisabled()
@@ -367,7 +375,7 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledTimes(2))
 
     const healthyOpen = screen.getByRole('button', {
-      name: 'Open dataset healthy observations from Source-only mount warehouse · fixture',
+      name: 'Open dataset healthy observations from Connected source warehouse · fixture',
     })
     expect(healthyOpen).toBeEnabled()
     fireEvent.click(healthyOpen)
@@ -479,7 +487,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.getCanvas.mockResolvedValue({ id: 'canvas-1', name: 'Analysis', version: 17, nodes: [], edges: [] })
     mocks.saveCanvas.mockResolvedValue({ ok: true, id: 'canvas-1', version: 18 })
-    mocks.deleteCanvas.mockResolvedValue({ ok: true })
+    mocks.workspaceBatch.mockResolvedValue({ ok: true, action: 'delete_canvases', items: [], deletedCanvasIds: ['canvas-1'] })
     render(<WorkspaceExplorer />)
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
@@ -493,19 +501,22 @@ describe('WorkspaceExplorer', () => {
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
     expect(screen.getByRole('dialog', { name: 'Delete Analysis' })).toHaveTextContent(
-      'This permanently deletes its version history, run and Job history, Inbox outcomes, and retained intermediate results.')
+      'This permanently deletes its version history, run and Job history, Inbox outcomes, and saved intermediate results.')
     expect(screen.getByRole('dialog', { name: 'Delete Analysis' })).toHaveTextContent(
       'Published or managed datasets remain available.')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(mocks.deleteCanvas).not.toHaveBeenCalled()
+    expect(mocks.workspaceBatch).not.toHaveBeenCalled()
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
     fireEvent.click(within(screen.getByRole('dialog', { name: 'Delete Analysis' })).getByRole('button', { name: 'Delete' }))
-    await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledWith('canvas-1'))
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenCalledWith({
+      action: 'delete_canvases',
+      items: [{ placementId: 'canvas-placement', expectedVersion: 3, expectedCanvasVersion: 17 }],
+    }))
   })
 
   it('fences a closed Canvas Rename fetch so an old row cannot save or close a newer dialog', async () => {
-    const secondCanvas = { ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis', placementId: 'canvas-placement-2', version: 4 }
+    const secondCanvas = { ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis', placementId: 'canvas-placement-2', version: 4, canvasVersion: 23 }
     let resolveFirst: ((value: { id: string; name: string; version: number; nodes: never[]; edges: never[] }) => void) | undefined
     store.files = [
       { id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' },
@@ -557,14 +568,212 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.getCanvas).toHaveBeenCalledWith('canvas-1')
   })
 
-  it('deletes multiple selected owned Canvases through one explicit confirmation', async () => {
+  it('requests server-wide sorting and real resource type filtering', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const sort = await screen.findByRole('combobox', { name: 'Sort Workspace' })
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.change(sort, { target: { value: 'name-desc' } })
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc' },
+    ))
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
+      target: { value: 'canvas' },
+    })
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc', kinds: ['canvas'] },
+    ))
+  })
+
+  it('disables unsupported query controls before browsing a connected source', async () => {
+    const providerRoot = {
+      ...EXTERNAL_FOLDER,
+      id: 'container:mount.bHVtYS1zdGFnaW5n',
+      name: 'luma-staging',
+      mountId: 'luma-staging',
+      resourceId: null,
+      bindingId: null,
+      localPlacement: null,
+    }
+    store.workspaceResourceId = providerRoot.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: providerRoot,
+      ancestors: [ROOT],
+      source: { ...PROVIDER_COMPLETE, id: 'mount:luma-staging', mountId: 'luma-staging' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: providerRoot, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
+      queryCapabilities: {
+        sort: [], kindFilter: false,
+        reason: 'This connected source controls its own order.',
+      },
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toBeDisabled()
+    expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
+      'This connected source controls its own order.',
+    )
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
+    )
+  })
+
+  it('renders configured mounts as explicit connected source folders', async () => {
+    const providerRoot = {
+      ...EXTERNAL_FOLDER,
+      id: 'container:mount.bHVtYS1zdGFnaW5n',
+      name: 'luma-staging',
+      mountId: 'luma-staging',
+      resourceId: null,
+      bindingId: null,
+      localPlacement: null,
+    }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], connectedSources: [providerRoot],
+      nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+    })
+    render(<WorkspaceExplorer />)
+
+    const section = await screen.findByRole('region', { name: 'Connected sources' })
+    fireEvent.click(within(section).getByRole('button', { name: 'Open folder luma-staging from Connected source luma-staging · fixture' }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
+      target: { value: 'canvas' },
+    })
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Connected sources' })).not.toBeInTheDocument())
+  })
+
+  it('moves multiple selected Canvases with one atomic Workspace request', async () => {
     const secondCanvas = { ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis', placementId: 'canvas-placement-2', version: 4 }
+    store.files = [
+      { id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' },
+      { id: 'canvas-2', name: 'Second analysis', version: 4, role: 'editor' },
+    ]
+    mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'folder-1'
+      ? { container: FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete' }
+      : { container: ROOT, items: [FOLDER, CANVAS, secondCanvas], nextCursor: null, hasMore: false, completeness: 'complete' }))
+    mocks.workspaceBatch.mockResolvedValue({
+      ok: true, action: 'move',
+      items: [
+        { ...CANVAS, parentId: FOLDER.id, version: 4 },
+        { ...secondCanvas, parentId: FOLDER.id, version: 5 },
+      ],
+      container: FOLDER,
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByLabelText('Select Analysis'))
+    fireEvent.click(screen.getByLabelText('Select Second analysis'))
+    fireEvent.click(screen.getByRole('button', { name: 'Move' }))
+    expect(await screen.findByRole('dialog', { name: 'Move 2 Canvases' })).toHaveTextContent(
+      'If any one changed or cannot be moved, none are moved.',
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Research' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Move to Research' }))
+
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenCalledTimes(1))
+    expect(mocks.workspaceBatch).toHaveBeenCalledWith({
+      action: 'move',
+      items: [
+        { placementId: 'canvas-placement', expectedVersion: 3 },
+        { placementId: 'canvas-placement-2', expectedVersion: 4 },
+      ],
+      containerId: 'folder-1', expectedContainerVersion: 1,
+    })
+    expect(store.pushToast).toHaveBeenCalledWith('Moved 2 Canvases.', 'success')
+  })
+
+  it('shows a Folder drop target and reports a failed Canvas drag move', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceBatch.mockRejectedValue(new Error('destination changed'))
+    render(<WorkspaceExplorer />)
+
+    const transfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() }
+    const canvasRow = (await screen.findByRole('button', { name: 'Open canvas Analysis' })).parentElement!
+    fireEvent.dragStart(canvasRow, { dataTransfer: transfer })
+    const folderRow = screen.getByRole('button', { name: 'Open folder Research' }).parentElement!
+    fireEvent.dragOver(folderRow, { dataTransfer: transfer })
+    expect(within(folderRow).getByRole('status')).toHaveTextContent('Move here')
+    fireEvent.drop(folderRow, { dataTransfer: transfer })
+
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenCalledWith({
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 3 }],
+      containerId: 'folder-1', expectedContainerVersion: 1,
+    }))
+    expect(store.pushToast).toHaveBeenCalledWith(
+      'Could not move “Analysis”: destination changed', 'error',
+    )
+  })
+
+  it('drags the selected Canvas group as one atomic move', async () => {
+    const secondCanvas = {
+      ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis',
+      placementId: 'canvas-placement-2', version: 4,
+    }
+    store.files = [
+      { id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' },
+      { id: 'canvas-2', name: 'Second analysis', version: 4, role: 'editor' },
+    ]
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER, CANVAS, secondCanvas], nextCursor: null,
+      hasMore: false, completeness: 'complete',
+    })
+    mocks.workspaceBatch.mockResolvedValue({
+      ok: true, action: 'move', container: FOLDER,
+      items: [
+        { ...CANVAS, parentId: FOLDER.id, version: 4 },
+        { ...secondCanvas, parentId: FOLDER.id, version: 5 },
+      ],
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByLabelText('Select Analysis'))
+    fireEvent.click(screen.getByLabelText('Select Second analysis'))
+    const transfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() }
+    const canvasRow = screen.getByRole('button', { name: 'Open canvas Analysis' }).parentElement!
+    fireEvent.dragStart(canvasRow, { dataTransfer: transfer })
+    const folderRow = screen.getByRole('button', { name: 'Open folder Research' }).parentElement!
+    fireEvent.dragOver(folderRow, { dataTransfer: transfer })
+    expect(within(folderRow).getByRole('status')).toHaveTextContent('Move 2 here')
+    fireEvent.drop(folderRow, { dataTransfer: transfer })
+
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenCalledWith({
+      action: 'move',
+      items: [
+        { placementId: 'canvas-placement', expectedVersion: 3 },
+        { placementId: 'canvas-placement-2', expectedVersion: 4 },
+      ],
+      containerId: 'folder-1', expectedContainerVersion: 1,
+    }))
+    expect(store.pushToast).toHaveBeenCalledWith(
+      'Moved 2 Canvases to “Research”.', 'success',
+    )
+  })
+
+  it('deletes multiple selected owned Canvases through one explicit confirmation', async () => {
+    const secondCanvas = { ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis', placementId: 'canvas-placement-2', version: 4, canvasVersion: 23 }
     store.files = [
       { id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' },
       { id: 'canvas-2', name: 'Second analysis', version: 4, role: 'owner' },
     ]
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS, secondCanvas], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.deleteCanvas.mockResolvedValue({ ok: true })
+    mocks.workspaceBatch.mockResolvedValue({ ok: true, action: 'delete_canvases', items: [], deletedCanvasIds: ['canvas-1', 'canvas-2'] })
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByLabelText('Select Analysis'))
@@ -573,9 +782,15 @@ describe('WorkspaceExplorer', () => {
     const dialog = screen.getByRole('dialog', { name: 'Delete 2 Canvases' })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete selected' }))
 
-    await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledTimes(2))
-    expect(mocks.deleteCanvas).toHaveBeenNthCalledWith(1, 'canvas-1')
-    expect(mocks.deleteCanvas).toHaveBeenNthCalledWith(2, 'canvas-2')
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenCalledTimes(1))
+    expect(mocks.workspaceBatch).toHaveBeenCalledWith({
+      action: 'delete_canvases',
+      items: [
+        { placementId: 'canvas-placement', expectedVersion: 3, expectedCanvasVersion: 17 },
+        { placementId: 'canvas-placement-2', expectedVersion: 4, expectedCanvasVersion: 23 },
+      ],
+    })
+    expect(dialog).toHaveTextContent('If any Canvas changed or cannot be deleted, nothing is deleted.')
   })
 
   it('does not expose Canvas mutations for a detached placement', async () => {
@@ -594,7 +809,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [EXTERNAL_FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
-    expect(await screen.findByRole('button', { name: 'Open folder Remote from Source-only mount warehouse · fixture' })).toBeEnabled()
+    expect(await screen.findByRole('button', { name: 'Open folder Remote from Connected source warehouse · fixture' })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'More actions for Remote' })).not.toBeInTheDocument()
     expect(screen.queryByText('Connected catalogs manage their folders. Canvases created here stay local to Data Playground.')).not.toBeInTheDocument()
     expect(mocks.workspaceCreateFolder).not.toHaveBeenCalled()
@@ -614,7 +829,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByText('Partial search results')).toBeVisible()
-    expect(screen.getByRole('region', { name: 'Search source Mount warehouse' })).toHaveTextContent('deadline exceeded')
+    expect(screen.getByRole('region', { name: 'Search source Connected source warehouse' })).toHaveTextContent('deadline exceeded')
     fireEvent.click(screen.getByRole('button', { name: 'Open dataset observations' }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(DATASET.id)
     expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 25, cursor: undefined })
@@ -817,8 +1032,8 @@ describe('WorkspaceExplorer', () => {
 
     const button = await screen.findByRole('button', { name: 'Create canvas' })
     expect(button).toBeDisabled()
-    expect(button).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
-    expect(screen.getByText('This source-only provider location is empty.')).toBeVisible()
+    expect(button).toHaveAttribute('title', 'This Canvas folder is unavailable; retry after the connected source recovers')
+    expect(screen.getByText('This connected source folder is empty.')).toBeVisible()
   })
 
   it('explains that a detached provider location must be relinked instead of calling it a local tombstone', async () => {
@@ -830,7 +1045,7 @@ describe('WorkspaceExplorer', () => {
 
     const button = await screen.findByRole('button', { name: 'Create canvas' })
     expect(button).toBeDisabled()
-    expect(button).toHaveAttribute('title', 'This source-only provider location is detached; relink or recover it before using its local Canvas overlay')
+    expect(button).toHaveAttribute('title', 'This connected source is unavailable. Relink it before creating or moving a Canvas here')
   })
 
   it('explores a stable dataset in a new canvas at its visible container', async () => {
@@ -1198,16 +1413,16 @@ describe('WorkspaceExplorer', () => {
     }))
     expect(store.openFile).toHaveBeenCalledWith('batch-canvas')
     expect(store.select).not.toHaveBeenCalled()
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', { limit: 1 })
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', { limit: 1, source: 'local' })
   })
 
   it('confirms a placement-only canvas move and offers a versioned undo', async () => {
     mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'folder-1'
       ? { container: FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete' }
       : { container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' }))
-    mocks.workspaceMoveCanvas
-      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, parentId: FOLDER.id, version: 4 }, previousContainer: ROOT, container: FOLDER })
-      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, version: 5 }, previousContainer: FOLDER, container: ROOT })
+    mocks.workspaceBatch
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...CANVAS, parentId: FOLDER.id, version: 4 }], container: FOLDER })
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...CANVAS, version: 5 }], container: ROOT })
     render(<WorkspaceExplorer />)
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
@@ -1216,36 +1431,45 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Research' }))
     await waitFor(() => expect(screen.getByText(/Destination:/)).toHaveTextContent('Destination: Workspace / Research'))
     fireEvent.click(await screen.findByRole('button', { name: 'Move to Research' }))
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
-      containerId: 'folder-1', expectedContainerVersion: 1, expectedVersion: 3,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(1, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 3 }],
+      containerId: 'folder-1', expectedContainerVersion: 1,
     }))
     fireEvent.click(await screen.findByRole('button', { name: 'Undo move' }))
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(2, 'canvas-placement', {
-      containerId: 'workspace-local-root', expectedContainerVersion: 1, expectedVersion: 4,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(2, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 4 }],
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
     }))
   })
 
   it('moves a Canvas into an external local overlay and uses its local destination again for undo', async () => {
     mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'external.mount-folder'
       ? { container: EXTERNAL_FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
-      : { container: ROOT, items: [EXTERNAL_FOLDER, CANVAS], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }))
-    mocks.workspaceMoveCanvas
-      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, parentId: EXTERNAL_FOLDER.id, version: 4 }, previousContainer: ROOT, container: EXTERNAL_FOLDER })
-      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, version: 5 }, previousContainer: EXTERNAL_FOLDER, container: ROOT })
+      : containerId === 'mount.d2FyZWhvdXNl'
+        ? { container: CONNECTED_SOURCE, items: [EXTERNAL_FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
+        : { container: ROOT, items: [CANVAS], connectedSources: [CONNECTED_SOURCE], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] }))
+    mocks.workspaceBatch
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...CANVAS, parentId: EXTERNAL_FOLDER.id, version: 4 }], container: EXTERNAL_FOLDER })
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...CANVAS, version: 5 }], container: ROOT })
     render(<WorkspaceExplorer />)
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
-    fireEvent.click(await screen.findByRole('button', { name: /Remote.*local overlay/ }))
-    const move = await screen.findByRole('button', { name: 'Move to Remote' })
-    expect(screen.getByText(/Destination:/)).toHaveTextContent('locally owned Canvas overlay')
+    const dialog = await screen.findByRole('dialog', { name: 'Move Analysis' })
+    fireEvent.click(await within(dialog).findByRole('button', { name: /warehouse.*connected source/ }))
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('mount.d2FyZWhvdXNl', { limit: 50, cursor: undefined })
+    fireEvent.click(await within(dialog).findByRole('button', { name: /Remote.*Canvas folder/ }))
+    const move = await within(dialog).findByRole('button', { name: 'Move to Remote' })
+    expect(screen.getByText(/Destination:/)).toHaveTextContent('Canvases stay in this Workspace')
     fireEvent.click(move)
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
-      containerId: 'local-overlay-anchor', expectedContainerVersion: 7, expectedVersion: 3,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(1, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 3 }],
+      containerId: 'local-overlay-anchor', expectedContainerVersion: 7,
     }))
     fireEvent.click(await screen.findByRole('button', { name: 'Undo move' }))
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(2, 'canvas-placement', {
-      containerId: 'workspace-local-root', expectedContainerVersion: 1, expectedVersion: 4,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(2, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 4 }],
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
     }))
   })
 
@@ -1256,21 +1480,23 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'external.mount-folder'
       ? { container: EXTERNAL_FOLDER, items: [overlayCanvas], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
       : { container: ROOT, items: [], nextCursor: null, hasMore: false, completeness: 'complete' }))
-    mocks.workspaceMoveCanvas
-      .mockResolvedValueOnce({ ok: true, resource: { ...overlayCanvas, parentId: ROOT.id, version: 4 }, previousContainer: EXTERNAL_FOLDER, container: ROOT })
-      .mockResolvedValueOnce({ ok: true, resource: { ...overlayCanvas, parentId: EXTERNAL_FOLDER.id, version: 5 }, previousContainer: ROOT, container: EXTERNAL_FOLDER })
+    mocks.workspaceBatch
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...overlayCanvas, parentId: ROOT.id, version: 4 }], container: ROOT })
+      .mockResolvedValueOnce({ ok: true, action: 'move', items: [{ ...overlayCanvas, parentId: EXTERNAL_FOLDER.id, version: 5 }], container: EXTERNAL_FOLDER })
     render(<WorkspaceExplorer />)
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Move to Workspace' }))
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
-      containerId: 'workspace-local-root', expectedContainerVersion: 1, expectedVersion: 3,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(1, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 3 }],
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
     }))
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Moved “Analysis”'))
     fireEvent.click(await screen.findByRole('button', { name: 'Undo move' }))
-    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(2, 'canvas-placement', {
-      containerId: 'local-overlay-anchor', expectedContainerVersion: 7, expectedVersion: 4,
+    await waitFor(() => expect(mocks.workspaceBatch).toHaveBeenNthCalledWith(2, {
+      action: 'move', items: [{ placementId: 'canvas-placement', expectedVersion: 4 }],
+      containerId: 'local-overlay-anchor', expectedContainerVersion: 7,
     }))
   })
 
@@ -1278,12 +1504,12 @@ describe('WorkspaceExplorer', () => {
     const overlayCanvas = { ...CANVAS, parentId: EXTERNAL_FOLDER.id }
     const unavailable = { ...EXTERNAL_FOLDER, localPlacement: { ...EXTERNAL_LOCAL_PLACEMENT, recoveryState: 'unavailable' as const } }
     store.workspaceResourceId = EXTERNAL_FOLDER.id
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_FOLDER, ancestors: [ROOT], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: unavailable, ancestors: [ROOT], source: PROVIDER_COMPLETE })
     mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'external.mount-folder'
-      ? { container: EXTERNAL_FOLDER, items: [overlayCanvas], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
+      ? { container: unavailable, items: [overlayCanvas], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
       : { container: ROOT, items: [], nextCursor: null, hasMore: false, completeness: 'complete' }))
-    mocks.workspaceMoveCanvas.mockResolvedValueOnce({
-      ok: true, resource: { ...overlayCanvas, parentId: ROOT.id, version: 4 }, previousContainer: unavailable, container: ROOT,
+    mocks.workspaceBatch.mockResolvedValueOnce({
+      ok: true, action: 'move', items: [{ ...overlayCanvas, parentId: ROOT.id, version: 4 }], container: ROOT,
     })
     render(<WorkspaceExplorer />)
 
@@ -1293,9 +1519,9 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Moved “Analysis”'))
     const undo = await screen.findByRole('button', { name: 'Undo unavailable' })
     expect(undo).toBeDisabled()
-    expect(undo).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
+    expect(undo).toHaveAttribute('title', 'This Canvas folder is unavailable; retry after the connected source recovers')
     expect(screen.getByRole('status')).toHaveTextContent('recover or relink it before undoing')
-    expect(mocks.workspaceMoveCanvas).toHaveBeenCalledTimes(1)
+    expect(mocks.workspaceBatch).toHaveBeenCalledTimes(1)
   })
 
   it('keeps an honest error and offers an explicit retry', async () => {
@@ -1304,7 +1530,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('offline')
     fireEvent.click(screen.getByText('Retry'))
-    expect(await screen.findByText(/This local container is empty/)).toBeInTheDocument()
+    expect(await screen.findByText('This folder is empty. Create a Canvas here to get started.')).toBeInTheDocument()
   })
 
   it('does not misreport a transient detail failure as a detached dataset', async () => {
@@ -1354,8 +1580,8 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    const archive = await screen.findByRole('button', { name: 'Open dataset observations from Source-only mount archive · fixture' })
-    expect(screen.getByRole('button', { name: 'Open dataset observations from Source-only mount warehouse · fixture' })).toBeVisible()
+    const archive = await screen.findByRole('button', { name: 'Open dataset observations from Connected source archive · fixture' })
+    expect(screen.getByRole('button', { name: 'Open dataset observations from Connected source warehouse · fixture' })).toBeVisible()
     fireEvent.click(archive)
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(duplicate.id)
   })
@@ -1372,7 +1598,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByText('Research')).toBeVisible()
     expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Some Workspace sources are unavailable')
-    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Mount warehouse · fixture · Unavailable — deadline exceeded')
+    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Connected source warehouse · fixture · Unavailable — deadline exceeded')
   })
 
   it('translates every provider completeness state without treating a healthy page as unavailable', async () => {
@@ -1389,8 +1615,8 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const status = await screen.findByRole('region', { name: 'Workspace source status' })
-    expect(status).not.toHaveTextContent('Mount complete')
-    expect(status).not.toHaveTextContent('Mount page')
+    expect(status).not.toHaveTextContent('Connected source complete')
+    expect(status).not.toHaveTextContent('Connected source page')
     expect(status).toHaveTextContent('Some results unavailable')
     expect(status).toHaveTextContent('Unavailable')
     expect(status).toHaveTextContent('Browse unavailable')
@@ -1406,7 +1632,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('region', { name: 'observations' })
-    expect(detail).toHaveTextContent('LocationMount warehouse / Remote / observationsfixture')
+    expect(detail).toHaveTextContent('LocationConnected source warehouse / Remote / observationsfixture')
     expect(detail).toHaveTextContent('2 rows· 1 data column')
     expect(detail).toHaveTextContent('Preview')
     await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith(
@@ -1414,7 +1640,7 @@ describe('WorkspaceExplorer', () => {
     ))
     fireEvent.click(screen.getByRole('button', { name: 'Use in Canvas' }))
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
-      'Only the stable provider identity and display metadata are stored locally',
+      'Data Playground saves only the connection and display details',
     )
     await waitFor(() => expect(screen.getByRole('button', { name: /^Choose another Canvas/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /^Choose another Canvas/ }))
@@ -1459,7 +1685,7 @@ describe('WorkspaceExplorer', () => {
     const systemLabels = within(context).getAllByText('System row ID')
     expect(systemLabels).toHaveLength(2)
     for (const label of systemLabels) {
-      expect(label).toHaveAttribute('title', expect.stringContaining('not a canonical data column'))
+      expect(label).toHaveAttribute('title', expect.stringContaining('not a data column'))
     }
     expect(within(context).getAllByTestId('provider-preview-column-name').map((column) => column.textContent)).toEqual([
       'image', '_rowid', 'source_rowid',
@@ -1527,7 +1753,7 @@ describe('WorkspaceExplorer', () => {
 
     const results = await screen.findByTestId('workspace-search-results')
     fireEvent.click(within(results).getByRole('button', {
-      name: 'Open dataset observations from Source-only mount warehouse · fixture',
+      name: 'Open dataset observations from Connected source warehouse · fixture',
     }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(EXTERNAL_DATASET.id)
 
@@ -1552,7 +1778,7 @@ describe('WorkspaceExplorer', () => {
     const restored = await screen.findByTestId('workspace-search-results')
     expect(restored).toHaveTextContent('for “will_demo”')
     expect(within(restored).getByRole('button', {
-      name: 'Open dataset observations from Source-only mount warehouse · fixture',
+      name: 'Open dataset observations from Connected source warehouse · fixture',
     })).toBeVisible()
   })
 
@@ -1647,7 +1873,7 @@ describe('WorkspaceExplorer', () => {
     })
   })
 
-  it('keeps a healthy paged provider usable and labels its continuation in researcher language', async () => {
+  it('keeps source pagination out of dataset details while leaving the dataset usable', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     const pagedSource = { ...PROVIDER_COMPLETE, completeness: 'page' as const }
     mocks.workspaceResource.mockResolvedValue({
@@ -1661,7 +1887,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('region', { name: 'observations' })
-    expect(within(detail).getByRole('status', { name: 'Dataset source status' })).toHaveTextContent('More results available')
+    expect(within(detail).queryByRole('status', { name: 'Dataset source status' })).not.toBeInTheDocument()
     expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
   })
 
@@ -1776,8 +2002,8 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Use in Canvas' }))
     const create = screen.getByRole('button', { name: 'Create and open' })
     expect(create).toBeDisabled()
-    expect(create).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
-    expect(screen.getByRole('status')).toHaveTextContent('local Canvas overlay is unavailable')
+    expect(create).toHaveAttribute('title', 'This Canvas folder is unavailable; retry after the connected source recovers')
+    expect(screen.getByRole('status')).toHaveTextContent('Canvas folder is unavailable')
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
   })
 
@@ -1807,9 +2033,9 @@ describe('WorkspaceExplorer', () => {
     expect(connection.parentElement).not.toHaveAttribute('open')
     fireEvent.click(connection)
     expect(detail).toHaveTextContent('Workspace placementremote-dataset')
-    expect(detail).toHaveTextContent('Canonical dataset IDcanonical-observations')
-    expect(detail).toHaveTextContent('Source dataset identityworkspace-provider:canonical-source')
-    expect(detail).toHaveTextContent('Version identityrevision-7')
+    expect(detail).toHaveTextContent('Provider dataset IDcanonical-observations')
+    expect(detail).toHaveTextContent('Dataset IDworkspace-provider:canonical-source')
+    expect(detail).toHaveTextContent('Version IDrevision-7')
     const context = within(detail).getByTestId('canonical-provider-dataset-context')
     expect(within(context).getAllByText('value', { exact: true })[0]).toBeVisible()
     expect(within(context).getByText('Integer', { exact: true })).toBeVisible()
@@ -1822,6 +2048,37 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledWith(
       EXTERNAL_DATASET.id, { signal: expect.any(AbortSignal) },
     )
+  })
+
+  it('embeds recorded provider lineage and opens a linked catalog dataset', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.lineage.mockResolvedValue({
+      rootUri: CANONICAL_DATASET_CONTEXT.datasetIdentity,
+      nodes: [
+        { id: 'canonical-observations', name: 'observations', uri: CANONICAL_DATASET_CONTEXT.datasetIdentity, kind: 'dataset' },
+        { id: 'dataset-1', name: 'events', uri: 'file:///events.parquet', kind: 'dataset' },
+      ],
+      edges: [{ parent: CANONICAL_DATASET_CONTEXT.datasetIdentity, child: 'file:///events.parquet', factCount: 1 }],
+      truncated: false,
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('region', { name: 'observations' })
+    expect(await within(detail).findByTestId('dataset-lineage-summary')).toBeVisible()
+    expect(mocks.lineage).toHaveBeenCalledWith(CANONICAL_DATASET_CONTEXT.datasetIdentity, 4, 60)
+    fireEvent.click(within(detail).getByRole('button', { name: 'events' }))
+
+    await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('dataset-1'))
+    expect(store.rememberTables).toHaveBeenCalledWith([expect.objectContaining({ registrationId: 'dataset-1' })])
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:dataset-1')
   })
 
   it('keeps the full named ancestor chain for a nested provider placement', async () => {
@@ -2304,7 +2561,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [unavailableCanonical], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     const second = render(<WorkspaceExplorer />)
     const detail = await screen.findByRole('region', { name: 'observations' })
-    expect(detail).toHaveTextContent('Canonical dataset state · offline')
+    expect(detail).toHaveTextContent('Dataset status · offline')
     expect(detail).toHaveTextContent('Placement state · current')
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     fireEvent.click(within(detail).getByRole('button', { name: 'Retry' }))
@@ -2328,7 +2585,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
     const both = await screen.findByRole('region', { name: 'observations' })
     expect(both).toHaveTextContent('Placement state · offline')
-    expect(both).toHaveTextContent('Canonical dataset state · offline')
+    expect(both).toHaveTextContent('Dataset status · offline')
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
   })
 
@@ -2382,7 +2639,7 @@ describe('WorkspaceExplorer', () => {
     expect(detail).toHaveTextContent('Placement state · offline')
     fireEvent.click(screen.getAllByRole('button', { name: 'Relink' })[0])
     const dialog = screen.getByRole('dialog', { name: 'Relink observations' })
-    expect(dialog).toHaveTextContent('Names are never used to repair a binding')
+    expect(dialog).toHaveTextContent('Names alone are not used to repair a connection')
     expect(screen.getByLabelText('Replacement mount ID')).toHaveValue('warehouse')
     expect(screen.getByLabelText('Replacement provider resource ID')).toHaveValue('remote-dataset')
     fireEvent.click(screen.getAllByRole('button', { name: 'Relink' }).at(-1)!)

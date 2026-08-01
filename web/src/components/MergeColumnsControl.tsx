@@ -199,7 +199,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     if (!request) return
     const key = requestKey(request)
     if (!preflight?.eligible || preflightKey !== key) {
-      setError('Check the current exact graph before submitting this column merge.')
+      setError('Check the current merge setup before submitting it.')
       return
     }
     const sequence = ++actionGeneration.current
@@ -274,7 +274,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     const sourceConfig = source?.data?.config as Record<string, unknown> | undefined
     const ref = sourceConfig?.datasetRef as { kind?: string; datasetId?: string } | undefined
     if (!source || ref?.kind !== 'exact' || !ref.datasetId) {
-      setError('Choose one exact Source revision before selecting the current head.')
+      setError('Choose one saved Source version before selecting the current destination version.')
       return
     }
     const sequence = ++actionGeneration.current
@@ -335,9 +335,9 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     || (!!task && !taskTerminal)
 
   if (!node) return null
-  return <div aria-label="Certified column merge" className={compact ? 'mt-2 text-[10.5px]' : 'mt-3 rounded-md border border-border bg-muted/30 p-2'}>
+  return <div aria-label="Column merge setup" className={compact ? 'mt-2 text-[10.5px]' : 'mt-3 rounded-md border border-border bg-muted/30 p-2'}>
     {!compact && <div className="font-semibold text-[11px] text-foreground">Add or replace columns</div>}
-    {!compact && <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Exact local Source → Select → Write only. Preflight proves identity coverage and the current head.</div>}
+    {!compact && <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Saved local Source version → Select → Write only. The check confirms identity coverage and the destination's current version.</div>}
     {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Identity columns
       <input aria-label="Merge identity columns" value={(config.identityColumns ?? []).join(', ')} disabled={!canEdit || intentLocked}
         onChange={(event) => changeIdentities(event.target.value)} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
@@ -365,30 +365,30 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
         returnToCanvas={{ canvasId, nodeId }} />
     </div>}
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-      <div className="font-semibold text-foreground">Tracked durable Task</div>
-      <div className="mt-0.5">Its current state is loading or temporarily unavailable. This is not treated as a new admission.</div>
+      <div className="font-semibold text-foreground">Submitted job</div>
+      <div className="mt-0.5">Its current state is loading or temporarily unavailable. This does not start a new setup.</div>
       <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: config.taskId! }).toString())}>Open in Jobs</Button>
     </div>}
     {responseUnknown && !recoveryAvailable && <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">Previous submission outcome is unresolved</div>
-      <div className="mt-0.5">The graph changed after submission. A second admission is blocked; undo those edits to recover the same submission, or inspect Jobs for its durable outcome.</div>
+      <div className="mt-0.5">The canvas changed after submission. A second run is blocked; undo those edits to recover the same submission, or inspect Jobs for the result.</div>
       <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery('')}>Open Jobs</Button>
     </div>}
-    {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error}</div>}
+    {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error === 'merge-columns destination head must equal the exact Source revision' ? "The saved Source version no longer matches the destination's current version." : error}</div>}
     {!compact && <div className="mt-2 flex gap-1">
-      {!task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null}>{busy === 'preflight' ? 'Checking…' : 'Check eligibility'}</Button>}
+      {!task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null}>{busy === 'preflight' ? 'Checking…' : 'Check setup'}</Button>}
       {!task && !config.taskId && !responseUnknown && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Run column merge'}</Button>}
       {recoveryAvailable && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void recover()} disabled={!canEdit || busy !== null}>{busy === 'submit' ? 'Recovering…' : 'Recover previous submission'}</Button>}
-      {taskTerminal && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Start new admission</Button>}
-      {staleHead && <div className="flex flex-col gap-1"><span className="text-[10px] text-muted-foreground">The destination moved. Nothing has been retargeted. Choose one of the explicit actions below, then check again; this never rebases automatically.</span><div className="flex gap-1"><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => void useCurrentHead()} disabled={!canEdit || busy !== null}>Use current head and recompute</Button><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Reset for a new admission</Button></div></div>}
+      {taskTerminal && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Start new setup</Button>}
+      {staleHead && <div className="flex flex-col gap-1"><span className="text-[10px] text-muted-foreground">The destination has a newer version. Nothing changed automatically. Choose an action below, then check again.</span><div className="flex gap-1"><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => void useCurrentHead()} disabled={!canEdit || busy !== null}>Use current version and recompute</Button><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Reset setup</Button></div></div>}
     </div>}
   </div>
 }
 
 function PreflightSummary({ value }: { value: MergeColumnsPreflight }) {
   const c = value.coverage
-  return <div aria-label="Merge preflight" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-    <div className="font-semibold text-foreground">{value.eligible ? 'Eligible exact merge' : 'Not eligible'}</div>
+  return <div aria-label="Merge check" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
+    <div className="font-semibold text-foreground">{value.eligible ? 'Ready to merge saved versions' : 'Not ready to merge'}</div>
     <div className="mt-0.5 break-all font-mono">base {value.base.datasetId}@{value.base.revisionId}</div>
     <div>Identity order: <span className="font-mono">{value.identityColumns.join(', ') || 'none'}</span></div>
     <div>Declared key suggestion (not verified): {value.declaredKey.length ? <span className="font-mono">{value.declaredKey.join(', ')}</span> : 'none'}</div>
@@ -396,8 +396,8 @@ function PreflightSummary({ value }: { value: MergeColumnsPreflight }) {
     <div>Candidate coverage: {countLabel(c.candidate.rows)} rows · {countLabel(c.candidate.uniqueIdentities)} unique · {countLabel(c.candidate.nullRows)} null · {countLabel(c.candidate.duplicateGroups)} duplicate groups ({countLabel(c.candidate.duplicateRows)} rows)</div>
     <div>Coverage: {c.status} · {countLabel(c.matchedIdentities)} matched · {countLabel(c.missingIdentities)} missing · {countLabel(c.extraIdentities)} extra</div>
     <div>Mapping: {value.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div>
-    <div>Expected head: <span className="font-mono">{value.expectedHead.revisionId}</span></div>
+    <div>Checked destination version: <span className="font-mono">{value.expectedHead.revisionId}</span></div>
     <div>Output schema: {value.outputSchema.length ? value.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'no fields'}</div>
-    <div>Evidence: {value.provenance.producer} · {value.provenance.source} · {value.provenance.selectKind} v{value.provenance.selectVersion}</div>
+    <div>Evidence: {value.provenance.producer} · {value.provenance.source === 'exact' ? 'saved version' : value.provenance.source} · {value.provenance.selectKind} v{value.provenance.selectVersion}</div>
   </div>
 }

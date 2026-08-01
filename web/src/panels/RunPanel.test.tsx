@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../store/graph', () => ({
   hasConfiguredManagedSidecarMerge: () => false,
-  roleCanEdit: () => true,
+  roleCanEdit: (role: string) => role === 'owner' || role === 'editor',
   targetParameterDeclarations: (doc: any) => doc.parameters ?? [],
   useStore: (selector: (state: any) => unknown) => selector(mocks.state),
 }))
@@ -37,7 +37,7 @@ describe('RunPanel typed parameter gate', () => {
         { name: 'input', value: { kind: 'exact', datasetId: 'dataset-1' } },
       ] } },
       sizes: {},
-      estimate: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), refreshPreviewInputs: vi.fn(),
+      estimate: vi.fn(), requestRun: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), refreshPreviewInputs: vi.fn(),
       previewBindings: {}, canvasRole: 'owner', setRunParameterBinding: mocks.setBinding,
       clearRunParameterBinding: mocks.clearBinding, submitRunParameters: mocks.submit,
       editRunParameters: mocks.edit, setJobsQuery: mocks.setJobsQuery,
@@ -47,7 +47,7 @@ describe('RunPanel typed parameter gate', () => {
   it('blocks invalid values, clears bindings explicitly, and keeps DatasetRef fields structural', () => {
     render(<RunPanel nodeId="target" />)
     expect(screen.getByText(/explicit timezone/i)).toBeVisible()
-    expect(screen.getByText(/provide the dataset identity and revision/i)).toBeVisible()
+    expect(screen.getByText(/provide the dataset and version IDs/i)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
 
     fireEvent.change(screen.getByLabelText('When'), { target: { value: '' } })
@@ -207,9 +207,9 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByText(revisionId)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run 2,001 rows' })).toBeVisible()
 
-    const technicalDetails = screen.getByText('Technical details').parentElement!
+    const technicalDetails = screen.getByText('Diagnostics').parentElement!
     expect(technicalDetails).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(technicalDetails).toHaveAttribute('open')
   })
 
@@ -256,8 +256,8 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getAllByText('Run 2,000 rows')).toHaveLength(2)
     expect(screen.getByText(/This full run will process 2,000 rows/)).toBeVisible()
-    const details = screen.getByText('Technical details').closest('details')!
-    fireEvent.click(screen.getByText('Technical details'))
+    const details = screen.getByText('Diagnostics').closest('details')!
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(details).toHaveTextContent('size unknown · retained input was not reopened during admission')
   })
 
@@ -294,8 +294,8 @@ describe('RunPanel typed parameter gate', () => {
     mocks.state.runs = { target: { phase: 'idle' } }
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByText('CERTIFIED COLUMN MERGE')).toBeVisible()
-    expect(screen.getByLabelText('Certified column merge')).toBeVisible()
+    expect(screen.getByText('COLUMN MERGE')).toBeVisible()
+    expect(screen.getByLabelText('Column merge setup')).toBeVisible()
     await waitFor(() => expect(mocks.state.estimate).not.toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: 'Run' })).not.toBeInTheDocument()
   })
@@ -328,7 +328,7 @@ describe('RunPanel typed parameter gate', () => {
     } }
     const { rerender } = render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByRole('button', { name: 'Publish revision' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Publish version' })).toBeVisible()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
@@ -365,9 +365,9 @@ describe('RunPanel typed parameter gate', () => {
 
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Exact input registration required' })).toBeDisabled()
-    expect(screen.getByLabelText('Exact run readiness')).toHaveTextContent(
+    expect(screen.queryByRole('button', { name: 'Publish version' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Register inputs to publish' })).toBeDisabled()
+    expect(screen.getByLabelText('Run readiness')).toHaveTextContent(
       'Fix before running: Register this local input',
     )
   })
@@ -390,9 +390,9 @@ describe('RunPanel typed parameter gate', () => {
 
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByRole('button', { name: 'Exact input registration required' })).toBeDisabled()
-    expect(screen.getByLabelText('Exact run readiness')).toHaveTextContent(
-      'Not exact-run-ready: Register this local input before running.',
+    expect(screen.getByRole('button', { name: 'Register inputs to run' })).toBeDisabled()
+    expect(screen.getByLabelText('Run readiness')).toHaveTextContent(
+      'Not ready to run: Register this local input before running.',
     )
   })
 
@@ -451,7 +451,7 @@ describe('RunPanel typed parameter gate', () => {
     const { rerender } = render(<RunPanel nodeId="target" />)
 
     expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Publish version' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
@@ -510,9 +510,9 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
     expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
-    const details = screen.getByText('Technical details').closest('details')!
+    const details = screen.getByText('Diagnostics').closest('details')!
     expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Technical details'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('committed · catalog · dataset')
     expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('managed://dataset-1')
     expect(publication).toHaveTextContent('file:///revision-9.parquet')
@@ -554,5 +554,32 @@ describe('RunPanel typed parameter gate', () => {
     }
     rerender(<RunPanel nodeId="target" />)
     expect(screen.queryByRole('button', { name: 'View in Jobs' })).toBeNull()
+  })
+
+  it('keeps a failed run readable without offering a false Retry action to viewers', () => {
+    mocks.state.canvasRole = 'viewer'
+    mocks.state.runs.target = { phase: 'failed', error: 'Transform failed' }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByText('Transform failed')).toBeVisible()
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).toBeDisabled()
+    expect(retry).toHaveAttribute('title', 'View-only canvas')
+    fireEvent.click(retry)
+    expect(mocks.state.estimate).not.toHaveBeenCalled()
+    expect(mocks.state.requestRun).not.toHaveBeenCalled()
+    expect(mocks.state.run).not.toHaveBeenCalled()
+  })
+
+  it('makes Retry repeat an ordinary failed run instead of stopping at a new estimate', () => {
+    mocks.state.runs.target = { phase: 'failed', error: 'Transform failed' }
+
+    render(<RunPanel nodeId="target" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    expect(mocks.state.requestRun).toHaveBeenCalledWith('target')
+    expect(mocks.state.estimate).not.toHaveBeenCalled()
+    expect(mocks.state.run).not.toHaveBeenCalled()
   })
 })

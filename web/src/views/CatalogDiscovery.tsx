@@ -51,6 +51,13 @@ function friendlyColumnType(type: string): string {
   return type
 }
 
+function friendlyUnregisterStatus(status: CatalogUnregisterResult['results'][number]['status']): string {
+  if (status === 'unregistered') return 'removed'
+  if (status === 'missing') return 'already absent'
+  if (status === 'conflict') return 'changed; reload and try again'
+  return "couldn't remove"
+}
+
 /**
  * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
  * Workspace supplies an explicit target without copying its query, paging, selection, or curation behavior.
@@ -147,7 +154,7 @@ export function CatalogDiscovery({
   const [selectionRevision, setSelectionRevision] = useState(0)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [confirmBatchUnregister, setConfirmBatchUnregister] = useState(false)
+  const [batchUnregisterTargets, setBatchUnregisterTargets] = useState<CatalogTable[] | null>(null)
   const [batchUnregistering, setBatchUnregistering] = useState(false)
   const [unregisterResult, setUnregisterResult] = useState<{
     response: CatalogUnregisterResult; names: Record<string, string>
@@ -310,10 +317,12 @@ export function CatalogDiscovery({
       pushToast('Reload before removing: at least one dataset has no version precondition', 'error')
       return
     }
-    setConfirmBatchUnregister(true)
+    // Freeze the reviewed rows and their CAS tokens. A debounced query may replace the visible
+    // page and clear its selection while this destructive confirmation remains open.
+    setBatchUnregisterTargets(selectedTables)
   }
   const deleteSelected = async () => {
-    const tables = items.filter((table) => selectedIds.has(table.id)); if (!tables.length) return
+    const tables = batchUnregisterTargets; if (!tables?.length) return
     const targets = tables.flatMap((table) => table.metadataRevision && table.registrationId
       ? [{ id: table.id, expectedRegistrationId: table.registrationId, expectedRevision: table.metadataRevision }] : [])
     if (targets.length !== tables.length || batchUnregistering) return
@@ -329,15 +338,26 @@ export function CatalogDiscovery({
         return current
       }, {})
       const failures = (counts.conflict ?? 0) + (counts.failed ?? 0)
+      const removed = counts.unregistered ?? 0
+      const missing = counts.missing ?? 0
       pushToast(
-        `Unregister result: ${counts.unregistered ?? 0} unregistered, ${counts.missing ?? 0} already gone`
+        `${removed} ${removed === 1 ? 'dataset' : 'datasets'} removed`
+        + (missing ? `, ${missing} already absent` : '')
         + (failures ? `, ${failures} need review` : ''),
         failures ? 'info' : 'success',
       )
     } catch (e) { pushToast(errorMessage(e), 'error') }
-    finally { setBatchUnregistering(false); setConfirmBatchUnregister(false) }
+    finally { setBatchUnregistering(false); setBatchUnregisterTargets(null) }
     clearSelection(); setCatalogRevision((v) => v + 1); await loadFirst()
   }
+  const unregisterSummary = unregisterResult ? unregisterResult.response.results.reduce(
+    (counts, item) => ({
+      removed: counts.removed + (item.status === 'unregistered' ? 1 : 0),
+      missing: counts.missing + (item.status === 'missing' ? 1 : 0),
+      review: counts.review + (item.status === 'conflict' || item.status === 'failed' ? 1 : 0),
+    }),
+    { removed: 0, missing: 0, review: 0 },
+  ) : null
   const onUpload = async (f?: File) => {
     if (!f) return
     if (await onUploadDataset(f)) {
@@ -474,13 +494,14 @@ export function CatalogDiscovery({
 
       {unregisterResult && <div role="status" data-testid="catalog-unregister-result" className="border-t border-border bg-muted/25 px-7 py-2 text-[11px] text-muted-foreground">
         <div className="flex items-center gap-2">
-          <strong className="text-foreground">Best-effort unregister result</strong>
-          <span>Each item was checked against its registration and metadata revision.</span>
+          <strong className="text-foreground">{unregisterSummary?.removed ?? 0} {(unregisterSummary?.removed ?? 0) === 1 ? 'dataset' : 'datasets'} removed</strong>
+          {!!unregisterSummary?.missing && <span>{unregisterSummary.missing} already absent.</span>}
+          {!!unregisterSummary?.review && <span>{unregisterSummary.review} need review.</span>}
           <button onClick={() => setUnregisterResult(null)} className="ml-auto font-semibold underline">Dismiss</button>
         </div>
         <div className="mt-1 flex max-h-20 flex-wrap gap-x-3 gap-y-0.5 overflow-y-auto">
           {unregisterResult.response.results.map((item) => <span key={item.id} title={item.detail ?? undefined} className={item.status === 'unregistered' || item.status === 'missing' ? '' : 'text-destructive'}>
-            {unregisterResult.names[item.id] ?? item.id}: {item.status}{item.detail ? ` — ${item.detail}` : ''}
+            {unregisterResult.names[item.id] ?? item.id}: {friendlyUnregisterStatus(item.status)}{item.detail ? ` — ${item.detail}` : ''}
           </span>)}
         </div>
       </div>}
@@ -557,15 +578,15 @@ export function CatalogDiscovery({
       </div>
 
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
-      {confirmBatchUnregister && <CatalogModal label={`Unregister ${selectedTables.length} dataset${selectedTables.length === 1 ? '' : 's'}`} onClose={batchUnregistering ? () => undefined : () => setConfirmBatchUnregister(false)}>
+      {batchUnregisterTargets && <CatalogModal label={`Unregister ${batchUnregisterTargets.length} dataset${batchUnregisterTargets.length === 1 ? '' : 's'}`} onClose={batchUnregistering ? () => undefined : () => setBatchUnregisterTargets(null)}>
         <p className="text-[12px] leading-5 text-muted-foreground">
           Remove these entries from the catalog? The underlying data is not deleted. Each entry is checked separately, so some may remain if they changed.
         </p>
         <ul className="max-h-32 list-disc overflow-y-auto pl-5 text-[12px] text-foreground">
-          {selectedTables.map((table) => <li key={table.id}>{table.name}</li>)}
+          {batchUnregisterTargets.map((table) => <li key={table.id}>{table.name}</li>)}
         </ul>
         <div className="flex justify-end gap-2">
-          <button type="button" onClick={() => setConfirmBatchUnregister(false)} disabled={batchUnregistering} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+          <button type="button" onClick={() => setBatchUnregisterTargets(null)} disabled={batchUnregistering} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
           <button type="button" onClick={() => void deleteSelected()} disabled={batchUnregistering} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{batchUnregistering ? 'Removing…' : 'Unregister'}</button>
         </div>
       </CatalogModal>}
@@ -1101,7 +1122,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       const prefix = status === 403
         ? 'You do not have permission to open this selected version.'
         : status === 404 || status === 410
-          ? 'This selected version is unavailable or no longer retained.'
+          ? 'This selected version is no longer available.'
           : `Couldn't load this selected version: ${errorMessage(error)}.`
       setRequestedExactError(`${prefix} Latest was not substituted.`)
     } finally {
@@ -1224,7 +1245,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   }
   const openLinked = async (ref: string | undefined) => {
     if (!ref) {
-      pushToast("Couldn't open linked dataset: lineage node has no catalog identity", 'error')
+      pushToast("Couldn't open linked dataset: this lineage item is not available in the catalog", 'error')
       return
     }
     try { onOpenTable(await api.table(ref)) }
@@ -1305,7 +1326,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     ? requestedExactDetail?.preview.columns ?? []
     : exactFacts ? exactFacts.preview.columns : table.columns
   const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
-  const factsVerifiedLatest = !requestedExact && factsMatchKnownHead && !headChecking && !headError
   const displayedVersion = requestedExact ?? exactFacts ?? latestHead
   const exactVersionContext = !requestedExact
     ? null
@@ -1354,19 +1374,43 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <span>· {requestedExact && !requestedExactDetail ? '—' : displayColumns.length} cols</span>
               <span>· {table.folder ? `Folder ${table.folder}` : 'Unfiled'}</span>
               {requestedExactDetail ? <span data-testid="dataset-facts-source">· {exactVersionContext}</span> : null}
-              {!requestedExact && exactFacts ? <span data-testid="dataset-facts-source">· Versioned facts</span> : null}
-              {!requestedExact && !exactFacts && latestHead ? <span data-testid="dataset-facts-source">· Latest version</span> : null}
-              {factsVerifiedLatest ? <span>· verified latest head</span> : null}
+              {!requestedExact && (exactFacts || latestHead) ? <span data-testid="dataset-facts-source">· Current version</span> : null}
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
+
+            <section aria-labelledby="dataset-details-title" className="rounded-lg border border-border p-3">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <div>
+                  <h2 id="dataset-details-title" className="text-[12px] font-bold text-foreground">Dataset details</h2>
+                  <p className="text-[10.5px] text-muted-foreground">{requestedExact
+                    ? 'These catalog details apply to the dataset, not only this selected version.'
+                    : 'Name and organize this dataset here.'}</p>
+                </div>
+                {dirty && <span className="text-[10.5px] font-semibold text-primary">Unsaved changes</span>}
+              </div>
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
+                <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} disabled={!atomicMetadataEditable} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
+                <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
+                <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
+                <div className="md:col-span-2"><Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field></div>
+              </div>
+              {!atomicMetadataEditable && <div className="mt-2 text-[11px] text-muted-foreground">This catalog is read-only. These values come from the connected data source.</div>}
+              {conflict && <div role="alert" className="mt-2 flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
+                <span>Another editor saved changes first.</span>
+                <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button>{conflictBase && <button onClick={() => void save(conflictBase)} className="font-semibold underline">Reapply</button>}</span>
+              </div>}
+              <div className="mt-3 flex justify-end gap-2">
+                <button onClick={discard} disabled={!dirty || busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50" data-testid="detail-discard">Discard</button>
+                <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save changes'}</button>
+              </div>
+            </section>
 
             <section aria-labelledby="dataset-preview-title" className="rounded-xl border border-border bg-card p-3 shadow-sm">
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
                 <div>
                   <h2 id="dataset-preview-title" className="text-[13px] font-bold text-foreground">Data preview</h2>
-                  <p className="text-[10.5px] text-muted-foreground">
-                    Bounded first page · up to 100 rows. This viewer does not scan or render the entire dataset.
-                  </p>
+                  <p className="text-[10.5px] text-muted-foreground">Showing up to 100 rows.</p>
                 </div>
                 {requestedExact ? <span className="rounded bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
                   {exactVersionContext}
@@ -1428,12 +1472,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                   <button type="button" onClick={() => void copyLocation()} aria-label="Copy dataset location" className="shrink-0 rounded border border-border px-2 py-1 font-semibold text-foreground hover:bg-accent">Copy</button>
                 </div>
                 {table.registrationId ? <div>
-                  <div className="text-[10px] text-muted-foreground">Catalog registration identity</div>
+                  <div className="text-[10px] text-muted-foreground">Registration ID</div>
                   <code className="break-all text-[10.5px] text-foreground">{table.registrationId}</code>
                 </div> : null}
                 {displayedVersion ? <div data-testid="dataset-version-identity">
                   <div className="text-[10px] text-muted-foreground">
-                    {requestedExact ? 'Selected version identity' : 'Version identity'}
+                    {requestedExact ? 'Selected version ID' : 'Version ID'}
                   </div>
                   <code className="break-all text-[10.5px] text-foreground">
                     {revisionLabel(displayedVersion)}
@@ -1443,11 +1487,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </details>
 
           {!requestedExact && headChecking && !latestHead ? (
-            <div role="status" className="text-[11px] text-muted-foreground">Checking latest dataset head…</div>
+            <div role="status" className="text-[11px] text-muted-foreground">Checking the latest dataset version…</div>
           ) : null}
           {!requestedExact && headError ? (
             <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-[11px] text-destructive">
-              <span>Couldn't verify the latest dataset head: {headError}</span>
+              <span>Couldn't verify the latest dataset version: {headError}</span>
               <button type="button" onClick={() => void resolveLatestHead()} className="shrink-0 font-semibold underline">Retry</button>
             </div>
           ) : null}
@@ -1472,8 +1516,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <section>
             <div className="mb-1 flex items-baseline justify-between gap-2">
               <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</div>
-              <span className="text-[10.5px] text-muted-foreground">
-                {requestedExact && !requestedExactDetail ? 'Selected version' : `${displayColumns.length} columns`}
+              <span className="flex items-center gap-1 text-[10.5px] text-muted-foreground">
+                <span>{requestedExact && !requestedExactDetail ? 'Selected version' : `${displayColumns.length} columns`}</span>
+                {!requestedExact && <><span aria-hidden="true">·</span><span>{persistedDeclaredKey.length > 1 ? 'Saved composite key' : persistedDeclaredKey.length === 1 ? 'Saved key' : 'No saved key'}</span></>}
               </span>
             </div>
             {requestedExactLoading ? <div role="status" className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
@@ -1481,15 +1526,31 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </div> : requestedExactError ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
               Selected version schema is unavailable. Latest schema was not substituted.
             </div> : displayColumns.length ? <div tabIndex={0} aria-label="Dataset schema columns" data-testid="detail-schema-scroll"
-              className="max-h-[320px] overflow-y-auto overscroll-contain rounded-lg border border-border text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
-              <div className="sticky top-0 grid grid-cols-[minmax(0,1fr)_140px_auto] gap-3 border-b border-border bg-muted px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                <span>Column</span><span>Type</span><span className="sr-only">Details</span>
+              className="max-h-[320px] overflow-auto overscroll-contain rounded-lg border border-border text-[11px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+              <div className="sticky top-0 grid min-w-[620px] grid-cols-[minmax(0,1fr)_140px_150px_auto] gap-3 border-b border-border bg-muted px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                <span>Column</span><span>Type</span><span>{requestedExact ? '' : 'Row identifier'}</span><span className="sr-only">Details</span>
               </div>
-              {displayColumns.map((column) => <div key={column.name} className="grid grid-cols-[minmax(0,1fr)_140px_auto] items-center gap-3 border-b border-border/50 px-3 py-1.5 last:border-0">
-                <span className="min-w-0 truncate font-mono text-foreground">{column.name}</span>
-                <span title={column.type} className="truncate text-muted-foreground">{friendlyColumnType(column.type)}</span>
-                <FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
-              </div>)}
+              {displayColumns.map((column) => {
+                const selected = declaredPk.includes(column.name)
+                const persisted = persistedDeclaredKey.includes(column.name)
+                const pendingAdd = selected && !persisted
+                const pendingRemoval = !selected && persisted
+                const state = pendingAdd ? 'Will be a key on Save' : pendingRemoval ? 'Will be removed on Save'
+                  : persisted ? persistedDeclaredKey.length > 1 ? 'Composite key' : 'Key' : 'Not a key'
+                const action = selected ? `Remove ${column.name} from the declared key` : `Mark ${column.name} as a key`
+                return <div key={column.name} className="grid min-w-[620px] grid-cols-[minmax(0,1fr)_140px_150px_auto] items-center gap-3 border-b border-border/50 px-3 py-1.5 last:border-0">
+                  <button type="button" onClick={() => onColumn(column.name)} title={`Show datasets with column ${column.name}`}
+                    className="min-w-0 truncate text-left font-mono text-foreground hover:text-primary hover:underline">{column.name}</button>
+                  <span title={`${column.type} · reported by the data source`} className="truncate text-muted-foreground">{friendlyColumnType(column.type)}</span>
+                  {requestedExact ? <span /> : <button type="button" onClick={() => togglePk(column.name)}
+                    disabled={!atomicMetadataEditable} data-testid={state === 'Not a key' ? `detail-pk-${column.name}` : `detail-key-state-${column.name}`} aria-label={action}
+                    title={`${action}. Saved together with the dataset details.`}
+                    className={`justify-self-start rounded px-1.5 py-0.5 text-[10px] font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${selected ? 'bg-primary/10 text-primary' : 'border border-border text-muted-foreground hover:bg-accent'}`}>
+                    {state}
+                  </button>}
+                  <FieldEvidenceButton column={column} label="Details" className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
+                </div>
+              })}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
           </section>
 
@@ -1498,52 +1559,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             detailsInViewer viewerDetail={requestedExactDetail}
             viewerLoading={requestedExactLoading} viewerError={requestedExactError}
             onViewerRetry={() => { void loadRequestedExact() }} />
-
-          <section aria-labelledby="edit-dataset-title" className="rounded-lg border border-border p-3">
-            <h2 id="edit-dataset-title" className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">Edit dataset</h2>
-            <div className="mt-3 flex flex-col gap-2">
-            <div className="text-[11px] text-muted-foreground">Change how this dataset is named and organized in Data Playground.</div>
-            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
-            <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} disabled={!atomicMetadataEditable} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
-            <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
-            <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
-            <Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field>
-            {!atomicMetadataEditable && <div className="text-[11px] text-muted-foreground">This catalog provider does not support atomic metadata and declared-key edits.</div>}
-            {atomicMetadataEditable && dirty && <div className="text-[11px] text-muted-foreground">Unsaved changes</div>}
-            {conflict && <div role="alert" className="flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
-              <span>Another editor saved changes first.</span>
-              <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button>{conflictBase && <button onClick={() => void save(conflictBase)} className="font-semibold underline">Reapply</button>}</span>
-            </div>}
-            <section>
-              <div className="mb-1 flex items-baseline justify-between gap-2">
-                <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Row identifier (optional)</div>
-                <span className="text-[10.5px] text-muted-foreground">{persistedDeclaredKey.length > 1 ? 'Saved composite key' : persistedDeclaredKey.length === 1 ? 'Saved key' : 'No saved key'}</span>
-              </div>
-              <p className="mb-2 text-[11px] leading-snug text-muted-foreground">Choose the column, or combination of columns, that uniquely identifies a row. Leave this empty when the dataset has no stable row identifier.</p>
-              <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
-                {displayColumns.map((c) => {
-                  const selected = declaredPk.includes(c.name)
-                  const persisted = persistedDeclaredKey.includes(c.name)
-                  const pendingAdd = selected && !persisted
-                  const pendingRemoval = !selected && persisted
-                  const role = pendingAdd ? 'Will be a key on Save'
-                    : pendingRemoval ? 'Will be removed on Save'
-                      : persisted ? persistedDeclaredKey.length > 1 ? 'Composite key' : 'Key' : null
-                  const action = selected ? `Remove ${c.name} from the declared key` : `Mark ${c.name} as a key`
-                  return <div key={c.name} className="flex w-full items-center gap-2 border-b border-border/60 px-2 py-1.5 last:border-0 hover:bg-accent">
-                    <button type="button" onClick={() => togglePk(c.name)} disabled={!atomicMetadataEditable} data-testid={`detail-pk-${c.name}`} aria-label={action} title={`${action}. This is saved only when you select Save.`} className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">{selected ? 'Remove key' : 'Mark as key'}</button>
-                    <button onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`} className="flex min-w-0 flex-1 items-center gap-2 text-left"><span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span><span className="text-[10px] text-muted-foreground">{c.type}</span></button>
-                    {role ? <span data-testid={`detail-key-state-${c.name}`} className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold ${persisted && !pendingRemoval ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>{role}</span> : null}
-                  </div>
-                })}
-              </div>
-            </section>
-            <div className="flex justify-end gap-2">
-              <button onClick={discard} disabled={!dirty || busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50" data-testid="detail-discard">Discard</button>
-              <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save'}</button>
-            </div>
-            </div>
-          </section>
 
           {/* lineage — click a row to open that dataset */}
           <section>
@@ -1558,15 +1573,21 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             {lin && parents.length === 0 && children.length === 0 ? <div className="py-0.5 text-[11px] text-muted-foreground">No related datasets yet.</div> : null}
             {lin && (parents.length > 0 || children.length > 0) ? <>
               {parents.length > 0 ? <LineageMini label="Parents" onOpen={openLinked}
-                rows={parents.map((e) => ({
-                  name: nameOf(e.parent), factCount: e.factCount,
-                  uri: e.parent, catalogId: lineageNode(e.parent)?.id,
-                }))} /> : null}
+                rows={parents.map((e) => {
+                  const node = lineageNode(e.parent)
+                  return {
+                    name: nameOf(e.parent), factCount: e.factCount,
+                    uri: e.parent, catalogId: node?.id !== node?.uri ? node?.id : undefined,
+                  }
+                })} /> : null}
               {children.length > 0 ? <LineageMini label="Children" onOpen={openLinked}
-                rows={children.map((e) => ({
-                  name: nameOf(e.child), factCount: e.factCount,
-                  uri: e.child, catalogId: lineageNode(e.child)?.id,
-                }))} /> : null}
+                rows={children.map((e) => {
+                  const node = lineageNode(e.child)
+                  return {
+                    name: nameOf(e.child), factCount: e.factCount,
+                    uri: e.child, catalogId: node?.id !== node?.uri ? node?.id : undefined,
+                  }
+                })} /> : null}
             </> : null}
           </section>
 
@@ -1652,7 +1673,7 @@ function DatasetPreviewTable({ columns, rows, exact = false }: {
     </table>
     {!rows.length ? <div className="border-t border-border px-3 py-3 text-[11px] text-muted-foreground">
       {exact
-        ? 'This selected version returned no preview rows; its retained schema remains available below.'
+        ? 'This selected version returned no preview rows; its saved schema remains available below.'
         : 'The bounded preview returned no rows.'}
     </div> : null}
   </div>
@@ -1855,12 +1876,14 @@ function LineageMini({ label, rows, onOpen }: {
     <div className="mb-1.5">
       <div className="text-[9.5px] font-bold uppercase tracking-wide text-muted-foreground">{label}</div>
       {rows.length
-        ? rows.map((r, i) => (
-            <button key={i} onClick={() => onOpen(r.catalogId)} title={r.uri}
-              className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-foreground hover:bg-accent hover:underline">
-              <Icon name="arrow" size={11} /> {r.name}<span className="text-[10px] text-muted-foreground">· {r.factCount} {r.factCount === 1 ? 'fact' : 'facts'}</span>
-            </button>
-          ))
+        ? rows.map((r, i) => {
+            const content = <><Icon name="arrow" size={11} /> {r.name}<span className="text-[10px] text-muted-foreground">· {r.factCount} {r.factCount === 1 ? 'fact' : 'facts'}</span></>
+            return r.catalogId
+              ? <button key={i} onClick={() => onOpen(r.catalogId)} title={r.uri}
+                className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-foreground hover:bg-accent hover:underline">{content}</button>
+              : <span key={i} title={r.uri}
+                className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-foreground">{content}</span>
+          })
         : null}
     </div>
   )

@@ -198,6 +198,12 @@ export function NodeCard({ id, data, children, metaOverride }: {
                 <Icon name="power" size={11} /> Confirm run…
               </button>
             )}
+            {runState === 'failed' && (
+              <button className="nodrag mt-1.5 inline-flex cursor-pointer items-center gap-[5px] rounded-md border border-destructive/30 bg-destructive/10 px-[9px] py-1 text-[11px] font-semibold text-destructive"
+                onClick={(e) => { e.stopPropagation(); useStore.getState().openPanel(id, 'run') }}>
+                Review failure
+              </button>
+            )}
 
             {/* compact body (kind-specific, kept small — P5) */}
             {children && (

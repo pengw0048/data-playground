@@ -1194,15 +1194,11 @@ test.describe('Data Playground canvas', () => {
 
     const nodes = page.locator('.react-flow__node')
     await expect(nodes).toHaveCount(3)
-    for (const [from, to] of [[nodes.nth(0), nodes.nth(1)], [nodes.nth(1), nodes.nth(2)]] as const) {
-      const sourcePort = await boxOf(from.locator('.react-flow__handle.source'))
-      const targetPort = await boxOf(to.locator('.react-flow__handle.target'))
-      await page.mouse.move(sourcePort.x + sourcePort.width / 2, sourcePort.y + sourcePort.height / 2)
-      await page.mouse.down()
-      await page.mouse.move(targetPort.x + targetPort.width / 2, targetPort.y + targetPort.height / 2)
-      await page.mouse.up()
+    const connections = [[nodes.nth(0), nodes.nth(1)], [nodes.nth(1), nodes.nth(2)]] as const
+    for (const [index, [from, to]] of connections.entries()) {
+      await connectHandles(page, from, to.locator('.react-flow__handle-left').first())
+      await expect(page.locator('.react-flow__edge')).toHaveCount(index + 1)
     }
-    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
 
     await page.getByRole('button', { name: 'Edit code' }).click()
     await expect(page.locator('.monaco-editor').first()).toBeVisible({ timeout: 15_000 })
@@ -1608,9 +1604,8 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings modal edits and saves the agent config', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
@@ -1620,22 +1615,24 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings reports effective plugin activation and placement', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await page.getByRole('button', { name: 'Plugins' }).click()
 
     const builtin = page.getByTestId('plugin-status-default-catalog')
     await expect(builtin).toContainText('active')
-    await expect(builtin).toContainText('catalog')
-    await expect(builtin).toContainText('required at startup')
-    await expect(builtin).toContainText('Placement: application')
+    await expect(builtin).toContainText('Catalog')
+    await expect(builtin).toContainText('browse its data connections in Workspace')
+    await builtin.getByText('Installation details').click()
+    await expect(builtin).toContainText('Features: catalog')
+    await expect(builtin).toContainText('Starts with: application')
+    await expect(builtin).toContainText('Required when Data Playground starts.')
   })
 
   test('settings keeps dirty edits across owned dismissals and warns before unload', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    const settingsTrigger = page.getByTestId('rail-settings')
+    await settingsTrigger.click()
     const settings = page.getByTestId('settings-modal')
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
@@ -1664,11 +1661,10 @@ test.describe('Data Playground canvas', () => {
     await expect(confirm).toBeVisible()
     await confirm.getByRole('button', { name: 'Discard' }).click()
     await expect(settings).toHaveCount(0)
-    await expect(page.getByTestId('app-menu')).toBeFocused()
+    await expect(settingsTrigger).toBeFocused()
 
     // A clean modal still closes immediately with no confirmation.
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await settingsTrigger.click()
     await expect(settings).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(settings).toHaveCount(0)
@@ -1676,41 +1672,60 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings manages destinations', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
-    await page.getByText('Settings', { exact: true }).click()
+    const listedRoot = resolve(process.cwd(), '.e2e-workspace/data/ux-fixtures')
+    const emptyRoot = resolve(process.cwd(), `.e2e-workspace/destination-empty-${Date.now()}`)
+    await mkdir(emptyRoot, { recursive: true })
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
-    // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
-    await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
-    await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
-    await page.getByPlaceholder('/path/to/dir').press('Enter')
-    await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
+    await expect(page.getByText(/does not create a test file or prove write access/i)).toBeVisible()
+    const addDestination = async (name: string, root: string) => {
+      await page.getByLabel('Destination name').fill(name)
+      await page.getByLabel('Destination root or prefix').fill(root)
+      await page.getByRole('button', { name: 'Add', exact: true }).click()
+      await expect(page.getByText(name, { exact: true })).toBeVisible()
+      await expect(page.getByText('Save to preview', { exact: true }).last()).toBeVisible()
+    }
+    await addDestination('fixture files', listedRoot)
+    await addDestination('empty scratch', emptyRoot)
+
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Preview files in fixture files' })).toBeVisible()
+    await page.getByRole('button', { name: 'Preview files in fixture files' }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'Preview loaded · 1 item found · manifest.json' }))
+      .toContainText('This checks listing only; a real write is verified when a run saves output.')
+
+    await page.getByRole('button', { name: 'Preview files in empty scratch' }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'Preview loaded · 0 items found' }))
+      .toContainText('This checks listing only; a real write is verified when a run saves output.')
   })
 
-  test('settings Execution explains built-in runners without exposing local worker ids', async ({ page }) => {
+  test('settings Execution explains selectable modes without exposing local worker ids', async ({ page }) => {
     await goToWorkspace(page)
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Execution' }).click()
-    await expect(page.getByText('When to use each runner', { exact: true })).toBeVisible()
-    await expect(page.getByText(/streams and spills data/i)).toBeVisible()
-    await expect(page.getByText(/isolated in its own OS process/i)).toBeVisible()
-    await expect(page.getByText(/durable worker per Canvas/i)).toBeVisible()
-    // Capacity remains visible, but an implementation-specific local worker id is not researcher-facing.
+    await expect(page.getByText('Choose how your jobs run', { exact: true })).toBeVisible()
+    const automatic = page.getByRole('button', { name: 'Use Automatic execution' })
+    await automatic.click()
+    await expect(automatic).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByText(/streams larger data through this machine/i)).toBeVisible()
+    await expect(page.getByText(/separate process.*does not interrupt the app/i)).toBeVisible()
+    await expect(page.getByText(/reusable worker for each Canvas/i)).toBeVisible()
+    // Implementation-specific worker ids and capacity are not researcher-facing choices.
     await expect(page.getByText('local-out-of-core:local')).toHaveCount(0)
-    await expect(page.getByText(/\d+ cpu/).first()).toBeVisible()
+    await expect(page.getByText(/\d+ cpu/)).toHaveCount(0)
   })
 
   test('settings Members creates a user', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Members' }).click()
     const name = `Member ${Date.now()}`
     await page.getByPlaceholder('Name').fill(name)
-    await page.getByRole('button', { name: 'Add member' }).click()
+    await page.getByRole('button', { name: 'Add identity' }).click()
     await expect(page.getByText(name, { exact: true })).toBeVisible() // new member appears in the roster
   })
 
@@ -1795,26 +1810,43 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
-  test('the Inspector keeps new Transform execution controls advanced and summarizes a configured GPU requirement', async ({ page }) => {
-    await fresh(page)
-    const inspector = page.getByTestId('inspector')
-    await addNode(page, 'Compute', 'transform') // auto-selected; transform can declare compute needs
-    const advanced = inspector.getByText('Advanced execution')
-    await expect(advanced.locator('..')).not.toHaveAttribute('open')
-    await expect(inspector.getByText('Resources (placement)')).not.toBeVisible()
-    await expect(inspector.getByText('Materialization')).not.toBeVisible()
-    const advancedOutputSchema = inspector.getByText('Advanced output schema')
-    await expect(advancedOutputSchema.locator('..')).not.toHaveAttribute('open')
-    await expect(inspector.getByText('Output schema (contract)')).not.toBeVisible()
-    await advanced.click()
-    await expect(inspector.getByText('Resources (placement)')).toBeVisible()
-    const gpus = inspector.locator('label').filter({ hasText: 'GPUs' }).locator('input')
-    await gpus.fill('8')
-    await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
-    await advanced.click()
-    await expect(inspector.getByText('8 GPUs')).toBeVisible()
-    await inspector.getByRole('button', { name: 'Edit resources' }).click()
-    await expect(gpus).toHaveValue('8')
+  test('the Inspector uses Automatic compute and can clear a legacy Transform resource override', async ({ page }) => {
+    const canvasId = `legacy-transform-compute-${Date.now()}`
+    try {
+      const created = await page.request.post('/api/canvas', { data: {
+        id: canvasId, name: 'Legacy Transform compute', version: 1, requirements: [], edges: [], nodes: [{
+          id: 'transform', type: 'transform', position: { x: 280, y: 180 }, data: {
+            title: 'Legacy Transform', status: 'draft', config: {
+              source: 'adhoc', code: 'def fn(row):\n    return row',
+              requires: { gpu: 8, gpuType: 'a100' },
+            },
+          },
+        }],
+      } })
+      expect(created.ok()).toBeTruthy()
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      await page.getByText('Legacy Transform', { exact: true }).click()
+      const inspector = page.getByTestId('inspector')
+      await expect(inspector.getByText('Runtime requirement · Automatic', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Legacy override · 8 GPUs · a100', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Output columns', { exact: true })).toBeVisible()
+      const materialization = inspector.getByText('Materialization options', { exact: true })
+      await expect(materialization.locator('..')).not.toHaveAttribute('open')
+
+      await inspector.getByRole('button', { name: 'Use runtime default' }).click()
+      await expect(inspector.getByText('Runtime requirement · Automatic', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Legacy override · 8 GPUs · a100', { exact: true })).toHaveCount(0)
+      await expect(inspector.getByRole('button', { name: 'Use runtime default' })).toHaveCount(0)
+      await expect.poll(async () => {
+        const saved = await canvasFor(page, canvasId)
+        const nodes = saved.nodes as Array<{
+          id: string; data: { config: { requires?: unknown } }
+        }>
+        return nodes.find((node) => node.id === 'transform')?.data.config.requires
+      }).toBeUndefined()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
   })
 
   test('the Inspector summarizes configured output schemas and exposes stale ones for review', async ({ page }) => {
@@ -1901,19 +1933,19 @@ test.describe('Data Playground canvas', () => {
       const inspector = page.getByTestId('inspector')
       await page.getByText('TRANSFORM', { exact: true }).click()
       await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
-      await inspector.getByText('Advanced execution').click()
+      await inspector.getByText('Materialization options').click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeDisabled()
       await expect(inspector.getByText('Checkpoints are available only for Source → Select → Write.')).toBeVisible()
 
       await page.goto(`/#/canvas/${supportedId}`)
       await page.getByText('SELECT', { exact: true }).click()
       await expect(inspector.getByText('SELECT', { exact: true })).toBeVisible()
-      const advanced = inspector.getByText('Advanced execution')
-      await advanced.click()
+      const materialization = inspector.getByText('Materialization options')
+      await materialization.click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeEnabled()
       await inspector.getByTestId('checkpoint-toggle').click()
       await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
-      await advanced.click()
+      await materialization.click()
       await expect(inspector.getByText('Checkpointed output')).toBeVisible()
       await inspector.getByRole('button', { name: 'Edit materialization' }).click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeVisible()
@@ -1949,13 +1981,13 @@ test.describe('Data Playground canvas', () => {
   test('the app menu goes to Workspace and the rail destinations remain operable', async ({ page }) => {
     await fresh(page)
     await backToWorkspace(page)
-    await expect(page.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Create canvas' })).toBeEnabled()
     await expect(page.getByRole('button', { name: 'Add dataset' })).toHaveCount(0)
     await expect(await workspaceResource(page, 'dataset', 'images')).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
     await page.getByTestId('rail-workspace').click()
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
   })
 
   test('the relationships graph preserves Dataset lineage context and widens to the catalog', async ({ page }) => {
@@ -2300,7 +2332,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     await expect(page.getByText(digest)).toHaveCount(0)
-    await page.getByRole('button', { name: /Execution manifest/ }).click()
+    await page.getByRole('button', { name: /Saved run setup/ }).click()
 
     await expect(page.getByText(digest)).toBeVisible()
     await expect(page.getByText('Submitted graph')).toBeVisible()
@@ -2398,7 +2430,7 @@ test.describe('Data Playground canvas', () => {
     }))
 
     const inspector = page.getByTestId('inspector')
-    await expect(inspector.locator('[title^="Local catalog · Current version"]')).toBeVisible()
+    await expect(inspector.locator('[title^="Datasets · Current version"]')).toBeVisible()
     await expect(inspector.getByLabel('Dataset URI')).toHaveCount(0)
     await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
     await inspector.getByRole('button', { name: 'View data' }).click()
@@ -2451,6 +2483,9 @@ test.describe('Data Playground canvas', () => {
       )
       expect(revisionResponse.ok()).toBeTruthy()
       const exact = await revisionResponse.json() as { datasetId: string; revisionId: string }
+      const expectedVersionLabel = exact.revisionId.length > 24
+        ? 'Selected version'
+        : `Version ${exact.revisionId}`
       const alternateRevisionId = `${exact.revisionId}-alternate`
       const exactDetail = {
         datasetId: exact.datasetId,
@@ -2546,7 +2581,7 @@ test.describe('Data Playground canvas', () => {
 
       await openDataset.click()
       const viewer = page.getByTestId('dataset-viewer')
-      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
       const viewerBack = viewer.getByRole('button', { name: 'Back to Canvas' })
       await expect(viewerBack).toBeFocused()
       await expect(page.getByTestId('catalog-search')).toHaveCount(0)
@@ -2573,7 +2608,7 @@ test.describe('Data Playground canvas', () => {
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
       const inspector = page.getByTestId('inspector')
       await expect(inspector).toContainText('DATASET')
-      await expect(inspector).toContainText(`Exact version ${exact.revisionId}`)
+      await expect(inspector).toContainText(expectedVersionLabel)
       const returnedSource = page.locator('.react-flow__node[data-id="source"]')
       await expect(returnedSource).toHaveClass(/selected/)
       await expect(returnedSource).toContainText('Unsaved researcher title')
@@ -2593,7 +2628,7 @@ test.describe('Data Playground canvas', () => {
 
       await page.goForward()
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
-      await expect(page.getByTestId('inspector')).toContainText(`Exact version ${exact.revisionId}`)
+      await expect(page.getByTestId('inspector')).toContainText(expectedVersionLabel)
       await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
 
       const staleViewerHash = `#/workspace/${encodeURIComponent(`dataset:${exact.datasetId}`)}?${new URLSearchParams({
@@ -2680,8 +2715,8 @@ test.describe('Data Playground canvas', () => {
       await expect(firstReceipt).toHaveAttribute('href', new RegExp(`revision=${encodeURIComponent(firstRevision!)}`))
       const summaryMode = publication.getByText('Mode', { exact: true }).locator('..')
       await expect(summaryMode).toContainText('Create a new dataset')
-      await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
-      await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
+      await expect(publicationDetails).toContainText(/Completed run setup:.*mode create/)
+      await expect(publicationDetails).toContainText(/Next run setup:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await expect(receiptRow).not.toContainText(firstReceiptId!, { timeout: 20_000 })
@@ -2697,7 +2732,7 @@ test.describe('Data Playground canvas', () => {
       await secondReceipt.click()
       const viewer = page.getByTestId('dataset-viewer')
       await expect(viewer).toBeVisible()
-      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
       await expect(viewer.getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=write$`))
@@ -2832,8 +2867,8 @@ test.describe('Data Playground canvas', () => {
       await expect(appendPublication.getByLabel('Write readiness'))
         .toContainText('Run finished. The selected backend wrote the output.')
       const appendDetails = appendPublication.locator('details')
-      await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
-      await expect(appendDetails).toContainText(/Next admission:.*mode append/)
+      await expect(appendDetails).toContainText(/Completed run setup:.*mode overwrite/)
+      await expect(appendDetails).toContainText(/Next run setup:.*mode append/)
       await expect.poll(() => captured).toBeTruthy()
 
       // Hold the UI request only after it contains its frozen intent. A competing admission from the
@@ -2865,7 +2900,10 @@ test.describe('Data Playground canvas', () => {
         await route.continue()
       })
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      const staleAdmission = page.getByText(/write admission is stale/i).last()
+      const staleAdmission = page.getByText(
+        'Destination changed before this run started. Review the latest version and try again.',
+        { exact: true },
+      ).last()
       const confirmation = page.getByTestId('panel-run').getByText('CONFIRM RUN')
       await expect(confirmation.or(staleAdmission).first()).toBeVisible({ timeout: 15_000 })
       if (await confirmation.isVisible()) await confirmRun(page)
@@ -2989,10 +3027,12 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByLabel('CSV header row')).toHaveCount(0)
 
     await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
-    await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    const registerDialog = page.getByRole('dialog', { name: 'Register path or URL' })
+    await expect(registerDialog).toBeVisible()
+    await expect(registerDialog.getByRole('button', { name: 'Browse storage' })).toBeVisible()
     await expect(inspector).toBeVisible()
-    await page.keyboard.press('Escape')
-    await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+    await registerDialog.getByRole('button', { name: 'Cancel' }).click()
+    await expect(registerDialog).toHaveCount(0)
     await expect(inspector).toBeVisible()
 
     await inspector.getByRole('button', { name: 'Select dataset' }).click()
@@ -3034,15 +3074,18 @@ test.describe('Data Playground canvas', () => {
       })
 
       const runPanel = page.getByTestId('panel-run')
-      await expect(runPanel.getByLabel('Exact run readiness')).toContainText('Not exact-run-ready')
+      await expect(runPanel.getByLabel('Run readiness')).toContainText('Not ready to run')
       await expect(runPanel.getByRole('button', {
-        name: 'Exact input registration required',
+        name: 'Register inputs to run',
       })).toBeDisabled()
       await runPanel.getByRole('button', { name: 'Close' }).click()
 
       await source.getByRole('button', { name: 'Select dataset' }).click()
       await page.getByText('Register accessible path / URI…', { exact: true }).click()
-      await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+      const registerDialog = page.getByRole('dialog', { name: 'Register path or URL' })
+      await expect(registerDialog).toBeVisible()
+      await registerDialog.getByRole('button', { name: 'Browse storage' }).click()
+      await expect(page.getByRole('dialog', { name: 'Open a dataset' })).toBeVisible()
       const registrationPromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === '/api/catalog/register'
         && response.request().method() === 'POST')
@@ -3109,7 +3152,6 @@ test.describe('Data Playground canvas', () => {
       await goToWorkspace(page)
       await openWorkspaceDataset(page, original.name)
 
-      await page.getByText('Edit catalog details', { exact: true }).click()
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()
       const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {

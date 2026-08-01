@@ -364,6 +364,22 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
             "expectedVersion": nested["version"], "name": "Blocked rename",
         })
         assert blocked_rename.status_code == 422
+        sibling_id = f"workspace-{token}-blocked-sibling"
+        blocked_sibling = client.post(
+            "/api/canvas",
+            params={"besideCanvasId": created["id"]},
+            json={
+                "id": sibling_id,
+                "name": "Blocked sibling",
+                "version": 1,
+                "nodes": [],
+                "edges": [],
+            },
+        )
+        assert blocked_sibling.status_code == 422, blocked_sibling.text
+        assert "read-only Workspace tombstone" in blocked_sibling.text
+        with metadb.session() as session:
+            assert session.get(metadb.Canvas, sibling_id) is None
         cleanup_resource = client.get(
             f"/api/workspace/resources/container:{recovery_cleanup['id']}")
         assert cleanup_resource.status_code == 200, cleanup_resource.text
@@ -1504,6 +1520,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     right_context = workspace_providers.provider_dataset_context(
         right["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
     assert left_context == right_context
+    assert left_context["sourceUri"] == left_source["data"]["config"]["uri"]
+    assert left_context["sourceUri"].startswith("workspace-provider://")
     assert left_context["readMode"] == "exact"
     assert left_context["revisionId"] == "fixture-revision-1"
     assert [(column["name"], column["type"])
@@ -2810,7 +2828,10 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         assert resolution["resource"]["id"] == nested_resource["id"]
         assert resolution["source"]["completeness"] == "complete"
         assert [item["id"] for item in resolution["ancestors"]] == [
-            f"container:{root['id']}", f"container:{folder['id']}", remote_container["id"],
+            f"container:{root['id']}",
+            f"container:{folder['id']}",
+            f"container:{workspace_providers.mount_container_identity('c-first')}",
+            remote_container["id"],
         ]
 
         reads_before_canvas_action = provider.list_calls
@@ -3280,6 +3301,49 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert detached_deep_link.status_code == 200, detached_deep_link.text
             assert detached_deep_link.json()["resource"]["parentId"] == remote["id"]
             assert detached_deep_link.json()["source"]["referenceState"] == "detached"
+
+            blocked_sibling_id = f"detached-sibling-{uuid.uuid4().hex}"
+            blocked_sibling = client.post(
+                "/api/canvas",
+                params={"besideCanvasId": created_doc["id"]},
+                json={
+                    "id": blocked_sibling_id,
+                    "name": "Must not enter detached provider folder",
+                    "version": 1,
+                    "nodes": [],
+                    "edges": [],
+                },
+            )
+            assert blocked_sibling.status_code == 422, blocked_sibling.text
+            with metadb.session() as session:
+                assert session.get(metadb.Canvas, blocked_sibling_id) is None
+
+            root_canvas_id = f"detached-move-{uuid.uuid4().hex}"
+            root_canvas = client.post("/api/canvas", json={
+                "id": root_canvas_id,
+                "name": "Remain visible at root",
+                "version": 1,
+                "nodes": [],
+                "edges": [],
+            })
+            assert root_canvas.status_code == 200, root_canvas.text
+            created_ids.append(root_canvas_id)
+            root_resource = client.get(
+                f"/api/workspace/resources/canvas:{root_canvas_id}").json()["resource"]
+            blocked_move = client.post("/api/workspace/batch", json={
+                "action": "move",
+                "items": [{
+                    "placementId": root_resource["placementId"],
+                    "expectedVersion": root_resource["version"],
+                }],
+                "containerId": anchor_id,
+                "expectedContainerVersion": capability["containerVersion"],
+            })
+            assert blocked_move.status_code == 422, blocked_move.text
+            still_at_root = client.get(
+                f"/api/workspace/resources/canvas:{root_canvas_id}").json()["resource"]
+            assert still_at_root["parentId"] == f"container:{root['id']}"
+
             resources[:] = [CatalogResource(
                 placement_id="container-a", kind="container", name="Recreated folder")]
             still_detached = client.get(f"/api/workspace/resources/{remote['id']}")
@@ -4437,6 +4501,614 @@ def test_workspace_move_and_undo_change_only_canvas_placement(workspace_scope):
         assert current.container_id == source["id"]
 
 
+def test_workspace_server_query_sorts_and_filters_the_complete_result(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-server-query")
+    for suffix in ("Zulu", "Alpha", "Middle"):
+        metadb.workspace_create_container(
+            folder["id"], f"workspace-{token}-{suffix}")
+    older = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-older",
+    )
+    newer = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-newer",
+    )
+    try:
+        with metadb.session() as session:
+            session.get(metadb.Canvas, older["id"]).updated_at = datetime.datetime(
+                2026, 1, 1, tzinfo=datetime.timezone.utc)
+            session.get(metadb.Canvas, newer["id"]).updated_at = datetime.datetime(
+                2026, 2, 1, tzinfo=datetime.timezone.utc)
+
+        with TestClient(app) as client:
+            names: list[str] = []
+            cursor: str | None = None
+            while True:
+                params: list[tuple[str, str | int]] = [
+                    ("limit", 1), ("sort", "name"), ("order", "desc"),
+                    ("kind", "container"),
+                ]
+                if cursor is not None:
+                    params.append(("cursor", cursor))
+                response = client.get(
+                    f"/api/workspace/containers/{folder['id']}", params=params)
+                assert response.status_code == 200, response.text
+                page = response.json()
+                assert {item["kind"] for item in page["items"]} <= {"container"}
+                names.extend(item["name"].removeprefix(f"workspace-{token}-")
+                             for item in page["items"])
+                cursor = page["nextCursor"]
+                if cursor is None:
+                    break
+            assert names == ["Zulu", "Middle", "Alpha"]
+
+            recent = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("sort", "updated"), ("order", "desc"),
+                    ("kind", "canvas"),
+                ])
+            assert recent.status_code == 200, recent.text
+            recent_page = recent.json()
+            assert [item["name"] for item in recent_page["items"]] == [
+                f"workspace-{token}-newer"]
+            older_page = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("sort", "updated"), ("order", "desc"),
+                    ("kind", "canvas"), ("cursor", recent_page["nextCursor"]),
+                ])
+            assert older_page.status_code == 200, older_page.text
+            assert [item["name"] for item in older_page.json()["items"]] == [
+                f"workspace-{token}-older"]
+
+            mismatched = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("sort", "name"), ("kind", "canvas"),
+                    ("cursor", recent_page["nextCursor"]),
+                ])
+            assert mismatched.status_code == 422
+            assert "does not match" in mismatched.text
+
+            mismatched_order = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("sort", "updated"), ("order", "asc"), ("kind", "canvas"),
+                    ("cursor", recent_page["nextCursor"]),
+                ])
+            assert mismatched_order.status_code == 422
+            assert "does not match" in mismatched_order.text
+
+            mismatched_kinds = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("sort", "updated"), ("order", "desc"), ("kind", "dataset"),
+                    ("cursor", recent_page["nextCursor"]),
+                ])
+            assert mismatched_kinds.status_code == 422
+            assert "does not match" in mismatched_kinds.text
+
+            mismatched_folder = client.get(
+                f"/api/workspace/containers/{root['id']}", params=[
+                    ("sort", "updated"), ("order", "desc"), ("kind", "canvas"),
+                    ("cursor", recent_page["nextCursor"]),
+                ])
+            assert mismatched_folder.status_code == 422
+            assert "does not match this folder" in mismatched_folder.text
+
+            malformed = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("sort", "name"), ("kind", "canvas"),
+                    ("cursor", "not-a-cursor"),
+                ])
+            assert malformed.status_code == 422
+            assert "invalid Workspace query cursor" in malformed.text
+    finally:
+        metadb.delete_canvas_cascade(older["id"])
+        metadb.delete_canvas_cascade(newer["id"])
+
+
+def test_workspace_server_name_query_keyset_survives_insert_before_cursor(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-name-keyset")
+    originals = [
+        metadb.workspace_create_container(folder["id"], f"workspace-{token}-{suffix}")
+        for suffix in ("BETA", "beta", "charlie")
+    ]
+
+    with TestClient(app) as client:
+        first_response = client.get(
+            f"/api/workspace/containers/{folder['id']}", params=[
+                ("limit", 1), ("sort", "name"), ("order", "asc"),
+                ("kind", "container"),
+            ])
+        assert first_response.status_code == 200, first_response.text
+        first_page = first_response.json()
+        assert first_page["nextCursor"] is not None
+
+        inserted = metadb.workspace_create_container(
+            folder["id"], f"workspace-{token}-aardvark")
+        seen_ids = [first_page["items"][0]["id"]]
+        cursor = first_page["nextCursor"]
+        while cursor is not None:
+            response = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("sort", "name"), ("order", "asc"),
+                    ("kind", "container"), ("cursor", cursor),
+                ])
+            assert response.status_code == 200, response.text
+            page = response.json()
+            seen_ids.extend(item["id"] for item in page["items"])
+            cursor = page["nextCursor"]
+
+    original_ids = {f"container:{item['id']}" for item in originals}
+    assert set(seen_ids) == original_ids
+    assert len(seen_ids) == len(original_ids)
+    assert f"container:{inserted['id']}" not in seen_ids
+
+
+def test_workspace_server_updated_query_keyset_survives_insert_before_cursor(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-updated-keyset")
+    originals = [
+        metadb.workspace_create_canvas_action(
+            uid=metadb.DEFAULT_USER_ID,
+            container_id=folder["id"],
+            expected_container_version=folder["version"],
+            name=f"workspace-{token}-{suffix}",
+        )
+        for suffix in ("Zulu", "Alpha", "Beta", "Old")
+    ]
+    inserted = None
+    try:
+        timestamps = (
+            datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+        )
+        with metadb.session() as session:
+            for canvas, updated_at in zip(originals, timestamps, strict=True):
+                session.get(metadb.Canvas, canvas["id"]).updated_at = updated_at
+
+        with TestClient(app) as client:
+            first_response = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 2), ("sort", "updated"), ("order", "desc"),
+                    ("kind", "canvas"),
+                ])
+            assert first_response.status_code == 200, first_response.text
+            first_page = first_response.json()
+            assert [item["name"].removeprefix(f"workspace-{token}-")
+                    for item in first_page["items"]] == ["Zulu", "Alpha"]
+            assert first_page["nextCursor"] is not None
+
+            inserted = metadb.workspace_create_canvas_action(
+                uid=metadb.DEFAULT_USER_ID,
+                container_id=folder["id"],
+                expected_container_version=folder["version"],
+                name=f"workspace-{token}-Newer",
+            )
+            with metadb.session() as session:
+                session.get(metadb.Canvas, inserted["id"]).updated_at = datetime.datetime(
+                    2026, 4, 1, tzinfo=datetime.timezone.utc)
+
+            second_response = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 2), ("sort", "updated"), ("order", "desc"),
+                    ("kind", "canvas"), ("cursor", first_page["nextCursor"]),
+                ])
+            assert second_response.status_code == 200, second_response.text
+            second_page = second_response.json()
+            assert [item["name"].removeprefix(f"workspace-{token}-")
+                    for item in second_page["items"]] == ["Beta", "Old"]
+            assert second_page["nextCursor"] is None
+
+            for suffix in ("Null-Zulu", "Null-Alpha"):
+                metadb.workspace_create_container(
+                    folder["id"], f"workspace-{token}-{suffix}")
+            all_names: list[str] = []
+            cursor: str | None = None
+            while True:
+                params: list[tuple[str, str | int]] = [
+                    ("limit", 2), ("sort", "updated"), ("order", "asc"),
+                    ("kind", "canvas"), ("kind", "container"),
+                ]
+                if cursor is not None:
+                    params.append(("cursor", cursor))
+                response = client.get(
+                    f"/api/workspace/containers/{folder['id']}", params=params)
+                assert response.status_code == 200, response.text
+                page = response.json()
+                all_names.extend(
+                    item["name"].removeprefix(f"workspace-{token}-")
+                    for item in page["items"]
+                )
+                cursor = page["nextCursor"]
+                if cursor is None:
+                    break
+            assert all_names == [
+                "Old", "Alpha", "Beta", "Zulu", "Newer", "Null-Alpha", "Null-Zulu",
+            ]
+    finally:
+        for canvas in originals:
+            metadb.delete_canvas_cascade(canvas["id"])
+        if inserted is not None:
+            metadb.delete_canvas_cascade(inserted["id"])
+
+
+def test_workspace_batch_move_and_delete_are_atomic(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    source = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-batch-source")
+    destination = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-batch-destination")
+    created = [metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=source["id"],
+        expected_container_version=source["version"],
+        name=f"workspace-{token}-batch-{index}",
+    ) for index in range(2)]
+    resources = [item["resource"] for item in created]
+    try:
+        with TestClient(app) as client:
+            stale_move = client.post("/api/workspace/batch", json={
+                "action": "move",
+                "items": [
+                    {"placementId": resources[0]["placementId"],
+                     "expectedVersion": resources[0]["version"]},
+                    {"placementId": resources[1]["placementId"],
+                     "expectedVersion": resources[1]["version"] + 1},
+                ],
+                "containerId": destination["id"],
+                "expectedContainerVersion": destination["version"],
+            })
+            assert stale_move.status_code == 409
+            with metadb.session() as session:
+                assert {session.get(metadb.WorkspacePlacement, item["placementId"]).container_id
+                        for item in resources} == {source["id"]}
+
+            moved = client.post("/api/workspace/batch", json={
+                "action": "move",
+                "items": [{
+                    "placementId": item["placementId"],
+                    "expectedVersion": item["version"],
+                } for item in resources],
+                "containerId": destination["id"],
+                "expectedContainerVersion": destination["version"],
+            })
+            assert moved.status_code == 200, moved.text
+            moved_resources = moved.json()["items"]
+            assert {item["parentId"] for item in moved_resources} == {
+                f"container:{destination['id']}"}
+            assert {item["canvasVersion"] for item in moved_resources} == {1}
+
+            stale_delete = client.post("/api/workspace/batch", json={
+                "action": "delete_canvases",
+                "items": [
+                    {"placementId": moved_resources[0]["placementId"],
+                     "expectedVersion": moved_resources[0]["version"],
+                     "expectedCanvasVersion": moved_resources[0]["canvasVersion"]},
+                    {"placementId": moved_resources[1]["placementId"],
+                     "expectedVersion": moved_resources[1]["version"] + 1,
+                     "expectedCanvasVersion": moved_resources[1]["canvasVersion"]},
+                ],
+            })
+            assert stale_delete.status_code == 409
+            with metadb.session() as session:
+                assert all(session.get(metadb.Canvas, item["id"]) is not None
+                           for item in created)
+
+            with metadb.session() as session:
+                session.execute(update(metadb.Canvas).where(
+                    metadb.Canvas.id == created[0]["id"],
+                ).values(version=2))
+
+            stale_canvas_delete = client.post("/api/workspace/batch", json={
+                "action": "delete_canvases",
+                "items": [{
+                    "placementId": item["placementId"],
+                    "expectedVersion": item["version"],
+                    "expectedCanvasVersion": item["canvasVersion"],
+                } for item in moved_resources],
+            })
+            assert stale_canvas_delete.status_code == 409
+            with metadb.session() as session:
+                assert all(session.get(metadb.Canvas, item["id"]) is not None
+                           for item in created)
+
+            deleted = client.post("/api/workspace/batch", json={
+                "action": "delete_canvases",
+                "items": [
+                    {
+                        "placementId": moved_resources[0]["placementId"],
+                        "expectedVersion": moved_resources[0]["version"],
+                        "expectedCanvasVersion": 2,
+                    },
+                    {
+                        "placementId": moved_resources[1]["placementId"],
+                        "expectedVersion": moved_resources[1]["version"],
+                        "expectedCanvasVersion": moved_resources[1]["canvasVersion"],
+                    },
+                ],
+            })
+            assert deleted.status_code == 200, deleted.text
+            assert set(deleted.json()["deletedCanvasIds"]) == {
+                item["id"] for item in created}
+            with metadb.session() as session:
+                assert all(session.get(metadb.Canvas, item["id"]) is None
+                           for item in created)
+    finally:
+        for item in created:
+            metadb.delete_canvas_cascade(item["id"])
+
+
+def test_workspace_provider_query_rejects_false_page_local_sort(
+        workspace_scope, monkeypatch):
+    folder = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"],
+        f"workspace-{workspace_scope['canvas_id'].removeprefix('workspace-canvas-')}-mount")
+    monkeypatch.setattr(
+        workspace_providers, "is_configured_mount_container",
+        lambda container_id: container_id == folder["id"],
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/workspace/containers/{folder['id']}", params={"sort": "name"})
+    assert response.status_code == 422
+    assert "controls its own order" in response.text
+
+
+def test_workspace_connected_source_lens_is_separate_bounded_and_resolvable(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-connected-parent")
+    metadb.workspace_create_container(folder["id"], f"workspace-{token}-z-local")
+    metadb.workspace_create_container(folder["id"], f"workspace-{token}-a-local")
+    mount_id = f"lens/{token}"
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {
+            "id": mount_id,
+            "provider": "fixture",
+            "containerId": folder["id"],
+            "config": {"endpoint": "must-not-cross-the-workspace-api"},
+        },
+        {"id": "invalid-without-provider"},
+    ]))
+
+    with TestClient(app) as client:
+        local_response = client.get(
+            f"/api/workspace/containers/{folder['id']}",
+            params=[
+                ("source", "local"),
+                ("sort", "name"),
+                ("order", "desc"),
+                ("kind", "container"),
+                ("limit", "10"),
+            ],
+        )
+        assert local_response.status_code == 200, local_response.text
+        local_page = local_response.json()
+        assert provider.list_calls == 0
+        assert [item["name"] for item in local_page["items"]] == [
+            f"workspace-{token}-z-local", f"workspace-{token}-a-local"]
+        assert local_page["queryCapabilities"] == {
+            "sort": ["name", "updated"], "kindFilter": True, "reason": None}
+        assert [source["kind"] for source in local_page["sources"]] == [
+            "local", "configuration"]
+        assert local_page["sources"][1]["error"] == "catalog mount configuration is invalid"
+        assert len(local_page["connectedSources"]) == 1
+        connected = local_page["connectedSources"][0]
+        assert connected == {
+            **connected,
+            "id": f"container:{workspace_providers.mount_container_identity(mount_id)}",
+            "kind": "container",
+            "name": mount_id,
+            "parentId": f"container:{folder['id']}",
+            "source": "provider",
+            "mountId": mount_id,
+            "provider": "fixture",
+            "referenceState": "current",
+            "providerMutation": False,
+            "canCreateFolder": False,
+            "canRenameFolder": False,
+            "canDeleteFolder": False,
+        }
+        assert connected["localPlacement"] is None
+        assert "must-not-cross-the-workspace-api" not in local_response.text
+
+        identity = connected["id"].removeprefix("container:")
+        first = client.get(
+            f"/api/workspace/containers/{identity}",
+            params={"source": "provider", "limit": 1},
+        )
+        assert first.status_code == 200, first.text
+        first_page = first.json()
+        assert provider.list_calls == 1
+        assert first_page["container"] == connected
+        assert first_page["queryCapabilities"]["sort"] == []
+        assert first_page["queryCapabilities"]["kindFilter"] is False
+        assert first_page["queryCapabilities"]["reason"]
+        assert first_page["items"][0]["parentId"] == connected["id"]
+        assert first_page["nextCursor"].startswith("provider.")
+        assert first_page["nextCursor"] != "1"
+
+        second = client.get(
+            f"/api/workspace/containers/{identity}",
+            params={"source": "provider", "limit": 1,
+                    "cursor": first_page["nextCursor"]},
+        )
+        assert second.status_code == 200, second.text
+        assert provider.list_calls == 2
+        assert second.json()["hasMore"] is False
+
+        rejected = client.get(
+            f"/api/workspace/containers/{identity}",
+            params={"source": "provider", "sort": "name"},
+        )
+        assert rejected.status_code == 422
+        assert provider.list_calls == 2
+
+        resolved = client.get(f"/api/workspace/resources/{connected['id']}")
+        assert resolved.status_code == 200, resolved.text
+        assert provider.list_calls == 2
+        resolution = resolved.json()
+        assert resolution["resource"] == connected
+        assert [item["id"] for item in resolution["ancestors"]] == [
+            f"container:{root['id']}", f"container:{folder['id']}"]
+        assert resolution["source"] == {
+            "id": f"mount:{mount_id}",
+            "kind": "provider",
+            "completeness": "complete",
+            "mountId": mount_id,
+            "provider": "fixture",
+            "error": None,
+            "referenceState": None,
+        }
+
+        child = client.get(
+            f"/api/workspace/resources/{first_page['items'][0]['id']}")
+        assert child.status_code == 200, child.text
+        assert [item["id"] for item in child.json()["ancestors"]] == [
+            f"container:{root['id']}",
+            f"container:{folder['id']}",
+            connected["id"],
+        ]
+
+
+def test_workspace_source_lens_cursors_bind_container_mount_and_config(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    left = metadb.workspace_create_container(root["id"], f"workspace-{token}-cursor-left")
+    right = metadb.workspace_create_container(root["id"], f"workspace-{token}-cursor-right")
+    for parent, suffix in ((left, "a"), (left, "b"), (right, "a"), (right, "b")):
+        metadb.workspace_create_container(parent["id"], f"workspace-{token}-{suffix}")
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+
+    def configure(endpoint: str) -> None:
+        monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+            {"id": "left-mount", "provider": "fixture", "containerId": left["id"],
+             "config": {"endpoint": endpoint}},
+            {"id": "right-mount", "provider": "fixture", "containerId": right["id"]},
+        ]))
+
+    configure("v1")
+    left_mount = workspace_providers.mount_container_identity("left-mount")
+    right_mount = workspace_providers.mount_container_identity("right-mount")
+    with TestClient(app) as client:
+        local_first = client.get(
+            f"/api/workspace/containers/{left['id']}",
+            params={"source": "local", "limit": 1},
+        )
+        assert local_first.status_code == 200, local_first.text
+        local_cursor = local_first.json()["nextCursor"]
+        assert local_cursor.startswith("local.")
+        cross_folder = client.get(
+            f"/api/workspace/containers/{right['id']}",
+            params={"source": "local", "limit": 1, "cursor": local_cursor},
+        )
+        assert cross_folder.status_code == 422
+        cross_lens = client.get(
+            f"/api/workspace/containers/{left_mount}",
+            params={"source": "provider", "limit": 1, "cursor": local_cursor},
+        )
+        assert cross_lens.status_code == 422
+
+        provider_first = client.get(
+            f"/api/workspace/containers/{left_mount}",
+            params={"source": "provider", "limit": 1},
+        )
+        assert provider_first.status_code == 200, provider_first.text
+        provider_cursor = provider_first.json()["nextCursor"]
+        assert provider_cursor.startswith("provider.")
+        provider_into_local = client.get(
+            f"/api/workspace/containers/{left['id']}",
+            params={"source": "local", "limit": 1, "cursor": provider_cursor},
+        )
+        assert provider_into_local.status_code == 422
+        cross_mount = client.get(
+            f"/api/workspace/containers/{right_mount}",
+            params={"source": "provider", "limit": 1, "cursor": provider_cursor},
+        )
+        assert cross_mount.status_code == 422
+
+        configure("v2")
+        stale_config = client.get(
+            f"/api/workspace/containers/{left_mount}",
+            params={"source": "provider", "limit": 1, "cursor": provider_cursor},
+        )
+        assert stale_config.status_code == 422
+
+
+def test_workspace_connected_source_final_page_reconciles_removed_bindings(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-reconcile-parent")
+    mount_id = f"reconcile-{token}"
+
+    class Provider(_WorkspaceFixtureProvider):
+        include_dataset = True
+
+        def _resources(self, current_mount_id: str) -> list[CatalogResource]:
+            resources = super()._resources(current_mount_id)
+            return resources if self.include_dataset else [
+                item for item in resources if item.placement_id != "dataset-a"]
+
+    provider = Provider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    identity = workspace_providers.mount_container_identity(mount_id)
+
+    with TestClient(app) as client:
+        initial = client.get(
+            f"/api/workspace/containers/{identity}",
+            params={"source": "provider", "limit": 100},
+        )
+        assert initial.status_code == 200, initial.text
+        removed = next(item for item in initial.json()["items"]
+                       if item.get("providerPlacementId") == "dataset-a")
+        provider.include_dataset = False
+        refreshed = client.get(
+            f"/api/workspace/containers/{identity}",
+            params={"source": "provider", "limit": 100},
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        assert all(item.get("providerPlacementId") != "dataset-a"
+                   for item in refreshed.json()["items"])
+        resolved = client.get(f"/api/workspace/resources/{removed['id']}")
+        assert resolved.status_code == 200, resolved.text
+        assert resolved.json()["resource"]["referenceState"] == "detached"
+
+
+def test_workspace_legacy_mixed_browse_declares_queries_unsupported(workspace_scope):
+    root = metadb.local_workspace_root()
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/workspace/containers/{root['id']}", params={"limit": 1})
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["connectedSources"] == []
+    assert page["queryCapabilities"]["sort"] == []
+    assert page["queryCapabilities"]["kindFilter"] is False
+    assert "different query capabilities" in page["queryCapabilities"]["reason"]
+
+
 def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     folder = metadb.workspace_create_container(
@@ -4529,6 +5201,76 @@ def test_normal_local_lifecycles_materialize_root_workspace_resources():
         with metadb.session() as session:
             session.execute(delete(metadb.WorkspacePlacement).where(
                 metadb.WorkspacePlacement.target_id.in_([canvas_id, dataset_id])))
+
+
+def test_canvas_create_can_preserve_the_open_canvas_workspace_folder(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    source_canvas_id = workspace_scope["canvas_id"]
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-sibling-create")
+    metadb.workspace_create_placement(
+        folder["id"],
+        target_kind="canvas",
+        target_id=source_canvas_id,
+        name=f"workspace-{token}-source",
+    )
+    created_id = f"workspace-{token}-sibling"
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/canvas",
+                params={"besideCanvasId": source_canvas_id},
+                json={
+                    "id": created_id,
+                    "name": f"workspace-{token}-example",
+                    "version": 1,
+                    "nodes": [],
+                    "edges": [],
+                },
+            )
+            assert created.status_code == 200, created.text
+            assert created.json()["created"] is True
+            resolved = client.get(f"/api/workspace/resources/canvas:{created_id}")
+            assert resolved.status_code == 200, resolved.text
+            assert resolved.json()["resource"]["parentId"] == f"container:{folder['id']}"
+
+            replay_after_source_loss = client.post(
+                "/api/canvas",
+                params={"besideCanvasId": f"workspace-{token}-deleted-source"},
+                json={
+                    "id": created_id,
+                    "name": f"workspace-{token}-example",
+                    "version": 1,
+                    "nodes": [],
+                    "edges": [],
+                },
+            )
+            assert replay_after_source_loss.status_code == 200, replay_after_source_loss.text
+            assert replay_after_source_loss.json()["created"] is False
+            replayed_resource = client.get(f"/api/workspace/resources/canvas:{created_id}")
+            assert replayed_resource.status_code == 200, replayed_resource.text
+            assert replayed_resource.json()["resource"]["parentId"] == f"container:{folder['id']}"
+
+            other = client.post("/api/users", json={"name": "Sibling create outsider"}).json()["id"]
+            denied_id = f"workspace-{token}-denied-sibling"
+            denied = client.post(
+                "/api/canvas",
+                params={"besideCanvasId": source_canvas_id},
+                headers={"X-DP-User": other},
+                json={
+                    "id": denied_id,
+                    "name": f"workspace-{token}-denied",
+                    "version": 1,
+                    "nodes": [],
+                    "edges": [],
+                },
+            )
+            assert denied.status_code == 404
+            with metadb.session() as session:
+                assert session.get(metadb.Canvas, denied_id) is None
+    finally:
+        metadb.delete_canvas_cascade(created_id)
 
 
 def test_bulk_seed_materializes_workspace_placements():

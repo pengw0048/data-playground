@@ -56,7 +56,7 @@ function SchemaDriftEvidence({ evidence }: { evidence: WriteSchemaDrift }) {
   const hidden = evidence.compatibility.fields.length - visible.length
   return <div aria-label="Schema comparison" className="rounded border border-border bg-background px-2 py-1.5">
     <div className="font-semibold text-foreground">
-      Exact schema comparison · {evidence.compatibility.status}
+      Schema comparison · {evidence.compatibility.status}
     </div>
     <div>
       Compared head <span className="font-mono">
@@ -71,7 +71,7 @@ function SchemaDriftEvidence({ evidence }: { evidence: WriteSchemaDrift }) {
     {visible.map((field, index) => <div key={`${field.kind}:${field.fieldId ?? ''}:${field.oldName ?? ''}:${field.newName ?? ''}:${index}`}>
       {field.kind} · {field.status} · {field.oldName ?? '—'} → {field.newName ?? '—'} · {field.reason}
     </div>)}
-    {hidden > 0 && <div>{hidden} more retained comparison fields are not shown.</div>}
+    {hidden > 0 && <div>{hidden} more saved comparison fields are not shown.</div>}
   </div>
 }
 
@@ -80,16 +80,16 @@ function AdmissionDetails({ label, admission }: { label: string; admission: Writ
   return <>
     <div><strong>{label}:</strong> node <span className="font-mono">{admission.nodeId}</span> · {admission.managed ? 'managed' : 'provider-neutral'} · mode <span className="font-mono">{admission.mode}</span></div>
     <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
-    <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
+    <div><strong>Checked destination:</strong> <span className="font-mono">{admission.destination}</span></div>
     <div><strong>Schema:</strong> {runtimeSchema
       ? 'Full output schema will be validated during this run.'
       : schemaText(admission.expectedSchema)}</div>
     <div><strong>Partitions:</strong> {partitionText(admission.partitions)}</div>
-    {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
+    {admission.expectedHead && <div><strong>Checked destination version:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
     {admission.intent && <>
-      <div><strong>Frozen destination:</strong> <span className="font-mono">{admission.intent.destination.logicalUri}</span> · {admission.intent.destination.name} · {admission.intent.destination.provider}{admission.intent.destination.datasetId ? ` · dataset ${admission.intent.destination.datasetId}` : ''}</div>
+      <div><strong>Saved destination:</strong> <span className="font-mono">{admission.intent.destination.logicalUri}</span> · {admission.intent.destination.name} · {admission.intent.destination.provider}{admission.intent.destination.datasetId ? ` · dataset ${admission.intent.destination.datasetId}` : ''}</div>
       <div><strong>Idempotency key:</strong> <span className="font-mono">{admission.intent.idempotencyKey}</span></div>
-      <div><strong>Frozen provenance:</strong> <span className="font-mono">{JSON.stringify(admission.intent.provenance)}</span></div>
+      <div><strong>Input record:</strong> <span className="font-mono">{JSON.stringify(admission.intent.provenance)}</span></div>
     </>}
   </>
 }
@@ -106,12 +106,12 @@ function PublicationDetails({ admission, outcomeAdmission, receipt, schemaDrift,
 }) {
   if (!admission && !outcomeAdmission && !receipt && outputs.length === 0) return null
   return <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
+    <summary className="cursor-pointer font-semibold text-foreground">Diagnostics</summary>
     <div className="mt-2 grid gap-1 break-all">
       {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
-      {outcomeAdmission && <AdmissionDetails label="Completed admission" admission={outcomeAdmission} />}
+      {outcomeAdmission && <AdmissionDetails label="Completed run setup" admission={outcomeAdmission} />}
       {admission && !sameAdmission(admission, outcomeAdmission)
-        && <AdmissionDetails label={outcomeAdmission ? 'Next admission' : 'Admission'} admission={admission} />}
+        && <AdmissionDetails label={outcomeAdmission ? 'Next run setup' : 'Run setup'} admission={admission} />}
       {receipt && <>
         <div><strong>Receipt:</strong> <span className="font-mono">{receipt.datasetId}@{receipt.revisionId}</span></div>
         <div><strong>Durable:</strong> yes</div>
@@ -174,7 +174,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
           <span className="font-semibold text-foreground">Mode</span>
           <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
         </div>}
-      {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Exact run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+      {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Fix before running:</strong> {summaryAdmission.exactRunReadiness.message}
       </div> : summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Fix before running:</strong> {summaryAdmission.blocker}

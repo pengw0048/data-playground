@@ -1,6 +1,8 @@
 import type { CanvasDoc } from '../types/graph'
 
 export const MAX_LOCAL_CANVAS_DRAFTS = 20
+export const UNAVAILABLE_DRAFT_BASE_MESSAGE = 'The server Canvas is no longer available. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+export const READ_ONLY_DRAFT_BASE_MESSAGE = 'The server Canvas is available read-only. Your local draft is preserved; open the server copy or keep the draft as a new Canvas.'
 
 const INDEX_VERSION = 1
 const INDEX_KEY = (principalId: string) => `dp-canvas-drafts-v1:${encodeURIComponent(principalId)}`
@@ -20,6 +22,8 @@ export interface LocalCanvasDraft {
   doc: CanvasDoc
   /** Exact document sent by the first idempotent create attempt. */
   createAttemptDoc: CanvasDoc | null
+  /** Existing Canvas used to place a local-only create beside its originating folder. */
+  besideCanvasId?: string
   syncState: CanvasDraftSyncState
   lastLocalEditAt: string
   lastError?: string
@@ -98,6 +102,9 @@ function parseDraft(raw: string, principalId: string, draftId: string): LocalCan
     || (value.baseCanvasId !== null && value.baseCanvasId !== value.canvasId)
     || (value.baseVersion !== null && (!Number.isInteger(value.baseVersion) || Number(value.baseVersion) < 1))
     || (value.createAttemptDoc !== null && !isCanvasDoc(value.createAttemptDoc))
+    || (value.besideCanvasId !== undefined
+      && (typeof value.besideCanvasId !== 'string' || value.besideCanvasId.length === 0
+        || value.besideCanvasId === value.canvasId))
     || !['dirty', 'syncing', 'conflict', 'error'].includes(String(value.syncState))
     || typeof value.lastLocalEditAt !== 'string') {
     throw new Error('draft record is corrupt')
@@ -129,7 +136,9 @@ export function readCanvasDrafts(principalId: string): DraftReadResult {
 }
 
 export function writeCanvasDraft(draft: LocalCanvasDraft): DraftWriteResult {
-  if (!draft.principalId || draft.draftId !== draft.canvasId || draft.doc.id !== draft.canvasId) {
+  if (!draft.principalId || draft.draftId !== draft.canvasId || draft.doc.id !== draft.canvasId
+    || (draft.besideCanvasId !== undefined
+      && (!draft.besideCanvasId || draft.besideCanvasId === draft.canvasId))) {
     return { ok: false, error: 'Could not save local Canvas draft: invalid draft identity.' }
   }
   const { index, error } = readIndex(draft.principalId)

@@ -33,7 +33,7 @@ describe('FieldEvidenceButton', () => {
     expect(screen.getByText('Logical type')).toBeVisible()
     expect(screen.getByText('Nullable')).toBeVisible()
     expect(screen.getByText('owned by the orders provider')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Technical metadata'))
+    fireEvent.click(screen.getByText('Diagnostics'))
     expect(screen.getByText('owned by the orders provider')).toBeVisible()
     expect(screen.getByText('utf8')).toBeVisible()
     await waitFor(() => expect(screen.getByText('Customers (renamed)')).toBeVisible())

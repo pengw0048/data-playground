@@ -832,7 +832,7 @@ def test_replace_fails_closed_when_exact_head_schema_metadata_is_corrupt(
     assert admission.intent is None
     assert admission.expected_head is not None
     assert admission.blocker == \
-        "the exact destination head has no valid retained schema metadata"
+        "the destination's saved schema is unavailable"
 
 
 def test_structural_drift_requires_the_displayed_admission_before_allocation(

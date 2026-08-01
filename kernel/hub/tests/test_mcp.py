@@ -95,6 +95,38 @@ def test_tools_list_every_tool_has_a_schema():
         assert t["description"] and t["inputSchema"]["type"] == "object"
 
 
+def test_stdio_server_rebinds_after_workspace_deps_are_replaced(tmp_path, monkeypatch):
+    from hub import deps as deps_module
+
+    original = get_deps()
+    # Record the current singleton with monkeypatch so teardown restores it after set_workspace's
+    # ordinary whole-object replacement. This reproduces a long-lived stdio server spanning that
+    # production lifecycle boundary without leaking the temporary workspace into later tests.
+    monkeypatch.setattr(deps_module, "_deps", original)
+    lifecycle_server = build_server(base_url="http://test.local")
+    replacement = deps_module.set_workspace(
+        str(tmp_path / "workspace"), str(tmp_path / "data"), maintain_storage=False,
+    )
+    expected = CatalogTable(
+        id="replacement", name="replacement", uri="memory://replacement",
+        columns=[ColumnSchema(name="id", type="int")],
+    )
+
+    def page(query):
+        return CatalogPage(
+            items=[expected], total=1, offset=query.offset, limit=query.limit, has_more=False,
+        )
+
+    monkeypatch.setattr(replacement.catalog, "list_page", page)
+    response = lifecycle_server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "search_catalog", "arguments": {"limit": 1}},
+    })
+
+    assert response["result"]["structuredContent"]["datasets"][0]["id"] == "replacement"
+    assert lifecycle_server.pg.deps is replacement
+
+
 # --------------------------------------------------------------------------- #
 # Catalog / discovery
 # --------------------------------------------------------------------------- #
