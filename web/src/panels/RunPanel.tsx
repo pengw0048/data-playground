@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils'
 import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
 import type { CanvasDoc, CanvasParameterDeclaration } from '../types/graph'
 import type { DatasetViewerCanvasReturn } from '../router'
+import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -396,7 +397,7 @@ function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc })
   return <div aria-label="Preview input drift" className="mt-2 flex flex-col gap-1.5">
     {drift.sources.map((source) => {
       const compatibility = source.compatibility
-      const notable = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
+      const notable = compatibility?.fields.filter(isMeaningfulSchemaChange) ?? []
       return <div key={`${source.nodeId}:${source.previewRevisionId}`} className="rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px]">
         <div className="font-semibold text-foreground">{titles.get(source.nodeId) ?? source.nodeId}</div>
         <div className="dp-mono mt-0.5 break-all text-muted-foreground">

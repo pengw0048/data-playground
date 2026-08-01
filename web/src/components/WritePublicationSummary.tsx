@@ -2,6 +2,7 @@ import { datasetViewerHash, type DatasetViewerCanvasReturn } from '../router'
 import type {
   RunOutput, WriteAdmission, WriteReceipt,
 } from '../types/api'
+import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
 
 export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
   if (mode === 'create') return 'Create a new dataset'
@@ -57,7 +58,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
-  const schemaChanges = schemaDrift?.compatibility.fields.filter((field) => field.kind !== 'unchanged') ?? []
+  const schemaChanges = schemaDrift?.compatibility.fields.filter(isMeaningfulSchemaChange) ?? []
   const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">

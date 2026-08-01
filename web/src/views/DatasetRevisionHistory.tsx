@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, KernelError } from '../api/client'
-import { compareSchemas } from '../lib/schemaCompatibility'
+import { compareSchemas, isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
 import { useStore } from '../store/graph'
 import type {
   CatalogTable, DatasetRevision, DatasetRevisionDetail, DatasetRevisionSummary, DatasetViewDefinition,
@@ -27,7 +27,7 @@ function timestamp(value?: string | null) {
 }
 
 function bytes(value?: number | null) {
-  if (value == null) return 'unknown'
+  if (value == null) return '—'
   if (value < 1024) return `${value} B`
   const units = ['KiB', 'MiB', 'GiB', 'TiB']
   let amount = value / 1024
@@ -36,9 +36,9 @@ function bytes(value?: number | null) {
   return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unit]}`
 }
 
-function number(value?: number | null) { return value == null ? 'unknown' : value.toLocaleString() }
+function number(value?: number | null) { return value == null ? '—' : value.toLocaleString() }
 function delta(current?: number | null, parent?: number | null) {
-  if (current == null || parent == null) return 'change unknown'
+  if (current == null || parent == null) return null
   const change = current - parent
   return change === 0 ? 'no change' : `${change > 0 ? '+' : ''}${change.toLocaleString()}`
 }
@@ -73,7 +73,6 @@ export function DatasetRevisionHistory({
   const [parent, setParent] = useState<DatasetRevisionDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
-  const [parentError, setParentError] = useState<string | null>(null)
   const [saveDetail, setSaveDetail] = useState<DatasetRevisionDetail | null>(null)
   const [restoreDetail, setRestoreDetail] = useState<DatasetRevisionDetail | null>(null)
   const [canSaveView, setCanSaveView] = useState(false)
@@ -128,7 +127,7 @@ export function DatasetRevisionHistory({
       openedRevision.current = ''
       detailRequest.current += 1
       setSelected(null); setDetail(null); setParent(null)
-      setDetailError(null); setParentError(null); setDetailLoading(false)
+      setDetailError(null); setDetailLoading(false)
       return
     }
     if (!initialRevisionId || !initialRevisionDatasetId) {
@@ -136,7 +135,7 @@ export function DatasetRevisionHistory({
         openedRevision.current = ''
         detailRequest.current += 1
         setSelected(null); setDetail(null); setParent(null)
-        setDetailError(null); setParentError(null); setDetailLoading(false)
+        setDetailError(null); setDetailLoading(false)
       }
       return
     }
@@ -152,7 +151,7 @@ export function DatasetRevisionHistory({
   useEffect(() => {
     if (!detailsInViewer) return
     const request = ++viewerParentRequest.current
-    setParent(null); setParentError(null)
+    setParent(null)
     const parentRevisionId = viewerDetail?.parentRevisionId
     if (!viewerDetail || !parentRevisionId) return
     void api.datasetRevision(viewerDetail.datasetId, parentRevisionId).then((next) => {
@@ -161,13 +160,7 @@ export function DatasetRevisionHistory({
         throw new Error('The response did not match the requested version')
       }
       setParent(next)
-    }).catch((error) => {
-      if (request === viewerParentRequest.current) {
-        setParentError(statusOf(error) === 410
-          ? 'The parent version is no longer available; schema and summary comparison are unavailable.'
-          : `Couldn't load the parent comparison: ${errorMessage(error)}`)
-      }
-    })
+    }).catch(() => {})
     return () => { viewerParentRequest.current += 1 }
   }, [detailsInViewer, viewerDetail])
 
@@ -193,7 +186,7 @@ export function DatasetRevisionHistory({
   const openRevision = useCallback(async (revision: DatasetRevision) => {
     openedRevision.current = JSON.stringify([revision.datasetId, revision.revisionId])
     const request = ++detailRequest.current
-    setSelected(revision); setDetail(null); setParent(null); setDetailError(null); setParentError(null); setDetailLoading(true)
+    setSelected(revision); setDetail(null); setParent(null); setDetailError(null); setDetailLoading(true)
     try {
       const next = await api.datasetRevision(revision.datasetId, revision.revisionId)
       if (request !== detailRequest.current) return
@@ -202,11 +195,8 @@ export function DatasetRevisionHistory({
       try {
         const parentDetail = await api.datasetRevision(next.datasetId, next.parentRevisionId)
         if (request === detailRequest.current) setParent(parentDetail)
-      } catch (error) {
+      } catch {
         if (request !== detailRequest.current) return
-        setParentError(statusOf(error) === 410
-          ? 'The parent version is no longer available; schema and summary comparison are unavailable.'
-          : `Couldn't load the parent comparison: ${errorMessage(error)}`)
       }
     } catch (error) {
       if (request !== detailRequest.current) return
@@ -282,11 +272,11 @@ export function DatasetRevisionHistory({
       </div>}
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
       {selected && !detailsInViewer && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
-        error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
+        error={detailError} onRetry={() => void openRevision(selected)}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
         onRestore={setRestoreDetail} />}
       {viewerRevision && <RevisionDetail revision={viewerRevision} detail={viewerDetail ?? null}
-        parent={parent} loading={viewerLoading} error={viewerError} parentError={parentError}
+        parent={parent} loading={viewerLoading} error={viewerError}
         onRetry={onViewerRetry ?? (() => {})}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
         onRestore={setRestoreDetail} showPreview={false} />}
@@ -310,10 +300,10 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
   </div>
 }
 
-function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave,
+function RevisionDetail({ revision, detail, parent, loading, error, onRetry, canSave, onSave,
   headRevisionId, onRestore, showPreview = true }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
-  loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
+  loading: boolean; error: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
@@ -325,7 +315,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
   if (!detail) return null
   const compatibility = parent ? compareSchemas(parent.preview.columns, detail.preview.columns) : null
-  const notableFields = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
+  const notableFields = compatibility?.fields.filter(isMeaningfulSchemaChange) ?? []
   const current = detail.revisionId === headRevisionId
   const schemaFields = detail.preview.columns.length
   return <div className="flex flex-col gap-2 border-t border-border pt-2" data-testid="revision-detail">
@@ -355,19 +345,16 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
       </div>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
-    {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
-      : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">The previous version is unavailable, so schema and summary changes are unknown.</div>
-        : !parent ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading parent comparison…</div>
-          : <div className="rounded-md border border-border p-2">
+    {parent && notableFields.length > 0 ? <div className="rounded-md border border-border p-2">
             <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
               <span>Schema compatibility with parent</span><CompatibilityBadge status={compatibility!.status} />
             </div>
-            {notableFields.length ? <div className="mt-1 flex flex-col gap-1">
+            <div className="mt-1 flex flex-col gap-1">
               {notableFields.map((field, index) => <div key={`${field.fieldId ?? field.oldName ?? field.newName}:${index}`} className="text-[9.5px] text-muted-foreground">
                 <span className="font-semibold text-foreground">{field.newName ?? field.oldName ?? field.fieldId ?? 'field'}: </span>{field.reason}
               </div>)}
-            </div> : <div className="mt-1 text-[9.5px] text-muted-foreground">No schema field changes.</div>}
-          </div>}
+            </div>
+          </div> : null}
     {showPreview && <ExactPreview detail={detail} />}
   </div>
 }
@@ -380,17 +367,15 @@ function CompatibilityBadge({ status }: { status: SchemaCompatibilityStatus }) {
 }
 
 function Summary({ current, parent }: { current: DatasetRevisionSummary; parent: DatasetRevisionSummary | null }) {
-  const facts: [string, string, string][] = [
-    ['Rows', number(current.rowCount), parent ? delta(current.rowCount, parent.rowCount) : 'comparison unavailable'],
-    ['Bytes', bytes(current.totalBytes), parent ? delta(current.totalBytes, parent.totalBytes) : 'comparison unavailable'],
-    ['Data files', number(current.dataFileCount), parent ? delta(current.dataFileCount, parent.dataFileCount) : 'comparison unavailable'],
-    ['Fragments', number(current.fragmentCount), parent ? delta(current.fragmentCount, parent.fragmentCount) : 'comparison unavailable'],
+  const facts: [string, string, string | null][] = [
+    ['Rows', number(current.rowCount), parent ? delta(current.rowCount, parent.rowCount) : null],
+    ['Size', bytes(current.totalBytes), parent ? delta(current.totalBytes, parent.totalBytes) : null],
   ]
   return <div className="grid grid-cols-2 gap-1">
     {facts.map(([label, value, change]) => <div key={label} className="rounded bg-muted/40 px-2 py-1">
       <div className="text-[9px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className="text-[10.5px] font-semibold text-foreground">{value}</div>
-      <div className="text-[9px] text-muted-foreground">{change}</div>
+      {change ? <div className="text-[9px] text-muted-foreground">{change}</div> : null}
     </div>)}
   </div>
 }

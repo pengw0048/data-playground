@@ -1067,8 +1067,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const [owner, setOwner] = useState(table.owner ?? '')
   const [description, setDescription] = useState(table.description ?? '')
   const [lin, setLin] = useState<LineageResult | null>(null)
-  const [lineageLoading, setLineageLoading] = useState(true)
-  const [lineageError, setLineageError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirmUnregister, setConfirmUnregister] = useState(false)
@@ -1166,14 +1164,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
   const loadLineage = useCallback(async () => {
     const s = ++lineageRequest.current
-    setLineageLoading(true); setLineageError(null)
     try {
       const next = await api.lineage(table.uri, 4, 60)
       if (s === lineageRequest.current) setLin(next)
-    } catch (e) {
-      if (s === lineageRequest.current) setLineageError(errorMessage(e))
-    } finally {
-      if (s === lineageRequest.current) setLineageLoading(false)
+    } catch {
+      if (s === lineageRequest.current) setLin(null)
     }
   }, [table.uri])
   useEffect(() => {
@@ -1304,6 +1299,14 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const children = (lin?.edges ?? []).filter((e) => e.parent === lineageRoot)
   const lineageNode = (u: string) => lin?.nodes.find((n) => n.uri === u)
   const nameOf = (u: string) => lineageNode(u)?.name ?? u.split('/').slice(-1)[0]
+  const lineageRows = (edges: typeof parents, endpoint: (edge: typeof parents[number]) => string) => edges.flatMap((edge) => {
+    const uri = endpoint(edge)
+    const node = lineageNode(uri)
+    const catalogId = node?.id !== node?.uri ? node?.id : undefined
+    return catalogId ? [{ name: nameOf(uri), factCount: edge.factCount, uri, catalogId }] : []
+  })
+  const parentRows = lineageRows(parents, (edge) => edge.parent)
+  const childRows = lineageRows(children, (edge) => edge.child)
   const displayRowCount = requestedExact
     ? requestedExactDetail?.summary.rowCount ?? null
     : exactFacts ? exactFacts.summary.rowCount : table.rowCount
@@ -1542,36 +1545,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             viewerLoading={requestedExactLoading} viewerError={requestedExactError}
             onViewerRetry={() => { void loadRequestedExact() }} />
 
-          {/* lineage — click a row to open that dataset */}
-          <section>
+          {(parentRows.length > 0 || childRows.length > 0) ? <section>
             <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> {requestedExact ? 'Current catalog lineage' : 'Lineage'}{lin?.truncated ? ' (truncated)' : ''}</div>
-            {lineageLoading && !lin ? <div className="py-0.5 text-[11px] text-muted-foreground">Loading…</div> : null}
-            {lineageError ? (
-              <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
-                <span>Couldn't load lineage: {lineageError}{lin ? ' (showing stale lineage)' : ''}</span>
-                <button onClick={() => void loadLineage()} data-testid="detail-lineage-retry" className="shrink-0 font-semibold underline">Retry</button>
-              </div>
-            ) : null}
-            {lin && parents.length === 0 && children.length === 0 ? <div className="py-0.5 text-[11px] text-muted-foreground">No related datasets yet.</div> : null}
-            {lin && (parents.length > 0 || children.length > 0) ? <>
-              {parents.length > 0 ? <LineageMini label="Parents" onOpen={openLinked}
-                rows={parents.map((e) => {
-                  const node = lineageNode(e.parent)
-                  return {
-                    name: nameOf(e.parent), factCount: e.factCount,
-                    uri: e.parent, catalogId: node?.id !== node?.uri ? node?.id : undefined,
-                  }
-                })} /> : null}
-              {children.length > 0 ? <LineageMini label="Children" onOpen={openLinked}
-                rows={children.map((e) => {
-                  const node = lineageNode(e.child)
-                  return {
-                    name: nameOf(e.child), factCount: e.factCount,
-                    uri: e.child, catalogId: node?.id !== node?.uri ? node?.id : undefined,
-                  }
-                })} /> : null}
-            </> : null}
-          </section>
+            {parentRows.length > 0 ? <LineageMini label="Parents" onOpen={openLinked} rows={parentRows} /> : null}
+            {childRows.length > 0 ? <LineageMini label="Children" onOpen={openLinked} rows={childRows} /> : null}
+          </section> : null}
 
           <button onClick={() => setConfirmUnregister(true)} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
             title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'

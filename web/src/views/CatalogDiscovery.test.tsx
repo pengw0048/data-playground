@@ -548,7 +548,7 @@ describe('Catalog discovery request and mutation truth', () => {
     await waitFor(() => expect(mocks.table).toHaveBeenCalledWith('downstream'))
   })
 
-  it('shows unregistered lineage endpoints without a broken Catalog link', async () => {
+  it('keeps unregistered lineage identities out of the inline dataset summary', async () => {
     const currentRoot = 'mem://orders-current'
     mocks.lineage.mockResolvedValue({
       rootUri: currentRoot,
@@ -561,9 +561,9 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
-    const raw = await screen.findByText('raw_orders')
-    expect(raw.closest('button')).toBeNull()
-    fireEvent.click(raw)
+    await waitFor(() => expect(mocks.lineage).toHaveBeenCalledWith(TABLE.uri, 4, 60))
+    expect(screen.queryByText('raw_orders')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Lineage' })).toBeVisible()
     expect(mocks.table).not.toHaveBeenCalled()
   })
 
@@ -585,9 +585,9 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
-    expect(await screen.findByText(/Couldn't load lineage: HTTP 503/i)).toBeInTheDocument()
-    fireEvent.click(screen.getByTestId('detail-lineage-retry'))
-    expect(await screen.findAllByText('No related datasets yet.')).toHaveLength(1)
+    await waitFor(() => expect(mocks.lineage).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText(/Couldn't load lineage: HTTP 503/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Lineage' })).toBeVisible()
     expect(screen.queryByText('Parents')).not.toBeInTheDocument()
     expect(screen.queryByText('Children')).not.toBeInTheDocument()
 

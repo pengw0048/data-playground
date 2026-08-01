@@ -480,7 +480,7 @@ describe('TransformsLibrary', () => {
     expect(screen.getAllByText('No field changes.')).toHaveLength(1)
   })
 
-  it('renders same-name nullability changes and unknown nullability evidence', async () => {
+  it('renders actual nullability changes without no-change evidence', async () => {
     store.transformVersion = 'v2'
     store.transformUpgradeCanvasId = 'target'
     store.transformUpgradeNodeId = 'node-1'
@@ -500,11 +500,11 @@ describe('TransformsLibrary', () => {
 
     render(<TransformsLibrary />)
 
-    expect(await screen.findByText(/nullability is not proven on both versions/)).toBeVisible()
-    expect(screen.getByText(/field became non-nullable/)).toBeVisible()
-    expect(screen.getByText('changed · unknown')).toBeVisible()
+    expect(await screen.findByText(/field became non-nullable/)).toBeVisible()
+    expect(screen.queryByText(/nullability is not proven on both versions/)).not.toBeInTheDocument()
+    expect(screen.queryByText('changed · unknown')).not.toBeInTheDocument()
     expect(screen.getByText('changed · breaking')).toBeVisible()
-    expect(screen.queryByText('No field changes.')).not.toBeInTheDocument()
+    expect(screen.getByText('No field changes.')).toBeVisible()
   })
 
   it('keeps a committed upgrade non-retryable when its Canvas cannot be opened', async () => {

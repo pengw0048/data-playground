@@ -189,6 +189,25 @@ describe('DatasetRevisionHistory', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 
+  it('keeps unchanged schema evidence and storage internals out of the version summary', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-1'))
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer
+      initialRevisionId="rev-2" initialRevisionDatasetId="dataset-stable"
+      viewerDetail={detail('rev-2', { parentRevisionId: 'rev-1' })} />)
+
+    expect(await screen.findByText('Rows')).toBeInTheDocument()
+    expect(screen.getByText('Size')).toBeInTheDocument()
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-stable', 'rev-1'))
+    expect(screen.queryByText('Schema compatibility with parent')).not.toBeInTheDocument()
+    expect(screen.queryByText(/nullability is not proven/)).not.toBeInTheDocument()
+    expect(screen.queryByText('comparison unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText('Data files')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fragments')).not.toBeInTheDocument()
+  })
+
   it('preserves Canvas return context when the full-page viewer switches revisions', async () => {
     store.workspaceDatasetQuery = new URLSearchParams({
       revision: 'rev-current',
