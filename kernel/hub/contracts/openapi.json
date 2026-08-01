@@ -866,6 +866,11 @@
             ],
             "title": "Rowcount"
           },
+          "sourceDeleteAllowed": {
+            "default": false,
+            "title": "Sourcedeleteallowed",
+            "type": "boolean"
+          },
           "tags": {
             "default": [],
             "items": {
@@ -19556,6 +19561,16 @@
             }
           },
           {
+            "in": "query",
+            "name": "delete_source",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Delete Source",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "x-dp-user",
             "required": false,
@@ -28904,6 +28919,90 @@
           }
         },
         "summary": "Canonical Workspace Provider Dataset"
+      }
+    },
+    "/api/workspace/resources/{resource_id}/provider-dataset": {
+      "delete": {
+        "description": "Remove one exact connected-source dataset when that provider declares write support.",
+        "operationId": "remove_workspace_provider_dataset_api_workspace_resources__resource_id__provider_dataset_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "title": "Resource Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Workspace Provider Dataset Api Workspace Resources  Resource Id  Provider Dataset Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Remove Workspace Provider Dataset"
       }
     },
     "/api/workspace/resources/{resource_id}/relink": {

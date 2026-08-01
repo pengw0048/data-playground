@@ -177,7 +177,7 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.getAllByText('output')).toHaveLength(1)
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1',
     )
   })
 
@@ -187,7 +187,7 @@ describe('WritePublicationSummary task-first output states', () => {
 
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
     )
   })
 })

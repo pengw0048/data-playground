@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import type { NodeSpec } from '../nodes/registry'
-import { color, kindAccent, type WireType } from '../theme/tokens'
+import { color, type WireType } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 
 type FinderResult = { spec: NodeSpec; compatible: boolean; match: number }
@@ -236,8 +236,10 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, anchor, bounda
           const cue = secondaryCue(result, shownResults)
           return (
           <button key={result.spec.kind} role="option" aria-selected={index === active} onMouseEnter={() => setActive(index)} onClick={() => choose(result)}
-            className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${index === active ? 'bg-accent' : 'hover:bg-accent/60'}`}>
-            <span className="mt-0.5 h-8 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[result.spec.kind] ?? color.text3 }} />
+            className={`flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left ${index === active ? 'bg-accent' : 'hover:bg-accent/60'}`}>
+            <span aria-hidden="true" className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md border border-border bg-card text-[9px] font-bold uppercase text-muted-foreground">
+              {(result.spec.tag ?? result.spec.kind).slice(0, 2)}
+            </span>
             <span className="min-w-0 flex-1">
               <span className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
                 <span>{result.spec.title}</span>

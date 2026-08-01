@@ -6444,6 +6444,33 @@ def workspace_provider_mark_dataset(
         return _workspace_provider_dataset_doc(row)
 
 
+def workspace_provider_mark_dataset_deleted(
+    *, mount_id: str, provider_dataset_id: str,
+) -> dict:
+    """Retire a provider dataset and every cached occurrence after an explicit source delete."""
+    with session() as s:
+        row = s.get(
+            WorkspaceProviderDataset,
+            (mount_id, provider_dataset_id),
+            with_for_update=True,
+        )
+        if row is None:
+            raise KeyError("Workspace provider dataset not found")
+        row.state = "detached"
+        row.last_error = _workspace_provider_safe_error("detached")
+        row.last_resolved_at = _now()
+        occurrences = list(s.scalars(select(WorkspaceProviderBinding).where(
+            WorkspaceProviderBinding.mount_id == mount_id,
+            WorkspaceProviderBinding.provider_dataset_id == provider_dataset_id,
+            WorkspaceProviderBinding.active.is_(True),
+        ).order_by(WorkspaceProviderBinding.id).with_for_update()))
+        for occurrence in occurrences:
+            occurrence.state = "detached"
+            occurrence.last_error = _workspace_provider_safe_error("detached")
+            occurrence.last_resolved_at = _now()
+        return _workspace_provider_dataset_doc(row)
+
+
 def workspace_provider_dataset(
         *, mount_id: str, provider_dataset_id: str) -> dict | None:
     with session() as s:
@@ -21220,6 +21247,20 @@ def catalog_get(token: str) -> dict | None:
         return _row_to_doc(r, [t.tag for t in s.scalars(select(CatalogTag).where(CatalogTag.uri == r.uri))])
 
 
+def catalog_entry_storage(registration_id: str) -> dict | None:
+    """Return exact storage ownership for one current registration, without alias rebinding."""
+    with session() as s:
+        row = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.registration_id == str(registration_id)).limit(1)).first()
+        if row is None:
+            return None
+        return {
+            "registrationId": row.registration_id,
+            "uri": row.uri,
+            "managed": row.logical_id is not None,
+        }
+
+
 def catalog_resolve_example_sources(refs: list[str]) -> list[dict]:
     """Resolve example Source refs against current local registrations with bounded DB reads.
 
@@ -21683,10 +21724,13 @@ def _catalog_current_logical_ownership(
 
 def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = None,
                          expected_metadata_revision: str | None = None,
-                         report_result: bool = False) -> bool | None:
+                         report_result: bool = False,
+                         remove_workspace_placement: bool = False) -> bool | None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
     declared key/relationships). ``report_result`` lets the versioned HTTP mutation distinguish a
-    committed removal from a concurrent miss without changing the legacy fire-and-forget contract."""
+    committed removal from a concurrent miss without changing the legacy fire-and-forget contract.
+    Explicit user-facing unregister also removes the file-browser placement in this transaction;
+    internal source loss keeps it so deep-link recovery can still explain the missing source."""
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         token = str(uri).rstrip("/")
@@ -21757,6 +21801,11 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
             if catalog_metadata_revision(current_doc, declared_key) != expected_metadata_revision:
                 raise CatalogMetadataConflict(
                     "catalog metadata changed; reload before removing this dataset")
+        if remove_workspace_placement:
+            s.execute(delete(WorkspacePlacement).where(
+                WorkspacePlacement.target_kind == "dataset",
+                WorkspacePlacement.target_id == entry.registration_id,
+            ))
         execution_manifest_candidates.update(
             _delete_catalog_governance(s, catalog_key))
         if current_uri:

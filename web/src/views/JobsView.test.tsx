@@ -563,7 +563,7 @@ describe('JobsView', () => {
     fireEvent.click(row)
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dwrite-run',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dwrite-run',
     )
     expect(screen.queryByRole('button', { name: 'Open result' })).not.toBeInTheDocument()
     expect(screen.queryByText('Receipt:')).not.toBeInTheDocument()
@@ -650,7 +650,7 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
+      '#/workspace/dataset%3Adataset-1?revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
     )
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(1)
   })
@@ -768,7 +768,7 @@ describe('JobsView', () => {
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Ads-logical-9?scope=datasets&revision=rev-9&revisionDataset=ds-logical-9&returnView=jobs&returnQuery=run%3Drestore-1',
+      '#/workspace/dataset%3Ads-logical-9?revision=rev-9&revisionDataset=ds-logical-9&returnView=jobs&returnQuery=run%3Drestore-1',
     )
   })
 

@@ -237,11 +237,11 @@ describe('ManagedSidecarMergeControl', () => {
 
     expect(await screen.findByRole('link', { name: 'Open published child' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Abase-dataset?scope=datasets&revision=base-r5&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
+      '#/workspace/dataset%3Abase-dataset?revision=base-r5&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
     )
     expect(screen.getByRole('link', { name: 'Open saved base' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Abase-dataset?scope=datasets&revision=base-r4&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
+      '#/workspace/dataset%3Abase-dataset?revision=base-r4&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
     )
   })
 

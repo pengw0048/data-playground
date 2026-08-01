@@ -18,10 +18,12 @@ from hub import metadb
 from hub.catalog_provider import (
     CatalogMount,
     CatalogResource,
+    MutableCatalogProvider,
     ProviderPage,
     ProviderSearchPage,
     ReadOnlyCatalogProvider,
     bounded_ancestors,
+    bounded_capabilities,
     bounded_dataset_detail,
     bounded_list_children,
     bounded_resolve,
@@ -66,6 +68,10 @@ class ProviderDatasetGone(ProviderDatasetUnavailable):
 
 class ProviderDatasetOffline(ProviderDatasetUnavailable):
     """A valid provider dataset binding could not be read because its provider is offline."""
+
+
+class ProviderDatasetMutationUnsupported(ProviderDatasetUnavailable):
+    """The mounted provider did not explicitly authorize dataset removal."""
 
 
 class MountConfigError(ValueError):
@@ -294,6 +300,47 @@ def _load_provider(name: str) -> ReadOnlyCatalogProvider:
     if not isinstance(provider, ReadOnlyCatalogProvider):
         raise TypeError("entry point did not return a read-only catalog provider")
     return provider
+
+
+@functools.lru_cache(maxsize=64)
+def _provider_dataset_delete_enabled(
+    provider_name: str, mount_id: str, config_fingerprint: str,
+) -> bool:
+    """Cache one non-secret capability decision for the current mount configuration."""
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id
+                    and item.mount.provider == provider_name
+                    and item.config_fingerprint == config_fingerprint), None)
+    if mounted is None:
+        return False
+    try:
+        provider = _load_provider(provider_name)
+    except Exception:  # noqa: BLE001 -- an unavailable plugin cannot authorize a mutation
+        return False
+    result = bounded_capabilities(
+        provider, mounted.mount, timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
+    return bool(
+        result.state == "ready"
+        and result.item is not None
+        and result.item.delete_dataset
+        and isinstance(provider, MutableCatalogProvider)
+    )
+
+
+def _mounted_dataset_delete_enabled(mounted: _MountedProvider) -> bool:
+    return _provider_dataset_delete_enabled(
+        mounted.mount.provider, mounted.mount.id, mounted.config_fingerprint)
+
+
+def _mounted_dataset_can_delete(mounted: _MountedProvider, dataset_id: object) -> bool:
+    if not isinstance(dataset_id, str) or not _mounted_dataset_delete_enabled(mounted):
+        return False
+    try:
+        provider = _load_provider(mounted.mount.provider)
+        return bool(isinstance(provider, MutableCatalogProvider)
+                    and provider.can_delete_dataset(mounted.mount, dataset_id))
+    except Exception:  # noqa: BLE001 -- a failed capability check never grants mutation authority
+        return False
 
 
 def _mount_fingerprint(mounts: list[_MountedProvider], invalid: bool) -> str:
@@ -624,6 +671,51 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     }
 
 
+def delete_provider_dataset(resource_ref: str, *, uid: str, actor: str) -> dict:
+    """Delete one current canonical dataset through its mounted provider authority."""
+    resolution = resolve(resource_ref, uid=uid)
+    resource = resolution.get("resource")
+    source = resolution.get("source") or {}
+    if (not isinstance(resource, dict) or resource.get("kind") != "dataset"
+            or resource.get("source") != "provider"):
+        raise ValueError("only a connected-source dataset can be removed here")
+    if source.get("completeness") != "complete" or resource.get("lastKnown"):
+        raise ProviderDatasetUnavailable(
+            "reload this dataset before removing it from its source")
+    mount_id = resource.get("mountId")
+    provider_dataset_id = resource.get("providerDatasetId")
+    if not isinstance(mount_id, str) or not isinstance(provider_dataset_id, str):
+        raise ProviderDatasetUnavailable("provider dataset identity is unavailable")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None:
+        raise ProviderDatasetUnavailable("connected source is not configured")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetOffline("connected source is unavailable") from exc
+    if (not isinstance(provider, MutableCatalogProvider)
+            or not _mounted_dataset_can_delete(mounted, provider_dataset_id)):
+        raise ProviderDatasetMutationUnsupported(
+            "this connected source does not support removing datasets")
+    try:
+        removed = provider.delete_dataset(
+            mounted.mount, provider_dataset_id, actor=actor)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise ProviderDatasetOffline(
+            "the connected source did not confirm whether the dataset was removed; reload it") from exc
+    except Exception as exc:  # noqa: BLE001 -- plugin details do not cross the product boundary
+        raise ProviderDatasetUnavailable(
+            "the connected source could not remove this dataset") from exc
+    if not removed:
+        raise ProviderDatasetGone("the dataset no longer exists in its connected source")
+    metadb.workspace_provider_mark_dataset_deleted(
+        mount_id=mount_id, provider_dataset_id=provider_dataset_id)
+    return {"ok": True, "removedFrom": mount_id}
+
+
 def provider_dataset_context(resource_ref: str, *, uid: str,
                              resolve_physical: Callable[[str], object]) -> dict:
     """Return only non-sensitive canonical facts proven by the exact Source admission path."""
@@ -732,7 +824,13 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         ),
         "lastResolvedAt": binding["lastResolvedAt"],
         "localPlacement": local_placement,
-        "providerMutation": False,
+        "providerMutation": (
+            binding["kind"] == "dataset"
+            and state == "current"
+            and canonical_state in {None, "current"}
+            and _mounted_dataset_can_delete(
+                mounted, binding.get("providerDatasetId"))
+        ),
         "canCreateFolder": False,
         "canRenameFolder": False,
         "canDeleteFolder": False,
@@ -1376,8 +1474,8 @@ _PROVIDER_QUERY_REASON = (
     "This source controls the order of its results. Sorting and type filters aren't available here."
 )
 _MIXED_QUERY_REASON = (
-    "This page mixes Workspace items with connected-source results. Open a local folder to sort "
-    "and filter, or open a connected source to browse it in source order."
+    "Items here come from Workspace and a connected source, whose orders cannot be compared "
+    "reliably. This view preserves each source's order; local folders can still be sorted and filtered."
 )
 
 
@@ -1590,6 +1688,11 @@ def browse(container_id: str, *, uid: str, limit: int = 50,
         return mixed_browse_contract(_remote_page(
             container_id, uid=uid, limit=limit, cursor=cursor,
             mounts=mounts, invalid=invalid))
+    if not any(item.container_id == container_id for item in mounts) and not invalid:
+        # A normal local folder has one source, so it keeps ordinary sort/filter capabilities. Only
+        # a real mount point needs the bounded multi-source cursor and source-owned ordering.
+        return browse_local_source(
+            container_id, uid=uid, limit=limit, cursor=cursor, bind_cursor=False)
     return mixed_browse_contract(_mixed_page(
         container_id, uid=uid, limit=limit, cursor=cursor,
         mounts=mounts, invalid=invalid))

@@ -5096,7 +5096,7 @@ def test_workspace_connected_source_final_page_reconciles_removed_bindings(
         assert resolved.json()["resource"]["referenceState"] == "detached"
 
 
-def test_workspace_legacy_mixed_browse_declares_queries_unsupported(workspace_scope):
+def test_workspace_normal_local_browse_keeps_sort_and_filter_capabilities(workspace_scope):
     root = metadb.local_workspace_root()
     with TestClient(app) as client:
         response = client.get(
@@ -5104,11 +5104,105 @@ def test_workspace_legacy_mixed_browse_declares_queries_unsupported(workspace_sc
     assert response.status_code == 200, response.text
     page = response.json()
     assert page["connectedSources"] == []
+    assert page["queryCapabilities"] == {
+        "sort": ["name", "updated"], "kindFilter": True, "reason": None}
+
+
+def test_workspace_default_browse_mixes_local_and_connected_source_roots(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    folder = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-mixed-root")
+    local_child = metadb.workspace_create_container(
+        folder["id"], f"workspace-{token}-local-child")
+    mount_id = f"mixed-{token}"
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/workspace/containers/{folder['id']}", params={"limit": 100})
+
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["container"]["id"] == f"container:{folder['id']}"
+    assert page["connectedSources"] == []
+    assert any(item["id"] == f"container:{local_child['id']}" for item in page["items"])
+    assert any(item.get("source") == "provider" for item in page["items"])
+    assert not any(item["id"].startswith("container:mount.") for item in page["items"])
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
-    assert "mixes Workspace items with connected-source results" in (
-        page["queryCapabilities"]["reason"]
-    )
+    assert "orders cannot be compared reliably" in page["queryCapabilities"]["reason"]
+
+
+def test_workspace_provider_delete_is_capability_driven_and_detaches_cached_dataset(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    folder = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-mutable-source")
+    mount_id = f"mutable-{token}"
+
+    class Provider(_WorkspaceFixtureProvider):
+        def __init__(self):
+            super().__init__()
+            self.deleted: list[tuple[str, str]] = []
+
+        def _resources(self, current_mount_id):
+            deleted_ids = {dataset_id for dataset_id, _actor in self.deleted}
+            return [
+                item for item in _WorkspaceFixtureProvider._resources(current_mount_id)
+                if item.dataset_id not in deleted_ids
+            ]
+
+        def capabilities(self, _mount):
+            return ProviderCapabilities(search=True, delete_dataset=True)
+
+        def can_delete_dataset(self, _mount, dataset_id):
+            return dataset_id == "dataset-a"
+
+        def delete_dataset(self, _mount, dataset_id, *, actor):
+            self.deleted.append((dataset_id, actor))
+            return True
+
+    provider = Provider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    with TestClient(app) as client:
+        page = client.get(
+            f"/api/workspace/containers/{folder['id']}", params={"limit": 100})
+        assert page.status_code == 200, page.text
+        dataset = next(
+            item for item in page.json()["items"]
+            if item.get("providerDatasetId") == "dataset-a")
+        provider_folder = next(
+            item for item in page.json()["items"]
+            if item.get("providerPlacementId") == "container-a")
+        nested = next(
+            item for item in client.get(
+                f"/api/workspace/containers/{provider_folder['id'].removeprefix('container:')}",
+                params={"limit": 100},
+            ).json()["items"]
+            if item.get("providerDatasetId") == "nested-dataset")
+        assert dataset["providerMutation"] is True
+        assert nested["providerMutation"] is False
+
+        removed = client.delete(
+            f"/api/workspace/resources/{dataset['id']}/provider-dataset")
+        assert removed.status_code == 200, removed.text
+        assert removed.json() == {"ok": True, "removedFrom": mount_id}
+
+        resolved = client.get(f"/api/workspace/resources/{dataset['id']}")
+
+    assert provider.deleted == [("dataset-a", metadb.DEFAULT_USER_ID)]
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resource"]["referenceState"] == "detached"
+    assert resolved.json()["resource"]["canonicalReferenceState"] == "detached"
 
 
 def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope):

@@ -94,6 +94,8 @@ export interface CatalogTable {
   description?: string | null
   usage?: number
   metadataRevision?: string | null
+  /** Server-owned capability for atomically deleting one unmanaged local source file. */
+  sourceDeleteAllowed?: boolean
 }
 
 export interface DatasetRevision {

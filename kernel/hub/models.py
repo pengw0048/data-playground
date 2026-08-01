@@ -441,6 +441,9 @@ class CatalogTable(Wire):
     # Fixed-length CAS token for the staged built-in catalog editor. It changes whenever the editable
     # metadata or declared primary key changes, but deliberately does not expose storage internals.
     metadata_revision: str | None = None
+    # True only when the built-in Catalog owns an unmanaged registration for one ordinary local
+    # file. The UI must not guess this from the URI: managed outputs can also use local paths.
+    source_delete_allowed: bool = False
 
 
 CatalogExampleSourceRef = Annotated[str, Field(min_length=1, max_length=8192)]

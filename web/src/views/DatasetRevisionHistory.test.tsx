@@ -153,7 +153,7 @@ describe('DatasetRevisionHistory', () => {
     const link = await screen.findByTestId('revision-open-rev-2')
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable',
+      '#/workspace/dataset%3Adataset-stable?revision=rev-2&revisionDataset=dataset-stable',
     )
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
@@ -222,7 +222,7 @@ describe('DatasetRevisionHistory', () => {
 
     expect(await screen.findByTestId('revision-open-rev-2')).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnCanvas=canvas-1&returnNode=source',
+      '#/workspace/dataset%3Adataset-stable?revision=rev-2&revisionDataset=dataset-stable&returnCanvas=canvas-1&returnNode=source',
     )
   })
 
@@ -240,7 +240,7 @@ describe('DatasetRevisionHistory', () => {
 
     expect(await screen.findByTestId('revision-open-rev-2')).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnView=jobs&returnQuery=status%3Dfailed%26run%3Drun-1',
+      '#/workspace/dataset%3Adataset-stable?revision=rev-2&revisionDataset=dataset-stable&returnView=jobs&returnQuery=status%3Dfailed%26run%3Drun-1',
     )
   })
 
@@ -289,7 +289,7 @@ describe('DatasetRevisionHistory', () => {
     expect(screen.getByText('4 rows · 1 schema field')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Open data' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable',
+      '#/workspace/dataset%3Adataset-stable?revision=rev-2&revisionDataset=dataset-stable',
     )
     expect(screen.queryByText('rev-2')).not.toBeInTheDocument()
     expect(screen.queryByText('dataset-stable')).not.toBeInTheDocument()

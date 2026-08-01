@@ -121,7 +121,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
         // flat card: thin token border, soft shadow. Selection reads as a primary ring (no heavy
         // border); a bypassed node keeps its dashed accent outline (dynamic color → inline).
         className={cn(
-          'overflow-hidden rounded-xl border bg-card shadow-sm transition-[box-shadow,border-color] duration-100',
+          'overflow-hidden rounded-lg border bg-card shadow-sm transition-[box-shadow,border-color] duration-100',
           !bypassed && (selected ? 'border-primary' : 'border-border'),
           selected && 'ring-2 ring-primary/20',
         )}
@@ -131,9 +131,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
         }}
       >
         <div className="flex">
-          {/* accent stripe (kind color → inline; tokens can't express per-node values) */}
-          <div className="w-1.5 shrink-0" style={{ background: bypassed ? 'transparent' : accent }} />
-          <div className="min-w-0 flex-1 pt-[11px] pr-3 pb-3 pl-2.5">
+          <div className="min-w-0 flex-1 px-3 pb-3 pt-[11px]">
             {/* header */}
             <div className="flex items-center gap-[7px]">
               {showRunStatus && <span

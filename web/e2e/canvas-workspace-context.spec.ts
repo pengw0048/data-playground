@@ -129,15 +129,16 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await expect(location).toContainText(`Workspace/${parent}/${child}`)
     await expect(location).not.toContainText(canvas)
 
-    // A Datasets filter cannot prove the Canvas is visible in this folder. Returning must reset
-    // it atomically to All at the exact opaque parent location.
-    await page.goto('/#/workspace?scope=datasets&dq=not-a-canvas-location')
-    await expect(page.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
+    // A global search cannot prove the Canvas is visible in this folder. Returning must clear it
+    // atomically and restore the exact opaque parent location.
+    await page.goto('/#/workspace?q=not-a-canvas-location')
+    await expect(page.getByLabel('Search views, datasets, canvases, and containers'))
+      .toHaveValue('not-a-canvas-location')
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(location).toContainText(child)
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace', { exact: true }).click()
-    await expect(page).not.toHaveURL(/scope=datasets|dq=not-a-canvas-location/)
+    await expect(page).not.toHaveURL(/q=not-a-canvas-location/)
     await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(`${parent}/${child}`)
 
     await page.getByLabel(`Select ${canvas}`).check()

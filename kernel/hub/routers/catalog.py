@@ -395,10 +395,36 @@ def get_table(table_id: str, registration: bool = False) -> CatalogTable:
             binding = metadb.catalog_revision_binding(table_id)
             if binding is None:
                 raise KeyError(table_id)
-            return get_deps().catalog.get_table(binding["uri"])
-        return get_deps().catalog.get_table(table_id)
+            table = get_deps().catalog.get_table(binding["uri"])
+        else:
+            table = get_deps().catalog.get_table(table_id)
+        return table.model_copy(update={"source_delete_allowed": _source_delete_allowed(table)})
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")
+
+
+def _source_delete_allowed(table: CatalogTable) -> bool:
+    """Whether this exact built-in registration can offer an atomic source-file delete."""
+    from hub import paths
+    from hub.plugins.catalog import InMemoryCatalog
+
+    if type(get_deps().catalog) is not InMemoryCatalog or not table.registration_id:
+        return False
+    storage = metadb.catalog_entry_storage(table.registration_id)
+    if storage is None or storage["uri"] != table.uri or storage["managed"]:
+        return False
+    try:
+        raw_path = paths.local_path(table.uri)
+        local_path = paths.checked_local_path(table.uri)
+    except (PermissionError, ValueError):
+        return False
+    return bool(
+        raw_path
+        and local_path
+        and not glob.has_magic(raw_path)
+        and not os.path.islink(os.path.expanduser(raw_path))
+        and not os.path.isdir(local_path)
+    )
 
 
 def _revision_adapter(uri: str) -> object:
@@ -829,6 +855,7 @@ def unregister_table(
     table_id: str,
     expected_registration_id: str = Query(..., min_length=1, max_length=128),
     expected_revision: str = Query(..., min_length=1, max_length=128),
+    delete_source: bool = Query(default=False),
 ) -> dict:
     """Remove one exact dataset only while its editable metadata still matches the caller's read."""
     from hub.plugins.catalog import InMemoryCatalog
@@ -837,6 +864,87 @@ def unregister_table(
     if type(cat) is not InMemoryCatalog:
         raise HTTPException(501, "catalog provider does not support versioned unregister")
     unregister = cat.unregister_if_revision
+    if delete_source:
+        from hub import paths
+
+        try:
+            current = cat.get_table(table_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"table '{table_id}' not found") from exc
+        if (current.registration_id != expected_registration_id
+                or current.metadata_revision != expected_revision):
+            raise HTTPException(
+                409, "catalog metadata changed; reload before removing this dataset")
+        storage = metadb.catalog_entry_storage(expected_registration_id)
+        if storage is None or storage["uri"] != current.uri:
+            raise HTTPException(
+                409, "catalog registration changed; reload before removing this dataset")
+        if storage["managed"]:
+            raise HTTPException(
+                409, "managed outputs can be removed from Workspace, but their files use output retention")
+        try:
+            raw_path = paths.local_path(current.uri)
+            local_path = paths.checked_local_path(current.uri)
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(403, str(exc)) from exc
+        if raw_path is None or local_path is None or glob.has_magic(raw_path):
+            raise HTTPException(422, "only one ordinary local source file can be deleted here")
+        original_path = os.path.expanduser(raw_path)
+        if os.path.islink(original_path) or os.path.isdir(local_path):
+            raise HTTPException(
+                422, "only ordinary local source files can be deleted here; folders and links are kept")
+        staged_path: str | None = None
+        if os.path.exists(local_path):
+            if not os.path.isfile(local_path):
+                raise HTTPException(422, "this local source is not an ordinary file")
+            staged_path = os.path.join(
+                os.path.dirname(local_path),
+                f".dp-delete-{uuid.uuid4().hex}-{os.path.basename(local_path)}",
+            )
+            try:
+                os.replace(local_path, staged_path)
+            except OSError as exc:
+                raise HTTPException(409, "the source file could not be prepared for deletion") from exc
+        try:
+            removed = unregister(table_id, expected_registration_id, expected_revision)
+        except metadb.CatalogMetadataConflict as exc:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise HTTPException(409, str(exc)) from exc
+        except Exception:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise
+        if not removed:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise HTTPException(404, f"table '{table_id}' not found")
+        source_deleted = False
+        warning = None
+        if staged_path is not None:
+            try:
+                os.unlink(staged_path)
+                source_deleted = True
+            except OSError:
+                restored = os.path.exists(local_path)
+                if not os.path.exists(local_path):
+                    try:
+                        os.replace(staged_path, local_path)
+                    except OSError:
+                        pass
+                    restored = os.path.exists(local_path)
+                warning = (
+                    "Dataset removed, but the source file could not be deleted and was kept."
+                    if restored else
+                    "Dataset removed, but the source file could not be deleted or restored "
+                    "to its original path. Contact the workspace operator."
+                )
+        return {
+            "ok": True,
+            "sourceDeleted": source_deleted,
+            "sourceMissing": staged_path is None,
+            "warning": warning,
+        }
     try:
         removed = unregister(table_id, expected_registration_id, expected_revision)
     except metadb.CatalogMetadataConflict as exc:

@@ -270,7 +270,7 @@ export function datasetViewerHash(
   const datasetQuery = params.size ? params.toString() : undefined
   return routeHash(
     'workspace', undefined, workspaceResourceId ?? `dataset:${datasetId}`, undefined, undefined, undefined,
-    undefined, workspaceResourceId ? 'all' : 'datasets', datasetQuery,
+    undefined, 'all', datasetQuery,
   )
 }
 

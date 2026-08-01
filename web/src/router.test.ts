@@ -60,14 +60,12 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({
       view: 'workspace',
       workspaceResourceId: 'dataset:dataset/with spaces',
-      workspaceScope: 'datasets',
     })
 
     window.location.hash = datasetViewerHash('dataset/with spaces', 'revision 9')
     expect(parseHash()).toEqual({
       view: 'workspace',
       workspaceResourceId: 'dataset:dataset/with spaces',
-      workspaceScope: 'datasets',
       workspaceDatasetQuery: new URLSearchParams({
         revision: 'revision 9',
         revisionDataset: 'dataset/with spaces',
@@ -82,7 +80,6 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({
       view: 'workspace',
       workspaceResourceId: 'dataset:dataset/with spaces',
-      workspaceScope: 'datasets',
       workspaceDatasetQuery: new URLSearchParams({
         revision: 'revision 9',
         revisionDataset: 'dataset/with spaces',
@@ -101,7 +98,6 @@ describe('Workspace routes', () => {
     expect(jobsRoute).toEqual({
       view: 'workspace',
       workspaceResourceId: 'dataset:dataset/with spaces',
-      workspaceScope: 'datasets',
       workspaceDatasetQuery: new URLSearchParams({
         revision: 'revision 9',
         revisionDataset: 'dataset/with spaces',

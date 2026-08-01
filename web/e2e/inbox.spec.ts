@@ -132,7 +132,7 @@ test('returns from an exact Inbox dataset to the originating filter @ux-smoke', 
   const exactDataset = page.getByRole('link', { name: 'Open dataset' })
   await expect(exactDataset).toHaveAttribute(
     'href',
-    '#/workspace/dataset%3Adataset-inbox?scope=datasets&revision=rev-inbox&revisionDataset=dataset-inbox&returnView=inbox&returnQuery=filter%3Dunread',
+    '#/workspace/dataset%3Adataset-inbox?revision=rev-inbox&revisionDataset=dataset-inbox&returnView=inbox&returnQuery=filter%3Dunread',
   )
   await exactDataset.click()
   const viewer = page.getByTestId('dataset-viewer')

@@ -6,7 +6,7 @@ import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useInputColumns, useSchemaWarnings } from '../nodes/fields'
 import { codeHash, outputPortId } from '../nodes/schema'
-import { color, status as statusTok, kindAccent } from '../theme/tokens'
+import { status as statusTok } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog, type SaveDialogDraft } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
@@ -310,7 +310,9 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* header */}
       <div className="flex flex-col gap-2 border-b border-border px-3.5 py-3">
         <div className="flex items-center gap-2">
-          <span className="h-[26px] w-1 flex-none rounded-sm" style={{ background: kindAccent[kind] ?? color.text3 }} />
+          <span aria-hidden="true" className="grid h-6 w-6 flex-none place-items-center rounded border border-border bg-muted text-[8px] font-bold uppercase text-muted-foreground">
+            {(spec?.tag ?? kind).slice(0, 2)}
+          </span>
           <input
             value={name}
             disabled={!canEdit}

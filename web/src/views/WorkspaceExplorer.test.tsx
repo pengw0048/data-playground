@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
   unregisterTable: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
 }))
@@ -81,8 +81,15 @@ vi.mock('./CatalogDiscovery', () => ({
     {workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
       && <button onClick={onRetryWorkspaceLocation}>Retry</button>}
   </div>,
-  CatalogDetail: ({ table, onClose, onUse }: { table: { name: string }; onClose: () => void; onUse: (table: { name: string }) => void }) =>
-    <div data-testid="catalog-detail">{table.name}<button onClick={() => onUse(table)}>Use</button><button onClick={onClose}>close detail</button></div>,
+  CatalogDetail: ({ table, onClose, onUse, initialRevisionId, initialRevisionDatasetId, backLabel }: {
+    table: { name: string }; onClose: () => void; onUse: (table: { name: string }) => void
+    initialRevisionId?: string; initialRevisionDatasetId?: string; backLabel?: string
+  }) => <div data-testid="catalog-detail">
+    {table.name}
+    <span>Exact deep link: {initialRevisionDatasetId ?? 'none'}@{initialRevisionId ?? 'none'}</span>
+    <span>Detail back: {backLabel ?? 'default'}</span>
+    <button onClick={() => onUse(table)}>Use</button><button onClick={onClose}>Close dataset</button>
+  </div>,
 }))
 
 import { WorkspaceExplorer } from './WorkspaceExplorer'
@@ -150,6 +157,7 @@ describe('WorkspaceExplorer', () => {
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
     mocks.unregisterTable.mockResolvedValue({ ok: true })
+    mocks.removeProviderDataset.mockResolvedValue({ ok: true, removedFrom: 'warehouse' })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
     mocks.previewDatasetView.mockResolvedValue({
       columns: [{ fieldId: 'frame_id', name: 'frame_id', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
@@ -174,7 +182,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('button', { name: 'Open dataset observations' })).not.toBeInTheDocument()
     expect(screen.queryByTestId('first-run-canvas-choice')).not.toBeInTheDocument()
     expect(screen.queryByText('local draft warning')).not.toBeInTheDocument()
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined, source: 'local' })
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
   })
 
   it('exposes both add-data choices directly from All Workspace', async () => {
@@ -210,46 +218,45 @@ describe('WorkspaceExplorer', () => {
   })
 
   it('preserves a receipt logical revision identity and route while resolving its current registration', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:logical-receipt'
+    store.workspaceResourceId = DATASET.id
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
     render(<WorkspaceExplorer />)
 
-    expect(screen.getByText('Exact deep link: logical-receipt@rev-receipt')).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Open receipt dataset' }))
-    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith('dataset:registration-current')
+    expect(await screen.findByText('Exact deep link: logical-receipt@rev-receipt')).toBeVisible()
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith('dataset-1')
     expect(store.setWorkspaceDatasetQuery).not.toHaveBeenCalledWith(expect.not.stringContaining('revision=rev-receipt'))
   })
 
   it('clears both exact revision fields when the user selects another dataset', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:registration-current'
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete',
+    })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Open dataset observations' }))
     await waitFor(() => expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(''))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(DATASET.id)
   })
 
   it('clears both exact revision fields when the user closes the exact dataset', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceResourceId = DATASET.id
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
     render(<WorkspaceExplorer />)
 
-    expect(screen.getByText('Detail back: Back to Workspace')).toBeVisible()
+    expect(await screen.findByText('Detail back: Back to Workspace')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
-    await waitFor(() => expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(''))
-    expect(store.setWorkspaceResource).toHaveBeenCalledWith(null)
+    await waitFor(() => expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', {
+      resourceId: 'container:workspace-local-root', datasetQuery: '',
+    }))
   })
 
   it('returns a Canvas-origin exact viewer to its original selected node', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceResourceId = DATASET.id
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt&returnCanvas=canvas-1&returnNode=write'
     render(<WorkspaceExplorer />)
 
-    expect(screen.getByText('Detail back: Back to Canvas')).toBeVisible()
+    expect(await screen.findByText('Detail back: Back to Canvas')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
 
     expect(store.activateLoadedCanvasRoute).toHaveBeenCalledWith('canvas-1', 'write')
@@ -262,9 +269,8 @@ describe('WorkspaceExplorer', () => {
   it.each([
     ['jobs', 'status=failed&run=run-7', 'Back to Jobs'],
     ['inbox', 'filter=unread', 'Back to Inbox'],
-  ] as const)('returns an exact viewer to its originating %s context', (view, returnQuery, label) => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:registration-current'
+  ] as const)('returns an exact viewer to its originating %s context', async (view, returnQuery, label) => {
+    store.workspaceResourceId = DATASET.id
     store.workspaceDatasetQuery = new URLSearchParams({
       dq: 'published',
       revision: 'rev-receipt',
@@ -274,23 +280,22 @@ describe('WorkspaceExplorer', () => {
     }).toString()
     render(<WorkspaceExplorer />)
 
-    expect(screen.getByText(`Detail back: ${label}`)).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+    expect(await screen.findByText(`Detail back: ${label}`)).toBeVisible()
+    fireEvent.click(await screen.findByRole('button', { name: 'Close dataset' }))
 
-    expect(store.returnFromWorkspaceDatasetViewer).toHaveBeenCalledWith(view, returnQuery, 'dq=published')
+    expect(store.returnFromWorkspaceDatasetViewer).toHaveBeenCalledWith(view, returnQuery, '')
     expect(store.activateLoadedCanvasRoute).not.toHaveBeenCalled()
     expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(null)
   })
 
   it('loads the return Canvas only when it is no longer the live in-memory document', async () => {
     store.doc = { id: 'different-canvas', version: 3 }
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceResourceId = DATASET.id
     store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt&returnCanvas=canvas-1&returnNode=write'
     render(<WorkspaceExplorer />)
 
     store.activateLoadedCanvasRoute.mockReturnValue(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Close dataset' }))
 
     await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('canvas-1', { skipViewportFit: true }))
     expect(store.activateLoadedCanvasRoute).toHaveBeenLastCalledWith('canvas-1', 'write')
@@ -304,7 +309,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByTestId('workspace-next-page'))
-    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2', source: 'local' }))
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2' }))
     expect(await screen.findByText('observations')).toBeInTheDocument()
     expect(screen.queryByText('Research')).not.toBeInTheDocument()
   })
@@ -320,7 +325,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByText('observations')).toBeVisible()
     expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', {
-      limit: 50, cursor: 'sparse-page-2', source: 'local',
+      limit: 50, cursor: 'sparse-page-2',
     })
   })
 
@@ -476,15 +481,15 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.tableByRegistration.mockResolvedValue({
       id: 'table-1', registrationId: 'dataset-1', metadataRevision: 'metadata-7',
-      name: 'observations', uri: 'file:///observations.parquet', columns: [],
+      name: 'observations', uri: 'file:///observations.parquet', columns: [], sourceDeleteAllowed: false,
     })
     render(<WorkspaceExplorer />)
 
     fireEvent.contextMenu(await screen.findByRole('button', { name: 'Open dataset observations' }))
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove dataset…' }))
     const dialog = screen.getByRole('dialog', { name: 'Remove observations' })
-    expect(dialog).toHaveTextContent('The source file stays on disk.')
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove dataset' }))
+    expect(dialog).toHaveTextContent('Keep the source file so it can be registered again.')
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Remove dataset' }))
 
     await waitFor(() => expect(mocks.unregisterTable).toHaveBeenCalledWith(
       'table-1', 'dataset-1', 'metadata-7',
@@ -492,7 +497,49 @@ describe('WorkspaceExplorer', () => {
     expect(store.pushToast).toHaveBeenCalledWith('Dataset removed from Workspace', 'success')
   })
 
-  it('explains provider dataset deletion as a read-only source limitation', async () => {
+  it('offers source-file deletion only when the server authorizes that exact local registration', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.tableByRegistration.mockResolvedValue({
+      id: 'table-1', registrationId: 'dataset-1', metadataRevision: 'metadata-7',
+      name: 'observations', uri: 'file:///data/observations.parquet', columns: [], sourceDeleteAllowed: true,
+    })
+    mocks.unregisterTable.mockResolvedValue({ ok: true, sourceDeleted: true })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Open dataset observations' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove dataset…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Remove observations' })
+    const deleteOption = await within(dialog).findByRole('radio', { name: /Delete the source file too/ })
+    expect(dialog).toHaveTextContent('/data/observations.parquet')
+    fireEvent.click(deleteOption)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete file and remove' }))
+
+    await waitFor(() => expect(mocks.unregisterTable).toHaveBeenCalledWith(
+      'table-1', 'dataset-1', 'metadata-7', true,
+    ))
+  })
+
+  it('removes a provider dataset through an explicitly writable connected source', async () => {
+    const removable = { ...EXTERNAL_DATASET, providerMutation: true }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [removable], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    store.workspaceResourceId = EXTERNAL_FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_FOLDER, ancestors: [ROOT], source: PROVIDER_COMPLETE })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: /Open dataset observations from Connected source/ }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Remove dataset…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Remove observations from warehouse' })
+    expect(dialog).toHaveTextContent('underlying data stays in its storage')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove from source' }))
+
+    await waitFor(() => expect(mocks.removeProviderDataset).toHaveBeenCalledWith(removable.id))
+    expect(store.pushToast).toHaveBeenCalledWith('Dataset removed from its connected source', 'success')
+  })
+
+  it('explains when a connected source does not expose dataset removal', async () => {
     mocks.workspaceBrowse.mockResolvedValue({
       container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
       completeness: 'complete', sources: [PROVIDER_COMPLETE],
@@ -502,9 +549,9 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.contextMenu(await screen.findByRole('button', { name: /Open dataset observations from Connected source/ }))
-    const unavailable = await screen.findByRole('menuitem', { name: /Delete unavailable/ })
+    const unavailable = await screen.findByRole('menuitem', { name: /Remove unavailable/ })
     expect(unavailable).toHaveAttribute('data-disabled')
-    expect(unavailable).toHaveTextContent('warehouse is read-only here')
+    expect(unavailable).toHaveTextContent('warehouse did not expose dataset removal')
   })
 
   it('keeps non-empty local Folder deletion non-destructive and offers opening the Folder instead', async () => {
@@ -639,7 +686,7 @@ describe('WorkspaceExplorer', () => {
     fireEvent.change(sort, { target: { value: 'name-desc' } })
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
-      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc' },
+      { limit: 50, cursor: undefined, sort: 'name', order: 'desc' },
     ))
 
     fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
@@ -647,7 +694,7 @@ describe('WorkspaceExplorer', () => {
     })
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
-      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc', kinds: ['canvas'] },
+      { limit: 50, cursor: undefined, sort: 'name', order: 'desc', kinds: ['canvas'] },
     ))
   })
 
@@ -688,7 +735,7 @@ describe('WorkspaceExplorer', () => {
     )
   })
 
-  it('renders configured mounts as explicit connected source folders', async () => {
+  it('mixes connected-source roots beside local items without a second Workspace section', async () => {
     const providerRoot = {
       ...EXTERNAL_FOLDER,
       id: 'container:mount.bHVtYS1zdGFnaW5n',
@@ -699,21 +746,23 @@ describe('WorkspaceExplorer', () => {
       localPlacement: null,
     }
     mocks.workspaceBrowse.mockResolvedValue({
-      container: ROOT, items: [CANVAS], connectedSources: [providerRoot],
+      container: ROOT, items: [providerRoot, CANVAS], connectedSources: [],
       nextCursor: null, hasMore: false, completeness: 'complete',
-      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
-      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
+      queryCapabilities: {
+        sort: [], kindFilter: false,
+        reason: "Items here come from Workspace and a connected source, whose orders cannot be compared reliably.",
+      },
     })
     render(<WorkspaceExplorer />)
 
-    const section = await screen.findByRole('region', { name: 'Connected sources' })
-    fireEvent.click(within(section).getByRole('button', { name: 'Open folder luma-staging from Connected source luma-staging · fixture' }))
+    expect(screen.queryByRole('region', { name: 'Connected sources' })).not.toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: 'Open folder luma-staging from Connected source luma-staging · fixture' }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
-
-    fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
-      target: { value: 'canvas' },
-    })
-    await waitFor(() => expect(screen.queryByRole('region', { name: 'Connected sources' })).not.toBeInTheDocument())
+    expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
+    expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
+      'whose orders cannot be compared reliably',
+    )
   })
 
   it('moves multiple selected Canvases with one atomic Workspace request', async () => {
@@ -1231,255 +1280,6 @@ describe('WorkspaceExplorer', () => {
     expect(retryRequest.requestId).not.toBe(firstRequest.requestId)
     expect(store.openFile).toHaveBeenCalledTimes(1)
     expect(store.openFile).toHaveBeenCalledWith('current-canvas')
-  })
-
-  it('labels the bounded local Catalog scope and preserves independent URL state', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceResourceId = 'dataset:dataset-1'
-    render(<WorkspaceExplorer />)
-
-    expect(await screen.findByTestId('catalog-discovery')).toHaveTextContent('Selected registration: dataset-1')
-    expect(screen.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
-    expect(screen.getByTestId('catalog-discovery')).toHaveTextContent('Catalog title: Datasets')
-    expect(screen.queryByText('Datasets registered in Data Playground. Mounted provider datasets appear in All Workspace.')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Workspace search')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Change dataset query' }))
-    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(
-      'dq=robot+hands&folder=robotics&tags=gold&columns=frame_id&sort=updated&order=desc&match=meaning',
-    )
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:dataset-1')
-  })
-
-  it('translates a nested Datasets folder into its exact opaque Catalog projection', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceDatasetQuery = 'folder=robotics'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('tab', { name: 'All' }))
-    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith('dataset:dataset-1'))
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', { resourceId: CATALOG_FOLDER.id })
-  })
-
-  it('switches the root Datasets scope back to the Workspace root without inventing a folder identity', async () => {
-    store.workspaceScope = 'datasets'
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('tab', { name: 'All' }))
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all')
-    expect(mocks.workspaceResource).not.toHaveBeenCalled()
-  })
-
-  it('keeps a current projected folder when switching from All Workspace to Datasets', async () => {
-    mocks.workspaceBrowse.mockResolvedValue({
-      container: CATALOG_FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete',
-      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(await screen.findByRole('tab', { name: 'Datasets' }))
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('datasets', {
-      resourceId: CATALOG_FOLDER.id, datasetQuery: 'folder=robotics',
-    })
-  })
-
-  it('does not fall back to a same-named local folder when a Catalog folder cannot be resolved', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceDatasetQuery = 'folder=robotics'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, { ...FOLDER, name: 'robotics' }],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('tab', { name: 'All' }))
-    await waitFor(() => expect(screen.getByRole('tab', { name: 'All' })).toBeDisabled())
-    expect(screen.getByRole('tab', { name: 'All' })).toHaveAttribute(
-      'title', 'This folder is not currently available in Workspace.',
-    )
-    expect(store.switchWorkspaceScope).not.toHaveBeenCalledWith('all', expect.anything())
-  })
-
-  it('offers an explicit retry for a partial folder resolution', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceDatasetQuery = 'folder=robotics'
-    mocks.workspaceResource.mockResolvedValueOnce({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'partial', error: 'catalog temporarily offline' },
-    }).mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('tab', { name: 'All' }))
-    const tab = screen.getByRole('tab', { name: 'All' })
-    await waitFor(() => expect(tab).toBeDisabled())
-    expect(tab.getAttribute('title')).toContain('This folder is not currently available in Workspace.')
-    fireEvent.click(screen.getByRole('button', { name: 'Retry Workspace location' }))
-
-    await waitFor(() => expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', {
-      resourceId: CATALOG_FOLDER.id,
-    }))
-  })
-
-  it('opens a dataset detail in the exact resolved Workspace folder', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace' })
-    await waitFor(() => expect(open).toBeEnabled())
-    fireEvent.click(open)
-    await waitFor(() => expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', { resourceId: CATALOG_FOLDER.id }))
-  })
-
-  it('opens a root dataset detail at the exact Workspace root', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: { ...DATASET, id: 'dataset:root-dataset', parentId: ROOT.id }, ancestors: [ROOT],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open root dataset' }))
-    const open = screen.getByRole('button', { name: 'Open root in Workspace' })
-    await waitFor(() => expect(open).toBeEnabled())
-    fireEvent.click(open)
-
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all')
-  })
-
-  it('disables an unresolvable dataset location without offering a false retry', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, { ...FOLDER, name: 'robotics' }],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace' })
-    await waitFor(() => expect(open).toBeDisabled())
-    expect(open).toHaveAttribute('title', 'This dataset is not currently available in Workspace.')
-    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
-    expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
-  })
-
-  it('does not borrow another dataset projection when the selected registration is detached', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, { ...FOLDER, name: 'robotics' }],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    mocks.tablesPage.mockResolvedValue({
-      items: [{ id: 'other', registrationId: 'other-registration', name: 'other', uri: 'file:///other.parquet', folder: 'robotics', columns: [] }],
-      total: 1, hasMore: false,
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace' })
-    await waitFor(() => expect(open).toHaveAttribute(
-      'title', 'This dataset is not currently available in Workspace.',
-    ))
-    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
-    expect(mocks.tablesPage).not.toHaveBeenCalled()
-  })
-
-  it('does not offer retry for a stable dataset-resolution error', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockRejectedValue(Object.assign(new Error('dataset missing'), { status: 404 }))
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace' })
-    await waitFor(() => expect(open.getAttribute('title')).toContain('dataset missing'))
-    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
-  })
-
-  it('offers retry for a transient dataset-resolution error', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockRejectedValue(Object.assign(new Error('catalog unavailable'), { status: 503 }))
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible())
-  })
-
-  it('retries a partial dataset location and opens only the recovered opaque folder', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceResource.mockResolvedValueOnce({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'partial', error: 'catalog temporarily offline' },
-    }).mockResolvedValue({
-      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-      source: { id: 'local', kind: 'local', completeness: 'complete' },
-    })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
-    const open = screen.getByRole('button', { name: 'Open in Workspace' })
-    await waitFor(() => expect(open).toBeDisabled())
-    expect(open.getAttribute('title')).toContain('This dataset is not currently available in Workspace.')
-    expect(open.getAttribute('title')).toContain('catalog temporarily offline')
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    await waitFor(() => expect(open).toBeEnabled())
-    fireEvent.click(open)
-
-    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', { resourceId: CATALOG_FOLDER.id })
-  })
-
-  it('ignores an obsolete folder resolution after the Datasets route changes', async () => {
-    store.workspaceScope = 'datasets'
-    store.workspaceDatasetQuery = 'folder=robotics'
-    store.workspaceResourceId = 'dataset:dataset-1'
-    let finish!: (value: unknown) => void
-    const pending = new Promise<unknown>((resolve) => { finish = resolve })
-    mocks.workspaceResource.mockReturnValueOnce(pending)
-    const { rerender } = render(<WorkspaceExplorer />)
-
-    fireEvent.click(screen.getByRole('tab', { name: 'All' }))
-    store.workspaceDatasetQuery = 'folder=other'
-    store.workspaceResourceId = 'dataset:dataset-2'
-    rerender(<WorkspaceExplorer />)
-    await act(async () => {
-      finish({
-        resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
-        source: { id: 'local', kind: 'local', completeness: 'complete' },
-      })
-      await pending
-    })
-
-    expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
-  })
-
-  it('uses a multi-dataset selection in one exact new Canvas destination', async () => {
-    store.workspaceScope = 'datasets'
-    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'batch-canvas', created: true, resource: CANVAS })
-    render(<WorkspaceExplorer />)
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Use selected datasets' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Use 2 datasets' })
-    expect(dialog).toHaveTextContent('2 datasets')
-    expect(dialog).not.toHaveTextContent('Bounded to 50 datasets')
-    expect(dialog).not.toHaveTextContent('atomically')
-    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
-    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
-      containerId: 'workspace-local-root', expectedContainerVersion: 1,
-      name: '2 datasets exploration', datasetIds: ['dataset-1', 'dataset-2'],
-    }))
-    expect(store.openFile).toHaveBeenCalledWith('batch-canvas')
-    expect(store.select).not.toHaveBeenCalled()
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', { limit: 1, source: 'local' })
   })
 
   it('confirms a placement-only canvas move and offers a versioned undo', async () => {

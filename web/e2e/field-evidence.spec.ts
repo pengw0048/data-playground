@@ -26,29 +26,23 @@ test('Workspace renders bounded field evidence and opens only its resolved targe
     },
   }
 
-  // Selecting a dataset from the page intentionally reuses its bounded list row rather than
-  // refetching it. Replace only that list response; the later logical target lookup remains a
+  // Replace only the selected registration detail. The later logical target lookup remains a
   // separate request and proves the UI does not substitute a different head.
-  await page.route(/\/api\/catalog\/tables\?.+$/, async (route) => {
+  await page.route(/\/api\/catalog\/tables\/[^?]+\?registration=true$/, async (route) => {
     const response = await route.fetch()
-    const body = await response.json() as { items?: CatalogTable[] }
-    await route.fulfill({ response, json: {
-      ...body,
-      items: body.items?.map((table) => table.id === source.id ? { ...table, columns: [evidenceColumn] } : table),
-    } })
+    const body = await response.json() as CatalogTable
+    await route.fulfill({ response, json: body.id === source.id
+      ? { ...body, columns: [evidenceColumn] }
+      : body })
   })
-  await page.goto('/#/workspace?scope=datasets')
-  await page.getByRole('button', { name: `Open dataset ${source.name}` }).click()
+  await page.goto(`/#/workspace/${encodeURIComponent(`dataset:${source.registrationId ?? source.id}`)}`)
   await expect(page.getByRole('region', { name: source.name })).toBeVisible()
   await page.getByRole('button', { name: 'Inspect evidence for foreign_id' }).click()
 
   const evidence = page.getByTestId('field-evidence-foreign_id')
   await expect(evidence).toContainText(target!.registrationId)
   await expect(evidence).toContainText('target-r7')
-  await expect(evidence.getByText('Diagnostics')).toBeVisible()
   await expect(evidence.getByText('bounded annotation')).not.toBeVisible()
-  await evidence.getByText('Diagnostics').click()
-  await expect(evidence.getByText('bounded annotation')).toBeVisible()
   await expect(evidence).toContainText(target!.name)
   const currentCatalogLink = page.getByRole('link', { name: 'Open current catalog entry' })
   await expect(currentCatalogLink).toBeInViewport()

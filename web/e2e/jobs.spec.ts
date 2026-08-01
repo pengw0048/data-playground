@@ -329,7 +329,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
   await expect(exactDataset).toHaveAttribute(
     'href',
-    '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-task-1',
+    '#/workspace/dataset%3Adataset-1?revision=rev-published&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-task-1',
   )
   await exactDataset.click()
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')

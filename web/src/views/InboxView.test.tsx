@@ -300,7 +300,7 @@ describe('InboxView', () => {
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Ads-logical-7?scope=datasets&revision=rev-7&revisionDataset=ds-logical-7&returnView=inbox&returnQuery=filter%3Dunread',
+      '#/workspace/dataset%3Ads-logical-7?revision=rev-7&revisionDataset=ds-logical-7&returnView=inbox&returnQuery=filter%3Dunread',
     )
   })
 

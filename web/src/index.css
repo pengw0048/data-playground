@@ -7,30 +7,31 @@
 @tailwind components;
 @tailwind utilities;
 
-/* shadcn design tokens — a clean neutral (slate) palette with a blue brand primary. HSL triples so
-   Tailwind's hsl(var(--x)) mapping works. This is the new source of truth the migrated UI reads. */
+/* Compact, neutral application chrome inspired by Figma UI3: white work surfaces, low-contrast
+   separators, and one bright blue reserved for focus and selection. HSL triples keep Tailwind's
+   hsl(var(--x)) mapping working. */
 @layer base {
   :root {
     --background: 0 0% 100%;
-    --foreground: 222 24% 12%;
+    --foreground: 0 0% 12%;
     --card: 0 0% 100%;
-    --card-foreground: 222 24% 12%;
+    --card-foreground: 0 0% 12%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222 24% 12%;
-    --primary: 217 89% 58%;
+    --popover-foreground: 0 0% 12%;
+    --primary: 204 100% 50%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 220 16% 96%;
-    --secondary-foreground: 222 20% 20%;
-    --muted: 220 16% 96%;
-    --muted-foreground: 220 9% 46%;
-    --accent: 220 16% 95%;
-    --accent-foreground: 222 20% 20%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 18%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 42%;
+    --accent: 0 0% 95%;
+    --accent-foreground: 0 0% 12%;
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --border: 220 14% 91%;
-    --input: 220 14% 91%;
-    --ring: 217 89% 58%;
-    --radius: 0.6rem;
+    --border: 0 0% 88%;
+    --input: 0 0% 82%;
+    --ring: 204 100% 50%;
+    --radius: 0.375rem;
   }
   [data-theme='dark'] {
     --background: 222 24% 10%;
@@ -56,30 +57,30 @@
 }
 
 :root {
-  --canvas: #f7f8fa;
+  --canvas: #f1f1f1;
   /* NOTE: --card and --border are OWNED by the shadcn tokens above (HSL triples, with a dark variant).
      They are intentionally NOT redefined here — a hex copy would (as an unlayered rule) shadow the
      shadcn value and break both `hsl(var(--card))` and dark mode. Use `bg-card`/`border-border`, or
      `hsl(var(--border))` in raw CSS. */
-  --hairline: #eef1f4;
-  --ink: #171a21;
-  --text-2: #5b616e;
-  --text-3: #98a0ac;
-  --wire: #aab0ba;
-  --wire-active: #2f7ff5;
-  --focus: #2f7ff5;
+  --hairline: #eeeeee;
+  --ink: #1e1e1e;
+  --text-2: #666666;
+  --text-3: #8a8a8a;
+  --wire: #9b9b9b;
+  --wire-active: #0099ff;
+  --focus: #0099ff;
   /* the embedded dataset viewer is light, consistent with the rest of the UI */
   --viewer-bg: #ffffff;
-  --viewer-2: #f6f7f9;
-  --viewer-line: #ececef;
-  --viewer-text: #1a1c22;
-  --viewer-text-2: #565a63;
+  --viewer-2: #f5f5f5;
+  --viewer-line: #e5e5e5;
+  --viewer-text: #1e1e1e;
+  --viewer-text-2: #666666;
   /* light code surface for inline cells + the code panel */
-  --code-bg: #f6f7f9;
+  --code-bg: #f5f5f5;
   --code-text: #24303f;
   --code-sql: #1f6f5c;
-  --dots: #d6d9df;              /* React Flow background dots */
-  --scrollbar-thumb: #d3d6dc;
+  --dots: #c9c9c9;              /* React Flow background dots */
+  --scrollbar-thumb: #c8c8c8;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
@@ -126,7 +127,7 @@ html, body, #root {
 body {
   font-family: var(--font-sans);
   color: var(--ink);
-  background: var(--canvas);
+  background: hsl(var(--background));
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   font-size: 13px;
@@ -154,7 +155,7 @@ input, textarea, select { font-family: inherit; }
   box-shadow: 0 0 0 2px var(--focus);
   border-radius: 2px;
 }
-.react-flow__minimap { border-radius: 10px; overflow: hidden; border: 1px solid hsl(var(--border)); }
+.react-flow__minimap { border-radius: 6px; overflow: hidden; border: 1px solid hsl(var(--border)); }
 
 /* Files home cards — visible focus for the open/delete controls (native buttons). */
 .dp-file-card:focus-visible,
@@ -185,7 +186,7 @@ input, textarea, select { font-family: inherit; }
 .dp-input {
   width: 100%;
   border: 1px solid hsl(var(--border));
-  border-radius: 8px;
+  border-radius: 6px;
   background: hsl(var(--card));
   padding: 6px 9px;
   font-size: 12.5px;

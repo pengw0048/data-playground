@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { useReactFlow, useViewport } from '@xyflow/react'
 import { allSpecs } from '../nodes'
 import { useStore, roleCanEdit } from '../store/graph'
-import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens'
+import { categoryOrder, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
@@ -86,7 +86,7 @@ export function Toolbar() {
       {doc.nodes.length > 0 && <CanvasViewportControls />}
       {canEdit && (
         <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
-          <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-2xl border border-border bg-card p-1.5 shadow-lg">
+          <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-lg border border-border bg-card p-1 shadow-lg">
             <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className="flex min-w-0 items-center gap-1">
               {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Add</span>}
               {cats.map((cat) => (
@@ -110,9 +110,8 @@ export function Toolbar() {
                   type="button"
                   aria-pressed={agentOpen}
                   onClick={() => setAgentOpen(!agentOpen)}
-                  className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
-                  // Agent brand accent (violet) — no design token expresses it; matches the AgentDock it opens.
-                  style={{ background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6' }}
+                  className={cn('inline-flex items-center gap-[7px] rounded-md px-3 py-[7px] text-[12.5px] font-semibold',
+                    agentOpen ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground')}
                 >
                   <Icon name="sparkle" size={14} /> Agent
                 </button>
@@ -235,7 +234,9 @@ function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {
             onClick={(e) => { e.stopPropagation(); onPick(s.kind) }}
             className="flex w-full items-center gap-[9px] rounded-md px-2 py-[7px] text-left hover:bg-accent"
           >
-            <span className="h-[15px] w-1 rounded-sm" style={{ background: kindAccent[s.kind] ?? color.text3 }} />
+            <span aria-hidden="true" className="grid h-6 w-6 shrink-0 place-items-center rounded border border-border bg-card text-[8.5px] font-bold uppercase text-muted-foreground">
+              {(s.tag ?? s.kind).slice(0, 2)}
+            </span>
             <span className="flex flex-col">
               <span className="text-[12.5px] font-semibold text-foreground">{s.title}</span>
               <span className="text-[10px] text-muted-foreground">{s.blurb}</span>

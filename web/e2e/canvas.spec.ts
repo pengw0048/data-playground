@@ -2619,7 +2619,7 @@ test.describe('Data Playground canvas', () => {
       await expect(page).toHaveURL(
         new RegExp(
           `#\\/workspace\\/dataset%3A${encodeURIComponent(exact.datasetId)}`
-          + `\\?scope=datasets&revision=${encodeURIComponent(alternateRevisionId)}`
+          + `\\?revision=${encodeURIComponent(alternateRevisionId)}`
           + `&revisionDataset=${encodeURIComponent(exact.datasetId)}`
           + `&returnCanvas=${encodeURIComponent(canvasId)}&returnNode=source$`,
         ),

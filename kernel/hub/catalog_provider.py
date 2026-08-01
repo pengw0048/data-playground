@@ -1,8 +1,8 @@
-"""Public contract for independent, read-only external catalog mounts.
+"""Public contract for independently mounted external catalogs.
 
 This module deliberately does not compose mounts into Workspace browse or persist mount settings.
-Those are consumer concerns.  A mount is passed to the provider on each read, which keeps local
-placement/configuration separate from a provider package and prevents this SPI from implying writes.
+Those are consumer concerns. A mount is passed to the provider on every operation. Reads remain the
+base contract; narrowly declared mutation capabilities are separate and opt-in.
 """
 
 from __future__ import annotations
@@ -98,6 +98,7 @@ class ProviderCapabilities(Wire):
     ancestors: bool = True
     dataset_detail: bool = True
     search: bool = False
+    delete_dataset: bool = False
 
 
 class ProviderCapabilitiesResult(Wire):
@@ -209,6 +210,18 @@ class ReadOnlyCatalogProvider(Protocol):
     def resolve(self, mount: CatalogMount, placement_id: str) -> ProviderResourceResult: ...
     def ancestors(self, mount: CatalogMount, placement_id: str) -> ProviderAncestors: ...
     def dataset_detail(self, mount: CatalogMount, dataset_id: str) -> ProviderDatasetDetailResult: ...
+
+
+@runtime_checkable
+class MutableCatalogProvider(Protocol):
+    """Optional provider-owned dataset removal.
+
+    The capability is deliberately separate from the read protocol: a mounted source stays read-only
+    unless it both declares ``delete_dataset`` and implements this exact operation.
+    """
+
+    def can_delete_dataset(self, mount: CatalogMount, dataset_id: str) -> bool: ...
+    def delete_dataset(self, mount: CatalogMount, dataset_id: str, *, actor: str) -> bool: ...
 
 
 def _provider_read(function: Callable[[], _R]) -> _R:

@@ -206,8 +206,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(recoveredDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
     await recoveredPublication.getByRole('link', { name: 'Open dataset' }).click()
     await expect(page).toHaveURL(new RegExp(
-      `#\\/workspace\\/dataset%3A${encodeURIComponent(dataset!.datasetId)}\\?scope=datasets`
-      + `&revision=${encodeURIComponent(dataset!.revisionId)}`
+      `#\\/workspace\\/dataset%3A${encodeURIComponent(dataset!.datasetId)}\\?revision=${encodeURIComponent(dataset!.revisionId)}`
       + `&revisionDataset=${encodeURIComponent(dataset!.datasetId)}`,
     ))
     const receiptViewer = page.getByTestId('dataset-viewer')

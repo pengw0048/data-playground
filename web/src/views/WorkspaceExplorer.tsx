@@ -15,10 +15,7 @@ import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
   ContextMenuSeparator, ContextMenuTrigger,
 } from '../components/ui/context-menu'
-import {
-  AddDataModal, CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
-  type CatalogDiscoveryQueryState,
-} from './CatalogDiscovery'
+import { AddDataModal, CatalogDetail } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
 import { examples } from '../examples'
@@ -259,6 +256,15 @@ function WorkspaceOverflowMenuProvider({ children }: { children: ReactNode }) {
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const previewCell = (value: unknown) => value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
+function ordinaryLocalSourcePath(uri: string): string | null {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(uri) && !uri.toLowerCase().startsWith('file://')) return null
+  try {
+    const path = uri.toLowerCase().startsWith('file://') ? decodeURIComponent(new URL(uri).pathname) : uri
+    return path && !path.toLowerCase().endsWith('.lance') ? path : null
+  } catch {
+    return null
+  }
+}
 const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
 const isCurrentCatalogLocation = (resource: WorkspaceResource | null) => !!resource && !resource.detached
@@ -356,128 +362,9 @@ function sourceIsUsable(status: WorkspaceSourceStatus | null): boolean {
   return status?.completeness === 'complete' || status?.completeness === 'page'
 }
 
-const DATASET_SORTS = new Set<CatalogDiscoveryQueryState['sort']>(['name', 'rows', 'updated', 'usage', 'folder'])
-
-type WorkspaceFolderContext = {
-  resource: WorkspaceResource | null
-  reason?: string
-  retryable?: boolean
-}
-
-// Folder paths are only a Catalog filter. Navigation is always to the opaque projected container
-// returned while resolving a stable dataset identity, so a same-named local container cannot win.
-function projectedFolderFromResolution(folder: string, resolved: { resource: WorkspaceResource | null; ancestors: WorkspaceResource[]; source: WorkspaceSourceStatus }): WorkspaceFolderContext {
-  if (resolved.source.completeness !== 'complete') {
-    return {
-      resource: null,
-      reason: statusMessage(resolved.source) ?? 'Workspace is only partially available',
-      retryable: resolved.source.completeness !== 'unsupported'
-        && resolved.source.referenceState !== 'detached'
-        && resolved.source.referenceState !== 'permission_lost',
-    }
-  }
-  const candidate = resolved.resource?.kind === 'container'
-    ? resolved.resource : resolved.ancestors[resolved.ancestors.length - 1] ?? null
-  const exactRoot = !folder && candidate?.id === `container:${LOCAL_ROOT_ID}`
-  const exactProjection = !!folder && candidate?.catalogFolderState === 'current'
-    && candidate.catalogFolderPath === folder
-  if (!candidate || candidate.kind !== 'container' || candidate.detached
-      || (!exactRoot && !exactProjection)) {
-    return { resource: null, reason: 'This dataset is not currently available in Workspace.' }
-  }
-  return { resource: candidate }
-}
-
-function retryableResolutionError(caught: unknown): boolean {
-  if (!caught || typeof caught !== 'object') return true
-  const error = caught as { status?: unknown; retryable?: unknown }
-  if (typeof error.retryable === 'boolean') return error.retryable
-  if (typeof error.status !== 'number') return true
-  return error.status === 429 || error.status >= 500
-}
-
-async function resolveSelectedDatasetFolder(table: CatalogTable): Promise<WorkspaceFolderContext> {
-  if (!table.registrationId) {
-    return { resource: null, reason: 'This dataset is not currently available in Workspace.' }
-  }
-  try {
-    return projectedFolderFromResolution(
-      table.folder ?? '', await api.workspaceResource(`dataset:${table.registrationId}`),
-    )
-  } catch (caught) {
-    return {
-      resource: null, reason: errorMessage(caught), retryable: retryableResolutionError(caught),
-    }
-  }
-}
-
-async function resolveProjectedFolder(folder: string, knownResourceId?: string | null): Promise<WorkspaceFolderContext> {
-  if (!folder) return { resource: null }
-  let knownError: string | undefined
-  let knownRetryable = false
-  if (knownResourceId) {
-    try {
-      const known = projectedFolderFromResolution(folder, await api.workspaceResource(knownResourceId))
-      if (known.resource || known.retryable) return known
-    } catch (caught) {
-      knownError = errorMessage(caught)
-      knownRetryable = retryableResolutionError(caught)
-      // The route may point at a dataset that was removed while this query was open. Fall through
-      // to one bounded Catalog lookup; it still has to resolve an opaque Workspace resource below.
-    }
-  }
-  try {
-    const page = await api.tablesPage({ folder, limit: 1 })
-    const table = page.items[0]
-    if (!table?.registrationId || table.folder !== folder) {
-      return knownError
-        ? { resource: null, reason: knownError, retryable: knownRetryable }
-        : { resource: null, reason: 'This folder is not currently available in Workspace.' }
-    }
-    return projectedFolderFromResolution(folder, await api.workspaceResource(`dataset:${table.registrationId}`))
-  } catch (caught) {
-    return {
-      resource: null, reason: errorMessage(caught), retryable: retryableResolutionError(caught),
-    }
-  }
-}
-
-function unavailableWorkspaceLocation(subject: 'dataset' | 'folder', reason?: string): string {
-  const message = `This ${subject} is not currently available in Workspace.`
-  return !reason || /^This (dataset|folder) is not currently available in Workspace\.$/.test(reason)
-    ? message : `${message} ${reason}`
-}
-
-export function parseWorkspaceDatasetQuery(value: string): CatalogDiscoveryQueryState {
-  const params = new URLSearchParams(value)
-  const state = emptyCatalogDiscoveryQuery()
-  state.q = params.get('dq')?.trim() ?? ''
-  state.folder = params.get('folder')?.trim().replace(/^\/+|\/+$/g, '') ?? ''
-  state.tags = (params.get('tags') ?? '').split(',').map((item) => item.trim()).filter(Boolean).slice(0, 50)
-  state.owner = params.get('owner')?.trim() ?? ''
-  state.hasColumns = (params.get('columns') ?? '').split(',').map((item) => item.trim()).filter(Boolean).slice(0, 50)
-  const sort = params.get('sort') as CatalogDiscoveryQueryState['sort'] | null
-  if (sort && DATASET_SORTS.has(sort)) state.sort = sort
-  if (params.get('order') === 'desc') state.order = 'desc'
-  if (params.get('match') === 'meaning') state.match = 'meaning'
-  return state
-}
-
-export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState): string {
-  const params = new URLSearchParams()
-  if (state.q) params.set('dq', state.q)
-  if (state.folder) params.set('folder', state.folder)
-  if (state.tags.length) params.set('tags', state.tags.join(','))
-  if (state.owner) params.set('owner', state.owner)
-  if (state.hasColumns.length) params.set('columns', state.hasColumns.join(','))
-  if (state.sort !== 'name') params.set('sort', state.sort)
-  if (state.order !== 'asc') params.set('order', state.order)
-  if (state.match !== 'text') params.set('match', state.match)
-  return params.toString()
-}
-
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
+  const setWorkspaceScope = useStore((state) => state.setWorkspaceScope)
   const firstRunChoice = useStore((state) => state.firstRunChoice)
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
   const fullPageResource = requestedResourceId?.startsWith('dataset:')
@@ -488,10 +375,15 @@ export function WorkspaceExplorer() {
     if (previousScope.current !== scope) providerPlacementObservations.reset()
     previousScope.current = scope
   }, [scope, providerPlacementObservations])
+  // `scope=datasets` was an older second Workspace lens. Keep old links readable, but fold them
+  // into the one file-browser surface instead of making people choose between two partial roots.
+  useEffect(() => {
+    if (scope === 'datasets') setWorkspaceScope('all')
+  }, [scope, setWorkspaceScope])
   return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="relative flex h-full min-h-0 flex-col overflow-hidden">
     {!fullPageResource && firstRunChoice && <FirstRunCanvasChoice />}
     {!fullPageResource && <WorkspaceLocalDrafts />}
-    <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
+    <div className="min-h-0 flex-1"><WorkspaceMixedExplorer /></div>
   </div></WorkspaceOverflowMenuProvider></ProviderPlacementObservationsContext.Provider>
 }
 
@@ -547,6 +439,7 @@ function WorkspaceMixedExplorer() {
   const pushToast = useStore((s) => s.pushToast)
   const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
+  const setWorkspaceDatasetQuery = useStore((s) => s.setWorkspaceDatasetQuery)
   const providerViewerRoute = useMemo(() => {
     const params = new URLSearchParams(workspaceDatasetQuery)
     const revisionId = params.get('revision') || undefined
@@ -657,7 +550,6 @@ function WorkspaceMixedExplorer() {
         limit: PAGE_SIZE,
         cursor: pageCursor ?? undefined,
       }
-      if (localSource) params.source = 'local'
       if (localSource && sort && order) {
         params.sort = sort
         params.order = order
@@ -808,6 +700,10 @@ function WorkspaceMixedExplorer() {
   const open = (resource: WorkspaceResource) => {
     if (itemAvailability(resource) && !hasDetachedDatasetRecovery(resource)) return
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
+    if (resource.kind === 'dataset'
+        && (providerViewerRoute.exactRevision || providerViewerRoute.viewerReturn)) {
+      setWorkspaceDatasetQuery('')
+    }
     setWorkspaceResource(resource.id)
   }
   const closeDetail = () => {
@@ -885,7 +781,7 @@ function WorkspaceMixedExplorer() {
         && files.find((file) => file.id === identity(exact))?.role === 'owner') {
         setCanvasDeleteResource(exact)
       } else if (action === 'remove-dataset' && exact.kind === 'dataset'
-        && !isExternal(exact) && !exact.detached) {
+        && !exact.detached && (!isExternal(exact) || exact.providerMutation)) {
         setDatasetRemoveResource(exact)
       }
     } catch (caught) {
@@ -911,23 +807,6 @@ function WorkspaceMixedExplorer() {
     } finally { setUndoBusy(false) }
   }
   const undoDestination = undoMove ? canvasDestination(undoMove.previousContainer, 'move') : null
-  const switchToDatasets = () => {
-    // Only a current built-in Catalog projection has a stable counterpart in the Datasets lens.
-    // Local folders and provider mounts intentionally remain in All Workspace rather than being
-    // guessed from their display name.
-    const mappedFolder = container?.catalogFolderState === 'current' && container.catalogFolderPath != null
-      ? container.catalogFolderPath : null
-    if (mappedFolder == null) {
-      switchWorkspaceScope('datasets')
-      return
-    }
-    const next = parseWorkspaceDatasetQuery(workspaceDatasetQuery)
-    next.folder = mappedFolder
-    switchWorkspaceScope('datasets', {
-      resourceId: container?.id ?? null,
-      datasetQuery: serializeWorkspaceDatasetQuery(next),
-    })
-  }
   const selectedResources = items.filter((resource) => selectedResourceIds.has(resource.id))
   const sortSupported = queryCapabilities.sort.length > 0
   const kindFilterSupported = queryCapabilities.kindFilter
@@ -945,7 +824,8 @@ function WorkspaceMixedExplorer() {
   const selectedOwnedCanvases = selectedResources.length > 0 && selectedResources.every(ownedCanvas)
     ? selectedResources : []
   const singleRemovableDataset = singleSelectedResource?.kind === 'dataset'
-    && !isExternal(singleSelectedResource) && !singleSelectedResource.detached
+    && !singleSelectedResource.detached
+    && (!isExternal(singleSelectedResource) || singleSelectedResource.providerMutation)
     ? singleSelectedResource : null
   const toggleResourceSelection = (resourceId: string) => setSelectedResourceIds((current) => {
     const next = new Set(current)
@@ -1051,13 +931,22 @@ function WorkspaceMixedExplorer() {
       backLabel={datasetViewerBackLabel(providerViewerRoute.viewerReturn)}
       onUse={() => useProviderDataset(selectedDataset)}
       onOpenLineageDataset={(catalogId) => void openLineageDataset(catalogId)}
-      onRelink={() => setRelinkResource(selectedDataset)} />
+      onRelink={() => setRelinkResource(selectedDataset)}
+      onRemove={selectedDataset.providerMutation ? () => setDatasetRemoveResource(selectedDataset) : undefined} />
     {providerActionDialog}
     {relinkDialog}
+    {datasetRemoveResource && <ProviderDatasetRemoveDialog resource={datasetRemoveResource}
+      onClose={() => setDatasetRemoveResource(null)} onRemoved={() => {
+        setDatasetRemoveResource(null); setSelectedDataset(null); setWorkspaceResource(null); reload()
+        pushToast('Dataset removed from its connected source', 'success')
+      }} />}
   </>
 
   if (selectedTable) return <>
     <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
+      initialRevisionId={providerViewerRoute.exactRevision?.revisionId}
+      initialRevisionDatasetId={providerViewerRoute.exactRevision?.datasetId}
+      backLabel={datasetViewerBackLabel(providerViewerRoute.viewerReturn)}
       onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
       folderActionLabel="Open in Workspace"
       folderActionVisible
@@ -1080,9 +969,6 @@ function WorkspaceMixedExplorer() {
           <button onClick={() => setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
           {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
         </nav>
-        <WorkspaceScopeTabs active="all" onChange={(next) => {
-          if (next === 'datasets') switchToDatasets()
-        }} />
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
           event.preventDefault()
@@ -1260,7 +1146,8 @@ function WorkspaceMixedExplorer() {
               onDuplicateCanvas={!groupSelected && editableCanvas(resource) ? () => void startDuplicate(resource) : undefined}
               onDeleteCanvas={groupSelected && selectedOwnedCanvases.length === selectedResources.length
                 ? deleteSelection : !groupSelected && ownedCanvas(resource) ? () => setCanvasDeleteResource(resource) : undefined}
-              onRemoveDataset={!groupSelected && resource.kind === 'dataset' && !isExternal(resource) && !resource.detached
+              onRemoveDataset={!groupSelected && resource.kind === 'dataset' && !resource.detached
+                && (!isExternal(resource) || resource.providerMutation)
                 ? () => setDatasetRemoveResource(resource) : undefined} />
             })}
           </div> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
@@ -1332,11 +1219,17 @@ function WorkspaceMixedExplorer() {
           setCanvasBatchDeleteResources(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload()
           pushToast(`Deleted ${deleted} Canvases.`, 'success')
         }} />}
-      {datasetRemoveResource && <DatasetRemoveDialog resource={datasetRemoveResource}
-        onClose={() => setDatasetRemoveResource(null)} onRemoved={() => {
+      {datasetRemoveResource && (isExternal(datasetRemoveResource)
+        ? <ProviderDatasetRemoveDialog resource={datasetRemoveResource}
+          onClose={() => setDatasetRemoveResource(null)} onRemoved={() => {
+            setDatasetRemoveResource(null); setSelectedResourceIds(new Set()); reload()
+            pushToast('Dataset removed from its connected source', 'success')
+          }} />
+        : <DatasetRemoveDialog resource={datasetRemoveResource}
+        onClose={() => setDatasetRemoveResource(null)} onRemoved={(warning) => {
           setDatasetRemoveResource(null); setSelectedResourceIds(new Set()); reload()
-          pushToast('Dataset removed from Workspace', 'success')
-        }} />}
+          pushToast(warning ?? 'Dataset removed from Workspace', warning ? 'info' : 'success')
+        }} />)}
       {canvasCopySource && <CanvasCopyModal source={canvasCopySource}
         initialDestination={container && !isExternal(container)
           ? { containerId: identity(container), path: crumbs }
@@ -1365,288 +1258,6 @@ function WorkspaceMixedExplorer() {
       {relinkDialog}
     </div>
   )
-}
-
-function WorkspaceScopeTabs({ active, onChange, disabled = false, disabledTitle }: {
-  active: 'all' | 'datasets'; onChange: (scope: 'all' | 'datasets') => void
-  disabled?: boolean; disabledTitle?: string
-}) {
-  return <div role="tablist" aria-label="Workspace scope" className="flex shrink-0 items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
-    {([['all', 'All'], ['datasets', 'Datasets']] as const).map(([scope, label]) => (
-      <button key={scope} role="tab" aria-selected={active === scope}
-        disabled={scope !== active && disabled} title={scope !== active ? disabledTitle : undefined}
-        onClick={() => onChange(scope)}
-        className={`rounded-md px-2.5 py-1 disabled:cursor-not-allowed disabled:opacity-45 ${active === scope ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
-        {label}
-      </button>
-    ))}
-  </div>
-}
-
-function WorkspaceDatasets() {
-  const catalogSource = useStore((state) => state.kernelInfo)
-  const foldersMutable = catalogSource?.capabilities?.includes('catalog.folder_mutation') ?? false
-  const uploadDataset = useStore((state) => state.uploadDataset)
-  const rememberTables = useStore((state) => state.rememberTables)
-  const files = useStore((state) => state.files)
-  const currentCanvasId = useStore((state) => state.doc?.id ?? '')
-  const refreshFiles = useStore((state) => state.refreshFiles)
-  const openFile = useStore((state) => state.openFile)
-  const select = useStore((state) => state.select)
-  const activateLoadedCanvasRoute = useStore((state) => state.activateLoadedCanvasRoute)
-  const pushToast = useStore((state) => state.pushToast)
-  const requestedResourceId = useStore((state) => state.workspaceResourceId)
-  const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
-  const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
-  const clearWorkspaceDatasetViewerState = useStore((state) => state.clearWorkspaceDatasetViewerState)
-  const returnFromWorkspaceDatasetViewer = useStore((state) => state.returnFromWorkspaceDatasetViewer)
-  const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
-  const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
-
-  // See the Workspace action path above: only the create response can identify one unambiguous
-  // Source. Ordinary opens and multi-dataset creates deliberately leave selection unchanged.
-  const openCreatedSourceCanvas = async (canvasId: string, nodeId?: string | null) => {
-    if (await openFile(canvasId) && nodeId) select(nodeId)
-  }
-  const query = useMemo(() => parseWorkspaceDatasetQuery(encodedQuery), [encodedQuery])
-  // An exact revision deep link is navigation state, not a Catalog filter. Keep it opaque here;
-  // DatasetRevisionHistory verifies/read-opens the revision instead of substituting the current head.
-  const exactRevision = useMemo(() => {
-    const params = new URLSearchParams(encodedQuery)
-    const revisionId = params.get('revision') || undefined
-    const datasetId = params.get('revisionDataset') || undefined
-    return revisionId && datasetId ? { revisionId, datasetId } : undefined
-  }, [encodedQuery])
-  const viewerReturn = useMemo(() => parseDatasetViewerReturn(encodedQuery), [encodedQuery])
-  const initialRevisionId = exactRevision?.revisionId
-  const initialRevisionDatasetId = exactRevision?.datasetId
-  const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
-  const selectedRegistrationId = requestedResourceId?.startsWith('dataset:')
-    ? requestedResourceId.slice('dataset:'.length) : null
-  const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
-  const [canvasTargetState, setCanvasTargetState] = useState<CanvasTargetState>('loading')
-  const canvasTargetRequest = useRef(0)
-  const [rootContainer, setRootContainer] = useState<WorkspaceResource | null>(null)
-  const [destinationError, setDestinationError] = useState<string | null>(null)
-  const [destinationRevision, setDestinationRevision] = useState(0)
-  const [selectedWorkspaceTable, setSelectedWorkspaceTable] = useState<CatalogTable | null>(null)
-  const returningToCanvas = useRef(false)
-  const [detailResolutionRevision, setDetailResolutionRevision] = useState(0)
-  const detailResolutionSeq = useRef(0)
-  const selectedWorkspaceKey = selectedWorkspaceTable?.registrationId
-    ? `${selectedWorkspaceTable.registrationId}\u0000${selectedWorkspaceTable.folder ?? ''}` : null
-  const [detailContext, setDetailContext] = useState<{
-    key: string
-    state: 'resolving' | 'available' | 'unavailable'
-    resourceId?: string
-    reason?: string
-    retryable?: boolean
-  } | null>(null)
-  const folderResolutionKey = `${query.folder}\u0000${requestedResourceId ?? ''}`
-  const folderResolutionKeyRef = useRef(folderResolutionKey)
-  folderResolutionKeyRef.current = folderResolutionKey
-  const folderResolutionSeq = useRef(0)
-  const [folderContext, setFolderContext] = useState<{
-    key: string
-    state: 'ready' | 'resolving' | 'unavailable'
-    reason?: string
-    retryable?: boolean
-  }>({ key: folderResolutionKey, state: 'ready' })
-
-  // A failed resolution belongs only to this exact filter/deep-link pair. Selecting another folder
-  // must immediately make its own resolution attempt possible rather than leaving a stale disabled tab.
-  useEffect(() => {
-    folderResolutionSeq.current += 1
-    setFolderContext({ key: folderResolutionKey, state: 'ready' })
-  }, [folderResolutionKey])
-
-  useEffect(() => {
-    const request = ++detailResolutionSeq.current
-    if (!selectedWorkspaceTable) {
-      setDetailContext(null)
-      return
-    }
-    const key = selectedWorkspaceKey
-    if (!key || !selectedWorkspaceTable.registrationId) {
-      setDetailContext({
-        key: key ?? '', state: 'unavailable',
-        reason: 'This dataset is not currently available in Workspace.',
-      })
-      return
-    }
-    setDetailContext({ key, state: 'resolving' })
-    void resolveSelectedDatasetFolder(selectedWorkspaceTable).then((context) => {
-      if (request !== detailResolutionSeq.current) return
-      if (context.resource) {
-        setDetailContext({ key, state: 'available', resourceId: context.resource.id })
-      } else {
-        setDetailContext({
-          key, state: 'unavailable', retryable: context.retryable,
-          reason: unavailableWorkspaceLocation('dataset', context.reason),
-        })
-      }
-    })
-    return () => { detailResolutionSeq.current += 1 }
-  }, [selectedWorkspaceKey, detailResolutionRevision])
-
-  useEffect(() => {
-    let cancelled = false
-    setDestinationError(null)
-    api.workspaceBrowse(LOCAL_ROOT_ID, { limit: 1, source: 'local' }).then((page) => {
-      if (cancelled) return
-      if (!page.container || page.container.version == null) throw new Error('Workspace root is unavailable')
-      setRootContainer(page.container)
-    }).catch((caught) => {
-      if (!cancelled) { setRootContainer(null); setDestinationError(errorMessage(caught)) }
-    })
-    return () => { cancelled = true }
-  }, [destinationRevision])
-
-  const useTables = (tables: CatalogTable[]) => {
-    if (!tables.length) return
-    if (tables.length > CATALOG_BATCH_LIMIT) {
-      pushToast(`Use is limited to ${CATALOG_BATCH_LIMIT} datasets`, 'error')
-      return
-    }
-    if (tables.some((table) => !table.registrationId)) {
-      pushToast('Reload before using: a dataset has no stable Workspace identity', 'error')
-      return
-    }
-    rememberTables(tables)
-    const request = ++canvasTargetRequest.current
-    setCanvasTargetState('loading')
-    setDatasetAction({ tables })
-    void refreshFiles().then((refreshed) => {
-      if (canvasTargetRequest.current === request) setCanvasTargetState(refreshed ? 'ready' : 'unavailable')
-    })
-  }
-
-  const openTableInWorkspace = (table: CatalogTable) => {
-    const key = table.registrationId ? `${table.registrationId}\u0000${table.folder ?? ''}` : null
-    if (!key || detailContext?.key !== key || detailContext.state !== 'available'
-        || !detailContext.resourceId) return
-    if (detailContext.resourceId === `container:${LOCAL_ROOT_ID}`) switchWorkspaceScope('all')
-    else switchWorkspaceScope('all', { resourceId: detailContext.resourceId })
-  }
-
-  const switchToAll = async () => {
-    if (!query.folder) {
-      switchWorkspaceScope('all')
-      return
-    }
-    const key = folderResolutionKey
-    const request = ++folderResolutionSeq.current
-    setFolderContext({ key, state: 'resolving' })
-    const context = await resolveProjectedFolder(query.folder, requestedResourceId)
-    if (request !== folderResolutionSeq.current || folderResolutionKeyRef.current !== key) return
-    if (!context.resource) {
-      setFolderContext({
-        key, state: 'unavailable', retryable: context.retryable,
-        reason: unavailableWorkspaceLocation('folder', context.reason),
-      })
-      return
-    }
-    setFolderContext({ key, state: 'ready' })
-    switchWorkspaceScope('all', { resourceId: context.resource.id })
-  }
-
-  const activeFolderContext = folderContext.key === folderResolutionKey
-    ? folderContext : { key: folderResolutionKey, state: 'ready' as const }
-  const activeDetailContext = selectedWorkspaceKey && detailContext?.key === selectedWorkspaceKey
-    ? detailContext : selectedWorkspaceKey ? { key: selectedWorkspaceKey, state: 'resolving' as const } : undefined
-
-  return <div className="flex h-full min-w-0 flex-col">
-    <div className="flex items-center gap-3 border-b border-border px-7 py-2">
-      <span className="text-[13px] font-bold text-foreground">Workspace</span>
-      <WorkspaceScopeTabs active="datasets" onChange={(scope) => { if (scope === 'all') void switchToAll() }}
-        disabled={activeFolderContext.state === 'resolving' || (activeFolderContext.state === 'unavailable' && !!query.folder)}
-        disabledTitle={activeFolderContext.state === 'resolving' ? 'Resolving this folder in Workspace…'
-          : activeFolderContext.reason ?? 'This folder is not currently available in Workspace.'} />
-      {activeFolderContext.state === 'unavailable' && activeFolderContext.retryable
-        && <button type="button" onClick={() => { void switchToAll() }}
-          className="text-[11px] font-semibold text-primary hover:underline">Retry Workspace location</button>}
-    </div>
-    <div className="min-h-0 flex-1">
-      <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
-        title="Datasets" queryState={query}
-        initialRevisionId={initialRevisionId}
-        initialRevisionDatasetId={initialRevisionDatasetId}
-        detailBackLabel={datasetViewerBackLabel(viewerReturn)}
-        onQueryStateChange={(next) => {
-          const params = new URLSearchParams(serializeWorkspaceDatasetQuery(next))
-          if (hasExactRevision) {
-            params.set('revision', initialRevisionId)
-            params.set('revisionDataset', initialRevisionDatasetId)
-          }
-          preserveDatasetViewerReturn(params, viewerReturn)
-          setEncodedQuery(params.toString())
-        }}
-        selectedRegistrationId={selectedRegistrationId}
-        onSelectedTableChange={(table, origin = 'user') => {
-          // Clearing the exact Workspace route below causes CatalogDiscovery to report its own
-          // route selection as null. That acknowledgement must not start a competing Workspace
-          // navigation while the explicit Canvas return is still loading.
-          if (!table && origin === 'route' && returningToCanvas.current) return
-          setSelectedWorkspaceTable(table)
-          if (!table && origin === 'user' && viewerReturn) {
-            const listQuery = serializeWorkspaceDatasetQuery(query)
-            if (viewerReturn.view !== 'canvas') {
-              returnFromWorkspaceDatasetViewer(viewerReturn.view, viewerReturn.query ?? '', listQuery)
-              return
-            }
-            // Canvas-origin viewers are a temporary detour. After returning, retain only the list
-            // query so the next ordinary Workspace visit does not reopen this receipt; the
-            // explicit node route restores Inspector selection.
-            returningToCanvas.current = true
-            // Open the Canvas first so the router publishes one atomic destination. Cleaning the
-            // retained Workspace viewer state before this resolves would insert a phantom
-            // Workspace history entry between the exact Dataset viewer and its Canvas.
-            if (currentCanvasId === viewerReturn.canvasId
-                && activateLoadedCanvasRoute(viewerReturn.canvasId, viewerReturn.nodeId)) {
-              // The viewer is only a route detour; its originating Canvas remains live in memory.
-              // The route action validates/reveals the requested node and publishes the final hash
-              // without reloading an edit that is still inside the autosave debounce.
-              clearWorkspaceDatasetViewerState(listQuery)
-              returningToCanvas.current = false
-              return
-            }
-            void openFile(viewerReturn.canvasId, { skipViewportFit: true }).then((opened) => {
-              if (!opened) return
-              if (!activateLoadedCanvasRoute(viewerReturn.canvasId, viewerReturn.nodeId)) return
-              clearWorkspaceDatasetViewerState(listQuery)
-            }).finally(() => { returningToCanvas.current = false })
-            return
-          }
-          // Exact revision navigation belongs to the selected route as an atomic pair. A user
-          // close or user-selected replacement leaves that route, while route resolution itself
-          // (including a transient null) must preserve it.
-          if (hasExactRevision && origin === 'user') {
-            const params = new URLSearchParams(serializeWorkspaceDatasetQuery(query))
-            params.delete('revision')
-            params.delete('revisionDataset')
-            setEncodedQuery(params.toString())
-          }
-          if (!table) setWorkspaceResource(null)
-          else if (table.registrationId) {
-            // Keep an exact receipt URL atomic: resolving its logical dataset to a current Catalog
-            // registration must not add a second browser-history entry before the user presses Back.
-            // Ordinary latest routes may still canonicalize stale registration ids.
-            if (!(hasExactRevision && origin === 'route')) {
-              setWorkspaceResource(`dataset:${table.registrationId}`)
-            }
-          }
-          else pushToast('This dataset has no stable Workspace identity', 'error')
-        }}
-        onUseTables={useTables} onUploadDataset={uploadDataset}
-        onOpenInWorkspace={openTableInWorkspace}
-        workspaceLocation={activeDetailContext}
-        onRetryWorkspaceLocation={() => setDetailResolutionRevision((current) => current + 1)} />
-    </div>
-    {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
-      destinationError={destinationError} files={files} currentCanvasId={currentCanvasId} targetState={canvasTargetState} onClose={() => setDatasetAction(null)}
-      onRetryDestination={() => setDestinationRevision((current) => current + 1)} onRefreshCanvases={refreshFiles}
-      onOpened={(canvasId, nodeId) => { setDatasetAction(null); void openCreatedSourceCanvas(canvasId, nodeId) }} />}
-  </div>
 }
 
 function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
@@ -1831,7 +1442,8 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
         ? () => onAction(resource, 'move-canvas') : undefined}
       onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
         ? () => onAction(resource, 'delete-canvas') : undefined}
-      onRemoveDataset={resource.kind === 'dataset' && !isExternal(resource) && !resource.detached
+      onRemoveDataset={resource.kind === 'dataset' && !resource.detached
+        && (!isExternal(resource) || resource.providerMutation)
         ? () => onAction(resource, 'remove-dataset') : undefined} />)}
     {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
       {source.completeness === 'complete' ? 'No matches from this source.'
@@ -2016,6 +1628,67 @@ function CanvasRenameDialog({ resource, onClose, onRenamed }: {
 }
 
 function DatasetRemoveDialog({ resource, onClose, onRemoved }: {
+  resource: WorkspaceResource; onClose: () => void; onRemoved: (warning?: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [table, setTable] = useState<CatalogTable | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [deleteSource, setDeleteSource] = useState(false)
+  useEffect(() => {
+    let active = true
+    void api.tableByRegistration(identity(resource)).then((next) => {
+      if (active) setTable(next)
+    }).catch((caught) => {
+      if (active) setError(errorMessage(caught))
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [resource])
+  const sourcePath = table?.sourceDeleteAllowed ? ordinaryLocalSourcePath(table.uri) : null
+  const remove = async () => {
+    if (busy || !table) return
+    setBusy(true); setError(null)
+    try {
+      if (!table.registrationId || !table.metadataRevision) {
+        throw new Error('Reload this dataset before removing it')
+      }
+      const result = deleteSource
+        ? await api.unregisterTable(table.id, table.registrationId, table.metadataRevision, true)
+        : await api.unregisterTable(table.id, table.registrationId, table.metadataRevision)
+      onRemoved(result.warning ?? undefined)
+    } catch (caught) {
+      setError(errorMessage(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <Modal label={`Remove ${resource.name}`} onClose={busy ? () => undefined : onClose}>
+    <div className="grid gap-2 text-[12px]">
+      <label className={`flex cursor-pointer gap-3 rounded-md border p-3 ${!deleteSource ? 'border-primary bg-primary/5' : 'border-border'}`}>
+        <input type="radio" name="remove-mode" checked={!deleteSource} onChange={() => setDeleteSource(false)} className="mt-0.5 accent-primary" />
+        <span><span className="block font-semibold text-foreground">Remove from Workspace</span>
+          <span className="mt-0.5 block text-muted-foreground">Keep the source file so it can be registered again.</span></span>
+      </label>
+      {sourcePath && <label className={`flex cursor-pointer gap-3 rounded-md border p-3 ${deleteSource ? 'border-destructive/70 bg-destructive/5' : 'border-border'}`}>
+        <input type="radio" name="remove-mode" checked={deleteSource} onChange={() => setDeleteSource(true)} className="mt-0.5 accent-destructive" />
+        <span className="min-w-0"><span className="block font-semibold text-foreground">Delete the source file too</span>
+          <span className="mt-0.5 block text-muted-foreground">This cannot be undone. Canvases using this dataset will no longer be able to read it.</span>
+          <span className="mt-1 block break-all font-mono text-[10.5px] text-muted-foreground">{sourcePath}</span></span>
+      </label>}
+      {!loading && table && !sourcePath && <p className="text-muted-foreground">This source is remote, managed, or folder-backed, so only its Workspace entry can be removed here.</p>}
+    </div>
+    {error && <div role="alert" className="text-[12px] text-destructive">Couldn't remove this dataset: {error}</div>}
+    <div className="flex justify-end gap-2">
+      <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+      <button onClick={() => void remove()} disabled={busy || loading || !table}
+        className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">
+        {busy ? 'Removing…' : deleteSource ? 'Delete file and remove' : 'Remove dataset'}
+      </button>
+    </div>
+  </Modal>
+}
+
+function ProviderDatasetRemoveDialog({ resource, onClose, onRemoved }: {
   resource: WorkspaceResource; onClose: () => void; onRemoved: () => void
 }) {
   const [busy, setBusy] = useState(false)
@@ -2024,12 +1697,7 @@ function DatasetRemoveDialog({ resource, onClose, onRemoved }: {
     if (busy) return
     setBusy(true); setError(null)
     try {
-      const registrationId = identity(resource)
-      const table = await api.tableByRegistration(registrationId)
-      if (!table.registrationId || !table.metadataRevision) {
-        throw new Error('Reload this dataset before removing it')
-      }
-      await api.unregisterTable(table.id, table.registrationId, table.metadataRevision)
+      await api.removeProviderDataset(resource.id)
       onRemoved()
     } catch (caught) {
       setError(errorMessage(caught))
@@ -2037,17 +1705,17 @@ function DatasetRemoveDialog({ resource, onClose, onRemoved }: {
       setBusy(false)
     }
   }
-  return <Modal label={`Remove ${resource.name}`} onClose={busy ? () => undefined : onClose}>
+  return <Modal label={`Remove ${resource.name} from ${resource.mountId ?? 'connected source'}`} onClose={busy ? () => undefined : onClose}>
     <div className="space-y-2 text-[12px] leading-5 text-muted-foreground">
-      <p>Remove this dataset from Data Playground?</p>
-      <p>The source file stays on disk. Canvases that reference this dataset may show it as unavailable until it is registered again.</p>
+      <p>This removes the table registration from {resource.mountId ?? 'the connected source'}.</p>
+      <p>The underlying data stays in its storage. Canvases using this table will show it as unavailable.</p>
     </div>
     {error && <div role="alert" className="text-[12px] text-destructive">Couldn't remove this dataset: {error}</div>}
     <div className="flex justify-end gap-2">
       <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
       <button onClick={() => void remove()} disabled={busy}
         className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">
-        {busy ? 'Removing…' : 'Remove dataset'}
+        {busy ? 'Removing…' : 'Remove from source'}
       </button>
     </div>
   </Modal>
@@ -2412,8 +2080,8 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
     actions.push({ label: 'Delete unavailable', disabled: true, hint: resource.folderMutationUnavailableReason })
   } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && isExternal(resource)) {
     actions.push({
-      label: 'Delete unavailable', disabled: true,
-      hint: `${resource.mountId ?? 'This connected source'} is read-only here. Delete the table in its source system.`,
+      label: 'Remove unavailable', disabled: true,
+      hint: `${resource.mountId ?? 'This connected source'} did not expose dataset removal.`,
     })
   } else if (contextSelectionCount === 1 && resource.kind === 'dataset' && !onRemoveDataset) {
     actions.push({ label: 'Remove unavailable', disabled: true, hint: 'Open this dataset to review its recovery options.' })
@@ -2474,12 +2142,13 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
 }
 
 function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exactRevision, backLabel,
-  onClose, onRetry, onUse, onOpenLineageDataset, onRelink }: {
+  onClose, onRetry, onUse, onOpenLineageDataset, onRelink, onRemove }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
   exactRevision?: { datasetId: string; revisionId: string }
   backLabel: 'Back to Workspace' | 'Back to Canvas' | 'Back to Jobs' | 'Back to Inbox'
   onRetry: () => void; onUse: () => void; onOpenLineageDataset: (catalogId: string) => void; onRelink: () => void
+  onRemove?: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const openRelationships = useStore((state) => state.openRelationships)
@@ -2604,7 +2273,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
         <Icon name="db" size={16} />
         <div className="min-w-0 flex-1">
           <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
-          <div className="truncate text-[10.5px] text-muted-foreground">Mounted dataset · {resource.provider ?? resource.mountId ?? 'external source'}</div>
+          <div className="truncate text-[10.5px] text-muted-foreground">Dataset · {resource.provider ?? resource.mountId ?? 'connected source'}</div>
         </div>
         <button type="button" onClick={openLineageGraph} disabled={!canonicalContext?.sourceUri}
           title={!canonicalContext?.sourceUri ? 'Lineage becomes available after this dataset connection is verified.' : undefined}
@@ -2617,6 +2286,10 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
         </button>
         {!exactRevision && <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
           className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>}
+        {!exactRevision && onRemove && <button onClick={onRemove}
+          className="shrink-0 rounded-md border border-destructive/40 bg-card px-2.5 py-1 text-[11.5px] font-semibold text-destructive hover:bg-destructive/5">
+          Remove…
+        </button>}
       </div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5 text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">

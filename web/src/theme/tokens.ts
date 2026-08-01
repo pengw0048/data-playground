@@ -1,8 +1,8 @@
-// Design tokens — the authoritative values from the Figma `design — tokens` page.
+// Design tokens — compact neutral application chrome inspired by Figma UI3.
 // P4: colors have exactly one job. Type accents are MUTED / non-semantic; red·amber·green
 // are reserved for status; blue = focus/selection AND running (never on the same element).
 
-// These mirror the shadcn CSS-var tokens in index.css (slate neutrals + one blue primary). Keeping
+// These mirror the shadcn CSS-var tokens in index.css (neutral grays + one blue primary). Keeping
 // them here lets the many inline-styled components re-skin in one place while they migrate to the
 // Tailwind/shadcn primitives. ONE primary blue now (the review found two: #2f6ef0 vs #3b7fe0).
 export const color = {
@@ -21,19 +21,20 @@ export const color = {
   // fill / in alpha-concatenated shadow strings where a CSS var() would not resolve)
   latest: '#16a34a',
   stale: '#d99a2b',
-  running: '#2f7ff5',
+  running: '#0099ff',
   failed: '#e0483d',
   queued: '#8a94a6',
   draft: '#aab1bd',
 
   // wire / selection — literal hex on purpose: consumed as SVG presentation attributes (ArrowDefs,
   // WireEdge) and in alpha-concatenated strings (shadow.focus), where var() does NOT resolve.
-  wire: '#aab0ba',
-  wireActive: '#2f7ff5',
-  focus: '#2f7ff5',
+  wire: '#9b9b9b',
+  wireActive: '#0099ff',
+  focus: '#0099ff',
 } as const
 
-// Muted, non-semantic accent stripe per node kind (left edge, 6px).
+// Muted node colors remain for the minimap and wire-scale overview only. Normal UI chrome uses
+// neutral glyph tiles so operation type is not expressed as a decorative colored stripe.
 export const kindAccent: Record<string, string> = {
   source: '#5b6cc4',
   sample: '#8b6fce',
@@ -75,12 +76,12 @@ export const status: Record<StatusKey, { color: string; glyph: string; label: st
   done: { color: color.latest, glyph: '✓', label: 'done' },  // per-node run completion
 }
 
-export const radius = { chip: 4, button: 8, node: 12, panel: 12, section: 14 } as const
+export const radius = { chip: 4, button: 6, node: 8, panel: 8, section: 8 } as const
 
 export const shadow = {
-  card: '0 1px 2px rgba(16,20,30,0.04), 0 1px 3px rgba(16,20,30,0.06)',
-  panel: '0 6px 24px rgba(16,20,30,0.12), 0 2px 6px rgba(16,20,30,0.08)',
-  focus: `0 0 0 2px ${color.focus}33, 0 1px 3px rgba(16,20,30,0.10)`,
+  card: '0 1px 2px rgba(0,0,0,0.06)',
+  panel: '0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08)',
+  focus: `0 0 0 2px ${color.focus}33, 0 1px 2px rgba(0,0,0,0.08)`,
 } as const
 
 export const font = {

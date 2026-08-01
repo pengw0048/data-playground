@@ -874,6 +874,57 @@ def workspace_provider_source(
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
 
 
+@router.delete("/workspace/resources/{resource_id}/provider-dataset")
+def remove_workspace_provider_dataset(
+    resource_id: str,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Remove one exact connected-source dataset when that provider declares write support."""
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
+
+    try:
+        result = workspace_providers.delete_provider_dataset(
+            resource_id, uid=uid, actor=uid)
+    except PermissionError as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.DENIED,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(403, str(exc)) from exc
+    except workspace_providers.ProviderDatasetMutationUnsupported as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.DENIED,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(501, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(404, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(409, str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    emit_audit(
+        AuditAction.DATASET_MUTATION, AuditOutcome.SUCCESS,
+        principal_id=uid, resource_type="workspace_provider_dataset",
+        attrs={"operation": "provider_remove"},
+    )
+    return result
+
+
 @router.post(
     "/workspace/resources/{resource_id}/relink",
     response_model=WorkspaceProviderRelinkResult,

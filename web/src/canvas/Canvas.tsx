@@ -735,7 +735,9 @@ export function Canvas() {
             <ContextMenuSubTrigger>Add {CONTEXT_CATEGORY_LABEL[category]}</ContextMenuSubTrigger>
             <ContextMenuSubContent className="max-h-80 w-56 overflow-y-auto">
               {specs.map((spec) => <ContextMenuItem key={spec.kind} onSelect={() => addNodeAtContext(spec.kind)}>
-                <span className="h-3.5 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[spec.kind] ?? color.text3 }} />
+                <span aria-hidden="true" className="grid h-5 w-5 shrink-0 place-items-center rounded border border-border bg-card text-[7.5px] font-bold uppercase text-muted-foreground">
+                  {(spec.tag ?? spec.kind).slice(0, 2)}
+                </span>
                 <span className="min-w-0 truncate">{spec.title}</span>
               </ContextMenuItem>)}
             </ContextMenuSubContent>

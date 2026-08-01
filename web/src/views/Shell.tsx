@@ -47,7 +47,7 @@ export function Shell() {
     return () => { unreadRequest.current += 1 }
   }, [refreshUnread, view])
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
+    <div style={{ position: 'absolute', inset: 0, display: 'flex', background: 'hsl(var(--background))' }}>
       <Rail onSettings={openSettings} unreadCount={unreadCount} />
       <main style={{ position: 'relative', flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'workspace' && <WorkspaceExplorer />}
@@ -110,7 +110,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
 
   return (
     <aside data-testid="workspace-rail" aria-label="Primary navigation"
-      className={cn('flex h-full flex-col border-r border-border bg-card p-3 transition-[width] duration-150', collapsed ? 'w-[64px] flex-[0_0_64px]' : 'w-[232px] flex-[0_0_232px]')}>
+      className={cn('flex h-full flex-col border-r border-border bg-card p-2 transition-[width] duration-150', collapsed ? 'w-[56px] flex-[0_0_56px]' : 'w-[220px] flex-[0_0_220px]')}>
       <div className={cn('flex items-center gap-2 pb-3 pt-1', collapsed ? 'justify-center px-0' : 'px-2')}>
         {!collapsed && (
           <span

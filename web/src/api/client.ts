@@ -445,8 +445,18 @@ export const api = {
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/edit`, { method: 'PUT', body: JSON.stringify(edit) }),
-  unregisterTable: (id: string, expectedRegistrationId: string, expectedRevision: string) => req<{ ok: boolean }>(
-    `/catalog/tables/${encodeURIComponent(id)}?${new URLSearchParams({ expected_registration_id: expectedRegistrationId, expected_revision: expectedRevision })}`,
+  unregisterTable: (id: string, expectedRegistrationId: string, expectedRevision: string, deleteSource = false) => req<{
+    ok: boolean; sourceDeleted?: boolean; sourceMissing?: boolean; warning?: string | null
+  }>(
+    `/catalog/tables/${encodeURIComponent(id)}?${new URLSearchParams({
+      expected_registration_id: expectedRegistrationId,
+      expected_revision: expectedRevision,
+      ...(deleteSource ? { delete_source: 'true' } : {}),
+    })}`,
+    { method: 'DELETE' },
+  ),
+  removeProviderDataset: (resourceId: string) => req<{ ok: boolean; removedFrom: string }>(
+    `/workspace/resources/${encodeURIComponent(resourceId)}/provider-dataset`,
     { method: 'DELETE' },
   ),
   unregisterTables: (targets: { id: string; expectedRegistrationId: string; expectedRevision: string }[]) =>
