@@ -4,6 +4,8 @@ import type { LineageResult } from '../types/api'
 import { Icon } from '../ui/Icon'
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error)
+const SUMMARY_GRAPH_NODES = 16
+const SUMMARY_ITEMS_PER_SIDE = 4
 
 export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
   uri: string | null | undefined
@@ -21,7 +23,7 @@ export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
     setLoading(true)
     setError(null)
     try {
-      const next = await api.lineage(uri, 4, 60)
+      const next = await api.lineage(uri, 1, SUMMARY_GRAPH_NODES)
       if (sequence === request.current) setLineage(next)
     } catch (caught) {
       if (sequence === request.current) setError(message(caught))
@@ -47,6 +49,14 @@ export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
   }
   const parents = root ? lineage?.edges.filter((edge) => edge.child === root) ?? [] : []
   const children = root ? lineage?.edges.filter((edge) => edge.parent === root) ?? [] : []
+  const visibleParents = parents.slice(0, SUMMARY_ITEMS_PER_SIDE)
+  const visibleChildren = children.slice(0, SUMMARY_ITEMS_PER_SIDE)
+  const remainingLabel = (count: number) => {
+    if (count === 0) return null
+    const hidden = Math.max(0, count - SUMMARY_ITEMS_PER_SIDE)
+    if (hidden === 0) return null
+    return `${hidden}${lineage?.truncated ? '+' : ''} more in Lineage`
+  }
   const linked = (label: string, nodeUri: string) => {
     const node = lineageNode(nodeUri)
     // The lineage service falls back to the stable URI as an id when the endpoint has no Catalog
@@ -63,7 +73,7 @@ export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
     <div className="flex items-center gap-2">
       <Icon name="lineage" size={13} />
       <h2 className="text-[11px] font-semibold text-foreground">Lineage</h2>
-      {lineage?.truncated && <span className="text-[10px] text-muted-foreground">Showing nearby datasets</span>}
+      {lineage?.truncated && <span className="text-[10px] text-muted-foreground">Preview of nearby datasets</span>}
     </div>
     {!uri ? <div className="mt-1 text-[11px] text-muted-foreground">Lineage becomes available after this dataset has a stable Source binding.</div> : null}
     {loading && !lineage ? <div role="status" className="mt-1 text-[11px] text-muted-foreground">Loading lineage…</div> : null}
@@ -75,16 +85,18 @@ export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
     {lineage && (parents.length > 0 || children.length > 0) ? <div className="mt-2 grid min-w-0 items-center gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto_minmax(0,1fr)]">
       <div className="grid min-w-0 gap-1" aria-label="Input datasets">
         <span className="text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Inputs</span>
-        {parents.length ? parents.map((edge) => <span key={`${edge.parent}:${edge.child}`}>{linked(nodeName(edge.parent), edge.parent)}</span>)
+        {parents.length ? visibleParents.map((edge) => <span key={`${edge.parent}:${edge.child}`}>{linked(nodeName(edge.parent), edge.parent)}</span>)
           : <span className="text-[10.5px] text-muted-foreground">None recorded</span>}
+        {remainingLabel(parents.length) ? <span className="text-[10px] text-muted-foreground">{remainingLabel(parents.length)}</span> : null}
       </div>
       <span aria-hidden="true" className="hidden text-muted-foreground sm:block">→</span>
       <div className="min-w-0 rounded-md bg-primary/10 px-2 py-1 text-center text-[10.5px] font-semibold text-primary" title={name}>{name}</div>
       <span aria-hidden="true" className="hidden text-muted-foreground sm:block">→</span>
       <div className="grid min-w-0 gap-1" aria-label="Output datasets">
         <span className="text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Outputs</span>
-        {children.length ? children.map((edge) => <span key={`${edge.parent}:${edge.child}`}>{linked(nodeName(edge.child), edge.child)}</span>)
+        {children.length ? visibleChildren.map((edge) => <span key={`${edge.parent}:${edge.child}`}>{linked(nodeName(edge.child), edge.child)}</span>)
           : <span className="text-[10.5px] text-muted-foreground">None recorded</span>}
+        {remainingLabel(children.length) ? <span className="text-[10px] text-muted-foreground">{remainingLabel(children.length)}</span> : null}
       </div>
     </div> : null}
   </section>

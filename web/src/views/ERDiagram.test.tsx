@@ -214,6 +214,39 @@ describe('ERDiagram request truth', () => {
     expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
   })
 
+  it('opens a high-fan-out lineage as a readable subset and expands it on demand', async () => {
+    const children = Array.from({ length: 20 }, (_, index) => ({
+      id: `child-${index + 1}`,
+      name: `child_${String(index + 1).padStart(2, '0')}`,
+      uri: `mem://child-${index + 1}`,
+      kind: 'table',
+    }))
+    store.erFocusUri = ORDERS.uri
+    store.erMode = 'lineage'
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [
+        { id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' },
+        ...children,
+      ],
+      edges: children.map((child) => ({
+        parent: ORDERS.uri, child: child.uri, factCount: 1,
+      })),
+      truncated: false,
+    })
+    render(<ERDiagram />)
+
+    await screen.findByTestId('er-lineage-show-more')
+    expect(screen.getByTestId('er-connection-count')).toHaveTextContent('12 of 20 connections')
+    expect(screen.getAllByTestId(/^node-/)).toHaveLength(13)
+
+    fireEvent.click(screen.getByTestId('er-lineage-show-more'))
+
+    await waitFor(() => expect(screen.getByTestId('er-connection-count')).toHaveTextContent('20 connections'))
+    expect(screen.getAllByTestId(/^node-/)).toHaveLength(21)
+    expect(screen.getByTestId('er-lineage-show-fewer')).toBeVisible()
+  })
+
   it('restores a routed stable focus in lineage mode and returns to its Dataset', async () => {
     store.erFocusDatasetId = ORDERS.registrationId!
     store.erMode = 'lineage'

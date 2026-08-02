@@ -29,7 +29,7 @@ describe('DatasetLineageSummary', () => {
     expect(within(summary).getByRole('button', { name: 'frames' })).toBeVisible()
     fireEvent.click(within(summary).getByRole('button', { name: 'frames' }))
     expect(onOpenDataset).toHaveBeenCalledWith('output')
-    expect(mocks.lineage).toHaveBeenCalledWith('workspace-provider://source', 4, 60)
+    expect(mocks.lineage).toHaveBeenCalledWith('workspace-provider://source', 1, 16)
   })
 
   it('keeps a failed lineage read retryable', async () => {
@@ -66,5 +66,34 @@ describe('DatasetLineageSummary', () => {
     expect(within(summary).queryByRole('button', { name: 'raw' })).toBeNull()
     expect(within(summary).queryByRole('button', { name: 'frames' })).toBeNull()
     expect(onOpenDataset).not.toHaveBeenCalled()
+  })
+
+  it('keeps a high-fan-out dataset detail summary compact', async () => {
+    const outputs = Array.from({ length: 10 }, (_, index) => ({
+      id: `output-${index + 1}`,
+      name: `output_${index + 1}`,
+      uri: `file:///output-${index + 1}.parquet`,
+      kind: 'dataset',
+    }))
+    mocks.lineage.mockResolvedValueOnce({
+      rootUri: 'workspace-provider://source',
+      nodes: [
+        { id: 'source', name: 'raw_video', uri: 'workspace-provider://source', kind: 'dataset' },
+        ...outputs,
+      ],
+      edges: outputs.map((output) => ({
+        parent: 'workspace-provider://source', child: output.uri, factCount: 1,
+      })),
+      truncated: true,
+    })
+
+    render(<DatasetLineageSummary uri="workspace-provider://source" name="raw_video" />)
+
+    const summary = await screen.findByTestId('dataset-lineage-summary')
+    for (const name of ['output_1', 'output_2', 'output_3', 'output_4']) {
+      expect(within(summary).getByText(name)).toBeVisible()
+    }
+    expect(within(summary).queryByText('output_5')).toBeNull()
+    expect(within(summary).getByText('6+ more in Lineage')).toBeVisible()
   })
 })

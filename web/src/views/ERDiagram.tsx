@@ -202,17 +202,78 @@ function lineageLayout(
     group.push(table)
     grouped.set(value, group)
   }
+  const metrics = new Map<number, { rows: number; columns: number }>()
+  for (const [value, group] of grouped) {
+    const rows = Math.max(1, Math.ceil(Math.sqrt(group.length)))
+    metrics.set(value, { rows, columns: Math.ceil(group.length / rows) })
+  }
+  const baseX = new Map<number, number>([[0, 0]])
+  let positiveCursor = 0
+  for (const value of [...grouped.keys()].filter((rank) => rank > 0).sort((a, b) => a - b)) {
+    const columns = metrics.get(value)?.columns ?? 1
+    const start = positiveCursor + 310
+    baseX.set(value, start)
+    positiveCursor = start + (columns - 1) * 270
+  }
+  let negativeCursor = 0
+  for (const value of [...grouped.keys()].filter((rank) => rank < 0).sort((a, b) => b - a)) {
+    const columns = metrics.get(value)?.columns ?? 1
+    const start = negativeCursor - 310 - (columns - 1) * 270
+    baseX.set(value, start)
+    negativeCursor = start
+  }
+
   const output: Record<string, { x: number; y: number }> = {}
   for (const [value, group] of grouped) {
     group.sort((left, right) => left.name.localeCompare(right.name))
+    const rows = metrics.get(value)?.rows ?? 1
     group.forEach((table, index) => {
+      const column = Math.floor(index / rows)
+      const row = index % rows
       output[table.id] = {
-        x: value * 310,
-        y: (index - (group.length - 1) / 2) * 150,
+        x: (baseX.get(value) ?? value * 310) + column * 270,
+        y: (row - (rows - 1) / 2) * 140,
       }
     })
   }
   return output
+}
+
+const LINEAGE_PAGE_SIZE = 12
+
+function lineageNeighbourhood(
+  tables: CatalogTable[],
+  edges: LineageEdge[],
+  rootUri: string | null,
+  limit: number,
+): CatalogTable[] {
+  if (!rootUri || tables.length <= limit + 1) return tables
+  const byUri = new Map(tables.map((table) => [table.uri, table]))
+  if (!byUri.has(rootUri)) return tables.slice(0, limit + 1)
+  const adjacency = new Map<string, Set<string>>()
+  for (const edge of edges) {
+    if (!byUri.has(edge.parent) || !byUri.has(edge.child)) continue
+    const parents = adjacency.get(edge.parent) ?? new Set<string>()
+    parents.add(edge.child)
+    adjacency.set(edge.parent, parents)
+    const children = adjacency.get(edge.child) ?? new Set<string>()
+    children.add(edge.parent)
+    adjacency.set(edge.child, children)
+  }
+  const selected = new Set<string>([rootUri])
+  let frontier = [rootUri]
+  while (frontier.length && selected.size < limit + 1) {
+    const candidates = [...new Set(frontier.flatMap((uri) => [...(adjacency.get(uri) ?? [])]))]
+      .filter((uri) => !selected.has(uri))
+      .sort((left, right) => {
+        const byName = (byUri.get(left)?.name ?? left).localeCompare(byUri.get(right)?.name ?? right)
+        return byName || left.localeCompare(right)
+      })
+    const next = candidates.slice(0, limit + 1 - selected.size)
+    next.forEach((uri) => selected.add(uri))
+    frontier = next
+  }
+  return tables.filter((table) => selected.has(table.uri))
 }
 
 // The graph renders one ENTITY per table + O(n²) join hints, so it operates on a BOUNDED set.
@@ -242,6 +303,7 @@ export function ERDiagram() {
   const [search, setSearch] = useState('')
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
+  const [lineageLimit, setLineageLimit] = useState(LINEAGE_PAGE_SIZE)
 
   const [tables, setTables] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
@@ -315,7 +377,12 @@ export function ERDiagram() {
 
   // a genuinely new query (focus/folder/mode/hops) must not show the previous query's rows while the
   // next request is in flight; a plain retry (reloadKey) keeps the last graph.
-  useEffect(() => { setTables([]); setTotal(0); setLinEdges([]) }, [focus, folder, mode, hops])
+  useEffect(() => {
+    setTables([])
+    setTotal(0)
+    setLinEdges([])
+    setLineageLimit(LINEAGE_PAGE_SIZE)
+  }, [focus, folder, mode, hops])
 
   // recompute the visible entity set whenever the query (focus / hops / mode / folder / rels) changes
   const visibleFocus = mode === 'lineage' && lineageFocus?.requested === focus
@@ -373,18 +440,28 @@ export function ERDiagram() {
 
   const refresh = useCallback(() => setReloadKey((k) => k + 1), [])
 
-  const visible = useMemo(() => {
+  const filtered = useMemo(() => {
     if (focus || !search.trim()) return tables
     const q = search.trim().toLowerCase()
     return tables.filter((t) => t.name.toLowerCase().includes(q) || (t.folder ?? '').toLowerCase().includes(q))
   }, [tables, focus, search])
+  const visible = useMemo(
+    () => mode === 'lineage'
+      ? lineageNeighbourhood(filtered, linEdges, visibleFocus, lineageLimit)
+      : filtered,
+    [filtered, lineageLimit, linEdges, mode, visibleFocus],
+  )
 
   const byUri = useMemo(() => Object.fromEntries(visible.map((t) => [t.uri, t.id])), [visible])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
+  const visibleLineageEdges = useMemo(
+    () => linEdges.filter((edge) => byUri[edge.parent] && byUri[edge.child]),
+    [byUri, linEdges],
+  )
 
   const lineagePositions = useMemo(
-    () => mode === 'lineage' ? lineageLayout(visible, linEdges, visibleFocus) : {},
-    [linEdges, mode, visible, visibleFocus],
+    () => mode === 'lineage' ? lineageLayout(visible, visibleLineageEdges, visibleFocus) : {},
+    [mode, visible, visibleFocus, visibleLineageEdges],
   )
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
@@ -414,7 +491,7 @@ export function ERDiagram() {
         style: { stroke: 'var(--primary)', strokeWidth: 1.5 }, data: { rel: r },
       })
     })
-    if (mode === 'lineage') linEdges.forEach((e, i) => {
+    if (mode === 'lineage') visibleLineageEdges.forEach((e, i) => {
       const s = byUri[e.parent], t = byUri[e.child]
       if (!s || !t) return
       out.push({
@@ -433,7 +510,7 @@ export function ERDiagram() {
         })
       }
     return out
-  }, [rels, visible, byUri, mode, linEdges, showSuggestions])
+  }, [rels, visible, byUri, mode, visibleLineageEdges, showSuggestions])
 
   const loadSuggestions = useCallback(async (left: CatalogTable, right: CatalogTable) => {
     setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
@@ -480,6 +557,7 @@ export function ERDiagram() {
 
   const hasFocusedRoute = !!focus || !!erFocusDatasetId
   const capped = !hasFocusedRoute && total > visible.length
+  const hiddenLineageConnections = Math.max(0, linEdges.length - visibleLineageEdges.length)
   const layoutKey = useMemo(() => JSON.stringify(nodes.map((node) => node.id)), [nodes])
 
   return (
@@ -508,8 +586,20 @@ export function ERDiagram() {
                 <button onClick={() => setHops((h) => Math.min(5, h + 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="More hops">+</button>
               </div>
               <span className="flex-1" />
-              <span className="text-[10px] text-muted-foreground">{linEdges.length} connection{linEdges.length === 1 ? '' : 's'}</span>
+              <span data-testid="er-connection-count" className="text-[10px] text-muted-foreground">
+                {hiddenLineageConnections > 0
+                  ? `${visibleLineageEdges.length} of ${linEdges.length} connections`
+                  : `${linEdges.length} connection${linEdges.length === 1 ? '' : 's'}`}
+              </span>
             </div>
+            {hiddenLineageConnections > 0 || lineageLimit > LINEAGE_PAGE_SIZE ? <div className="flex items-center gap-2 text-[10px]">
+              {hiddenLineageConnections > 0 ? <button type="button" data-testid="er-lineage-show-more"
+                onClick={() => setLineageLimit((current) => current + LINEAGE_PAGE_SIZE)}
+                className="font-semibold text-primary hover:underline">Show more</button> : null}
+              {lineageLimit > LINEAGE_PAGE_SIZE ? <button type="button" data-testid="er-lineage-show-fewer"
+                onClick={() => setLineageLimit(LINEAGE_PAGE_SIZE)}
+                className="text-muted-foreground hover:text-foreground hover:underline">Show fewer</button> : null}
+            </div> : null}
           </div>
         ) : hasFocusedRoute ? (
           <div className="flex flex-col gap-2" data-testid="er-focus-bar">
@@ -559,7 +649,7 @@ export function ERDiagram() {
         {showHelp && (
           <div className="rounded-md border border-border bg-muted/40 p-2 text-[10.5px] leading-relaxed">
             {mode === 'lineage'
-              ? 'Arrows run from source datasets to the datasets produced from them. Increase Depth to reveal more of the connected history.'
+              ? 'Arrows run from source datasets to the datasets produced from them. Busy graphs open with a readable subset; use Show more or increase Depth when you need more context.'
               : 'Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to re-focus the graph.'}
           </div>
         )}

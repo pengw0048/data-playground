@@ -1946,7 +1946,7 @@ describe('WorkspaceExplorer', () => {
 
     const detail = await screen.findByRole('region', { name: 'observations' })
     expect(await within(detail).findByTestId('dataset-lineage-summary')).toBeVisible()
-    expect(mocks.lineage).toHaveBeenCalledWith(CANONICAL_DATASET_CONTEXT.sourceUri, 4, 60)
+    expect(mocks.lineage).toHaveBeenCalledWith(CANONICAL_DATASET_CONTEXT.sourceUri, 1, 16)
     fireEvent.click(within(detail).getByRole('button', { name: 'Lineage' }))
     expect(store.openRelationships).toHaveBeenCalledWith(
       CANONICAL_DATASET_CONTEXT.sourceUri,
