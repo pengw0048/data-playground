@@ -60,6 +60,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   // them never leaves the subtree, so onMouseLeave doesn't fire. A short grace delay on leave then
   // debounces the final exit so a quick brush-past doesn't flicker the shelf.
   const [hover, setHover] = useState(false)
+  const [renameHover, setRenameHover] = useState(false)
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const enterHover = () => { if (hoverTimer.current) clearTimeout(hoverTimer.current); setHover(true) }
   const leaveHover = () => { hoverTimer.current = setTimeout(() => setHover(false), 160) }
@@ -124,6 +125,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
           'overflow-hidden rounded-lg border bg-card shadow-sm transition-[box-shadow,border-color] duration-100',
           !bypassed && (selected ? 'border-primary' : 'border-border'),
           selected && 'ring-2 ring-primary/20',
+          canEdit && hover && !selected && !bypassed && 'border-primary/60 ring-1 ring-primary/15',
+          renameHover && 'border-primary ring-2 ring-primary/20',
         )}
         style={{
           ...(bypassed ? { border: `1.5px dashed ${accent}` } : {}),
@@ -141,7 +144,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
               >
                 {st.glyph}
               </span>}
-              <EditableTitle id={id} title={data.title} selected={selected} canEdit={canEdit} />
+              <EditableTitle id={id} title={data.title} selected={selected} canEdit={canEdit}
+                onRenameHover={setRenameHover} />
               <span className="flex-1" />
               {disabled && (
                 <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.5px] text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
@@ -291,7 +295,13 @@ function ActionIcon({ name, label, active, onClick, disabled }: {
   )
 }
 
-function EditableTitle({ id, title, selected, canEdit }: { id: string; title: string; selected?: boolean; canEdit: boolean }) {
+function EditableTitle({ id, title, selected, canEdit, onRenameHover }: {
+  id: string
+  title: string
+  selected?: boolean
+  canEdit: boolean
+  onRenameHover: (hovered: boolean) => void
+}) {
   const renameDraft = useStore((s) => s.renameDraft?.id === id ? s.renameDraft : null)
   const startRename = useStore((s) => s.startRename)
   const updateRenameDraft = useStore((s) => s.updateRenameDraft)
@@ -316,10 +326,15 @@ function EditableTitle({ id, title, selected, canEdit }: { id: string; title: st
   return (
     <span
       // click the name of an already-selected node to rename (Figma-style); double-click always works
-      onClick={(e) => { if (canEdit && selected) { e.stopPropagation(); startRename(id, title) } }}
-      onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); startRename(id, title) } }}
+      onMouseEnter={() => { if (canEdit) onRenameHover(true) }}
+      onMouseLeave={() => onRenameHover(false)}
+      onClick={(e) => { if (canEdit && selected) { e.stopPropagation(); onRenameHover(false); startRename(id, title) } }}
+      onDoubleClick={(e) => { if (canEdit) { e.stopPropagation(); onRenameHover(false); startRename(id, title) } }}
       title={canEdit ? 'Click (when selected) or double-click to rename' : 'View-only'}
-      className={cn('truncate text-[13.5px] font-semibold text-foreground', canEdit && 'cursor-text')}
+      className={cn(
+        '-mx-0.5 min-w-0 truncate rounded-sm border border-transparent px-0.5 text-[13.5px] font-semibold text-foreground',
+        canEdit && 'cursor-text hover:border-primary/40 hover:bg-primary/5',
+      )}
     >
       {title}
     </span>

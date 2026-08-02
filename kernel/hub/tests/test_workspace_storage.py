@@ -5153,7 +5153,8 @@ def test_workspace_default_browse_mixes_local_and_connected_source_roots(
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
     assert page["queryCapabilities"]["reason"] == (
-        "Mixed sources cannot share one sort order. Open a local folder to sort or filter."
+        "This folder includes connected-source items and local Canvases. Sorting and type filters "
+        "are unavailable because the source controls its result order."
     )
 
 

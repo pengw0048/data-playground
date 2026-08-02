@@ -72,7 +72,9 @@ from hub.models import (
     InstalledProcessorSource,
     JoinSuggestion,
     KernelInfo,
+    LineageEdge,
     LineageFactsPage,
+    LineageNode,
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
@@ -747,6 +749,47 @@ def save_table_edit(table_id: str, req: CatalogEdit) -> CatalogTable:
         raise HTTPException(400, str(exc)) from exc
 
 
+def _merge_lineage_graphs(
+    root_uri: str,
+    graphs: list[LineageResult],
+    *,
+    max_nodes: int,
+) -> LineageResult:
+    """Merge provider and local lineage without exceeding the requested UI boundary."""
+    ordered: dict[str, LineageNode] = {}
+    for graph in graphs:
+        for node in graph.nodes:
+            if node.uri == root_uri:
+                ordered.setdefault(node.uri, node)
+    for graph in graphs:
+        for node in graph.nodes:
+            if len(ordered) >= max_nodes and node.uri not in ordered:
+                continue
+            ordered.setdefault(node.uri, node)
+    if root_uri not in ordered:
+        ordered[root_uri] = LineageNode(
+            id=root_uri, name=root_uri.rsplit("/", 1)[-1], uri=root_uri)
+
+    counts: dict[tuple[str, str], int] = {}
+    dropped = False
+    for graph in graphs:
+        for edge in graph.edges:
+            if edge.parent not in ordered or edge.child not in ordered:
+                dropped = True
+                continue
+            pair = (edge.parent, edge.child)
+            counts[pair] = counts.get(pair, 0) + edge.fact_count
+    return LineageResult(
+        root_uri=root_uri,
+        nodes=list(ordered.values()),
+        edges=[
+            LineageEdge(parent=parent, child=child, fact_count=count)
+            for (parent, child), count in sorted(counts.items())
+        ],
+        truncated=dropped or any(graph.truncated for graph in graphs),
+    )
+
+
 @router.get("/catalog/lineage", response_model=LineageResult)
 def lineage(
         uri: str = Query(..., max_length=8192), depth: int = 6,
@@ -758,8 +801,27 @@ def lineage(
         root_uri = metadb.catalog_lineage_uri(uri)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return get_deps().catalog.lineage(root_uri, depth=max(1, min(int(depth), 20)),
-                                      max_nodes=max(1, min(int(max_nodes), 5000)))
+    bounded_depth = max(1, min(int(depth), 20))
+    bounded_nodes = max(1, min(int(max_nodes), 5000))
+    local = get_deps().catalog.lineage(
+        root_uri, depth=bounded_depth, max_nodes=bounded_nodes)
+    if not workspace_providers.is_provider_dataset_uri(root_uri):
+        return local
+    try:
+        connected = workspace_providers.provider_dataset_lineage(
+            root_uri, depth=bounded_depth, max_nodes=bounded_nodes)
+    except workspace_providers.ProviderDatasetLineageUnsupported:
+        return local
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        raise HTTPException(410, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return _merge_lineage_graphs(
+        root_uri, [connected, local], max_nodes=bounded_nodes)
 
 
 @router.get("/catalog/lineage/facts", response_model=LineageFactsPage)

@@ -11995,7 +11995,7 @@ def list_workspace_runs(
         recorded_after: datetime.datetime | None = None,
         recorded_before: datetime.datetime | None = None,
         text: str | None = None) -> dict:
-    """Return one bounded keyset page across every canvas the caller can currently read."""
+    """Return one bounded keyset page of jobs started by the caller on readable canvases."""
     if limit < 1 or limit > 100:
         raise ValueError("Jobs limit must be between 1 and 100")
     decoded = _workspace_run_cursor_decode(cursor)
@@ -12026,6 +12026,7 @@ def list_workspace_runs(
         history_identity = literal("h:") + RunRecord.id
         history_predicates = [
             visible_canvas,
+            func.coalesce(RunInputAdmission.creator_id, RunState.created_by) == str(uid),
             # A managed-local durable write mirrors its receipt into Run history, but Jobs already
             # lists the owning task ("t:"); exclude the history twin so it stays one Jobs entry.
             ~exists().where(and_(
@@ -12073,6 +12074,10 @@ def list_workspace_runs(
                 RunState.run_id == RunRecord.run_id,
                 RunState.canvas_id == RunRecord.canvas_id,
             ))
+            .outerjoin(
+                RunInputAdmission,
+                RunInputAdmission.run_id == RunRecord.run_id,
+            )
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunRecord.run_id)
             .where(*history_predicates)
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
@@ -12087,6 +12092,7 @@ def list_workspace_runs(
         state_identity = literal("s:") + RunState.run_id
         state_predicates = [
             visible_canvas,
+            RunState.created_by == str(uid),
             ~exists().where(and_(
                 RunRecord.canvas_id == RunState.canvas_id,
                 RunRecord.run_id == RunState.run_id,
@@ -12144,6 +12150,7 @@ def list_workspace_runs(
         task_identity = literal("t:") + DurableTask.id
         task_predicates = [
             visible_canvas,
+            DurableTask.owner_id == str(uid),
             DurableTask.task_kind.notin_(_JOBS_HIDDEN_TASK_KINDS),
         ]
         if canvas_id:

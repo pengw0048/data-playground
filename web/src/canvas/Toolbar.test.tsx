@@ -107,7 +107,7 @@ describe('Canvas controls', () => {
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
   })
 
-  it('keeps one searchable operation picker in the bottom toolbar when selection changes', () => {
+  it('keeps category tools and node search without a redundant global add button', () => {
     toolbarState.canvasRole = 'owner'
     toolbarState.selectedIds = ['source-1']
     toolbarState.specs = [{
@@ -120,7 +120,7 @@ describe('Canvas controls', () => {
     )
 
     expect(screen.queryByRole('button', { name: 'Add next step' })).not.toBeInTheDocument()
-    expect(screen.getAllByRole('button', { name: 'Add operation' })).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: 'Add operation' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Locate existing node' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Inspector/ })).not.toBeInTheDocument()
 
@@ -130,6 +130,6 @@ describe('Canvas controls', () => {
         <Toolbar />
       </TooltipProvider>,
     )
-    expect(screen.getAllByRole('button', { name: 'Add operation' })).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: 'Add operation' })).not.toBeInTheDocument()
   })
 })

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
@@ -126,13 +126,13 @@ describe('ERDiagram request truth', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Declare' })).toBeEnabled())
   })
 
-  it('explains the current Workspace route for declaring a primary key', async () => {
+  it('explains how to edit the relationship graph', async () => {
     render(<ERDiagram />)
 
     fireEvent.click(screen.getByRole('button', { name: 'How this works' }))
 
-    expect(await screen.findByText(/Open a dataset from Workspace, then declare a primary key in its detail drawer/)).toBeVisible()
-    expect(screen.queryByText(/Tables.*detail drawer/i)).toBeNull()
+    expect(await screen.findByText(/Drag from one entity to another to declare a join/)).toBeVisible()
+    expect(screen.getByText(/Click a solid edge to remove it/)).toBeVisible()
   })
 
   it('requires an in-app confirmation before removing a declared relationship', async () => {
@@ -186,7 +186,7 @@ describe('ERDiagram request truth', () => {
 
     fireEvent.click(await screen.findByTestId('er-mode-lineage'))
 
-    expect(await screen.findByText('Focused: orders-current')).toBeInTheDocument()
+    expect(await within(screen.getByTestId('er-focus-bar')).findByText('orders-current')).toBeInTheDocument()
     expect(screen.getByTestId('node-orders')).toHaveAttribute('data-focused', 'true')
     await waitFor(() => expect(mocks.lineage).toHaveBeenLastCalledWith(
       currentOrders.uri, 1, 60))
@@ -207,8 +207,8 @@ describe('ERDiagram request truth', () => {
     mocks.tablesPage.mockResolvedValue({ items: [CUSTOMERS], total: 1, hasMore: false })
     render(<ERDiagram />)
 
-    expect(await screen.findByText('Focused: raw_video_v2')).toBeInTheDocument()
-    expect(screen.getByText('raw_video_v2')).toBeInTheDocument()
+    expect(await screen.findByText('Current dataset')).toBeInTheDocument()
+    expect(within(screen.getByTestId('er-focus-bar')).getByText('raw_video_v2')).toBeInTheDocument()
     expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveAttribute('data-focused', 'true')
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
@@ -229,8 +229,8 @@ describe('ERDiagram request truth', () => {
     })
     render(<ERDiagram />)
 
-    expect(await screen.findByText('Focused: orders')).toBeInTheDocument()
-    expect(screen.getByTestId('er-mode-lineage')).toHaveClass('bg-accent')
+    expect(await screen.findByText('Current dataset')).toBeInTheDocument()
+    expect(screen.queryByTestId('er-mode-lineage')).not.toBeInTheDocument()
     expect(mocks.tableByRegistration).toHaveBeenCalledWith(ORDERS.registrationId)
     await waitFor(() => expect(mocks.lineage).toHaveBeenCalledWith(ORDERS.uri, 1, 60))
 

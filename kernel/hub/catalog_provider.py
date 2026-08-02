@@ -16,7 +16,7 @@ from typing import Literal, Protocol, TypeVar, runtime_checkable
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
-from hub.models import ColumnSchema, Wire
+from hub.models import ColumnSchema, LineageResult, Wire
 
 ProviderState = Literal["ready", "partial", "unavailable", "unsupported"]
 ProviderFailure = Literal["offline", "permission_lost", "not_found", "provider_error"]
@@ -98,6 +98,7 @@ class ProviderCapabilities(Wire):
     ancestors: bool = True
     dataset_detail: bool = True
     search: bool = False
+    lineage: bool = False
     delete_dataset: bool = False
 
 
@@ -169,6 +170,27 @@ class ProviderDatasetDetailResult(Wire):
         return self
 
 
+class ProviderLineageResult(Wire):
+    """One bounded provider-owned lineage graph or a classified read failure."""
+
+    state: ProviderState = "ready"
+    item: LineageResult | None = None
+    reason: str | None = Field(default=None, max_length=512)
+    failure: ProviderFailure | None = None
+
+    @model_validator(mode="after")
+    def _failure_shape(self) -> "ProviderLineageResult":
+        if self.state == "ready" and self.item is None:
+            raise ValueError("ready provider lineage requires an item")
+        if self.state == "ready" and self.failure is not None:
+            raise ValueError("ready provider lineage cannot carry a failure")
+        if self.state != "ready" and self.item is not None:
+            raise ValueError("failed provider lineage cannot carry an item")
+        if self.state not in {"ready", "unsupported"} and self.failure is None:
+            raise ValueError("failed provider lineage must classify its failure")
+        return self
+
+
 class ProviderAncestors(Wire):
     state: ProviderState = "ready"
     items: list[CatalogResource] = Field(default_factory=list, max_length=128)
@@ -222,6 +244,20 @@ class MutableCatalogProvider(Protocol):
 
     def can_delete_dataset(self, mount: CatalogMount, dataset_id: str) -> bool: ...
     def delete_dataset(self, mount: CatalogMount, dataset_id: str, *, actor: str) -> bool: ...
+
+
+@runtime_checkable
+class CatalogLineageProvider(Protocol):
+    """Optional provider-owned lineage for one canonical dataset identity."""
+
+    def lineage(
+        self,
+        mount: CatalogMount,
+        dataset_id: str,
+        *,
+        depth: int,
+        max_nodes: int,
+    ) -> LineageResult: ...
 
 
 def _provider_read(function: Callable[[], _R]) -> _R:
@@ -373,6 +409,76 @@ def bounded_dataset_detail(provider: ReadOnlyCatalogProvider, mount: CatalogMoun
             failure="provider_error"),
         failed=lambda: ProviderDatasetDetailResult(
             state="unavailable", reason="provider dataset detail is invalid",
+            failure="provider_error"),
+        timeout=timeout,
+    )
+
+
+def bounded_lineage(
+    provider: ReadOnlyCatalogProvider,
+    mount: CatalogMount,
+    dataset_id: str,
+    *,
+    depth: int,
+    max_nodes: int,
+    timeout: float = 1.0,
+) -> ProviderLineageResult:
+    """Read optional provider lineage without trusting an unbounded plugin graph."""
+    if not 1 <= depth <= 20:
+        raise ValueError("depth must be between 1 and 20")
+    if not 1 <= max_nodes <= 5000:
+        raise ValueError("max_nodes must be between 1 and 5000")
+
+    def read() -> ProviderLineageResult:
+        raw_capabilities = provider.capabilities(mount)
+        if isinstance(raw_capabilities, ProviderCapabilities):
+            raw_capabilities = raw_capabilities.model_dump(mode="python")
+        capabilities = ProviderCapabilities.model_validate(raw_capabilities)
+        if not capabilities.lineage or not isinstance(provider, CatalogLineageProvider):
+            raise NotImplementedError
+        try:
+            raw = provider.lineage(
+                mount, dataset_id, depth=depth, max_nodes=max_nodes)
+        except PermissionError:
+            return ProviderLineageResult(
+                state="unavailable", reason="provider permission was denied",
+                failure="permission_lost")
+        except FileNotFoundError:
+            return ProviderLineageResult(
+                state="unavailable", reason="provider dataset was not found",
+                failure="not_found")
+        except OSError:
+            return ProviderLineageResult(
+                state="unavailable", reason="provider is unavailable", failure="offline")
+        if isinstance(raw, LineageResult):
+            raw = raw.model_dump(mode="python")
+        item = LineageResult.model_validate(raw)
+        node_uris = [node.uri for node in item.nodes]
+        node_uri_set = set(node_uris)
+        node_ids = [node.id for node in item.nodes]
+        edge_pairs = [(edge.parent, edge.child) for edge in item.edges]
+        edge_cap = min(50_000, max(2_000, max_nodes * 8))
+        if (
+            len(item.nodes) > max_nodes
+            or len(item.edges) > edge_cap
+            or len(node_uris) != len(set(node_uris))
+            or len(node_ids) != len(set(node_ids))
+            or len(edge_pairs) != len(set(edge_pairs))
+            or item.root_uri not in node_uri_set
+            or any(parent not in node_uri_set or child not in node_uri_set
+                   for parent, child in edge_pairs)
+        ):
+            raise ValueError("provider lineage exceeds its requested graph boundary")
+        return ProviderLineageResult(item=item)
+
+    return _bounded_provider_read(
+        read,
+        unavailable=lambda reason: ProviderLineageResult(
+            state="unavailable", reason=reason, failure="offline"),
+        unsupported=lambda: ProviderLineageResult(
+            state="unsupported", reason="lineage is unsupported"),
+        failed=lambda: ProviderLineageResult(
+            state="unavailable", reason="provider lineage result is invalid",
             failure="provider_error"),
         timeout=timeout,
     )

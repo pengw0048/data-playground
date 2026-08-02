@@ -112,7 +112,7 @@ export function ExistingNodeLocator({ nodes, onPick, onClose }: {
   }
 
   return createPortal(
-    <div className="dp-modal-overlay fixed inset-0 z-[70] grid place-items-start bg-black/20 pt-[12vh]" onMouseDown={onClose}>
+    <div className="dp-modal-overlay fixed inset-0 z-[70] grid place-items-center bg-black/20 p-4" onMouseDown={onClose}>
       <section role="dialog" aria-modal="true" aria-label="Locate an existing node" className="w-[min(620px,calc(100vw-32px))] overflow-hidden rounded-xl border border-border bg-popover shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
           <Icon name="search" size={16} style={{ color: color.text3 }} />

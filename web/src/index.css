@@ -57,7 +57,7 @@
 }
 
 :root {
-  --canvas: #f1f1f1;
+  --canvas: #f6f6f6;
   /* NOTE: --card and --border are OWNED by the shadcn tokens above (HSL triples, with a dark variant).
      They are intentionally NOT redefined here — a hex copy would (as an unlayered rule) shadow the
      shadcn value and break both `hsl(var(--card))` and dark mode. Use `bg-card`/`border-border`, or

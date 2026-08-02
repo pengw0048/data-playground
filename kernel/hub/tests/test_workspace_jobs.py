@@ -34,7 +34,8 @@ def _identity() -> tuple[str, str]:
 def _live(
         canvas_id: str, run_id: str, status: str = "running",
         *, progress: float | None = None,
-        updated_at: datetime.datetime | None = None) -> None:
+        updated_at: datetime.datetime | None = None,
+        owner_id: str) -> None:
     doc = RunStatus(
         run_id=run_id, status=status, target_node_id="live-node",
         placement="distributed", per_node=[], progress=progress,
@@ -46,24 +47,57 @@ def _live(
     with metadb.session() as session:
         session.add(metadb.RunState(
             run_id=run_id, canvas_id=canvas_id, status=status,
-            doc=json.dumps(doc), created_by="test", auth_canvas_id=canvas_id,
+            doc=json.dumps(doc), created_by=owner_id, auth_canvas_id=canvas_id,
             target_node_id="live-node",
             updated_at=updated_at or datetime.datetime.now(datetime.timezone.utc),
         ))
 
 
+def _record(
+    owner_id: str,
+    canvas_id: str,
+    target_node_id: str | None,
+    job_type: str,
+    status: str,
+    *,
+    run_id: str,
+    error: str | None = None,
+    per_node: list[dict] | None = None,
+) -> bool:
+    with metadb.session() as session:
+        session.add(metadb.RunInputAdmission(
+            run_id=run_id,
+            creator_id=owner_id,
+            canvas_id=canvas_id,
+            submission_id=f"submission-{run_id}",
+            target_node_id=target_node_id,
+            intent_sha256="a" * 64,
+            manifest="[]",
+        ))
+    return metadb.record_run(
+        canvas_id,
+        target_node_id,
+        job_type,
+        status,
+        run_id=run_id,
+        error=error,
+        per_node=per_node,
+    )
+
+
 def test_workspace_jobs_are_accessible_filtered_and_keyset_paginated():
     uid, suffix = _identity()
     alpha, beta, secret = f"jobs-a-{suffix}", f"jobs-b-{suffix}", f"jobs-secret-{suffix}"
-    assert metadb.record_run(
-        alpha, "failed-node", "run", "failed", error="warehouse rejected batch",
+    assert _record(
+        uid, alpha, "failed-node", "run", "failed", error="warehouse rejected batch",
         per_node=[{"node_id": "failed-node", "status": "failed", "label": "Publish climate"}],
         run_id=f"failed-{suffix}")
-    assert metadb.record_run(
-        beta, None, "run", "cancelled", run_id=f"cancelled-{suffix}")
-    assert metadb.record_run(
-        secret, None, "run", "failed", error="must stay private", run_id=f"secret-{suffix}")
-    _live(beta, f"live-{suffix}")
+    assert _record(
+        uid, beta, None, "run", "cancelled", run_id=f"cancelled-{suffix}")
+    assert _record(
+        f"jobs-stranger-{suffix}", secret, None, "run", "failed",
+        error="must stay private", run_id=f"secret-{suffix}")
+    _live(beta, f"live-{suffix}", owner_id=uid)
 
     first = metadb.list_workspace_runs(uid, limit=2)
     assert len(first["items"]) == 2
@@ -91,11 +125,34 @@ def test_workspace_jobs_are_accessible_filtered_and_keyset_paginated():
     assert [item["runId"] for item in node["items"]] == [f"failed-{suffix}"]
 
 
+def test_workspace_jobs_show_only_the_callers_work_on_a_shared_canvas():
+    uid, suffix = _identity()
+    stranger = f"jobs-stranger-{suffix}"
+    canvas_id = f"jobs-shared-{suffix}"
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id=stranger,
+            name="Shared canvas",
+            visibility="workspace",
+        ))
+    assert _record(
+        stranger, canvas_id, None, "run", "done", run_id=f"other-{suffix}")
+    assert _record(
+        uid, canvas_id, None, "run", "done", run_id=f"mine-{suffix}")
+
+    page = WorkspaceRunPage.model_validate(metadb.list_workspace_runs(uid))
+
+    assert [item.run_id for item in page.items if item.canvas_id == canvas_id] == [
+        f"mine-{suffix}",
+    ]
+
+
 def test_workspace_jobs_keep_the_durable_backend_attempt_after_live_state_pruning():
     uid, suffix = _identity()
     canvas_id = f"jobs-a-{suffix}"
     run_id = f"durable-attempt-{suffix}"
-    assert metadb.record_run(canvas_id, None, "run", "done", run_id=run_id)
+    assert _record(uid, canvas_id, None, "run", "done", run_id=run_id)
     with metadb.session() as session:
         session.add(metadb.RunBackendJob(
             run_id=run_id,
@@ -118,8 +175,8 @@ def test_workspace_jobs_project_only_owned_progress_and_canonical_update_times()
     live_id = f"progress-{suffix}"
     terminal_id = f"terminal-{suffix}"
     fixed = datetime.datetime(2026, 7, 18, 12, 34, 56)
-    _live(canvas_id, live_id, progress=0.375, updated_at=fixed)
-    assert metadb.record_run(canvas_id, None, "run", "failed", run_id=terminal_id)
+    _live(canvas_id, live_id, progress=0.375, updated_at=fixed, owner_id=uid)
+    assert _record(uid, canvas_id, None, "run", "failed", run_id=terminal_id)
 
     page = WorkspaceRunPage.model_validate(metadb.list_workspace_runs(uid))
     by_run = {item.run_id: item for item in page.items}
@@ -143,7 +200,7 @@ def test_canvas_history_and_jobs_serialize_one_core_timestamp_as_utc():
     canvas_id = f"jobs-a-{suffix}"
     run_id = f"timestamp-{suffix}"
     instant = datetime.datetime(2026, 7, 21, 18, 28, 35, tzinfo=datetime.timezone.utc)
-    assert metadb.record_run(canvas_id, None, "run", "done", run_id=run_id)
+    assert _record(uid, canvas_id, None, "run", "done", run_id=run_id)
     with metadb.session() as session:
         row = session.scalar(select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
         assert row is not None
@@ -228,18 +285,15 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
     assert owner_item.task_attempts[1].progress == 0.625
     assert owner_item.task_attempts[1].updated_at == second_update_iso
 
-    viewer_item = WorkspaceRunPage.model_validate(
-        metadb.list_workspace_runs(viewer, run_id=task["id"])).items[0]
-    assert viewer_item.progress == owner_item.progress
-    assert viewer_item.updated_at == owner_item.updated_at
-    assert viewer_item.can_cancel is False and viewer_item.can_retry is False
+    assert WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(viewer, run_id=task["id"])).items == []
 
 
 def test_workspace_jobs_route_enforces_visibility_and_rejects_bad_cursor():
     uid, suffix = _identity()
     canvas_id = f"jobs-a-{suffix}"
-    assert metadb.record_run(
-        canvas_id, None, "run", "failed", error="route failure",
+    assert _record(
+        uid, canvas_id, None, "run", "failed", error="route failure",
         run_id=f"route-{suffix}")
 
     response = client.get("/api/jobs?limit=1", headers={"X-DP-User": uid})

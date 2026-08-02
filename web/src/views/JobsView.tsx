@@ -353,8 +353,8 @@ export function JobsView() {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
-        <div><h1 className="text-[20px] font-bold text-foreground">Jobs</h1>
-          <p className="text-[11.5px] text-muted-foreground">{items.length || ordinaryFilters ? freshness ?? 'Persisted runs across accessible canvases' : 'Progress and results across accessible canvases'}</p></div>
+        <div><h1 className="text-[20px] font-bold text-foreground">Your Jobs</h1>
+          <p className="text-[11.5px] text-muted-foreground">{items.length || ordinaryFilters ? freshness ?? 'Runs and background tasks you started' : 'Progress and results from work you started'}</p></div>
         <span className="flex-1" />
         <Button variant="outline" size="sm" onClick={() => void load(undefined, 'refresh')} disabled={loading || loadingMore}>
           <Icon name="refresh" size={13} /> Refresh
@@ -425,7 +425,7 @@ function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[];
   const listed = canvases.some((canvas) => canvas.id === value)
   return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Canvas
     <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-      <option value="">All accessible canvases</option>
+      <option value="">All canvases</option>
       {!listed && value && <option value={value}>Canvas ID from link: {value}</option>}
       {canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvasLabel(canvas)}</option>)}
     </select></label>

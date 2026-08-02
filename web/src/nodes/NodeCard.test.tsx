@@ -85,6 +85,29 @@ describe('NodeCard result summary', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(2)
   })
 
+  it('highlights an editable card on hover and strengthens the cue over its rename target', () => {
+    const data = useStore.getState().doc.nodes[0].data
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    const title = screen.getByTitle('Click (when selected) or double-click to rename')
+    const card = title.closest('div.overflow-hidden.rounded-lg')
+    const wrapper = card?.closest('.dp-no-select')
+    expect(card).not.toBeNull()
+    expect(wrapper).not.toBeNull()
+    expect(card).not.toHaveClass('ring-1', 'ring-2')
+    fireEvent.mouseEnter(wrapper!)
+    expect(card).toHaveClass('ring-1')
+    fireEvent.mouseEnter(title)
+    expect(card).toHaveClass('border-primary', 'ring-2')
+    fireEvent.mouseLeave(title)
+    expect(card).not.toHaveClass('ring-2')
+    expect(card).toHaveClass('ring-1')
+  })
+
   it('names retained successful snapshots as output versions on output nodes', () => {
     useStore.setState((state) => ({
       selectedIds: ['target'],

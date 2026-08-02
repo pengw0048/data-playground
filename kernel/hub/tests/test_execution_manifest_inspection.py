@@ -76,7 +76,8 @@ def _fixture(monkeypatch) -> tuple[str, dict[str, str]]:
 
 
 def _history(
-        canvas_id: str, identity: str, digest: str | None, *, job_type: str = "run") -> None:
+        canvas_id: str, identity: str, digest: str | None, *, job_type: str = "run",
+        creator_id: str | None = None) -> None:
     with metadb.session() as session:
         session.add(metadb.RunRecord(
             id=identity,
@@ -90,6 +91,17 @@ def _history(
             outputs="[]",
             execution_manifest_sha256=digest,
         ))
+        if creator_id is not None:
+            session.add(metadb.RunInputAdmission(
+                run_id=f"logical-{identity}",
+                creator_id=creator_id,
+                canvas_id=canvas_id,
+                submission_id=f"submission-{identity}",
+                target_node_id="source",
+                intent_sha256="a" * 64,
+                manifest="[]",
+                execution_manifest_sha256=digest,
+            ))
 
 
 def _detail(canvas_id: str, subject_id: str, uid: str):
@@ -186,7 +198,7 @@ def test_manifest_detail_classifies_lifecycle_and_integrity_without_fallback(mon
 
 def test_history_and_jobs_lists_read_only_bounded_manifest_metadata(monkeypatch):
     digest, ids = _fixture(monkeypatch)
-    _history(ids["canvas"], "bounded-history", digest)
+    _history(ids["canvas"], "bounded-history", digest, creator_id=ids["owner"])
 
     def must_not_validate(*_args, **_kwargs):
         raise AssertionError("list endpoints must not parse the manifest document")

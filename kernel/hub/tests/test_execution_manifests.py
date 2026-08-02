@@ -663,6 +663,7 @@ def test_shared_manifest_survives_one_owner_and_legacy_history_is_explicit():
         _canvas(canvas_id)
     _admit("manifest-canvas", str(uuid.uuid4()), digest, payload)
     _admit("manifest-canvas-2", str(uuid.uuid4()), digest, payload)
+    metadb.bind_run_owner("legacy-run", "local", "legacy-canvas")
     metadb.record_run(
         canvas_id="legacy-canvas", target_node_id=None, job_type="run",
         status="failed", error="legacy", run_id="legacy-run",

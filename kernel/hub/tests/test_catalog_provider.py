@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -18,9 +19,10 @@ from hub import catalog_provider_conformance
 from hub.catalog_provider import (
     _PROVIDER_READ_CONCURRENCY, CatalogDatasetDetail, CatalogMount, CatalogResource,
     ProviderAncestors, ProviderCapabilities, ProviderCapabilitiesResult,
-    ProviderDatasetDetailResult, ProviderPage, ProviderResourceResult, ProviderSearchPage,
+    ProviderDatasetDetailResult, ProviderLineageResult, ProviderPage,
+    ProviderResourceResult, ProviderSearchPage,
     bounded_ancestors, bounded_capabilities, bounded_dataset_detail, bounded_list_children,
-    bounded_resolve, bounded_search,
+    bounded_lineage, bounded_resolve, bounded_search,
 )
 
 
@@ -277,6 +279,98 @@ def test_bounded_helpers_enforce_requested_provider_identity():
     assert resolved.state == "unavailable" and resolved.failure == "provider_error"
     detailed = bounded_dataset_detail(MismatchedProvider(), mount, "requested-dataset")
     assert detailed.state == "unavailable" and detailed.failure == "provider_error"
+
+
+def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from hub import metadb, workspace_providers
+    from hub.main import app
+    from hub.models import LineageEdge, LineageNode, LineageResult
+
+    suffix = uuid.uuid4().hex
+    mount_id = f"lineage-mount-{suffix}"
+    source_binding_id = uuid.uuid4().hex
+    provider_dataset_id = f"dataset-{suffix}"
+    physical_root = f"s3://secret-bucket/{suffix}/raw_video_v2.lance"
+    physical_parent = f"s3://secret-bucket/{suffix}/raw_video_v1.lance"
+
+    class Provider:
+        def capabilities(self, _mount):
+            return ProviderCapabilities(lineage=True)
+
+        def list_children(self, *_args, **_kwargs):
+            return ProviderPage()
+
+        def resolve(self, *_args, **_kwargs):
+            return ProviderResourceResult(state="unavailable", failure="not_found")
+
+        def ancestors(self, *_args, **_kwargs):
+            return ProviderAncestors()
+
+        def dataset_detail(self, *_args, **_kwargs):
+            return ProviderDatasetDetailResult(state="unavailable", failure="not_found")
+
+        def lineage(self, _mount, dataset_id, *, depth, max_nodes):
+            assert dataset_id == provider_dataset_id
+            assert depth == 2 and max_nodes == 10
+            return LineageResult(
+                root_uri=physical_root,
+                nodes=[
+                    LineageNode(id=physical_parent, name="raw_video_v1", uri=physical_parent),
+                    LineageNode(id=physical_root, name="raw_video_v2", uri=physical_root),
+                ],
+                edges=[LineageEdge(
+                    parent=physical_parent, child=physical_root, fact_count=2)],
+            )
+
+    provider = Provider()
+    bounded = bounded_lineage(
+        provider, CatalogMount(id=mount_id, provider="fixture"), provider_dataset_id,
+        depth=2, max_nodes=10,
+    )
+    assert bounded == ProviderLineageResult(item=provider.lineage(
+        CatalogMount(id=mount_id, provider="fixture"), provider_dataset_id,
+        depth=2, max_nodes=10,
+    ))
+
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id,
+        "provider": "fixture",
+        "config": {},
+    }]))
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    with metadb.session() as session:
+        session.add(metadb.WorkspaceProviderDataset(
+            mount_id=mount_id,
+            provider_dataset_id=provider_dataset_id,
+            provider="fixture",
+            source_binding_id=source_binding_id,
+            uri="fixture://hidden/provider-binding",
+            columns_doc="[]",
+            state="current",
+        ))
+    source_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    graph = workspace_providers.provider_dataset_lineage(
+        source_uri, depth=2, max_nodes=10)
+    serialized = graph.model_dump_json()
+    assert graph.root_uri == source_uri
+    assert graph.nodes[1].name == "raw_video_v2"
+    assert graph.edges[0].child == source_uri
+    assert "secret-bucket" not in serialized and suffix not in graph.nodes[0].uri
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/catalog/lineage",
+            params={"uri": source_uri, "depth": 2, "maxNodes": 10},
+        )
+    assert response.status_code == 200, response.text
+    routed = response.json()
+    assert routed["rootUri"] == source_uri
+    assert {node["name"] for node in routed["nodes"]} >= {
+        "raw_video_v1", "raw_video_v2",
+    }
+    assert "secret-bucket" not in response.text
 
 
 def test_bounded_pages_reject_overlimit_and_nonadvancing_cursors():

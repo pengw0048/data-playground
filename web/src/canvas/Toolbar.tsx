@@ -11,7 +11,6 @@ import { locateNode } from './locateNode'
 import { cn } from '@/lib/utils'
 import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 import { canvasFitOptions } from './viewportFit'
-import { NodeFinder } from './NodeFinder'
 import { NodeTypeIcon } from './NodeTypeIcon'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
@@ -32,7 +31,6 @@ export function Toolbar() {
   const canvasRole = useStore((s) => s.canvasRole)
   const [open, setOpen] = useState<Category | null>(null)
   const [locatorOpen, setLocatorOpen] = useState(false)
-  const [finderOpen, setFinderOpen] = useState(false)
   const toolbarRef = useRef<HTMLDivElement>(null)
 
   const specs = allSpecs()
@@ -67,7 +65,6 @@ export function Toolbar() {
   }
 
   const toolbarDensity = useToolbarDensity(toolbarRef)
-  const labelsVisible = toolbarDensity !== 'icons'
 
   const locate = (id: string) => {
     const nodes = useStore.getState().doc.nodes
@@ -90,10 +87,7 @@ export function Toolbar() {
       {canEdit && (
         <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
           <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-lg border border-border bg-card p-1 shadow-lg">
-            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className="flex min-w-0 items-center gap-1">
-              {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Add</span>}
-              <ToolbarIconButton label="Add operation" tooltip="Search and add an operation" icon="plus"
-                showLabel={labelsVisible} onClick={() => { setOpen(null); setLocatorOpen(false); setFinderOpen(true) }} />
+            <div data-testid="toolbar-add-controls" role="group" aria-label="Canvas tools" className="flex min-w-0 items-center gap-1">
               {cats.map((cat) => (
                 <CategoryButton
                   key={cat}
@@ -126,8 +120,6 @@ export function Toolbar() {
         </div>
       )}
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
-      {finderOpen && <NodeFinder specs={specs} onPick={(kind) => { add(kind); setFinderOpen(false) }}
-        onClose={() => setFinderOpen(false)} />}
     </>
   )
 }

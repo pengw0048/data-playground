@@ -16,6 +16,7 @@ from typing import Literal
 
 from hub import metadb
 from hub.catalog_provider import (
+    CatalogLineageProvider,
     CatalogMount,
     CatalogResource,
     MutableCatalogProvider,
@@ -26,6 +27,7 @@ from hub.catalog_provider import (
     bounded_capabilities,
     bounded_dataset_detail,
     bounded_list_children,
+    bounded_lineage,
     bounded_resolve,
     bounded_search,
 )
@@ -47,7 +49,7 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 # Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
 # actions may wait a little longer, but remain bounded and use the same isolated provider workers.
 _PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
-_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
+_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
 }
@@ -72,6 +74,10 @@ class ProviderDatasetOffline(ProviderDatasetUnavailable):
 
 class ProviderDatasetMutationUnsupported(ProviderDatasetUnavailable):
     """The mounted provider did not explicitly authorize dataset removal."""
+
+
+class ProviderDatasetLineageUnsupported(ProviderDatasetUnavailable):
+    """The mounted provider does not expose lineage for its datasets."""
 
 
 class MountConfigError(ValueError):
@@ -448,6 +454,87 @@ def provider_dataset_uri_for_identity(dataset_id: str) -> str | None:
         return None
     _decode_source_identity_token(dataset_id.removeprefix(prefix))
     return f"{_PROVIDER_DATASET_URI_PREFIX}{dataset_id.removeprefix(prefix)}"
+
+
+def _provider_lineage_uri(mount_id: str, uri: str) -> str:
+    """Return a stable, non-reversible UI identity for a provider-owned lineage endpoint."""
+    digest = hashlib.sha256(f"{mount_id}\0{uri}".encode()).hexdigest()
+    return f"workspace-provider-lineage://{digest}"
+
+
+def provider_dataset_lineage(uri: str, *, depth: int, max_nodes: int):
+    """Read one connected source's lineage while keeping physical provider URIs private."""
+    from hub.models import LineageEdge, LineageNode, LineageResult
+
+    dataset_identity = provider_dataset_identity(uri)
+    if dataset_identity is None:
+        raise ValueError("lineage requires a Workspace provider dataset URI")
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_identity.removeprefix("workspace-provider:"))
+    binding = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if binding is None:
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None or mounted.mount.provider != binding["provider"]:
+        raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetUnavailable(_activation_error()) from exc
+    if not isinstance(provider, CatalogLineageProvider):
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source does not provide lineage")
+    result = bounded_lineage(
+        provider,
+        mounted.mount,
+        binding["providerDatasetId"],
+        depth=depth,
+        max_nodes=max_nodes,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    if result.state == "unsupported":
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source does not provide lineage")
+    if result.state != "ready" or result.item is None:
+        if result.failure == "permission_lost":
+            raise PermissionError("permission to read provider lineage was lost")
+        if result.failure == "not_found":
+            raise ProviderDatasetGone("provider lineage dataset was deleted")
+        if result.failure == "offline":
+            raise ProviderDatasetOffline("provider lineage is temporarily unavailable")
+        raise ProviderDatasetUnavailable("provider returned invalid lineage")
+
+    item = result.item
+    aliases = {
+        node.uri: (
+            uri if node.uri == item.root_uri
+            else _provider_lineage_uri(mount_id, node.uri)
+        )
+        for node in item.nodes
+    }
+    return LineageResult(
+        root_uri=uri,
+        nodes=[
+            LineageNode(
+                id=aliases[node.uri],
+                name=node.name,
+                uri=aliases[node.uri],
+                kind=node.kind,
+            )
+            for node in item.nodes
+        ],
+        edges=[
+            LineageEdge(
+                parent=aliases[edge.parent],
+                child=aliases[edge.child],
+                fact_count=edge.fact_count,
+            )
+            for edge in item.edges
+        ],
+        truncated=item.truncated,
+    )
 
 
 class _BoundProviderDatasetAdapter:
@@ -1471,10 +1558,10 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
 
 
 _PROVIDER_QUERY_REASON = (
-    "This source controls the order of its results. Sorting and type filters aren't available here."
+    "Items are shown in the connected source's order. This source does not support sorting or type filters."
 )
 _MIXED_QUERY_REASON = (
-    "Mixed sources cannot share one sort order. Open a local folder to sort or filter."
+    "This folder includes connected-source items and local Canvases. Sorting and type filters are unavailable because the source controls its result order."
 )
 
 

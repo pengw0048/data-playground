@@ -284,8 +284,6 @@ export function AppMenu({
   onCopy: () => void
   copyable: boolean
 }) {
-  const setJobsQuery = useStore((s) => s.setJobsQuery)
-  const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   const doc = useStore((s) => s.doc)
   const currentDraftId = useStore((s) => s.currentDraftId)
@@ -315,7 +313,6 @@ export function AppMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">
         <DropdownMenuItem onSelect={onWorkspace}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New Canvas</DropdownMenuItem>
         <DropdownMenuItem data-testid="import-native-canvas" onSelect={() => setTimeout(onNativeImport)}><Icon name="import" size={14} /> Import native Canvas…</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
@@ -326,8 +323,6 @@ export function AppMenu({
         <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>
           <DropdownMenuSubTrigger><Icon name="sun" size={14} /> Appearance</DropdownMenuSubTrigger>
@@ -367,13 +362,6 @@ export function AppMenu({
     />
     </>
   )
-}
-
-function MenuDestination({ label, detail }: { label: string; detail: string }) {
-  return <span className="flex min-w-0 flex-1 flex-col items-start leading-tight">
-    <span>{label}</span>
-    <span aria-hidden className="mt-0.5 whitespace-normal text-[10px] leading-tight text-muted-foreground">{detail}</span>
-  </span>
 }
 
 export function CanvasTitle() {
@@ -463,7 +451,7 @@ export function CanvasTitle() {
     aria-label={canEdit ? `Rename Canvas ${name}` : `Canvas ${name}, view only`}
     disabled={!canEdit}
     onClick={begin}
-    className="min-w-0 max-w-[min(42vw,520px)] truncate rounded-md px-1 py-0.5 text-left text-[13.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-default disabled:hover:bg-transparent"
+    className="min-w-0 max-w-[min(42vw,520px)] truncate rounded-md border border-transparent px-1 py-0.5 text-left text-[13.5px] font-semibold text-foreground hover:border-primary/40 hover:bg-primary/5 disabled:cursor-default disabled:hover:border-transparent disabled:hover:bg-transparent"
   >
     {name}
   </button>

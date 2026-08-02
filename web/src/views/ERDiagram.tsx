@@ -22,10 +22,37 @@ import { ConfirmationDialog } from '../components/ConfirmationDialog'
 // mode swaps the join graph for the data-lineage (provenance) graph. Primary keys are declared in the
 // table drawer, so entity columns here are read-only.
 
-type EntityData = { table: CatalogTable; pk: string[]; focused: boolean; onFocus: () => void }
+type EntityData = {
+  table: CatalogTable
+  pk: string[]
+  focused: boolean
+  lineage: boolean
+  onFocus: () => void
+}
 
 function EntityNode({ data }: { data: EntityData }) {
-  const { table, pk, focused, onFocus } = data
+  const { table, pk, focused, lineage, onFocus } = data
+  if (lineage) {
+    return (
+      <div className={cn(
+        'w-[230px] overflow-hidden rounded-xl border bg-card shadow-sm',
+        focused ? 'border-primary ring-2 ring-primary/20' : 'border-border',
+      )}>
+        <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-muted-foreground" />
+        <div className="flex min-w-0 items-center gap-2 px-3 py-2.5">
+          <span className={cn(
+            'grid h-7 w-7 shrink-0 place-items-center rounded-lg',
+            focused ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground',
+          )}><Icon name="db" size={14} /></span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[12.5px] font-semibold text-foreground" title={table.name}>{table.name}</span>
+            <span className="block text-[10px] text-muted-foreground">{focused ? 'Current dataset' : 'Dataset'}</span>
+          </span>
+        </div>
+        <Handle type="source" position={Position.Right} className="!h-2 !w-2 !border-0 !bg-muted-foreground" />
+      </div>
+    )
+  }
   return (
     <div className={cn('w-[240px] overflow-hidden rounded-lg border bg-card shadow-sm', focused ? 'border-primary ring-2 ring-primary/20' : 'border-border')}>
       <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-primary" />
@@ -58,11 +85,22 @@ const nodeTypes = { entity: EntityNode }
 // directly usable after fitting. The left inset also keeps nodes clear of the viewport buttons.
 const ER_FIT_PADDING = { top: '164px', right: '16px', bottom: '16px', left: '344px' } as const
 const ER_FIT_OPTIONS = { padding: ER_FIT_PADDING, maxZoom: 1 }
+const LINEAGE_FIT_OPTIONS = {
+  padding: { top: '168px', right: '32px', bottom: '32px', left: '32px' },
+  maxZoom: 1,
+} as const
 
-function ERViewportControls({ layoutKey, container }: { layoutKey: string; container: RefObject<HTMLDivElement | null> }) {
+function ERViewportControls({ layoutKey, container, lineage }: {
+  layoutKey: string
+  container: RefObject<HTMLDivElement | null>
+  lineage: boolean
+}) {
   const { fitView } = useReactFlow()
   const [size, setSize] = useState({ width: 0, height: 0 })
-  const fitSafely = useCallback(() => fitView(ER_FIT_OPTIONS), [fitView])
+  const fitSafely = useCallback(
+    () => fitView(lineage ? LINEAGE_FIT_OPTIONS : ER_FIT_OPTIONS),
+    [fitView, lineage],
+  )
 
   // A relationship query can replace the node set after React Flow's mount-only `fitView` has
   // already run. Reapply the same safe fit after React Flow has laid out the replacement query and
@@ -135,6 +173,46 @@ function joinNeighbourhood(rootUri: string, rels: Relationship[], hops: number):
     if (!frontier.length) break
   }
   return [...seen]
+}
+
+function lineageLayout(
+  tables: CatalogTable[],
+  edges: LineageEdge[],
+  rootUri: string | null,
+): Record<string, { x: number; y: number }> {
+  if (!rootUri) return {}
+  const rank = new Map<string, number>([[rootUri, 0]])
+  for (let pass = 0; pass < tables.length; pass += 1) {
+    let changed = false
+    for (const edge of edges) {
+      const parent = rank.get(edge.parent)
+      const child = rank.get(edge.child)
+      if (parent != null && child == null) {
+        rank.set(edge.child, parent + 1); changed = true
+      } else if (child != null && parent == null) {
+        rank.set(edge.parent, child - 1); changed = true
+      }
+    }
+    if (!changed) break
+  }
+  const grouped = new Map<number, CatalogTable[]>()
+  for (const table of tables) {
+    const value = rank.get(table.uri) ?? 0
+    const group = grouped.get(value) ?? []
+    group.push(table)
+    grouped.set(value, group)
+  }
+  const output: Record<string, { x: number; y: number }> = {}
+  for (const [value, group] of grouped) {
+    group.sort((left, right) => left.name.localeCompare(right.name))
+    group.forEach((table, index) => {
+      output[table.id] = {
+        x: value * 310,
+        y: (index - (group.length - 1) / 2) * 150,
+      }
+    })
+  }
+  return output
 }
 
 // The graph renders one ENTITY per table + O(n²) join hints, so it operates on a BOUNDED set.
@@ -225,10 +303,15 @@ export function ERDiagram() {
   }, [])
 
   useEffect(() => {
+    if (mode !== 'joins') {
+      setRels([])
+      setRelsError(null)
+      return
+    }
     void loadRelationships()
     api.facets().then((f) => setFolders(f.folders.map((x) => x.value))).catch(() => {})
     return () => { relsReq.current += 1 }
-  }, [loadRelationships])
+  }, [loadRelationships, mode])
 
   // a genuinely new query (focus/folder/mode/hops) must not show the previous query's rows while the
   // next request is in flight; a plain retry (reloadKey) keeps the last graph.
@@ -237,7 +320,8 @@ export function ERDiagram() {
   // recompute the visible entity set whenever the query (focus / hops / mode / folder / rels) changes
   const visibleFocus = mode === 'lineage' && lineageFocus?.requested === focus
     ? lineageFocus.canonical : focus
-  const focusName = tables.find((t) => t.uri === visibleFocus)?.name ?? visibleFocus?.split('/').slice(-1)[0]
+  const focusName = tables.find((t) => t.uri === visibleFocus)?.name
+    ?? (mode === 'lineage' ? 'Current dataset' : visibleFocus?.split('/').slice(-1)[0])
   useEffect(() => {
     if (focusResolving || focusResolutionError) {
       setLoading(focusResolving)
@@ -298,21 +382,28 @@ export function ERDiagram() {
   const byUri = useMemo(() => Object.fromEntries(visible.map((t) => [t.uri, t.id])), [visible])
   const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
 
+  const lineagePositions = useMemo(
+    () => mode === 'lineage' ? lineageLayout(visible, linEdges, visibleFocus) : {},
+    [linEdges, mode, visible, visibleFocus],
+  )
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
-    position: positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
+    position: mode === 'lineage'
+      ? lineagePositions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 180 }
+      : positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
     data: {
       table: t,
       pk: pkOf(t),
       focused: t.uri === visibleFocus,
+      lineage: mode === 'lineage',
       onFocus: () => { setFocus(t.uri); setRelationshipsFocus(t) },
     } satisfies EntityData,
-  })), [visible, positions, visibleFocus, setRelationshipsFocus])
+  })), [lineagePositions, mode, visible, positions, visibleFocus, setRelationshipsFocus])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []
     const declared = new Set<string>()
-    rels.forEach((r, i) => {
+    if (mode === 'joins') rels.forEach((r, i) => {
       const s = byUri[r.leftUri], t = byUri[r.rightUri]
       if (!s || !t) return
       declared.add([s, t].sort().join('|'))
@@ -332,7 +423,7 @@ export function ERDiagram() {
         style: { stroke: 'var(--muted-foreground)', strokeWidth: 1.5 },
       })
     })
-    if (showSuggestions) for (let a = 0; a < visible.length; a++)
+    if (mode === 'joins' && showSuggestions) for (let a = 0; a < visible.length; a++)
       for (let b = a + 1; b < visible.length; b++) {
         const ta = visible[a], tb = visible[b]
         if (declared.has([ta.id, tb.id].sort().join('|')) || !sharesKey(ta, tb)) continue
@@ -395,7 +486,7 @@ export function ERDiagram() {
     <div ref={graphContainer} className="relative h-full w-full">
       <div data-testid="er-controls-panel" className="absolute left-3 top-3 z-10 flex w-[320px] flex-col gap-2 rounded-lg border border-border bg-card/95 px-3 py-2.5 text-[11px] text-muted-foreground shadow-sm backdrop-blur">
         <div className="flex items-center gap-2">
-          <span className="text-[12.5px] font-semibold text-foreground">Relationships</span>
+          <span className="text-[12.5px] font-semibold text-foreground">{mode === 'lineage' ? 'Lineage' : 'Relationships'}</span>
           <span className="flex-1" />
           {erReturn && <button type="button" onClick={returnFromRelationships}
             data-testid="er-back-to-dataset" aria-label="Back to dataset"
@@ -404,7 +495,23 @@ export function ERDiagram() {
             className="grid h-5 w-5 place-items-center rounded-full border border-border text-[11px] font-bold hover:bg-accent">?</button>
         </div>
 
-        {hasFocusedRoute ? (
+        {hasFocusedRoute && mode === 'lineage' ? (
+          <div className="flex flex-col gap-2" data-testid="er-focus-bar">
+            <span className="truncate rounded-md bg-primary/10 px-2 py-1 text-[11px] font-semibold text-primary" title={focusName}>
+              {focusName ?? (focusResolving ? 'Loading dataset…' : 'Current dataset')}
+            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10.5px]">Depth</span>
+              <div className="inline-flex items-center rounded-md border border-border bg-background">
+                <button onClick={() => setHops((h) => Math.max(1, h - 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="Fewer hops">−</button>
+                <span className="w-5 text-center text-[11px] font-semibold text-foreground" data-testid="er-hops">{hops}</span>
+                <button onClick={() => setHops((h) => Math.min(5, h + 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="More hops">+</button>
+              </div>
+              <span className="flex-1" />
+              <span className="text-[10px] text-muted-foreground">{linEdges.length} connection{linEdges.length === 1 ? '' : 's'}</span>
+            </div>
+          </div>
+        ) : hasFocusedRoute ? (
           <div className="flex flex-col gap-2" data-testid="er-focus-bar">
             <div className="flex items-center gap-1.5">
               <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-primary">Focused: {focusName ?? (focusResolving ? 'loading…' : 'dataset')}</span>
@@ -438,19 +545,22 @@ export function ERDiagram() {
           </div>
         )}
 
-        <div className="flex items-center gap-2 text-[10px]">
+        {mode === 'lineage' ? <div className="flex items-center gap-2 text-[10px]">
+          <span className="inline-flex items-center gap-1"><span className="inline-block h-0 w-3 border-t-[1.5px] border-muted-foreground" /> upstream → current → downstream</span>
+          {linEdges.length > 0 && <span className="ml-auto text-muted-foreground">Arrows show data flow</span>}
+        </div> : <div className="flex items-center gap-2 text-[10px]">
           <span className="inline-flex items-center gap-1"><span className="inline-block h-0 w-3 border-t-[1.5px] border-primary" /> declared join</span>
-          {mode === 'lineage' && <span className="inline-flex items-center gap-1"><span className="inline-block h-0 w-3 border-t-[1.5px] border-muted-foreground" /> lineage</span>}
           <label className="ml-auto inline-flex cursor-pointer items-center gap-1">
             <input type="checkbox" checked={showSuggestions} onChange={(e) => setShowSuggestions(e.target.checked)} data-testid="er-suggestions-toggle" className="h-3 w-3 accent-primary" />
             suggestions
           </label>
-        </div>
+        </div>}
 
         {showHelp && (
           <div className="rounded-md border border-border bg-muted/40 p-2 text-[10.5px] leading-relaxed">
-            Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to
-            re-focus the graph on it. Open a dataset from Workspace, then declare a primary key in its detail drawer.
+            {mode === 'lineage'
+              ? 'Arrows run from source datasets to the datasets produced from them. Increase Depth to reveal more of the connected history.'
+              : 'Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to re-focus the graph.'}
           </div>
         )}
 
@@ -468,7 +578,7 @@ export function ERDiagram() {
             <button onClick={refresh} data-testid="er-catalog-retry" className="font-semibold underline">Retry</button>
           </span>
         )}
-        {relsError && (
+        {mode === 'joins' && relsError && (
           <span role="alert" className="text-destructive">
             Couldn't load declared relationships: {relsError}{' '}
             <button onClick={() => void loadRelationships()} data-testid="er-relationships-retry" className="font-semibold underline">Retry</button>
@@ -479,17 +589,21 @@ export function ERDiagram() {
 
       {!loading && !error && visible.length === 0 && (
         <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
-          {hasFocusedRoute ? 'No neighbours at this hop distance.' : total === 0 ? (
+          {hasFocusedRoute ? (mode === 'lineage' ? 'No recorded inputs or outputs at this depth.' : 'No neighbours at this hop distance.') : total === 0 ? (
             <span className="pointer-events-auto">No datasets registered yet — add some in <button onClick={() => openWorkspace('workspace')} className="underline">Workspace</button>.</span>
           ) : 'No datasets in this folder.'}
         </div>
       )}
 
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
-        onConnect={onConnect} onEdgeClick={onEdgeClick} minZoom={0.2} colorMode={resolvedTheme()}
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes}
+        onNodesChange={mode === 'joins' ? onNodesChange : undefined}
+        onConnect={mode === 'joins' ? onConnect : undefined}
+        onEdgeClick={mode === 'joins' ? onEdgeClick : undefined}
+        nodesDraggable={mode === 'joins'} nodesConnectable={mode === 'joins'}
+        minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
-        <ERViewportControls layoutKey={layoutKey} container={graphContainer} />
+        <ERViewportControls layoutKey={layoutKey} container={graphContainer} lineage={mode === 'lineage'} />
       </ReactFlow>
       {pending && (
         <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}
