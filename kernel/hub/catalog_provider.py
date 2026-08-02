@@ -102,6 +102,7 @@ class CatalogDatasetDetail(Wire):
     dataset_id: str = Field(min_length=1, max_length=512)
     uri: str = Field(min_length=1, max_length=8192)
     columns: list[ColumnSchema] = Field(default_factory=list, max_length=2048)
+    readable: bool = True
 
 
 class ProviderCapabilities(Wire):

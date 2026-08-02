@@ -2026,6 +2026,34 @@ describe('WorkspaceExplorer', () => {
     expect(context).not.toHaveTextContent('Exact revision')
   })
 
+  it('opens lineage-only dataset details without offering an unusable Canvas Source', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({
+      ...CANONICAL_DATASET_CONTEXT,
+      readMode: 'lineage',
+      revisionId: null,
+      committedAt: null,
+      columns: [{
+        name: 'original_row_id', type: 'unknown', provenance: 'provider' as const,
+        capabilities: [], annotations: [],
+      }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('region', { name: 'observations' })
+    expect(detail).toHaveTextContent('Lineage record')
+    expect(detail).toHaveTextContent('original_row_id')
+    expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
+  })
+
   it('bounds canonical column rendering while retaining the reported total', async () => {
     const columns = Array.from({ length: 27 }, (_, index) => ({
       name: `column-${index}`, type: 'string', provenance: 'provider' as const,

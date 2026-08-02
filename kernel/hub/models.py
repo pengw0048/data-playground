@@ -1364,7 +1364,7 @@ class WorkspaceCanonicalDatasetContext(Wire):
     provider_dataset_id: str = Field(min_length=1, max_length=512)
     dataset_identity: str = Field(min_length=1, max_length=512)
     source_uri: str = Field(pattern=r"^workspace-provider://[A-Za-z0-9_-]+$", max_length=1024)
-    read_mode: Literal["exact", "current"]
+    read_mode: Literal["exact", "current", "lineage"]
     revision_id: str | None = Field(default=None, min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
     columns: list[ColumnSchema] = Field(default_factory=list, max_length=2048)
@@ -1373,9 +1373,9 @@ class WorkspaceCanonicalDatasetContext(Wire):
     def validate_read_mode(self) -> "WorkspaceCanonicalDatasetContext":
         if self.read_mode == "exact" and self.revision_id is None:
             raise ValueError("exact canonical dataset context requires a revision")
-        if self.read_mode == "current" and (
+        if self.read_mode in {"current", "lineage"} and (
                 self.revision_id is not None or self.committed_at is not None):
-            raise ValueError("current canonical dataset context cannot imply an exact revision")
+            raise ValueError("non-exact canonical dataset context cannot imply an exact revision")
         return self
 
 

@@ -630,10 +630,13 @@ class _BoundProviderDatasetAdapter:
         "revision_detail", "revision_schema", "open_revision_native_rows",
     }
 
-    def __init__(self, source_uri: str, physical_uri: str, adapter: object):
+    def __init__(
+        self, source_uri: str, physical_uri: str, adapter: object, *, readable: bool = True,
+    ):
         self.source_uri = source_uri
         self.physical_uri = physical_uri
         self.adapter = adapter
+        self.readable = readable
         self.name = str(getattr(adapter, "name", "") or "")
 
     def matches(self, uri: str) -> bool:
@@ -718,7 +721,8 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         adapter = resolve_physical(detail.uri)
     except Exception as exc:
         raise ProviderDatasetUnavailable("provider dataset adapter is unavailable") from exc
-    return _BoundProviderDatasetAdapter(uri, detail.uri, adapter)
+    return _BoundProviderDatasetAdapter(
+        uri, detail.uri, adapter, readable=detail.readable)
 
 
 def provider_dataset_supports_exact(adapter: object) -> bool:
@@ -766,8 +770,13 @@ def provider_dataset_inspection_graph(
     return bound
 
 
-def provider_dataset_source(resource_ref: str, *, uid: str,
-                            resolve_physical: Callable[[str], object]) -> dict:
+def provider_dataset_source(
+    resource_ref: str,
+    *,
+    uid: str,
+    resolve_physical: Callable[[str], object],
+    allow_lineage_metadata: bool = False,
+) -> dict:
     """Create one minimal Source config from a live stable provider dataset reference."""
     resolution = resolve(resource_ref, uid=uid)
     resource = resolution.get("resource")
@@ -810,7 +819,12 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     from hub.models import ExactDatasetRef
     from hub.plugins.adapters import RevisionPermissionLost, RevisionProviderOffline
     read_mode = "mutable"
-    if provider_dataset_supports_exact(adapter):
+    if isinstance(adapter, _BoundProviderDatasetAdapter) and not adapter.readable:
+        if not allow_lineage_metadata:
+            raise ProviderDatasetUnavailable(
+                "this lineage record is not a readable provider dataset")
+        read_mode = "lineage"
+    elif provider_dataset_supports_exact(adapter):
         try:
             evidence = adapter.resolve_revision(uri)
             revision_id = str(evidence.get("revision_id") or "")
@@ -887,7 +901,11 @@ def provider_dataset_context(resource_ref: str, *, uid: str,
                              resolve_physical: Callable[[str], object]) -> dict:
     """Return only non-sensitive canonical facts proven by the exact Source admission path."""
     source = provider_dataset_source(
-        resource_ref, uid=uid, resolve_physical=resolve_physical)
+        resource_ref,
+        uid=uid,
+        resolve_physical=resolve_physical,
+        allow_lineage_metadata=True,
+    )
     config = source["data"]["config"]
     uri = str(config["uri"])
     dataset_identity = provider_dataset_identity(uri)
@@ -902,11 +920,15 @@ def provider_dataset_context(resource_ref: str, *, uid: str,
     dataset_ref = config.get("datasetRef")
     exact = dataset_ref if isinstance(dataset_ref, dict) else None
     provider_read_mode = config.get("providerReadMode")
-    if provider_read_mode not in {"exact", "mutable"}:
+    if provider_read_mode not in {"exact", "mutable", "lineage"}:
         raise ProviderDatasetUnavailable("canonical provider dataset read mode is unavailable")
     if provider_read_mode == "exact" and exact is None:
         raise ProviderDatasetUnavailable("canonical provider dataset revision is unavailable")
-    read_mode = "exact" if provider_read_mode == "exact" else "current"
+    read_mode = (
+        "exact" if provider_read_mode == "exact"
+        else "lineage" if provider_read_mode == "lineage"
+        else "current"
+    )
     return {
         "mountId": canonical["mountId"],
         "sourceBindingId": canonical["sourceBindingId"],

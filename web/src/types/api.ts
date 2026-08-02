@@ -446,7 +446,7 @@ export interface WorkspaceCanonicalDatasetContext {
   datasetIdentity: string
   /** Stable non-sensitive Source URI used for core lineage recorded by Data Playground runs. */
   sourceUri: string
-  readMode: 'exact' | 'current'
+  readMode: 'exact' | 'current' | 'lineage'
   revisionId?: string | null
   committedAt?: string | null
   columns: ColumnSchema[]

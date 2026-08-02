@@ -12539,7 +12539,8 @@
           "readMode": {
             "enum": [
               "exact",
-              "current"
+              "current",
+              "lineage"
             ],
             "title": "Readmode",
             "type": "string"

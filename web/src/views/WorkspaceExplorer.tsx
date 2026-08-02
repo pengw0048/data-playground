@@ -2326,7 +2326,9 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
           <Icon name="refresh" size={12} /> Reload
         </button>
-        {!exactRevision && <button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+        {!exactRevision && <button onClick={onUse}
+          disabled={canonicalContext?.readMode === 'lineage' || !sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+          title={canonicalContext?.readMode === 'lineage' ? 'This historical lineage record is not a readable dataset.' : undefined}
           className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button>}
         {!exactRevision && onRemove && <button onClick={onRemove}
           className="shrink-0 rounded-md border border-destructive/40 bg-card px-2.5 py-1 text-[11.5px] font-semibold text-destructive hover:bg-destructive/5">
@@ -2345,9 +2347,11 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           </div>}
         </section>
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
-          <div className="text-[11px] text-muted-foreground">{selectedRevisionId
-            ? <><span className="block">{exactRevision ? 'Selected version' : 'Published version'}</span>{selectedCommittedAt && <span>Committed {new Date(selectedCommittedAt).toLocaleString()}</span>}</>
-            : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
+          <div className="text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'lineage'
+            ? 'Lineage record'
+            : selectedRevisionId
+              ? <><span className="block">{exactRevision ? 'Selected version' : 'Published version'}</span>{selectedCommittedAt && <span>Committed {new Date(selectedCommittedAt).toLocaleString()}</span>}</>
+              : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
         </section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
           && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading dataset details…</div>}
