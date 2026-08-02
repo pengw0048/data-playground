@@ -64,6 +64,20 @@ describe('Yjs hydration decisions', () => {
     expect(replica.getMap('meta').get('executionBackend')).toBeNull()
     replica.destroy()
   })
+
+  it('round-trips the Canvas result-retention override', () => {
+    useStore.setState({ doc: { ...doc, resultRetention: { history: 'recent' } } })
+    const sent: Uint8Array[] = []
+    startYSync((update) => sent.push(update))
+    hydrateIfEmpty()
+
+    const replica = new Y.Doc()
+    for (const update of sent) Y.applyUpdate(replica, update)
+    expect(JSON.parse(String(replica.getMap('meta').get('resultRetention')))).toEqual({
+      history: 'recent',
+    })
+    replica.destroy()
+  })
 })
 
 describe('YSyncReplica readiness', () => {

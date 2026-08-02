@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -1492,6 +1493,24 @@ class RetainedResultIdentity(BaseModel):
     execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parameter_bindings: list[ParameterBinding]
     output: RunOutput
+
+
+class CanvasResultRecoveryRequest(BaseModel):
+    """One bounded reopen check for the Canvas's retained full results."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+
+
+class CanvasResultRecovery(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    latest_node_ids: list[str]
+    failed_node_ids: list[str]
+    stale_node_ids: list[str]
+    unknown_node_ids: list[str]
+    results: list[RetainedResultIdentity]
 
 
 class ExampleRowsEditorPreviewRequest(BaseModel):
@@ -4644,6 +4663,117 @@ def retained_canvas_result(
         requested_bindings=(
             req.parameter_bindings
             if "parameter_bindings" in req.model_fields_set else None),
+    )
+
+
+def _retained_result_readability(
+        identity: RetainedResultIdentity, deps) -> Literal["readable", "missing", "unknown"]:
+    """Distinguish a missing artifact from a result whose availability cannot be proved now."""
+    uri = identity.output.uri or ""
+    if not uri:
+        return "missing"
+    try:
+        with source_read_scope(
+                deps.storage, [uri],
+                owner=f"canvas-reopen:{identity.run_id}:{uuid.uuid4().hex}"):
+            member = _object_attempt_member(uri)
+            target_uri = member[0] if member is not None else uri
+            if (member is not None and identity.output.rows is not None
+                    and member[2] != identity.output.rows):
+                return "missing"
+            # Schema is a bounded provider read that proves the committed member/file can actually be
+            # reopened. Metadata identity alone is insufficient after credential loss or external GC.
+            deps.resolve_adapter(target_uri).schema(target_uri)
+        return "readable"
+    except (FileNotFoundError, ValueError):
+        return "missing"
+    except Exception:  # noqa: BLE001 - a transient check failure must not falsify result state
+        return "unknown"
+
+
+@router.post("/run/current-results", response_model=CanvasResultRecovery)
+def recover_canvas_results(
+        req: CanvasResultRecoveryRequest,
+        uid: str = Depends(current_user)) -> CanvasResultRecovery:
+    """Rebuild current node badges from exact plans and readable Canvas-owned results."""
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
+        raise _retained_editor_error(
+            404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    deps = get_deps()
+    node_map = graph_mod.node_map(req.graph)
+    latest: set[str] = set()
+    failed: set[str] = set()
+    stale: set[str] = set()
+    unknown: set[str] = set()
+    results: list[RetainedResultIdentity] = []
+    for projection in metadb.canvas_result_latest(canvas_id):
+        target_id = str(projection["target_node_id"])
+        if target_id not in node_map:
+            continue
+        output_docs = projection.get("result_outputs") or []
+        identities: list[RetainedResultIdentity] = []
+        valid = bool(output_docs)
+        availability_unknown = False
+        for output_doc in output_docs:
+            if not isinstance(output_doc, dict):
+                valid = False
+                break
+            port_id = output_doc.get("port_id", output_doc.get("portId"))
+            if not isinstance(port_id, str) or not port_id:
+                valid = False
+                break
+            try:
+                identity = _current_retained_result(
+                    req.graph, canvas_id, target_id, port_id, uid, deps)
+            except APIError:
+                valid = False
+                break
+            if identity.run_id != projection.get("result_run_id"):
+                valid = False
+                break
+            readability = _retained_result_readability(identity, deps)
+            if readability != "readable":
+                valid = False
+                availability_unknown = readability == "unknown"
+                break
+            identities.append(identity)
+        if not valid:
+            affected = {node.id for node in graph_mod.upstream_chain(req.graph, target_id)}
+            (unknown if availability_unknown else stale).update(affected)
+            continue
+        terminal_is_result = (
+            projection.get("terminal_status") == "done"
+            and projection.get("terminal_run_id") == projection.get("result_run_id")
+        )
+        terminal_matches_result_plan = (
+            projection.get("terminal_execution_manifest_sha256") is not None
+            and projection.get("terminal_execution_manifest_sha256")
+            == projection.get("result_execution_manifest_sha256")
+        )
+        if terminal_is_result or not terminal_matches_result_plan:
+            # A later attempt for another plan does not invalidate the exact result that was just
+            # proved current for this graph (for example, the user reverted an unsuccessful edit).
+            latest.update(node.id for node in graph_mod.upstream_chain(req.graph, target_id))
+            results.extend(identities)
+        elif projection.get("terminal_status") == "failed":
+            # Same execution manifest means the failed attempt targeted the exact plan whose prior
+            # result remains retained. Keep failure visible without discarding that successful data.
+            failed.add(target_id)
+            latest.update(
+                node.id for node in graph_mod.upstream_chain(req.graph, target_id)
+                if node.id != target_id
+            )
+            results.extend(identities)
+        else:
+            stale.add(target_id)
+    return CanvasResultRecovery(
+        latest_node_ids=sorted(latest - failed),
+        failed_node_ids=sorted(failed),
+        stale_node_ids=sorted(stale - latest - failed),
+        unknown_node_ids=sorted(unknown - latest - failed - stale),
+        results=results,
     )
 
 

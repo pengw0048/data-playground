@@ -25,7 +25,9 @@ from hub.version import current_version
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
 # (a metric or a node value driving another node's param). All must be representable on an edge.
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
-NodeStatus = Literal["draft", "latest", "stale", "queued", "running", "failed"]
+NodeStatus = Literal[
+    "draft", "checking", "latest", "stale", "unknown", "queued", "running", "failed",
+]
 Placement = Literal["local", "distributed"]
 DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
@@ -2642,6 +2644,17 @@ class ExecutionTargetInfo(Wire):
     substrate: str | None = None
 
 
+class ResultStorageInfo(Wire):
+    """The one lifecycle-managed result store available to Canvas runs.
+
+    Export destinations are deliberately absent: they do not own result references, manifests, or
+    garbage collection and therefore cannot truthfully be selected as a Canvas result store.
+    """
+    id: Literal["workspace-managed"] = "workspace-managed"
+    label: str = "Workspace managed storage"
+    kind: Literal["local", "object", "plugin"] = "local"
+
+
 class CapabilityView(Wire):
     """A plugin capability that contributes a VIEWER TAB, declaratively. `viewer.kind` names a generic
     renderer the SPA ships (e.g. 'grid' = media/image grid, 'json' = pretty-printed cell) — so a plugin
@@ -2664,6 +2677,7 @@ class KernelInfo(Wire):
     capability_views: list[CapabilityView] = []  # plugin capabilities that declare a viewer tab (additive)
     backends: list[BackendInfo] = []  # real backend/worker topology + capacities (additive; runners kept)
     execution_targets: list[ExecutionTargetInfo] = []
+    result_storage: ResultStorageInfo = ResultStorageInfo()
 
 
 class ProcessorDescriptor(Wire):
@@ -2910,6 +2924,15 @@ class ParameterBinding(Wire):
     value: Any
 
 
+class CanvasResultRetention(Wire):
+    """Canvas override for physical full-result history.
+
+    ``latest`` always remains owned by the Canvas. ``recent`` additionally lets bounded Jobs history
+    retain its result artifacts. The managed store itself is deployment-owned and runner-independent.
+    """
+    history: Literal["inherit", "latest", "recent"] = "inherit"
+
+
 class Graph(Wire):
     id: str = Field(default="canvas", min_length=1, max_length=512)
     version: int = Field(default=1, ge=0, le=MAX_SAFE_INTEGER)
@@ -2919,6 +2942,7 @@ class Graph(Wire):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
     )
+    result_retention: CanvasResultRetention = Field(default_factory=CanvasResultRetention)
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them

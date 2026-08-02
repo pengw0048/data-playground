@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogExampleSourceResolveResponse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, InstalledProcessorSource, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
-  CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasCopyValidation, CanvasResultRecovery, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
   WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResource, WorkspaceResourceResolution, WorkspaceSearchPage,
@@ -118,6 +118,7 @@ function toGraph(doc: CanvasDoc) {
     id: doc.id,
     version: doc.version,
     executionBackend: doc.executionBackend ?? null,
+    resultRetention: doc.resultRetention ?? { history: 'inherit' },
     requirements: doc.requirements ?? [],  // the canvas's declared pip deps → the kernel installs them
     parameters: doc.parameters ?? [],
     nodes: dataNodes.map((n) => ({
@@ -483,6 +484,9 @@ export const api = {
     body: JSON.stringify({
       graph: toGraph(doc), nodeId, portId, parameterBindings,
     }),
+  }),
+  currentResults: (doc: CanvasDoc) => req<CanvasResultRecovery>('/run/current-results', {
+    method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }),
   }),
   retainedEditorPreview: (
     doc: CanvasDoc, nodeId: string, k = 50, offset = 0,

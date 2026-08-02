@@ -89,7 +89,7 @@ describe('SettingsModal — plugin config form', () => {
   it('opens directly to a requested settings category', async () => {
     render(<SettingsModal onClose={vi.fn()} initialCategory="destinations" />)
 
-    expect(await screen.findByText('Save locations for Canvas outputs.')).toBeInTheDocument()
+    expect(await screen.findByText('Canvas results')).toBeInTheDocument()
     const destinations = screen.getByRole('button', { name: 'Destinations' })
     expect(destinations).toHaveClass('bg-accent')
     expect(destinations).toHaveFocus()
@@ -983,6 +983,28 @@ describe('SettingsModal — plugin config form', () => {
     expect(await screen.findByLabelText('Destination credential')).toBeVisible()
     expect(screen.getByText(/Restart the Data Playground server after adding this destination/i)).toBeVisible()
     expect(screen.getByText(/restarting only the canvas kernel is not enough/i)).toBeVisible()
+  })
+
+  it('saves the workspace result-history policy and shows the actual managed store', async () => {
+    getSettings.mockResolvedValue({
+      global: { canvasResultRetention: { history: 'recent' } },
+      user: {}, revision: { global: 2, user: 4 },
+    })
+    ;(state.kernelInfo as any).resultStorage = {
+      id: 'workspace-managed', label: 'Shared object storage', kind: 'object',
+    }
+    render(<SettingsModal onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
+
+    expect(await screen.findByText('Shared object storage · object')).toBeVisible()
+    fireEvent.click(screen.getByLabelText('Canvas result history'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Latest result' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
+      { global: 2, user: 4 },
+      [{ scope: 'global', key: 'canvasResultRetention', value: { history: 'latest' } }],
+    ))
   })
 
   it('tests browsing for a saved destination without claiming write access', async () => {

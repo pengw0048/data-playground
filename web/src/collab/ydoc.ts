@@ -80,6 +80,8 @@ function yToDoc(base: CanvasDoc): CanvasDoc {
   edges().forEach((e) => es.push(e))
   const hasExecutionBackend = meta().has('executionBackend')
   const executionBackend = meta().get('executionBackend')
+  const hasResultRetention = meta().has('resultRetention')
+  const resultRetention = meta().get('resultRetention')
   return {
     ...base,
     name: (meta().get('name') as string) ?? base.name,
@@ -89,6 +91,11 @@ function yToDoc(base: CanvasDoc): CanvasDoc {
     executionBackend: !hasExecutionBackend
       ? base.executionBackend
       : typeof executionBackend === 'string' ? executionBackend : undefined,
+    resultRetention: !hasResultRetention
+      ? base.resultRetention
+      : typeof resultRetention === 'string'
+        ? JSON.parse(resultRetention) as CanvasDoc['resultRetention']
+        : undefined,
     nodes: ns,
     edges: es,
   }
@@ -101,6 +108,10 @@ function pushDocToY(doc: CanvasDoc): void {
     const executionBackend = doc.executionBackend ?? null
     if (!meta().has('executionBackend') || meta().get('executionBackend') !== executionBackend) {
       meta().set('executionBackend', executionBackend)
+    }
+    const resultRetention = JSON.stringify(doc.resultRetention ?? { history: 'inherit' })
+    if (meta().get('resultRetention') !== resultRetention) {
+      meta().set('resultRetention', resultRetention)
     }
     const nmap = nodes()
     const ids = new Set(doc.nodes.map((n) => n.id))

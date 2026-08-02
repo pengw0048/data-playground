@@ -31,6 +31,7 @@ from hub.models import (
     CapabilityView,
     ExecutionTargetInfo,
     KernelInfo,
+    ResultStorageInfo,
     ResourceSpec,
     WorkerInfo,
 )
@@ -1297,11 +1298,22 @@ class Deps:
 
     def info(self) -> KernelInfo:
         from hub.plugins.catalog import InMemoryCatalog
+        from hub.storage import LocalStorage, ObjectStorage
 
         # These mutations are implemented by the bundled metadata store, not by the generic catalog
         # SPI. A subclass may reuse read behavior for an external provider, but must not inherit a
         # capability that would route deletes or atomic edits into the local metadata database.
         built_in_catalog = type(self.catalog) is InMemoryCatalog
+        result_storage_kind = (
+            "local" if isinstance(self.storage, LocalStorage)
+            else "object" if isinstance(self.storage, ObjectStorage)
+            else "plugin"
+        )
+        result_storage_label = {
+            "local": "Local workspace",
+            "object": "Shared object storage",
+            "plugin": "Plugin-managed storage",
+        }[result_storage_kind]
         return KernelInfo(
             mode="local", backend="duckdb+polars+arrow", warm=True,
             adapters=[a.name for a in self.adapters],
@@ -1315,6 +1327,8 @@ class Deps:
                               for c in self.capabilities if isinstance(getattr(c, "viewer", None), dict)],
             backends=self._backends(),
             execution_targets=self._execution_targets(),
+            result_storage=ResultStorageInfo(
+                label=result_storage_label, kind=result_storage_kind),
         )
 
 

@@ -450,6 +450,49 @@ class RunRecord(Base):
     )
 
 
+class CanvasResultLatest(Base):
+    """Latest terminal attempt plus the latest successful full result for one Canvas target.
+
+    RunState and RunRecord are deliberately bounded operational/history surfaces. This projection is
+    the Canvas-lifetime owner that makes reopen truthful without keeping every historical artifact.
+    Terminal and successful identities are separate so a failed rerun remains visible while the last
+    successful result can still be inspected when its execution plan is unchanged.
+    """
+    __tablename__ = "canvas_result_latest"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    canvas_id: Mapped[str] = mapped_column(
+        String, ForeignKey("canvases.id"), nullable=False, index=True)
+    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    terminal_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    terminal_status: Mapped[str] = mapped_column(String, nullable=False)
+    terminal_execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
+    terminal_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    terminal_submitted_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    terminal_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    result_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    result_execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
+    result_outputs: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]")
+    result_input_manifest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_submitted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    result_updated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    __table_args__ = (
+        UniqueConstraint(
+            "canvas_id", "target_node_id", name="uq_canvas_result_latest_target"),
+        CheckConstraint(
+            "terminal_status IN ('done','failed','cancelled')",
+            name="ck_canvas_result_latest_terminal_status"),
+    )
+
+
 class CanvasVersion(Base):
     """A point-in-time snapshot of a canvas doc, for restore-after-a-bad-edit. Auto-captured (throttled)
     on save, plus explicit named snapshots. One row per snapshot; oldest auto-snapshots are pruned."""
@@ -10800,6 +10843,10 @@ def _execution_manifest_sha256_for_run_in_session(
             RunState.run_id == str(run_id)),
         select(RunRecord.execution_manifest_sha256).where(
             RunRecord.run_id == str(run_id)),
+        select(CanvasResultLatest.terminal_execution_manifest_sha256).where(
+            CanvasResultLatest.terminal_run_id == str(run_id)),
+        select(CanvasResultLatest.result_execution_manifest_sha256).where(
+            CanvasResultLatest.result_run_id == str(run_id)),
         select(CatalogLineageFact.execution_manifest_sha256).where(
             CatalogLineageFact.run_id == str(run_id)),
         select(ManagedLocalFileRevision.execution_manifest_sha256).where(
@@ -10854,6 +10901,8 @@ def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> 
             RunInputAdmission.execution_manifest_sha256,
             RunState.execution_manifest_sha256,
             RunRecord.execution_manifest_sha256,
+            CanvasResultLatest.terminal_execution_manifest_sha256,
+            CanvasResultLatest.result_execution_manifest_sha256,
             CatalogLineageFact.execution_manifest_sha256,
             ManagedLocalFileRevision.execution_manifest_sha256,
             ManagedLocalLanceWriteReceipt.execution_manifest_sha256,
@@ -11087,6 +11136,35 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
     return failed_status.model_dump()
 
 
+def _canvas_result_history_mode(s, canvas: Canvas) -> str:
+    """Resolve the Canvas override over the validated workspace default."""
+    try:
+        canvas_doc = json.loads(canvas.doc)
+    except (TypeError, ValueError):
+        canvas_doc = {}
+    override = (
+        canvas_doc.get("resultRetention", {}).get("history")
+        if isinstance(canvas_doc, dict)
+        and isinstance(canvas_doc.get("resultRetention"), dict)
+        else None
+    )
+    if override in ("latest", "recent"):
+        return str(override)
+    setting = s.scalar(select(Setting.value).where(
+        Setting.scope == "global",
+        Setting.scope_id == "",
+        Setting.key == "canvasResultRetention",
+    ).limit(1))
+    if setting is not None:
+        try:
+            value = json.loads(setting)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, dict) and value.get("history") in ("latest", "recent"):
+            return str(value["history"])
+    return "latest"
+
+
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        target_port_id: str | None,
                        job_type: str, status: str,
@@ -11131,8 +11209,10 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     if len(output_payload.encode("utf-8")) > _RUN_RECORD_OUTPUTS_MAX_BYTES:
         raise ValueError(
             f"run history outputs exceed {_RUN_RECORD_OUTPUTS_MAX_BYTES} encoded bytes")
-    if s.get(Canvas, canvas_id, with_for_update=True) is None:
+    canvas = s.get(Canvas, canvas_id, with_for_update=True)
+    if canvas is None:
         return False
+    retain_history_artifacts = _canvas_result_history_mode(s, canvas) == "recent"
     rec = (s.scalar(select(RunRecord).where(
         RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
     ).limit(1).with_for_update())
@@ -11190,8 +11270,9 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         RunRecord.canvas_id == canvas_id, RunRecord.id != rid
     ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
       .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
+    history_artifact_doc = {"outputs": output_docs if retain_history_artifacts else []}
     _replace_attempt_refs(
-        s, "run_record", rid, _result_doc_refs({"outputs": output_docs}))
+        s, "run_record", rid, _result_doc_refs(history_artifact_doc))
     stale_execution_manifests = {
         obj.execution_manifest_sha256 for obj in stale
     }
@@ -11208,7 +11289,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     if stale:
         _lock_local_result_registry(s)
     sync_local_result_owner(
-        s, "run_record", rid, {"outputs": output_docs}, rec.input_manifest, rec.profile)
+        s, "run_record", rid, history_artifact_doc, rec.input_manifest, rec.profile)
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
         if obj.run_id:
@@ -11305,6 +11386,9 @@ def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
         runs = list(s.scalars(select(RunRecord).where(
             RunRecord.canvas_id == canvas_id
         ).order_by(RunRecord.id).with_for_update()))
+        canvas_results = list(s.scalars(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == canvas_id
+        ).order_by(CanvasResultLatest.id).with_for_update()))
         admissions = list(s.scalars(select(RunInputAdmission).where(
             RunInputAdmission.canvas_id == canvas_id
         ).order_by(RunInputAdmission.run_id).with_for_update()))
@@ -11345,6 +11429,14 @@ def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
                 *durable_tasks, *durable_attempts, *durable_inbox,
             ]
         }
+        execution_manifest_identities.update(
+            identity
+            for row in canvas_results
+            for identity in (
+                row.terminal_execution_manifest_sha256,
+                row.result_execution_manifest_sha256,
+            )
+        )
         profile_retention = s.get(ProfileJobRetention, canvas_id, with_for_update=True)
         profile_latest = list(s.scalars(select(ProfileJobLatest).where(
             ProfileJobLatest.canvas_id == canvas_id
@@ -11397,6 +11489,10 @@ def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
             _replace_attempt_ref(s, "run_record", r.id, None)
             local_owners.append(("run_record", r.id))
             s.delete(r)
+        for result in canvas_results:
+            _replace_attempt_ref(s, "canvas_result", result.id, None)
+            local_owners.append(("canvas_result", result.id))
+            s.delete(result)
         for v in versions:
             local_owners.append(("canvas_version", v.id))
             _drop_promoted_transform_refs(s, "canvas_version", v.id)
@@ -12613,6 +12709,33 @@ def retained_run_output_candidates(
     unrelated recent Jobs from hiding a still-retained editor input.
     """
     with session() as s:
+        latest = s.scalar(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == str(canvas_id),
+            CanvasResultLatest.target_node_id == str(target_node_id),
+        ).limit(1))
+        if latest is not None:
+            try:
+                latest_outputs = json.loads(latest.result_outputs)
+            except (TypeError, ValueError):
+                latest_outputs = []
+            if not isinstance(latest_outputs, list):
+                latest_outputs = []
+            output = next((
+                item for item in latest_outputs
+                if isinstance(item, dict)
+                and item.get("node_id", item.get("nodeId")) == target_node_id
+                and item.get("port_id", item.get("portId")) == port_id
+                and item.get("outcome") == "committed"
+                and item.get("publication_kind", item.get("publicationKind")) == "result"
+                and item.get("uri")
+            ), None)
+            # Once a target has an authoritative projection, bounded history must never resurrect an
+            # older generation after this result is missing, replaced, or intentionally unretained.
+            return ([{
+                "run_id": str(latest.result_run_id),
+                "execution_manifest_sha256": latest.result_execution_manifest_sha256,
+                "output": dict(output),
+            }] if output is not None and latest.result_run_id is not None else [])
         rows = s.execute(
             select(
                 RunRecord.run_id,
@@ -12747,6 +12870,36 @@ def retained_run_output_candidates(
         return []
     candidates.sort(key=lambda item: item["_terminal_at"], reverse=True)
     return public(candidates)
+
+
+def canvas_result_latest(canvas_id: str) -> list[dict]:
+    """Return the bounded current-result projections for one Canvas."""
+    with session() as s:
+        rows = list(s.scalars(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == str(canvas_id),
+        ).order_by(CanvasResultLatest.target_node_id)))
+        result: list[dict] = []
+        for row in rows:
+            try:
+                terminal_doc = json.loads(row.terminal_doc)
+                outputs = json.loads(row.result_outputs)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(terminal_doc, dict) or not isinstance(outputs, list):
+                continue
+            result.append({
+                "target_node_id": row.target_node_id,
+                "terminal_run_id": row.terminal_run_id,
+                "terminal_status": row.terminal_status,
+                "terminal_execution_manifest_sha256": (
+                    row.terminal_execution_manifest_sha256),
+                "terminal_doc": terminal_doc,
+                "result_run_id": row.result_run_id,
+                "result_execution_manifest_sha256": (
+                    row.result_execution_manifest_sha256),
+                "result_outputs": outputs,
+            })
+        return result
 
 
 def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:
@@ -12896,6 +13049,124 @@ def _upsert_profile_latest(
             _drop_local_result_owner_locked(s, "profile_job", retired_run_id)
 
 
+def _projection_attempt_is_newer(
+        *, run_id: str, submitted_at: datetime.datetime,
+        current_run_id: str | None, current_submitted_at: datetime.datetime | None) -> bool:
+    """Deterministic latest-submission comparison for one Canvas target.
+
+    Admission timestamps are minted by the metadata database before dispatch. The run id is only a
+    stable tie breaker for the extremely narrow equal-timestamp case; repeated publication of the same
+    run remains idempotent.
+    """
+    if current_run_id is None or current_submitted_at is None:
+        return True
+    if str(run_id) == str(current_run_id):
+        return True
+    return (submitted_at, str(run_id)) > (current_submitted_at, str(current_run_id))
+
+
+def _upsert_canvas_result_latest(
+        s, *, canvas_id: str | None, run_id: str, target_node_id: str | None,
+        terminal_status: str, status_doc: dict,
+        execution_manifest_sha256: str | None) -> CanvasResultLatest | None:
+    """Advance one Canvas target's terminal/result projection and its object-result owner.
+
+    The caller must already hold the Canvas row and must not have acquired the local-result registry
+    lock. Local ownership is synchronized after every object-attempt owner in the publication
+    transaction has settled.
+    """
+    if (canvas_id is None or target_node_id is None
+            or terminal_status not in _TERMINAL_RUN
+            or str(status_doc.get("job_type", status_doc.get("jobType", "run"))) != "run"):
+        return None
+    admission = s.get(RunInputAdmission, str(run_id))
+    state = s.get(RunState, str(run_id))
+    now = _db_now(s)
+    submitted_at = (
+        admission.created_at if admission is not None and admission.created_at is not None
+        else state.created_at if state is not None and state.created_at is not None
+        else now
+    )
+    row = s.scalar(select(CanvasResultLatest).where(
+        CanvasResultLatest.canvas_id == str(canvas_id),
+        CanvasResultLatest.target_node_id == str(target_node_id),
+    ).limit(1).with_for_update())
+    if row is None:
+        row = CanvasResultLatest(
+            canvas_id=str(canvas_id),
+            target_node_id=str(target_node_id),
+            terminal_run_id=str(run_id),
+            terminal_status=str(terminal_status),
+            terminal_execution_manifest_sha256=execution_manifest_sha256,
+            terminal_doc=json.dumps(status_doc, separators=(",", ":"), default=str),
+            terminal_submitted_at=submitted_at,
+            terminal_at=now,
+            updated_at=now,
+        )
+        s.add(row)
+        terminal_wins = True
+    else:
+        terminal_wins = _projection_attempt_is_newer(
+            run_id=str(run_id), submitted_at=submitted_at,
+            current_run_id=row.terminal_run_id,
+            current_submitted_at=row.terminal_submitted_at,
+        )
+
+    old_manifest_identities = {
+        row.terminal_execution_manifest_sha256,
+        row.result_execution_manifest_sha256,
+    }
+    if terminal_wins:
+        row.terminal_run_id = str(run_id)
+        row.terminal_status = str(terminal_status)
+        row.terminal_execution_manifest_sha256 = execution_manifest_sha256
+        row.terminal_doc = json.dumps(
+            status_doc, separators=(",", ":"), default=str)
+        row.terminal_submitted_at = submitted_at
+        row.terminal_at = now
+        row.updated_at = now
+
+    result_outputs = [
+        dict(output) for output in (status_doc.get("outputs") or [])
+        if isinstance(output, dict)
+        and output.get("outcome") == "committed"
+        and output.get("publication_kind", output.get("publicationKind")) == "result"
+        and output.get("uri")
+    ] if terminal_status == "done" else []
+    result_wins = bool(result_outputs) and _projection_attempt_is_newer(
+        run_id=str(run_id), submitted_at=submitted_at,
+        current_run_id=row.result_run_id,
+        current_submitted_at=row.result_submitted_at,
+    )
+    if result_wins:
+        row.result_run_id = str(run_id)
+        row.result_execution_manifest_sha256 = execution_manifest_sha256
+        row.result_outputs = json.dumps(
+            result_outputs, separators=(",", ":"), default=str)
+        row.result_input_manifest = admission.manifest if admission is not None else None
+        row.result_submitted_at = submitted_at
+        row.result_updated_at = now
+    s.flush()
+    if result_wins:
+        _replace_attempt_refs(
+            s, "canvas_result", row.id,
+            _result_doc_refs({"outputs": result_outputs}),
+        )
+    _delete_unreferenced_execution_manifests(s, old_manifest_identities)
+    return row
+
+
+def _sync_canvas_result_latest_local_owner(s, row: CanvasResultLatest | None) -> None:
+    if row is None:
+        return
+    try:
+        outputs = json.loads(row.result_outputs)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Canvas current-result output metadata is invalid") from exc
+    sync_local_result_owner(
+        s, "canvas_result", row.id, {"outputs": outputs}, row.result_input_manifest)
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False,
                    execution_manifest_sha256: str | None = None,
@@ -12935,6 +13206,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     with session() as s:
         if (execution_manifest_sha256 is None) != (execution_manifest_doc is None):
             raise ValueError("execution manifest identity and document must be supplied together")
+        projection_canvas = (
+            s.get(Canvas, str(canvas_id), with_for_update=True)
+            if st in _TERMINAL_RUN and job_type == "run" and canvas_id is not None
+            else None
+        )
         stale_candidate_ids: list[str] = []
         locked: dict[str, RunState] = {}
         if st not in _TERMINAL_RUN:
@@ -13099,6 +13375,16 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             s, "run_state", run_id, output_refs,
             publish=bool(publish_region and st in ("done", "failed")),
             publish_kind="region")
+        canvas_result_latest = _upsert_canvas_result_latest(
+            s,
+            canvas_id=(str(canvas_id) if projection_canvas is not None else None),
+            run_id=str(run_id),
+            target_node_id=(target_node_id or r.target_node_id),
+            terminal_status=st,
+            status_doc=status,
+            execution_manifest_sha256=(
+                execution_manifest_sha256 or r.execution_manifest_sha256),
+        )
         if st in _TERMINAL_RUN:
             stale_execution_manifests = {
                 obj.execution_manifest_sha256 for obj in stale
@@ -13118,6 +13404,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if st in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
+        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
         if st in _TERMINAL_RUN:
             for obj in stale:
                 _drop_local_result_owner_locked(s, "run_state", obj.run_id)
@@ -14530,6 +14817,20 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         pruned = [*stale, *([state] if prune_current else [])]
         _replace_attempt_refs(
             s, "run_state", run_id, _result_doc_refs(published))
+        canvas_result_latest = _upsert_canvas_result_latest(
+            s,
+            canvas_id=(
+                str(state.canvas_id)
+                if state.canvas_id is not None
+                and locked_canvases.get(str(state.canvas_id)) is not None
+                else None
+            ),
+            run_id=str(run_id),
+            target_node_id=(published.get("target_node_id") or state.target_node_id),
+            terminal_status=terminal,
+            status_doc=published,
+            execution_manifest_sha256=state.execution_manifest_sha256,
+        )
         _release_backend_publication_effect_refs(s, job, effects)
         for obj in pruned:
             stale_job = s.get(RunBackendJob, obj.run_id)
@@ -14561,6 +14862,7 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         elif terminal in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=True)
+        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
         for obj in pruned:
             _drop_local_result_owner_locked(s, "run_state", obj.run_id)
         return True
@@ -14931,7 +15233,7 @@ _INSTALLATION_ID = 1
 _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
-    "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
+    "canvas", "canvas_result", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
     "dataset_view", "distribution_report", "durable_task", "profile_job",
     "run_input_admission", "run_record", "run_state", "sparse_output",
 }
@@ -14997,7 +15299,7 @@ def _canvas_local_result_candidates(value) -> set[str]:
 def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     """Owner-aware exact extraction avoids scanning arbitrary caller-controlled JSON strings."""
     candidates: set[str] = set()
-    if owner_kind in ("run_state", "run_record", "result_cache"):
+    if owner_kind in ("canvas_result", "run_state", "run_record", "result_cache"):
         for value in values:
             for uri in _result_doc_uris(value):
                 candidate = _local_result_candidate(uri)
@@ -15188,7 +15490,8 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
             if parsed is not None:
                 identities.update(parsed[1])
             identities.update(_manifest_revision_identities(value))
-    elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
+    elif owner_kind in (
+            "canvas_result", "profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))
     return sorted(identities)
@@ -15197,7 +15500,7 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
 def _local_result_input_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if owner_kind in (
-            "durable_task", "profile_job", "run_input_admission", "run_record", "run_state"):
+            "canvas_result", "durable_task", "profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_local_file_input_identities(value))
     return sorted(identities)
@@ -16694,6 +16997,17 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             for cache in list(s.scalars(select(ResultCache).with_for_update())):
                 if any(uri in inherited_uris for uri in _result_doc_uris(cache.doc)):
                     s.delete(cache)
+            for latest in list(s.scalars(select(CanvasResultLatest).with_for_update())):
+                if any(uri in inherited_uris for uri in _result_doc_uris({
+                        "outputs": json.loads(latest.result_outputs)})):
+                    execution_manifest_candidates.add(
+                        latest.result_execution_manifest_sha256)
+                    latest.result_run_id = None
+                    latest.result_execution_manifest_sha256 = None
+                    latest.result_outputs = "[]"
+                    latest.result_input_manifest = None
+                    latest.result_submitted_at = None
+                    latest.result_updated_at = None
             for ref in list(s.scalars(select(ObjectAttemptRef).where(
                     ObjectAttemptRef.attempt_uri.in_(inherited_uris)).with_for_update())):
                 s.delete(ref)

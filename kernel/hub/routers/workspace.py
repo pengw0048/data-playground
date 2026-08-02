@@ -1958,6 +1958,16 @@ def _prepare_setting_changes(
         if change.key in _REMOVED_CREDENTIAL_SETTINGS:
             raise HTTPException(400, _REMOVED_CREDENTIAL_SETTINGS[change.key])
         value = change.value
+        if change.key == "canvasResultRetention":
+            if change.scope != "global":
+                raise HTTPException(400, "canvasResultRetention is a workspace setting")
+            if (not isinstance(value, dict)
+                    or set(value) != {"history"}
+                    or value.get("history") not in ("latest", "recent")):
+                raise HTTPException(
+                    400,
+                    "canvasResultRetention.history must be 'latest' or 'recent'",
+                )
         is_secret = change.scope == "global" and change.key in plugin_secrets
         if is_secret:
             try:

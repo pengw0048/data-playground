@@ -5,10 +5,15 @@ const mocks = vi.hoisted(() => ({
   getShares: vi.fn(),
   addShare: vi.fn(),
   state: {
-    doc: { id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[] },
+    doc: {
+      id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[],
+      resultRetention: { history: 'inherit' as 'inherit' | 'latest' | 'recent' },
+    },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
+    kernelInfo: { resultStorage: { id: 'workspace-managed', label: 'Local workspace', kind: 'local' } },
     renameFile: vi.fn(),
     setRequirements: vi.fn(),
+    setResultRetention: vi.fn(),
     setParameters: vi.fn(),
   },
 }))
@@ -32,6 +37,7 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     mocks.getShares.mockResolvedValue({ visibility: 'private', shares: [] })
     mocks.addShare.mockResolvedValue({ ok: true })
     mocks.state.doc.parameters = []
+    mocks.state.doc.resultRetention = { history: 'inherit' }
   })
 
   it('renders workspace_view accurately and disables document fields for a viewer', async () => {
@@ -94,5 +100,13 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
 
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 's3://public-bucket/key' } })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows the managed result location and saves a Canvas history override', async () => {
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+
+    expect(screen.getByText('Local workspace · local')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Result history'), { target: { value: 'recent' } })
+    expect(mocks.state.setResultRetention).toHaveBeenCalledWith('recent')
   })
 })

@@ -25,6 +25,8 @@ export const color = {
   failed: '#e0483d',
   queued: '#8a94a6',
   draft: '#aab1bd',
+  checking: '#8a94a6',
+  unknown: '#8a94a6',
 
   // wire / selection — literal hex on purpose: consumed as SVG presentation attributes (ArrowDefs,
   // WireEdge) and in alpha-concatenated strings (shadow.focus), where var() does NOT resolve.
@@ -64,15 +66,18 @@ export const wire: Record<WireType, { color: string; shape: 'dot' | 'ring' | 'sq
   value: { color: '#8a8f98', shape: 'diamond' },
 }
 
-export type StatusKey = 'draft' | 'latest' | 'stale' | 'queued' | 'running' | 'failed' | 'done'
+export type StatusKey =
+  | 'draft' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed' | 'done'
 
 export const status: Record<StatusKey, { color: string; glyph: string; label: string }> = {
   draft: { color: color.draft, glyph: '○', label: 'draft' },
+  checking: { color: color.checking, glyph: '…', label: 'checking' },
   latest: { color: color.latest, glyph: '✓', label: 'latest' },
   stale: { color: color.stale, glyph: '▲', label: 'stale' },
   queued: { color: color.queued, glyph: '◔', label: 'queued' },
   running: { color: color.running, glyph: '●', label: 'running' },
   failed: { color: color.failed, glyph: '✕', label: 'failed' },
+  unknown: { color: color.unknown, glyph: '?', label: 'status unavailable' },
   done: { color: color.latest, glyph: '✓', label: 'done' },  // per-node run completion
 }
 

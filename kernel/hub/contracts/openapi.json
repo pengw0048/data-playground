@@ -401,6 +401,85 @@
         "title": "CanvasCopyValidationResponse",
         "type": "object"
       },
+      "CanvasResultRecovery": {
+        "properties": {
+          "failedNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Failednodeids",
+            "type": "array"
+          },
+          "latestNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Latestnodeids",
+            "type": "array"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/RetainedResultIdentity"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "staleNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Stalenodeids",
+            "type": "array"
+          },
+          "unknownNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unknownnodeids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "latestNodeIds",
+          "failedNodeIds",
+          "staleNodeIds",
+          "unknownNodeIds",
+          "results"
+        ],
+        "title": "CanvasResultRecovery",
+        "type": "object"
+      },
+      "CanvasResultRecoveryRequest": {
+        "additionalProperties": false,
+        "description": "One bounded reopen check for the Canvas's retained full results.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          }
+        },
+        "required": [
+          "graph"
+        ],
+        "title": "CanvasResultRecoveryRequest",
+        "type": "object"
+      },
+      "CanvasResultRetention": {
+        "description": "Canvas override for physical full-result history.\n\n``latest`` always remains owned by the Canvas. ``recent`` additionally lets bounded Jobs history\nretain its result artifacts. The managed store itself is deployment-owned and runner-independent.",
+        "properties": {
+          "history": {
+            "default": "inherit",
+            "enum": [
+              "inherit",
+              "latest",
+              "recent"
+            ],
+            "title": "History",
+            "type": "string"
+          }
+        },
+        "title": "CanvasResultRetention",
+        "type": "object"
+      },
       "CanvasTransformReference": {
         "properties": {
           "availability": {
@@ -5492,6 +5571,9 @@
             "title": "Requirements",
             "type": "array"
           },
+          "resultRetention": {
+            "$ref": "#/components/schemas/CanvasResultRetention"
+          },
           "version": {
             "default": 1,
             "maximum": 9007199254740991.0,
@@ -6116,6 +6198,14 @@
             },
             "title": "Processors",
             "type": "array"
+          },
+          "resultStorage": {
+            "$ref": "#/components/schemas/ResultStorageInfo",
+            "default": {
+              "id": "workspace-managed",
+              "kind": "local",
+              "label": "Workspace managed storage"
+            }
           },
           "runners": {
             "default": [],
@@ -9506,6 +9596,34 @@
           "expectedHeadRevisionId"
         ],
         "title": "RestoreRevisionTaskV1",
+        "type": "object"
+      },
+      "ResultStorageInfo": {
+        "description": "The one lifecycle-managed result store available to Canvas runs.\n\nExport destinations are deliberately absent: they do not own result references, manifests, or\ngarbage collection and therefore cannot truthfully be selected as a Canvas result store.",
+        "properties": {
+          "id": {
+            "const": "workspace-managed",
+            "default": "workspace-managed",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "local",
+            "enum": [
+              "local",
+              "object",
+              "plugin"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "default": "Workspace managed storage",
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "title": "ResultStorageInfo",
         "type": "object"
       },
       "RetainedEditorPreviewRequest": {
@@ -25362,6 +25480,89 @@
           }
         },
         "summary": "Run"
+      }
+    },
+    "/api/run/current-results": {
+      "post": {
+        "description": "Rebuild current node badges from exact plans and readable Canvas-owned results.",
+        "operationId": "recover_canvas_results_api_run_current_results_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CanvasResultRecoveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasResultRecovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Recover Canvas Results"
       }
     },
     "/api/run/editor-preview": {

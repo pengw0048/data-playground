@@ -105,6 +105,18 @@ def test_native_canvas_preserves_supported_placement_state(auto_placed: bool):
     assert parsed["canvas"]["nodes"][0]["data"]["autoPlaced"] is auto_placed
 
 
+def test_native_canvas_preserves_result_retention_policy():
+    doc = _doc("native-result-retention")
+    doc["resultRetention"] = {"history": "recent"}
+
+    envelope = native_canvas.export_envelope(doc, get_deps())
+    parsed = native_canvas.parse_envelope(
+        envelope, filename="result-retention.dp-canvas.json")
+
+    assert envelope["canvas"]["resultRetention"] == {"history": "recent"}
+    assert parsed["canvas"]["resultRetention"] == {"history": "recent"}
+
+
 def test_native_canvas_rejects_non_boolean_placement_state():
     doc = _doc("native-invalid-placement")
     doc["nodes"][0]["data"]["autoPlaced"] = "yes"

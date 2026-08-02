@@ -215,6 +215,11 @@ def test_kernel_info():
     assert "duckdb" in info["adapters"] and "lance" in info["adapters"]
     assert info["runners"] == ["local-out-of-core", "local-subprocess", "kernel"]
     assert {"media", "vector"} <= set(info["capabilities"])
+    assert info["resultStorage"] == {
+        "id": "workspace-managed",
+        "label": "Local workspace",
+        "kind": "local",
+    }
 
 
 def test_nodes_endpoint():

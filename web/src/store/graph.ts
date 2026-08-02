@@ -1457,6 +1457,7 @@ interface Store {
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   setExecutionBackend: (backend: string | null) => void
+  setResultRetention: (history: 'inherit' | 'latest' | 'recent') => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
@@ -1685,7 +1686,12 @@ function invalidateCurrentResults(
     // Retain lastRun/history as durable output history, but stale the status that lets Canvas
     // present that output as the current result for the changed graph.
     nodes: doc.nodes.map((node) => (
-      affected.has(node.id) && node.data.status === 'latest'
+      affected.has(node.id) && (
+        node.data.status === 'latest'
+        || node.data.status === 'checking'
+        || node.data.status === 'unknown'
+        || node.data.status === 'failed'
+      )
         ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
         : node
     )),
@@ -4297,6 +4303,14 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((state) => ({ doc: { ...state.doc, executionBackend: normalized } }))
   },
+  setResultRetention: (history) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    if ((get().doc.resultRetention?.history ?? 'inherit') === history) return
+    get().commit()
+    set((state) => ({
+      doc: { ...state.doc, resultRetention: { history } },
+    }))
+  },
   setParameters: (parameters) => {
     if (!roleCanEdit(get().canvasRole)) return 'You do not have permission to edit Canvas parameters.'
     const currentDoc = get().doc
@@ -4816,10 +4830,12 @@ export const useStore = create<Store>((set, get) => ({
 
   loadDoc: (doc, role = get().canvasRole, options) => {
     _cfgEdit = { id: '', t: 0 }
-    // A canvas document is not execution authority. A queued/running badge saved in a snapshot can
-    // outlive its run, so settle it before the document is ever rendered. reattachRuns below may
-    // immediately replace these with the live run's authoritative per-node states.
-    const d = settleAnimatingDoc(doc)
+    // A canvas document is not execution authority. Any badge that claims a server-side result or
+    // run is checked before it is shown again; recovery below then installs readable retained
+    // results or reattaches a live run from the authoritative server state.
+    const d = options?.recoverServerState === false
+      ? doc
+      : prepareLoadedStatusDoc(doc)
     const agentLog = d.id === get().doc.id ? get().agentLog : []
     // Every loadDoc caller is installing a server response or a deliberately selected server
     // snapshot.  The subscriber observes a different object identity, so it needs this synchronous
@@ -4852,7 +4868,7 @@ export const useStore = create<Store>((set, get) => ({
       _settlingLoadedDoc = false
     }
     if (options?.recoverServerState !== false) {
-      recoverRetainedResultBindings(get, set, d)
+      recoverCanvasResults(get, set, d)
       reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     }
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
@@ -5083,6 +5099,20 @@ function settleAnimatingDoc(doc: CanvasDoc): CanvasDoc {
   return changed ? { ...doc, nodes } : doc
 }
 
+function prepareLoadedStatusDoc(doc: CanvasDoc): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((node) => {
+    if (node.data.status !== 'latest'
+        && node.data.status !== 'queued'
+        && node.data.status !== 'running'
+        && node.data.status !== 'failed'
+        && node.data.status !== 'unknown') return node
+    changed = true
+    return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
+  })
+  return changed ? { ...doc, nodes } : doc
+}
+
 function settleAnimatingNodes(set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void) {
   set((s) => {
     const doc = settleAnimatingDoc(s.doc)
@@ -5109,48 +5139,72 @@ function applyPerNodeStatus(
   })
 }
 
-function recoverRetainedResultBindings(
+function recoverCanvasResults(
   get: () => Store,
   set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
   doc: CanvasDoc,
 ) {
   const generation = ++_retainedResultRecoveryGeneration
   const userId = get().currentUser?.id
-  for (const node of doc.nodes) {
-    if (node.type !== 'transform' || node.data.status !== 'latest'
-        || targetParameterDeclarations(doc, node.id).length === 0) continue
-    const planIdentity = previewPlanIdentity(doc, node.id, 'out')
-    const initialRun = get().runs[node.id]
-    // A preview binding is local user intent, not a full-result identity. Preserve it and let the
-    // server validate it explicitly during schema refresh; recover only a genuinely missing form.
-    if (initialRun?.parameterBindings !== undefined) continue
-    void api.retainedResult(doc, node.id, 'out').then((identity) => {
-      let installed = false
-      set((state) => {
-        const latestNode = state.doc.nodes.find((candidate) => candidate.id === node.id)
-        if (
-          generation !== _retainedResultRecoveryGeneration
+  const structure = structSig(doc)
+  void api.currentResults(doc).then((recovery) => {
+    let installedBindings = false
+    set((state) => {
+      if (generation !== _retainedResultRecoveryGeneration
           || state.doc.id !== doc.id
           || state.currentUser?.id !== userId
-          || latestNode?.data.status !== 'latest'
-          || previewPlanIdentity(state.doc, node.id, 'out') !== planIdentity
-          || state.runs[node.id] !== undefined
-          || identity.output.nodeId !== node.id
-          || identity.output.portId !== 'out'
-          || !Array.isArray(identity.parameterBindings)
-        ) return {}
-        installed = true
-        return { runs: { ...state.runs, [node.id]: {
-          phase: 'idle' as const,
-          parameterBindings: identity.parameterBindings,
-        } } }
+          || structSig(state.doc) !== structure) return {}
+      const latest = new Set(recovery.latestNodeIds)
+      const failed = new Set(recovery.failedNodeIds)
+      const unknown = new Set(recovery.unknownNodeIds ?? [])
+      let nodesChanged = false
+      const nodes = state.doc.nodes.map((node) => {
+        if (node.data.status !== 'checking') return node
+        const status: NodeStatus = failed.has(node.id)
+          ? 'failed'
+          : latest.has(node.id)
+            ? 'latest'
+            : unknown.has(node.id)
+              ? 'unknown' : 'stale'
+        nodesChanged = true
+        return { ...node, data: { ...node.data, status } }
       })
-      if (installed) void get().refreshSchemas()
-    }).catch(() => {
-      // Missing/stale/temporarily unavailable retained state remains unknown. Schema recovery and
-      // the result panel use the same server contract and may retry independently.
+      let runs = state.runs
+      for (const identity of recovery.results) {
+        const nodeId = identity.output.nodeId
+        const node = nodes.find((candidate) => candidate.id === nodeId)
+        if (node?.type !== 'transform'
+            || targetParameterDeclarations(state.doc, nodeId).length === 0
+            || runs[nodeId]?.parameterBindings !== undefined
+            || !Array.isArray(identity.parameterBindings)) continue
+        if (runs === state.runs) runs = { ...state.runs }
+        runs[nodeId] = {
+          ...(runs[nodeId] ?? { phase: 'idle' as const }),
+          parameterBindings: identity.parameterBindings,
+        }
+        installedBindings = true
+      }
+      return {
+        ...(nodesChanged ? { doc: { ...state.doc, nodes } } : {}),
+        ...(runs !== state.runs ? { runs } : {}),
+      }
     })
-  }
+    if (installedBindings) void get().refreshSchemas()
+  }).catch(() => {
+    set((state) => {
+      if (generation !== _retainedResultRecoveryGeneration
+          || state.doc.id !== doc.id
+          || state.currentUser?.id !== userId
+          || structSig(state.doc) !== structure) return {}
+      let changed = false
+      const nodes = state.doc.nodes.map((node) => {
+        if (node.data.status !== 'checking') return node
+        changed = true
+        return { ...node, data: { ...node.data, status: 'unknown' as NodeStatus } }
+      })
+      return changed ? { doc: { ...state.doc, nodes } } : {}
+    })
+  })
 }
 
 // On canvas open, recover normal active runs plus the latest durable profile per node/plan. Profiles

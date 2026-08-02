@@ -208,6 +208,11 @@ function stagedSettings(
       ['agentCredId', global.agentCredId === NO_CRED ? '' : String(global.agentCredId ?? ''), String(baseline.global.agentCredId ?? '')],
       ['defaultObjectStoreCredId', global.defaultObjectStoreCredId === NO_CRED ? '' : String(global.defaultObjectStoreCredId ?? ''), String(baseline.global.defaultObjectStoreCredId ?? '')],
       [
+        'canvasResultRetention',
+        { history: String((global.canvasResultRetention as { history?: string } | undefined)?.history || 'latest') },
+        { history: String((baseline.global.canvasResultRetention as { history?: string } | undefined)?.history || 'latest') },
+      ],
+      [
         'agentDataPolicy',
         {
           level: String(global.agentDataPolicyLevel || 'metadata-only'),
@@ -254,6 +259,10 @@ function editableGlobal(snapshot: SettingsSnapshot): Record<string, unknown> {
     : null
   global.agentDataPolicyLevel = policy?.level || 'metadata-only'
   global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
+  const retention = global.canvasResultRetention
+  global.canvasResultRetention = retention && typeof retention === 'object'
+    ? { history: (retention as { history?: string }).history || 'latest' }
+    : { history: 'latest' }
   return global
 }
 
@@ -378,6 +387,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
   const dests = (Array.isArray(g.destinations) ? g.destinations : []) as DestinationPreset[]
+  const canvasResultHistory = String(
+    (g.canvasResultRetention as { history?: string } | undefined)?.history || 'latest')
   const savedDestinations = (Array.isArray(baseline?.global.destinations)
     ? baseline.global.destinations : []) as DestinationPreset[]
   const isSavedDestination = (destination: DestinationPreset) => savedDestinations.some(
@@ -975,7 +986,29 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                 </Section>}
 
                 {canGlobal && active === 'destinations' && <Section id="destinations" title="Destinations">
-                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">Save locations for Canvas outputs.</p>
+                  <div className="mb-3 rounded-md border border-border bg-background">
+                    <div className="border-b border-border px-2.5 py-2 text-[11.5px] font-semibold text-foreground">Canvas results</div>
+                    <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2 px-2.5 py-2">
+                      <div>
+                        <div className="text-[11.5px] font-medium text-foreground">Stored results</div>
+                      </div>
+                      <Select value={canvasResultHistory} onValueChange={(history) => setG((prev) => ({
+                        ...prev, canvasResultRetention: { history },
+                      }))}>
+                        <SelectTrigger className="w-[140px]" aria-label="Canvas result history"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="latest">Latest result</SelectItem>
+                          <SelectItem value="recent">Recent run results</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="text-[11.5px] font-medium text-foreground">Location</div>
+                      <div className="text-right text-[11px] text-muted-foreground">
+                        {kernelInfo?.resultStorage?.label ?? 'Workspace managed storage'}
+                        {kernelInfo?.resultStorage?.kind ? ` · ${kernelInfo.resultStorage.kind}` : ''}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Export destinations</div>
                   <div className="mb-2 flex flex-col gap-1">
                     {dests.map((d, i) => (
                       <div key={d.id} className="rounded-md border border-border px-2.5 py-2">

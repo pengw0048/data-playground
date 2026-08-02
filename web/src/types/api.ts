@@ -32,6 +32,11 @@ export interface KernelInfo {
   capabilityViews?: CapabilityView[]  // plugin capabilities that declare a viewer tab (rendered generically)
   backends: BackendInfo[]
   executionTargets?: ExecutionTargetInfo[]
+  resultStorage?: {
+    id: 'workspace-managed'
+    label: string
+    kind: 'local' | 'object' | 'plugin'
+  }
 }
 
 export interface NativeCanvasDiagnostic {
@@ -845,6 +850,14 @@ export interface RetainedResultIdentity {
   executionManifestSha256: string
   parameterBindings: CanvasParameterBinding[]
   output: RunOutput
+}
+
+export interface CanvasResultRecovery {
+  latestNodeIds: string[]
+  failedNodeIds: string[]
+  staleNodeIds: string[]
+  unknownNodeIds: string[]
+  results: RetainedResultIdentity[]
 }
 
 export interface WriteIntent {

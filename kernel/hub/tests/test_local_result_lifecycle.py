@@ -135,6 +135,82 @@ def test_local_result_end_to_end_owner_reader_and_gc(storage):
     assert _artifact(uri) is None
 
 
+def test_canvas_current_result_survives_operational_state_pruning(storage):
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    _user_id, canvas_id, _doc = _publish_run(storage, run_id, uri)
+
+    with metadb.session() as session:
+        projection = session.scalar(select(metadb.CanvasResultLatest).where(
+            metadb.CanvasResultLatest.canvas_id == canvas_id,
+            metadb.CanvasResultLatest.target_node_id == "target",
+        ))
+        assert projection is not None
+        assert session.get(metadb.LocalResultReference, {
+            "uri": uri, "owner_kind": "canvas_result", "owner_key": projection.id,
+        }) is not None
+        state = session.get(metadb.RunState, run_id, with_for_update=True)
+        assert state is not None
+        metadb._lock_local_result_registry(session)
+        metadb._drop_local_result_owner_locked(session, "run_state", run_id)
+        session.delete(state)
+
+    storage.prune_results(limit=10)
+    assert pathlib.Path(uri).exists(), "Canvas lifetime must outlive bounded operational status"
+
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+    assert not pathlib.Path(uri).exists()
+    assert _artifact(uri) is None
+
+
+@pytest.mark.parametrize(("history", "workspace_history", "retains_history_artifact"), [
+    ("latest", "recent", False),
+    ("recent", "latest", True),
+    ("inherit", "recent", True),
+])
+def test_canvas_result_history_policy_controls_only_historical_artifacts(
+        storage, history, workspace_history, retains_history_artifact):
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = _ready_result(storage, run_id)
+    _user_id, canvas_id, doc = _publish_run(storage, run_id, uri)
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps({"resultRetention": {"history": history}})
+    metadb.set_setting(
+        "canvasResultRetention", {"history": workspace_history}, scope="global")
+
+    assert metadb.record_run(
+        canvas_id=canvas_id,
+        target_node_id="target",
+        job_type="run",
+        status="done",
+        rows=1,
+        outputs=doc["outputs"],
+        run_id=run_id,
+    ) is True
+    with metadb.session() as session:
+        record = session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.canvas_id == canvas_id,
+            metadb.RunRecord.run_id == run_id,
+        ))
+        projection = session.scalar(select(metadb.CanvasResultLatest).where(
+            metadb.CanvasResultLatest.canvas_id == canvas_id,
+        ))
+        assert record is not None and projection is not None
+        history_ref = session.get(metadb.LocalResultReference, {
+            "uri": uri, "owner_kind": "run_record", "owner_key": record.id,
+        })
+        assert (history_ref is not None) is retains_history_artifact
+        assert session.get(metadb.LocalResultReference, {
+            "uri": uri, "owner_kind": "canvas_result", "owner_key": projection.id,
+        }) is not None
+
+    metadb.delete_canvas_cascade(canvas_id)
+    storage.prune_results(limit=10)
+
+
 def test_terminal_commit_then_raise_is_proved_by_exact_receipt(storage):
     run_id = f"run-{uuid.uuid4().hex}"
     uri = _ready_result(storage, run_id)

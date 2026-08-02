@@ -111,6 +111,27 @@ describe('API error recovery contract', () => {
     expect(body).not.toContain('uri')
   })
 
+  it('checks all reopened Canvas results in one server-owned batch', async () => {
+    const payload = {
+      latestNodeIds: ['source', 'chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+    const doc: CanvasDoc = {
+      id: 'canvas', version: 3, resultRetention: { history: 'latest' }, nodes: [], edges: [],
+    }
+
+    await expect(api.currentResults(doc)).resolves.toEqual(payload)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/run/current-results',
+      expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }),
+      }),
+    )
+  })
+
   it('asks the server to discover retained editor input without sending a run id or artifact URI', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       columns: [], rows: [], truncated: false,

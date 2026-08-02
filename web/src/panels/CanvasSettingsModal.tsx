@@ -23,7 +23,9 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const canvasRole = useStore((s) => s.canvasRole)
   const renameFile = useStore((s) => s.renameFile)
   const setRequirements = useStore((s) => s.setRequirements)
+  const setResultRetention = useStore((s) => s.setResultRetention)
   const setParameters = useStore((s) => s.setParameters)
+  const resultStorage = useStore((s) => s.kernelInfo?.resultStorage)
   const canEdit = roleCanEdit(canvasRole)
   const isOwner = canvasRole === 'owner'
   const sharing = useCanvasSharing(doc.id, isOwner)
@@ -69,7 +71,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
         </div>
         <DialogDescription className="sr-only">Settings for the current canvas: its name, visibility, and dependencies.</DialogDescription>
 
-        <div className="flex flex-col gap-4 p-4">
+        <div className="flex max-h-[min(76vh,760px)] flex-col gap-4 overflow-y-auto p-4">
           <div className="rounded-md bg-muted px-2.5 py-1.5 text-[10.5px] text-muted-foreground">{access}</div>
           {sharing.error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-[11.5px] text-destructive">
@@ -122,6 +124,31 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
               className="dp-mono w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-[11.5px] text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-70"
             />
             <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed on this canvas's kernel, then importable in <code>transform</code> cells. Travels with the canvas.</div>
+          </div>
+          <div>
+            <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Results</Label>
+            <div className="grid grid-cols-[1fr_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
+              <div>
+                <div className="text-[11.5px] font-medium text-foreground">Stored results</div>
+              </div>
+              <select
+                aria-label="Result history"
+                value={doc.resultRetention?.history ?? 'inherit'}
+                disabled={!canEdit}
+                onChange={(event) => setResultRetention(
+                  event.target.value as 'inherit' | 'latest' | 'recent')}
+                className="h-8 rounded-md border border-border bg-background px-2 text-[11.5px] text-foreground outline-none focus:border-primary disabled:opacity-60"
+              >
+                <option value="inherit">Workspace default</option>
+                <option value="latest">Latest result</option>
+                <option value="recent">Recent run results</option>
+              </select>
+              <div className="text-[11.5px] font-medium text-foreground">Location</div>
+              <div className="text-right text-[11px] text-muted-foreground">
+                {resultStorage?.label ?? 'Workspace managed storage'}
+                {resultStorage?.kind ? ` · ${resultStorage.kind}` : ''}
+              </div>
+            </div>
           </div>
           <div>
             <div className="mb-1 flex items-center gap-2">

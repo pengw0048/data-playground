@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 const apiMocks = vi.hoisted(() => ({
   kernel: vi.fn(), nodes: vi.fn(), me: vi.fn(), users: vi.fn(),
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
+  currentResults: vi.fn(), retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
   resolveExampleSources: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
@@ -30,6 +30,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.listRuns
       : property === 'retainedResult'
         ? apiMocks.retainedResult
+      : property === 'currentResults'
+        ? apiMocks.currentResults
       : property === 'retainedEditorPreview'
         ? apiMocks.retainedEditorPreview
       : property === 'exampleRowsEditorPreview'
@@ -186,6 +188,9 @@ describe('graph store — core authority ops', () => {
     apiMocks.users.mockReset().mockResolvedValue([{ id: 'alice', name: 'Alice' }])
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
+    apiMocks.currentResults.mockReset().mockResolvedValue({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
     apiMocks.retainedResult.mockReset().mockRejectedValue(new Error('no retained result'))
     apiMocks.retainedEditorPreview.mockReset()
     apiMocks.exampleRowsEditorPreview.mockReset()
@@ -432,7 +437,7 @@ describe('graph store — core authority ops', () => {
       name: 'transform_code',
       value: "def fn(row): return {**row, 'derived': 1}",
     }]
-    apiMocks.retainedResult.mockResolvedValueOnce({
+    const identity = {
       runId: 'retained-transform-run',
       executionManifestSha256: 'a'.repeat(64),
       parameterBindings,
@@ -440,13 +445,17 @@ describe('graph store — core authority ops', () => {
         nodeId: 'transform', portId: 'out', wire: 'dataset',
         publicationKind: 'result', outcome: 'committed', uri: '/results/transform.parquet',
       },
+    }
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['transform'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [identity],
     })
 
     useStore.getState().loadDoc(doc, 'owner')
 
     await vi.waitFor(() => expect(useStore.getState().runs.transform?.parameterBindings)
       .toEqual(parameterBindings))
-    expect(apiMocks.retainedResult).toHaveBeenCalledWith(doc, 'transform', 'out')
+    expect(apiMocks.currentResults).toHaveBeenCalledWith(expect.objectContaining({ id: doc.id }))
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('latest')
     await vi.waitFor(() => expect(apiMocks.schema).toHaveBeenCalledWith(
       doc, undefined, undefined, parameterBindings,
     ))
@@ -537,22 +546,25 @@ describe('graph store — core authority ops', () => {
       parameters: [{ name: 'transform_code', type: 'string' as const, required: true }],
       nodes: [transform], edges: [],
     }
-    let finishRecovery!: (identity: any) => void
-    apiMocks.retainedResult.mockImplementationOnce(() => new Promise((resolve) => {
+    let finishRecovery!: (recovery: any) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
       finishRecovery = resolve
     }))
     useStore.getState().loadDoc(doc, 'owner')
-    await vi.waitFor(() => expect(apiMocks.retainedResult).toHaveBeenCalled())
+    await vi.waitFor(() => expect(apiMocks.currentResults).toHaveBeenCalled())
     const local = { name: 'transform_code', value: 'local edit' }
     useStore.getState().setRunParameterBinding('transform', local)
 
-    finishRecovery({
+    const identity = {
       runId: 'older-retained-run', executionManifestSha256: 'a'.repeat(64),
       parameterBindings: [{ name: 'transform_code', value: 'retained code' }],
       output: {
         nodeId: 'transform', portId: 'out', wire: 'dataset',
         publicationKind: 'result', outcome: 'committed', uri: '/result.parquet',
       },
+    }
+    finishRecovery({
+      latestNodeIds: ['transform'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [identity],
     })
 
     await vi.waitFor(() => expect(useStore.getState().runs.transform?.parameterBindings)
@@ -630,7 +642,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.graphSizes).not.toHaveBeenCalled()
   })
 
-  it('settles persisted transient badges on reopen and version restore when no run is active', async () => {
+  it('checks persisted execution badges on reopen and settles them from server evidence', async () => {
     const snapshot = {
       id: 'c', version: 1, name: 'restored', requirements: [], edges: [], nodes: [
         { ...NODE('queued'), data: { ...NODE('queued').data, status: 'queued' as const } },
@@ -644,8 +656,11 @@ describe('graph store — core authority ops', () => {
 
     useStore.getState().loadDoc(snapshot, 'owner') // ordinary reopen
     expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
-      'stale', 'stale', 'draft', 'latest', 'stale', 'failed',
+      'checking', 'checking', 'draft', 'checking', 'stale', 'checking',
     ])
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
+      'stale', 'stale', 'draft', 'stale', 'stale', 'stale',
+    ]))
     // The returned snapshot is not mutated; the same boundary can safely receive it from restore.
     expect(snapshot.nodes.map((node) => node.data.status)).toEqual([
       'queued', 'running', 'draft', 'latest', 'stale', 'failed',
@@ -653,9 +668,32 @@ describe('graph store — core authority ops', () => {
 
     useStore.getState().loadDoc(snapshot, 'owner') // VersionHistoryModal restore
     expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
-      'stale', 'stale', 'draft', 'latest', 'stale', 'failed',
+      'checking', 'checking', 'draft', 'checking', 'stale', 'checking',
     ])
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
+      'stale', 'stale', 'draft', 'stale', 'stale', 'stale',
+    ]))
     await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
+  })
+
+  it('rechecks an unknown persisted badge and preserves uncertainty after a transient storage check', async () => {
+    let finishRecovery!: (recovery: any) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    const snapshot = {
+      id: 'c', version: 1, name: 'reopen unknown', requirements: [], edges: [], nodes: [
+        { ...NODE('source'), data: { ...NODE('source').data, status: 'unknown' as const } },
+      ],
+    }
+
+    useStore.getState().loadDoc(snapshot, 'owner')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    finishRecovery({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: ['source'], results: [],
+    })
+
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('unknown'))
   })
 
   it('lets a delayed authoritative active-run response replace settled badges', async () => {
@@ -670,7 +708,7 @@ describe('graph store — core authority ops', () => {
     }
 
     useStore.getState().loadDoc(snapshot, 'owner')
-    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['checking', 'checking'])
 
     finishActive([{
       runId: 'live-recovered-run', status: 'running', jobType: 'run', targetNodeId: 'target',

@@ -36,7 +36,9 @@ FILENAME_SUFFIX = ".dp-canvas.json"
 _ENVELOPE_KEYS = frozenset({
     "format", "version", "canvas", "descriptors", "dataReferences", "libraryProcessors",
 })
-_CANVAS_KEYS = frozenset({"name", "nodes", "edges", "requirements", "parameters"})
+_CANVAS_KEYS = frozenset({
+    "name", "nodes", "edges", "requirements", "parameters", "resultRetention",
+})
 _NODE_KEYS = frozenset({"id", "type", "position", "data", "parentId"})
 _EDGE_KEYS = frozenset({"id", "source", "target", "sourceHandle", "targetHandle", "data"})
 _NODE_DATA_KEYS = frozenset({
@@ -124,6 +126,7 @@ def _portable_canvas(doc: dict[str, Any]) -> dict[str, Any]:
         "nodes": [], "edges": doc.get("edges", []),
         "requirements": doc.get("requirements", []),
         "parameters": doc.get("parameters", []),
+        "resultRetention": doc.get("resultRetention", {"history": "inherit"}),
     }
     for raw in doc.get("nodes", []):
         if not isinstance(raw, dict):
