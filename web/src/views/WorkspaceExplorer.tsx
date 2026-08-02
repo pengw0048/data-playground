@@ -579,7 +579,7 @@ function WorkspaceMixedExplorer() {
       setConnectedSources(page.connectedSources ?? [])
       const capabilities = page.queryCapabilities ?? (localSource
         ? LOCAL_QUERY_CAPABILITIES
-        : { sort: [], kindFilter: false, reason: 'This connected source controls sorting and filters.' })
+        : { sort: [], kindFilter: false, reason: "Sorting and type filters aren't available for this source." })
       setQueryCapabilities(capabilities)
       if (!capabilities.sort.length && sortMode !== 'source') setSortMode('source')
       if (!capabilities.kindFilter && kindFilter !== 'all') setKindFilter('all')

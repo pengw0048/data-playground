@@ -1616,10 +1616,8 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     }
 
 
-_PROVIDER_QUERY_REASON = "This connected source controls sorting and filters."
-_MIXED_QUERY_REASON = (
-    "This connected source controls sorting and filters."
-)
+_PROVIDER_QUERY_REASON = "Sorting and type filters aren't available for this source."
+_MIXED_QUERY_REASON = "Open a source folder to sort or filter its contents."
 
 
 def _connected_source_resource(mounted: _MountedProvider) -> dict:

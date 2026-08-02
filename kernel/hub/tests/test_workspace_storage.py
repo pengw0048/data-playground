@@ -4988,7 +4988,9 @@ def test_workspace_connected_source_lens_is_separate_bounded_and_resolvable(
         assert first_page["container"] == connected
         assert first_page["queryCapabilities"]["sort"] == []
         assert first_page["queryCapabilities"]["kindFilter"] is False
-        assert first_page["queryCapabilities"]["reason"]
+        assert first_page["queryCapabilities"]["reason"] == (
+            "Sorting and type filters aren't available for this source."
+        )
         assert first_page["items"][0]["parentId"] == connected["id"]
         assert first_page["nextCursor"].startswith("provider.")
         assert first_page["nextCursor"] != "1"
@@ -5185,7 +5187,9 @@ def test_workspace_default_browse_mixes_local_and_connected_source_roots(
     assert not any(item["id"].startswith("container:mount.") for item in page["items"])
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
-    assert page["queryCapabilities"]["reason"] == "This connected source controls sorting and filters."
+    assert page["queryCapabilities"]["reason"] == (
+        "Open a source folder to sort or filter its contents."
+    )
 
 
 def test_workspace_provider_delete_is_capability_driven_and_detaches_cached_dataset(

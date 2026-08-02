@@ -9,8 +9,8 @@ export type ExistingNodeResult = { node: CanvasNode; match: number; outputs: str
 export type ExistingNodeSearch = { results: ExistingNodeResult[]; total: number }
 const MAX_RENDERED_RESULTS = 100
 
-function normalized(value: string): string {
-  return value.trim().toLowerCase()
+function normalized(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : ''
 }
 
 /** Compare Unicode code points directly, rather than inheriting the browser's locale collation. */
@@ -24,7 +24,7 @@ function codePointCompare(left: string, right: string): number {
   return a.length - b.length
 }
 
-function fieldMatch(value: string, query: string, exact: number, prefix: number, includes: number): number {
+function fieldMatch(value: unknown, query: string, exact: number, prefix: number, includes: number): number {
   const field = normalized(value)
   if (field === query) return exact
   if (field.startsWith(query)) return prefix
@@ -38,12 +38,15 @@ function outputLabels(node: CanvasNode): string[] {
 }
 
 function stateLabels(node: CanvasNode): string[] {
+  const nodeStatus = typeof node.data.status === 'string'
+    ? status[node.data.status]?.label ?? node.data.status
+    : null
   return [
-    status[node.data.status]?.label ?? node.data.status,
+    nodeStatus,
     ...(node.data.disabled ? ['disabled'] : []),
     ...(node.data.bypassed ? ['bypassed'] : []),
-    ...(node.data.meta ? [node.data.meta] : []),
-  ]
+    ...(typeof node.data.meta === 'string' ? [node.data.meta] : []),
+  ].filter((label): label is string => Boolean(label?.trim()))
 }
 
 function compareResults(left: ExistingNodeResult, right: ExistingNodeResult): number {

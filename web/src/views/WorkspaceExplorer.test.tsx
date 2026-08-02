@@ -731,7 +731,7 @@ describe('WorkspaceExplorer', () => {
       completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: 'This connected source controls sorting and filters.',
+        reason: "Sorting and type filters aren't available for this source.",
       },
     })
     render(<WorkspaceExplorer />)
@@ -740,7 +740,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('option', { name: 'Source order' })).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'This connected source controls sorting and filters.',
+      "Sorting and type filters aren't available for this source.",
     )
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
@@ -763,7 +763,7 @@ describe('WorkspaceExplorer', () => {
       sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: 'This connected source controls sorting and filters.',
+        reason: 'Open a source folder to sort or filter its contents.',
       },
     })
     render(<WorkspaceExplorer />)
@@ -773,7 +773,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
     expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'This connected source controls sorting and filters.',
+      'Open a source folder to sort or filter its contents.',
     )
   })
 
