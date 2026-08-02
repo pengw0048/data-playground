@@ -615,7 +615,7 @@ test.describe('Data Playground canvas', () => {
     const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
     const search = locator.getByRole('textbox', { name: 'Search existing nodes' })
     await search.fill('duplicate-off-screen')
-    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('failed · disabled')
+    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('stale · disabled')
     await search.press('Enter')
 
     await expect(locator).toBeHidden()
@@ -1684,7 +1684,8 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
-    await expect(page.getByText('Save locations for Canvas outputs.')).toBeVisible()
+    await expect(page.getByLabel('Destination name')).toBeVisible()
+    await expect(page.getByLabel('Destination root or prefix')).toBeVisible()
     const addDestination = async (name: string, root: string) => {
       await page.getByLabel('Destination name').fill(name)
       await page.getByLabel('Destination root or prefix').fill(root)
