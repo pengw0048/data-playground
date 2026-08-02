@@ -63,7 +63,7 @@ vi.mock('@xyflow/react', () => ({
   BackgroundVariant: { Dots: 'dots' },
 }))
 
-import { ERDiagram } from './ERDiagram'
+import { ERDiagram, EntityNode } from './ERDiagram'
 
 const ORDERS: CatalogTable = {
   id: 'orders', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders',
@@ -361,6 +361,23 @@ describe('ERDiagram request truth', () => {
     ))
     expect(screen.getByTestId('edge-shape-l0')).toHaveTextContent('publish_customers')
     expect(screen.getByTestId('edge-shape-l1')).toBeEmptyDOMElement()
+  })
+
+  it('reserves enough space for the longest semantic field role', () => {
+    render(<EntityNode data={{
+      table: CUSTOMERS,
+      fields: [{ name: 'id', role: 'mapped', column: CUSTOMERS.columns[0], type: 'int' }],
+      focused: false,
+      lineage: true,
+      expanded: true,
+      opening: false,
+      onFocus: vi.fn(),
+      onOpen: vi.fn(),
+    }} />)
+
+    const badge = screen.getByTestId('er-field-role:customers:id')
+    expect(badge).toHaveTextContent('mapped')
+    expect(badge).toHaveClass('w-12')
   })
 
   it('does not invent a key role from a column capability', async () => {

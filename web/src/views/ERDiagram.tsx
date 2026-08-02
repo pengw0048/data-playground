@@ -40,7 +40,7 @@ type EntityField = {
   column?: CatalogTable['columns'][number]
 }
 
-function EntityNode({ data }: { data: EntityData }) {
+export function EntityNode({ data }: { data: EntityData }) {
   const { table, fields, focused, lineage, expanded, opening, onFocus, onOpen } = data
   const activate = lineage ? onOpen : onFocus
   return (
@@ -72,11 +72,11 @@ function EntityNode({ data }: { data: EntityData }) {
           <Handle id={`column-in:${field.name}`} type="target" position={Position.Left}
             className="!h-1.5 !w-1.5 !border-0 !bg-primary" />
           {field.role === 'field'
-            ? <span aria-hidden className="w-8 shrink-0" />
+            ? <span aria-hidden className="w-12 shrink-0" />
             : <span className={cn(
-                'w-8 shrink-0 rounded px-1 text-center text-[8px] font-bold uppercase tracking-wide',
+                'w-12 shrink-0 rounded px-1 text-center text-[8px] font-bold uppercase tracking-wide',
                 field.role === 'PK' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground',
-              )}>{field.role}</span>}
+              )} data-testid={`er-field-role:${table.id}:${field.name}`}>{field.role}</span>}
           {field.column
             ? <FieldEvidenceButton column={field.column} marker className="dp-mono min-w-0 flex-1 truncate rounded px-0.5 text-left hover:bg-accent" />
             : <span className="dp-mono min-w-0 flex-1 truncate" title={field.name}>{field.name}</span>}
