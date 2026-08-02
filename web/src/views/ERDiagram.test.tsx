@@ -169,7 +169,19 @@ describe('ERDiagram request truth', () => {
     await waitFor(() => expect(mocks.deleteRelationship).toHaveBeenCalledWith(relationship))
   })
 
-  it('uses the same safe insets for the React Flow Fit View control', async () => {
+  it('keeps overview fitting compact while preserving the same safe insets', async () => {
+    render(<ERDiagram />)
+
+    await screen.findByText('orders')
+    fireEvent.click(screen.getByRole('button', { name: 'Fit view' }))
+
+    expect(mocks.fitView).toHaveBeenCalledWith({
+      padding: { top: '164px', right: '16px', bottom: '16px', left: '344px' }, maxZoom: 0.8,
+    })
+  })
+
+  it('allows a focused relationship graph to fit at detail zoom', async () => {
+    store.erFocusUri = ORDERS.uri
     render(<ERDiagram />)
 
     await screen.findByText('orders')

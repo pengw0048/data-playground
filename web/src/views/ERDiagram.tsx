@@ -101,23 +101,29 @@ const nodeTypes = { entity: EntityNode }
 // directly usable after fitting. The left inset also keeps nodes clear of the viewport buttons.
 const ER_FIT_PADDING = { top: '164px', right: '16px', bottom: '16px', left: '344px' } as const
 const ER_FIT_OPTIONS = { padding: ER_FIT_PADDING, maxZoom: 1 }
+// The overview deliberately stops below semantic-detail zoom. Otherwise Fit view can measure the
+// compact cards, zoom just far enough to expand every schema, and leave those newly taller cards
+// outside the viewport. A focused graph may still fit at full detail; overview users can zoom in
+// deliberately when they want columns.
+const ER_OVERVIEW_FIT_OPTIONS = { padding: ER_FIT_PADDING, maxZoom: 0.8 }
 const LINEAGE_FIT_OPTIONS = {
   padding: { top: '168px', right: '32px', bottom: '32px', left: '32px' },
   maxZoom: 1,
 } as const
 
-function ERViewportControls({ fitKey, container, lineage, onZoomChange }: {
+function ERViewportControls({ fitKey, container, lineage, overview, onZoomChange }: {
   fitKey: string
   container: RefObject<HTMLDivElement | null>
   lineage: boolean
+  overview: boolean
   onZoomChange: (zoom: number) => void
 }) {
   const { fitView } = useReactFlow()
   const { zoom } = useViewport()
   const [size, setSize] = useState({ width: 0, height: 0 })
   const fitSafely = useCallback(async () => {
-    await fitView(lineage ? LINEAGE_FIT_OPTIONS : ER_FIT_OPTIONS)
-  }, [fitView, lineage])
+    await fitView(lineage ? LINEAGE_FIT_OPTIONS : overview ? ER_OVERVIEW_FIT_OPTIONS : ER_FIT_OPTIONS)
+  }, [fitView, lineage, overview])
 
   // `useViewport` follows manual controls and programmatic fits. React Flow's `onMove` callback can
   // miss a mount-time fit, which otherwise leaves a one-node graph compact until the user nudges it.
@@ -885,6 +891,7 @@ export function ERDiagram() {
         proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
         <ERViewportControls fitKey={fitKey} container={graphContainer} lineage={mode === 'lineage'}
+          overview={!hasFocusedRoute}
           onZoomChange={updateExpandedEntities} />
       </ReactFlow>
       {pending && (
