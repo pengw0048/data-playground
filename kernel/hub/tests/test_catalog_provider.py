@@ -22,7 +22,7 @@ from hub.catalog_provider import (
     ProviderDatasetDetailResult, ProviderLineageResult, ProviderPage,
     ProviderResourceResult, ProviderSearchPage,
     bounded_ancestors, bounded_capabilities, bounded_dataset_detail, bounded_list_children,
-    bounded_lineage, bounded_resolve, bounded_search,
+    bounded_lineage, bounded_resolve, bounded_search, lineage_resource_key,
 )
 
 
@@ -306,7 +306,8 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
                 kind="dataset",
                 name="raw_video_v1",
                 dataset_id=f"parent-{suffix}",
-                uri=physical_parent,
+                uri="fixture://opaque/provider-binding",
+                lineage_key=lineage_resource_key(mount_id, physical_parent),
             )])
 
         def list_children(self, *_args, **_kwargs):

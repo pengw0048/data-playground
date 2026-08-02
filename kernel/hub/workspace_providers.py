@@ -31,6 +31,7 @@ from hub.catalog_provider import (
     bounded_lineage,
     bounded_resolve,
     bounded_search,
+    lineage_resource_key,
 )
 
 _EXTERNAL_PREFIX = "external."
@@ -459,8 +460,7 @@ def provider_dataset_uri_for_identity(dataset_id: str) -> str | None:
 
 def _provider_lineage_uri(mount_id: str, uri: str) -> str:
     """Return a stable, non-reversible UI identity for a provider-owned lineage endpoint."""
-    digest = hashlib.sha256(f"{mount_id}\0{uri}".encode()).hexdigest()
-    return f"workspace-provider-lineage://{digest}"
+    return f"workspace-provider-lineage://{lineage_resource_key(mount_id, uri)}"
 
 
 def provider_dataset_lineage(uri: str, *, depth: int, max_nodes: int):
@@ -585,7 +585,10 @@ def resolve_provider_lineage_resource(
     matches = [
         item for item in page.items
         if item.kind == "dataset" and item.uri
-        and _provider_lineage_uri(mount_id, item.uri) == node_uri
+        and (
+            item.lineage_key == node_uri.removeprefix("workspace-provider-lineage://")
+            or _provider_lineage_uri(mount_id, item.uri) == node_uri
+        )
     ]
     if not matches:
         raise ProviderDatasetGone("lineage dataset is not registered in this connected source")

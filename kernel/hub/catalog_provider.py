@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import threading
 from collections.abc import Callable
 from typing import Literal, Protocol, TypeVar, runtime_checkable
@@ -38,6 +39,15 @@ class CatalogMount(Wire):
     config: dict[str, str] = Field(default_factory=dict)
 
 
+def lineage_resource_key(mount_id: str, uri: str) -> str:
+    """Return the shared opaque key that joins provider browse results to lineage nodes."""
+    if not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128:
+        raise ValueError("mount_id must be a bounded non-empty string")
+    if not isinstance(uri, str) or not uri or len(uri) > 8192:
+        raise ValueError("uri must be a bounded non-empty string")
+    return hashlib.sha256(f"{mount_id}\0{uri}".encode()).hexdigest()
+
+
 class CatalogResource(Wire):
     """One provider-owned browse/search occurrence.
 
@@ -54,6 +64,7 @@ class CatalogResource(Wire):
     parent_placement_id: str | None = Field(default=None, max_length=512)
     dataset_id: str | None = Field(default=None, min_length=1, max_length=512)
     uri: str | None = Field(default=None, max_length=8192)
+    lineage_key: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     columns: list[ColumnSchema] = Field(default_factory=list, max_length=2048)
     availability: ResourceAvailability = "available"
     availability_reason: str | None = Field(default=None, min_length=1, max_length=512)
@@ -72,11 +83,12 @@ class CatalogResource(Wire):
                 self.dataset_id is None):
             raise ValueError("an unavailable dataset occurrence requires a canonical dataset ID")
         if self.kind == "dataset" and self.availability != "available" and (
-                self.uri is not None or self.columns):
+                self.uri is not None or self.lineage_key is not None or self.columns):
             raise ValueError(
                 "an unavailable dataset occurrence cannot carry URI or columns")
         if self.kind == "container" and (
-            self.dataset_id is not None or self.uri is not None or self.columns
+            self.dataset_id is not None or self.uri is not None
+            or self.lineage_key is not None or self.columns
         ):
             raise ValueError("a container resource cannot carry dataset details")
         return self
