@@ -375,8 +375,10 @@ export function JobsView() {
           {freshness && <p className="text-[11.5px] text-muted-foreground">{freshness}</p>}</div>
         <span className="flex-1" />
         <div className="inline-flex rounded-md border border-border bg-background p-0.5" role="group" aria-label="Whose jobs">
-          <Button size="sm" variant={scope === 'mine' ? 'secondary' : 'ghost'} onClick={() => selectScope('mine')} data-testid="jobs-scope-mine">My jobs</Button>
-          <Button size="sm" variant={scope === 'all' ? 'secondary' : 'ghost'} onClick={() => selectScope('all')} data-testid="jobs-scope-all">All users</Button>
+          <Button size="sm" variant={scope === 'mine' ? 'secondary' : 'ghost'} aria-pressed={scope === 'mine'}
+            onClick={() => selectScope('mine')} data-testid="jobs-scope-mine">My jobs</Button>
+          <Button size="sm" variant={scope === 'all' ? 'secondary' : 'ghost'} aria-pressed={scope === 'all'}
+            onClick={() => selectScope('all')} data-testid="jobs-scope-all">All users</Button>
         </div>
         <Button variant="outline" size="sm" onClick={() => void load(undefined, 'refresh')} disabled={loading || loadingMore}>
           <Icon name="refresh" size={13} /> Refresh

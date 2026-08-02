@@ -190,10 +190,14 @@ describe('JobsView', () => {
 
     await screen.findByText('Alpha research')
     expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(1, expect.not.objectContaining({ scope: 'all' }))
+    expect(screen.getByTestId('jobs-scope-mine')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('jobs-scope-all')).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(screen.getByTestId('jobs-scope-all'))
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('scope=all'))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ scope: 'all' })))
+    expect(screen.getByTestId('jobs-scope-mine')).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByTestId('jobs-scope-all')).toHaveAttribute('aria-pressed', 'true')
     expect(await screen.findByText(/Ada/)).toBeVisible()
   })
 
