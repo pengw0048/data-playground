@@ -763,7 +763,7 @@ describe('WorkspaceExplorer', () => {
       sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: 'Open a source folder to sort or filter its contents.',
+        reason: "Sorting and type filters aren't available in this view.",
       },
     })
     render(<WorkspaceExplorer />)
@@ -773,7 +773,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
     expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'Open a source folder to sort or filter its contents.',
+      "Sorting and type filters aren't available in this view.",
     )
   })
 

@@ -48,9 +48,10 @@ _MAX_MOUNTS = 8
 _MAX_MISSING_PLACEMENT_PROBES = 8
 _MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
-# Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
-# actions may wait a little longer, but remain bounded and use the same isolated provider workers.
-_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
+# Passive Workspace browse must stay responsive even when a remote mount is slow. Keep cold remote
+# catalog reads within the same bounded deadline as explicit actions so first-time browsing does not
+# report a false timeout while the provider is still warming up.
+_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
 _INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
@@ -1617,7 +1618,7 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
 
 
 _PROVIDER_QUERY_REASON = "Sorting and type filters aren't available for this source."
-_MIXED_QUERY_REASON = "Open a source folder to sort or filter its contents."
+_MIXED_QUERY_REASON = "Sorting and type filters aren't available in this view."
 
 
 def _connected_source_resource(mounted: _MountedProvider) -> dict:
