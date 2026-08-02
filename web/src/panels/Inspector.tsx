@@ -251,8 +251,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       : kind === 'source' && !manualDelimitedSource
         ? ['delimiter', 'header']
         : []
-  const showGenericProperties = kind !== 'transform'
-    || (!libraryTransform && cfg.mode === 'map_batches')
+  // Chart configuration is edited directly on the card, where the controls can use the
+  // connected input schema. The generic Inspector would turn the same axes back into raw
+  // text fields and create two conflicting editing surfaces.
+  const showGenericProperties = kind !== 'chart' && (
+    kind !== 'transform' || (!libraryTransform && cfg.mode === 'map_batches')
+  )
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)

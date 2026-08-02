@@ -1460,6 +1460,43 @@ describe('Inspector — draft Source entry', () => {
   })
 })
 
+describe('Inspector — Chart configuration', () => {
+  it('keeps schema-aware axis editing on the Canvas card instead of duplicating free-text fields', () => {
+    registerGenericNodes([{
+      kind: 'chart', title: 'chart', category: 'inspect', tag: 'chart',
+      inputs: [{ id: 'in', wire: 'dataset' }],
+      outputs: [{ id: 'out', wire: 'dataset' }],
+      params: [
+        { name: 'x', type: 'string', label: 'group by (X)' },
+        { name: 'y', type: 'string', label: 'value (Y)' },
+      ],
+      canBypass: false, previewable: true, blurb: 'Create a chart from selected columns',
+    }])
+    useStore.setState({
+      selectedIds: ['chart'], canvasRole: 'owner', runs: {},
+      doc: {
+        id: 'chart-inspector', name: 'Chart Inspector', version: 1, requirements: [],
+        nodes: [{
+          id: 'chart', type: 'chart', position: { x: 100, y: 100 },
+          data: {
+            title: 'Chart', status: 'draft', history: [],
+            config: { x: 'event', y: 'amount', agg: 'sum' },
+          },
+        }],
+        edges: [],
+      },
+      schemas: { chart: { out: cols } },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.queryByText('Properties')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('group by (X)')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('value (Y)')).not.toBeInTheDocument()
+    expect(screen.getByText('Create a chart from selected columns')).toBeInTheDocument()
+  })
+})
+
 describe('Inspector — Join configuration', () => {
   const selectJoin = (config: Record<string, unknown>) => {
     registerGenericNodes([{

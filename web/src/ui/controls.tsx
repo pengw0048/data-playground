@@ -51,14 +51,15 @@ export const miniInputClass = 'h-7 px-2 py-1 text-[11.5px] md:text-[11.5px] text
 export const miniSelectClass =
   'h-7 w-full cursor-pointer rounded-md border border-input bg-transparent px-2 text-[11.5px] text-foreground outline-none focus:ring-1 focus:ring-ring focus:ring-offset-0'
 
-export function MiniInput({ value, onChange, placeholder, mono, onBlur, invalid }: {
+export function MiniInput({ value, onChange, placeholder, mono, onBlur, invalid, ariaLabel }: {
   value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean; onBlur?: () => void
-  invalid?: boolean
+  invalid?: boolean; ariaLabel?: string
 }) {
   return (
     <Input
       value={value}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       aria-invalid={invalid || undefined}
       onChange={(e) => onChange(e.target.value)}
       onBlur={onBlur}

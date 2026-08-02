@@ -43,6 +43,7 @@ from hub.sqlpolicy import (
     validate_identifier_alias,
     validate_identifier_schema,
     validate_query,
+    validate_value_expression,
 )
 from hub.sdk import ExactSourceRowRestriction, NodePreparation, UnsupportedUpstreamError, ctx
 
@@ -1580,29 +1581,40 @@ class BuildEngine:
             )
 
         if t == "chart":
-            x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "count")  # default matches nodespec/UI
+            base = parent
+            agg = str(cfg.get("agg", "count"))  # default matches nodespec/UI
+            x_mode = str(cfg.get("xMode", "column"))
+            y_mode = str(cfg.get("yMode", "column"))
+            x = str(cfg.get("x") or "").strip()
+            y = str(cfg.get("y") or "").strip()
+            if x_mode == "column" and not x:
+                x = _default_chart_dimension(base)
+            if agg != "count" and y_mode == "column" and not y:
+                y = _default_chart_measure(base, exclude=x)
             if not x:
-                raise NotPreviewable(node, "pick an X column to chart")
+                raise NotPreviewable(node, "Connect data with a chartable column, or enter an X SQL expression.")
             if agg == "none" and not y:
-                raise NotPreviewable(node, "pick a Y column (or an aggregation) to chart")
+                raise NotPreviewable(node, "Choose a numeric Y column, or enter a Y SQL expression.")
             if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
-                raise NotPreviewable(node, f"pick a Y column to {agg}")
+                raise NotPreviewable(node, f"Choose a numeric Y value to {agg}.")
             if agg != "none" and not self.full:
                 raise NotPreviewable(
                     node,
                     "This grouped chart needs all input rows. Run this step to compute its series.",
                     suggested_action="run",
                 )
-            base = parent
-            x = identifier(x, base.columns, label="chart X column")
-            if y:
-                y = identifier(y, base.columns, label="chart Y column")
-            v, xq = self._view(base, "ch"), quote_identifier(x)
+            try:
+                xq = _chart_axis_expression(base, x, x_mode, label="X")
+                yq = _chart_axis_expression(base, y, y_mode, label="Y") if y else None
+            except (SQLPolicyError, duckdb.Error, ValueError) as exc:
+                axis = "SQL expression" if "expression" in (x_mode, y_mode) else "field selection"
+                raise NotPreviewable(node, f"Fix the chart {axis} before running it.") from exc
+            v = self._view(base, "ch")
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
                 return db.conn().sql(
-                    f"SELECT {xq} AS x, {quote_identifier(y)} AS y FROM {quote_identifier(v)}"
+                    f"SELECT {xq} AS x, {yq} AS y FROM {quote_identifier(v)}"
                 )
-            yexpr = "count(*)" if agg == "count" or not y else f"{_agg_name(agg)}({quote_identifier(y)})"
+            yexpr = "count(*)" if agg == "count" or not yq else f"{_agg_name(agg)}({yq})"
             # Grouped series is a real dataset output, so the durable artifact must retain every group.
             # The interactive chart renderer owns its explicit 2,000-point display budget; imposing the
             # cap here would silently make both downstream nodes and full-result exports incomplete.
@@ -2024,6 +2036,63 @@ def _agg_name(agg: str) -> str:
     if a not in _AGG_ALLOWED:
         raise ValueError(f"unsupported aggregate '{agg}' (allowed: {', '.join(sorted(_AGG_ALLOWED))})")
     return {"mean": "avg"}.get(a, a)
+
+
+_CHART_NESTED_OR_BINARY = re.compile(r"(?:LIST|ARRAY|STRUCT|MAP|UNION|BLOB|BIT)", re.I)
+_CHART_NUMERIC = re.compile(
+    r"(?:U?INT(?:8|16|32|64|128)?|TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC)",
+    re.I,
+)
+_CHART_TEMPORAL = re.compile(r"(?:DATE|TIME|TIMESTAMP|INTERVAL)", re.I)
+_CHART_CATEGORICAL = re.compile(r"(?:VARCHAR|CHAR|TEXT|ENUM|BOOL)", re.I)
+_CHART_ID_LIKE = re.compile(r"(?:^id$|_id$|^uuid$|row_?id|index$)", re.I)
+_CHART_MEASURE_LIKE = re.compile(
+    r"(?:amount|value|score|total|price|revenue|cost|duration|latency|size|width|height|rate|count)",
+    re.I,
+)
+
+
+def _chart_fields(relation: Relation) -> list[tuple[str, str]]:
+    return [
+        (str(name), str(field_type))
+        for name, field_type in zip(relation.columns, relation.types)
+        if not _CHART_NESTED_OR_BINARY.search(str(field_type))
+    ]
+
+
+def _default_chart_dimension(relation: Relation) -> str:
+    fields = _chart_fields(relation)
+    return next((name for name, field_type in fields
+                 if _CHART_CATEGORICAL.search(field_type) and not _CHART_ID_LIKE.search(name)), None) \
+        or next((name for name, field_type in fields if _CHART_TEMPORAL.search(field_type)), None) \
+        or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
+        or (fields[0][0] if fields else "")
+
+
+def _default_chart_measure(relation: Relation, *, exclude: str = "") -> str:
+    fields = [(name, field_type) for name, field_type in _chart_fields(relation)
+              if name != exclude and _CHART_NUMERIC.search(field_type)]
+    return next((name for name, _field_type in fields
+                 if _CHART_MEASURE_LIKE.search(name) and not _CHART_ID_LIKE.search(name)), None) \
+        or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
+        or (fields[0][0] if fields else "")
+
+
+def _chart_axis_expression(relation: Relation, value: str, mode: str, *, label: str) -> str:
+    if mode not in {"column", "expression"}:
+        raise ValueError(f"unsupported chart {label} mode")
+    if mode == "column":
+        column = identifier(value, relation.columns, label=f"chart {label} column")
+        return quote_identifier(column)
+    if not value:
+        raise SQLPolicyError(f"chart {label} expression is empty")
+    validated = validate_value_expression(value, con=db.conn())
+    # Bind against the real input schema without reading rows. This catches unknown columns,
+    # aggregates/window expressions in a per-row slot, and expressions that return nested values.
+    probe = relation.project(f"({validated.sql}) AS {quote_identifier('__dp_chart_axis')}")
+    if len(probe.columns) != 1 or _CHART_NESTED_OR_BINARY.search(str(probe.types[0])):
+        raise SQLPolicyError(f"chart {label} expression must return one scalar value")
+    return f"({validated.sql})"
 
 
 def _ident(col: str) -> str:

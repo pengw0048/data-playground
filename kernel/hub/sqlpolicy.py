@@ -519,6 +519,27 @@ def validate_fragment(kind: FragmentKind, fragment: object, *, con=None) -> Vali
     return ValidatedSQL(text, refs)
 
 
+def validate_value_expression(expression: object, *, con=None) -> ValidatedSQL:
+    """Validate one scalar projection expression for an embedded value slot.
+
+    ``PROJECTION`` deliberately accepts comma-separated lists and aliases for Select nodes. Chart
+    axes need exactly one value and embed it inside their own ``AS x`` / ``AS y`` projection, so
+    accepting a list, ``*``, or a user alias would make the surrounding query ambiguous.
+    """
+    validated = validate_fragment(FragmentKind.PROJECTION, expression, con=con)
+    ast, _normalized = _parse_select(_wrapper(FragmentKind.PROJECTION, validated.sql))
+    select_list = _top_select(ast).get("select_list") or []
+    values = select_list[:-1]
+    if len(values) != 1:
+        raise SQLPolicyError("value expression must produce exactly one column")
+    value = values[0]
+    if not isinstance(value, dict) or value.get("class") in {"STAR", "COLUMNS"}:
+        raise SQLPolicyError("value expression must produce exactly one scalar value")
+    if str(value.get("alias") or ""):
+        raise SQLPolicyError("value expression cannot define an alias")
+    return validated
+
+
 def join_equality_columns(fragment: object, *, con=None) -> tuple[list[str], list[str]] | None:
     """Extract a pure ``a.field = b.field [AND ...]`` JOIN_ON key sequence.
 

@@ -181,8 +181,10 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
              inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset
              params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),
-                     ParamSpec(name="x", type="string", label="X column"),
-                     ParamSpec(name="y", type="string", label="Y column"),
+                     ParamSpec(name="x", type="string", label="group by (X)"),
+                     ParamSpec(name="xMode", type="select", options=["column", "expression"], default="column", label="X source"),
+                     ParamSpec(name="y", type="string", label="value (Y)"),
+                     ParamSpec(name="yMode", type="select", options=["column", "expression"], default="column", label="Y source"),
                      ParamSpec(name="agg", type="select", options=["none", "count", "sum", "mean", "min", "max"], default="count", label="aggregate Y by X")],
              blurb="Create a chart from selected columns"),
     NodeSpec(kind="vector-search", title="vector-search", category="query", tag="vector",

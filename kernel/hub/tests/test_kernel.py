@@ -11812,7 +11812,19 @@ def test_chart_node_produces_series():
     assert {r["x"] for r in grouped["rows"]} == {"view", "click", "purchase", "signup"}
     scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
     assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
-    assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")       # no X → honest refusal
+    _, automatic = _full_result(chart_graph({"chartType": "bar", "agg": "count"}), "ch", 50)
+    assert {r["x"] for r in automatic["rows"]} == {"view", "click", "purchase", "signup"}
+    assert all(isinstance(r["y"], (int, float)) for r in automatic["rows"])
+    expression = chart({
+        "chartType": "scatter", "agg": "none",
+        "xMode": "expression", "x": "user_id + 1",
+        "yMode": "expression", "y": "amount * 2",
+    })
+    assert expression["rows"][:2] == [{"x": 1, "y": 0.0}, {"x": 2, "y": 3.0}]
+    assert chart({
+        "chartType": "scatter", "agg": "none",
+        "xMode": "expression", "x": "user_id FROM secret", "y": "amount",
+    }).get("notPreviewable")
     assert chart({"chartType": "bar", "x": "event", "agg": "sum"}).get("notPreviewable")  # sum needs a Y (not silent count)
     minmax = chart({"chartType": "bar", "x": "event", "y": "event", "agg": "max"})  # max of a TEXT column
     assert minmax.get("notPreviewable")

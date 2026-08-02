@@ -1,0 +1,44 @@
+import { describe, expect, it } from 'vitest'
+import type { ColumnSchema } from '../../types/graph'
+import {
+  chartableColumns,
+  numericChartColumns,
+  suggestedChartDimension,
+  suggestedChartMeasure,
+} from './chart'
+
+const columns: ColumnSchema[] = [
+  { name: 'id', type: 'int64', capabilities: [] },
+  { name: 'event', type: 'string', capabilities: [] },
+  { name: 'user_id', type: 'int64', capabilities: [] },
+  { name: 'amount', type: 'float64', capabilities: [] },
+  { name: 'created_at', type: 'timestamp[us]', capabilities: [] },
+  { name: 'embedding', type: 'list<float32>', capabilities: [] },
+]
+
+describe('Chart schema recommendations', () => {
+  it('starts with a useful category and business measure instead of identifiers', () => {
+    expect(suggestedChartDimension(columns)?.name).toBe('event')
+    expect(suggestedChartMeasure(columns, 'event')?.name).toBe('amount')
+  })
+
+  it('offers scalar input fields while keeping Y choices numeric', () => {
+    expect(chartableColumns(columns).map((column) => column.name)).toEqual([
+      'id', 'event', 'user_id', 'amount', 'created_at',
+    ])
+    expect(numericChartColumns(columns).map((column) => column.name)).toEqual([
+      'id', 'user_id', 'amount',
+    ])
+  })
+
+  it('falls back through time and scalar fields for unfamiliar schemas', () => {
+    expect(suggestedChartDimension([
+      { name: 'created_at', type: 'timestamp', capabilities: [] },
+      { name: 'value', type: 'double', capabilities: [] },
+    ])?.name).toBe('created_at')
+    expect(suggestedChartDimension([
+      { name: 'row_id', type: 'bigint', capabilities: [] },
+      { name: 'score', type: 'double', capabilities: [] },
+    ])?.name).toBe('score')
+  })
+})

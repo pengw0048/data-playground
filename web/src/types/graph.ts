@@ -87,6 +87,8 @@ export interface NodeConfig {
   chartType?: 'bar' | 'line' | 'scatter' | 'area'
   x?: string
   y?: string
+  xMode?: 'column' | 'expression'
+  yMode?: 'column' | 'expression'
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'

@@ -49,7 +49,7 @@ _CORE_CONFIG_KEYS = frozenset({
     "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
     "delimiter", "header", "n", "seed", "method", "predicate", "filterBuilder", "select", "columns", "source", "processor",
     "version", "params", "code", "io", "mode", "onError", "outputSchema", "outputSchemaSource",
-    "outputSchemaCodeHash", "on", "how", "sql", "agg", "column", "chartType", "x", "y", "name", "writeMode",
+    "outputSchemaCodeHash", "on", "how", "sql", "agg", "column", "chartType", "x", "y", "xMode", "yMode", "name", "writeMode",
     "partitionBy", "filename", "destination", "destId", "destName", "destPath", "aggs", "by", "align", "count", "k", "lang", "markdown", "script",
 })
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
