@@ -310,6 +310,19 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
                 lineage_key=lineage_resource_key(mount_id, physical_parent),
             )])
 
+        def lineage_resource(self, _mount, root_dataset_id, node_key, name):
+            assert root_dataset_id == provider_dataset_id
+            assert node_key == lineage_resource_key(mount_id, physical_parent)
+            assert name == "raw_video_v1"
+            return ProviderResourceResult(item=CatalogResource(
+                placement_id=f"lineage-{node_key}",
+                kind="dataset",
+                name=name,
+                dataset_id=f"lineage-{node_key}",
+                uri="fixture://opaque/provider-lineage-binding",
+                lineage_key=node_key,
+            ))
+
         def list_children(self, *_args, **_kwargs):
             return ProviderPage()
 

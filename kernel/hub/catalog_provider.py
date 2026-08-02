@@ -272,6 +272,19 @@ class CatalogLineageProvider(Protocol):
     ) -> LineageResult: ...
 
 
+@runtime_checkable
+class CatalogLineageResourceProvider(Protocol):
+    """Optional navigation from one opaque lineage node to a provider dataset resource."""
+
+    def lineage_resource(
+        self,
+        mount: CatalogMount,
+        root_dataset_id: str,
+        node_key: str,
+        name: str,
+    ) -> ProviderResourceResult: ...
+
+
 def _provider_read(function: Callable[[], _R]) -> _R:
     try:
         return function()
@@ -491,6 +504,70 @@ def bounded_lineage(
             state="unsupported", reason="lineage is unsupported"),
         failed=lambda: ProviderLineageResult(
             state="unavailable", reason="provider lineage result is invalid",
+            failure="provider_error"),
+        timeout=timeout,
+    )
+
+
+def bounded_lineage_resource(
+    provider: ReadOnlyCatalogProvider,
+    mount: CatalogMount,
+    root_dataset_id: str,
+    node_key: str,
+    name: str,
+    *,
+    timeout: float = 1.0,
+) -> ProviderResourceResult:
+    """Resolve one clicked opaque lineage node without trusting its display name as identity."""
+    if not isinstance(root_dataset_id, str) or not root_dataset_id or len(root_dataset_id) > 512:
+        raise ValueError("root_dataset_id must be a bounded non-empty string")
+    if (
+        not isinstance(node_key, str)
+        or len(node_key) != 64
+        or any(character not in "0123456789abcdef" for character in node_key)
+    ):
+        raise ValueError("node_key must be a SHA-256 digest")
+    if not isinstance(name, str) or not name.strip() or len(name.encode("utf-8")) > 512:
+        raise ValueError("name must be a bounded non-empty string")
+
+    def read() -> ProviderResourceResult:
+        if not isinstance(provider, CatalogLineageResourceProvider):
+            raise NotImplementedError
+        try:
+            raw = provider.lineage_resource(
+                mount, root_dataset_id, node_key, name)
+        except PermissionError:
+            return ProviderResourceResult(
+                state="unavailable", reason="provider permission was denied",
+                failure="permission_lost")
+        except FileNotFoundError:
+            return ProviderResourceResult(
+                state="unavailable", reason="provider lineage dataset was not found",
+                failure="not_found")
+        except OSError:
+            return ProviderResourceResult(
+                state="unavailable", reason="provider is unavailable", failure="offline")
+        if isinstance(raw, ProviderResourceResult):
+            raw = raw.model_dump(mode="python")
+        result = ProviderResourceResult.model_validate(raw)
+        item = result.item
+        if item is not None and (
+            item.kind != "dataset"
+            or item.lineage_key != node_key
+            or item.name != " ".join(name.split())
+        ):
+            raise ValueError("provider lineage resource does not match the requested node")
+        return result
+
+    return _bounded_provider_read(
+        read,
+        unavailable=lambda reason: ProviderResourceResult(
+            state="unavailable", reason=reason, failure="offline"),
+        unsupported=lambda: ProviderResourceResult(
+            state="unsupported", reason="lineage navigation is unsupported",
+            failure="provider_error"),
+        failed=lambda: ProviderResourceResult(
+            state="unavailable", reason="provider lineage resource is invalid",
             failure="provider_error"),
         timeout=timeout,
     )

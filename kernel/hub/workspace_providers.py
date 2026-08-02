@@ -18,6 +18,7 @@ from typing import Literal
 from hub import metadb
 from hub.catalog_provider import (
     CatalogLineageProvider,
+    CatalogLineageResourceProvider,
     CatalogMount,
     CatalogResource,
     MutableCatalogProvider,
@@ -29,6 +30,7 @@ from hub.catalog_provider import (
     bounded_dataset_detail,
     bounded_list_children,
     bounded_lineage,
+    bounded_lineage_resource,
     bounded_resolve,
     bounded_search,
     lineage_resource_key,
@@ -570,6 +572,25 @@ def resolve_provider_lineage_resource(
         provider = _load_provider(mounted.mount.provider)
     except Exception as exc:  # noqa: BLE001 -- activation details remain private
         raise ProviderDatasetUnavailable(_activation_error()) from exc
+    if isinstance(provider, CatalogLineageResourceProvider):
+        resolved = bounded_lineage_resource(
+            provider,
+            mounted.mount,
+            canonical["providerDatasetId"],
+            node_uri.removeprefix("workspace-provider-lineage://"),
+            query,
+            timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+        if resolved.state == "ready" and resolved.item is not None:
+            return _workspace_resource(resolved.item, mounted)
+        if resolved.failure == "permission_lost":
+            raise PermissionError("permission to open provider lineage was lost")
+        if resolved.failure == "not_found":
+            raise ProviderDatasetGone("lineage dataset is no longer available")
+        if resolved.failure == "offline":
+            raise ProviderDatasetOffline("provider lineage dataset is temporarily unavailable")
+        raise ProviderDatasetUnavailable("provider returned invalid lineage dataset details")
+
     page = bounded_search(
         provider,
         mounted.mount,
