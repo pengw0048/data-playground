@@ -58,6 +58,8 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
+  const isMetric = node?.type === 'metric'
+  const isChart = node?.type === 'chart'
   const outputPorts = node ? nodeOutputs(node) : []
   const [portSelection, setPortSelection] = useState<{ nodeId: string; portId?: string }>(() => ({
     nodeId, portId: preview?.portId,
@@ -167,12 +169,16 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     parameterBindingsKnown, planIdentity, bindingsIdentity,
   ])
   useEffect(() => {
+    // A Chart is a full-input visualization. Once a saved output exists, opening the
+    // panel reads that artifact directly instead of issuing a preview request that can only refuse.
+    if (isChart && selectedOutput?.uri) return
     if (editorPreview?.autoLoad !== false
         && (!preview || preview.portId !== requestPortId)) {
       previewAction(nodeId, 0, requestPortId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad])
+  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad,
+    isChart, selectedOutput?.uri])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
@@ -233,6 +239,30 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     </>
   )
 
+  const artifactPresentation: ArtifactPresentation | undefined = isChart
+    ? {
+        kind: 'chart',
+        type: String(node?.data.config.chartType ?? 'bar'),
+        xLabel: String(node?.data.config.x || 'All rows'),
+        grouped: node?.data.config.agg !== 'none',
+        yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
+          ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
+          : (node?.data.config.y ?? 'y')),
+      }
+    : isMetric ? { kind: 'metric' } : undefined
+
+  // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
+  // toggle or let an old preview error cover the last successful full result.
+  if (!editorPreview && isChart && selectedOutput?.uri) {
+    return withOutputPorts(<FullResult uri={selectedOutput.uri}
+      total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
+      runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+      publicationKind={selectedOutput.publicationKind}
+      name={String(node?.data.title || node?.id || 'result')}
+      presentation={artifactPresentation} fillAvailableHeight={fillAvailableHeight}
+      onRunUnavailable={() => requestRun(nodeId)} currentResult />)
+  }
+
   if (!preview || preview.portId !== requestPortId) {
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
@@ -272,19 +302,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
-  const isMetric = node?.type === 'metric'
-  const isChart = node?.type === 'chart'
-  const artifactPresentation: ArtifactPresentation | undefined = isChart
-    ? {
-        kind: 'chart',
-        type: String(node?.data.config.chartType ?? 'bar'),
-        xLabel: String(node?.data.config.x ?? 'x'),
-        grouped: node?.data.config.agg !== 'none',
-        yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
-          ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
-          : (node?.data.config.y ?? 'y')),
-      }
-    : isMetric ? { kind: 'metric' } : undefined
   const resultModeToggle = selectedOutput?.uri
     ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
         fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />

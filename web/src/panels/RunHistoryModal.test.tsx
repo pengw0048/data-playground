@@ -1410,14 +1410,17 @@ describe('durable full results', () => {
     })
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'chart', position: { x: 0, y: 0 },
-      data: { title: 'Tasks', status: 'latest', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
+      data: { title: 'Tasks', status: 'failed', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
     }] }
     useStore.setState({
       doc, canvasRole: 'owner', profileJobs: {},
-      previews: { target: boundPreview(doc, 'target', {
-        columns: [], rows: [], truncated: false, notPreviewable: true,
-        reason: 'grouped charts require a full pass',
-      }) },
+      previews: { target: {
+        ...boundPreview(doc, 'target', {
+          columns: [], rows: [], truncated: false, notPreviewable: true,
+          reason: 'grouped charts require a full pass',
+        }),
+        error: "at 'target': NotPreviewable: an old preview request failed",
+      } },
       runs: { target: { phase: 'done', status: {
         runId: 'chart-exact-run', status: 'done', targetNodeId: 'target',
         rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
@@ -1429,7 +1432,9 @@ describe('durable full results', () => {
 
     expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
     expect(screen.getByText('sum(count) vs task')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Preview sample' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/NotPreviewable/)).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('chart-exact-run', 'target', 'out', 2_000, 0)
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
   })

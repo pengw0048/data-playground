@@ -11793,7 +11793,7 @@ def test_catalog_missing_flag_and_unregister(tmp_path):
 
 def test_chart_node_produces_series():
     # F37 (charting): the chart node builds an (x, y) series — grouped agg(y) by x (bar/line), or
-    # raw x,y points (scatter). Grouped charts require a durable full run; raw points stay bounded-previewable.
+    # raw x,y points (scatter). Charts always use a durable full run so the visible shape is complete.
     ev = _uri("events")
 
     def chart_graph(cfg):
@@ -11810,16 +11810,20 @@ def test_chart_node_produces_series():
     _, grouped = _full_result(chart_graph({"chartType": "bar", "x": "event", "agg": "count"}), "ch", 50)
     assert {c["name"] for c in grouped["columns"]} == {"x", "y"}
     assert {r["x"] for r in grouped["rows"]} == {"view", "click", "purchase", "signup"}
-    scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
-    assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
     _, automatic = _full_result(chart_graph({"chartType": "bar", "agg": "count"}), "ch", 50)
     assert {r["x"] for r in automatic["rows"]} == {"view", "click", "purchase", "signup"}
     assert all(isinstance(r["y"], (int, float)) for r in automatic["rows"])
-    expression = chart({
+    scatter_cfg = {"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"}
+    assert chart(scatter_cfg).get("notPreviewable")
+    _, scatter = _full_result(chart_graph(scatter_cfg), "ch", 50)
+    assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
+    expression_cfg = {
         "chartType": "scatter", "agg": "none",
         "xMode": "expression", "x": "user_id + 1",
         "yMode": "expression", "y": "amount * 2",
-    })
+    }
+    assert chart(expression_cfg).get("notPreviewable")
+    _, expression = _full_result(chart_graph(expression_cfg), "ch", 50)
     assert expression["rows"][:2] == [{"x": 1, "y": 0.0}, {"x": 2, "y": 3.0}]
     assert chart({
         "chartType": "scatter", "agg": "none",
@@ -11832,6 +11836,26 @@ def test_chart_node_produces_series():
         chart_graph({"chartType": "bar", "x": "event", "y": "event", "agg": "max"}), "ch", 50,
     )
     assert not minmax_result.get("error")  # TRY_CAST → NULL y, not a raw ConversionException
+
+
+def test_chart_counts_all_rows_when_only_binary_and_identifier_fields_exist(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "provider-images.parquet"
+    pq.write_table(pa.table({
+        "image_res_2048": [b"first", b"second"],
+        "source_rowid": [10, 11],
+        "_rowid": [20, 21],
+    }), source)
+    graph = {"id": "chart-provider-images", "version": 1, "nodes": [
+        N("source", "source", {"uri": str(source)}),
+        N("chart", "chart", {"chartType": "bar", "agg": "count"}),
+    ], "edges": [E("source", "chart")]}
+
+    _, result = _full_result(graph, "chart", 50)
+
+    assert result["rows"] == [{"x": "All rows", "y": 2.0}]
 
 
 def test_grouped_chart_keeps_all_groups_while_interactive_view_is_capped(tmp_path, monkeypatch):

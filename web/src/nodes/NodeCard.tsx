@@ -82,7 +82,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
     && typeof data.config.version === 'string' && data.config.version.length > 0
   const accent = kindAccent[kind] ?? '#8a8f98'
   const st = statusTok[data.status] ?? statusTok.draft
-  const showRunStatus = data.status === 'queued' || data.status === 'running' || data.status === 'failed'
   const bypassed = !!data.bypassed
   const disabled = !!data.disabled
   const off = disabled || offDownstream  // dimmed either way; only self-disabled shows the badge
@@ -137,13 +136,13 @@ export function NodeCard({ id, data, children, metaOverride }: {
           <div className="min-w-0 flex-1 px-3 pb-3 pt-[11px]">
             {/* header */}
             <div className="flex items-center gap-[7px]">
-              {showRunStatus && <span
+              <span
                 className={cn('w-3 text-center text-xs leading-none', data.status === 'running' && 'dp-running-glyph')}
                 style={{ color: st.color }}
                 title={st.label}
               >
                 {st.glyph}
-              </span>}
+              </span>
               <EditableTitle id={id} title={data.title} selected={selected} canEdit={canEdit}
                 onRenameHover={setRenameHover} />
               <span className="flex-1" />
@@ -236,9 +235,17 @@ export function NodeCard({ id, data, children, metaOverride }: {
       {showShelf && (
         <div className="nodrag absolute left-0 top-[calc(100%+5px)] z-[4] inline-flex items-center gap-px rounded-lg border border-border bg-card px-1 py-[3px] shadow-sm">
           <ActionIcon
-            name="eye" label={openPanel === 'data' ? 'Hide data' : !kernelUp ? 'Hub offline — preview unavailable' : invalid ?? (runnable ? 'View data' : 'Connect a source to preview')}
+            name="eye" label={openPanel === 'data'
+              ? 'Hide data'
+              : !kernelUp
+                ? `Hub offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
+                : invalid ?? (runnable
+                    ? kind === 'chart' ? 'View chart result' : 'View data'
+                    : `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`)}
             active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
-            onClick={() => (openPanel === 'data' ? closePanel(id) : runPreview(id))}
+            onClick={() => (openPanel === 'data'
+              ? closePanel(id)
+              : kind === 'chart' ? togglePanel(id, 'data') : runPreview(id))}
           />
           {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick action
               here. Preview shares the same action shelf as every other node; run/materialize stays
@@ -405,7 +412,7 @@ function MoreMenu({ id, kind, canEdit, disabled, bypassed }: { id: string; kind:
         {canEdit && item('duplicate', 'Duplicate', () => duplicate(id))}
         {canEdit && canBypass && item('power', bypassed ? 'Un-bypass' : 'Bypass (pass data through)', () => bypass(id))}
         {canEdit && item('mute', disabled ? 'Enable' : 'Disable (+ downstream)', () => disable(id))}
-        {item('export', 'Export preview sample (JSON + CSV)', () => exportNode(id))}
+        {kind !== 'chart' && item('export', 'Export preview sample (JSON + CSV)', () => exportNode(id))}
         {item('lineage', 'Lineage', () => openPanel(id, 'lineage'))}
         {canEdit && <DropdownMenuSeparator />}
         {canEdit && item('trash', 'Delete', () => removeNode(id), true)}
@@ -439,7 +446,10 @@ function NodeContextActions({ id, kind, canEdit, disabled, bypassed, kernelUp, r
       if (node) useStore.getState().startRename(id, node.data.title)
     }}>
     {canEdit && item('rename', 'Rename', requestRename)}
-    {item('eye', 'Preview data', () => { void useStore.getState().runPreview(id) }, {
+    {item('eye', kind === 'chart' ? 'View chart result' : 'Preview data', () => {
+      if (kind === 'chart') useStore.getState().openPanel(id, 'data')
+      else void useStore.getState().runPreview(id)
+    }, {
       disabled: !kernelUp || !runnable || !!invalid,
     })}
     {item('play', 'Run details', () => useStore.getState().openPanel(id, 'run'))}

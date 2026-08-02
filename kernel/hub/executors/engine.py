@@ -1591,25 +1591,32 @@ class BuildEngine:
                 x = _default_chart_dimension(base)
             if agg != "count" and y_mode == "column" and not y:
                 y = _default_chart_measure(base, exclude=x)
-            if not x:
+            # A chart is a complete-result view, not a sample of a visualization. Sampling can change
+            # category counts, line shape, and extrema, so every chart uses the durable run lifecycle.
+            if not self.full:
+                raise NotPreviewable(
+                    node,
+                    "Charts use all input rows. Run this step to calculate the chart.",
+                    suggested_action="run",
+                )
+            ungrouped_count = agg == "count" and x_mode == "column" and not x
+            if not x and not ungrouped_count:
                 raise NotPreviewable(node, "Connect data with a chartable column, or enter an X SQL expression.")
             if agg == "none" and not y:
                 raise NotPreviewable(node, "Choose a numeric Y column, or enter a Y SQL expression.")
             if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
                 raise NotPreviewable(node, f"Choose a numeric Y value to {agg}.")
-            if agg != "none" and not self.full:
-                raise NotPreviewable(
-                    node,
-                    "This grouped chart needs all input rows. Run this step to compute its series.",
-                    suggested_action="run",
-                )
             try:
-                xq = _chart_axis_expression(base, x, x_mode, label="X")
+                xq = _chart_axis_expression(base, x, x_mode, label="X") if x else None
                 yq = _chart_axis_expression(base, y, y_mode, label="Y") if y else None
             except (SQLPolicyError, duckdb.Error, ValueError) as exc:
                 axis = "SQL expression" if "expression" in (x_mode, y_mode) else "field selection"
                 raise NotPreviewable(node, f"Fix the chart {axis} before running it.") from exc
             v = self._view(base, "ch")
+            if ungrouped_count:
+                return db.conn().sql(
+                    f"SELECT 'All rows' AS x, count(*)::DOUBLE AS y FROM {quote_identifier(v)}"
+                )
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
                 return db.conn().sql(
                     f"SELECT {xq} AS x, {yq} AS y FROM {quote_identifier(v)}"
@@ -2066,7 +2073,7 @@ def _default_chart_dimension(relation: Relation) -> str:
                  if _CHART_CATEGORICAL.search(field_type) and not _CHART_ID_LIKE.search(name)), None) \
         or next((name for name, field_type in fields if _CHART_TEMPORAL.search(field_type)), None) \
         or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
-        or (fields[0][0] if fields else "")
+        or ""
 
 
 def _default_chart_measure(relation: Relation, *, exclude: str = "") -> str:
@@ -2075,7 +2082,7 @@ def _default_chart_measure(relation: Relation, *, exclude: str = "") -> str:
     return next((name for name, _field_type in fields
                  if _CHART_MEASURE_LIKE.search(name) and not _CHART_ID_LIKE.search(name)), None) \
         or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
-        or (fields[0][0] if fields else "")
+        or ""
 
 
 def _chart_axis_expression(relation: Relation, value: str, mode: str, *, label: str) -> str:
@@ -2083,6 +2090,9 @@ def _chart_axis_expression(relation: Relation, value: str, mode: str, *, label: 
         raise ValueError(f"unsupported chart {label} mode")
     if mode == "column":
         column = identifier(value, relation.columns, label=f"chart {label} column")
+        field_type = str(relation.types[relation.columns.index(column)])
+        if _CHART_NESTED_OR_BINARY.search(field_type):
+            raise SQLPolicyError(f"chart {label} column must contain scalar values")
         return quote_identifier(column)
     if not value:
         raise SQLPolicyError(f"chart {label} expression is empty")

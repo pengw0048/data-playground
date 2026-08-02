@@ -41,4 +41,18 @@ describe('Chart schema recommendations', () => {
       { name: 'score', type: 'double', capabilities: [] },
     ])?.name).toBe('score')
   })
+
+  it('does not recommend image bytes or row identifiers as a chart dimension', () => {
+    const providerImageSchema: ColumnSchema[] = [
+      { name: 'image_res_2048', type: 'bytes', physicalType: 'BLOB', capabilities: [] },
+      { name: 'source_rowid', type: 'int', physicalType: 'BIGINT', capabilities: [] },
+      { name: '_rowid', type: 'int', physicalType: 'UBIGINT', capabilities: [] },
+    ]
+
+    expect(chartableColumns(providerImageSchema).map((column) => column.name)).toEqual([
+      'source_rowid', '_rowid',
+    ])
+    expect(suggestedChartDimension(providerImageSchema)).toBeUndefined()
+    expect(suggestedChartMeasure(providerImageSchema)).toBeUndefined()
+  })
 })

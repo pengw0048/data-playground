@@ -217,9 +217,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const cfg = node.data.config as Record<string, unknown>
   const bspec = getBackendSpec(kind)
   const st = statusTok[node.data.status] ?? statusTok.draft
-  const showRunStatus = node.data.status === 'queued'
-    || node.data.status === 'running'
-    || node.data.status === 'failed'
+  const showRunStatus = kind !== 'note'
   const libraryTransform = kind === 'transform' && cfg.source === 'library'
   const codeParams = (bspec?.params ?? []).filter((p) => (
     p.type === 'code' && !libraryTransform
@@ -468,7 +466,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {!unboundSource && kind !== 'note' && <>
-            <Action icon="eye" label={!kernelUp ? 'Hub offline — preview unavailable' : 'View data'} disabled={!kernelUp || !runnable || !!invalid} onClick={() => runPreview(nodeId)} />
+            <Action icon="eye"
+              label={!kernelUp
+                ? `Hub offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
+                : kind === 'chart' ? 'View chart result' : 'View data'}
+              disabled={!kernelUp || !runnable || !!invalid}
+              onClick={() => (kind === 'chart' ? togglePanel(nodeId, 'data') : runPreview(nodeId))} />
           <Action icon={runState === 'running' ? 'stop' : 'play'} label={!kernelUp ? 'Hub offline — run unavailable' : kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}

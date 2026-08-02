@@ -12,28 +12,31 @@ type ChartType = 'bar' | 'line' | 'scatter' | 'area'
 type Agg = 'none' | 'count' | 'sum' | 'mean' | 'min' | 'max'
 type AxisMode = 'column' | 'expression'
 
-const NESTED_OR_BINARY = /(?:list|array|struct|map|union|blob|binary)/i
+const NESTED_OR_BINARY = /(?:list|array|struct|map|union|blob|bytes?|binary|varbinary|bytea|bit)/i
 const NUMERIC = /(?:^|\W)(?:u?int(?:8|16|32|64|128)?|tinyint|smallint|integer|bigint|hugeint|float(?:16|32|64)?|double|real|decimal|numeric)(?:\W|$)/i
 const TEMPORAL = /(?:date|time|timestamp|duration|interval)/i
 const CATEGORICAL = /(?:string|varchar|char|text|enum|bool)/i
 const ID_LIKE = /(?:^id$|_id$|^uuid$|row_?id|index$)/i
 const MEASURE_LIKE = /(?:amount|value|score|total|price|revenue|cost|duration|latency|size|width|height|rate|count)/i
 
+function chartColumnType(column: ColumnSchema): string {
+  return `${column.type} ${column.physicalType ?? ''}`
+}
+
 export function chartableColumns(columns: ColumnSchema[]): ColumnSchema[] {
-  return columns.filter((column) => !NESTED_OR_BINARY.test(column.type))
+  return columns.filter((column) => !NESTED_OR_BINARY.test(chartColumnType(column)))
 }
 
 export function numericChartColumns(columns: ColumnSchema[]): ColumnSchema[] {
-  return chartableColumns(columns).filter((column) => NUMERIC.test(column.type))
+  return chartableColumns(columns).filter((column) => NUMERIC.test(chartColumnType(column)))
 }
 
 /** A useful zero-config dimension: a category first, then time, then any scalar field. */
 export function suggestedChartDimension(columns: ColumnSchema[]): ColumnSchema | undefined {
   const scalar = chartableColumns(columns)
-  return scalar.find((column) => CATEGORICAL.test(column.type) && !ID_LIKE.test(column.name))
-    ?? scalar.find((column) => TEMPORAL.test(column.type))
+  return scalar.find((column) => CATEGORICAL.test(chartColumnType(column)) && !ID_LIKE.test(column.name))
+    ?? scalar.find((column) => TEMPORAL.test(chartColumnType(column)) && !ID_LIKE.test(column.name))
     ?? scalar.find((column) => !ID_LIKE.test(column.name))
-    ?? scalar[0]
 }
 
 /** Prefer a business measure over an identifier when a Y value is required. */
@@ -41,10 +44,10 @@ export function suggestedChartMeasure(columns: ColumnSchema[], x?: string): Colu
   const numeric = numericChartColumns(columns).filter((column) => column.name !== x)
   return numeric.find((column) => MEASURE_LIKE.test(column.name) && !ID_LIKE.test(column.name))
     ?? numeric.find((column) => !ID_LIKE.test(column.name))
-    ?? numeric[0]
 }
 
-function typeLabel(type: string): string {
+function typeLabel(column: ColumnSchema): string {
+  const type = chartColumnType(column)
   if (NUMERIC.test(type)) return 'Number'
   if (TEMPORAL.test(type)) return 'Date/time'
   if (/(?:bool)/i.test(type)) return 'Boolean'
@@ -52,7 +55,7 @@ function typeLabel(type: string): string {
 }
 
 function AxisEditor({
-  axis, value, mode, columns, placeholder, fallback, onChange,
+  axis, value, mode, columns, placeholder, fallback, allowEmpty = false, onChange,
 }: {
   axis: 'X' | 'Y'
   value: string
@@ -60,6 +63,7 @@ function AxisEditor({
   columns: ColumnSchema[]
   placeholder: string
   fallback?: string
+  allowEmpty?: boolean
   onChange: (value: string, mode: AxisMode) => void
 }) {
   const known = columns.some((column) => column.name === value)
@@ -95,10 +99,11 @@ function AxisEditor({
           onClick={(event) => event.stopPropagation()}
           onChange={(event) => onChange(event.target.value, 'column')}
           className={cn('nodrag min-w-0 flex-1', miniSelectClass)}>
-          {!value && <option value="">{columns.length ? 'Choose a column' : 'Connect input'}</option>}
+          {allowEmpty && <option value="">No grouping · one total</option>}
+          {!allowEmpty && !value && <option value="">{columns.length ? 'Choose a column' : 'Connect input'}</option>}
           {value && !known && <option value={value}>{value} · unavailable</option>}
           {columns.map((column) => (
-            <option key={column.name} value={column.name}>{column.name} · {typeLabel(column.type)}</option>
+            <option key={column.name} value={column.name}>{column.name} · {typeLabel(column)}</option>
           ))}
         </select>
         <button type="button" className="nodrag inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-input px-2 text-[10px] font-semibold text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -133,19 +138,28 @@ function Chart({ id, data }: NodeComponentProps) {
   const measures = numericChartColumns(inputColumns)
   const defaultX = suggestedChartDimension(inputColumns)
   const defaultY = suggestedChartMeasure(inputColumns, x)
+  const inputHasX = !!x && inputColumns.some((column) => column.name === x)
+  const inputHasY = !!y && inputColumns.some((column) => column.name === y)
+  const xIsChartable = !!x && columns.some((column) => column.name === x)
+  const yIsChartable = !!y && measures.some((column) => column.name === y)
 
   // A newly connected Chart should already be useful. Persist the recommendation so the visible
   // controls, saved Canvas, durable run, and reopened result all agree on the same fields.
   useEffect(() => {
     const patch: Record<string, unknown> = {}
-    if (xMode === 'column' && !x && defaultX) patch.x = defaultX.name
-    if (agg !== 'count' && yMode === 'column' && !y && defaultY) patch.y = defaultY.name
+    if (xMode === 'column' && inputHasX && !xIsChartable) patch.x = defaultX?.name ?? ''
+    else if (xMode === 'column' && !x && defaultX) patch.x = defaultX.name
+    if (agg !== 'count' && yMode === 'column' && inputHasY && !yIsChartable) patch.y = defaultY?.name ?? ''
+    else if (agg !== 'count' && yMode === 'column' && !y && defaultY) patch.y = defaultY.name
     if (Object.keys(patch).length) updateConfig(id, patch)
-  }, [agg, defaultX, defaultY, id, updateConfig, x, xMode, y, yMode])
+  }, [agg, defaultX, defaultY, id, inputHasX, inputHasY, updateConfig,
+    x, xIsChartable, xMode, y, yIsChartable, yMode])
 
   const axisName = (value: string, mode: AxisMode) => mode === 'expression' ? 'SQL' : (value || '…')
   const summary = agg === 'count'
-    ? `Count rows by ${axisName(x || defaultX?.name || '', xMode)}`
+    ? (x || defaultX?.name
+        ? `Count rows by ${axisName(x || defaultX?.name || '', xMode)}`
+        : 'Count all rows')
     : agg === 'none'
       ? `${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`
       : `${AGG_LABELS[agg]} ${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`
@@ -171,6 +185,7 @@ function Chart({ id, data }: NodeComponentProps) {
       <div className="mt-2 flex flex-col gap-2">
         <AxisEditor axis="X" value={x || defaultX?.name || ''} mode={xMode} columns={columns}
           fallback={defaultX?.name}
+          allowEmpty={agg === 'count'}
           placeholder="date_trunc('day', created_at)"
           onChange={(value, mode) => updateConfig(id, { x: value, xMode: mode })} />
         {agg !== 'count' && (

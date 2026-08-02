@@ -1493,7 +1493,7 @@ describe('Inspector — Chart configuration', () => {
     expect(screen.queryByText('Properties')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('group by (X)')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('value (Y)')).not.toBeInTheDocument()
-    expect(screen.getByText('Create a chart from selected columns')).toBeInTheDocument()
+    expect(screen.getByText(/Create a chart from selected columns/)).toBeInTheDocument()
   })
 })
 

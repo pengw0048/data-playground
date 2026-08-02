@@ -26,6 +26,10 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await expect(chart.getByLabel('Summary')).toHaveValue('count')
     await expect(chart.getByRole('textbox')).toHaveCount(0)
 
+    await xColumn.selectOption('user_id')
+    await expect(xColumn).toHaveValue('user_id')
+    await xColumn.selectOption('event')
+
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
       const graph = await response.json() as { nodes: Array<{ id: string; data: { config: Record<string, unknown> } }> }
@@ -37,8 +41,11 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
     await expect(chart).toContainText('4 rows', { timeout: 15_000 })
     await page.getByRole('button', { name: 'Close' }).click()
-    await chart.getByRole('button', { name: 'View data' }).click()
+    await chart.getByRole('button', { name: 'View chart result' }).click()
     await expect(page.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Preview sample' })).toHaveCount(0)
+    await expect(page.getByTestId('panel-data').getByTitle('Refresh')).toHaveCount(0)
+    await expect(chart.locator('[title="latest"]')).toBeVisible()
     await page.getByRole('button', { name: 'Close' }).click()
 
     await chart.getByLabel('Summary').selectOption('sum')

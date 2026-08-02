@@ -54,6 +54,19 @@ describe('NodeCard result summary', () => {
     expect(screen.queryByText(/\b250 rows\b/)).not.toBeInTheDocument()
   })
 
+  it('keeps the result freshness icon visible on every resting node', () => {
+    const latest = useStore.getState().doc.nodes[0].data
+    const { rerender } = render(
+      <ReactFlowProvider><NodeCard id="target" data={latest} /></ReactFlowProvider>,
+    )
+
+    expect(screen.getByTitle('latest')).toHaveTextContent('✓')
+
+    const stale: NodeData = { ...latest, status: 'stale' }
+    rerender(<ReactFlowProvider><NodeCard id="target" data={stale} /></ReactFlowProvider>)
+    expect(screen.getByTitle('stale')).toBeVisible()
+  })
+
   it('hides output-run history on Source nodes', () => {
     const data = useStore.getState().doc.nodes[0].data
     useStore.setState({ selectedIds: ['target'] })

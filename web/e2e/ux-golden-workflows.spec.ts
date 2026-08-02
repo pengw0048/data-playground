@@ -426,7 +426,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
 
     await page.goto(`/#/canvas/${doc.id}`)
     await page.getByTestId('rf__node-chart').click()
-    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View chart result' }).click()
     const result = page.getByTestId('panel-data')
     await expect(result.getByTestId('full-result-status')).toHaveText('Complete · 2,001 rows')
     await expect(result.getByText('count(*) vs event · Showing 2,000 groups · display capped')).toBeVisible()

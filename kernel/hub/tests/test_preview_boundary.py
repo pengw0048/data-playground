@@ -108,7 +108,6 @@ def test_preview_full_pass_operators_never_issue_an_unbounded_source_scan(
         ("filter", {"predicate": "id >= 0"}),
         ("select", {"expr": "id, value"}),
         ("fill", {"columns": "value", "method": "zero"}),
-        ("chart", {"x": "id", "y": "value", "agg": "none"}),
     ],
 )
 def test_bounded_preview_paths_push_the_budget_into_the_adapter(
