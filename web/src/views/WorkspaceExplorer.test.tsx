@@ -2105,9 +2105,8 @@ describe('WorkspaceExplorer', () => {
       .mockResolvedValueOnce(CANONICAL_DATASET_CONTEXT)
     render(<WorkspaceExplorer />)
 
-    expect(await screen.findByText(/Couldn't load provider details/)).toHaveTextContent(
-      'canonical detail timed out',
-    )
+    const failure = await screen.findByText("Couldn't load dataset details.")
+    expect(failure).not.toHaveTextContent('canonical detail timed out')
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     await screen.findByTestId('canonical-provider-dataset-context')

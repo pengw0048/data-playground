@@ -3942,6 +3942,7 @@ def test_workspace_provider_deadlines_keep_browse_fast_and_explicit_actions_boun
         mount_id="deadline-fixture", resource_id="dataset-a")
 
     expected = workspace_providers._INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS
+    assert expected == 20.0
     assert observed["search"] == [expected]
     assert observed["resolve"] and all(timeout == expected for timeout in observed["resolve"])
     assert observed["ancestors"] and all(timeout == expected for timeout in observed["ancestors"])

@@ -2229,7 +2229,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   const providerIssue = previewError
     ? `Couldn't load the selected version preview: ${previewError}`
     : !exactRevision && canonicalContextError
-      ? `Couldn't load provider details: ${canonicalContextError}`
+      ? "Couldn't load dataset details."
     : source && !sourceIsUsable(source)
       ? statusMessage(source) ?? 'This provider is not available right now.'
       : placementState !== 'current'

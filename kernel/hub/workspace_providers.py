@@ -48,11 +48,10 @@ _MAX_MOUNTS = 8
 _MAX_MISSING_PLACEMENT_PROBES = 8
 _MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
-# Passive Workspace browse must stay responsive even when a remote mount is slow. Keep cold remote
-# catalog reads within the same bounded deadline as explicit actions so first-time browsing does not
-# report a false timeout while the provider is still warming up.
+# Passive Workspace browse must stay responsive even when a remote mount is slow. Allow one cold
+# catalog startup while keeping explicit dataset actions on a separate, longer bounded deadline.
 _PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
-_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
+_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 20.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
 }
