@@ -378,6 +378,7 @@ describe('ERDiagram request truth', () => {
     const badge = screen.getByTestId('er-field-role:customers:id')
     expect(badge).toHaveTextContent('mapped')
     expect(badge).toHaveClass('w-12')
+    expect(screen.getByRole('button', { name: 'Open dataset customers' })).toBeInTheDocument()
   })
 
   it('does not invent a key role from a column capability', async () => {

@@ -1144,7 +1144,7 @@ describe('Catalog discovery folder child request identity', () => {
     expect(await screen.findByText('📁 initial')).toBeInTheDocument()
     submitFolderCreate('created')
     await waitFor(() => expect(branchCalls).toBe(2))
-    expect(screen.getByText('Refreshing…')).toBeInTheDocument()
+    expect(await screen.findByText('Refreshing…')).toBeInTheDocument()
     submitFolderCreate('created')
     await waitFor(() => expect(branchCalls).toBe(3))
     expect(revisionSignals[0].aborted).toBe(true)

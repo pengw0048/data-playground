@@ -51,6 +51,9 @@ export function EntityNode({ data }: { data: EntityData }) {
       <Handle id="node-target" type="target" position={Position.Left}
         className={cn('!h-2 !w-2 !border-0', lineage ? '!bg-muted-foreground' : '!bg-primary')} />
       <button onClick={activate} disabled={opening}
+        aria-label={lineage
+          ? `${focused ? 'Back to' : 'Open'} dataset ${table.name}`
+          : `Focus graph on ${table.name}`}
         title={lineage ? undefined : 'Focus the graph on this table'}
         className={cn(
           'nodrag flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left hover:bg-accent disabled:cursor-wait',

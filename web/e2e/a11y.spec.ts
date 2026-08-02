@@ -149,7 +149,10 @@ test.describe('accessibility gate @ux-smoke', () => {
     await page.getByRole('navigation', { name: 'Workspace path' })
       .getByRole('button', { name: 'Workspace', exact: true }).focus()
     const openCard = await workspaceResource(page, 'canvas', canvasName)
-    expect(await tabUntil(page, openCard)).toBe(true)
+    // A full accumulated Workspace page can contain a checkbox, Open control, and actions menu
+    // for each of 50 items before this Canvas. Keep the keyboard proof bounded to one page, not
+    // to the smaller catalog that happens to exist in an isolated run.
+    expect(await tabUntil(page, openCard, 200)).toBe(true)
     await expect(openCard).toBeFocused()
     const focusVisible = await openCard.evaluate((el) => el.matches(':focus-visible'))
     expect(focusVisible, 'focused file Open control should match :focus-visible').toBe(true)
@@ -188,7 +191,7 @@ test.describe('accessibility gate @ux-smoke', () => {
     await page.getByRole('navigation', { name: 'Workspace path' })
       .getByRole('button', { name: 'Workspace', exact: true }).focus()
     const openCard = await workspaceResource(page, 'canvas', canvasName)
-    expect(await tabUntil(page, openCard)).toBe(true)
+    expect(await tabUntil(page, openCard, 200)).toBe(true)
     await page.keyboard.press('Space')
     await expect(page.getByTestId('toolbar')).toBeVisible({ timeout: 10_000 })
   })

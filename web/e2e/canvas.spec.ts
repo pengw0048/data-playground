@@ -2044,7 +2044,7 @@ test.describe('Data Playground canvas', () => {
 
     // Lineage is navigation, not a static poster: opening a neighbouring card lands on that
     // dataset's normal detail page, and browser Back restores the graph and its route context.
-    await entities.filter({ hasText: 'Open dataset' }).first().getByTitle('Open dataset details').click()
+    await page.getByRole('button', { name: /^Open dataset / }).first().click()
     await expect(page.getByTestId('dataset-viewer')).toBeVisible()
     await page.goBack()
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
