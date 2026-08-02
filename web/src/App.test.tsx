@@ -67,8 +67,10 @@ describe('App auth bootstrap', () => {
 
     render(<App />)
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('could not confirm whether this server uses local or signed-in access')
+    expect(await screen.findByRole('alert')).toHaveTextContent('could not connect')
     expect(screen.getByText(/Local Canvas drafts remain in this browser/i)).toBeVisible()
+    expect(screen.getByText('Tried 3 times.')).toBeVisible()
+    expect(screen.queryByText(/Last attempt:/i)).not.toBeInTheDocument()
     expect(screen.queryByTestId('canvas')).not.toBeInTheDocument()
     expect(mocks.bootstrap).not.toHaveBeenCalled()
     expect(status).toHaveBeenCalledTimes(3)

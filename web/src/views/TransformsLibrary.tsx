@@ -16,11 +16,23 @@ import { processorModeLabel } from '../nodes/processorIdentity'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 25
+const TRANSFORM_MODES = [
+  ['', 'All behaviors'],
+  ['map', 'Per row'],
+  ['map_batches', 'In batches'],
+  ['filter', 'Filter rows'],
+  ['flat_map', 'Expand rows'],
+  ['callable', 'Whole dataset'],
+  ['aggregate', 'Aggregate rows'],
+] as const
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
 const retained = (entry: TransformLibraryEntry) => (
   entry.retention.canvas + entry.retention.canvasVersion + entry.retention.executionManifest
+)
+const provenanceLabel = (provenance: TransformLibraryEntry['provenance']) => (
+  provenance === 'promoted' ? 'Saved' : 'Installed'
 )
 
 function queryValue(query: string, key: string): string {
@@ -120,6 +132,7 @@ export function TransformsLibrary() {
       && nextCursor === null
       && !items.some((item) => item.id === selectedId),
   )
+  const emptyLibrary = !loading && !error && !hasFilters && !selectedId && items.length === 0
   const recoverFromUnavailableDetail = () => {
     const backHref = routeHash(
       'transforms', undefined, undefined, undefined, undefined, undefined, undefined, undefined,
@@ -134,7 +147,6 @@ export function TransformsLibrary() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-[220px] flex-1">
           <h1 className="text-xl font-bold text-foreground">Transforms</h1>
-          <p className="mt-1 text-[12px] text-muted-foreground">Versioned transforms for repeatable data work.</p>
         </div>
         {targetContext && <a
           data-testid="transform-return-canvas"
@@ -152,20 +164,24 @@ export function TransformsLibrary() {
       >
         <input aria-label="Search Transforms" value={filters.q} onChange={(event) => setFilter('q', event.target.value)} placeholder="Search title, description, category…" className="dp-input min-w-0" />
         <select aria-label="Transform source" value={filters.source} onChange={(event) => setFilter('source', event.target.value)} className="dp-input min-w-0">
-          <option value="all">All sources</option><option value="promoted">Promoted</option><option value="plugin">Plugin</option>
+          <option value="all">All sources</option><option value="promoted">Saved from Canvas</option><option value="plugin">Installed</option>
         </select>
-        <input aria-label="Transform mode" value={filters.mode} onChange={(event) => setFilter('mode', event.target.value)} placeholder="Mode" className="dp-input min-w-0" />
+        <select aria-label="Transform behavior" value={filters.mode} onChange={(event) => setFilter('mode', event.target.value)} className="dp-input min-w-0">
+          {filters.mode && !TRANSFORM_MODES.some(([value]) => value === filters.mode) && <option value={filters.mode}>{processorModeLabel(filters.mode)}</option>}
+          {TRANSFORM_MODES.map(([value, label]) => <option key={value || 'all'} value={value}>{label}</option>)}
+        </select>
         <input aria-label="Transform category" value={filters.category} onChange={(event) => setFilter('category', event.target.value)} placeholder="Category" className="dp-input min-w-0" />
       </div>
     </header>
 
-    <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 pt-5 lg:grid-cols-[minmax(360px,0.9fr)_minmax(460px,1.1fr)]">
+    <div className={`grid min-h-0 flex-1 grid-cols-1 gap-5 pt-5 ${emptyLibrary ? '' : 'lg:grid-cols-[minmax(360px,0.9fr)_minmax(460px,1.1fr)]'}`}>
       <section aria-label="Transform library" className="min-w-0">
         {loading && <div className="rounded-lg border border-border p-5 text-sm text-muted-foreground">Loading Transform library…</div>}
         {!loading && !items.length && !error && (selectedOutsideFilteredResults
           ? <FilteredSelectionNotice onClear={() => setRouteQuery('')} empty />
-          : <div className="rounded-lg border border-dashed border-border p-6 text-sm text-muted-foreground">
-              No matching Transforms. Promote a tested ad-hoc Transform from a Canvas, or adjust these filters.
+          : <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+              <strong className="block text-foreground">{hasFilters ? 'No transforms match these filters.' : 'No transforms yet.'}</strong>
+              {!hasFilters && <a href={routeHash('workspace')} className="mt-3 inline-flex rounded-md border border-border bg-background px-3 py-1.5 font-semibold text-foreground hover:bg-accent">Open Workspace</a>}
             </div>)}
         {!!items.length && selectedOutsideFilteredResults && <FilteredSelectionNotice onClear={() => setRouteQuery('')} />}
         <div className="grid gap-2">
@@ -175,7 +191,7 @@ export function TransformsLibrary() {
             className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-xl border p-3.5 text-left transition-colors hover:bg-accent ${selectedId === item.id ? 'border-primary bg-primary/5' : 'border-border bg-card'}`}>
             <span className="min-w-0">
               <span className="flex flex-wrap items-center gap-1.5"><strong className="truncate text-[13px] text-foreground">{item.title}</strong>
-                <span className="rounded bg-muted px-1.5 py-0.5 text-[9.5px] font-semibold uppercase text-muted-foreground">{item.provenance}</span>
+                <span className="rounded bg-muted px-1.5 py-0.5 text-[9.5px] font-semibold uppercase text-muted-foreground">{provenanceLabel(item.provenance)}</span>
                 {item.availability !== 'active' && <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-destructive">{item.availability}</span>}
               </span>
               <span className="mt-1 block line-clamp-2 text-[11px] leading-4 text-muted-foreground">{item.blurb || 'No description supplied.'}</span>
@@ -188,7 +204,7 @@ export function TransformsLibrary() {
         {nextCursor && <button onClick={() => void loadMore()} disabled={loadingMore} className="mt-3 w-full rounded-lg border border-border px-3 py-2 text-[12px] font-semibold hover:bg-accent disabled:opacity-50">{loadingMore ? 'Loading…' : 'Load more'}</button>}
       </section>
 
-      <section aria-label="Transform detail" className="min-w-0 rounded-xl border border-border bg-card p-5 lg:sticky lg:top-5 lg:self-start">
+      {!emptyLibrary && <section aria-label="Transform detail" className="min-w-0 rounded-xl border border-border bg-card p-5 lg:sticky lg:top-5 lg:self-start">
         {!selectedId && <div className="py-12 text-center text-sm text-muted-foreground">Select a Transform to inspect its versions and use it.</div>}
         {selectedId && !detail && !detailError && <div className="py-12 text-center text-sm text-muted-foreground">Loading versions…</div>}
         {detailError && <div role="alert" className="grid gap-3 text-sm text-destructive">
@@ -203,7 +219,7 @@ export function TransformsLibrary() {
             detail.id, version, targetContext,
           )} onUse={setUseEntry}
           onRefresh={() => setRefreshEpoch((value) => value + 1)} />}
-      </section>
+      </section>}
     </div>
     {useEntry && <TransformUseDialog entry={useEntry} onClose={() => setUseEntry(null)} />}
   </div>
@@ -415,7 +431,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
       >{configuring ? 'Configuring…' : `Use ${selected.version}`}</button>}
     </div>
     <div className="mt-3 flex flex-wrap gap-1.5 text-[10.5px] text-muted-foreground">
-      <span className="rounded bg-muted px-2 py-1">{selected.provenance}</span><span className="rounded bg-muted px-2 py-1">{selected.category}</span><span className="rounded bg-muted px-2 py-1">{processorModeLabel(selected.mode)}</span>
+      <span className="rounded bg-muted px-2 py-1">{provenanceLabel(selected.provenance)}</span><span className="rounded bg-muted px-2 py-1">{selected.category}</span><span className="rounded bg-muted px-2 py-1">{processorModeLabel(selected.mode)}</span>
       <span className={`rounded px-2 py-1 ${selected.availability === 'active' ? 'bg-emerald-500/10 text-emerald-700' : 'bg-destructive/10 text-destructive'}`}>{selected.availability}</span>
     </div>
     {upgradeCanvasId && upgradeNodeId && <section className="mt-4 rounded-lg border border-border bg-background p-3">
@@ -504,30 +520,27 @@ function ImplementationSource({
   provenance: TransformLibraryDetail['provenance']
 }) {
   return <section aria-label="Implementation source" className="mt-4">
-    <h3 className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
-      Implementation source
-    </h3>
-    {source ? <div className="mt-1.5 rounded-md border border-border bg-background p-2">
-      <pre className="max-h-80 overflow-auto text-[11px] leading-relaxed text-foreground">
-        <code>{source.source}</code>
-      </pre>
-      <details className="mt-2 border-t border-border pt-2 text-[10.5px] text-muted-foreground">
-        <summary className="cursor-pointer font-medium text-foreground">Developer details</summary>
-        <div className="mt-1">
-          <span className="mr-2 uppercase">{source.language}</span>
-          <span className="break-all font-mono">SHA-256 {source.sha256}</span>
-        </div>
-      </details>
-    </div> : loading ? <div role="status" className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
-      Loading implementation source…
-    </div> : error ? <div role="alert" className="mt-1.5 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">
-      <strong>Implementation source could not be loaded.</strong> {error}
-    </div> : <div className="mt-1.5 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
-      <strong className="text-foreground">Implementation source unavailable.</strong>{' '}
-      {provenance === 'plugin'
-        ? 'This plugin does not publish implementation source for this version.'
-        : 'This promoted version has no readable implementation source.'}
-    </div>}
+    <details className="rounded-md border border-border bg-background text-[11px]">
+      <summary className="cursor-pointer px-2 py-2 font-semibold text-foreground hover:bg-accent">
+        Implementation source
+      </summary>
+      <div className="border-t border-border p-2">
+        {source ? <>
+          <pre className="max-h-80 overflow-auto leading-relaxed text-foreground">
+            <code>{source.source}</code>
+          </pre>
+        </> : loading ? <div role="status" className="text-muted-foreground">
+          Loading implementation source…
+        </div> : error ? <div role="alert" className="rounded-md bg-destructive/10 p-2 text-destructive">
+          <strong>Implementation source could not be loaded.</strong> {error}
+        </div> : <div className="text-muted-foreground">
+          <strong className="text-foreground">Implementation source unavailable.</strong>{' '}
+          {provenance === 'plugin'
+            ? 'This plugin does not publish implementation source for this version.'
+            : 'This promoted version has no readable implementation source.'}
+        </div>}
+      </div>
+    </details>
   </section>
 }
 

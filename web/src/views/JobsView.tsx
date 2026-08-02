@@ -21,6 +21,7 @@ function queryFrom(params: URLSearchParams, cursor?: string): WorkspaceJobsQuery
   const status = params.get('status')
   return {
     limit: PAGE_SIZE, cursor,
+    scope: params.get('scope') === 'all' ? 'all' : undefined,
     status: STATUSES.includes(status as typeof STATUSES[number]) && status
       ? status as Exclude<typeof STATUSES[number], ''> : undefined,
     canvasId: params.get('canvas') || undefined,
@@ -91,6 +92,15 @@ function jobStep(item: WorkspaceJobDto): string | null {
   return null
 }
 
+function jobFailureMessage(error: string): string {
+  const message = error.trim()
+  if (/local run input revision is unavailable/i.test(message)) {
+    return 'An input dataset version used by this run is no longer available.'
+  }
+  return message.replace(/^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*/, '')
+    || 'This Job failed before a result was produced.'
+}
+
 function managedWriteRevisionReceipt(
   item: WorkspaceJobDto,
   committed: WorkspaceJobDto['outputs'],
@@ -109,6 +119,7 @@ export function JobsView() {
   const canvases = useStore((state) => state.files)
   const refreshFiles = useStore((state) => state.refreshFiles)
   const params = useMemo(() => new URLSearchParams(jobsQuery), [jobsQuery])
+  const scope = params.get('scope') === 'all' ? 'all' : 'mine'
   const filterKey = useMemo(() => {
     const copy = new URLSearchParams(params)
     clearSelectionParams(copy)
@@ -227,7 +238,7 @@ export function JobsView() {
     let live = true
     // A copied Job URL identifies one exact run. Ordinary list filters describe the surrounding
     // page and must not make that selected run look missing when it no longer matches them.
-    void api.workspaceJobs({ limit: 1, runId })
+    void api.workspaceJobs({ limit: 1, runId, ...(scope === 'all' ? { scope } : {}) })
       .then((page) => {
         if (!live) return
         const exact = page.items.find((item) => jobKey(item) === runId)
@@ -242,7 +253,7 @@ export function JobsView() {
         setSelectedRunLookupError(caught instanceof Error ? caught.message : String(caught))
       })
     return () => { live = false }
-  }, [filterKey, items, loading, params, selectedRunRetry])
+  }, [filterKey, items, loading, params, scope, selectedRunRetry])
   useEffect(() => {
     if (loadedMore || !hasActiveFirstPage) return
     const timer = window.setInterval(() => { if (!loading && !loadingMore) void load(undefined, 'refresh') }, 5000)
@@ -252,6 +263,13 @@ export function JobsView() {
   const update = (name: string, value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set(name, value); else next.delete(name)
+    clearSelectionParams(next)
+    setJobsQuery(next.toString())
+  }
+  const selectScope = (value: 'mine' | 'all') => {
+    const next = new URLSearchParams(params)
+    if (value === 'all') next.set('scope', value)
+    else next.delete('scope')
     clearSelectionParams(next)
     setJobsQuery(next.toString())
   }
@@ -353,9 +371,13 @@ export function JobsView() {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
-        <div><h1 className="text-[20px] font-bold text-foreground">Your Jobs</h1>
-          <p className="text-[11.5px] text-muted-foreground">{items.length || ordinaryFilters ? freshness ?? 'Runs and background tasks you started' : 'Progress and results from work you started'}</p></div>
+        <div><h1 className="text-[20px] font-bold text-foreground">Jobs</h1>
+          {freshness && <p className="text-[11.5px] text-muted-foreground">{freshness}</p>}</div>
         <span className="flex-1" />
+        <div className="inline-flex rounded-md border border-border bg-background p-0.5" role="group" aria-label="Whose jobs">
+          <Button size="sm" variant={scope === 'mine' ? 'secondary' : 'ghost'} onClick={() => selectScope('mine')} data-testid="jobs-scope-mine">My jobs</Button>
+          <Button size="sm" variant={scope === 'all' ? 'secondary' : 'ghost'} onClick={() => selectScope('all')} data-testid="jobs-scope-all">All users</Button>
+        </div>
         <Button variant="outline" size="sm" onClick={() => void load(undefined, 'refresh')} disabled={loading || loadingMore}>
           <Icon name="refresh" size={13} /> Refresh
         </Button>
@@ -368,15 +390,15 @@ export function JobsView() {
         ] as [QuickView, string][]).map(([view, label]) => <Button key={view} size="sm" variant={quickView === view ? 'default' : 'outline'} onClick={() => selectQuickView(view)}>{label}</Button>)}
       </section>
 
-      <section aria-label="Job filters" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2 border-b border-border bg-card/30 px-4 py-3 text-[11.5px] xl:px-7">
+      <section aria-label="Job filters" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-2 border-b border-border bg-card/30 px-4 py-3 text-[11.5px] xl:px-7">
         <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
-        <Filter label="Canvas step ID" name="node" value={params.get('node') ?? ''} onChange={update} placeholder="Any step" />
-        <Filter label="Run mode" name="backend" value={params.get('backend') ?? ''} onChange={update} placeholder="Any mode" />
+        <Filter label="Step" name="node" value={params.get('node') ?? ''} onChange={update} placeholder="Any step" />
+        <Filter label="Compute target" name="backend" value={params.get('backend') ?? ''} onChange={update} placeholder="Any target" />
         <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
           <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
         <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
           <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-        <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
+        <Filter label="Search" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
       </section>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
@@ -390,14 +412,14 @@ export function JobsView() {
           <Button variant="outline" size="sm" className="ml-2" onClick={clearSelection}>Back to Jobs</Button>
         </div>}
         {!loading && !error && selectedRunUnavailable && <div className="mb-3 rounded-lg border border-border bg-card p-5 text-center text-[12.5px] text-muted-foreground"><p>This Job is unavailable or you no longer have access.</p><Button variant="outline" size="sm" className="mt-3" onClick={clearSelection}>Back to Jobs</Button></div>}
-        {!loading && !error && items.length === 0 && !selectedRunUnavailable && !selectedRunLookupError && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
+        {!loading && !error && items.length === 0 && !selectedRunUnavailable && !selectedRunLookupError && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No jobs match these filters.' : 'No jobs yet.'}</div>}
         {items.length > 0 && <section aria-labelledby="jobs-list-heading">
           <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Runs and background tasks</h2>
           <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-card">
             <div className="grid grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
-              <span>State</span><span>Context</span><span>Outcome</span><span className="hidden md:block">Duration</span><span className="hidden xl:block">Backend</span><span className="hidden md:block">Recorded</span>
+              <span>State</span><span>Context</span><span>Outcome</span><span className="hidden md:block">Duration</span><span className="hidden xl:block">Compute</span><span className="hidden md:block">Recorded</span>
             </div>
-            {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
+            {items.map((item) => <JobRow key={item.id} item={item} showAuthor={scope === 'all'} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
           </div>
         </section>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
@@ -426,7 +448,7 @@ function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[];
   return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Canvas
     <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
       <option value="">All canvases</option>
-      {!listed && value && <option value={value}>Canvas ID from link: {value}</option>}
+      {!listed && value && <option value={value}>Canvas from link (not in this list)</option>}
       {canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvasLabel(canvas)}</option>)}
     </select></label>
 }
@@ -460,7 +482,7 @@ function JobSubject({ name }: { name: string }) {
   )
 }
 
-function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
+function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; showAuthor: boolean; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const publishedRevision = managedWriteRevisionReceipt(item, committed)
@@ -504,7 +526,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {!report && !dataset
           ? <JobSubject name={subject} />
           : <span className="block truncate font-semibold text-foreground">{subject}</span>}
-        <span className="block truncate text-muted-foreground">{context}</span>
+        <span className="block truncate text-muted-foreground">{context}{showAuthor ? ` · ${item.isMine === false ? item.createdByName || item.createdById || 'Another user' : 'You'}` : ''}</span>
       </span>
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
       <span className="hidden text-muted-foreground md:block">{duration}</span>
@@ -518,7 +540,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       </div>}
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
         {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
-        {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
+        {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{jobFailureMessage(item.error)}</div>}
       </div>}
       <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId ?? undefined)}>Open in Canvas</a>}

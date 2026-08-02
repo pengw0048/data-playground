@@ -69,7 +69,7 @@ describe('ManagedSidecarMergeControl', () => {
 
   it('starts with an explicit empty draft and persists only exact identities, never physical URIs', async () => {
     const view = render(<ManagedSidecarMergeControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Configure managed sidecar merge' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Set up column merge' }))
     expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.managedSidecarMerge).toEqual({ identityColumns: [], rules: [] })
     view.rerender(<ManagedSidecarMergeControl nodeId="write" />)
     fireEvent.change(screen.getByLabelText('Search destination bases'), { target: { value: 'wide' } })
@@ -83,7 +83,7 @@ describe('ManagedSidecarMergeControl', () => {
 
   it('offers explicit non-authoritative suggestions before preflight and fences a late response after an edit', async () => {
     const view = render(<ManagedSidecarMergeControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Configure managed sidecar merge' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Set up column merge' }))
     view.rerender(<ManagedSidecarMergeControl nodeId="write" />)
     fireEvent.change(screen.getByLabelText('Search destination bases'), { target: { value: 'wide' } })
     await screen.findByText('wide base'); fireEvent.click(screen.getByText('wide base'))
@@ -100,15 +100,15 @@ describe('ManagedSidecarMergeControl', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     fireEvent.change(screen.getByLabelText('Managed sidecar identity columns'), { target: { value: 'id, frame' } })
     resolve({ base: { kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r4' }, sidecar: { kind: 'exact', datasetId: 'sidecar-dataset', revisionId: 'sidecar-r1' }, expectedHead: { kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r4' }, identityColumns: ['id'], rules: [], baseSchema: [], sidecarSchema: [], outputSchema: [], coverage: { base: { rows: 1, uniqueIdentities: 1, nullRows: 0, duplicateGroups: 0, duplicateRows: 0 }, candidate: { rows: 1, uniqueIdentities: 1, nullRows: 0, duplicateGroups: 0, duplicateRows: 0 }, matchedIdentities: 1, missingIdentities: 0, extraIdentities: 0, status: 'complete' }, eligible: true })
-    await waitFor(() => expect(screen.queryByText('Ready to merge saved sidecar')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText('Ready to merge')).not.toBeInTheDocument())
   })
 
   it('refuses an ambiguous multi-input graph rather than selecting an arbitrary source', () => {
     install({ multiple: true })
     const view = render(<ManagedSidecarMergeControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Configure managed sidecar merge' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Set up column merge' }))
     view.rerender(<ManagedSidecarMergeControl nodeId="write" />)
-    expect(screen.getByText(/Connect one saved local Source version directly/)).toBeVisible()
+    expect(screen.getByText(/Connect a saved dataset directly/)).toBeVisible()
   })
 
   it('does not search the catalog until the managed-sidecar control is enabled', () => {
@@ -139,8 +139,8 @@ describe('ManagedSidecarMergeControl', () => {
     mocks.submit.mockRejectedValueOnce(new Error('connection lost')).mockResolvedValueOnce({ taskId: 'task-1', status: 'queued', canCancel: true, canRetry: false })
     const view = render(<ManagedSidecarMergeControl nodeId="write" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Check setup' }))
-    await screen.findByText('Ready to merge saved sidecar')
-    fireEvent.click(screen.getByRole('button', { name: 'Start managed merge' }))
+    await screen.findByText('Ready to merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Start merge' }))
     await screen.findByText('connection lost')
     const first = mocks.submit.mock.calls[0]![0]
     view.rerender(<ManagedSidecarMergeControl nodeId="write" />)
@@ -156,8 +156,8 @@ describe('ManagedSidecarMergeControl', () => {
     mocks.submit.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve }))
     const view = render(<ManagedSidecarMergeControl nodeId="write" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Check setup' }))
-    await screen.findByText('Ready to merge saved sidecar')
-    fireEvent.click(screen.getByRole('button', { name: 'Start managed merge' }))
+    await screen.findByText('Ready to merge')
+    fireEvent.click(screen.getByRole('button', { name: 'Start merge' }))
     const existing = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.managedSidecarMerge
     mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.managedSidecarMerge = { ...existing, submissionId: 'peer-submission', submissionState: undefined }
     view.rerender(<ManagedSidecarMergeControl nodeId="write" />)
@@ -219,7 +219,7 @@ describe('ManagedSidecarMergeControl', () => {
     const stored = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.managedSidecarMerge
     expect(stored.base).toEqual({ kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r6' })
     expect(stored.taskId).toBeUndefined()
-    expect(screen.getByRole('button', { name: 'Start managed merge' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Start merge' })).toBeDisabled()
   })
 
   it('returns both completed-task dataset links to the owning Write node', async () => {
@@ -235,11 +235,11 @@ describe('ManagedSidecarMergeControl', () => {
 
     render(<ManagedSidecarMergeControl nodeId="write" />)
 
-    expect(await screen.findByRole('link', { name: 'Open published child' })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: 'Open merged dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Abase-dataset?revision=base-r5&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
     )
-    expect(screen.getByRole('link', { name: 'Open saved base' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: 'Open original dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Abase-dataset?revision=base-r4&revisionDataset=base-dataset&returnCanvas=canvas-1&returnNode=write',
     )
@@ -268,7 +268,7 @@ describe('ManagedSidecarMergeControl', () => {
     install({ role: 'viewer', config: configured() })
     const viewer = render(<ManagedSidecarMergeControl nodeId="write" />)
     expect(screen.getByRole('button', { name: 'Check setup' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Start managed merge' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Start merge' })).toBeDisabled()
     viewer.unmount()
   })
 })

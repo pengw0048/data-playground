@@ -6,7 +6,7 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), relationships: vi.fn(), facets: vi.fn(), joinSuggestions: vi.fn(),
   declareKey: vi.fn(), deleteRelationship: vi.fn(), addRelationship: vi.fn(), lineage: vi.fn(),
-  tableByRegistration: vi.fn(), fitView: vi.fn(),
+  tableByRegistration: vi.fn(), workspaceLineageResource: vi.fn(), fitView: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
@@ -20,33 +20,42 @@ const store = vi.hoisted(() => ({
   setRelationshipsMode: vi.fn(),
   returnFromRelationships: vi.fn(),
   setView: vi.fn(),
+  setWorkspaceResource: vi.fn(),
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 vi.mock('../theme/mode', () => ({ resolvedTheme: () => 'light' }))
 
 // React Flow's canvas geometry is irrelevant here; expose connection and Fit View deterministically.
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: ({ nodes, edges, onConnect, onEdgeClick, children }: {
+  ReactFlow: ({ nodes, edges, onConnect, onEdgeClick, onMove, children }: {
     nodes: { id: string; data: {
-      table: CatalogTable; focused: boolean; onFocus: () => void
-    } }[]
-    edges: { id: string; data?: { rel?: unknown } }[]
+      table: CatalogTable; fields: Array<{ name: string; role: string }>
+      focused: boolean; lineage: boolean; onFocus: () => void; onOpen: () => void
+    }; position: { x: number; y: number } }[]
+    edges: { id: string; data?: { rel?: unknown }; sourceHandle?: string; targetHandle?: string; label?: string }[]
     onConnect: (connection: { source: string; target: string }) => void
     onEdgeClick: (event: unknown, edge: { id: string; data?: { rel?: unknown } }) => void
+    onMove?: (event: unknown, viewport: { zoom: number }) => void
     children?: ReactNode
   }) => <div data-testid="flow">
     {nodes.map((node) => <button key={node.id} data-testid={`node-${node.id}`}
-      data-focused={String(node.data.focused)} onClick={node.data.onFocus}>{node.data.table.name}</button>)}
+      data-focused={String(node.data.focused)} data-x={node.position.x} data-y={node.position.y}
+      data-fields={node.data.fields.map((field) => `${field.role}:${field.name}`).join(',')}
+      onClick={node.data.lineage ? node.data.onOpen : node.data.onFocus}>{node.data.table.name}</button>)}
+    <button onClick={() => onMove?.({}, { zoom: 1 })}>zoom graph</button>
     <button disabled={nodes.length < 2} onClick={() => onConnect({ source: nodes[0].id, target: nodes[1].id })}>connect tables</button>
     {edges.filter((edge) => edge.data?.rel).map((edge) => (
       <button key={edge.id} data-testid={`edge-${edge.id}`} onClick={(event) => onEdgeClick(event, edge)}>relationship edge</button>
     ))}
+    {edges.map((edge) => <span key={`shape-${edge.id}`} data-testid={`edge-shape-${edge.id}`}
+      data-source-handle={edge.sourceHandle} data-target-handle={edge.targetHandle}>{edge.label}</span>)}
     {children}
   </div>,
   Background: () => null,
   Controls: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props}>{children}</button>,
   useReactFlow: () => ({ fitView: mocks.fitView }),
+  useViewport: () => ({ x: 0, y: 0, zoom: 0.5 }),
   Handle: () => null,
   Position: { Left: 'left', Right: 'right' },
   MarkerType: { ArrowClosed: 'arrow-closed' },
@@ -57,7 +66,8 @@ import { ERDiagram } from './ERDiagram'
 
 const ORDERS: CatalogTable = {
   id: 'orders', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders',
-  columns: [{ name: 'customer_id', type: 'int', capabilities: ['key'] }],
+  columns: [{ name: 'customer_id', type: 'int', capabilities: [] }],
+  keys: [{ columns: ['customer_id'], confidence: 'inferred' }],
 }
 const CUSTOMERS: CatalogTable = {
   id: 'customers', registrationId: 'registration-customers', name: 'customers', uri: 'mem://customers',
@@ -81,6 +91,7 @@ describe('ERDiagram request truth', () => {
     mocks.deleteRelationship.mockResolvedValue([])
     mocks.addRelationship.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: ORDERS.uri, nodes: [], edges: [] })
+    mocks.workspaceLineageResource.mockResolvedValue({ id: 'dataset:resolved', kind: 'dataset', name: 'resolved', source: 'provider', detached: false })
     mocks.fitView.mockReset()
   })
   afterEach(() => cleanup())
@@ -188,8 +199,10 @@ describe('ERDiagram request truth', () => {
 
     expect(await within(screen.getByTestId('er-focus-bar')).findByText('orders-current')).toBeInTheDocument()
     expect(screen.getByTestId('node-orders')).toHaveAttribute('data-focused', 'true')
+    // The graph renders the canonical root returned by the service, while refreshes continue to
+    // query from the stable route focus so a physical generation is never fed back as a new root.
     await waitFor(() => expect(mocks.lineage).toHaveBeenLastCalledWith(
-      currentOrders.uri, 1, 60))
+      ORDERS.uri, 1, 60))
   })
 
   it('keeps a provider dataset visible when it is not registered in the local Catalog', async () => {
@@ -212,6 +225,129 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveAttribute('data-focused', 'true')
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
+  })
+
+  it('opens a clicked provider-lineage neighbour as a Workspace dataset', async () => {
+    const providerRoot = 'workspace-provider://opaque-root'
+    const providerChild = `workspace-provider-lineage://${'a'.repeat(64)}`
+    store.erFocusUri = providerRoot
+    store.erMode = 'lineage'
+    mocks.lineage.mockResolvedValue({
+      rootUri: providerRoot,
+      nodes: [
+        { id: 'root', name: 'raw_video_v2', uri: providerRoot, kind: 'table' },
+        { id: 'child', name: 'raw_video_v4', uri: providerChild, kind: 'table' },
+      ],
+      edges: [{ parent: providerRoot, child: providerChild, factCount: 1 }],
+    })
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
+    render(<ERDiagram />)
+
+    fireEvent.click(await screen.findByTestId(`node-lineage:${providerChild}`))
+
+    await waitFor(() => expect(mocks.workspaceLineageResource).toHaveBeenCalledWith({
+      rootUri: providerRoot,
+      nodeUri: providerChild,
+      name: 'raw_video_v4',
+    }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:resolved')
+  })
+
+  it('opens a clicked registered-lineage neighbour in its normal Dataset detail page', async () => {
+    store.erFocusUri = ORDERS.uri
+    store.erMode = 'lineage'
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [
+        { id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' },
+        { id: CUSTOMERS.id, name: CUSTOMERS.name, uri: CUSTOMERS.uri, kind: 'table' },
+      ],
+      edges: [{ parent: ORDERS.uri, child: CUSTOMERS.uri, factCount: 1 }],
+    })
+    render(<ERDiagram />)
+
+    fireEvent.click(await screen.findByTestId('node-customers'))
+
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:registration-customers')
+    expect(mocks.workspaceLineageResource).not.toHaveBeenCalled()
+  })
+
+  it('reveals relationship and lineage column endpoints at detail zoom', async () => {
+    mocks.relationships.mockResolvedValue([{
+      leftUri: ORDERS.uri, leftColumns: ['customer_id'],
+      rightUri: CUSTOMERS.uri, rightColumns: ['id'],
+      cardinality: 'N:1', confidence: 'declared',
+    }])
+    const { unmount } = render(<ERDiagram />)
+
+    const compactJoin = await screen.findByTestId('edge-shape-d0')
+    expect(compactJoin).toHaveTextContent('N:1')
+    expect(compactJoin).toHaveAttribute('data-source-handle', 'node-source')
+    fireEvent.click(screen.getByRole('button', { name: 'zoom graph' }))
+    await waitFor(() => expect(screen.getByTestId('edge-shape-d0')).toHaveAttribute(
+      'data-source-handle', 'column-out:customer_id',
+    ))
+    expect(screen.getByTestId('edge-shape-d0')).toHaveAttribute('data-target-handle', 'column-in:id')
+
+    unmount()
+    cleanup()
+    vi.clearAllMocks()
+    store.erFocusUri = ORDERS.uri
+    store.erMode = 'lineage'
+    mocks.tablesPage.mockResolvedValue(PAGE)
+    mocks.relationships.mockResolvedValue([])
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [
+        { id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' },
+        { id: CUSTOMERS.id, name: CUSTOMERS.name, uri: CUSTOMERS.uri, kind: 'table' },
+      ],
+      edges: [{
+        parent: ORDERS.uri,
+        child: CUSTOMERS.uri,
+        factCount: 1,
+        columns: ['id'],
+        pipelineNames: ['publish_customers'],
+      }],
+    })
+    render(<ERDiagram />)
+
+    expect(await screen.findByTestId('edge-shape-l0')).not.toHaveTextContent('publish_customers')
+    fireEvent.click(screen.getByRole('button', { name: 'zoom graph' }))
+    await waitFor(() => expect(screen.getByTestId('edge-shape-l0')).toHaveAttribute(
+      'data-target-handle', 'column-in:id',
+    ))
+    expect(screen.getByTestId('edge-shape-l0')).toHaveTextContent('publish_customers')
+  })
+
+  it('does not invent a key role from a column capability', async () => {
+    store.erFocusUri = CUSTOMERS.uri
+    store.erMode = 'lineage'
+    mocks.tablesPage.mockResolvedValue({ items: [CUSTOMERS], total: 1, hasMore: false })
+    mocks.lineage.mockResolvedValue({
+      rootUri: CUSTOMERS.uri,
+      nodes: [{ id: CUSTOMERS.id, name: CUSTOMERS.name, uri: CUSTOMERS.uri, kind: 'table' }],
+      edges: [],
+    })
+
+    render(<ERDiagram />)
+
+    expect(await screen.findByTestId('node-customers')).toHaveAttribute('data-fields', 'field:id')
+  })
+
+  it('does not present an inferred catalog key as a declared PK', async () => {
+    store.erFocusUri = ORDERS.uri
+    store.erMode = 'lineage'
+    mocks.tablesPage.mockResolvedValue({ items: [ORDERS], total: 1, hasMore: false })
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [{ id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' }],
+      edges: [],
+    })
+
+    render(<ERDiagram />)
+
+    expect(await screen.findByTestId('node-orders')).toHaveAttribute('data-fields', 'field:customer_id')
   })
 
   it('opens a high-fan-out lineage as a readable subset and expands it on demand', async () => {
@@ -237,11 +373,19 @@ describe('ERDiagram request truth', () => {
     render(<ERDiagram />)
 
     await screen.findByTestId('er-lineage-show-more')
-    expect(screen.getByTestId('er-connection-count')).toHaveTextContent('12 of 20 connections')
-    expect(screen.getAllByTestId(/^node-/)).toHaveLength(13)
+    expect(screen.getByTestId('er-connection-count')).toHaveTextContent('8 of 20 connections')
+    expect(screen.getAllByTestId(/^node-/)).toHaveLength(9)
+    const childNodes = screen.getAllByTestId(/^node-lineage:mem:\/\/child-/)
+    expect(new Set(childNodes.map((node) => node.getAttribute('data-x')))).toEqual(new Set(['340']))
+    const childRows = childNodes.map((node) => Number(node.getAttribute('data-y'))).sort((left, right) => left - right)
+    expect(childRows.slice(1).map((row, index) => row - childRows[index])).toEqual(
+      Array(childRows.length - 1).fill(220),
+    )
 
     fireEvent.click(screen.getByTestId('er-lineage-show-more'))
 
+    await waitFor(() => expect(screen.getByTestId('er-connection-count')).toHaveTextContent('16 of 20 connections'))
+    fireEvent.click(screen.getByTestId('er-lineage-show-more'))
     await waitFor(() => expect(screen.getByTestId('er-connection-count')).toHaveTextContent('20 connections'))
     expect(screen.getAllByTestId(/^node-/)).toHaveLength(21)
     expect(screen.getByTestId('er-lineage-show-fewer')).toBeVisible()
@@ -263,11 +407,14 @@ describe('ERDiagram request truth', () => {
     render(<ERDiagram />)
 
     expect(await screen.findByText('Current dataset')).toBeInTheDocument()
-    expect(screen.queryByTestId('er-mode-lineage')).not.toBeInTheDocument()
+    expect(screen.getByTestId('er-mode-lineage')).toBeVisible()
     expect(mocks.tableByRegistration).toHaveBeenCalledWith(ORDERS.registrationId)
     await waitFor(() => expect(mocks.lineage).toHaveBeenCalledWith(ORDERS.uri, 1, 60))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to dataset' }))
+    fireEvent.click(screen.getByTestId('node-orders'))
     expect(store.returnFromRelationships).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to dataset' }))
+    expect(store.returnFromRelationships).toHaveBeenCalledTimes(2)
   })
 })

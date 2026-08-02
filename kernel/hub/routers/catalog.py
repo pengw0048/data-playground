@@ -18,7 +18,7 @@ import re
 import tempfile
 import uuid
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -770,7 +770,7 @@ def _merge_lineage_graphs(
         ordered[root_uri] = LineageNode(
             id=root_uri, name=root_uri.rsplit("/", 1)[-1], uri=root_uri)
 
-    counts: dict[tuple[str, str], int] = {}
+    facts: dict[tuple[str, str], dict[str, object]] = {}
     dropped = False
     for graph in graphs:
         for edge in graph.edges:
@@ -778,13 +778,24 @@ def _merge_lineage_graphs(
                 dropped = True
                 continue
             pair = (edge.parent, edge.child)
-            counts[pair] = counts.get(pair, 0) + edge.fact_count
+            fact = facts.setdefault(pair, {
+                "count": 0, "columns": set(), "pipelines": set(),
+            })
+            fact["count"] = int(fact["count"]) + edge.fact_count
+            cast(set[str], fact["columns"]).update(edge.columns)
+            cast(set[str], fact["pipelines"]).update(edge.pipeline_names)
     return LineageResult(
         root_uri=root_uri,
         nodes=list(ordered.values()),
         edges=[
-            LineageEdge(parent=parent, child=child, fact_count=count)
-            for (parent, child), count in sorted(counts.items())
+            LineageEdge(
+                parent=parent,
+                child=child,
+                fact_count=int(fact["count"]),
+                columns=sorted(cast(set[str], fact["columns"]))[:64],
+                pipeline_names=sorted(cast(set[str], fact["pipelines"]))[:16],
+            )
+            for (parent, child), fact in sorted(facts.items())
         ],
         truncated=dropped or any(graph.truncated for graph in graphs),
     )

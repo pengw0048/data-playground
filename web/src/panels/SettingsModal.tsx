@@ -113,7 +113,7 @@ const pluginStateTone: Record<NonNullable<PluginInfo['state']>, string> = {
 }
 
 const pluginStateCopy: Record<NonNullable<PluginInfo['state']>, string> = {
-  active: 'Ready to use in this Data Playground instance.',
+  active: '',
   inactive: 'Installed, but not currently available.',
   degraded: 'Some features are unavailable.',
   conflict: 'Could not start because it conflicts with another extension.',
@@ -142,19 +142,19 @@ function capabilityLabel(capability: string): string {
 function pluginActionCopy(plugin: PluginInfo, state: NonNullable<PluginInfo['state']>): string {
   const configurable = (plugin.config?.length ?? 0) > 0
   if (state === 'active') {
-    if (configurable) return 'Action: change the setup below, Save, then restart the affected Data Playground process.'
+    if (configurable) return 'Configure below. Save, then restart the affected process.'
     const kinds = new Set((plugin.effective_capabilities ?? []).map((capability) => capability.split(':')[0]))
     const actions: string[] = []
-    if (kinds.has('catalog') || kinds.has('adapter')) actions.push('browse its data connections in Workspace')
-    if (kinds.has('node') || kinds.has('processor')) actions.push('add its steps from a Canvas')
-    if (kinds.has('pipeline-importer')) actions.push('import a supported pipeline from Transforms')
-    if (kinds.has('runner')) actions.push('choose it from the compute target in a Canvas top bar')
+    if (kinds.has('catalog') || kinds.has('adapter')) actions.push('Browse its data connections in Workspace')
+    if (kinds.has('node') || kinds.has('processor')) actions.push('Add its steps from a Canvas')
+    if (kinds.has('pipeline-importer')) actions.push('Import a supported pipeline from Transforms')
+    if (kinds.has('runner')) actions.push('Choose it from the compute target in a Canvas top bar')
     return actions.length > 0
-      ? `Next: ${actions.join('; ')}.`
-      : 'This extension works in the background; there is nothing to configure in Settings.'
+      ? `${actions.join('; ')}.`
+      : 'No settings.'
   }
   return configurable
-    ? 'Next: review the setup below, Save, then restart the affected Data Playground process.'
+    ? 'Review the setup below. Save, then restart the affected process.'
     : 'This cannot be repaired in Settings. Open Installation details, fix the server installation or configuration, then restart Data Playground.'
 }
 
@@ -536,7 +536,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
         ...current,
         [destination.id]: {
           kind: 'success',
-          message: `Preview loaded · ${count.toLocaleString()} item${count === 1 ? '' : 's'} found${preview ? ` · ${preview}${count > 3 ? '…' : ''}` : ''}. This checks listing only; a real write is verified when a run saves output.`,
+          message: count === 0
+            ? 'No files found.'
+            : `${count.toLocaleString()} item${count === 1 ? '' : 's'} · ${preview}${count > 3 ? '…' : ''}`,
         },
       }))
     } catch (error) {
@@ -866,7 +868,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
               </div>
             ) : (
               <div className="flex flex-col gap-[26px]">
-                {canGlobal && active === 'agent' && <Section id="agent" title="Agent (LLM)">
+                {canGlobal && active === 'agent' && <Section id="agent" title="Agent">
                   <Field label="Model"><Input value={val('agentModel')} placeholder="anthropic/claude-opus-4-8" onChange={(e) => set('agentModel', e.target.value)} /></Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">e.g. anthropic/claude-opus-4-8 · openai/gpt-5 · google/gemini-2.5-pro · ollama/llama3.3</div>
                   <Field label="API key credential">
@@ -878,7 +880,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                       </SelectContent>
                     </Select>
                   </Field>
-                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Pick an <span className="font-medium">agent</span> credential (managed in the Credentials pane). Its key is a reference (`env:VAR` / `file:/path`), never stored raw.</div>
+                  <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">Choose a credential from Credentials. Only an environment variable or file reference is stored.</div>
                   <Field label="Base URL"><Input value={val('agentBaseUrl')} placeholder="http://localhost:11434 (optional)" onChange={(e) => set('agentBaseUrl', e.target.value)} /></Field>
                   <Field label="Data policy">
                     <Select
@@ -887,14 +889,13 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     >
                       <SelectTrigger aria-label="Data policy"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="metadata-only">metadata-only (default for hosted models)</SelectItem>
-                        <SelectItem value="sample-values">sample-values (send up to 8 preview rows)</SelectItem>
+                        <SelectItem value="metadata-only">Metadata only</SelectItem>
+                        <SelectItem value="sample-values">Include preview values (up to 8 rows)</SelectItem>
                       </SelectContent>
                     </Select>
                   </Field>
                   <div className="-mt-1 mb-2 text-[10.5px] text-muted-foreground">
-                    Hosted providers default to metadata-only so catalog identity may leave but sample cell values do not.
-                    Opt into sample-values only when that third-party egress is acceptable.
+                    Metadata only sends column names and types. Include preview values only when this model endpoint may receive sample data.
                   </div>
                   <label className="mb-2 flex items-start gap-2 text-[11.5px] text-foreground">
                     <input
@@ -904,10 +905,10 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                       onChange={(e) => setG((prev) => ({ ...prev, agentDataPolicyEndpointIsLocal: e.target.checked }))}
                     />
                     <span>
-                      Treat Base URL as a local / self-hosted endpoint
+                        Treat this Base URL as local or self-hosted
                       <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
                         When set, sample values may reach that endpoint without the sample-values opt-in.
-                        Does nothing unless a Base URL is configured.
+                        Allows preview values to reach this endpoint without changing the data policy above.
                       </span>
                     </span>
                   </label>
@@ -925,11 +926,11 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Default for Canvases without a target</div>
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Default compute target</div>
                   <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
-                    This is only a fallback. Choose where the current Canvas runs from the compute control in its top bar.
+                    Change a specific Canvas from its top bar.
                   </p>
-                  <div role="group" aria-label="Execution mode" className="flex flex-col gap-1.5">
+                  <div role="group" aria-label="Compute target" className="flex flex-col gap-1.5">
                     <button
                       type="button"
                       aria-label="Use Automatic execution"
@@ -946,7 +947,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                           ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Recommended</Badge>
                           : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
                       </div>
-                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the deployment default and automatic resource placement.</div>
+                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the workspace default.</div>
                     </button>
                     {runners.map((runner) => (
                       <button
@@ -961,7 +962,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         )}
                       >
                         <div className="flex items-baseline gap-1.5 text-xs font-semibold text-foreground">
-                          <Icon name="db" size={12} /> {runnerLabel(runner)}
+                          <Icon name="server" size={12} /> {runnerLabel(runner)}
                           {String(u.backend ?? '') === runner
                             ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Selected</Badge>
                             : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
@@ -969,17 +970,12 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">{runnerGuidance(runner)}</div>
                       </button>
                     ))}
-                    {runners.length === 0 && <div className="text-[11.5px] text-muted-foreground">No execution modes are available.</div>}
+                    {runners.length === 0 && <div className="text-[11.5px] text-muted-foreground">No compute targets are available.</div>}
                   </div>
                 </Section>}
 
                 {canGlobal && active === 'destinations' && <Section id="destinations" title="Destinations">
-                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Named places to save outputs / open files: a local directory, or an object-store prefix (s3://, gs://).
-                  </p>
-                  <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
-                    Preview files confirms that the saved location can be listed with its configured credential. It does not create a test file or prove write access.
-                  </p>
+                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">Save locations for Canvas outputs.</p>
                   <div className="mb-2 flex flex-col gap-1">
                     {dests.map((d, i) => (
                       <div key={d.id} className="rounded-md border border-border px-2.5 py-2">
@@ -1001,8 +997,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         </div>}
                       </div>
                     ))}
-                    {dests.length === 0 && <div className="text-[11.5px] text-muted-foreground">Only the default "Workspace outputs".</div>}
+                    {dests.length === 0 && <div className="text-[11.5px] text-muted-foreground">No custom destinations.</div>}
                   </div>
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Add destination</div>
                   <div className="flex gap-1.5">
                     <Input value={dest.name} onChange={(e) => setDest({ ...dest, name: e.target.value })} placeholder="e.g. S3 exports" className="w-[120px] shrink-0" aria-label="Destination name" />
                     <Select value={dest.backend} onValueChange={(v) => setDest({ ...dest, backend: v, credId: v === 'local' ? NO_CRED : dest.credId })}>
@@ -1096,9 +1093,6 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                 </Section>}
 
                 {canGlobal && active === 'plugins' && <Section id="plugins" title="Plugins">
-                  <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    See what each extension adds and complete any setup it exposes. Extension settings apply after the relevant Data Playground process restarts.
-                  </p>
                   {pluginLoadError && <div role="alert" className="mb-2.5 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[11.5px] text-destructive">
                     Extensions could not be loaded: {pluginLoadError}{' '}
                     <button type="button" className="font-semibold underline disabled:opacity-50" disabled={pluginReloading} onClick={() => void retryPlugins()}>{pluginReloading ? 'Retrying…' : 'Retry'}</button>
@@ -1115,9 +1109,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                           <span className="font-semibold">{p.name}</span>
                           <Badge variant="outline" className={cn('rounded border-0 px-1.5 py-0 text-[10px] font-medium', pluginStateTone[state])}>{state}</Badge>
                         </div>
-                        <div className="mt-1.5 text-[10.5px] text-muted-foreground">
+                        {pluginStateCopy[state] && <div className="mt-1.5 text-[10.5px] text-muted-foreground">
                           {pluginStateCopy[state]}
-                        </div>
+                        </div>}
                         {capabilities.length > 0 && <div className="mt-2">
                           <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Available features</div>
                           <div className="flex flex-wrap gap-1">
@@ -1151,16 +1145,14 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {canGlobal && active === 'members' && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    People available from a Canvas&apos;s Share dialog.
+                    Canvas collaborators.
                     {authEnabled
                       ? ' Creating a member also creates their sign-in account.'
-                      : ' Sign-in is off, so these are collaboration identities rather than password accounts.'}
+                      : ' Sign-in is off, so adding a name does not grant access.'}
                   </p>
-                  <div className="mb-2 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
-                    {authEnabled
-                      ? 'Set the person’s first password here. They can change it after signing in. Account creation applies immediately and does not wait for Save.'
-                      : 'No password is created. Anyone who can reach this trusted server can act as a listed identity, so names here must not be treated as authentication. Adding an identity applies immediately.'}
-                  </div>
+                  {authEnabled && <div className="mb-2 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                    Set an initial password. The member can change it after signing in.
+                  </div>}
                   <div className="mb-2.5 flex flex-col gap-1">
                     {users.map((usr) => (
                       <div key={usr.id} className="flex items-center gap-2 text-xs text-foreground">
@@ -1177,7 +1169,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {authEnabled && <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
                         onKeyDown={(e) => { if (e.key === 'Enter') void addUser() }}
                         aria-label="Initial password" placeholder="Initial password (at least 6 characters)" className="min-w-0 flex-1" />}
-                    <Button onClick={() => void addUser()} disabled={!newUser.name.trim() || (authEnabled && newUser.password.length < 6) || memberAdding} className="shrink-0">{memberAdding ? 'Adding…' : authEnabled ? 'Create account' : 'Add identity'}</Button>
+                    <Button onClick={() => void addUser()} disabled={!newUser.name.trim() || (authEnabled && newUser.password.length < 6) || memberAdding} className="shrink-0">{memberAdding ? 'Adding…' : authEnabled ? 'Create account' : 'Add member'}</Button>
                   </div>
                   {authEnabled && newUser.password.length > 0 && newUser.password.length < 6 && <div role="alert" className="mt-1.5 text-[10.5px] text-destructive">Password must be at least 6 characters.</div>}
                   {memberNotice && <div role={memberNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', memberNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>

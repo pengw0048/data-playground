@@ -93,8 +93,8 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     expect(screen.getByText(/SQL changed after these output columns were saved/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for actual' }))
-    expect(screen.getByTestId('field-evidence-actual')).not.toHaveTextContent('Row-reference target')
+    fireEvent.click(screen.getByRole('button', { name: 'View details for actual' }))
+    expect(screen.getByTestId('field-evidence-actual')).not.toHaveTextContent('Linked dataset')
     expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
 
@@ -136,8 +136,8 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     render(<Inspector />)
     expect(screen.getByText(/code changed after these output columns were saved/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for copied' }))
-    expect(screen.getByTestId('field-evidence-copied')).not.toHaveTextContent('Row-reference target')
+    fireEvent.click(screen.getByRole('button', { name: 'View details for copied' }))
+    expect(screen.getByTestId('field-evidence-copied')).not.toHaveTextContent('Linked dataset')
     expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
 
@@ -183,8 +183,8 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
 
     render(<Inspector />)
     fireEvent.click(screen.getByTitle('Show columns'))
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for owner_id' }))
-    expect(screen.getByTestId('field-evidence-owner_id')).not.toHaveTextContent('Row-reference target')
+    fireEvent.click(screen.getByRole('button', { name: 'View details for owner_id' }))
+    expect(screen.getByTestId('field-evidence-owner_id')).not.toHaveTextContent('Linked dataset')
     expect(screen.queryByText(/forged-target/i)).not.toBeInTheDocument()
   })
 })
@@ -304,9 +304,8 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.queryByDisplayValue('legacy_override')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Add column/i })).not.toBeInTheDocument()
     expect(screen.queryByText('Properties')).not.toBeInTheDocument()
-    expect(screen.getByText(`${processorId}@v1`, { exact: false })).not.toBeVisible()
-    fireEvent.click(screen.getByText('Developer details'))
-    expect(screen.getByText(`${processorId}@v1`, { exact: false })).toBeVisible()
+    expect(screen.queryByText(`${processorId}@v1`, { exact: false })).not.toBeInTheDocument()
+    expect(screen.queryByText('Developer details')).not.toBeInTheDocument()
     expect(screen.queryByText('(empty)')).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ source: 'library', mode: 'map' })
   })
@@ -585,7 +584,7 @@ describe('Inspector — effective named outputs', () => {
     } } } as any)
     render(<Inspector />)
     expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Run finished, but the published dataset could not be confirmed.')
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Run finished, but the dataset could not be confirmed.')
   })
 
   it('keeps specialized merge and upsert controls out of an ordinary Write', () => {
@@ -1159,16 +1158,19 @@ describe('Inspector — Source connection details', () => {
       'href',
       '#/workspace/provider%3A%2F%2Fdatasets%2Forders?revision=revision%3Aan-intentionally-long-opaque-identity&revisionDataset=provider%3Adataset%3Aan-intentionally-long-opaque-identity&returnCanvas=source-connection&returnNode=source',
     )
-    expect(screen.getByText('binding:very-long-provider-source-binding')).not.toBeVisible()
+    expect(screen.queryByText('binding:very-long-provider-source-binding')).not.toBeInTheDocument()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByText('Connection details'))
+    fireEvent.click(screen.getByText('Data details'))
     const details = await screen.findByLabelText('Source connection details')
-    expect(details).toHaveTextContent('provider://datasets/orders')
-    expect(details).toHaveTextContent('binding:very-long-provider-source-binding')
-    expect(details).toHaveTextContent('revision:an-intentionally-long-opaque-identity')
-    expect(await screen.findByText('Field evidence · 1 column')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
+    expect(details).toHaveTextContent('Luma Data API')
+    expect(details).toHaveTextContent('orders')
+    expect(details).toHaveTextContent('Saved version')
+    expect(details).not.toHaveTextContent('provider://datasets/orders')
+    expect(details).not.toHaveTextContent('binding:very-long-provider-source-binding')
+    expect(details).not.toHaveTextContent('revision:an-intentionally-long-opaque-identity')
+    expect(await screen.findByText('Fields · 1 column')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'View details for customer_id' }))
     expect(await screen.findByTestId('field-evidence-customer_id')).not.toHaveTextContent('selected exact schema')
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(exact).toHaveBeenCalledWith('provider:dataset:an-intentionally-long-opaque-identity', 'revision:an-intentionally-long-opaque-identity')
@@ -1230,7 +1232,7 @@ describe('Inspector — draft Source entry', () => {
     expect(screen.getByRole('button', { name: 'Select dataset' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Upload a file…' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Register or browse an accessible path…' })).toBeInTheDocument()
-    expect(screen.getByText('Connection details')).not.toBeVisible()
+    expect(screen.getByText('Data details')).not.toBeVisible()
     expect(screen.queryByText('Related data')).not.toBeInTheDocument()
     expect(screen.queryByText('Ports')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'View data' })).not.toBeInTheDocument()
@@ -1251,7 +1253,7 @@ describe('Inspector — draft Source entry', () => {
     render(<Inspector />)
     const before = JSON.stringify(useStore.getState().doc.nodes[0].data.config)
     expect(screen.getByLabelText('Dataset URI')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Advanced source configuration'))
+    fireEvent.click(screen.getByText('Manual source settings'))
     expect(screen.getByLabelText('Dataset URI')).toBeVisible()
     expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
@@ -1266,7 +1268,7 @@ describe('Inspector — draft Source entry', () => {
   it('keeps focus while entering a manual URI, then restores the configured Source Inspector', async () => {
     selectSource({})
     render(<Inspector />)
-    fireEvent.click(screen.getByText('Advanced source configuration'))
+    fireEvent.click(screen.getByText('Manual source settings'))
     const uri = screen.getByLabelText('Dataset URI')
     uri.focus()
     fireEvent.change(uri, { target: { value: 'events.parquet' } })
@@ -1298,8 +1300,11 @@ describe('Inspector — draft Source entry', () => {
     expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
     expect(screen.getByText('Data source')).toBeInTheDocument()
     expect(screen.getByText('Related data')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Connection details'))
-    expect(screen.getByLabelText('Source connection details')).toHaveTextContent('dataset:events')
+    fireEvent.click(screen.getByText('Data details'))
+    const details = screen.getByLabelText('Source connection details')
+    expect(details).toHaveTextContent('Datasets')
+    expect(details).toHaveTextContent('events')
+    expect(details).not.toHaveTextContent('dataset:events')
   })
 
   it('shows the selected Workspace provider version as bound without manual parsing controls', () => {
@@ -1317,22 +1322,25 @@ describe('Inspector — draft Source entry', () => {
       },
     })
     render(<Inspector />)
-    expect(screen.getByTitle('Luma Data API · Version provider-revision-7')).toBeInTheDocument()
+    expect(screen.getByTitle('Luma Data API · Saved version')).toBeInTheDocument()
     expect(screen.queryByTitle('Choose a registered dataset')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Dataset URI')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CSV delimiter')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CSV header row')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByText('Connection details'))
+    fireEvent.click(screen.getByText('Data details'))
     const details = screen.getByLabelText('Source connection details')
-    expect(details).toHaveTextContent('provider-dataset-identity')
-    expect(details).toHaveTextContent('provider-revision-7')
+    expect(details).toHaveTextContent('Luma Data API')
+    expect(details).toHaveTextContent('Source')
+    expect(details).toHaveTextContent('Saved version')
+    expect(details).not.toHaveTextContent('provider-dataset-identity')
+    expect(details).not.toHaveTextContent('provider-revision-7')
   })
 
   it.each([
     ['exact', {
       uri: 'file:///data/exact.csv',
       datasetRef: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-3' },
-    }, 'Selected dataset · Version revision-3'],
+    }, 'Selected dataset · Saved version'],
     ['as-of', {
       uri: 'file:///data/as-of.csv',
       datasetRef: {
@@ -1342,7 +1350,7 @@ describe('Inspector — draft Source entry', () => {
           committedAt: '2026-07-23T23:00:00Z', retentionOwner: 'provider', selector: 'as_of',
         },
       },
-    }, 'Selected dataset · Version revision-4'],
+    }, 'Selected dataset · Saved version'],
     ['run-time parameter', {
       uri: 'file:///data/runtime.csv',
       datasetRef: { parameterRef: 'runtime_dataset' },
@@ -1378,7 +1386,7 @@ describe('Inspector — draft Source entry', () => {
     expect(screen.getByText(/CSV delimiter/)).toBeInTheDocument()
     expect(screen.getByText('CSV header row')).toBeInTheDocument()
     expect(screen.queryByTitle(/Current version/)).not.toBeInTheDocument()
-    fireEvent.click(screen.getByText('Connection details'))
+    fireEvent.click(screen.getByText('Data details'))
     const details = screen.getByLabelText('Source connection details')
     expect(details).toHaveTextContent('Manual URI')
     expect(details).not.toHaveTextContent('Catalog registration')
@@ -1393,7 +1401,7 @@ describe('Inspector — draft Source entry', () => {
     expect(screen.getByText('dataset uri')).toBeInTheDocument()
     expect(screen.getByText(/CSV delimiter/)).toBeInTheDocument()
     expect(screen.getByText('CSV header row')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Connection details'))
+    fireEvent.click(screen.getByText('Data details'))
     expect(screen.getByLabelText('Source connection details')).toHaveTextContent('Manual URI')
   })
 
@@ -1432,7 +1440,7 @@ describe('Inspector — draft Source entry', () => {
         },
       }))
     })
-    expect(screen.getByTitle('Luma Data API · Version provider-revision-7')).toBeInTheDocument()
+    expect(screen.getByTitle('Luma Data API · Saved version')).toBeInTheDocument()
     expect(screen.queryByText('Choose data')).not.toBeInTheDocument()
 
     act(() => {

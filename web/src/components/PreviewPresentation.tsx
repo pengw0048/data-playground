@@ -98,7 +98,6 @@ export function PreviewDetails({ provenance, stale = false }: {
       <div className="space-y-0.5 pb-1">
         {stale && <div>These saved rows are from the version below, not a refreshed preview.</div>}
         <div>{counts}</div>
-        <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
         {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
       </div>
     </details>

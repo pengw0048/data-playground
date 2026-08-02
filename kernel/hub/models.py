@@ -738,10 +738,15 @@ class LineageNode(Wire):
     kind: str = "dataset"
 
 
+LineageEdgeLabel = Annotated[str, Field(min_length=1, max_length=512)]
+
+
 class LineageEdge(Wire):
     parent: str
     child: str
     fact_count: int = Field(ge=1)
+    columns: list[LineageEdgeLabel] = Field(default_factory=list, max_length=64)
+    pipeline_names: list[LineageEdgeLabel] = Field(default_factory=list, max_length=16)
 
 
 class LineageFieldMapping(Wire):
@@ -2509,6 +2514,9 @@ class WorkspaceRunRecord(Wire):
     canvas_id: str | None = None
     canvas_name: str | None = None
     node_label: str | None = None
+    created_by_id: str | None = Field(default=None, max_length=512)
+    created_by_name: str | None = Field(default=None, max_length=512)
+    is_mine: bool = True
     backend: str
     placement: Placement
     attempt: str

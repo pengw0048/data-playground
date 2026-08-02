@@ -637,7 +637,7 @@ describe('Catalog discovery request and mutation truth', () => {
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
-    expect(await screen.findByRole('button', { name: 'Inspect evidence for order_id' })).toBeVisible()
+    expect(await screen.findByRole('button', { name: 'View details for order_id' })).toBeVisible()
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(screen.queryByText(TABLE.uri)).not.toBeInTheDocument()
     expect(screen.getByTestId('detail-name')).toBeVisible()
@@ -655,12 +655,12 @@ describe('Catalog discovery request and mutation truth', () => {
 
     const schema = screen.getByTestId('detail-schema-scroll')
     expect(schema).toHaveAttribute('tabindex', '0')
-    expect(await within(schema).findByRole('button', { name: 'Inspect evidence for column_12' })).toBeInTheDocument()
+    expect(await within(schema).findByRole('button', { name: 'View details for column_12' })).toBeInTheDocument()
     expect(screen.queryByText(/more columns in Catalog maintenance/)).not.toBeInTheDocument()
     await waitFor(() => expect(mocks.sample).toHaveBeenCalled())
   })
 
-  it('labels a catalog prefix preview as non-random and exposes its input revision', async () => {
+  it('labels a catalog prefix preview without exposing internal input identities', async () => {
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
       hasMore: true, truncated: true, completeness: 'page', notPreviewable: false, wire: 'dataset',
@@ -676,7 +676,8 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
     expect(screen.getByText(/Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
-    expect(screen.getByText(`Input ${TABLE.uri} · revision revision-1.`)).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent(TABLE.uri)
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('revision-1')
     expect(screen.getByText('This is a prefix preview, not representative or random.')).toBeInTheDocument()
   })
 
@@ -761,7 +762,8 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getAllByText('legacy_code')).not.toHaveLength(0)
     expect(screen.queryByText('orders-dataset@3')).not.toBeInTheDocument()
 
-    expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('mem://orders')
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('lance-v4')
     expect(await screen.findByText(/header and columns describe an earlier version/i)).toBeInTheDocument()
     expect(screen.getByTestId('dataset-facts-stale')).not.toHaveTextContent('orders-dataset@4')
     expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Current version')

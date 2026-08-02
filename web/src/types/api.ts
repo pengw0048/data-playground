@@ -594,7 +594,14 @@ export interface Relationship {
 }
 
 export interface LineageNode { id: string; name: string; uri: string; kind: string }
-export interface LineageEdge { parent: string; child: string; factCount: number }
+export interface LineageEdge {
+  parent: string
+  child: string
+  factCount: number
+  /** Provider-reported mapped columns. Empty means the graph has no column-level evidence. */
+  columns?: string[]
+  pipelineNames?: string[]
+}
 export interface LineageResult { rootUri: string; nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
 
 export interface LineageFieldMapping {

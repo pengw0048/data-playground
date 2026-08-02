@@ -29,9 +29,8 @@ async function expectPrimaryContent(page: Page, surface: AcceptanceScreenshotSur
   await expect(viewer).toBeVisible()
   await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
   await expect(viewer.getByTestId('detail-preview-scroll')).toBeVisible()
-  await expect(viewer.getByTestId('dataset-version-identity')).toContainText(
-    `${requested.datasetId}@${requested.revisionId}`,
-  )
+  await expect(viewer.getByTestId('dataset-version-context')).toHaveText(/^(Current|Previous|Selected) version$/)
+  await expect(viewer).not.toContainText(`${requested.datasetId}@${requested.revisionId}`)
   await expect(viewer.getByText('Loading selected version preview…', { exact: true })).toHaveCount(0)
   await expect(viewer.getByText('Loading selected version schema…', { exact: true })).toHaveCount(0)
 }

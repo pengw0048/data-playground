@@ -1,28 +1,12 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
-import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
+import { backToWorkspace, createCanvasFromWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 // Accessibility gate for issue #118: keyboard contract on Workspace/Canvas + one axe smoke suite that
 // fails the build on serious/critical violations across the primary surfaces.
 
 async function fresh(page: Page) {
-  await page.goto('/')
-  // A fresh workspace has an explicit entry choice; tests create a blank Canvas through that UI
-  // rather than relying on the retired implicit bootstrap Canvas.
-  const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
-  await expect.poll(() => page.evaluate(() => (
-    location.hash.startsWith('#/canvas/')
-      || Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Start a blank Canvas')
-  ))).toBe(true)
-  if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
-  await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
-  const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('app-menu').click()
-  const menu = page.getByRole('menu', { name: 'Data Playground menu' })
-  await expect(menu).toBeVisible()
-  await menu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
-  await expect(menu).toBeHidden()
-  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await createCanvasFromWorkspace(page)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }
 
@@ -121,7 +105,7 @@ test.describe('accessibility gate @ux-smoke', () => {
       items: Array<{ name: string; uri: string }>
     }).items.find((item) => item.name === 'images')
     expect(registered, 'the running-state fixture requires the registered images source').toBeTruthy()
-    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await inspector.getByText('Manual source settings', { exact: true }).click()
     await inspector.getByLabel('Dataset URI').fill(registered!.uri)
     let releaseRun: (() => void) | undefined
     const held = new Promise<void>((resolve) => { releaseRun = resolve })

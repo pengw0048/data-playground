@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, ControlButton, Controls, Handle, Position, MarkerType,
-  useReactFlow,
+  useReactFlow, useViewport,
   type Node, type Edge, type Connection, type NodeChange,
 } from '@xyflow/react'
 import { useStore } from '../store/graph'
@@ -24,56 +24,69 @@ import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 type EntityData = {
   table: CatalogTable
-  pk: string[]
+  fields: EntityField[]
   focused: boolean
   lineage: boolean
+  expanded: boolean
+  opening: boolean
   onFocus: () => void
+  onOpen: () => void
+}
+
+type EntityField = {
+  name: string
+  type?: string
+  role: 'PK' | 'FK' | 'KEY' | 'mapped' | 'field'
+  column?: CatalogTable['columns'][number]
 }
 
 function EntityNode({ data }: { data: EntityData }) {
-  const { table, pk, focused, lineage, onFocus } = data
-  if (lineage) {
-    return (
-      <div className={cn(
-        'w-[230px] overflow-hidden rounded-xl border bg-card shadow-sm',
-        focused ? 'border-primary ring-2 ring-primary/20' : 'border-border',
-      )}>
-        <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-muted-foreground" />
-        <div className="flex min-w-0 items-center gap-2 px-3 py-2.5">
-          <span className={cn(
-            'grid h-7 w-7 shrink-0 place-items-center rounded-lg',
-            focused ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground',
-          )}><Icon name="db" size={14} /></span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-[12.5px] font-semibold text-foreground" title={table.name}>{table.name}</span>
-            <span className="block text-[10px] text-muted-foreground">{focused ? 'Current dataset' : 'Dataset'}</span>
-          </span>
-        </div>
-        <Handle type="source" position={Position.Right} className="!h-2 !w-2 !border-0 !bg-muted-foreground" />
-      </div>
-    )
-  }
+  const { table, fields, focused, lineage, expanded, opening, onFocus, onOpen } = data
+  const activate = lineage ? onOpen : onFocus
   return (
-    <div className={cn('w-[240px] overflow-hidden rounded-lg border bg-card shadow-sm', focused ? 'border-primary ring-2 ring-primary/20' : 'border-border')}>
-      <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-primary" />
-      <button onClick={onFocus} title="Focus the graph on this table"
-        className="flex w-full items-center gap-1.5 truncate border-b border-border bg-muted px-3 py-1.5 text-left text-[12px] font-semibold text-foreground hover:bg-accent">
-        <Icon name="lineage" size={11} /> <span className="truncate">{table.name}</span>
+    <div data-testid="er-entity" className={cn(
+      'group w-[244px] overflow-hidden rounded-xl border bg-card shadow-sm transition-[border-color,box-shadow]',
+      focused ? 'border-primary ring-2 ring-primary/20' : 'border-border hover:border-primary/70 hover:shadow-md',
+    )}>
+      <Handle id="node-target" type="target" position={Position.Left}
+        className={cn('!h-2 !w-2 !border-0', lineage ? '!bg-muted-foreground' : '!bg-primary')} />
+      <button onClick={activate} disabled={opening}
+        title={lineage ? 'Open dataset details' : 'Focus the graph on this table'}
+        className={cn(
+          'nodrag flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left hover:bg-accent disabled:cursor-wait',
+          expanded && fields.length > 0 && 'border-b border-border',
+        )}>
+        <span className={cn(
+          'grid h-7 w-7 shrink-0 place-items-center rounded-lg',
+          focused ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground',
+        )}><Icon name={lineage ? 'db' : 'lineage'} size={14} /></span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[12.5px] font-semibold text-foreground" title={table.name}>{table.name}</span>
+          <span className="block text-[10px] text-muted-foreground">
+            {opening ? 'Opening…' : focused ? 'Current dataset' : lineage ? 'Open dataset' : 'Dataset'}
+          </span>
+        </span>
       </button>
-      <div className="flex max-h-[220px] flex-col overflow-y-auto py-1">
-        {table.columns.map((c) => {
-          const isPk = pk.includes(c.name)
-          const isKey = c.capabilities?.includes('key')
-          return (
-            <div key={c.name} className={cn('flex items-center gap-1.5 px-3 py-0.5 text-left text-[11px]', isPk && 'font-semibold text-foreground')}>
-              <span className="w-3 text-center text-[10px]">{isPk ? '🔑' : isKey ? '·' : ''}</span>
-              <FieldEvidenceButton column={c} marker className="dp-mono flex-1 truncate rounded px-0.5 text-left hover:bg-accent" />
-              <span className="text-[9.5px] text-muted-foreground">{c.type}</span>
-            </div>
-          )
-        })}
-      </div>
-      <Handle type="source" position={Position.Right} className="!h-2 !w-2 !border-0 !bg-primary" />
+      {expanded && fields.length > 0 && <div className="flex max-h-[144px] flex-col overflow-y-auto py-1">
+        {fields.map((field) => <div key={field.name} className="relative flex min-h-6 items-center gap-1.5 px-3 py-0.5 text-left text-[11px]">
+          <Handle id={`column-in:${field.name}`} type="target" position={Position.Left}
+            className="!h-1.5 !w-1.5 !border-0 !bg-primary" />
+          {field.role === 'field'
+            ? <span aria-hidden className="w-8 shrink-0" />
+            : <span className={cn(
+                'w-8 shrink-0 rounded px-1 text-center text-[8px] font-bold uppercase tracking-wide',
+                field.role === 'PK' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground',
+              )}>{field.role}</span>}
+          {field.column
+            ? <FieldEvidenceButton column={field.column} marker className="dp-mono min-w-0 flex-1 truncate rounded px-0.5 text-left hover:bg-accent" />
+            : <span className="dp-mono min-w-0 flex-1 truncate" title={field.name}>{field.name}</span>}
+          {field.type && <span className="max-w-16 truncate text-[9.5px] text-muted-foreground">{field.type}</span>}
+          <Handle id={`column-out:${field.name}`} type="source" position={Position.Right}
+            className="!h-1.5 !w-1.5 !border-0 !bg-primary" />
+        </div>)}
+      </div>}
+      <Handle id="node-source" type="source" position={Position.Right}
+        className={cn('!h-2 !w-2 !border-0', lineage ? '!bg-muted-foreground' : '!bg-primary')} />
     </div>
   )
 }
@@ -90,17 +103,22 @@ const LINEAGE_FIT_OPTIONS = {
   maxZoom: 1,
 } as const
 
-function ERViewportControls({ layoutKey, container, lineage }: {
-  layoutKey: string
+function ERViewportControls({ fitKey, container, lineage, onZoomChange }: {
+  fitKey: string
   container: RefObject<HTMLDivElement | null>
   lineage: boolean
+  onZoomChange: (zoom: number) => void
 }) {
   const { fitView } = useReactFlow()
+  const { zoom } = useViewport()
   const [size, setSize] = useState({ width: 0, height: 0 })
-  const fitSafely = useCallback(
-    () => fitView(lineage ? LINEAGE_FIT_OPTIONS : ER_FIT_OPTIONS),
-    [fitView, lineage],
-  )
+  const fitSafely = useCallback(async () => {
+    await fitView(lineage ? LINEAGE_FIT_OPTIONS : ER_FIT_OPTIONS)
+  }, [fitView, lineage])
+
+  // `useViewport` follows manual controls and programmatic fits. React Flow's `onMove` callback can
+  // miss a mount-time fit, which otherwise leaves a one-node graph compact until the user nudges it.
+  useEffect(() => { onZoomChange(zoom) }, [onZoomChange, zoom])
 
   // A relationship query can replace the node set after React Flow's mount-only `fitView` has
   // already run. Reapply the same safe fit after React Flow has laid out the replacement query and
@@ -109,7 +127,7 @@ function ERViewportControls({ layoutKey, container, lineage }: {
     if (size.width === 0 || size.height === 0) return
     const frame = requestAnimationFrame(() => { void fitSafely() })
     return () => cancelAnimationFrame(frame)
-  }, [fitSafely, layoutKey, size])
+  }, [fitKey, fitSafely, size])
 
   useEffect(() => {
     const element = container.current
@@ -202,44 +220,24 @@ function lineageLayout(
     group.push(table)
     grouped.set(value, group)
   }
-  const metrics = new Map<number, { rows: number; columns: number }>()
-  for (const [value, group] of grouped) {
-    const rows = Math.max(1, Math.ceil(Math.sqrt(group.length)))
-    metrics.set(value, { rows, columns: Math.ceil(group.length / rows) })
-  }
-  const baseX = new Map<number, number>([[0, 0]])
-  let positiveCursor = 0
-  for (const value of [...grouped.keys()].filter((rank) => rank > 0).sort((a, b) => a - b)) {
-    const columns = metrics.get(value)?.columns ?? 1
-    const start = positiveCursor + 310
-    baseX.set(value, start)
-    positiveCursor = start + (columns - 1) * 270
-  }
-  let negativeCursor = 0
-  for (const value of [...grouped.keys()].filter((rank) => rank < 0).sort((a, b) => b - a)) {
-    const columns = metrics.get(value)?.columns ?? 1
-    const start = negativeCursor - 310 - (columns - 1) * 270
-    baseX.set(value, start)
-    negativeCursor = start
-  }
-
   const output: Record<string, { x: number; y: number }> = {}
   for (const [value, group] of grouped) {
     group.sort((left, right) => left.name.localeCompare(right.name))
-    const rows = metrics.get(value)?.rows ?? 1
     group.forEach((table, index) => {
-      const column = Math.floor(index / rows)
-      const row = index % rows
       output[table.id] = {
-        x: (baseX.get(value) ?? value * 310) + column * 270,
-        y: (row - (rows - 1) / 2) * 140,
+        // Every graph depth owns exactly one x-rank. Splitting a high-fan-out rank into additional
+        // x-columns made independent siblings look like a downstream chain.
+        x: value * 340,
+        // The detailed card is at most 200px tall. Keep a visible lane between siblings so zooming
+        // past the semantic-detail threshold cannot make two independent datasets overlap.
+        y: (index - (group.length - 1) / 2) * 220,
       }
     })
   }
   return output
 }
 
-const LINEAGE_PAGE_SIZE = 12
+const LINEAGE_PAGE_SIZE = 8
 
 function lineageNeighbourhood(
   tables: CatalogTable[],
@@ -280,6 +278,63 @@ function lineageNeighbourhood(
 const ER_CAP = 60
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
+function relationshipFields(
+  table: CatalogTable,
+  relationships: Relationship[],
+): EntityField[] {
+  const roles = new Map<string, EntityField['role']>()
+  for (const relationship of relationships) {
+    const left = relationship.leftUri === table.uri
+    const right = relationship.rightUri === table.uri
+    if (!left && !right) continue
+    const columns = left ? relationship.leftColumns : relationship.rightColumns
+    const side = left ? relationship.cardinality.split(':')[0] : relationship.cardinality.split(':')[1]
+    for (const column of columns) {
+      if (!roles.has(column)) roles.set(column, side === '1' ? 'KEY' : side === 'N' ? 'FK' : 'KEY')
+    }
+  }
+  // Keep relationship endpoints first so every expanded edge can land on a visible field. Updating
+  // an existing Map entry changes the role without moving that field out of its endpoint-first slot.
+  for (const key of table.keys ?? []) for (const column of key.columns) {
+    if (key.confidence === 'declared') roles.set(column, 'PK')
+  }
+  for (const column of table.columns) {
+    if (roles.size >= 6) break
+    if (!roles.has(column.name)) roles.set(column.name, 'field')
+  }
+  const byName = new Map(table.columns.map((column) => [column.name, column]))
+  return [...roles].slice(0, 6).map(([name, role]) => ({
+    name,
+    role,
+    column: byName.get(name),
+    type: byName.get(name)?.type,
+  }))
+}
+
+function lineageFields(
+  table: CatalogTable,
+  edges: LineageEdge[],
+): EntityField[] {
+  const roles = new Map<string, EntityField['role']>()
+  for (const name of edges.filter((edge) => edge.child === table.uri).flatMap((edge) => edge.columns ?? [])) {
+    roles.set(name, 'mapped')
+  }
+  for (const key of table.keys ?? []) for (const column of key.columns) {
+    if (key.confidence === 'declared') roles.set(column, 'PK')
+  }
+  for (const column of table.columns) {
+    if (roles.size >= 6) break
+    if (!roles.has(column.name)) roles.set(column.name, 'field')
+  }
+  const byName = new Map(table.columns.map((column) => [column.name, column]))
+  return [...roles].slice(0, 6).map(([name, role]) => ({
+    name,
+    role,
+    column: byName.get(name),
+    type: byName.get(name)?.type,
+  }))
+}
+
 export function ERDiagram() {
   const pushToast = useStore((s) => s.pushToast)
   const erFocusUri = useStore((s) => s.erFocusUri)
@@ -290,12 +345,14 @@ export function ERDiagram() {
   const setRelationshipsMode = useStore((s) => s.setRelationshipsMode)
   const returnFromRelationships = useStore((s) => s.returnFromRelationships)
   const openWorkspace = useStore((s) => s.setView)
+  const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
 
   // focus === null → the global / folder view; otherwise the neighbourhood of that uri
   const [focus, setFocus] = useState<string | null>(erFocusUri)
   const [hops, setHops] = useState(1)
   const [mode, setMode] = useState<'joins' | 'lineage'>(erMode)
   const [focusResolving, setFocusResolving] = useState(!erFocusUri && !!erFocusDatasetId)
+  const [focusedTable, setFocusedTable] = useState<CatalogTable | null>(null)
   const [focusResolutionError, setFocusResolutionError] = useState<string | null>(null)
   const [focusResolutionRevision, setFocusResolutionRevision] = useState(0)
   const [folder, setFolder] = useState('')
@@ -304,6 +361,12 @@ export function ERDiagram() {
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
   const [lineageLimit, setLineageLimit] = useState(LINEAGE_PAGE_SIZE)
+  const [expandedEntities, setExpandedEntities] = useState(false)
+  const [openingNode, setOpeningNode] = useState<string | null>(null)
+  const updateExpandedEntities = useCallback((zoom: number) => {
+    const next = zoom >= 0.82
+    setExpandedEntities((current) => current === next ? current : next)
+  }, [])
 
   const [tables, setTables] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
@@ -333,10 +396,34 @@ export function ERDiagram() {
   useEffect(() => {
     const request = ++focusReq.current
     setFocusResolutionError(null)
+    setFocusedTable(null)
+    const resolveStableFocus = async (datasetId: string): Promise<CatalogTable> => {
+      if (!datasetId.startsWith('dataset:')) return api.tableByRegistration(datasetId)
+      const [resolution, context] = await Promise.all([
+        api.workspaceResource(datasetId),
+        api.workspaceCanonicalDataset(datasetId),
+      ])
+      if (!resolution.resource || resolution.resource.kind !== 'dataset') {
+        throw new Error('The focused Workspace dataset is unavailable')
+      }
+      return {
+        id: `lineage:${context.sourceUri}`,
+        registrationId: datasetId,
+        name: resolution.resource.name,
+        uri: context.sourceUri,
+        columns: context.columns,
+      }
+    }
     if (erFocusUri) {
       setFocus(erFocusUri)
       setFocusResolving(false)
-      return
+      if (!erFocusDatasetId) return
+      void resolveStableFocus(erFocusDatasetId).then((table) => {
+        if (request === focusReq.current) setFocusedTable(table)
+      }).catch(() => {
+        // Lineage remains usable when optional schema enrichment is temporarily unavailable.
+      })
+      return () => { focusReq.current += 1 }
     }
     if (!erFocusDatasetId) {
       setFocus(null)
@@ -345,8 +432,9 @@ export function ERDiagram() {
     }
     setFocus(null)
     setFocusResolving(true)
-    void api.tableByRegistration(erFocusDatasetId).then((table) => {
+    void resolveStableFocus(erFocusDatasetId).then((table) => {
       if (request !== focusReq.current) return
+      setFocusedTable(table)
       setFocus(table.uri)
       setFocusResolving(false)
     }).catch((caught) => {
@@ -398,9 +486,12 @@ export function ERDiagram() {
     setLoading(true); setError(null)
     ;(async () => {
       try {
-        if (visibleFocus) {
+        if (focus) {
           if (mode === 'lineage') {
-            const lin = await api.lineage(visibleFocus, hops, ER_CAP)
+            // Always query from the stable route focus. The response may canonicalize that focus
+            // to a physical generation for layout, but feeding that returned root back into the
+            // next request can turn a connected graph into an isolated node after reload.
+            const lin = await api.lineage(focus, hops, ER_CAP)
             const uris = [...new Set(lin.nodes.map((n) => n.uri))]
             const page = uris.length ? await api.tablesPage({ uris, limit: ER_CAP }) : { items: [], total: 0, hasMore: false }
             if (s !== dataReq.current) return
@@ -409,17 +500,23 @@ export function ERDiagram() {
             // though they are intentionally not registered in the local Catalog. Keep those nodes
             // in the graph instead of silently dropping the root while resolving richer Catalog
             // metadata for every node that does have a registration.
-            const lineageTables = lin.nodes.map((node) => registered.get(node.uri) ?? ({
-              id: `lineage:${node.uri}`,
-              name: node.name || node.uri.split('/').filter(Boolean).slice(-1)[0] || 'Dataset',
-              uri: node.uri,
-              columns: [],
-              missing: true,
-            } satisfies CatalogTable))
+            const lineageTables = lin.nodes.map((node) => registered.get(node.uri)
+              ?? (focusedTable && node.uri === lin.rootUri ? {
+                ...focusedTable,
+                uri: node.uri,
+                name: node.name || focusedTable.name,
+              } : null)
+              ?? ({
+                id: `lineage:${node.uri}`,
+                name: node.name || node.uri.split('/').filter(Boolean).slice(-1)[0] || 'Dataset',
+                uri: node.uri,
+                columns: [],
+                missing: true,
+              } satisfies CatalogTable))
             setTables(lineageTables); setTotal(lineageTables.length); setLinEdges(lin.edges)
-            setLineageFocus({ requested: focus ?? visibleFocus, canonical: lin.rootUri })
+            setLineageFocus({ requested: focus, canonical: lin.rootUri })
           } else {
-            const uris = joinNeighbourhood(visibleFocus, rels, hops)
+            const uris = joinNeighbourhood(focus, rels, hops)
             const page = await api.tablesPage({ uris, limit: ER_CAP })
             if (s !== dataReq.current) return
             setTables(page.items); setTotal(page.items.length); setLinEdges([]); setLineageFocus(null)
@@ -436,7 +533,7 @@ export function ERDiagram() {
       }
     })()
     return () => { dataReq.current += 1 }
-  }, [focus, visibleFocus, hops, mode, folder, rels, reloadKey, focusResolving, focusResolutionError])
+  }, [focus, hops, mode, folder, rels, reloadKey, focusResolving, focusResolutionError, focusedTable])
 
   const refresh = useCallback(() => setReloadKey((k) => k + 1), [])
 
@@ -453,7 +550,6 @@ export function ERDiagram() {
   )
 
   const byUri = useMemo(() => Object.fromEntries(visible.map((t) => [t.uri, t.id])), [visible])
-  const pkOf = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
   const visibleLineageEdges = useMemo(
     () => linEdges.filter((edge) => byUri[edge.parent] && byUri[edge.child]),
     [byUri, linEdges],
@@ -463,6 +559,37 @@ export function ERDiagram() {
     () => mode === 'lineage' ? lineageLayout(visible, visibleLineageEdges, visibleFocus) : {},
     [mode, visible, visibleFocus, visibleLineageEdges],
   )
+  const fieldsByTable = useMemo(() => Object.fromEntries(visible.map((table) => [
+    table.id,
+    mode === 'lineage'
+      ? lineageFields(table, visibleLineageEdges)
+      : relationshipFields(table, rels),
+  ])), [mode, rels, visible, visibleLineageEdges])
+  const openLineageDataset = useCallback(async (table: CatalogTable) => {
+    if (openingNode) return
+    if (table.uri === visibleFocus && erReturn) {
+      returnFromRelationships()
+      return
+    }
+    if (!table.id.startsWith('lineage:')) {
+      setWorkspaceResource(`dataset:${table.registrationId ?? table.id}`)
+      return
+    }
+    if (!visibleFocus) return
+    setOpeningNode(table.id)
+    try {
+      const resource = await api.workspaceLineageResource({
+        rootUri: visibleFocus,
+        nodeUri: table.uri,
+        name: table.name,
+      })
+      setWorkspaceResource(resource.id)
+    } catch (caught) {
+      pushToast(`Couldn't open ${table.name}: ${errorMessage(caught)}`, 'error')
+    } finally {
+      setOpeningNode(null)
+    }
+  }, [erReturn, openingNode, pushToast, returnFromRelationships, setWorkspaceResource, visibleFocus])
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
     position: mode === 'lineage'
@@ -470,12 +597,15 @@ export function ERDiagram() {
       : positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
     data: {
       table: t,
-      pk: pkOf(t),
+      fields: fieldsByTable[t.id] ?? [],
       focused: t.uri === visibleFocus,
       lineage: mode === 'lineage',
+      expanded: expandedEntities,
+      opening: openingNode === t.id,
       onFocus: () => { setFocus(t.uri); setRelationshipsFocus(t) },
+      onOpen: () => { void openLineageDataset(t) },
     } satisfies EntityData,
-  })), [lineagePositions, mode, visible, positions, visibleFocus, setRelationshipsFocus])
+  })), [expandedEntities, fieldsByTable, lineagePositions, mode, openLineageDataset, openingNode, positions, setRelationshipsFocus, visible, visibleFocus])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []
@@ -486,16 +616,30 @@ export function ERDiagram() {
       declared.add([s, t].sort().join('|'))
       out.push({
         id: `d${i}`, source: s, target: t,
-        label: `${r.leftColumns.join('+')} → ${r.rightColumns.join('+')}  ${r.cardinality}`,
-        labelStyle: { fontSize: 9.5 }, markerEnd: { type: MarkerType.ArrowClosed },
+        sourceHandle: expandedEntities && r.leftColumns[0]
+          && fieldsByTable[s]?.some((field) => field.name === r.leftColumns[0])
+          ? `column-out:${r.leftColumns[0]}` : 'node-source',
+        targetHandle: expandedEntities && r.rightColumns[0]
+          && fieldsByTable[t]?.some((field) => field.name === r.rightColumns[0])
+          ? `column-in:${r.rightColumns[0]}` : 'node-target',
+        label: r.cardinality,
+        labelStyle: { fontSize: 10, fontWeight: 600 }, markerEnd: { type: MarkerType.ArrowClosed },
         style: { stroke: 'var(--primary)', strokeWidth: 1.5 }, data: { rel: r },
       })
     })
     if (mode === 'lineage') visibleLineageEdges.forEach((e, i) => {
       const s = byUri[e.parent], t = byUri[e.child]
       if (!s || !t) return
+      const mappedColumn = e.columns?.[0]
+      const pipeline = e.pipelineNames?.length === 1 ? e.pipelineNames[0] : null
       out.push({
         id: `l${i}`, source: s, target: t, selectable: false,
+        sourceHandle: 'node-source',
+        targetHandle: expandedEntities && mappedColumn
+          && fieldsByTable[t]?.some((field) => field.name === mappedColumn)
+          ? `column-in:${mappedColumn}` : 'node-target',
+        label: expandedEntities ? pipeline ?? (mappedColumn ? `via ${mappedColumn}` : undefined) : undefined,
+        labelStyle: { fontSize: 9.5 },
         markerEnd: { type: MarkerType.ArrowClosed },
         style: { stroke: 'var(--muted-foreground)', strokeWidth: 1.5 },
       })
@@ -510,7 +654,7 @@ export function ERDiagram() {
         })
       }
     return out
-  }, [rels, visible, byUri, mode, visibleLineageEdges, showSuggestions])
+  }, [rels, visible, byUri, expandedEntities, fieldsByTable, mode, visibleLineageEdges, showSuggestions])
 
   const loadSuggestions = useCallback(async (left: CatalogTable, right: CatalogTable) => {
     setPending((cur) => cur?.left.id === left.id && cur.right.id === right.id
@@ -559,12 +703,26 @@ export function ERDiagram() {
   const capped = !hasFocusedRoute && total > visible.length
   const hiddenLineageConnections = Math.max(0, linEdges.length - visibleLineageEdges.length)
   const layoutKey = useMemo(() => JSON.stringify(nodes.map((node) => node.id)), [nodes])
+  // Expanding a busy lineage page is a deliberate pan/zoom continuation. Fit only when the query's
+  // fetched graph changes, never when Show more merely reveals another bounded sibling batch.
+  const fitKey = useMemo(() => mode === 'lineage'
+    ? JSON.stringify([mode, visibleFocus, hops, tables.map((table) => table.id)])
+    : layoutKey, [hops, layoutKey, mode, tables, visibleFocus])
 
   return (
     <div ref={graphContainer} className="relative h-full w-full">
       <div data-testid="er-controls-panel" className="absolute left-3 top-3 z-10 flex w-[320px] flex-col gap-2 rounded-lg border border-border bg-card/95 px-3 py-2.5 text-[11px] text-muted-foreground shadow-sm backdrop-blur">
         <div className="flex items-center gap-2">
           <span className="text-[12.5px] font-semibold text-foreground">{mode === 'lineage' ? 'Lineage' : 'Relationships'}</span>
+          <div className="inline-flex rounded-md border border-border bg-background p-0.5 text-[10.5px]" role="group" aria-label="Graph mode">
+            {(['joins', 'lineage'] as const).map((graphMode) => (
+              <button key={graphMode} onClick={() => { setMode(graphMode); setRelationshipsMode(graphMode) }}
+                data-testid={`er-mode-${graphMode}`}
+                className={cn('rounded px-1.5 py-0.5 capitalize', mode === graphMode ? 'bg-accent font-semibold text-foreground' : 'hover:text-foreground')}>
+                {graphMode === 'joins' ? 'ER' : 'Lineage'}
+              </button>
+            ))}
+          </div>
           <span className="flex-1" />
           {erReturn && <button type="button" onClick={returnFromRelationships}
             data-testid="er-back-to-dataset" aria-label="Back to dataset"
@@ -615,12 +773,6 @@ export function ERDiagram() {
                 <button onClick={() => setHops((h) => Math.min(5, h + 1))} className="px-1.5 py-0.5 hover:bg-accent" aria-label="More hops">+</button>
               </div>
               <span className="flex-1" />
-              <div className="inline-flex rounded-md border border-border p-0.5 text-[10.5px]">
-                {(['joins', 'lineage'] as const).map((m) => (
-                  <button key={m} onClick={() => { setMode(m); setRelationshipsMode(m) }} data-testid={`er-mode-${m}`}
-                    className={cn('rounded px-1.5 py-0.5', mode === m ? 'bg-accent font-semibold text-foreground' : 'hover:text-foreground')}>{m}</button>
-                ))}
-              </div>
             </div>
           </div>
         ) : (
@@ -689,11 +841,13 @@ export function ERDiagram() {
         onNodesChange={mode === 'joins' ? onNodesChange : undefined}
         onConnect={mode === 'joins' ? onConnect : undefined}
         onEdgeClick={mode === 'joins' ? onEdgeClick : undefined}
+        onMove={(_event, viewport) => updateExpandedEntities(viewport.zoom)}
         nodesDraggable={mode === 'joins'} nodesConnectable={mode === 'joins'}
         minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
-        <ERViewportControls layoutKey={layoutKey} container={graphContainer} lineage={mode === 'lineage'} />
+        <ERViewportControls fitKey={fitKey} container={graphContainer} lineage={mode === 'lineage'}
+          onZoomChange={updateExpandedEntities} />
       </ReactFlow>
       {pending && (
         <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}

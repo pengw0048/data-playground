@@ -57,10 +57,10 @@ describe('UpsertControl', () => {
 
   it('projects preflight evidence then requires it before submitting', async () => {
     render(<UpsertControl nodeId="write" />)
-    const run = screen.getByRole('button', { name: 'Run keyed upsert' })
+    const run = screen.getByRole('button', { name: 'Update dataset' })
     expect(run).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
-    await screen.findByText('Ready to run keyed upsert')
+    await screen.findByText('Ready to update')
     expect(screen.getByLabelText('Upsert check')).toHaveTextContent('2 matched · 1 inserted · 1 unchanged')
     await waitFor(() => expect(run).toBeEnabled())
     fireEvent.click(run)
@@ -81,7 +81,7 @@ describe('UpsertControl', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await screen.findByText(/duplicate=1/)
     expect(mocks.submit).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: 'Run keyed upsert' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update dataset' })).toBeDisabled()
   })
 
   it('surfaces a moved head as permanent and offers only a new admission', async () => {

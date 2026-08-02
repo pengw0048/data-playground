@@ -12,11 +12,11 @@ const failedJob = {
 
 const jobFilterLabels = [
   'Filter jobs by canvas',
-  'Filter jobs by canvas step id',
-  'Filter jobs by run mode',
+  'Filter jobs by step',
+  'Filter jobs by compute target',
   'Filter jobs from time',
   'Filter jobs to time',
-  'Filter jobs by text',
+  'Filter jobs by search',
 ]
 
 async function expectJobsFiltersToFit(page: Page) {
@@ -85,10 +85,10 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByRole('heading', { name: 'Runs and background tasks' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
   await expect(page.getByRole('region', { name: 'Job filters' })).toBeVisible()
-  await expect(page.getByRole('option', { name: 'Canvas ID from link: not-accessible' })).toHaveCount(1)
+  await expect(page.getByRole('option', { name: 'Canvas from link (not in this list)' })).toHaveCount(1)
   await expect(page.getByLabel('Filter jobs by canvas', { exact: true })).toHaveValue('not-accessible')
-  await expect(page.getByLabel('Filter jobs by canvas step id', { exact: true })).toHaveValue('exact-node')
-  await expect(page.getByLabel('Filter jobs by run mode', { exact: true })).toHaveValue('exact-backend')
+  await expect(page.getByLabel('Filter jobs by step', { exact: true })).toHaveValue('exact-node')
+  await expect(page.getByLabel('Filter jobs by compute target', { exact: true })).toHaveValue('exact-backend')
   await expect(page.getByLabel(/Filter jobs by canvas id \(exact\)/i)).toHaveCount(0)
   await expect(page.getByLabel(/Filter jobs by canvas step id \(exact\)/i)).toHaveCount(0)
   await expect(page.getByLabel(/Filter jobs by backend id \(exact\)/i)).toHaveCount(0)
@@ -96,9 +96,9 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page).toHaveURL(/#\/jobs\?node=orphan-node$/)
   await page.reload()
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await expect(page.getByLabel('Filter jobs by canvas step id', { exact: true })).toHaveValue('orphan-node')
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).fill('')
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).press('Enter')
+  await expect(page.getByLabel('Filter jobs by step', { exact: true })).toHaveValue('orphan-node')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/#\/jobs$/)
   for (const width of [1024, 1280, 1440]) {
     await page.setViewportSize({ width, height: 720 })
@@ -106,24 +106,24 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   }
   await page.setViewportSize({ width: 1280, height: 720 })
   await expect(page.getByRole('button', { name: /retired-identity-task/ })).toHaveCount(0)
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).fill('')
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('')
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).fill('')
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('canvas-jobs')
   await expect(page).toHaveURL(/canvas=canvas-jobs/)
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).fill('publish')
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('publish')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/canvas=canvas-jobs&node=publish/)
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).fill('local')
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('local')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/backend=local/)
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).fill('')
-  await page.getByLabel('Filter jobs by canvas step id', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('')
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).fill('')
-  await page.getByLabel('Filter jobs by run mode', { exact: true }).press('Enter')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
   await page.getByRole('button', { name: 'Failed', exact: true }).click()
   await expect(page).toHaveURL(/#\/jobs\?status=failed/)
 
@@ -132,10 +132,8 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute(
     'href', '#/canvas/canvas-jobs?node=publish')
   await expect(page).toHaveURL(/run=run-failed/)
-  await page.getByText('Diagnostics', { exact: true }).click()
-  await page.getByRole('button', { name: /Saved run setup/ }).click()
-  await expect(page.getByText('Submitted graph')).toBeVisible()
-  await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Submitted graph')).toHaveCount(0)
   await page.goBack()
   await expect(page).toHaveURL(/#\/jobs\?status=failed$/)
   await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
@@ -191,8 +189,40 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   await expect(page.getByRole('button', { name: 'Open result 1' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open result 2' })).toBeVisible()
   await expect(page.getByText(/transform:clean/)).toBeHidden()
-  await page.getByText('Diagnostics', { exact: true }).click()
-  await expect(page.getByText(/Result 1 · transform:clean, Result 2 · transform:rejected/)).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+  await expect(page.getByText(/transform:clean|transform:rejected/)).toHaveCount(0)
+})
+
+test('defaults to my Jobs and can show visible work from other users @ux-smoke', async ({ page }) => {
+  const requestedScopes: Array<string | null> = []
+  await page.route('**/api/canvas', async (route) => route.fulfill({
+    json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }],
+  }))
+  await page.route('**/api/jobs?*', async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get('scope')
+    requestedScopes.push(scope)
+    await route.fulfill({ json: {
+      items: scope === 'all'
+        ? [{ ...failedJob, isMine: false, createdById: 'peer', createdByName: 'Ada' }]
+        : [{ ...failedJob, isMine: true, createdById: 'local', createdByName: 'Local' }],
+      nextCursor: null,
+      hasMore: false,
+    } })
+  })
+
+  await page.goto('/#/jobs')
+  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
+  expect(requestedScopes[0]).toBeNull()
+  await expect(page.getByText(/Ada/)).toHaveCount(0)
+
+  await page.getByTestId('jobs-scope-all').click()
+  await expect(page).toHaveURL(/#\/jobs\?scope=all$/)
+  await expect(page.getByText(/Ada/)).toBeVisible()
+  expect(requestedScopes).toContain('all')
+
+  await page.getByTestId('jobs-scope-mine').click()
+  await expect(page).toHaveURL(/#\/jobs$/)
+  await expect(page.getByText(/Ada/)).toHaveCount(0)
 })
 
 test('long shared-prefix Canvas names keep their suffixes visible without widening Jobs @ux-smoke', async ({ page }) => {
@@ -292,6 +322,19 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.route('**/api/canvas', async (route) => route.fulfill({ json: [{ id: 'canvas-merge', name: 'Column enrichment', version: 1, role: 'editor' }] }))
   await page.route('**/api/jobs?*', async (route) => route.fulfill({ json: { items: [mergeJob], nextCursor: null, hasMore: false } }))
   await page.route('**/api/canvas/canvas-merge/runs/merge-task-1/manifest', async (route) => route.fulfill({ json: { availability: 'not_recorded' } }))
+  await page.route((url) => decodeURIComponent(url.pathname) === '/api/workspace/resources/dataset:dataset-1', async (route) => route.fulfill({
+    json: {
+      resource: {
+        id: 'dataset:dataset-1', kind: 'dataset', name: 'Published column enrichment', resourceId: 'dataset-1',
+        detached: false, source: 'local',
+      },
+      ancestors: [{
+        id: 'container:workspace-local-root', kind: 'container', name: 'Workspace',
+        detached: false, source: 'local',
+      }],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    },
+  }))
   await page.route('**/api/catalog/tables/dataset-1?registration=true', async (route) => route.fulfill({
     json: { ...template, id: 'dataset-1', name: 'Published column enrichment' },
   }))
@@ -323,9 +366,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
   await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
   const exactDataset = page.getByRole('link', { name: 'Open dataset' })
-  await page.getByText('Diagnostics', { exact: true }).click()
-  await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
-  await expect(page.getByText('rev-published')).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
   await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
   await expect(exactDataset).toHaveAttribute(
     'href',

@@ -885,6 +885,8 @@ def test_lineage_graph_reports_fact_count_and_pair_truncation(monkeypatch):
         "parent": root,
         "child": child,
         "factCount": 4,
+        "columns": [],
+        "pipelineNames": [],
     }]
     assert response.json()["truncated"] is True
 

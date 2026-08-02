@@ -113,7 +113,7 @@ export function TopBar() {
   const navigateToWorkspace = (resourceId: string | null | undefined) => {
     const store = useStore.getState()
     if (resourceId === undefined) {
-      // No placement was proven (local draft/unplaced Canvas): retain the existing generic entry.
+      // No placement was proven (local draft/unplaced Canvas): retain the generic entry.
       store.setView('workspace')
       return
     }

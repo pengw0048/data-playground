@@ -787,15 +787,6 @@ function LibraryProcessorDefinition({
           </>
         )}
 
-        <details className="mt-6 rounded-md border border-border bg-card px-3 py-2 text-[11px] text-muted-foreground">
-          <summary className="cursor-pointer font-medium text-foreground">Version details</summary>
-          <div className="mt-2">
-            <div>Processor reference</div>
-            <div className="break-all font-mono text-foreground">
-              {configuredRef ?? 'No processor version selected'}
-            </div>
-          </div>
-        </details>
         <InstalledSourcePanel
           source={installedSource}
           loading={installedSourceLoading}
@@ -824,23 +815,12 @@ function InstalledSourcePanel({
 }) {
   if (source) {
     return (
-      <section aria-label="Installed processor source"
+      <section aria-label="Implementation source"
         className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
-        <div className="font-semibold text-foreground">Installed processor source</div>
-        <div className="mt-1">
-          This is the local implementation installed for this Canvas transform. It does not
-          indicate remote or distributed dispatch.
-        </div>
+        <div className="font-semibold text-foreground">Implementation source</div>
         <pre className="mt-3 max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground">
           <code>{source.source}</code>
         </pre>
-        <details className="mt-2">
-          <summary className="cursor-pointer font-medium text-foreground">Developer details</summary>
-          <div className="mt-1">
-            <span className="mr-2 uppercase">{source.language}</span>
-            <span className="break-all font-mono">SHA-256 {source.sha256}</span>
-          </div>
-        </details>
       </section>
     )
   }
@@ -856,7 +836,7 @@ function InstalledSourcePanel({
     return (
       <div role="alert"
         className="mt-6 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-[11.5px] text-destructive">
-        <div className="font-semibold">Installed processor source could not be loaded</div>
+        <div className="font-semibold">Implementation source could not be loaded</div>
         <div className="mt-1">{error}</div>
       </div>
     )

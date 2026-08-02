@@ -22,20 +22,21 @@ describe('FieldEvidenceButton', () => {
   beforeEach(() => { vi.clearAllMocks() })
   afterEach(() => cleanup())
 
-  it('keeps an exact row-reference identity while opening the resolved current catalog entry', async () => {
+  it('opens the resolved linked dataset without exposing internal identities', async () => {
     mocks.table.mockResolvedValue({ id: 'stale-collision', registrationId: 'stale-collision', name: 'Wrong current dataset', uri: 'mem://wrong', columns: [] })
     mocks.tableByRegistration.mockResolvedValue({ id: 'customers-registration', registrationId: 'customers registration/1', name: 'Customers (renamed)', uri: 'mem://customers', columns: [] })
     render(<FieldEvidenceButton column={CUSTOMER} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
-    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('customers-logical')
-    expect(screen.getByText('customer-r7')).toBeVisible()
-    expect(screen.getByText('Logical type')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'View details for customer_id' }))
+    const detail = await screen.findByTestId('field-evidence-customer_id')
+    expect(detail).not.toHaveTextContent('customers-logical')
+    expect(detail).not.toHaveTextContent('customer-r7')
+    expect(screen.getByText('Type')).toBeVisible()
     expect(screen.getByText('Nullable')).toBeVisible()
     expect(screen.queryByText('owned by the orders provider')).not.toBeInTheDocument()
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('Customers (renamed)')).toBeVisible())
-    expect(screen.getByRole('link', { name: 'Open current catalog entry' })).toHaveAttribute('href', '#/workspace/dataset%3Acustomers%20registration%2F1')
+    expect(screen.getByRole('link', { name: 'Open linked dataset' })).toHaveAttribute('href', '#/workspace/dataset%3Acustomers%20registration%2F1')
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('customers-logical')
     expect(mocks.table).not.toHaveBeenCalled()
   })
@@ -44,20 +45,20 @@ describe('FieldEvidenceButton', () => {
     mocks.tableByRegistration.mockRejectedValue({ status: 410, message: 'compacted' })
     render(<FieldEvidenceButton column={CUSTOMER} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Target catalog identity is unavailable; no current dataset was substituted.')
-    expect(screen.getByTestId('field-evidence-customer_id')).toHaveTextContent('customers-logical')
-    expect(screen.queryByRole('link', { name: 'Open current catalog entry' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'View details for customer_id' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The linked dataset is no longer available.')
+    expect(screen.getByTestId('field-evidence-customer_id')).not.toHaveTextContent('customers-logical')
+    expect(screen.queryByRole('link', { name: 'Open linked dataset' })).toBeNull()
   })
 
   it('omits unavailable reference and raw annotation copy from a field without evidence', async () => {
     const absent: ColumnSchema = { name: 'legacy_row_id', type: 'int', capabilities: [], provenance: 'inferred' }
     render(<FieldEvidenceButton column={absent} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for legacy_row_id' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View details for legacy_row_id' }))
     const detail = await screen.findByTestId('field-evidence-legacy_row_id')
-    expect(detail).toHaveTextContent('Logical type')
-    expect(detail).not.toHaveTextContent('Row-reference target')
+    expect(detail).toHaveTextContent('Typeint')
+    expect(detail).not.toHaveTextContent('Linked dataset')
     expect(detail).not.toHaveTextContent('Raw annotations')
     expect(detail).not.toHaveTextContent('not supplied')
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()

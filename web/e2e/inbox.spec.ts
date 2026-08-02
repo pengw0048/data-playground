@@ -68,9 +68,10 @@ test('Inbox badge, filter, open job, and redacted outcomes @ux-smoke', async ({ 
   await expect(page.getByTestId('inbox-unread-badge')).toHaveText('3')
   await page.getByTestId('rail-inbox').click()
   await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible()
+  await expect(page.getByText(/background work you started|other people’s activity/)).toHaveCount(0)
   await expect(page.getByText('Climate analysis').first()).toBeVisible()
   await expect(page.getByText('“annual-results” written · 12 rows')).toBeVisible()
-  await expect(page.getByText('external wait deadline')).toBeVisible()
+  await expect(page.getByText('Timed out before completion')).toBeVisible()
   await expect(page.getByText('Cancelled', { exact: true })).toBeVisible()
   await expect(page.getByText(/traceback|secret boom/i)).toHaveCount(0)
 
@@ -111,6 +112,19 @@ test('returns from an exact Inbox dataset to the originating filter @ux-smoke', 
     readAt = '2026-07-20T12:05:00Z'
     await route.fulfill({ json: { ...datasetItem, readAt } })
   })
+  await page.route((url) => decodeURIComponent(url.pathname) === '/api/workspace/resources/dataset:dataset-inbox', async (route) => route.fulfill({
+    json: {
+      resource: {
+        id: 'dataset:dataset-inbox', kind: 'dataset', name: 'Inbox upserts', resourceId: 'dataset-inbox',
+        detached: false, source: 'local',
+      },
+      ancestors: [{
+        id: 'container:workspace-local-root', kind: 'container', name: 'Workspace',
+        detached: false, source: 'local',
+      }],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    },
+  }))
   await page.route('**/api/catalog/tables/dataset-inbox?registration=true', async (route) => route.fulfill({
     json: { ...template, id: 'dataset-inbox', name: 'Inbox upserts' },
   }))

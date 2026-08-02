@@ -78,7 +78,7 @@ test('auth bootstrap stays fenced while unavailable and recovers on Retry withou
   await page.goto('/')
 
   await expect(page.getByRole('heading', { name: 'Connection unavailable' })).toBeVisible()
-  await expect(page.getByText('Checked 3 times.')).toBeVisible()
+  await expect(page.getByText('Tried 3 times.')).toBeVisible()
   await expect(page.getByTestId('toolbar')).toHaveCount(0)
   expect(authRequests).toBe(3)
   expect(bootstrapRequests).toBe(0)

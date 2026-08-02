@@ -297,7 +297,17 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
 
     class Provider:
         def capabilities(self, _mount):
-            return ProviderCapabilities(lineage=True)
+            return ProviderCapabilities(search=True, lineage=True)
+
+        def search(self, _mount, query, *, limit, cursor=None):
+            assert query == "raw_video_v1" and limit == 100 and cursor is None
+            return ProviderSearchPage(items=[CatalogResource(
+                placement_id=f"placement-{suffix}",
+                kind="dataset",
+                name="raw_video_v1",
+                dataset_id=f"parent-{suffix}",
+                uri=physical_parent,
+            )])
 
         def list_children(self, *_args, **_kwargs):
             return ProviderPage()
@@ -371,6 +381,21 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
         "raw_video_v1", "raw_video_v2",
     }
     assert "secret-bucket" not in response.text
+
+    resolved = workspace_providers.resolve_provider_lineage_resource(
+        source_uri, graph.nodes[0].uri, "raw_video_v1", uid="local")
+    assert resolved["kind"] == "dataset" and resolved["name"] == "raw_video_v1"
+    assert "secret-bucket" not in json.dumps(resolved, default=str)
+
+    with TestClient(app) as client:
+        opened = client.get("/api/workspace/lineage/resolve", params={
+            "rootUri": source_uri,
+            "nodeUri": graph.nodes[0].uri,
+            "name": "raw_video_v1",
+        })
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["name"] == "raw_video_v1"
+    assert "secret-bucket" not in opened.text
 
 
 def test_bounded_pages_reject_overlimit_and_nonadvancing_cursors():

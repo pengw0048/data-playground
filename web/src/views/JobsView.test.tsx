@@ -42,7 +42,7 @@ describe('JobsView', () => {
     render(<JobsView />)
     expect(screen.getByText('Loading Jobs…')).toBeVisible()
     await act(async () => { finish?.({ items: [], hasMore: false, nextCursor: null }) })
-    expect(screen.getByText('No Jobs match these filters.')).toBeVisible()
+    expect(screen.getByText('No jobs match these filters.')).toBeVisible()
   })
 
   it('shows normalized workspace history and stable canvas/node links', async () => {
@@ -61,6 +61,20 @@ describe('JobsView', () => {
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(screen.queryByText('Last durable update:')).not.toBeInTheDocument()
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
+  })
+
+  it('turns a known engine exception into an actionable failure message', async () => {
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ error: 'LocalRunInputError: local run input revision is unavailable' })],
+      hasMore: false,
+      nextCursor: null,
+    })
+
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+
+    expect(screen.getByRole('alert')).toHaveTextContent('An input dataset version used by this run is no longer available.')
+    expect(screen.queryByText(/LocalRunInputError/)).not.toBeInTheDocument()
   })
 
   it('keeps the differentiating suffix and full tooltip for long shared-prefix canvas names', async () => {
@@ -159,6 +173,28 @@ describe('JobsView', () => {
     } finally {
       now.mockRestore()
     }
+  })
+
+  it('defaults to my jobs and can include visible jobs from all users', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ isMine: true })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({
+        items: [
+          job({ isMine: true }),
+          job({ id: 'history-2', runId: 'run-2', isMine: false, createdById: 'peer', createdByName: 'Ada' }),
+        ],
+        hasMore: false,
+        nextCursor: null,
+      })
+    render(<JobsView />)
+
+    await screen.findByText('Alpha research')
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(1, expect.not.objectContaining({ scope: 'all' }))
+    fireEvent.click(screen.getByTestId('jobs-scope-all'))
+
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('scope=all'))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ scope: 'all' })))
+    expect(await screen.findByText(/Ada/)).toBeVisible()
   })
 
   it('keeps internal run evidence out of the user-facing Job detail', async () => {
@@ -278,8 +314,8 @@ describe('JobsView', () => {
     await screen.findAllByText('Research')
     expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by canvas step id')).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by run mode')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by step')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by compute target')).toBeVisible()
 
     fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
@@ -293,9 +329,9 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
     render(<JobsView />)
 
-    expect(await screen.findByRole('option', { name: 'Canvas ID from link: not-accessible' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by canvas step id')).toHaveValue('exact-node')
-    expect(screen.getByLabelText('Filter jobs by run mode')).toHaveValue('exact-backend')
+    expect(await screen.findByRole('option', { name: 'Canvas from link (not in this list)' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by step')).toHaveValue('exact-node')
+    expect(screen.getByLabelText('Filter jobs by compute target')).toHaveValue('exact-backend')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: 'not-accessible', nodeId: 'exact-node', backend: 'exact-backend', limit: 50,
     })))
@@ -305,7 +341,7 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'node=orphan-node' } as never)
     render(<JobsView />)
 
-    const nodeFilter = await screen.findByLabelText('Filter jobs by canvas step id')
+    const nodeFilter = await screen.findByLabelText('Filter jobs by step')
     expect(nodeFilter).toHaveValue('orphan-node')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: undefined, nodeId: 'orphan-node', limit: 50,

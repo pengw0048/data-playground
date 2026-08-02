@@ -731,7 +731,7 @@ describe('WorkspaceExplorer', () => {
       completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: "Items are shown in the connected source's order. This source does not support sorting or type filters.",
+        reason: 'This connected source controls sorting and filters.',
       },
     })
     render(<WorkspaceExplorer />)
@@ -740,7 +740,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('option', { name: 'Source order' })).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      "Items are shown in the connected source's order. This source does not support sorting or type filters.",
+      'This connected source controls sorting and filters.',
     )
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
@@ -763,7 +763,7 @@ describe('WorkspaceExplorer', () => {
       sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: 'This folder includes connected-source items and local Canvases. Sorting and type filters are unavailable because the source controls its result order.',
+        reason: 'This connected source controls sorting and filters.',
       },
     })
     render(<WorkspaceExplorer />)
@@ -773,7 +773,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
     expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
     expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      'This folder includes connected-source items and local Canvases',
+      'This connected source controls sorting and filters.',
     )
   })
 

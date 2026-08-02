@@ -46,7 +46,7 @@ const DATASET_VIEWER_QUERY_KEYS = [
   'revision', 'revisionDataset', 'returnCanvas', 'returnNode', 'returnView', 'returnQuery',
 ] as const
 const DATASET_VIEWER_RETURN_QUERY_KEYS = {
-  jobs: ['status', 'canvas', 'node', 'backend', 'after', 'before', 'q', 'run', 'output', 'report', 'compare'],
+  jobs: ['scope', 'status', 'canvas', 'node', 'backend', 'after', 'before', 'q', 'run', 'output', 'report', 'compare'],
   inbox: ['filter'],
 } as const
 

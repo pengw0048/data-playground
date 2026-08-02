@@ -1,5 +1,5 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
-import { goToWorkspace, workspaceResource } from './support/workspace'
+import { createCanvasFromWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
 const workspaceRoot = /\/api\/workspace\/containers\/workspace-local-root(?:\?|$)/
@@ -19,15 +19,11 @@ async function namedTable(request: APIRequestContext, name: string) {
 }
 
 async function freshSource(page: Page, uri: string) {
-  await page.goto('/')
-  const previous = await page.evaluate(() => location.hash)
-  await page.getByTestId('app-menu').click()
-  await page.getByText('New Canvas').click()
-  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await createCanvasFromWorkspace(page)
   await page.getByRole('button', { name: 'Sources & sinks', exact: true }).click()
   await page.locator('.dp-panel', { hasText: 'source' }).last().getByText('source', { exact: true }).click()
   const inspector = page.getByTestId('inspector')
-  await inspector.getByText('Advanced source configuration', { exact: true }).click()
+  await inspector.getByText('Manual source settings', { exact: true }).click()
   await inspector.getByLabel('Dataset URI').fill(uri)
   return inspector
 }
@@ -52,7 +48,7 @@ test.describe('full researcher acceptance matrix', () => {
     await page.getByRole('button', { name: 'Back to Workspace', exact: true }).click()
     await openWorkspaceTable(page, left.name)
     await page.getByTestId('detail-relationships').click()
-    await expect(page.getByText('Relationships', { exact: true })).toBeVisible()
+    await expect(page.getByText('Lineage', { exact: true }).first()).toBeVisible()
     await page.getByTestId('er-mode-joins').click()
     await expect(page.locator('.react-flow__node', { hasText: left.name })).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: right.name })).toBeVisible()
@@ -92,10 +88,13 @@ test.describe('full researcher acceptance matrix', () => {
       if (route.request().method() !== 'POST') return route.continue()
       return route.fulfill({ status: 403, body: JSON.stringify({ detail: 'forbidden' }) })
     }
-    await page.route('**/api/canvas', denyNewCanvas)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('New Canvas').click()
-    await expect(page.getByTestId('toast').filter({ hasText: 'permission' })).toContainText('permission')
-    await page.unroute('**/api/canvas', denyNewCanvas)
+    await goToWorkspace(page)
+    await page.route('**/api/workspace/canvases', denyNewCanvas)
+    await page.getByRole('button', { name: 'Create canvas', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Create canvas' })
+    await dialog.getByLabel('Canvas name').fill('Denied Canvas')
+    await dialog.getByRole('button', { name: 'Create canvas', exact: true }).click()
+    await expect(dialog.getByRole('alert')).toContainText('forbidden')
+    await page.unroute('**/api/workspace/canvases', denyNewCanvas)
   })
 })

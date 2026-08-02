@@ -42,10 +42,6 @@ function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle
   return 'error'
 }
 
-function versionSummary(value: string): string {
-  return value.length > 24 ? 'Selected version' : `Version ${value}`
-}
-
 function countSummary(rowCount: number | null | undefined, columnCount: number | null | undefined): string {
   const rows = rowCount == null ? 'Rows unknown' : `${rowCount.toLocaleString()} ${rowCount === 1 ? 'row' : 'rows'}`
   const columns = columnCount == null ? 'columns unknown' : `${columnCount} ${columnCount === 1 ? 'column' : 'columns'}`
@@ -222,13 +218,13 @@ function Source({ id, data }: NodeComponentProps) {
   }
 
   // A card is for choosing and orienting.  It deliberately names one source, one version state,
-  // and one count/schema summary; opaque identities belong in Inspector → Connection details.
+  // and one count/schema summary; source details belong in Inspector → Data details.
   const sourceLabel = providerBinding ? data.config.providerName ?? 'Provider' : 'Datasets'
   const meta = datasetParameter
     ? `${sourceLabel} · Run-time dataset parameter · Rows and columns vary by run`
     : selectedExact
       ? exactDetailState === 'available' && exactDetail
-        ? `${sourceLabel} · ${versionSummary(exactDetail.revisionId)} · ${countSummary(exactDetail.summary.rowCount, exactDetail.preview.columns.length)}`
+        ? `${sourceLabel} · Saved version · ${countSummary(exactDetail.summary.rowCount, exactDetail.preview.columns.length)}`
         : exactDetailState === 'unavailable'
           ? `${sourceLabel} · Selected version unavailable`
           : exactDetailState === 'permission'

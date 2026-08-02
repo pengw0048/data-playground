@@ -325,7 +325,7 @@ describe('RunPanel typed parameter gate', () => {
     } }
     const { rerender } = render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByRole('button', { name: 'Publish version' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Publish output' })).toBeVisible()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
@@ -336,7 +336,7 @@ describe('RunPanel typed parameter gate', () => {
       },
     }
     rerender(<RunPanel nodeId="target" />)
-    expect(screen.getByText('publishing managed revision')).toBeVisible()
+    expect(screen.getByText('publishing dataset')).toBeVisible()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Writing output…')
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
   })
@@ -362,7 +362,7 @@ describe('RunPanel typed parameter gate', () => {
 
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.queryByRole('button', { name: 'Publish version' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Publish output' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Register inputs to publish' })).toBeDisabled()
     expect(screen.getByLabelText('Run readiness')).toHaveTextContent(
       'Fix before running: Register this local input',
@@ -425,7 +425,7 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.getByLabelText('Schema changes')).not.toHaveTextContent('dataset-1@revision-1')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
       'Review schema changes before running.')
-    fireEvent.click(screen.getByRole('button', { name: 'Publish a new version' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Publish output' }))
     expect(mocks.state.run).toHaveBeenCalledWith('target', true)
   })
 
@@ -446,7 +446,7 @@ describe('RunPanel typed parameter gate', () => {
     const { rerender } = render(<RunPanel nodeId="target" />)
 
     expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Publish version' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Publish output' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to run')
 
     mocks.state.runs.target = {
@@ -458,7 +458,7 @@ describe('RunPanel typed parameter gate', () => {
     }
     rerender(<RunPanel nodeId="target" />)
     expect(screen.getByText('running')).toBeVisible()
-    expect(screen.queryByText('publishing managed revision')).not.toBeInTheDocument()
+    expect(screen.queryByText('publishing dataset')).not.toBeInTheDocument()
 
     mocks.state.runs.target = {
       phase: 'done', writeOutcomeAdmission: admission,
@@ -469,7 +469,7 @@ describe('RunPanel typed parameter gate', () => {
     }
     rerender(<RunPanel nodeId="target" />)
     expect(screen.getByText('DONE')).toBeVisible()
-    expect(screen.queryByText('MANAGED REVISION PUBLISHED')).not.toBeInTheDocument()
+    expect(screen.queryByText('DATASET PUBLISHED')).not.toBeInTheDocument()
   })
 
   it('uses the same receipt-backed publication hierarchy after an ordinary Write succeeds', () => {
@@ -502,7 +502,7 @@ describe('RunPanel typed parameter gate', () => {
     expect(publication).toHaveTextContent('Append to the selected dataset')
     expect(publication).toHaveTextContent('Published · results · 2 rows')
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-9')
-    expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
+    expect(screen.getByText('DATASET PUBLISHED')).toBeVisible()
     expect(screen.getByRole('link', { name: 'Open dataset' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()

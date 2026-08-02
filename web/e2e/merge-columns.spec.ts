@@ -136,7 +136,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     const preflight = control.getByLabel('Merge check')
     await expect(preflight).toContainText('Ready to merge saved versions')
     await expect(preflight).toContainText('replacement → replace_me (replace); addition → added_numeric (add)')
-    await expect(preflight).toContainText('Output schema: id: int, untouched_text: string, untouched_numeric: float, replace_me: string, added_numeric: float')
+    await expect(preflight).toContainText('Result columns: id: int, untouched_text: string, untouched_numeric: float, replace_me: string, added_numeric: float')
 
     const submitted = page.waitForResponse((response) => response.url().endsWith('/api/merge-columns')
       && response.request().method() === 'POST')
@@ -156,7 +156,6 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(published.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
       `#/workspace/${encodeURIComponent(`dataset:${final!.datasetId}`)}?${new URLSearchParams({
-        scope: 'datasets',
         revision: final!.revisionId,
         revisionDataset: final!.datasetId,
         returnCanvas: canvasId,
@@ -168,13 +167,11 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
     const job = page.getByRole('button', { name: `Open run ${task.taskId} in Issue 585 exact merge canvas` })
     await expect(job).toBeVisible()
-    await page.getByText('Diagnostics', { exact: true }).click()
-    await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
+    await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     const exactDataset = page.getByRole('link', { name: 'Open dataset' })
     await expect(exactDataset).toHaveAttribute(
       'href',
       `#/workspace/${encodeURIComponent(`dataset:${final!.datasetId}`)}?${new URLSearchParams({
-        scope: 'datasets',
         revision: final!.revisionId,
         revisionDataset: final!.datasetId,
         returnView: 'jobs',
@@ -183,15 +180,8 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     )
     await exactDataset.click()
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
-    const datasetDetails = page.getByTestId('detail-dataset-details')
-    await datasetDetails.locator('summary').click()
-    await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
-      `${final!.datasetId}@${final!.revisionId}`,
-    )
-    const revisionTechnicalDetails = page.getByTestId('revision-technical-details')
-    await revisionTechnicalDetails.locator('summary').click()
-    await expect(revisionTechnicalDetails.getByText('Parent revision', { exact: true })).toBeVisible()
-    await expect(revisionTechnicalDetails.getByText(base.revisionId, { exact: true })).toBeVisible()
+    await expect(page.getByTestId('dataset-version-context')).toHaveText('Current version')
+    await expect(page.getByTestId('dataset-viewer')).not.toContainText(`${final!.datasetId}@${final!.revisionId}`)
     await page.getByTestId('dataset-viewer').getByRole('button', { name: 'Back to Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${encodeURIComponent(task.taskId)}$`))
     await expect(job).toHaveAttribute('aria-expanded', 'true')

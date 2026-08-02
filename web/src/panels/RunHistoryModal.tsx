@@ -6,7 +6,6 @@ import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
 import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
@@ -77,10 +76,17 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                       }}>
                       View in Jobs
                     </Button>}
+                    {(r.executionManifestAvailability === 'available' || r.executionManifestSha256) && (
+                      <Button size="sm" variant="ghost" className="h-7 shrink-0 px-2 text-[10.5px]"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setCopySource({ canvasId, subjectId: r.id, name: useStore.getState().doc.name ?? 'Untitled canvas' })
+                        }}>
+                        Create Canvas from run
+                      </Button>
+                    )}
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
-                  <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r}
-                    onClone={() => setCopySource({ canvasId, subjectId: r.id, name: useStore.getState().doc.name ?? 'Untitled canvas' })} />
                   {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}

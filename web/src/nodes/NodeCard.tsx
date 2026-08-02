@@ -27,7 +27,7 @@ import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
 const KINDS_WITH_CODE = new Set(['transform', 'sql'])
-const fmtMs = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`)
+const fmtMs = (ms: number) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`)
 
 export function NodeCard({ id, data, children, metaOverride }: {
   id: string

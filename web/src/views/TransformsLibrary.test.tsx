@@ -121,10 +121,13 @@ describe('TransformsLibrary', () => {
 
     render(<TransformsLibrary />)
 
-    await screen.findByText("row['score'] = 1", { exact: false })
+    const sourceCode = await screen.findByText("row['score'] = 1", { exact: false })
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent("row['score'] = 1")
-    expect(source).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
+    expect(source).not.toHaveTextContent('SHA-256')
+    expect(sourceCode).not.toBeVisible()
+    fireEvent.click(screen.getByText('Implementation source'))
+    expect(sourceCode).toBeVisible()
     expect(mocks.installedProcessorSource).toHaveBeenCalledWith('tr_exact', 'v1')
   })
 
@@ -154,7 +157,7 @@ describe('TransformsLibrary', () => {
     await screen.findByText('def processor_factory(params)', { exact: false })
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent('def processor_factory(params)')
-    expect(source).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)
+    expect(source).not.toHaveTextContent('SHA-256')
     expect(mocks.installedProcessorSource).toHaveBeenCalledWith(luma.id, luma.version)
   })
 
@@ -193,18 +196,21 @@ describe('TransformsLibrary', () => {
         : new Promise((resolve) => { resolveV2 = resolve })
     ))
     const { rerender } = render(<TransformsLibrary />)
-    expect(await screen.findByText('SOURCE_FROM_V1')).toBeVisible()
+    const sourceV1 = await screen.findByText('SOURCE_FROM_V1')
+    expect(sourceV1).not.toBeVisible()
+    fireEvent.click(screen.getByText('Implementation source'))
+    expect(sourceV1).toBeVisible()
 
     store.transformVersion = 'v2'
     rerender(<TransformsLibrary />)
 
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
-    expect(await screen.findByText('Loading implementation source…')).toBeVisible()
+    expect(await screen.findByText('Loading implementation source…')).not.toBeVisible()
     resolveV2?.({
       processorId: 'tr_exact', version: 'v2', language: 'python',
       source: 'SOURCE_FROM_V2', sha256: '2'.repeat(64),
     })
-    expect(await screen.findByText('SOURCE_FROM_V2')).toBeVisible()
+    expect(await screen.findByText('SOURCE_FROM_V2')).not.toBeVisible()
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
   })
 
@@ -282,8 +288,21 @@ describe('TransformsLibrary', () => {
 
     const toolbar = screen.getByRole('group', { name: 'Transform filters' })
     expect(toolbar).toHaveClass('xl:grid-cols-[minmax(220px,1fr)_130px_105px_120px]')
-    expect(within(toolbar).getAllByRole('textbox')).toHaveLength(3)
+    expect(within(toolbar).getAllByRole('textbox')).toHaveLength(2)
     expect(within(toolbar).getByRole('combobox', { name: 'Transform source' })).toBeVisible()
+    expect(within(toolbar).getByRole('combobox', { name: 'Transform behavior' })).toBeVisible()
+  })
+
+  it('uses one actionable empty state when the library has no Transforms', async () => {
+    store.transformResourceId = null as never
+    store.transformVersion = null as never
+    mocks.transformLibrary.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByText('No transforms yet.')).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open Workspace' })).toHaveAttribute('href', '#/workspace')
+    expect(screen.queryByRole('region', { name: 'Transform detail' })).not.toBeInTheDocument()
   })
 
   it('configures an explicit blank Transform in place without opening the generic chooser', async () => {

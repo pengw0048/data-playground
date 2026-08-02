@@ -579,7 +579,7 @@ function WorkspaceMixedExplorer() {
       setConnectedSources(page.connectedSources ?? [])
       const capabilities = page.queryCapabilities ?? (localSource
         ? LOCAL_QUERY_CAPABILITIES
-        : { sort: [], kindFilter: false, reason: "Items are shown in the connected source's order. This source does not support sorting or type filters." })
+        : { sort: [], kindFilter: false, reason: 'This connected source controls sorting and filters.' })
       setQueryCapabilities(capabilities)
       if (!capabilities.sort.length && sortMode !== 'source') setSortMode('source')
       if (!capabilities.kindFilter && kindFilter !== 'all') setKindFilter('all')
@@ -961,6 +961,7 @@ function WorkspaceMixedExplorer() {
 
   if (selectedTable) return <>
     <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
+      workspaceResourceId={selectedDataset?.id}
       initialRevisionId={providerViewerRoute.exactRevision?.revisionId}
       initialRevisionDatasetId={providerViewerRoute.exactRevision?.datasetId}
       backLabel={datasetViewerBackLabel(providerViewerRoute.viewerReturn)}
@@ -2248,6 +2249,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   const openLineageGraph = () => {
     if (!canonicalContext?.sourceUri) return
     openRelationships(canonicalContext.sourceUri, {
+      focusDatasetId: resource.id,
       mode: 'lineage',
       returnTo: {
         resourceId: resource.id,

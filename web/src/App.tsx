@@ -26,7 +26,7 @@ type AuthState =
   | { kind: 'local' }
   | { kind: 'authenticated'; userId: string }
   | { kind: 'login' }
-  | { kind: 'unavailable'; attempts: number; diagnostic: string }
+  | { kind: 'unavailable'; attempts: number }
 
 const AUTH_BOOTSTRAP_ATTEMPTS = 3
 const AUTH_RETRY_DELAY_MS = 250
@@ -35,11 +35,6 @@ function isAuthStatus(value: unknown): value is { authEnabled: boolean; userId: 
   if (!value || typeof value !== 'object') return false
   const status = value as Record<string, unknown>
   return typeof status.authEnabled === 'boolean' && (typeof status.userId === 'string' || status.userId === null)
-}
-
-function authDiagnostic(error: unknown) {
-  if (error instanceof Error && error.message) return error.message
-  return 'The auth status response is incompatible with this app version.'
 }
 
 function AuthBootstrapUnavailable({ state, onRetry }: {
@@ -51,9 +46,9 @@ function AuthBootstrapUnavailable({ state, onRetry }: {
       <section className="w-full max-w-md rounded-lg border border-border bg-card p-6 shadow-lg" aria-labelledby="auth-bootstrap-title">
         <h1 id="auth-bootstrap-title" className="text-base font-semibold text-foreground">Connection unavailable</h1>
         <p role="alert" className="mt-2 text-sm leading-6 text-muted-foreground">
-          Data Playground could not confirm whether this server uses local or signed-in access. Local Canvas drafts remain in this browser, but server identity, permissions, and Canvas state are unknown.
+          Data Playground could not connect. Local Canvas drafts remain in this browser.
         </p>
-        <p className="mt-3 text-xs text-muted-foreground">Checked {state.attempts} times. Last attempt: {state.diagnostic}</p>
+        <p className="mt-3 text-xs text-muted-foreground">Tried {state.attempts} times.</p>
         <Button className="mt-5" onClick={onRetry}>Retry connection</Button>
       </section>
     </main>
@@ -77,7 +72,6 @@ export default function App() {
   const checkAuth = useCallback(async () => {
     const generation = ++requestGeneration.current
     setAuth({ kind: 'checking' })
-    let diagnostic = 'Auth status is unavailable.'
     for (let attempt = 1; attempt <= AUTH_BOOTSTRAP_ATTEMPTS; attempt += 1) {
       try {
         const status: unknown = await api.authStatus()
@@ -88,8 +82,7 @@ export default function App() {
         setAuth(!status.authEnabled ? { kind: 'local' }
           : status.userId ? { kind: 'authenticated', userId: status.userId } : { kind: 'login' })
         return
-      } catch (error) {
-        diagnostic = authDiagnostic(error)
+      } catch {
         if (attempt < AUTH_BOOTSTRAP_ATTEMPTS) {
           await new Promise((resolve) => window.setTimeout(resolve, AUTH_RETRY_DELAY_MS))
           if (generation !== requestGeneration.current) return
@@ -101,7 +94,7 @@ export default function App() {
       // Re-enter only that mode while the hub is down so its Canvas drafts can survive a full reload.
       // Signed-in deployments never use this fallback: identity/logout must be re-confirmed online.
       if (confirmedLocalMode()) setAuth({ kind: 'local' })
-      else setAuth({ kind: 'unavailable', attempts: AUTH_BOOTSTRAP_ATTEMPTS, diagnostic })
+      else setAuth({ kind: 'unavailable', attempts: AUTH_BOOTSTRAP_ATTEMPTS })
     }
   }, [])
 

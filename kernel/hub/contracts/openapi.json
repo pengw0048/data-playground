@@ -6183,6 +6183,16 @@
             "title": "Child",
             "type": "string"
           },
+          "columns": {
+            "items": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Columns",
+            "type": "array"
+          },
           "factCount": {
             "minimum": 1.0,
             "title": "Factcount",
@@ -6191,6 +6201,16 @@
           "parent": {
             "title": "Parent",
             "type": "string"
+          },
+          "pipelineNames": {
+            "items": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Pipelinenames",
+            "type": "array"
           }
         },
         "required": [
@@ -13385,6 +13405,30 @@
             ],
             "title": "Createdat"
           },
+          "createdById": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdbyid"
+          },
+          "createdByName": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdbyname"
+          },
           "datasetContext": {
             "anyOf": [
               {
@@ -13489,6 +13533,11 @@
               }
             ],
             "title": "Inputmanifest"
+          },
+          "isMine": {
+            "default": true,
+            "title": "Ismine",
+            "type": "boolean"
           },
           "jobType": {
             "enum": [
@@ -23043,6 +23092,20 @@
           },
           {
             "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "mine",
+              "enum": [
+                "mine",
+                "all"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "status",
             "required": false,
             "schema": {
@@ -28739,6 +28802,109 @@
           }
         },
         "summary": "Rename Workspace Folder"
+      }
+    },
+    "/api/workspace/lineage/resolve": {
+      "get": {
+        "description": "Open one clicked provider-lineage node as an ordinary Workspace dataset.",
+        "operationId": "resolve_workspace_lineage_resource_api_workspace_lineage_resolve_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "rootUri",
+            "required": true,
+            "schema": {
+              "maxLength": 1024,
+              "title": "Rooturi",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "nodeUri",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "title": "Nodeuri",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Resolve Workspace Lineage Resource"
       }
     },
     "/api/workspace/placements/{placement_id}/canvas": {

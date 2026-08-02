@@ -41,6 +41,7 @@ from hub.models import (
     WorkspaceBrowsePage,
     WorkspaceCanonicalDatasetContext,
     WorkspaceProviderSource,
+    WorkspaceResource,
     WorkspaceResourceResolution,
     WorkspaceProviderRelinkRequest,
     WorkspaceProviderRelinkResult,
@@ -842,6 +843,28 @@ def canonical_workspace_provider_dataset(
     except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
         _provider_dataset_action_error(exc)
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
+
+
+@router.get("/workspace/lineage/resolve", response_model=WorkspaceResource)
+def resolve_workspace_lineage_resource(
+        root_uri: str = Query(..., alias="rootUri", max_length=1024),
+        node_uri: str = Query(..., alias="nodeUri", max_length=128),
+        name: str = Query(..., max_length=512),
+        uid: str = Depends(current_user)) -> dict:
+    """Open one clicked provider-lineage node as an ordinary Workspace dataset."""
+    try:
+        return workspace_providers.resolve_provider_lineage_resource(
+            root_uri, node_uri, name, uid=uid)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except workspace_providers.ProviderDatasetLineageUnsupported as exc:
+        raise HTTPException(501, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.get(
@@ -1749,6 +1772,7 @@ def execution_manifest_detail(
 def workspace_jobs(
         limit: int = Query(default=50, ge=1, le=100),
         cursor: str | None = Query(default=None, max_length=4096),
+        scope: Literal["mine", "all"] = Query(default="mine"),
         status: Literal["queued", "running", "done", "failed", "cancelled"] | None = None,
         canvas_id: str | None = Query(default=None, max_length=512),
         node_id: str | None = Query(default=None, max_length=256),
@@ -1770,6 +1794,7 @@ def workspace_jobs(
             uid, limit=limit, cursor=cursor, status=status,
             canvas_id=canvas_id, node_id=node_id, run_id=run_id, backend=backend,
             recorded_after=after, recorded_before=before, text=q,
+            owned_only=(scope == "mine"),
         )
         return WorkspaceRunPage.model_validate(page)
     except ValueError as exc:

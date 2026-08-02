@@ -147,6 +147,15 @@ def test_workspace_jobs_show_only_the_callers_work_on_a_shared_canvas():
         f"mine-{suffix}",
     ]
 
+    all_visible = WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(uid, owned_only=False))
+    shared = [item for item in all_visible.items if item.canvas_id == canvas_id]
+    assert {item.run_id for item in shared} == {f"mine-{suffix}", f"other-{suffix}"}
+    by_run = {item.run_id: item for item in shared}
+    assert by_run[f"mine-{suffix}"].is_mine is True
+    assert by_run[f"other-{suffix}"].is_mine is False
+    assert by_run[f"other-{suffix}"].created_by_name == "Jobs stranger"
+
 
 def test_workspace_jobs_keep_the_durable_backend_attempt_after_live_state_pruning():
     uid, suffix = _identity()
@@ -287,6 +296,11 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
 
     assert WorkspaceRunPage.model_validate(
         metadb.list_workspace_runs(viewer, run_id=task["id"])).items == []
+    visible_to_peer = WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(viewer, run_id=task["id"], owned_only=False)).items[0]
+    assert visible_to_peer.is_mine is False
+    assert visible_to_peer.can_cancel is False
+    assert visible_to_peer.can_retry is False
 
 
 def test_workspace_jobs_route_enforces_visibility_and_rejects_bad_cursor():
@@ -300,6 +314,9 @@ def test_workspace_jobs_route_enforces_visibility_and_rejects_bad_cursor():
     assert response.status_code == 200, response.text
     page = WorkspaceRunPage.model_validate(response.json())
     assert page.items and page.items[0].canvas_id == canvas_id
+    all_response = client.get(
+        "/api/jobs", params={"scope": "all"}, headers={"X-DP-User": uid})
+    assert all_response.status_code == 200, all_response.text
     bad = client.get("/api/jobs?cursor=not-a-cursor", headers={"X-DP-User": uid})
     assert bad.status_code == 422
     bad_padding = client.get("/api/jobs?cursor=a", headers={"X-DP-User": uid})

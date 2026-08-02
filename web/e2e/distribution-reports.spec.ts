@@ -88,14 +88,14 @@ async function openTerminalReport(page: Page, reportId: string, viewName: string
   await expect(page).toHaveURL(new RegExp(`#\/distribution-reports\/${reportId}$`))
   await expect(page.getByRole('heading', { name: viewName })).toBeVisible()
   await expect(page.getByText('done', { exact: true })).toBeVisible({ timeout: 20_000 })
-  await expect(page.getByText('Coverage before distributions')).toBeVisible()
-  await expect(page.getByText(/complete for this view/)).toBeVisible()
+  await expect(page.getByText('Report coverage')).toBeVisible()
+  await expect(page.getByText(/scanned every row selected/)).toBeVisible()
 
   await page.goto(`/#/distribution-reports/${encodeURIComponent(reportId)}`)
   await expect(page).toHaveURL(new RegExp(`#\/distribution-reports\/${reportId}$`))
   await expect(page.getByRole('heading', { name: viewName })).toBeVisible()
   await expect(page.getByText('done', { exact: true })).toBeVisible()
-  await expect(page.getByText('Coverage before distributions')).toBeVisible()
+  await expect(page.getByText('Report coverage')).toBeVisible()
 }
 
 async function waitForCompletedReport(page: Page, reportId: string) {
@@ -160,8 +160,8 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     const compareUrl = `/#/distribution-reports/${encodeURIComponent(knownSmall.reportId)}?compare=${encodeURIComponent(secondKnownSmall.reportId)}`
     await page.goto(compareUrl)
     await expect(page.getByLabel('Compare with saved report')).toHaveValue(secondKnownSmall.reportId)
-    await expect(page.getByText('Coverage before comparison')).toBeVisible()
-    await expect(page.getByText('Server-authorized deltas (comparison − current)').first()).toBeVisible()
+    await expect(page.getByText('Comparison coverage')).toBeVisible()
+    await expect(page.getByText('Change (comparison − current)').first()).toBeVisible()
 
     const examplesResponse = page.waitForResponse((response) =>
       response.url().startsWith(`${new URL(page.url()).origin}/api/distribution-reports/${knownSmall.reportId}/sections/`)
@@ -175,24 +175,21 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     const drawer = page.getByRole('dialog', { name: 'Bucket examples' })
     await expect(drawer).toContainText(`${examples.bucketKind} bucket`)
     await expect(drawer).toContainText(`Showing ${examples.returnedRows} of up to ${examples.rowLimit} bounded example rows`)
-    await drawer.getByText('Diagnostics').click()
-    await expect(drawer).toContainText(knownSmall.reportId)
-    await expect(drawer).toContainText(view.id)
-    await expect(drawer).toContainText(examples.datasetId)
-    await expect(drawer).toContainText(examples.revisionId)
-    await expect(drawer).toContainText(examples.sectionId)
-    await expect(drawer).toContainText(examples.bucketId)
+    await expect(drawer.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(drawer).not.toContainText(knownSmall.reportId)
+    await expect(drawer).not.toContainText(examples.datasetId)
+    await expect(drawer).not.toContainText(examples.revisionId)
     expect(examples.rows.length).toBeLessThanOrEqual(examples.rowLimit)
     await drawer.getByRole('button', { name: 'Close' }).click()
 
     await page.reload()
     await expect(page).toHaveURL(new RegExp(`#\\/distribution-reports\\/${knownSmall.reportId}\\?compare=${secondKnownSmall.reportId}$`))
-    await expect(page.getByText('Coverage before comparison')).toBeVisible()
+    await expect(page.getByText('Comparison coverage')).toBeVisible()
     await page.getByRole('button', { name: 'Close' }).click()
     await expect(page).toHaveURL(/#\/jobs$/)
     await page.goBack()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?report=${knownSmall.reportId}&compare=${secondKnownSmall.reportId}$`))
-    await expect(page.getByText('Coverage before comparison')).toBeVisible()
+    await expect(page.getByText('Comparison coverage')).toBeVisible()
     await page.goForward()
     await expect(page).toHaveURL(/#\/jobs$/)
 
@@ -243,7 +240,7 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     const crossViewSelect = page.getByLabel('Compare with saved report')
     await expect(crossViewSelect).toHaveValue(confirmed.reportId)
     await expect(crossViewSelect.locator('option:checked')).toHaveText(/^Linked report · /)
-    await expect(page.getByText('Coverage before comparison')).toBeVisible()
+    await expect(page.getByText('Comparison coverage')).toBeVisible()
   } finally {
     if (view) await page.request.delete(`/api/dataset-views/${encodeURIComponent(view.id)}`)
     if (largeView) await page.request.delete(`/api/dataset-views/${encodeURIComponent(largeView.id)}`)

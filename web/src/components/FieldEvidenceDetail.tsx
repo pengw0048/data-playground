@@ -15,9 +15,9 @@ function fact(value: string | boolean | null | undefined, unknown = 'not supplie
 
 function unavailableTarget(error: unknown) {
   const code = status(error)
-  if (code === 403) return 'Target catalog identity is unavailable: access is denied.'
-  if (code === 404 || code === 410) return 'Target catalog identity is unavailable; no current dataset was substituted.'
-  return `Target catalog identity could not be resolved: ${message(error)}`
+  if (code === 403) return 'The linked dataset is unavailable: access denied.'
+  if (code === 404 || code === 410) return 'The linked dataset is no longer available.'
+  return `The linked dataset could not be opened: ${message(error)}`
 }
 
 /**
@@ -36,8 +36,8 @@ export function FieldEvidenceButton({ column, className, label, marker = false }
   const hasEvidence = !!column.rowReference || !!column.annotations?.length
   return <>
     <button ref={anchor} type="button" onClick={(event) => { event.stopPropagation(); setOpen((value) => !value) }}
-      aria-expanded={open} aria-label={`Inspect evidence for ${column.name}`}
-      title={hasEvidence ? `Inspect field evidence for ${column.name}` : `Inspect field details for ${column.name}`}
+      aria-expanded={open} aria-label={`View details for ${column.name}`}
+      title={hasEvidence ? `View field details and linked dataset for ${column.name}` : `View field details for ${column.name}`}
       className={className ?? 'rounded px-1 text-left hover:bg-accent'}>
       {marker && column.rowReference ? <span aria-hidden="true" className="mr-1 text-primary">↗</span> : null}
       {label ?? column.name}
@@ -76,25 +76,23 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
       <div className="dp-mono break-all text-[12px] font-semibold text-foreground">{column.name}</div>
     </div>
 
-    <EvidenceSection title="Field detail">
+    <EvidenceSection title="Field details">
       <Facts values={[
-        ['Logical type', column.type],
+        ['Type', column.type],
         ...(column.nullable != null ? [['Nullable', fact(column.nullable)]] as Array<[string, string]> : []),
       ]} />
     </EvidenceSection>
 
-    {reference && <EvidenceSection title="Row-reference target">
+    {reference && <EvidenceSection title="Linked dataset">
         <Facts values={[
-          ['Target dataset', reference.target.datasetId],
-          ...(reference.target.kind === 'exact' ? [['Target version', reference.target.revisionId]] as Array<[string, string]> : []),
           ['Key columns', reference.keyFields.join(', ')],
           ...(reference.semanticType != null ? [['Semantic type', reference.semanticType]] as Array<[string, string]> : []),
         ]} />
-        {targetState === 'loading' && <div role="status" className="text-muted-foreground">Resolving current catalog display…</div>}
+        {targetState === 'loading' && <div role="status" className="text-muted-foreground">Opening linked dataset…</div>}
         {targetState === 'unavailable' && <div role="alert" className="rounded border border-destructive/30 bg-destructive/5 p-1.5 text-destructive">{targetError}</div>}
         {target && <div className="rounded border border-border bg-muted/30 p-1.5">
-          <div>Current catalog entry: <strong>{target.name}</strong></div>
-          <a href={`#/workspace/${encodeURIComponent(`dataset:${target.registrationId ?? target.id}`)}`} className="mt-1 inline-block font-semibold text-primary underline">Open current catalog entry</a>
+          <div><strong>{target.name}</strong></div>
+          <a href={`#/workspace/${encodeURIComponent(`dataset:${target.registrationId ?? target.id}`)}`} className="mt-1 inline-block font-semibold text-primary underline">Open linked dataset</a>
         </div>}
     </EvidenceSection>}
   </div>

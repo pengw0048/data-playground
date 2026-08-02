@@ -46,6 +46,7 @@ function delta(current?: number | null, parent?: number | null) {
 export function DatasetRevisionHistory({
   table, initialRevisionId, initialRevisionDatasetId, detailsInViewer = false,
   viewerDetail, viewerLoading = false, viewerError = null, onViewerRetry,
+  workspaceResourceId: workspaceResourceIdOverride,
 }: {
   table: CatalogTable
   initialRevisionId?: string
@@ -57,9 +58,13 @@ export function DatasetRevisionHistory({
   viewerLoading?: boolean
   viewerError?: string | null
   onViewerRetry?: () => void
+  /** Preserve the opaque Workspace placement while opening an immutable version. */
+  workspaceResourceId?: string
 }) {
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
+  const routedWorkspaceResourceId = useStore((state) => state.workspaceResourceId)
+  const workspaceResourceId = workspaceResourceIdOverride ?? routedWorkspaceResourceId
   const viewerReturn = detailsInViewer ? parseDatasetViewerReturn(encodedQuery) : undefined
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
   const [items, setItems] = useState<DatasetRevision[]>([])
@@ -247,7 +252,12 @@ export function DatasetRevisionHistory({
             const openControl = detailsInViewer
               ? <a
                   data-testid={`revision-open-${revision.revisionId}`}
-                  href={datasetViewerHash(revision.datasetId, revision.revisionId, viewerReturn)}
+                  href={datasetViewerHash(
+                    revision.datasetId,
+                    revision.revisionId,
+                    viewerReturn,
+                    workspaceResourceId ?? undefined,
+                  )}
                   aria-label={`Open data from ${versionTime}`} className={className}>
                   {content}
                 </a>
@@ -274,7 +284,7 @@ export function DatasetRevisionHistory({
       {selected && !detailsInViewer && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} onRetry={() => void openRevision(selected)}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
-        onRestore={setRestoreDetail} />}
+        onRestore={setRestoreDetail} workspaceResourceId={workspaceResourceId ?? undefined} />}
       {viewerRevision && <RevisionDetail revision={viewerRevision} detail={viewerDetail ?? null}
         parent={parent} loading={viewerLoading} error={viewerError}
         onRetry={onViewerRetry ?? (() => {})}
@@ -301,13 +311,14 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
 }
 
 function RevisionDetail({ revision, detail, parent, loading, error, onRetry, canSave, onSave,
-  headRevisionId, onRestore, showPreview = true }: {
+  headRevisionId, onRestore, showPreview = true, workspaceResourceId }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
+  workspaceResourceId?: string
   /** The full-page dataset viewer already owns the selected bounded row preview. */
   showPreview?: boolean
 }) {
@@ -328,26 +339,31 @@ function RevisionDetail({ revision, detail, parent, loading, error, onRetry, can
         </div>
       </div>
       <div className="flex shrink-0 flex-col gap-1">
-        {showPreview && <a href={datasetViewerHash(detail.datasetId, detail.revisionId)}
+        {showPreview && <a href={datasetViewerHash(
+          detail.datasetId,
+          detail.revisionId,
+          undefined,
+          workspaceResourceId,
+        )}
           className="rounded-md bg-primary px-2 py-1 text-center text-[10.5px] font-semibold text-primary-foreground hover:opacity-90">
           Open data
         </a>}
         {canSave && <button type="button" onClick={() => onSave(detail)}
-          aria-label="Create reusable view"
+          aria-label="Create filtered view"
           className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
-          Create view
+          Create filtered view
         </button>}
         {detail.retentionOwner === 'core' && detail.revisionId !== headRevisionId
           && <button type="button" data-testid="restore-revision" onClick={() => onRestore(detail)}
             className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
-            Restore as new revision
+            Restore this version
           </button>}
       </div>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parent && notableFields.length > 0 ? <div className="rounded-md border border-border p-2">
             <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
-              <span>Schema compatibility with parent</span><CompatibilityBadge status={compatibility!.status} />
+              <span>Changes from previous version</span><CompatibilityBadge status={compatibility!.status} />
             </div>
             <div className="mt-1 flex flex-col gap-1">
               {notableFields.map((field, index) => <div key={`${field.fieldId ?? field.oldName ?? field.newName}:${index}`} className="text-[9.5px] text-muted-foreground">
@@ -363,7 +379,8 @@ function CompatibilityBadge({ status }: { status: SchemaCompatibilityStatus }) {
   const className = status === 'breaking' ? 'bg-destructive/10 text-destructive'
     : status === 'compatible' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
       : 'bg-muted text-muted-foreground'
-  return <span className={`rounded px-1.5 py-0.5 text-[9px] ${className}`}>{status}</span>
+  const label = status === 'breaking' ? 'Breaking' : status === 'compatible' ? 'Compatible' : 'Review needed'
+  return <span className={`rounded px-1.5 py-0.5 text-[9px] ${className}`}>{label}</span>
 }
 
 function Summary({ current, parent }: { current: DatasetRevisionSummary; parent: DatasetRevisionSummary | null }) {
@@ -479,13 +496,13 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
   }
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
-    <div role="dialog" aria-modal="true" aria-label="Create a reusable view" aria-busy={busy}
+    <div role="dialog" aria-modal="true" aria-label="Create a filtered view" aria-busy={busy}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
       onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2">
-        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Create a reusable view</h2>
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Create a filtered view</h2>
           <p className="truncate text-[10.5px] text-muted-foreground">{table.name} · selected version</p></div>
-        <button onClick={onClose} disabled={busy} aria-label="Close create view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
+        <button onClick={onClose} disabled={busy} aria-label="Close filtered view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
       </div>
       <p className="text-[11px] leading-relaxed text-muted-foreground">
         A view remembers this version, the selected columns, filters, and sampling without copying the dataset.
@@ -528,7 +545,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
       <div className="flex justify-end gap-2">
         <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
         <button onClick={() => void submit()} disabled={busy || !name.trim() || !selected.length}
-          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating view…' : 'Create view'}</button>
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating view…' : 'Create filtered view'}</button>
       </div>
     </div>
   </div>
@@ -576,7 +593,7 @@ function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: 
       if (request !== generation.current) return
       if (task.status === 'done' && task.childRevisionId) {
         submission.current = ''
-        pushToast(`Published revision ${task.childRevisionId} from the restored source`, 'success')
+        pushToast('Restored as the current version', 'success')
         onRestored(task)
         return
       }
@@ -587,40 +604,40 @@ function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: 
       setError(status === 409
         ? 'The current version changed. Reload the history and try again.'
         : status === 410 ? 'The source version is no longer available, so it cannot be restored.'
-          : `Couldn't restore this revision: ${errorMessage(caught)}`)
+          : `Couldn't restore this version: ${errorMessage(caught)}`)
     } finally {
       if (request === generation.current) setBusy(false)
     }
   }
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
-    <div role="dialog" aria-modal="true" aria-label="Restore revision as new head" aria-busy={busy}
+    <div role="dialog" aria-modal="true" aria-label="Restore saved version" aria-busy={busy}
       className="flex max-h-[90vh] w-[520px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
       onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2">
-        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Restore revision as new head</h2>
-          <p className="text-[10.5px] text-muted-foreground">Publishes the contents of an old revision as a new current revision. History stays append-only.</p></div>
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Restore saved version</h2>
+          <p className="text-[10.5px] text-muted-foreground">This creates a new current version; existing history is kept.</p></div>
         <button onClick={onClose} disabled={busy} aria-label="Close restore dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
       </div>
       <div className="grid gap-2">
         <div className="rounded-md border border-border p-2">
-          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Restoring this source</div>
-          <div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">{detail.revisionId}</div>
-          <div className="text-[9.5px] text-muted-foreground">{number(detail.summary.rowCount)} rows · {bytes(detail.summary.totalBytes)} · {timestamp(detail.committedAt)}</div>
+          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Saved version</div>
+          <div className="text-[10.5px] font-semibold text-foreground">{timestamp(detail.committedAt)}</div>
+          <div className="text-[9.5px] text-muted-foreground">{number(detail.summary.rowCount)} rows · {bytes(detail.summary.totalBytes)}</div>
         </div>
         <div className="rounded-md border border-border p-2">
-          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Replacing the current version</div>
+          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Current version</div>
           {headError ? <div role="alert" className="text-[10.5px] text-destructive">Couldn't load the current version: {headError}</div>
             : !head ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading current version…</div>
-              : <><div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">{head.revisionId}</div>
-                <div className="text-[9.5px] text-muted-foreground">{number(head.summary.rowCount)} rows · {bytes(head.summary.totalBytes)} · {timestamp(head.committedAt)}</div></>}
+              : <><div className="text-[10.5px] font-semibold text-foreground">{timestamp(head.committedAt)}</div>
+                <div className="text-[9.5px] text-muted-foreground">{number(head.summary.rowCount)} rows · {bytes(head.summary.totalBytes)}</div></>}
         </div>
       </div>
       {error && <div role="alert" className="text-[11px] text-destructive">{error}</div>}
       <div className="flex justify-end gap-2">
         <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
         <button onClick={() => void submit()} disabled={busy || !!headError} data-testid="restore-revision-confirm"
-          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Restoring…' : 'Restore as new head'}</button>
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Restoring…' : 'Restore as current version'}</button>
       </div>
     </div>
   </div>

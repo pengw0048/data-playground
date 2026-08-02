@@ -188,7 +188,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 1 column')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 0 rows · 1 column')).toBeInTheDocument()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
@@ -207,7 +207,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 0 rows · 0 columns')).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
@@ -227,7 +227,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId },
     } })
 
-    expect(await screen.findByText('fixture · Selected version · 12 rows · 1 column')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 12 rows · 1 column')).toBeInTheDocument()
     expect(screen.queryByText(/intentionally-long-opaque/i)).not.toBeInTheDocument()
   })
 
@@ -507,7 +507,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     render1(data)
 
-    expect(await screen.findByText('Datasets · Version rev-1 · 1,000 rows · 4 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1,000 rows · 4 columns')).toBeInTheDocument()
     expect(screen.queryByText(/Current head/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
   })
@@ -652,7 +652,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     expect(await screen.findByText(/Permission to open the selected version was lost.*latest was not substituted/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry selected version' }))
-    expect(await screen.findByText('Datasets · Version 7 · 1 row · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1 row · 0 columns')).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -697,7 +697,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     fireEvent.click(control)
     expect(screen.getByText('Jul 16, 2026, 15:38:00 UTC')).toBeInTheDocument()
     expect(screen.getByLabelText('As-of UTC date and time')).toBeInTheDocument()
-    expect(await screen.findByText('Datasets · Version rev-pin · 1 row · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1 row · 0 columns')).toBeInTheDocument()
   })
 
   it('stores UTC as-of intent with exact and as-of capabilities after history is ready', async () => {

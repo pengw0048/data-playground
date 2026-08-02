@@ -64,8 +64,13 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const isDark = (await html.getAttribute('data-theme')) === 'dark'
     if ((theme === 'dark') !== isDark) {
       await page.getByTestId('app-menu').click()
-      await page.getByRole('menuitem', { name: 'Appearance' }).hover()
-      await page.getByRole('menuitemradio', { name: theme === 'dark' ? 'Dark' : 'Light' }).click()
+      const appearance = page.getByRole('menuitem', { name: 'Appearance' })
+      await appearance.hover()
+      const choice = page.getByRole('menuitemradio', { name: theme === 'dark' ? 'Dark' : 'Light' })
+      await expect(choice).toBeVisible()
+      // Radix repositions this portal after its first frame; dispatch immediately once the
+      // visible item exists instead of waiting for geometric stability that is irrelevant here.
+      await choice.click({ force: true })
     }
     if (theme === 'dark') await expect(html).toHaveAttribute('data-theme', 'dark')
     else await expect(html).not.toHaveAttribute('data-theme', 'dark')
@@ -126,23 +131,19 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const publication = inspector.getByLabel('Write publication')
     await expect(publication).toContainText('Create a new dataset')
     await expect(publication.getByLabel('Write readiness')).toContainText('Ready to run')
-    const publicationDetails = publication.locator('details')
-    await expect(publicationDetails).not.toHaveAttribute('open')
-    await publicationDetails.locator('summary').click()
-    await expect(publicationDetails).toContainText(/Run setup:.*node write.*mode create/)
-    await expect(publicationDetails).toContainText('managed-local-file')
+    await expect(publication.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(publication).not.toContainText('managed-local-file')
     const runResponse = page.waitForResponse((response) =>
       response.url().endsWith('/api/run') && response.request().method() === 'POST')
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const runPanel = page.getByTestId('panel-run')
     await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
-    await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
+    await runPanel.getByRole('button', { name: 'Publish output', exact: true }).click()
     const started = await ok<{ runId: string }>(await runResponse, 'submit default-kernel write')
     const runId = started.runId
     await expect(publication.getByLabel('Published result')).toContainText('Published', { timeout: 30_000 })
     await expect(publication.getByLabel('Published result').getByText(outputName, { exact: true })).toBeVisible()
     await expect(publication.getByRole('link', { name: 'Open dataset' })).toBeVisible()
-    await expect(publicationDetails).toContainText('Durable: yes')
     type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
     type Receipt = { datasetId: string; revisionId: string; name: string; rows: number }
     type JobItem = {
@@ -165,8 +166,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     ])
     const [admittedInput] = job!.inputManifest
     expect(admittedInput).toBeTruthy()
-    // The inspector receipt names the same durable revision the Jobs surface published.
-    await expect(publicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
+    // The action retains the exact version in navigation without exposing opaque IDs in the UI.
+    await expect(publication.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
+      'href', new RegExp(`revision=${encodeURIComponent(dataset!.revisionId)}`),
+    )
+    await expect(publication).not.toContainText(`${dataset!.datasetId}@${dataset!.revisionId}`)
 
     // A real browser reload clears the Zustand run store. Wait until the exact pointer is saved in
     // Canvas, then prove the reloaded UI resolves that run rather than guessing from latest history.
@@ -201,9 +205,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(recoveredResult).not.toContainText(dataset!.revisionId)
     await expect(recoveredResult).toContainText(`${dataset!.rows.toLocaleString()} rows`)
     await expect(recoveredPublication.getByRole('link', { name: 'Open dataset' })).toBeVisible()
-    const recoveredDetails = recoveredPublication.locator('details')
-    await recoveredDetails.locator('summary').click()
-    await expect(recoveredDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
+    await expect(recoveredPublication).not.toContainText(`${dataset!.datasetId}@${dataset!.revisionId}`)
     await recoveredPublication.getByRole('link', { name: 'Open dataset' }).click()
     await expect(page).toHaveURL(new RegExp(
       `#\\/workspace\\/dataset%3A${encodeURIComponent(dataset!.datasetId)}\\?revision=${encodeURIComponent(dataset!.revisionId)}`
@@ -212,11 +214,8 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const receiptViewer = page.getByTestId('dataset-viewer')
     await expect(receiptViewer).toBeVisible()
     await expect(receiptViewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
-    const datasetDetails = receiptViewer.getByTestId('detail-dataset-details')
-    await datasetDetails.locator('summary').click()
-    await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
-      `${dataset!.datasetId}@${dataset!.revisionId}`,
-    )
+    await expect(receiptViewer.getByTestId('dataset-version-context')).toHaveText('Current version')
+    await expect(receiptViewer).not.toContainText(`${dataset!.datasetId}@${dataset!.revisionId}`)
     await expect(receiptViewer.getByTestId('detail-preview-scroll')).toBeVisible()
     await page.goBack()
     await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}`))
@@ -247,7 +246,9 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(historyDialog).toContainText(localHistoryTime)
     await historyDialog.getByRole('button', { name: /Input data/ }).click()
     await expect(historyDialog.getByText('used for this run')).toBeVisible()
-    await expect(historyDialog.getByText(`Version ${admittedInput!.revision_id}`)).toBeVisible()
+    await expect(historyDialog.getByText('Saved version is available.')).toBeVisible()
+    await historyDialog.getByRole('button', { name: 'Show saved version details' }).click()
+    await expect(historyDialog.getByTestId('run-input-revision-detail')).toContainText(`${dataset!.rows.toLocaleString()}`)
     await expect(historyDialog.getByText('Input data details were not saved for this older run.')).toHaveCount(0)
     await historyDialog.getByRole('button', { name: 'Close' }).click()
     await shoot(page, 'light', 'canvas')
@@ -281,17 +282,14 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await revisionHistory.getByTestId(`revision-open-${dataset!.revisionId}`).click()
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
 
-    // 8. Reopen that same revision from Jobs' primary result action while retaining receipt evidence.
+    // 8. Reopen that same revision from Jobs' primary result action.
     const jobUrl = `/#/jobs?run=${encodeURIComponent(runId)}`
     await page.goto(jobUrl)
     const jobsDatasetLink = page.getByRole('link', { name: 'Open dataset' })
-    const diagnostics = page.getByText('Diagnostics', { exact: true }).locator('..')
-    await diagnostics.locator('summary').click()
-    await expect(diagnostics.getByText('Receipt:', { exact: true })).toBeVisible()
+    await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
     await expect(page.getByRole('button', { name: 'Open result' })).toHaveCount(0)
     const exactDatasetHref = `#/workspace/${encodeURIComponent(`dataset:${dataset!.datasetId}`)}?${new URLSearchParams({
-      scope: 'datasets',
       revision: dataset!.revisionId,
       revisionDataset: dataset!.datasetId,
       returnView: 'jobs',
@@ -335,15 +333,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(darkPublication.getByLabel('Published result')).toContainText('Published')
     await expect(darkPublication.getByLabel('Published result').getByText(dataset!.name, { exact: true })).toBeVisible()
     await expect(darkPublication.getByRole('link', { name: 'Open dataset' })).toBeVisible()
-    const darkPublicationDetails = darkPublication.locator('details')
-    await darkPublicationDetails.locator('summary').click()
-    await expect(darkPublicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
-    await expect(darkPublicationDetails).toContainText('Durable: yes')
+    await expect(darkPublication).not.toContainText(`${dataset!.datasetId}@${dataset!.revisionId}`)
     await shoot(page, 'dark', 'canvas')
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    const darkDiagnostics = page.getByText('Diagnostics', { exact: true }).locator('..')
-    await darkDiagnostics.locator('summary').click()
+    await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     await shoot(page, 'dark', 'jobs')
     await page.getByRole('link', { name: 'Open dataset' }).click()
     await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')

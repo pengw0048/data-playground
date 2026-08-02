@@ -61,15 +61,14 @@ test('reports a stopped hub within 5s and recovers the local draft after restart
     await source.click()
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     await expect(page.getByTestId('panel-data')).toBeVisible()
-    const badge = page.getByTestId('kernel-badge')
-    await badge.click()
-    await expect(badge).toHaveText(/kernel · warm/, { timeout: 8_000 })
+    const target = page.getByRole('button', { name: /Execution target:/ })
+    await expect(target).toBeEnabled()
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/)
 
     await killHub()
 
     await expect(page.getByText('Kernel offline — your work is cached locally.')).toBeVisible({ timeout: 5_000 })
-    await expect(badge).toHaveText(/kernel · offline/)
+    await expect(target).toBeDisabled()
     await expect(page.getByTestId('autosave')).toContainText(/offline/i)
     await expect(page.getByTestId('autosave')).not.toContainText(/saved/i)
     await expect(page.getByRole('button', { name: 'Rerun all' })).toBeDisabled()

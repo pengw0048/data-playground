@@ -1359,12 +1359,12 @@ export function FullResult({
       // Keep the inert frame for the page lifetime. Removing it on a timer can cancel a slow native
       // artifact stream; one tiny frame per user-requested download is the safer trade-off.
       pushToast(
-        `Full-result artifact download requested${reportedTotal == null ? ' · row count unknown.' : ` · ${reportedTotal.toLocaleString()} rows.`}`,
+        `Download started${reportedTotal == null ? '.' : ` · ${reportedTotal.toLocaleString()} rows.`}`,
         'info',
       )
     } catch (error) {
       const reason = error instanceof Error && error.message ? error.message : String(error)
-      pushToast(`Could not start full-result export: ${reason}`, 'error')
+      pushToast(`Couldn’t start download: ${reason}`, 'error')
     } finally {
       setExporting(false)
     }
@@ -1382,8 +1382,8 @@ export function FullResult({
   ) : undefined
 
   if (!hasRunIdentity) return (
-    <FullResultMessage title={`${viewLabel} identity unavailable`}
-      reason="This history entry has no durable run identity, so the kernel cannot verify which output to read. Run the node again to create a verifiable result."
+    <FullResultMessage title={`${viewLabel} unavailable`}
+      reason="This older run did not record which saved result to open. Run this step again to create a result you can reopen."
       modeToggle={modeToggle} />
   )
   const runAction = onRunUnavailable ? (

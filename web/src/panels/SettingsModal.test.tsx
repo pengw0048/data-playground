@@ -89,7 +89,7 @@ describe('SettingsModal — plugin config form', () => {
   it('opens directly to a requested settings category', async () => {
     render(<SettingsModal onClose={vi.fn()} initialCategory="destinations" />)
 
-    expect(await screen.findByText(/Named places to save outputs/i)).toBeInTheDocument()
+    expect(await screen.findByText('Save locations for Canvas outputs.')).toBeInTheDocument()
     const destinations = screen.getByRole('button', { name: 'Destinations' })
     expect(destinations).toHaveClass('bg-accent')
     expect(destinations).toHaveFocus()
@@ -566,9 +566,9 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
     expect(within(screen.getByTestId('plugin-status-healthy')).getByText('active')).toBeVisible()
-    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Ready to use in this Data Playground instance.')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('active')
     expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Canvas step: clean')
-    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Next: add its steps from a Canvas.')
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Add its steps from a Canvas.')
     fireEvent.click(within(screen.getByTestId('plugin-status-healthy')).getByText('Installation details'))
     expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Features: node:clean')
     expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Starts with: execution')
@@ -631,7 +631,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
-    expect(screen.getByText('Default for Canvases without a target')).toBeVisible()
+    expect(screen.getByText('Default compute target')).toBeVisible()
     expect(screen.getByText('Local streaming')).toBeVisible()
     expect(screen.getByText('Isolated local process')).toBeVisible()
     expect(screen.getByText('Canvas worker')).toBeVisible()
@@ -649,8 +649,8 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByText('This is only a fallback. Choose where the current Canvas runs from the compute control in its top bar.')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the deployment default and automatic resource placement.')
+    expect(screen.getByText('Change a specific Canvas from its top bar.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the workspace default.')
     expect(screen.queryByText(/Uses the mode chosen for this Workspace/)).toBeNull()
     expect(screen.queryByText('Workspace default (deployment default)')).toBeNull()
   })
@@ -667,7 +667,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(isolated).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(isolated)
     expect(isolated).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByRole('group', { name: 'Execution mode' })).toHaveTextContent('Isolated local process')
+    expect(screen.getByRole('group', { name: 'Compute target' })).toHaveTextContent('Isolated local process')
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
@@ -846,10 +846,9 @@ describe('SettingsModal — plugin config form', () => {
 
     fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
     expect(screen.queryByLabelText('Initial password')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Add identity' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
     await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor'))
-    expect(screen.getByText(/collaboration identities rather than password accounts/i)).toBeVisible()
-    expect(screen.getByText(/must not be treated as authentication/i)).toBeVisible()
+    expect(screen.getByText(/sign-in is off, so adding a name does not grant access/i)).toBeVisible()
   })
 
   it('requires an initial password of at least six characters when authentication is on', async () => {
@@ -1000,8 +999,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Preview files in Exports' }))
 
     await waitFor(() => expect(browseDestination).toHaveBeenCalledWith('d1', ''))
-    expect(await screen.findByText(/Preview loaded · 1 item found/)).toHaveTextContent('This checks listing only; a real write is verified when a run saves output.')
-    expect(screen.getByText(/does not create a test file or prove write access/i)).toBeVisible()
+    expect(await screen.findByText('1 item · result.parquet')).toBeVisible()
     expect(screen.queryByText(/write access works/i)).toBeNull()
   })
 

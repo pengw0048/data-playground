@@ -228,8 +228,8 @@ describe('admitted run inputs', () => {
   })
 })
 
-describe('execution manifest inspection', () => {
-  it('loads the immutable detail lazily and renders every recorded contract section', async () => {
+describe('run-to-Canvas action', () => {
+  it('keeps the useful action without exposing the execution manifest', async () => {
     const digest = 'a'.repeat(64)
     apiMock.listRuns.mockResolvedValue([{
       id: 'manifest-history', runId: 'manifest-run', jobType: 'run', status: 'failed',
@@ -249,22 +249,14 @@ describe('execution manifest inspection', () => {
         descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
       },
     })
-    const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    const toggle = await screen.findByRole('button', { name: /Saved run setup/ })
+    expect(await screen.findByRole('button', { name: 'Create Canvas from run' })).toBeVisible()
     expect(screen.queryByText(digest)).not.toBeInTheDocument()
+    expect(screen.queryByText('Saved run setup')).not.toBeInTheDocument()
+    expect(screen.queryByText('Submitted graph')).not.toBeInTheDocument()
+    expect(screen.queryByText(/dataset-1@revision-1/)).not.toBeInTheDocument()
     expect(apiMock.executionManifest).not.toHaveBeenCalled()
-    await user.click(toggle)
-
-    expect(await screen.findByText(digest)).toBeVisible()
-    expect(await screen.findByText('Submitted graph')).toBeVisible()
-    expect(screen.getByText('Admitted write intent')).toBeVisible()
-    expect(screen.getByText('Runtime descriptor snapshot')).toBeVisible()
-    expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
-    expect(screen.getByText(/dataset-1@revision-1/)).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
-    expect(apiMock.executionManifest).toHaveBeenCalledWith('history-canvas', 'manifest-history')
   })
 })
 
@@ -505,7 +497,7 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Export all rows' }))
 
     await waitFor(() => expect(useStore.getState().toasts.at(-1)).toMatchObject({
-      kind: 'error', msg: 'Could not start full-result export: artifact is not exportable',
+      kind: 'error', msg: 'Couldn’t start download: artifact is not exportable',
     }))
     expect(anchorClick).not.toHaveBeenCalled()
     expect(document.querySelector('iframe[data-full-result-download]')).toBeNull()
@@ -520,8 +512,8 @@ describe('durable full results', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Open full result' }))
 
-    expect(await screen.findByText('Full result identity unavailable')).toBeInTheDocument()
-    expect(screen.getByText(/has no durable run identity/i)).toBeInTheDocument()
+    expect(await screen.findByText('Full result unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/older run did not record which saved result/i)).toBeInTheDocument()
     expect(apiMock.runOutputSample).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Export all rows' })).not.toBeInTheDocument()
   })

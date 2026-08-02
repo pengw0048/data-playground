@@ -75,7 +75,7 @@ export function DatasetLineageSummary({ uri, name, onOpenDataset }: {
       <h2 className="text-[11px] font-semibold text-foreground">Lineage</h2>
       {lineage?.truncated && <span className="text-[10px] text-muted-foreground">Preview of nearby datasets</span>}
     </div>
-    {!uri ? <div className="mt-1 text-[11px] text-muted-foreground">Lineage becomes available after this dataset has a stable Source binding.</div> : null}
+    {!uri ? <div className="mt-1 text-[11px] text-muted-foreground">Lineage is not available for this dataset.</div> : null}
     {loading && !lineage ? <div role="status" className="mt-1 text-[11px] text-muted-foreground">Loading lineage…</div> : null}
     {error ? <div role="alert" className="mt-1 flex items-center justify-between gap-2 text-[11px] text-destructive">
       <span>Couldn't load lineage: {error}</span>

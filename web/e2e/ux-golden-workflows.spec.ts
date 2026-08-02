@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 import { goToWorkspace, workspaceResource } from './support/workspace'
@@ -38,41 +39,21 @@ async function expectCompactFullResult(
   expect(geometry!.toolbarScrollWidth).toBeLessThanOrEqual(geometry!.toolbarClientWidth)
 }
 
-async function expectBoundedFullResultEvidence(
+async function expectNoTechnicalResultEvidence(
   surface: import('@playwright/test').Locator,
   runId: string,
   output: string,
 ) {
-  const trigger = surface.getByRole('button', { name: 'Diagnostics' })
-  await expect(trigger).toHaveAttribute('aria-expanded', 'false')
-  await trigger.click()
-  await expect(trigger).toHaveAttribute('aria-expanded', 'true')
-  const evidence = surface.getByTestId('full-result-technical-details')
-  await expect(evidence).toContainText(runId)
-  await expect(evidence).toContainText(output)
-  await expect(evidence).toContainText('State')
-  await expect(evidence).toContainText('committed')
-  const [surfaceBox, evidenceBox, widths] = await Promise.all([
-    surface.boundingBox(),
-    evidence.boundingBox(),
-    evidence.evaluate((element) => ({
-      clientWidth: element.clientWidth,
-      scrollWidth: element.scrollWidth,
-    })),
-  ])
-  expect(surfaceBox).not.toBeNull()
-  expect(evidenceBox).not.toBeNull()
-  expect(evidenceBox!.x).toBeGreaterThanOrEqual(surfaceBox!.x)
-  expect(evidenceBox!.x + evidenceBox!.width).toBeLessThanOrEqual(surfaceBox!.x + surfaceBox!.width)
-  expect(widths.scrollWidth).toBeLessThanOrEqual(widths.clientWidth)
-  await trigger.click()
-  await expect(evidence).toHaveCount(0)
+  await expect(surface.getByRole('button', { name: 'Diagnostics' })).toHaveCount(0)
+  await expect(surface.getByTestId('full-result-technical-details')).toHaveCount(0)
+  await expect(surface).not.toContainText(runId)
+  await expect(surface).not.toContainText(output)
 }
 
 test.describe('researcher golden workflow @ux-smoke', () => {
   test('targets the chosen canvas and labels/downloads only the visible preview page', async ({ page }) => {
-    const primary = goldenCanvas('ux-golden-primary', 'UX primary canvas', 'UX primary source')
-    const secondary = goldenCanvas('ux-golden-secondary', 'UX secondary canvas', 'UX secondary source')
+    const primary = goldenCanvas(`ux-golden-primary-${randomUUID()}`, 'UX primary canvas', 'UX primary source')
+    const secondary = goldenCanvas(`ux-golden-secondary-${randomUUID()}`, 'UX secondary canvas', 'UX secondary source')
     await installCanvas(page.request, primary)
     await installCanvas(page.request, secondary)
 
@@ -120,19 +101,19 @@ test.describe('researcher golden workflow @ux-smoke', () => {
   })
 
   test('a changed graph invalidates the old result instead of treating it as current', async ({ page }) => {
-    const doc = goldenCanvas('ux-golden-stale', 'UX stale canvas', 'UX stale source')
+    const doc = goldenCanvas(`ux-golden-stale-${randomUUID()}`, 'UX stale canvas', 'UX stale source')
     await installCanvas(page.request, doc)
 
     await page.goto(`/#/canvas/${doc.id}`)
     const filter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
-    await expect(filter.getByTitle('latest')).toBeVisible()
+    await expect(filter).toContainText('500 rows · 12 ms')
     await filter.click()
     await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup' OR amount > 0")
-    await expect(filter.getByTitle('stale')).toBeVisible()
+    await expect(filter).not.toContainText('500 rows · 12 ms')
   })
 
   test('reopens and downloads the native full result without navigating away', async ({ page }) => {
-    const doc = goldenCanvas('ux-golden-export', 'UX export canvas', 'UX export source')
+    const doc = goldenCanvas(`ux-golden-export-${randomUUID()}`, 'UX export canvas', 'UX export source')
     await installCanvas(page.request, doc)
     const graph = {
       id: doc.id,
@@ -184,7 +165,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
   })
 
   test('recovers the exact retained result in a fresh browser and stops after a stale edit', async ({ page, browser, baseURL }) => {
-    const doc = goldenCanvas('ux-golden-retained', 'UX retained canvas', 'UX retained source')
+    const doc = goldenCanvas(`ux-golden-retained-${randomUUID()}`, 'UX retained canvas', 'UX retained source')
     await installCanvas(page.request, doc)
     const graph = {
       id: doc.id,
@@ -229,7 +210,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     try {
       await freshPage.goto(`/#/canvas/${doc.id}`)
       const filter = freshPage.locator('.react-flow__node', { hasText: 'UX golden filter' })
-      await expect(filter.getByTitle('latest')).toBeVisible()
+      await expect(filter).toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
       await filter.click()
       await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
 
@@ -241,7 +222,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       expect((await historyAfterOpen.json()) as Array<{ runId?: string }>).toEqual(runsBefore)
 
       await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup'")
-      await expect(filter.getByTitle('stale')).toBeVisible()
+      await expect(filter).not.toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
       await expect(panel.getByTestId('full-result-status')).toHaveCount(0)
       await expect(panel.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(0)
     } finally {
@@ -251,7 +232,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
   })
 
   test('keeps one complete-result header and table space from Canvas through Jobs', async ({ page }, testInfo) => {
-    const doc = goldenCanvas('ux-full-result-header', 'UX full result header', 'UX full result source')
+    const doc = goldenCanvas(`ux-full-result-header-${randomUUID()}`, 'UX full result header', 'UX full result source')
     await installCanvas(page.request, doc)
     const graph = {
       id: doc.id,
@@ -294,7 +275,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await expect(canvasResult.getByRole('button', { name: 'Preview sample' })).toHaveCount(1)
       await expect(canvasResult.getByRole('button', { name: 'Full result', exact: true })).toHaveCount(1)
       await expectCompactFullResult(canvasResult, 430)
-      await expectBoundedFullResultEvidence(canvasResult, runId, 'filter:out')
+      await expectNoTechnicalResultEvidence(canvasResult, runId, 'filter:out')
     }
     await canvasResult.getByRole('button', { name: 'Export result' }).click()
     await expect(page.getByRole('menuitem', { name: 'Export all rows' })).toBeVisible()
@@ -310,7 +291,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
       await page.setViewportSize(viewport)
       await expectCompactFullResult(jobsResult, viewport.height === 720 ? 190 : 250)
-      await expectBoundedFullResultEvidence(jobsResult, runId, 'filter:out')
+      await expectNoTechnicalResultEvidence(jobsResult, runId, 'filter:out')
     }
 
     const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
@@ -331,7 +312,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expiredFilter.click()
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const expiredResult = page.getByTestId('panel-data')
-    await expect(expiredFilter.getByTitle('latest')).toBeVisible()
+    await expect(expiredFilter).toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
     await expect(expiredResult.getByText('Current result unavailable')).toBeVisible()
     await expect(expiredResult.getByText(/calculation is still up to date/i)).toBeVisible()
     await expect(expiredResult.getByRole('button', { name: 'Rerun and save result' })).toBeVisible()
@@ -344,7 +325,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
         `issue-1109-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
       ) })
     }
-    await expectBoundedFullResultEvidence(expiredResult, runId, 'filter:out')
+    await expectNoTechnicalResultEvidence(expiredResult, runId, 'filter:out')
 
     const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
     await page.route(sampleRoute, async (route) => {
@@ -370,12 +351,12 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     const errorResult = page.getByTestId('panel-data')
     await expect(errorResult.getByText('Couldn’t read full result')).toBeVisible()
     await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
-    await expectBoundedFullResultEvidence(errorResult, runId, 'filter:out')
+    await expectNoTechnicalResultEvidence(errorResult, runId, 'filter:out')
     await page.unroute(sampleRoute)
   })
 
   test('states a capped chart window once while keeping whole-result export', async ({ page }) => {
-    const doc = goldenCanvas('ux-capped-chart', 'UX capped chart canvas', 'UX capped chart source')
+    const doc = goldenCanvas(`ux-capped-chart-${randomUUID()}`, 'UX capped chart canvas', 'UX capped chart source')
     doc.nodes.push({
       id: 'chart', type: 'chart', position: { x: 700, y: 180 },
       data: {
@@ -462,7 +443,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
 
   test('never falls back to an older default-binding result in a fresh browser', async ({ page, browser, baseURL }) => {
     const doc = goldenCanvas(
-      'ux-golden-retained-parameters',
+      `ux-golden-retained-parameters-${randomUUID()}`,
       'UX retained parameter canvas',
       'UX retained parameter source',
     )
@@ -545,7 +526,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     try {
       await freshPage.goto(`/#/canvas/${doc.id}`)
       const filter = freshPage.locator('.react-flow__node', { hasText: 'UX golden filter' })
-      await expect(filter.getByTitle('latest')).toBeVisible()
+      await expect(filter).toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
       await filter.click()
       await freshPage.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
 

@@ -283,6 +283,39 @@ def test_historical_missing_canvas_placement_is_not_a_workspace_resource(workspa
         )
 
 
+def test_managed_logical_dataset_deep_link_resolves_current_workspace_placement(workspace_scope):
+    logical_id = f"logical_{uuid.uuid4().hex}"
+    logical_uri = f"managed://{uuid.uuid4().hex}/output.parquet"
+    catalog_key = f"tbl_{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        entry = session.get(metadb.CatalogEntry, workspace_scope["uri"])
+        assert entry is not None
+        entry.logical_id = logical_id
+        session.add(metadb.CatalogLogicalDataset(
+            logical_id=logical_id,
+            catalog_key=catalog_key,
+            logical_uri=logical_uri,
+            current_uri=entry.uri,
+            state="active",
+        ))
+
+    try:
+        with TestClient(app) as client:
+            resolved = client.get(f"/api/workspace/resources/dataset:{logical_id}")
+        assert resolved.status_code == 200, resolved.text
+        resource = resolved.json()["resource"]
+        assert resource["id"] == f"dataset:{workspace_scope['dataset_id']}"
+        assert resource["detached"] is False
+    finally:
+        with metadb.session() as session:
+            entry = session.get(metadb.CatalogEntry, workspace_scope["uri"])
+            if entry is not None:
+                entry.logical_id = None
+            logical = session.get(metadb.CatalogLogicalDataset, logical_id)
+            if logical is not None:
+                session.delete(logical)
+
+
 def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_overlay(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     uri, dataset_id = workspace_scope["uri"], workspace_scope["dataset_id"]
@@ -3897,7 +3930,7 @@ def test_workspace_provider_deadlines_keep_browse_fast_and_explicit_actions_boun
     page = workspace_providers.browse(folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
     resource_ref = next(
         item["id"] for item in page["items"] if item.get("resourceId") == "dataset-a")
-    assert observed["list"] == [2.0]
+    assert observed["list"] == [workspace_providers._PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS]
 
     workspace_providers.search("shared", uid=metadb.DEFAULT_USER_ID)
     workspace_providers.resolve(resource_ref, uid=metadb.DEFAULT_USER_ID)
@@ -5152,10 +5185,7 @@ def test_workspace_default_browse_mixes_local_and_connected_source_roots(
     assert not any(item["id"].startswith("container:mount.") for item in page["items"])
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
-    assert page["queryCapabilities"]["reason"] == (
-        "This folder includes connected-source items and local Canvases. Sorting and type filters "
-        "are unavailable because the source controls its result order."
-    )
+    assert page["queryCapabilities"]["reason"] == "This connected source controls sorting and filters."
 
 
 def test_workspace_provider_delete_is_capability_driven_and_detaches_cached_dataset(

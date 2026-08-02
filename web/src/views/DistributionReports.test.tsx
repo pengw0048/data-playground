@@ -51,15 +51,16 @@ const comparison = (rightId = 'b'.repeat(32), comparable = true, revisionId = 'r
 describe('DistributionReportPage', () => {
   beforeEach(() => { vi.clearAllMocks(); mocks.distributionReport.mockResolvedValue(envelope()); mocks.distributionReports.mockResolvedValue([]) })
 
-  it('puts exact coverage and sample evidence before bounded renderers', async () => {
+  it('puts report coverage before the distribution charts', async () => {
     const { container } = render(<DistributionReportPage reportId={'a'.repeat(32)} />)
-    expect(await screen.findByText('Coverage before distributions')).toBeVisible()
+    expect(await screen.findByText('Report coverage')).toBeVisible()
     const text = container.textContent ?? ''
-    expect(text.indexOf('Coverage before distributions')).toBeLessThan(text.indexOf('Missingness'))
-    expect(screen.getByText(/sample only; no full-population claim/)).toBeVisible()
+    expect(text.indexOf('Report coverage')).toBeLessThan(text.indexOf('Missingness'))
+    expect(screen.getByText(/sample of selected rows/)).toBeVisible()
     expect(screen.getByText(/Approximate distinct count: 42/)).toBeVisible()
     expect(screen.getByText(/Unsupported \/ partial: unsupported type/)).toBeVisible()
     expect(screen.getByText(/Non-finite 1/)).toBeVisible()
+    fireEvent.click(screen.getByText('Sampling details'))
     expect(screen.getByText(/scanned 100/)).toBeVisible()
     expect(screen.getByText(/Min \/ max 1e-9 \/ 8/)).toBeVisible()
     expect(screen.getByText(`Dataset version:`).parentElement).toHaveTextContent(
@@ -72,8 +73,8 @@ describe('DistributionReportPage', () => {
   it('keeps report coverage visible without exposing internal identities', async () => {
     render(<DistributionReportPage reportId={'a'.repeat(32)} />)
 
-    expect(await screen.findByText('Coverage before distributions')).toBeVisible()
-    expect(screen.getByText(/10 rows · sample only/)).toBeVisible()
+    expect(await screen.findByText('Report coverage')).toBeVisible()
+    expect(screen.getByText(/10 rows · sample of selected rows/)).toBeVisible()
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(screen.queryByText('dataset-1')).not.toBeInTheDocument()
     expect(screen.queryByText('revision-1')).not.toBeInTheDocument()
@@ -136,7 +137,7 @@ describe('DistributionReportPage', () => {
       },
     })
     render(<DistributionReportPage reportId={'a'.repeat(32)} />)
-    await screen.findByText('Coverage before distributions')
+    await screen.findByText('Report coverage')
 
     for (const label of ['0 of 10 rows', '0 of 1 rows', '0 of 7 rows']) {
       const fill = screen.getByLabelText(label).firstElementChild
@@ -255,11 +256,11 @@ describe('DistributionReportPage', () => {
     const comparison: DistributionReportComparison = { schemaVersion: 1, coverage: { left: { reportId: source.reportId, datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: source.revisionId, viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, right: { reportId: 'b'.repeat(32), datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: 'revision-2', viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, comparable: true, reason: 'same_deterministic_sample' }, columns: [], unmatchedLeftColumns: [], unmatchedRightColumns: [] }
     mocks.compareDistributionReports.mockResolvedValue(comparison)
     const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
-    expect(await screen.findByText('Coverage before comparison')).toBeVisible()
+    expect(await screen.findByText('Comparison coverage')).toBeVisible()
     mocks.compareDistributionReports.mockRejectedValue(new KernelError(503, 'sanitized', 'service_unavailable', true))
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('Comparison is temporarily unavailable')
-    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText('Report coverage')).toBeVisible()
   })
 
   it('uses the exact bucket endpoint and explains revision-gone examples without hiding the report', async () => {
@@ -267,7 +268,7 @@ describe('DistributionReportPage', () => {
     render(<DistributionReportPage reportId={'a'.repeat(32)} />)
     fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
     expect(await screen.findByRole('dialog', { name: 'Bucket examples' })).toHaveTextContent('dataset version is no longer available')
-    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText('Report coverage')).toBeVisible()
   })
 
   it.each([
@@ -279,7 +280,7 @@ describe('DistributionReportPage', () => {
     render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('The selected comparison is unavailable or not authorized.')
     expect(screen.queryByText(sensitive)).not.toBeInTheDocument()
-    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText('Report coverage')).toBeVisible()
   })
 
   it.each([
@@ -292,7 +293,7 @@ describe('DistributionReportPage', () => {
     fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
     expect(await screen.findByRole('alert')).toHaveTextContent('Examples are unavailable for this bucket.')
     expect(screen.queryByText(sensitive)).not.toBeInTheDocument()
-    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText('Report coverage')).toBeVisible()
   })
 
   it('keeps the primary document visible while a linked comparison loads without exposing its raw id', async () => {
@@ -300,20 +301,20 @@ describe('DistributionReportPage', () => {
     mocks.compareDistributionReports.mockReturnValue(new Promise((done) => { resolve = done }))
     render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
     expect(await screen.findByText('Loading comparison…')).toBeVisible()
-    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByText('Report coverage')).toBeVisible()
     expect(screen.getByRole('option', { name: 'Linked report · loading details' })).toBeVisible()
     expect(screen.queryByText('c'.repeat(32))).not.toBeInTheDocument()
     expect(screen.queryByText(/diagnostics/i)).not.toBeInTheDocument()
     await act(async () => { resolve(comparison('c'.repeat(32))) })
-    expect(await screen.findByText('Coverage before comparison')).toBeVisible()
+    expect(await screen.findByText('Comparison coverage')).toBeVisible()
     expect(screen.getByRole('option', { name: 'Linked report · 10 measured rows · sample' })).toBeVisible()
   })
 
   it('does not render deltas for incompatible coverage and preserves unknown top-K values as unknown', async () => {
     mocks.compareDistributionReports.mockResolvedValue(comparison('b'.repeat(32), false))
     const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
-    expect(await screen.findByText(/Coverage is not comparable/)).toBeVisible()
-    expect(screen.queryByText(/Server-authorized deltas/)).not.toBeInTheDocument()
+    expect(await screen.findByText(/These reports cannot be compared/)).toBeVisible()
+    expect(screen.queryByText(/Change \(comparison − current\)/)).not.toBeInTheDocument()
     mocks.compareDistributionReports.mockResolvedValue(comparison())
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'d'.repeat(32)} />)
     expect(await screen.findByText(/outside comparison top-K/)).toBeVisible()
@@ -330,7 +331,7 @@ describe('DistributionReportPage', () => {
     await waitFor(() => expect(mocks.compareDistributionReports).toHaveBeenCalledWith('a'.repeat(32), 'new'))
     await act(async () => { newCompare(comparison('new', true, 'new-revision')) })
     await act(async () => { oldCompare(comparison('old', true, 'old-revision')); await Promise.resolve() })
-    expect(await screen.findByText('Coverage before comparison')).toBeVisible()
+    expect(await screen.findByText('Comparison coverage')).toBeVisible()
     expect(screen.queryByText('new-revision')).not.toBeInTheDocument()
     expect(screen.queryByText('old-revision')).not.toBeInTheDocument()
     page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} />)

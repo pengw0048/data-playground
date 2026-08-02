@@ -300,6 +300,22 @@ describe('graph store — core authority ops', () => {
     })
   })
 
+  it('drops a dataset revision query when opening a different Workspace resource', () => {
+    useStore.setState({
+      view: 'relationships',
+      workspaceResourceId: 'dataset:published',
+      workspaceDatasetQuery: 'revision=rev-1&revisionDataset=published&returnCanvas=canvas-1',
+    })
+
+    useStore.getState().setWorkspaceResource('dataset:events')
+
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace',
+      workspaceResourceId: 'dataset:events',
+      workspaceDatasetQuery: '',
+    })
+  })
+
   it('promotes same-title nodes with distinct stable identities and reuses one identity on retry', async () => {
     const transform = (id: string) => ({
       ...NODE(id, 'transform'),

@@ -306,6 +306,10 @@ export const api = {
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`, {
       signal: options?.signal,
     }),
+  workspaceLineageResource: (params: { rootUri: string; nodeUri: string; name: string }) => {
+    const query = new URLSearchParams(params)
+    return req<WorkspaceResource>(`/workspace/lineage/resolve?${query}`)
+  },
   workspaceCanonicalDataset: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceCanonicalDatasetContext>(
       `/workspace/resources/${encodeURIComponent(resourceId)}/canonical-dataset`,
@@ -787,6 +791,7 @@ export const api = {
     const query = new URLSearchParams()
     if (params.limit != null) query.set('limit', String(params.limit))
     if (params.cursor) query.set('cursor', params.cursor)
+    if (params.scope && params.scope !== 'mine') query.set('scope', params.scope)
     if (params.status) query.set('status', params.status)
     if (params.canvasId) query.set('canvas_id', params.canvasId)
     if (params.nodeId) query.set('node_id', params.nodeId)
@@ -881,9 +886,9 @@ export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
 export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write'
 export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; revisionId?: string | null; name?: string | null; deepLink?: string | null }
-export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
+export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; createdById?: string | null; createdByName?: string | null; isMine?: boolean; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
-export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
+export interface WorkspaceJobsQuery { limit?: number; cursor?: string; scope?: 'mine' | 'all'; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {
   id: string
   taskId: string

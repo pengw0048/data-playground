@@ -27,7 +27,8 @@ describe('Preview presentation', () => {
     expect(details).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
     expect(screen.getByText(/Requested 50 rows.*scanned unknown.*returned 1.*total unknown/i)).toBeInTheDocument()
-    expect(screen.getByText('Input dataset://events · revision revision-1.')).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('dataset://events')
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('revision-1')
   })
 
   it('labels a reservoir sample and keeps one actionable bounded-input warning', () => {

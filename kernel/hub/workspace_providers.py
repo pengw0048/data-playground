@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import entry_points
@@ -48,7 +49,7 @@ _MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
 # Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
 # actions may wait a little longer, but remain bounded and use the same isolated provider workers.
-_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
+_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
 _INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
@@ -530,11 +531,66 @@ def provider_dataset_lineage(uri: str, *, depth: int, max_nodes: int):
                 parent=aliases[edge.parent],
                 child=aliases[edge.child],
                 fact_count=edge.fact_count,
+                columns=edge.columns,
+                pipeline_names=edge.pipeline_names,
             )
             for edge in item.edges
         ],
         truncated=item.truncated,
     )
+
+
+def resolve_provider_lineage_resource(
+        root_uri: str, node_uri: str, name: str, *, uid: str) -> dict:
+    """Resolve one opaque provider-lineage neighbour to a current Workspace resource.
+
+    The browser never receives the physical provider URI.  On an explicit card click, provider
+    search returns a bounded candidate set and this server compares only its non-reversible lineage
+    aliases before caching the matched occurrence as a normal Workspace resource.
+    """
+    dataset_identity = provider_dataset_identity(root_uri)
+    if dataset_identity is None:
+        raise ValueError("lineage navigation requires a provider dataset root")
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_identity.removeprefix("workspace-provider:"))
+    if not re.fullmatch(r"workspace-provider-lineage://[0-9a-f]{64}", node_uri):
+        raise ValueError("lineage navigation requires an opaque provider node")
+    query = " ".join(str(name).split())
+    if not query or len(query.encode("utf-8")) > 512:
+        raise ValueError("lineage dataset name is invalid")
+    canonical = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if canonical is None:
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None or mounted.mount.provider != canonical["provider"]:
+        raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetUnavailable(_activation_error()) from exc
+    page = bounded_search(
+        provider,
+        mounted.mount,
+        query,
+        limit=100,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    if page.state == "unsupported":
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source cannot open lineage neighbours")
+    if page.state != "ready":
+        raise ProviderDatasetOffline("provider lineage dataset search is unavailable")
+    matches = [
+        item for item in page.items
+        if item.kind == "dataset" and item.uri
+        and _provider_lineage_uri(mount_id, item.uri) == node_uri
+    ]
+    if not matches:
+        raise ProviderDatasetGone("lineage dataset is not registered in this connected source")
+    match = sorted(matches, key=lambda item: item.placement_id)[0]
+    return _workspace_resource(match, mounted)
 
 
 class _BoundProviderDatasetAdapter:
@@ -1557,11 +1613,9 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     }
 
 
-_PROVIDER_QUERY_REASON = (
-    "Items are shown in the connected source's order. This source does not support sorting or type filters."
-)
+_PROVIDER_QUERY_REASON = "This connected source controls sorting and filters."
 _MIXED_QUERY_REASON = (
-    "This folder includes connected-source items and local Canvases. Sorting and type filters are unavailable because the source controls its result order."
+    "This connected source controls sorting and filters."
 )
 
 

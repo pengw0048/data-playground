@@ -435,13 +435,11 @@ describe('Transform exact processor labels', () => {
 
     render(<CodeFullscreen />)
 
-    const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
+    const implementation = await screen.findByRole('region', { name: 'Implementation source' })
     expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
     expect(implementation).toHaveTextContent("return {**row, 'normalized': True}")
-    expect(implementation).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
-    const details = screen.getByText('Processor reference').closest('details')
-    expect(details).not.toHaveAttribute('open')
-    expect(within(details as HTMLElement).getByText(`${PROCESSOR_ID}@v1`)).not.toBeVisible()
+    expect(implementation).not.toHaveTextContent('SHA-256')
+    expect(screen.queryByText('Processor reference')).not.toBeInTheDocument()
   })
 
   it('shows the exact Library definition and tests a previewable processor on retained upstream rows', async () => {
@@ -516,7 +514,7 @@ describe('Transform exact processor labels', () => {
     render(<CodeFullscreen />)
 
     const definition = await screen.findByRole('region', { name: 'Library processor definition' })
-    expect(definition).toHaveTextContent(`${PROCESSOR_ID}@v1`)
+    expect(definition).not.toHaveTextContent(`${PROCESSOR_ID}@v1`)
     expect(definition).toHaveTextContent('Adds decoded image height and width while preserving row identity.')
     expect(definition).toHaveTextContent('Plugin')
     expect(definition).toHaveTextContent('Bounded testSupported')
@@ -525,13 +523,11 @@ describe('Transform exact processor labels', () => {
     expect(definition).toHaveTextContent('width')
     expect(definition).toHaveTextContent('image_key')
     expect(definition).toHaveTextContent('default "image"')
-    const implementation = await screen.findByRole('region', { name: 'Installed processor source' })
+    const implementation = await screen.findByRole('region', { name: 'Implementation source' })
     expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
-    expect(implementation).toHaveTextContent('Installed processor source')
-    expect(implementation).toHaveTextContent('local implementation installed for this Canvas transform')
-    expect(implementation).toHaveTextContent('does not indicate remote or distributed dispatch')
+    expect(implementation).toHaveTextContent('Implementation source')
     expect(implementation).toHaveTextContent('MAX_DECODED_IMAGE_PIXELS = 50_000_000')
-    expect(implementation).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)
+    expect(implementation).not.toHaveTextContent('SHA-256')
     expect(definition).not.toHaveTextContent('Implementation source unavailable')
     expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument()
 
@@ -586,7 +582,7 @@ describe('Transform exact processor labels', () => {
 
     expect(await screen.findByText('Implementation source unavailable')).toBeVisible()
     expect(apiMocks.installedProcessorSource).toHaveBeenCalledWith(PROCESSOR_ID, 'v1')
-    expect(screen.queryByRole('region', { name: 'Installed processor source' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Implementation source' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Test transform' })).toBeEnabled()
   })
 

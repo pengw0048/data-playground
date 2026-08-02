@@ -83,10 +83,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       : null
   )
   const confirmationActionLabel = isManagedWrite
-    ? 'Publish a new version'
+    ? 'Publish output'
     : visibleRows == null ? 'Run with unknown row count' : `Run ${visibleRows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
-    ? exactRunReady ? 'Publish version' : 'Register inputs to publish'
+    ? exactRunReady ? 'Publish output' : 'Register inputs to publish'
     : exactRunReady ? 'Run' : 'Register inputs to run'
   const previewActionLabel = isManagedWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
@@ -204,7 +204,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <div className="mb-2.5 flex items-center gap-2">
             <span className="dp-running-glyph text-primary">●</span>
-            <span className="text-[13px] font-semibold">{isManagedWrite ? 'publishing managed revision' : 'running'}</span>
+            <span className="text-[13px] font-semibold">{isManagedWrite ? 'publishing dataset' : 'running'}</span>
             {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
           {/* step-progress (deterministic) when we have it, else the row-based fallback */}
@@ -231,7 +231,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 
       {phase === 'done' && st && (
         isManagedWrite ? <>
-          <Label>MANAGED REVISION PUBLISHED</Label>
+          <Label>DATASET PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
             outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed
             returnToCanvas={returnToCanvas} />
@@ -477,16 +477,6 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
                     : 'bg-muted text-muted-foreground',
               )}>{output.outcome}</span>
             </div>
-            {output.uri && <div className="dp-mono mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground" title={output.uri}>→ {output.uri}</div>}
-            {output.writeReceipt && (
-              <div aria-label="Durable write receipt" className="mt-1 text-muted-foreground">
-                <span className="font-semibold text-foreground">revision {output.writeReceipt.revisionId}</span>
-                {' · '}dataset {output.writeReceipt.datasetId}
-                {' · '}{output.writeReceipt.bytes.toLocaleString()} bytes
-                {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
-                {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
-              </div>
-            )}
             {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
           </div>
         )

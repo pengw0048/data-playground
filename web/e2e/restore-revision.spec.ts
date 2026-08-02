@@ -16,10 +16,9 @@ const DETAIL = (revisionId: string, rows: number) => ({
 
 async function expectExactRevision(page: import('@playwright/test').Page, revisionId: string) {
   await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
-  const details = page.getByTestId('detail-dataset-details')
-  const identity = details.getByTestId('dataset-version-identity')
-  if (!await identity.isVisible()) await details.locator('summary').click()
-  await expect(identity).toContainText(`stable-dataset@${revisionId}`)
+  await expect.poll(() => new URL(page.url()).hash).toContain(`revision=${revisionId}`)
+  await expect(page.getByTestId('dataset-version-context')).toHaveText(/^(Current|Previous|Selected) version$/)
+  await expect(page.getByTestId('dataset-viewer')).not.toContainText(`stable-dataset@${revisionId}`)
 }
 
 async function openHistory(page: import('@playwright/test').Page) {
@@ -56,10 +55,10 @@ test('restores an old revision as a new head and reopens the exact result', asyn
     } }))
 
   await page.getByTestId('restore-revision').click()
-  const dialog = page.getByRole('dialog', { name: 'Restore revision as new head' })
+  const dialog = page.getByRole('dialog', { name: 'Restore saved version' })
   await expect(dialog).toBeVisible()
-  await expect(dialog.getByText('rev-old')).toBeVisible()  // the source being restored
-  await expect(dialog.getByText('rev-head')).toBeVisible()  // the current destination head
+  await expect(dialog).not.toContainText('rev-old')
+  await expect(dialog).not.toContainText('rev-head')
   await dialog.getByTestId('restore-revision-confirm').click()
 
   // Completion reopens the exact new revision through the ordinary Catalog surface.
@@ -77,9 +76,9 @@ test('reports a moving-head conflict and publishes nothing', async ({ page }) =>
     } }))
 
   await page.getByTestId('restore-revision').click()
-  const dialog = page.getByRole('dialog', { name: 'Restore revision as new head' })
+  const dialog = page.getByRole('dialog', { name: 'Restore saved version' })
   await dialog.getByTestId('restore-revision-confirm').click()
   await expect(dialog.getByRole('alert')).toContainText(/current version changed/i)
   await expectExactRevision(page, 'rev-old')
-  await expect(page.getByTestId('dataset-version-identity')).not.toContainText('stable-dataset@rev-new')
+  await expect(page.getByTestId('dataset-viewer')).not.toContainText('stable-dataset@rev-new')
 })

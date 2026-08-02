@@ -400,12 +400,6 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
               <span>· {processorModeLabel(libraryProcessor?.mode ?? cfg.mode)}</span>
             </div>
           </div>
-          <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-            <summary className="cursor-pointer font-semibold text-foreground">Developer details</summary>
-            <div className="mt-1.5 break-all font-mono">
-              Processor reference: {libraryProcessorRef}
-            </div>
-          </details>
         </Section>
       )}
       {libraryTransform && libraryProcessor && <Section title="Output columns">
@@ -975,9 +969,7 @@ function sourceInspectorSummary(catalog: CatalogTable[], config: Record<string, 
     if (parameter) return hasLocalSourceIdentity(config) || provider
       ? `${source} · Run-time dataset parameter`
       : 'Run-time dataset parameter'
-    const version = exact
-      ? exact.revisionId.length > 24 ? 'Selected version' : `Version ${exact.revisionId}`
-      : 'Current version'
+    const version = exact ? 'Saved version' : 'Current version'
     if (!exact && table) {
       const rows = table.rowCount == null
         ? 'Rows unknown'
@@ -1002,9 +994,6 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
   const updateConfig = useStore((s) => s.updateConfig)
   return <>
     <Section title="Choose data">
-      <div className="text-[11.5px] leading-relaxed text-muted-foreground">
-        Choose a dataset in Workspace, upload a local file, or register a path the kernel can access.
-      </div>
       <div className="grid gap-1.5">
         <CodeBtn icon="db" label="Select dataset" disabled={!canEdit}
           onClick={() => requestSourceEntryAction(nodeId, 'select')} />
@@ -1015,7 +1004,7 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
       </div>
     </Section>
     <details className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
-      <summary className="cursor-pointer font-semibold text-foreground">Advanced source configuration</summary>
+      <summary className="cursor-pointer font-semibold text-foreground">Manual source settings</summary>
       <div className="mt-2 grid gap-3">
         <EditOnly enabled={canEdit}>
           <div className="grid gap-2">
@@ -1095,25 +1084,15 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   }, [exact?.datasetId, exact?.revisionId, open])
 
   const columns = exact ? detail?.preview.columns : table?.columns
-  const values: Array<[string, string]> = [
-    ['Source', sourceLabel],
-  ]
+  const values: Array<[string, string]> = [['Source', sourceLabel]]
   const stringValue = (key: string) => typeof config[key] === 'string' ? config[key] as string : undefined
   const add = (label: string, value: string | null | undefined) => { if (value) values.push([label, value]) }
   if (parameter) add('Dataset parameter', parameter.parameterRef)
-  if (provider) {
-    add('Provider resource', stringValue('providerResourceRef'))
-    add('Provider mount', stringValue('providerMountId'))
-    add('Provider source binding', stringValue('providerSourceBindingId'))
-  } else if (local) {
-    add('Catalog registration', table?.registrationId ?? stringValue('registrationId') ?? table?.id)
-  }
-  add('Dataset location', stringValue('uri'))
-  if (exact) {
-    add('Dataset ID', exact.datasetId)
-    add('Revision ID', exact.revisionId)
-  }
-  if (selectedRef?.kind === 'as_of') add('As-of selection (UTC)', selectedRef.asOf)
+  if (provider) add('Dataset', node?.data.title)
+  else if (local) add('Dataset', table?.name)
+  else add('Location', stringValue('uri'))
+  if (selectedRef?.kind === 'exact') add('Version', 'Saved version')
+  if (selectedRef?.kind === 'as_of') add('Version', `As of ${selectedRef.asOf}`)
 
   if (!node) return null
 
@@ -1123,19 +1102,18 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
 
   const details = (
     <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
-        <summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
+        <summary className="cursor-pointer font-semibold text-foreground">Data details</summary>
         <div aria-label="Source connection details" className="mt-2 grid gap-2">
-          <div className="text-[10px] leading-relaxed text-muted-foreground">Identifiers are shown here for inspection and copying; they do not replace the selected version.</div>
           <dl className="grid gap-1.5">
             {values.map(([label, value]) => <ConnectionFact key={label} label={label} value={value} />)}
           </dl>
-          {exact && detailState === 'loading' && <div role="status" className="text-muted-foreground">Loading selected version fields…</div>}
-          {exact && detailState === 'unavailable' && <div role="alert" className="text-destructive">The selected version is unavailable. The current dataset was not substituted.</div>}
-          {exact && detailState === 'permission' && <div role="alert" className="text-destructive">Permission to inspect the selected version was lost.</div>}
-          {exact && detailState === 'offline' && <div role="alert" className="text-destructive">The provider is offline; selected version fields cannot be checked.</div>}
-          {exact && detailState === 'error' && <div role="alert" className="text-destructive">Selected version fields could not be loaded.</div>}
+          {exact && detailState === 'loading' && <div role="status" className="text-muted-foreground">Loading fields…</div>}
+          {exact && detailState === 'unavailable' && <div role="alert" className="text-destructive">This saved version is unavailable.</div>}
+          {exact && detailState === 'permission' && <div role="alert" className="text-destructive">You no longer have access to this saved version.</div>}
+          {exact && detailState === 'offline' && <div role="alert" className="text-destructive">The data source is offline.</div>}
+          {exact && detailState === 'error' && <div role="alert" className="text-destructive">Fields could not be loaded.</div>}
           {columns && <div>
-            <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-muted-foreground">Field evidence · {columns.length} {columns.length === 1 ? 'column' : 'columns'}</div>
+            <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-muted-foreground">Fields · {columns.length} {columns.length === 1 ? 'column' : 'columns'}</div>
             {columns.length ? <div className="grid max-h-32 gap-0.5 overflow-y-auto rounded border border-border bg-background/60 p-1">
               {columns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
             </div> : <div className="text-muted-foreground">No fields were supplied for this version.</div>}
@@ -1154,12 +1132,9 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
 }
 
 function ConnectionFact({ label, value }: { label: string; value: string }) {
-  const copy = () => { if (navigator.clipboard) void navigator.clipboard.writeText(value) }
-  return <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-2 gap-y-0.5">
+  return <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] items-start gap-2">
     <dt className="text-muted-foreground">{label}</dt>
-    <button type="button" aria-label={`Copy ${label}`} title={`Copy ${label}`} onClick={copy}
-      className="rounded px-1 text-[9px] font-semibold text-primary hover:bg-accent">Copy</button>
-    <dd className="col-span-2 break-all rounded bg-background/70 px-1.5 py-1 font-mono text-[9.5px] text-foreground">{value}</dd>
+    <dd className="min-w-0 break-words text-foreground">{value}</dd>
   </div>
 }
 

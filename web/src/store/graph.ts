@@ -1983,7 +1983,9 @@ export const useStore = create<Store>((set, get) => ({
   setWorkspaceResource: (resourceId) => {
     startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
-    set({ workspaceResourceId: resourceId, view: 'workspace' })
+    // A saved-version query belongs to exactly one dataset. Carrying it to a different resource
+    // can render the new dataset's title with the previous dataset's rows and revision status.
+    set({ workspaceResourceId: resourceId, workspaceDatasetQuery: '', view: 'workspace' })
   },
   workspaceSearchQuery: '',
   setWorkspaceSearchQuery: (query) => {

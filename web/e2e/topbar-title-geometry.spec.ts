@@ -42,7 +42,7 @@ async function openCanvas(page: Page, canvasId: string) {
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
   await expect(page.getByTestId('inspector')).toHaveCount(0)
   await expect(page.getByTestId('canvas-title')).toBeVisible()
-  await expect(page.getByTestId('kernel-badge')).toBeVisible()
+  await expect(page.getByRole('button', { name: /Execution target:/ })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Rerun all' })).toBeVisible()
   await expect(page.getByTestId('share-btn')).toBeVisible()
   await page.evaluate(() => document.fonts.ready)
@@ -53,8 +53,8 @@ async function expectRunControlsOperable(page: Page, fullName: string) {
   await expect(page.getByRole('textbox', { name: 'Canvas name' })).toHaveValue(fullName)
   await page.keyboard.press('Escape')
 
-  await page.getByTestId('kernel-badge').click()
-  await expect(page.getByText('Execution kernel', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: /Execution target:/ }).click()
+  await expect(page.getByText('Run this Canvas on', { exact: true })).toBeVisible()
   await page.keyboard.press('Escape')
 
   const rerun = page.getByRole('button', { name: 'Rerun all' })

@@ -12,9 +12,9 @@ export function publicationMode(mode: WriteAdmission['mode'] | undefined): strin
 }
 
 function writeMode(mode: WriteAdmission['mode'] | undefined): string {
-  if (mode === 'append') return 'Append provider output'
-  if (mode === 'replace' || mode === 'overwrite') return 'Overwrite provider output'
-  if (mode === 'create') return 'Create provider output'
+  if (mode === 'append') return 'Append to output'
+  if (mode === 'replace' || mode === 'overwrite') return 'Replace output'
+  if (mode === 'create') return 'Create output'
   return 'Write mode is not available yet'
 }
 
@@ -94,7 +94,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
         <strong>Fix before running:</strong> {summaryAdmission.blocker}
       </div> : receipt ? null
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
-            {providerNeutral ? 'Run finished. The selected backend wrote the output.' : 'Run finished, but the published dataset could not be confirmed.'}
+            {providerNeutral ? 'Run finished. Output was written.' : 'Run finished, but the dataset could not be confirmed.'}
           </div>
         : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Writing output…</div>
         : schemaDrift?.requiresConfirmation ? <div aria-label="Write readiness" className="text-amber-700 dark:text-amber-300">

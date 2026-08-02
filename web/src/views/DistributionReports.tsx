@@ -71,11 +71,10 @@ export function DistributionReportLauncher({ definition }: { definition: Dataset
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-3">
     <div className="flex items-center gap-2"><div className="flex-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Distribution reports</div>
       <Button size="sm" variant="outline" onClick={() => void start()} disabled={busy}>{busy ? 'Preparing…' : 'Inspect distributions'}</Button></div>
-    <p className="text-[10.5px] text-muted-foreground">Creates a bounded saved report for this view; the quick Stats preview remains separate.</p>
     {estimate && <div role="dialog" aria-label="Confirm distribution report" className="grid gap-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px]">
       <strong>Confirmation required</strong>
       <span>{estimate.reason === 'unknown_size' ? 'The saved report does not include a reliable scan size.' : 'This saved view exceeds the automatic scan limit.'} Estimated rows: {estimate.estimatedScanRows == null ? 'unknown' : count(estimate.estimatedScanRows)}; bytes: {estimate.estimatedScanBytes == null ? 'unknown' : count(estimate.estimatedScanBytes)}.</span>
-      <span>Bounded to {estimate.limits.reportedColumns} columns, {estimate.limits.topCategories} categories and {estimate.limits.histogramBuckets} buckets per section; deadline {estimate.limits.deadlineSeconds}s.</span>
+      <span>The report will include up to {estimate.limits.reportedColumns} columns, {estimate.limits.topCategories} categories, and {estimate.limits.histogramBuckets} ranges per column.</span>
       <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => setEstimate(null)} disabled={busy}>Cancel</Button><Button size="sm" onClick={() => void submit(true)} disabled={busy}>Confirm and start</Button></div>
     </div>}
     {error && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">{prepareMessage(error)} <button className="font-semibold underline" onClick={() => void load()}>Retry list</button></div>}
@@ -226,7 +225,7 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
         <option value="">No comparison</option>
         {compareReportId && !reports.some((item) => item.reportId === compareReportId) && <option value={compareReportId}>{comparison ? `Linked report · ${count(comparison.coverage.right.measuredRows)} measured rows · ${comparison.coverage.right.complete ? 'complete' : 'sample'}` : 'Linked report · loading details'}</option>}
         {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'saved report'}</option>)}
-      </select><span className="text-muted-foreground">Completed reports for this DatasetView only.</span>
+      </select><span className="text-muted-foreground">Completed reports for this saved view.</span>
     </section>
     {!compareReportId && <ReportDocument report={report} view={view} onExamples={openExamples} />}
     {compareReportId && !comparison && !comparisonError && <><span className="text-[11px] text-muted-foreground">Loading comparison…</span><ReportDocument report={report} view={view} onExamples={openExamples} /></>}
@@ -239,16 +238,16 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
 function ReportDocument({ report, view, onExamples }: { report: DistributionReportDocument; view: DatasetViewDefinition; onExamples: (target: ExampleTarget) => void }) {
   const coverage = report.sections.find((section): section is Extract<DistributionReportSection, { kind: 'coverage_schema' }> => section.kind === 'coverage_schema')
   const sections = report.sections.filter((section) => section.kind !== 'coverage_schema')
-  const sampling = view.sampling.kind === 'all' ? 'All matching rows' : `Reservoir sample of ${count(view.sampling.size)} rows · seed ${view.sampling.seed}`
+  const sampling = view.sampling.kind === 'all' ? 'All matching rows' : `Sample of ${count(view.sampling.size)} rows`
   return <><Evidence report={report} view={view} coverage={coverage} sampling={sampling} />
     <div className="grid gap-3">{sections.map((section) => <Section key={section.sectionId} section={section} measuredRows={report.measuredRows} reportId={report.reportId} onExamples={onExamples} />)}</div></>
 }
 
 function Evidence({ report, view, coverage, sampling }: { report: DistributionReportDocument; view: DatasetViewDefinition; coverage: Extract<DistributionReportSection, { kind: 'coverage_schema' }> | undefined; sampling: string }) {
   const committedAt = datasetRevisionTimeLabel(view.datasetRef.lastKnown?.committedAt, view.retentionOwner)
-  return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before distributions</div>
-    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Dataset version:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
-    {report.sampleProvenance && <div className="rounded border border-border bg-background p-2"><strong>Sample evidence:</strong> {count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div>}
+  return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Report coverage</div>
+    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Dataset version:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Rows:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'all selected rows' : 'sample of selected rows'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'not available'}</div></div>
+    {report.sampleProvenance && <details className="rounded border border-border bg-background p-2"><summary className="cursor-pointer font-semibold">Sampling details</summary><div className="mt-1 text-muted-foreground">{count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div></details>}
     {report.limitations.length > 0 && <ul className="list-disc pl-4 text-muted-foreground">{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul>}
   </section>
 }
@@ -257,9 +256,9 @@ function ComparisonDocument({ comparison, onExamples }: { comparison: Distributi
   const { coverage } = comparison
   return <>
     <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]">
-      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before comparison</div>
+      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Comparison coverage</div>
       <div className="grid gap-2 sm:grid-cols-2"><Identity label="Current report" identity={coverage.left} /><Identity label="Comparison report" identity={coverage.right} /></div>
-      <strong>{coverage.comparable ? 'Coverage is comparable.' : `Coverage is not comparable: ${coverageReason(coverage.reason)}.`}</strong>
+      <strong>{coverage.comparable ? 'These reports can be compared.' : `These reports cannot be compared: ${coverageReason(coverage.reason)}.`}</strong>
     </section>
     <div className="grid gap-3">{comparison.columns.map((column) => {
       const authorized = coverage.comparable && column.comparable
@@ -275,13 +274,13 @@ function ComparisonDocument({ comparison, onExamples }: { comparison: Distributi
 }
 
 function Identity({ label, identity }: { label: string; identity: DistributionReportComparison['coverage']['left'] }) {
-  return <div><strong>{label}</strong><div>{count(identity.measuredRows)} measured rows · {identity.complete ? 'complete coverage' : 'sample coverage'}</div>{identity.sampleProvenance && <div className="text-muted-foreground">{identity.sampleProvenance.strategy} · {count(identity.sampleProvenance.returnedRows)} returned{identity.sampleProvenance.totalRows != null ? ` of ${count(identity.sampleProvenance.totalRows)}` : ''}</div>}</div>
+  return <div><strong>{label}</strong><div>{count(identity.measuredRows)} measured rows · {identity.complete ? 'all selected rows' : 'sample'}</div>{identity.sampleProvenance && <div className="text-muted-foreground">{count(identity.sampleProvenance.returnedRows)} sampled{identity.sampleProvenance.totalRows != null ? ` from ${count(identity.sampleProvenance.totalRows)}` : ''}</div>}</div>
 }
 
 
 function Delta({ column }: { column: DistributionReportComparison['columns'][number] }) {
   const delta = column.metricDelta
-  return <div className="rounded border border-primary/30 bg-primary/5 p-2"><strong>Server-authorized deltas (comparison − current)</strong>{column.missingCountDelta != null && <div>Missing: {signed(column.missingCountDelta)}</div>}{delta?.kind === 'numeric' && <><div>Finite: {signed(delta.countDelta)} · non-finite: {signed(delta.nonFiniteCountDelta)}</div><div>Min: {signed(delta.minDelta)} · max: {signed(delta.maxDelta)} · mean: {signed(delta.meanDelta)} · sd: {signed(delta.stddevDelta)}</div><div>Quantiles: {delta.quantiles.map((item) => `p${Math.round(item.probability * 100)} ${signed(item.valueDelta)}`).join(' · ')}</div><div>{delta.histogramReason === 'unequal_edges' ? 'Histogram bucket edges differ; distributions are shown side by side.' : `Histogram bucket deltas: ${delta.histogram?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div></>}{delta?.kind === 'temporal' && <div>{delta.bucketReason === 'unequal_edges' ? 'Temporal bucket edges differ; distributions are shown side by side.' : `Temporal bucket deltas: ${delta.buckets?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div>}{delta?.kind === 'categorical' && <div className="grid gap-1">{delta.categories.map((category) => <span key={`${typeof category.label}:${category.label}`}>{String(category.label)}: {category.leftCount == null ? 'outside current top-K' : count(category.leftCount)} / {category.rightCount == null ? 'outside comparison top-K' : count(category.rightCount)}{category.countDelta != null ? ` · ${signed(category.countDelta)}` : ''}</span>)}<span>Other: {delta.otherCountReason.replaceAll('_', ' ')}{delta.otherCountDelta != null ? ` · ${signed(delta.otherCountDelta)}` : ''}; distinct: {delta.distinctCountReason.replaceAll('_', ' ')}{delta.distinctCountDelta != null ? ` · ${signed(delta.distinctCountDelta)}` : ''}</span></div>}</div>
+  return <div className="rounded border border-primary/30 bg-primary/5 p-2"><strong>Change (comparison − current)</strong>{column.missingCountDelta != null && <div>Missing: {signed(column.missingCountDelta)}</div>}{delta?.kind === 'numeric' && <><div>Finite: {signed(delta.countDelta)} · non-finite: {signed(delta.nonFiniteCountDelta)}</div><div>Min: {signed(delta.minDelta)} · max: {signed(delta.maxDelta)} · mean: {signed(delta.meanDelta)} · sd: {signed(delta.stddevDelta)}</div><div>Quantiles: {delta.quantiles.map((item) => `p${Math.round(item.probability * 100)} ${signed(item.valueDelta)}`).join(' · ')}</div><div>{delta.histogramReason === 'unequal_edges' ? 'Histogram bucket edges differ; distributions are shown side by side.' : `Histogram bucket deltas: ${delta.histogram?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div></>}{delta?.kind === 'temporal' && <div>{delta.bucketReason === 'unequal_edges' ? 'Temporal bucket edges differ; distributions are shown side by side.' : `Temporal bucket deltas: ${delta.buckets?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div>}{delta?.kind === 'categorical' && <div className="grid gap-1">{delta.categories.map((category) => <span key={`${typeof category.label}:${category.label}`}>{String(category.label)}: {category.leftCount == null ? 'outside current top-K' : count(category.leftCount)} / {category.rightCount == null ? 'outside comparison top-K' : count(category.rightCount)}{category.countDelta != null ? ` · ${signed(category.countDelta)}` : ''}</span>)}<span>Other: {delta.otherCountReason.replaceAll('_', ' ')}{delta.otherCountDelta != null ? ` · ${signed(delta.otherCountDelta)}` : ''}; distinct: {delta.distinctCountReason.replaceAll('_', ' ')}{delta.distinctCountDelta != null ? ` · ${signed(delta.distinctCountDelta)}` : ''}</span></div>}</div>
 }
 
 function Section({ section, measuredRows, reportId, onExamples }: { section: DistributionReportSection; measuredRows: number; reportId: string; onExamples: (target: ExampleTarget) => void }) {

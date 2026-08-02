@@ -354,15 +354,6 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     || error.toLowerCase().includes('evidence')
     || error.toLowerCase().includes('revision')
   )
-  const sourceFallback = page
-    ? `${page.source.registrationId ?? page.source.sourceBindingId}@${page.source.revisionMode}`
-    : sourceIdentity.kind === 'local' ? sourceIdentity.registrationId
-      : `${sourceIdentity.mountId}/${sourceIdentity.sourceBindingId}`
-  const candidateIdentity = candidate
-    ? candidate.exactRef
-      ? `${candidate.exactRef.datasetId}@${candidate.exactRef.revisionId}`
-      : `${candidate.identity.registrationId ?? candidate.identity.sourceBindingId}@${candidate.identity.revisionMode}`
-    : ''
   const reviewedRevisionId = candidate?.identity.revisionMode === 'exact'
     ? candidate.identity.revisionId ?? '' : ''
   const exactRevisionPending = Boolean(requestedRevisionId && requestedRevisionId !== reviewedRevisionId)
@@ -408,7 +399,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
             <div>
               <div className="text-sm font-semibold text-foreground">Find join candidates</div>
               <div className="mt-0.5 text-[11px] text-muted-foreground">
-                Review the evidence before adding this Join to the Canvas.
+                Check the datasets, matching columns, and expected row matches before adding this Join.
               </div>
             </div>
             <button type="button" aria-label="Cancel finding data to join" disabled={confirming}

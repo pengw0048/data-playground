@@ -50,7 +50,7 @@ describe('NodeCard result summary', () => {
 
     render(<ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider>)
 
-    expect(screen.getByText('2 outputs · 250ms')).toBeInTheDocument()
+    expect(screen.getByText('2 outputs · 250 ms')).toBeInTheDocument()
     expect(screen.queryByText(/\b250 rows\b/)).not.toBeInTheDocument()
   })
 

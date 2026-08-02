@@ -34,7 +34,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column, sessionmaker
 
 from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
 from hub.settings import settings
@@ -7342,6 +7342,25 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         placement = s.scalar(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity,
             _workspace_local_placement_visible_clause()))
+        if placement is None and kind == "dataset":
+            # Managed writes expose their stable logical dataset identity in receipts and revision
+            # links, while Workspace placements follow the current physical catalog registration.
+            # Resolve that intentional alias at the Workspace boundary so a receipt deep link keeps
+            # working across head replacements without teaching the browser about catalog internals.
+            current_registration_id = s.scalar(select(CatalogEntry.registration_id).join(
+                CatalogLogicalDataset,
+                CatalogLogicalDataset.logical_id == CatalogEntry.logical_id,
+            ).where(
+                CatalogEntry.logical_id == identity,
+                CatalogLogicalDataset.state == "active",
+                CatalogLogicalDataset.current_uri == CatalogEntry.uri,
+            ).limit(1))
+            if current_registration_id is not None:
+                placement = s.scalar(select(WorkspacePlacement).where(
+                    WorkspacePlacement.target_kind == "dataset",
+                    WorkspacePlacement.target_id == current_registration_id,
+                    _workspace_local_placement_visible_clause(),
+                ))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "canvas":
@@ -7355,7 +7374,7 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         else:
             live = (s.get(Canvas, identity) is not None if kind == "canvas" else
                     s.scalar(select(CatalogEntry.uri).where(
-                        CatalogEntry.registration_id == identity)) is not None)
+                        CatalogEntry.registration_id == placement.target_id)) is not None)
         return {"resource": _workspace_public_placement_resource(
                     s, placement, detached=not live),
                 "ancestors": _workspace_ancestors(s, placement.container_id)}
@@ -11522,7 +11541,9 @@ def _workspace_progress(value) -> float | None:
 def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
                        backend: str | None, backend_attempt: str | None,
                        state_updated_at: datetime.datetime | None,
-                       source: str) -> tuple[tuple[datetime.datetime, str], dict]:
+                       source: str, created_by_id: str | None,
+                       created_by_name: str | None,
+                       viewer_id: str) -> tuple[tuple[datetime.datetime, str], dict]:
     """Normalize terminal history and live state without inventing another lifecycle."""
     if source == "history":
         outputs = json.loads(row.outputs)
@@ -11584,6 +11605,9 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
         "canvasId": row.canvas_id, "canvasName": canvas_name,
         "nodeLabel": node_label, "backend": effective_backend,
         "placement": placement, "attempt": attempt,
+        "createdById": created_by_id,
+        "createdByName": created_by_name,
+        "isMine": created_by_id == str(viewer_id),
     })
     return (created_at, identity), doc
 
@@ -11994,8 +12018,8 @@ def list_workspace_runs(
         backend: str | None = None,
         recorded_after: datetime.datetime | None = None,
         recorded_before: datetime.datetime | None = None,
-        text: str | None = None) -> dict:
-    """Return one bounded keyset page of jobs started by the caller on readable canvases."""
+        text: str | None = None, owned_only: bool = True) -> dict:
+    """Return one bounded keyset page of visible jobs, owner-scoped by default."""
     if limit < 1 or limit > 100:
         raise ValueError("Jobs limit must be between 1 and 100")
     decoded = _workspace_run_cursor_decode(cursor)
@@ -12024,9 +12048,11 @@ def list_workspace_runs(
         effective_backend = func.coalesce(
             RunBackendJob.backend, state_backend_ref, state_placement, literal("unknown"))
         history_identity = literal("h:") + RunRecord.id
+        history_creator_id = func.coalesce(
+            RunInputAdmission.creator_id, RunState.created_by)
+        history_creator = aliased(User)
         history_predicates = [
             visible_canvas,
-            func.coalesce(RunInputAdmission.creator_id, RunState.created_by) == str(uid),
             # A managed-local durable write mirrors its receipt into Run history, but Jobs already
             # lists the owning task ("t:"); exclude the history twin so it stays one Jobs entry.
             ~exists().where(and_(
@@ -12034,6 +12060,8 @@ def list_workspace_runs(
                 DurableTask.canvas_id == RunRecord.canvas_id,
             )),
         ]
+        if owned_only:
+            history_predicates.append(history_creator_id == str(uid))
         if canvas_id:
             history_predicates.append(RunRecord.canvas_id == canvas_id)
         if run_id:
@@ -12068,6 +12096,7 @@ def list_workspace_runs(
             select(
                 RunRecord, Canvas.name, RunState.doc, RunState.updated_at,
                 RunBackendJob.backend, RunBackendJob.attempt_id,
+                history_creator_id, history_creator.name,
             )
             .join(Canvas, Canvas.id == RunRecord.canvas_id)
             .outerjoin(RunState, and_(
@@ -12078,26 +12107,32 @@ def list_workspace_runs(
                 RunInputAdmission,
                 RunInputAdmission.run_id == RunRecord.run_id,
             )
+            .outerjoin(history_creator, history_creator.id == history_creator_id)
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunRecord.run_id)
             .where(*history_predicates)
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, raw_state, state_updated_at, backend_name, backend_attempt in history_rows:
+        for (row, name, raw_state, state_updated_at, backend_name, backend_attempt,
+             creator_id, creator_name) in history_rows:
             state_doc = json.loads(raw_state) if raw_state else None
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
                 backend=backend_name, backend_attempt=backend_attempt,
-                state_updated_at=state_updated_at, source="history"))
+                state_updated_at=state_updated_at, source="history",
+                created_by_id=creator_id, created_by_name=creator_name,
+                viewer_id=uid))
 
         state_identity = literal("s:") + RunState.run_id
+        state_creator = aliased(User)
         state_predicates = [
             visible_canvas,
-            RunState.created_by == str(uid),
             ~exists().where(and_(
                 RunRecord.canvas_id == RunState.canvas_id,
                 RunRecord.run_id == RunState.run_id,
             )),
         ]
+        if owned_only:
+            state_predicates.append(RunState.created_by == str(uid))
         if canvas_id:
             state_predicates.append(RunState.canvas_id == canvas_id)
         if run_id:
@@ -12131,13 +12166,15 @@ def list_workspace_runs(
             select(
                 RunState, Canvas.name,
                 RunBackendJob.backend, RunBackendJob.attempt_id,
+                state_creator.name,
             )
             .join(Canvas, Canvas.id == RunState.canvas_id)
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
+            .outerjoin(state_creator, state_creator.id == RunState.created_by)
             .where(*state_predicates)
             .order_by(RunState.created_at.desc(), RunState.run_id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, backend_name, backend_attempt in state_rows:
+        for row, name, backend_name, backend_attempt, creator_name in state_rows:
             try:
                 state_doc = json.loads(row.doc)
             except (TypeError, ValueError) as exc:
@@ -12145,14 +12182,18 @@ def list_workspace_runs(
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
                 backend=backend_name, backend_attempt=backend_attempt,
-                state_updated_at=row.updated_at, source="state"))
+                state_updated_at=row.updated_at, source="state",
+                created_by_id=row.created_by, created_by_name=creator_name,
+                viewer_id=uid))
 
         task_identity = literal("t:") + DurableTask.id
+        task_creator = aliased(User)
         task_predicates = [
             visible_canvas,
-            DurableTask.owner_id == str(uid),
             DurableTask.task_kind.notin_(_JOBS_HIDDEN_TASK_KINDS),
         ]
+        if owned_only:
+            task_predicates.append(DurableTask.owner_id == str(uid))
         if canvas_id:
             task_predicates.append(DurableTask.canvas_id == canvas_id)
         if run_id:
@@ -12183,9 +12224,12 @@ def list_workspace_runs(
                 DurableTask.created_at < stamp,
                 and_(DurableTask.created_at == stamp, task_identity < identity),
             ))
-        task_rows = s.execute(select(DurableTask, Canvas.name, Canvas.owner_id, Canvas.visibility).join(
+        task_rows = s.execute(select(
+            DurableTask, Canvas.name, Canvas.owner_id, Canvas.visibility, task_creator.name,
+        ).join(
             Canvas, Canvas.id == DurableTask.canvas_id,
-        ).where(*task_predicates).order_by(
+        ).outerjoin(task_creator, task_creator.id == DurableTask.owner_id).where(
+            *task_predicates).order_by(
             DurableTask.created_at.desc(), DurableTask.id.desc()).limit(fetch_limit)).all()
         share_roles = {
             row.canvas_id: row.role
@@ -12194,7 +12238,7 @@ def list_workspace_runs(
                 CanvasShare.canvas_id.in_([task.canvas_id for task, *_rest in task_rows] or ["__none__"]),
             )).all()
         } if task_rows else {}
-        for task, name, canvas_owner_id, canvas_visibility in task_rows:
+        for task, name, canvas_owner_id, canvas_visibility, creator_name in task_rows:
             task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
             status_doc = task_doc["status_doc"]
             created_at = task.created_at or _now()
@@ -12214,7 +12258,7 @@ def list_workspace_runs(
             role = _effective_canvas_role(
                 SimpleNamespace(owner_id=canvas_owner_id, visibility=canvas_visibility),
                 str(uid), share_roles.get(task.canvas_id))
-            can_mutate = role in ("owner", "editor")
+            can_mutate = role in ("owner", "editor") and task.owner_id == str(uid)
             if task.task_kind == "merge_columns_write":
                 # Keep Jobs action affordances identical to the merge action routes.  Other
                 # durable task kinds retain their established Canvas-role semantics.
@@ -12270,6 +12314,8 @@ def list_workspace_runs(
                 "updatedAt": _core_utc_iso(task.updated_at),
                 "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
                 "backend": "local", "placement": "local", "attempt": latest["id"],
+                "createdById": task.owner_id, "createdByName": creator_name,
+                "isMine": task.owner_id == str(uid),
                 "taskId": task.id,
                 "taskAttempts": [{
                     "id": item["id"], "attemptNumber": item["attempt_number"],

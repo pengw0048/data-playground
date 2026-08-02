@@ -42,8 +42,10 @@ test('adds, previews, uses, and removes a local dataset in the unified Workspace
 
     const catalogRoot = await workspaceResource(page, 'catalog folder', 'research')
     await catalogRoot.click()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' }).getByRole('button', { name: 'research' })).toBeVisible()
     const projectedFolder = await workspaceResource(page, 'catalog folder', `workspace-${suffix}`)
     await projectedFolder.click()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' }).getByRole('button', { name: `workspace-${suffix}` })).toBeVisible()
     const dataset = await workspaceResource(page, 'dataset', registeredName)
     await expect(dataset).toBeVisible()
     await page.reload()
@@ -74,7 +76,11 @@ test('adds, previews, uses, and removes a local dataset in the unified Workspace
     await expect(removeDialog).toContainText('Remove from Workspace')
     await removeDialog.getByText('Delete the source file too').click()
     await expect(removeDialog).toContainText(registeredPath)
+    const removedResponse = page.waitForResponse((response) =>
+      response.url().includes('/api/catalog/tables/') && response.request().method() === 'DELETE')
     await removeDialog.getByRole('button', { name: 'Delete file and remove' }).click()
+    expect((await removedResponse).ok()).toBeTruthy()
+    registered = null
     await expect(removeDialog).toHaveCount(0)
     await expect.poll(async () => access(registeredPath).then(() => true).catch(() => false)).toBe(false)
     await expect(page.getByRole('button', { name: `Open dataset ${registeredName}` })).toHaveCount(0)
@@ -83,10 +89,13 @@ test('adds, previews, uses, and removes a local dataset in the unified Workspace
       await page.request.delete(`/api/catalog/tables/${encodeURIComponent(registered.id)}`, { params: {
         expected_registration_id: registered.registrationId,
         expected_revision: registered.metadataRevision,
-      } })
+      }, timeout: 3_000 }).catch(() => {})
     }
-    if (canvasId) await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
-    await page.request.post('/api/catalog/folders/delete', { data: { path: registeredFolder } })
+    if (canvasId) await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`, { timeout: 3_000 }).catch(() => {})
+    await page.request.post('/api/catalog/folders/delete', {
+      data: { path: registeredFolder },
+      timeout: 3_000,
+    }).catch(() => {})
     await unlink(registeredPath).catch(() => {})
   }
 })

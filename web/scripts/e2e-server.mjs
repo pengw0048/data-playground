@@ -73,6 +73,11 @@ async function waitForServer(child) {
 async function main() {
   await timedPhase('e2e-workspace-cleanup', async () => rmSync(workspace, { recursive: true, force: true }))
   await timedPhase(
+    'candidate-spa-build',
+    () => run('npm', ['run', 'build'], { cwd: webRoot }),
+    'Rebuilds the SPA immediately before packaging so local Playwright runs cannot serve stale UI code.',
+  )
+  await timedPhase(
     'webserver-fixture-build',
     () => run('uv', ['run', 'python', join(repoRoot, 'scripts/build_ux_fixtures.py'), '--profile', profile, '--output', join(workspace, 'data')], { cwd: kernelRoot }),
     'Real UX fixture build inside the fresh shared E2E workspace.',

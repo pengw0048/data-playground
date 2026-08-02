@@ -48,7 +48,7 @@ test('keeps execution placement concise while warnings stay visible', async ({ p
     await expect(details.getByText('source-9342868352a9')).toBeVisible()
     await expect(details.getByText('join-5-33741')).toBeVisible()
     await expect(details.getByText('ray-data')).toBeVisible()
-    await expect(details.getByTitle('materialization tier for the handoff')).toHaveText('→ object')
+    await expect(details.getByTitle('storage used between execution regions')).toHaveText('→ object')
     await expect(details.getByTitle('declared resource requirement')).toHaveText('needs 8GB')
   } finally {
     await page.unroute('**/api/graph/plan')

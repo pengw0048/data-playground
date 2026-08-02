@@ -1039,7 +1039,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
   folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
-  backLabel = 'Back to Workspace',
+  backLabel = 'Back to Workspace', workspaceResourceId: workspaceResourceIdOverride,
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
@@ -1050,10 +1050,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   initialRevisionId?: string
   initialRevisionDatasetId?: string
   backLabel?: string
+  workspaceResourceId?: string
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
-  const workspaceResourceId = useStore((s) => s.workspaceResourceId)
+  const routedWorkspaceResourceId = useStore((s) => s.workspaceResourceId)
+  const workspaceResourceId = workspaceResourceIdOverride ?? routedWorkspaceResourceId
   const workspaceScope = useStore((s) => s.workspaceScope)
   const workspaceSearchQuery = useStore((s) => s.workspaceSearchQuery)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
@@ -1349,7 +1351,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-bold text-foreground">{table.name}</div>
             <div data-testid="dataset-version-context" className="truncate text-[10.5px] text-muted-foreground">
-              {exactVersionContext ?? 'Latest dataset'}
+              {exactVersionContext ?? 'Current version'}
             </div>
           </div>
           <button type="button" onClick={openLineageGraph} data-testid="detail-relationships"
@@ -1366,7 +1368,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           {requestedExact
             ? <span data-testid="detail-use-unavailable"
               className="shrink-0 rounded-md bg-muted px-2.5 py-1 text-[11.5px] font-semibold text-muted-foreground">
-              {exactVersionContext} · view-only
+              {exactVersionContext ?? 'Selected version'} · view-only
             </span>
             : <button onClick={() => onUse(table)} data-testid="detail-use"
               className="inline-flex shrink-0 items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary">
@@ -1388,12 +1390,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
             <section aria-labelledby="dataset-details-title" className="rounded-lg border border-border p-3">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <div>
-                  <h2 id="dataset-details-title" className="text-[12px] font-bold text-foreground">Dataset details</h2>
-                  <p className="text-[10.5px] text-muted-foreground">{requestedExact
-                    ? 'These catalog details apply to the dataset, not only this selected version.'
-                    : 'Name and organize this dataset here.'}</p>
-                </div>
+                <h2 id="dataset-details-title" className="text-[12px] font-bold text-foreground">Dataset details</h2>
                 {dirty && <span className="text-[10.5px] font-semibold text-primary">Unsaved changes</span>}
               </div>
               <div className="mt-3 grid gap-2 md:grid-cols-2">
@@ -1424,7 +1421,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 {requestedExact ? <span className="rounded bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
                   {exactVersionContext}
                 </span> : <span className="rounded bg-muted px-2 py-1 text-[10px] font-semibold text-muted-foreground">
-                  Latest dataset
+                  Current version
                 </span>}
               </div>
 
@@ -1541,12 +1538,13 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
           <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table}
             initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId}
+            workspaceResourceId={workspaceResourceId ?? undefined}
             detailsInViewer viewerDetail={requestedExactDetail}
             viewerLoading={requestedExactLoading} viewerError={requestedExactError}
             onViewerRetry={() => { void loadRequestedExact() }} />
 
           {(parentRows.length > 0 || childRows.length > 0) ? <section>
-            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> {requestedExact ? 'Current catalog lineage' : 'Lineage'}{lin?.truncated ? ' (truncated)' : ''}</div>
+            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"><Icon name="lineage" size={12} /> Lineage{lin?.truncated ? ' (truncated)' : ''}</div>
             {parentRows.length > 0 ? <LineageMini label="Parents" onOpen={openLinked} rows={parentRows} /> : null}
             {childRows.length > 0 ? <LineageMini label="Children" onOpen={openLinked} rows={childRows} /> : null}
           </section> : null}
