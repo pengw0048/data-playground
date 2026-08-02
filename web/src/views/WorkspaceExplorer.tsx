@@ -2358,7 +2358,6 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
             {systemColumns.length > 0 && <span>· {providerColumnCount(systemColumns.length, 'system')}</span>}
           </div>
           <div className="order-2"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
-            <div className="mt-0.5 text-[10px] text-muted-foreground">Types are reported by {resource.provider ?? resource.mountId ?? 'this source'} and are read-only here.</div>
             {exactRevision && !preview && !previewError
               ? <div className="mt-1 text-[11px] text-muted-foreground">Loading selected schema…</div>
               : dataColumns.length || systemColumns.length

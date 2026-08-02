@@ -32,7 +32,7 @@ vi.mock('@xyflow/react', () => ({
       table: CatalogTable; fields: Array<{ name: string; role: string }>
       focused: boolean; lineage: boolean; onFocus: () => void; onOpen: () => void
     }; position: { x: number; y: number } }[]
-    edges: { id: string; data?: { rel?: unknown }; sourceHandle?: string; targetHandle?: string; label?: string }[]
+    edges: { id: string; data?: { rel?: unknown }; sourceHandle?: string; targetHandle?: string; label?: string; style?: { stroke?: string } }[]
     onConnect: (connection: { source: string; target: string }) => void
     onEdgeClick: (event: unknown, edge: { id: string; data?: { rel?: unknown } }) => void
     onMove?: (event: unknown, viewport: { zoom: number }) => void
@@ -48,7 +48,8 @@ vi.mock('@xyflow/react', () => ({
       <button key={edge.id} data-testid={`edge-${edge.id}`} onClick={(event) => onEdgeClick(event, edge)}>relationship edge</button>
     ))}
     {edges.map((edge) => <span key={`shape-${edge.id}`} data-testid={`edge-shape-${edge.id}`}
-      data-source-handle={edge.sourceHandle} data-target-handle={edge.targetHandle}>{edge.label}</span>)}
+      data-source-handle={edge.sourceHandle} data-target-handle={edge.targetHandle}
+      data-stroke={edge.style?.stroke}>{edge.label}</span>)}
     {children}
   </div>,
   Background: () => null,
@@ -253,6 +254,32 @@ describe('ERDiagram request truth', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:resolved')
   })
 
+  it('explains when a lineage node has no registered dataset details', async () => {
+    const providerRoot = 'workspace-provider://opaque-root'
+    const providerChild = `workspace-provider-lineage://${'b'.repeat(64)}`
+    store.erFocusUri = providerRoot
+    store.erMode = 'lineage'
+    mocks.lineage.mockResolvedValue({
+      rootUri: providerRoot,
+      nodes: [
+        { id: 'root', name: 'raw_video_v2', uri: providerRoot, kind: 'table' },
+        { id: 'child', name: 'scratch_output', uri: providerChild, kind: 'table' },
+      ],
+      edges: [{ parent: providerRoot, child: providerChild, factCount: 1 }],
+    })
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
+    mocks.workspaceLineageResource.mockRejectedValueOnce(
+      new Error('HTTP 404: lineage dataset is not registered in this connected source'),
+    )
+    render(<ERDiagram />)
+
+    fireEvent.click(await screen.findByTestId(`node-lineage:${providerChild}`))
+
+    await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith(
+      'No dataset details are available for scratch_output.', 'error',
+    ))
+  })
+
   it('opens a clicked registered-lineage neighbour in its normal Dataset detail page', async () => {
     store.erFocusUri = ORDERS.uri
     store.erMode = 'lineage'
@@ -282,6 +309,7 @@ describe('ERDiagram request truth', () => {
 
     const compactJoin = await screen.findByTestId('edge-shape-d0')
     expect(compactJoin).toHaveTextContent('N:1')
+    expect(compactJoin).toHaveAttribute('data-stroke', 'hsl(var(--primary))')
     expect(compactJoin).toHaveAttribute('data-source-handle', 'node-source')
     fireEvent.click(screen.getByRole('button', { name: 'zoom graph' }))
     await waitFor(() => expect(screen.getByTestId('edge-shape-d0')).toHaveAttribute(
@@ -296,28 +324,43 @@ describe('ERDiagram request truth', () => {
     store.erMode = 'lineage'
     mocks.tablesPage.mockResolvedValue(PAGE)
     mocks.relationships.mockResolvedValue([])
+    const archive = {
+      id: 'customers-archive', name: 'customers_archive', uri: 'mem://customers-archive', kind: 'table',
+    }
     mocks.lineage.mockResolvedValue({
       rootUri: ORDERS.uri,
       nodes: [
         { id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' },
         { id: CUSTOMERS.id, name: CUSTOMERS.name, uri: CUSTOMERS.uri, kind: 'table' },
+        archive,
       ],
-      edges: [{
-        parent: ORDERS.uri,
-        child: CUSTOMERS.uri,
-        factCount: 1,
-        columns: ['id'],
-        pipelineNames: ['publish_customers'],
-      }],
+      edges: [
+        {
+          parent: ORDERS.uri,
+          child: CUSTOMERS.uri,
+          factCount: 1,
+          columns: ['id'],
+          pipelineNames: ['publish_customers'],
+        },
+        {
+          parent: ORDERS.uri,
+          child: archive.uri,
+          factCount: 1,
+          columns: ['id'],
+          pipelineNames: ['publish_customers_with_a_generated_identifier'],
+        },
+      ],
     })
     render(<ERDiagram />)
 
     expect(await screen.findByTestId('edge-shape-l0')).not.toHaveTextContent('publish_customers')
+    expect(screen.getByTestId('edge-shape-l0')).toHaveAttribute('data-stroke', 'hsl(var(--muted-foreground))')
     fireEvent.click(screen.getByRole('button', { name: 'zoom graph' }))
     await waitFor(() => expect(screen.getByTestId('edge-shape-l0')).toHaveAttribute(
       'data-target-handle', 'column-in:id',
     ))
     expect(screen.getByTestId('edge-shape-l0')).toHaveTextContent('publish_customers')
+    expect(screen.getByTestId('edge-shape-l1')).toBeEmptyDOMElement()
   })
 
   it('does not invent a key role from a column capability', async () => {
@@ -376,11 +419,15 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByTestId('er-connection-count')).toHaveTextContent('8 of 20 connections')
     expect(screen.getAllByTestId(/^node-/)).toHaveLength(9)
     const childNodes = screen.getAllByTestId(/^node-lineage:mem:\/\/child-/)
-    expect(new Set(childNodes.map((node) => node.getAttribute('data-x')))).toEqual(new Set(['340']))
-    const childRows = childNodes.map((node) => Number(node.getAttribute('data-y'))).sort((left, right) => left - right)
-    expect(childRows.slice(1).map((row, index) => row - childRows[index])).toEqual(
-      Array(childRows.length - 1).fill(220),
+    expect(new Set(childNodes.map((node) => node.getAttribute('data-x')))).toEqual(
+      new Set(['340', '640']),
     )
+    const rowsAt = (x: number) => childNodes
+      .filter((node) => Number(node.getAttribute('data-x')) === x)
+      .map((node) => Number(node.getAttribute('data-y')))
+      .sort((left, right) => left - right)
+    expect(rowsAt(340)).toEqual([-330, -110, 110, 330])
+    expect(rowsAt(640)).toEqual([-440, -220, 220, 440])
 
     fireEvent.click(screen.getByTestId('er-lineage-show-more'))
 

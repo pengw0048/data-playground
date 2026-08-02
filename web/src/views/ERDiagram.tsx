@@ -51,7 +51,7 @@ function EntityNode({ data }: { data: EntityData }) {
       <Handle id="node-target" type="target" position={Position.Left}
         className={cn('!h-2 !w-2 !border-0', lineage ? '!bg-muted-foreground' : '!bg-primary')} />
       <button onClick={activate} disabled={opening}
-        title={lineage ? 'Open dataset details' : 'Focus the graph on this table'}
+        title={lineage ? undefined : 'Focus the graph on this table'}
         className={cn(
           'nodrag flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left hover:bg-accent disabled:cursor-wait',
           expanded && fields.length > 0 && 'border-b border-border',
@@ -63,11 +63,11 @@ function EntityNode({ data }: { data: EntityData }) {
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[12.5px] font-semibold text-foreground" title={table.name}>{table.name}</span>
           <span className="block text-[10px] text-muted-foreground">
-            {opening ? 'Opening…' : focused ? 'Current dataset' : lineage ? 'Open dataset' : 'Dataset'}
+            {opening ? 'Opening…' : focused ? 'Current dataset' : 'Dataset'}
           </span>
         </span>
       </button>
-      {expanded && fields.length > 0 && <div className="flex max-h-[144px] flex-col overflow-y-auto py-1">
+      {expanded && fields.length > 0 && <div className="flex max-h-[144px] flex-col overflow-x-hidden overflow-y-auto py-1">
         {fields.map((field) => <div key={field.name} className="relative flex min-h-6 items-center gap-1.5 px-3 py-0.5 text-left text-[11px]">
           <Handle id={`column-in:${field.name}`} type="target" position={Position.Left}
             className="!h-1.5 !w-1.5 !border-0 !bg-primary" />
@@ -221,16 +221,42 @@ function lineageLayout(
     grouped.set(value, group)
   }
   const output: Record<string, { x: number; y: number }> = {}
+  const columnsFor = (group: CatalogTable[]) => Math.ceil(group.length / 4)
+  const rankX = new Map<number, number>([[0, 0]])
+  let downstreamX = 340
+  for (const value of [...grouped.keys()].filter((item) => item > 0).sort((a, b) => a - b)) {
+    rankX.set(value, downstreamX)
+    downstreamX += columnsFor(grouped.get(value)!) * 300 + 40
+  }
+  let upstreamX = -340
+  for (const value of [...grouped.keys()].filter((item) => item < 0).sort((a, b) => b - a)) {
+    rankX.set(value, upstreamX)
+    upstreamX -= columnsFor(grouped.get(value)!) * 300 + 40
+  }
   for (const [value, group] of grouped) {
     group.sort((left, right) => left.name.localeCompare(right.name))
     group.forEach((table, index) => {
+      const column = Math.floor(index / 4)
+      const row = index % 4
+      const rowsInColumn = Math.min(4, group.length - column * 4)
+      const centre = (rowsInColumn - 1) / 2
+      const gapOffset = column % 2 === 0
+        ? 0
+        : row < Math.floor(rowsInColumn / 2)
+          ? -110
+          : row >= Math.ceil(rowsInColumn / 2)
+            ? 110
+            : 0
       output[table.id] = {
-        // Every graph depth owns exactly one x-rank. Splitting a high-fan-out rank into additional
-        // x-columns made independent siblings look like a downstream chain.
-        x: value * 340,
-        // The detailed card is at most 200px tall. Keep a visible lane between siblings so zooming
-        // past the semantic-detail threshold cannot make two independent datasets overlap.
-        y: (index - (group.length - 1) / 2) * 220,
+        // Keep every depth in a distinct horizontal band, then wrap high fan-out siblings inside
+        // that band. Eight first-page neighbours now fit as two readable columns instead of one
+        // long lane that forces Fit View to shrink every label into illegibility.
+        x: (rankX.get(value) ?? 0) + (value < 0 ? -column : column) * 300,
+        // The detailed card can grow to about 200px at semantic-detail zoom.
+        // Stagger every second column into the gaps of the preceding column. Direct lineage edges
+        // can then reach wrapped siblings without disappearing behind a nearer card and implying a
+        // parent-child relationship that does not exist.
+        y: (row - centre) * 220 + gapOffset,
       }
     })
   }
@@ -585,7 +611,13 @@ export function ERDiagram() {
       })
       setWorkspaceResource(resource.id)
     } catch (caught) {
-      pushToast(`Couldn't open ${table.name}: ${errorMessage(caught)}`, 'error')
+      const message = errorMessage(caught)
+      pushToast(
+        message.includes('lineage dataset is not registered')
+          ? `No dataset details are available for ${table.name}.`
+          : `Couldn't open ${table.name}: ${message}`,
+        'error',
+      )
     } finally {
       setOpeningNode(null)
     }
@@ -624,7 +656,7 @@ export function ERDiagram() {
           ? `column-in:${r.rightColumns[0]}` : 'node-target',
         label: r.cardinality,
         labelStyle: { fontSize: 10, fontWeight: 600 }, markerEnd: { type: MarkerType.ArrowClosed },
-        style: { stroke: 'var(--primary)', strokeWidth: 1.5 }, data: { rel: r },
+        style: { stroke: 'hsl(var(--primary))', strokeWidth: 1.5 }, data: { rel: r },
       })
     })
     if (mode === 'lineage') visibleLineageEdges.forEach((e, i) => {
@@ -638,10 +670,13 @@ export function ERDiagram() {
         targetHandle: expandedEntities && mappedColumn
           && fieldsByTable[t]?.some((field) => field.name === mappedColumn)
           ? `column-in:${mappedColumn}` : 'node-target',
-        label: expandedEntities ? pipeline ?? (mappedColumn ? `via ${mappedColumn}` : undefined) : undefined,
+        // Long generated pipeline identifiers turn a dense graph into an unreadable wall of text.
+        // Keep concise human names on the wire; the column endpoint already explains mapped data.
+        label: expandedEntities && pipeline && pipeline.length <= 28 ? pipeline : undefined,
+        ariaLabel: pipeline ? `Produced by ${pipeline}` : 'Lineage',
         labelStyle: { fontSize: 9.5 },
         markerEnd: { type: MarkerType.ArrowClosed },
-        style: { stroke: 'var(--muted-foreground)', strokeWidth: 1.5 },
+        style: { stroke: 'hsl(var(--muted-foreground))', strokeWidth: 1.5 },
       })
     })
     if (mode === 'joins' && showSuggestions) for (let a = 0; a < visible.length; a++)
@@ -650,7 +685,7 @@ export function ERDiagram() {
         if (declared.has([ta.id, tb.id].sort().join('|')) || !sharesKey(ta, tb)) continue
         out.push({
           id: `c-${ta.id}-${tb.id}`, source: ta.id, target: tb.id, selectable: false,
-          style: { stroke: 'var(--muted-foreground)', strokeDasharray: '4 3', opacity: 0.45 },
+          style: { stroke: 'hsl(var(--muted-foreground))', strokeDasharray: '4 3', opacity: 0.45 },
         })
       }
     return out
