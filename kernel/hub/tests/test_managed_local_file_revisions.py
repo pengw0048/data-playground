@@ -275,7 +275,7 @@ def test_saved_exact_canvas_previews_retained_revision_after_head_replacement_an
         registry=ProcessorRegistry(),
         node_builders={},
         node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
-        chosen_backend=lambda _uid: "local-out-of-core",
+        chosen_backend=lambda _uid, _requested=None: "local-out-of-core",
     )
     monkeypatch.setattr(runs, "get_deps", lambda: deps)
     try:

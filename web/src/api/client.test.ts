@@ -261,6 +261,11 @@ describe('toGraph wire serialization', () => {
     expect(byId['j'].data.status).toBe('draft')
   })
 
+  it('sends the Canvas execution target with every graph request', () => {
+    expect(toGraph({ ...doc, executionBackend: 'ray-data' }).executionBackend).toBe('ray-data')
+    expect(toGraph(doc).executionBackend).toBeNull()
+  })
+
   it('drops note/code annotation nodes (no build step)', () => {
     expect(toGraph(doc).nodes.map((n) => n.id)).toEqual(['a', 'j'])
   })

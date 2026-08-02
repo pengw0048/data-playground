@@ -5096,6 +5096,50 @@
         "title": "ExecutionManifestDetail",
         "type": "object"
       },
+      "ExecutionTargetInfo": {
+        "description": "One configured whole-Canvas execution choice exposed to the editor.\n\n``name`` remains the stable runner identity persisted in a Canvas. The other fields are bounded\npresentation metadata so the web client never has to turn implementation class names into UX.\nOnly registered runners are returned; unavailable integrations must not look selectable.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "interactive",
+              "job"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "substrate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Substrate"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "kind",
+          "description"
+        ],
+        "title": "ExecutionTargetInfo",
+        "type": "object"
+      },
       "FacetValue": {
         "properties": {
           "count": {
@@ -5400,6 +5444,20 @@
             "maxItems": 10000,
             "title": "Edges",
             "type": "array"
+          },
+          "executionBackend": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionbackend"
           },
           "id": {
             "default": "canvas",
@@ -6032,6 +6090,14 @@
               "$ref": "#/components/schemas/CapabilityView"
             },
             "title": "Capabilityviews",
+            "type": "array"
+          },
+          "executionTargets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExecutionTargetInfo"
+            },
+            "title": "Executiontargets",
             "type": "array"
           },
           "mode": {
@@ -13130,6 +13196,18 @@
               }
             ],
             "title": "Unavailablereason"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
           },
           "version": {
             "anyOf": [

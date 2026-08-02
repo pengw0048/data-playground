@@ -167,12 +167,6 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Back to Workspace' }), 'dataset detail back')
-    const datasetDetails = detail.getByTestId('detail-dataset-details')
-    await expect(datasetDetails).not.toHaveAttribute('open', '')
-    await expect(datasetDetails).toContainText('Diagnostics')
-    await datasetDetails.locator('summary').click()
-    await expect(datasetDetails).toHaveAttribute('open', '')
-    await expect(datasetDetails.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
     await expect(detail.getByRole('heading', { name: 'Data preview' })).toBeVisible()
     await expect(detail.getByRole('status').filter({
@@ -193,7 +187,7 @@ test.describe('minimum viewport support', () => {
     await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
     await node.click()
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Add operation from dataset output' })).toBeVisible()
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
     if (testInfo.project.name === 'chromium-reference-viewport') {

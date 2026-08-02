@@ -25,6 +25,9 @@ def _doc(canvas_id: str, *, dataset_ref: dict | None = None) -> dict:
     config = {"datasetRef": dataset_ref} if dataset_ref is not None else {"uri": "events"}
     return {
         "id": canvas_id, "name": "portable report", "version": 4,
+        # Execution targets name deployment-local infrastructure and therefore do not cross the
+        # portable native-Canvas boundary; imported Canvases return to Automatic.
+        "executionBackend": "ray-data",
         "requirements": ["requests>=2"], "parameters": [
             {"name": "limit", "type": "integer", "default": 10},
         ],
@@ -63,6 +66,7 @@ def test_export_is_viewer_readable_and_omits_identity_and_run_history():
         envelope = response.json()
         assert envelope["format"] == native_canvas.FORMAT
         assert envelope["canvas"].get("id") is None
+        assert envelope["canvas"].get("executionBackend") is None
         assert envelope["canvas"]["nodes"][0]["data"]["status"] == "draft"
         assert "lastRun" not in envelope["canvas"]["nodes"][0]["data"]
         assert "history" not in envelope["canvas"]["nodes"][0]["data"]

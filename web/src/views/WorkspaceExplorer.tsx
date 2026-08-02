@@ -4,6 +4,7 @@ import {
 } from 'react'
 import { api, KernelError, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
+import { canvasOpenedAt } from '../store/canvasRecents'
 import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceResource, WorkspaceSearchGroup,
@@ -37,6 +38,22 @@ const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
 const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for this run; it is not a data column.'
 const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
   sort: ['name', 'updated'], kindFilter: true,
+}
+
+export function workspaceTimestampLabel(value: string | null | undefined, now = Date.now()): string {
+  if (!value) return '—'
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) return '—'
+  const elapsed = Math.max(0, now - timestamp)
+  const minute = 60_000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (elapsed < minute) return 'just now'
+  if (elapsed < hour) return `${Math.floor(elapsed / minute)}m ago`
+  if (elapsed < day) return `${Math.floor(elapsed / hour)}h ago`
+  if (elapsed < 30 * day) return `${Math.floor(elapsed / day)}d ago`
+  if (elapsed < 365 * day) return `${Math.floor(elapsed / (30 * day))}mo ago`
+  return `${Math.floor(elapsed / (365 * day))}y ago`
 }
 
 function isProviderBrowseIdentity(identity: string): boolean {
@@ -1093,12 +1110,14 @@ function WorkspaceMixedExplorer() {
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : <div className="mx-auto flex min-h-full w-full max-w-[1600px] flex-col">
           {visibleConnectedSources.length > 0 && <section aria-label="Connected sources" className="mb-4 border-b border-border pb-4">
             <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Connected sources</h2>
+            {viewMode === 'list' && <WorkspaceListHeader />}
             <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
               {visibleConnectedSources.map((resource) => <ResourceRow key={resource.id} resource={resource}
                 onOpen={() => open(resource)} onRetry={reload} viewMode={viewMode} />)}
             </div>
           </section>}
-          {items.length ? <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
+          {items.length ? <>{viewMode === 'list' && <WorkspaceListHeader />}
+          <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
             {items.map((resource) => {
               const rowSelected = selectedResourceIds.has(resource.id)
               const groupSelected = rowSelected && selectedResources.length > 1
@@ -1150,7 +1169,7 @@ function WorkspaceMixedExplorer() {
                 && (!isExternal(resource) || resource.providerMutation)
                 ? () => setDatasetRemoveResource(resource) : undefined} />
             })}
-          </div> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
+          </div></> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
             ? 'This Workspace location is unavailable.'
             : hasMore ? 'This page has no items. Continue to the next page.'
             : isExternal(container) ? canvasDestination(container, 'create')
@@ -2021,6 +2040,12 @@ function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResourc
   return <Icon name={icon} size={size} />
 }
 
+function WorkspaceListHeader() {
+  return <div aria-hidden="true" className="mb-1 grid grid-cols-[minmax(0,1fr)_130px_130px_16px] gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+    <span>Name</span><span>Last modified</span><span>Opened here</span><span />
+  </div>
+}
+
 type ResourceMenuAction = {
   label: string
   onSelect?: () => void
@@ -2051,6 +2076,7 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
 }) {
   const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const currentUserId = useStore((state) => state.currentUser?.id)
   const menuOpen = openId === resource.id
   const unavailable = itemAvailability(resource)
   const canOpen = !unavailable || hasDetachedDatasetRecovery(resource)
@@ -2063,6 +2089,12 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   const grid = viewMode === 'grid'
+  const updatedAt = workspaceTimestampLabel(resource.updatedAt)
+  const openedAtValue = resource.kind === 'canvas'
+    ? canvasOpenedAt(currentUserId, identity(resource)) : null
+  const openedAt = workspaceTimestampLabel(openedAtValue)
+  const updatedAtTitle = resource.updatedAt ? new Date(resource.updatedAt).toLocaleString() : undefined
+  const openedAtTitle = openedAtValue ? new Date(openedAtValue).toLocaleString() : undefined
   const actions: ResourceMenuAction[] = [
     ...(canOpen && contextSelectionCount === 1 ? [{ label: resource.kind === 'dataset' ? 'Open in Workspace' : 'Open', onSelect: onOpen }] : []),
     ...(onNewFolder ? [{ label: 'New folder', onSelect: onNewFolder }] : []),
@@ -2112,10 +2144,18 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
       title={unavailable?.reason}
       className={grid
         ? 'flex min-h-0 min-w-0 max-w-full flex-1 flex-col items-center justify-center gap-2 overflow-hidden px-4 pb-3 pt-8 text-center disabled:cursor-not-allowed'
-        : 'flex min-w-0 max-w-full flex-1 items-center gap-2.5 overflow-hidden px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
-      <span className="shrink-0 text-muted-foreground"><WorkspaceResourceGlyph resource={resource} size={grid ? 28 : 16} /></span>
-      <span className="min-w-0 max-w-full flex-1 overflow-hidden"><span title={resource.name} className={`flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="min-w-0 flex-1 truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
-      {!grid && resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
+        : 'grid min-w-0 max-w-full flex-1 grid-cols-[minmax(0,1fr)_130px_130px_16px] items-center gap-4 overflow-hidden px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
+      <span className={`min-w-0 ${grid ? 'contents' : 'flex items-center gap-2.5'}`}>
+        <span className="shrink-0 text-muted-foreground"><WorkspaceResourceGlyph resource={resource} size={grid ? 28 : 16} /></span>
+        <span className="min-w-0 max-w-full flex-1 overflow-hidden"><span title={resource.name} className={`flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="min-w-0 flex-1 truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
+      </span>
+      {grid ? (resource.updatedAt || openedAtValue) && <span className="text-[10px] text-muted-foreground">
+        {resource.updatedAt ? `Edited ${updatedAt}` : `Opened ${openedAt}`}
+      </span> : <>
+        <span title={updatedAtTitle} className="truncate text-[11px] text-muted-foreground">{updatedAt}</span>
+        <span title={openedAtTitle ?? 'Recorded on this browser'} className="truncate text-[11px] text-muted-foreground">{openedAt}</span>
+        <span>{resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}</span>
+      </>}
     </button>
     {resource.unavailableReason && unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
       className={grid ? 'pb-2 text-[11px] font-semibold text-primary underline' : 'mr-2 shrink-0 font-semibold text-primary underline'}>Retry</button>}

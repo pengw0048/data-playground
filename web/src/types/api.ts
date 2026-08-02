@@ -11,6 +11,13 @@ export interface ResourceSpec {
 }
 export interface WorkerInfo { id: string; capacity: ResourceSpec; state: 'idle' | 'busy' | 'down' }
 export interface BackendInfo { name: string; workers: WorkerInfo[] }
+export interface ExecutionTargetInfo {
+  name: string
+  label: string
+  kind: 'interactive' | 'job'
+  description: string
+  substrate?: string | null
+}
 
 export interface CapabilityView { id: string; label: string; viewer: { kind: string } }
 export interface KernelInfo {
@@ -24,6 +31,7 @@ export interface KernelInfo {
   capabilities: string[]
   capabilityViews?: CapabilityView[]  // plugin capabilities that declare a viewer tab (rendered generically)
   backends: BackendInfo[]
+  executionTargets?: ExecutionTargetInfo[]
 }
 
 export interface NativeCanvasDiagnostic {
@@ -364,6 +372,8 @@ export interface WorkspaceResource {
   version?: number | null
   /** Canvas document CAS token. Workspace placement mutations continue to use `version`. */
   canvasVersion?: number | null
+  /** Authoritative modification time when the backing resource exposes one. */
+  updatedAt?: string | null
   /** Stable built-in Catalog folder binding when this local container is a folder projection. */
   catalogFolderId?: string | null
   catalogFolderState?: 'current' | 'detached' | null

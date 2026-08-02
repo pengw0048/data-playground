@@ -7,6 +7,8 @@ export type IconName =
   | 'chevronDown' | 'chevronRight' | 'chevronLeft' | 'lineage' | 'power' | 'mute' | 'rename'
   | 'duplicate' | 'export' | 'import' | 'trash' | 'search' | 'sparkle' | 'grid'
   | 'fx' | 'sample' | 'arrow' | 'external' | 'check' | 'db' | 'sigma' | 'sql' | 'note'
+  | 'filter' | 'columns' | 'sort' | 'join' | 'union' | 'chart'
+  | 'server'
   | 'minus' | 'link' | 'settings' | 'undo' | 'redo' | 'sun' | 'moon' | 'users' | 'bell' | 'maximize' | 'minimize'
   | 'menu'
 
@@ -52,6 +54,13 @@ const P: Record<IconName, JSX.Element> = {
   sigma: <path d="M11.5 3.5H4.5L8 8l-3.5 4.5h7" />,
   sql: <><ellipse cx="8" cy="4.5" rx="4.5" ry="1.8" /><path d="M3.5 4.5v6c0 1 2 1.8 4.5 1.8s4.5-.8 4.5-1.8v-6" /></>,
   note: <><rect x="3" y="2.5" width="10" height="11" rx="1.5" /><path d="M5.5 6h5M5.5 8.5h5M5.5 11h3" opacity=".6" /></>,
+  filter: <><path d="M2.5 3.5h11L9.2 8.4v3.8l-2.4 1.2v-5z" /></>,
+  columns: <><rect x="2.5" y="3" width="11" height="10" rx="1.5" /><path d="M6.2 3v10M9.8 3v10" opacity=".65" /></>,
+  sort: <><path d="M4 3v10M2.2 11.2 4 13l1.8-1.8" /><path d="M7.5 4h6M7.5 8h4.5M7.5 12h3" /></>,
+  join: <><path d="M2.5 4.5h3a3 3 0 0 1 3 3v1a3 3 0 0 0 3 3h2" /><path d="M2.5 11.5h3a3 3 0 0 0 3-3v-1a3 3 0 0 1 3-3h2" /><circle cx="2.5" cy="4.5" r=".8" /><circle cx="2.5" cy="11.5" r=".8" /></>,
+  union: <><path d="M3 3.5h3v3H3zM3 9.5h3v3H3zM10 6.5h3v3h-3z" /><path d="M6 5h1.2A2.8 2.8 0 0 1 10 7.8M6 11h1.2A2.8 2.8 0 0 0 10 8.2" /></>,
+  chart: <><path d="M2.5 13.5h11M3.5 12V8.5h2V12M7 12V4h2v8M10.5 12V6.5h2V12" /></>,
+  server: <><rect x="2.5" y="2.5" width="11" height="4.5" rx="1.2" /><rect x="2.5" y="9" width="11" height="4.5" rx="1.2" /><circle cx="5" cy="4.8" r=".7" fill="currentColor" stroke="none" /><circle cx="5" cy="11.2" r=".7" fill="currentColor" stroke="none" /><path d="M7.5 4.8h3.5M7.5 11.2h3.5" opacity=".6" /></>,
   link: <><path d="M6.5 9.5 9.5 6.5" /><path d="M7 5l1-1a2.5 2.5 0 0 1 3.5 3.5l-1 1M9 11l-1 1A2.5 2.5 0 0 1 4.5 9.5l1-1" /></>,
   maximize: <path d="M6 3H3v3M10 3h3v3M6 13H3v-3M10 13h3v-3" />,
   minimize: <path d="M3 6h3V3M13 6h-3V3M3 10h3v3M13 10h-3v3" />,

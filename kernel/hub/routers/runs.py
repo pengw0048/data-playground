@@ -877,7 +877,8 @@ def _write_admission_for_graph(
             getattr(deps, "node_ir", {}))
         # #391's typed publisher is the in-process local consumer. Other bundled/plugin transports
         # retain their provider-neutral sink contract and must not be labelled create/replace.
-        runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
+        runner = _route_by_capability(
+            deps, _pick_runner(deps, plan, uid, graph), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
         execution_resolve = getattr(runner, "resolve_adapter", None)
         if managed and runner is getattr(deps, "runner", None) and callable(execution_resolve):
@@ -1798,7 +1799,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     _reject_invalid(preview_graph, deps, req.node_id)
     port_id = _inspection_port(preview_graph, req.node_id, req.port_id, deps)
     k = req.k if req.k is not None else settings.preview_k
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, preview_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         try:
             result = SampleResult(**kb.preview(
                 preview_graph, req.node_id, k, max(0, req.offset), port_id))
@@ -1856,7 +1857,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     )
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         try:
             result = ProfileResult(**kb.profile(
                 graph, req.node_id, full=False, port_id=port_id))
@@ -2435,7 +2436,7 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
         plan = compiler.compile_plan(
             graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
         runner = _route_by_capability(
-            deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
+            deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
         warning = _destination_credential_preflight(deps, runner, plan, graph)
         if warning is not None and regions:
             region = regions[-1]
@@ -2679,6 +2680,13 @@ def _metadata_only_cone_size(
     return (None if unbounded_population else max(rows) if rows else None), None, sizes
 
 
+def _pick_runner(deps, plan, uid: str, graph):
+    try:
+        return deps.pick_runner(plan, uid, graph.execution_backend)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None):
     """Route a declared requirement to region placement or explicit whole-graph admission.
 
@@ -2698,6 +2706,15 @@ def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None)
         accepts = getattr(r, "accepts_whole_graph", None)
         return callable(accepts) and bool(accepts(req))
 
+    if graph.execution_backend is not None:
+        hard_requirement = bool(req.gpu or req.gpu_type or req.labels)
+        if not hard_requirement or _can_place(chosen) or _accepts_whole_graph(chosen):
+            return chosen
+        raise HTTPException(
+            409,
+            f"Canvas execution target '{graph.execution_backend}' cannot satisfy this graph's "
+            "GPU or placement requirement",
+        )
     if _can_place(chosen) or _accepts_whole_graph(chosen):
         return chosen
     return next(
@@ -2767,7 +2784,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     _require_satisfiable_hard_requirements(deps, graph, req.target_node_id)
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
-        deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
+        deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
     multi_output = False
     if output_target is not None:
         multi_output = _require_backend_run_output_support(
@@ -3237,7 +3254,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     _require_satisfiable_hard_requirements(deps, graph, target_node_id)
     output_target = _run_output_preflight(plan, target_node_id)
     runner = _route_by_capability(
-        deps, deps.pick_runner(plan, uid), graph, target_node_id
+        deps, _pick_runner(deps, plan, uid, graph), graph, target_node_id
     )  # honor requirements only in the target's executable cone
     if ((write_admission is not None and write_admission.managed
             or bound_unsubmitted_write)
@@ -4013,6 +4030,7 @@ def _example_rows_editor_graph(graph: Graph, transform_id: str, fixture_uri: str
     return Graph.model_validate({
         "id": graph.id,
         "version": graph.version,
+        "executionBackend": graph.execution_backend,
         "requirements": graph.requirements,
         "parameters": [
             parameter.model_dump(by_alias=True, mode="json")
@@ -4461,6 +4479,7 @@ def _retained_editor_graph(
     return Graph.model_validate({
         "id": graph.id,
         "version": graph.version,
+        "executionBackend": graph.execution_backend,
         "requirements": graph.requirements,
         "nodes": [
             source.model_dump(by_alias=True, mode="json"),
@@ -4491,7 +4510,7 @@ def preview_transform_with_example_rows(
         graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         result = SampleResult(**kb.preview(
             graph,
             req.node_id,
@@ -4566,7 +4585,7 @@ def preview_transform_with_retained_upstream(
                 editor_graph = _retained_editor_graph(
                     graph, req.node_id, upstream, edge, target_uri)
                 _reject_invalid(editor_graph, deps, req.node_id)
-                if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+                if deps.chosen_backend(uid, editor_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
                     result = SampleResult(**kb.preview(
                         editor_graph, req.node_id, req.k, req.offset, port_id))
                 else:

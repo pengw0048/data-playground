@@ -23,7 +23,7 @@ import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../theme/mode'
-import { KernelBadge } from './KernelBadge'
+import type { ExecutionTargetInfo, KernelInfo } from '../types/api'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
@@ -150,7 +150,7 @@ export function TopBar() {
         </div>
         <div data-testid="canvas-run-controls" className="flex items-center gap-2.5">
           <PeerAvatars />
-          <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
+          <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
           <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
             <Icon name="refresh" size={13} /> Rerun all
           </Button>
@@ -173,6 +173,78 @@ export function TopBar() {
       {copyOpen && <CanvasCopyModal source={{ canvasId: useStore.getState().doc.id, version: useStore.getState().doc.version, name: useStore.getState().doc.name ?? 'Untitled canvas' }} onClose={() => setCopyOpen(false)} />}
     </>
   )
+}
+
+const AUTOMATIC_EXECUTION = '__automatic__'
+
+function ExecutionTargetMenu({ kernelUp, kernelInfo, canEdit }: {
+  kernelUp: boolean
+  kernelInfo: KernelInfo | null
+  canEdit: boolean
+}) {
+  const selected = useStore((state) => state.doc.executionBackend)
+  const setExecutionBackend = useStore((state) => state.setExecutionBackend)
+  const targets = kernelInfo?.executionTargets ?? []
+  const selectedTarget = targets.find((target) => target.name === selected)
+  const unavailable = selected && !selectedTarget
+  const label = selectedTarget?.label ?? (unavailable ? 'Target unavailable' : 'Automatic')
+  const grouped = (kind: ExecutionTargetInfo['kind']) => targets.filter((target) => target.kind === kind)
+
+  const targetItem = (target: ExecutionTargetInfo) => (
+    <DropdownMenuRadioItem key={target.name} value={target.name} className="items-start py-2 pl-8">
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex items-center gap-2 text-[12px] font-semibold text-foreground">
+          {target.label}
+          {target.substrate && <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">{target.substrate}</span>}
+        </span>
+        <span className="whitespace-normal text-[10.5px] leading-snug text-muted-foreground">{target.description}</span>
+      </span>
+    </DropdownMenuRadioItem>
+  )
+
+  return <DropdownMenu modal={false}>
+    <DropdownMenuTrigger asChild>
+      <button type="button" disabled={!kernelUp || !canEdit}
+        aria-label={`Execution target: ${label}`}
+        title={!canEdit ? 'View-only Canvas' : !kernelUp ? 'Hub offline' : 'Choose where full Canvas runs execute'}
+        className="inline-flex h-8 max-w-[210px] items-center gap-1.5 rounded-full border border-border bg-card px-2.5 text-[11px] font-semibold text-foreground shadow-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${kernelUp && !unavailable ? 'bg-green-500' : 'bg-amber-500'}`} />
+        <Icon name="server" size={13} />
+        <span className="truncate">{label}</span>
+        <Icon name="chevronDown" size={11} />
+      </button>
+    </DropdownMenuTrigger>
+    <DropdownMenuContent align="end" className="w-[360px] p-1.5">
+      <div className="px-2 pb-1.5 pt-1 text-[11px] font-semibold text-foreground">Run this Canvas on</div>
+      <DropdownMenuRadioGroup value={selected ?? AUTOMATIC_EXECUTION}
+        onValueChange={(value) => setExecutionBackend(value === AUTOMATIC_EXECUTION ? null : value)}>
+        <DropdownMenuRadioItem value={AUTOMATIC_EXECUTION} className="items-start py-2 pl-8">
+          <span className="flex flex-col gap-0.5">
+            <span className="text-[12px] font-semibold text-foreground">Automatic</span>
+            <span className="whitespace-normal text-[10.5px] leading-snug text-muted-foreground">Use the workspace default and automatic resource placement.</span>
+          </span>
+        </DropdownMenuRadioItem>
+        {unavailable && <DropdownMenuRadioItem value={selected} disabled className="items-start py-2 pl-8">
+          <span className="flex flex-col gap-0.5">
+            <span className="text-[12px] font-semibold text-destructive">{selected}</span>
+            <span className="text-[10.5px] text-muted-foreground">This saved target is not configured on this deployment.</span>
+          </span>
+        </DropdownMenuRadioItem>}
+        {grouped('interactive').length > 0 && <>
+          <DropdownMenuSeparator />
+          <div className="px-2 py-1 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Interactive worker</div>
+          {grouped('interactive').map(targetItem)}
+        </>}
+        {grouped('job').length > 0 && <>
+          <DropdownMenuSeparator />
+          <div className="px-2 py-1 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Full-run jobs</div>
+          {grouped('job').map(targetItem)}
+        </>}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p className="px-2 py-1.5 text-[10px] leading-snug text-muted-foreground">Previews remain interactive; full runs use the target saved with this Canvas.</p>
+    </DropdownMenuContent>
+  </DropdownMenu>
 }
 
 // Live presence: avatars of other people currently on this canvas (realtime collab).

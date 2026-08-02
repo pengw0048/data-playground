@@ -216,7 +216,9 @@ def test_graph_reads_reject_before_source_resolution(authed, monkeypatch, canvas
 @pytest.mark.parametrize(("case", "path"), _GRAPH_READ_ENDPOINTS, ids=[c[0] for c in _GRAPH_READ_ENDPOINTS])
 def test_graph_reads_allow_every_canvas_read_role(authed, monkeypatch, uid, case, path):
     _share_editor_and_viewer()
-    monkeypatch.setattr(get_deps(), "chosen_backend", lambda _uid=None: "local-out-of-core")
+    monkeypatch.setattr(
+        get_deps(), "chosen_backend",
+        lambda _uid=None, _requested=None: "local-out-of-core")
     response = client.post(path, json=_graph_read_body(case, "authz_canvas"), headers=_hdr(uid))
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -702,7 +704,9 @@ def test_mcp_reuses_submit_and_cancel_mutation_policy(authed):
 def test_mcp_graph_reads_use_the_authorized_saved_document(authed, monkeypatch):
     """MCP accepts a canvas id, not a caller-supplied graph; `_get_doc` enforces the same read roles."""
     _share_editor_and_viewer()
-    monkeypatch.setattr(get_deps(), "chosen_backend", lambda _uid=None: "local-out-of-core")
+    monkeypatch.setattr(
+        get_deps(), "chosen_backend",
+        lambda _uid=None, _requested=None: "local-out-of-core")
     saved = client.put("/api/canvas/authz_canvas", json=_analysis_graph("authz_canvas"),
                        headers=_hdr("authz_a"))
     assert saved.status_code == 200, saved.text

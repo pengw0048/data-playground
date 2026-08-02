@@ -57,7 +57,7 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
     const sourcePort = page.getByRole('button', { name: 'Add operation from dataset output' })
     await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Sources & sinks', exact: true })).toBeVisible()
     await expect(sourcePort).toBeVisible()
     await expect(sourcePort).toHaveText('')

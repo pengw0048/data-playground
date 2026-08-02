@@ -592,7 +592,7 @@ describe('SettingsModal — plugin config form', () => {
     state.currentUser.capabilities = []
     render(<SettingsModal onClose={vi.fn()} />)
 
-    expect(await screen.findByText('Workspace-wide settings are managed by an administrator. You can still change how your own jobs run.')).toBeVisible()
+    expect(await screen.findByText('Workspace-wide defaults are managed by an administrator. Choose a target for the current Canvas from its top bar.')).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Agent' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Destinations' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Plugins' })).toBeNull()
@@ -629,12 +629,12 @@ describe('SettingsModal — plugin config form', () => {
     })
 
     render(<SettingsModal onClose={vi.fn()} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
-    expect(screen.getByText('Choose how your jobs run')).toBeVisible()
+    expect(screen.getByText('Default for Canvases without a target')).toBeVisible()
     expect(screen.getByText('Local streaming')).toBeVisible()
     expect(screen.getByText('Isolated local process')).toBeVisible()
-    expect(screen.getByText('Warm Canvas worker')).toBeVisible()
+    expect(screen.getByText('Canvas worker')).toBeVisible()
     expect(screen.getByText('Acme batch')).toBeVisible()
     expect(screen.getByText(/Runs through a provider configured for this workspace/)).toBeVisible()
     expect(screen.queryByText(/8 cpu|32GiB|128GiB|256GiB/)).toBeNull()
@@ -647,10 +647,10 @@ describe('SettingsModal — plugin config form', () => {
 
   it('presents inherited execution as Automatic without exposing deployment internals', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByText('Leave Automatic selected unless you need a specific isolation or worker behavior.')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the default configured for Data Playground.')
+    expect(screen.getByText('This is only a fallback. Choose where the current Canvas runs from the compute control in its top bar.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the deployment default and automatic resource placement.')
     expect(screen.queryByText(/Uses the mode chosen for this Workspace/)).toBeNull()
     expect(screen.queryByText('Workspace default (deployment default)')).toBeNull()
   })
@@ -661,7 +661,7 @@ describe('SettingsModal — plugin config form', () => {
       backends: [],
     } as typeof state.kernelInfo
     render(<SettingsModal onClose={vi.fn()} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
     const isolated = screen.getByRole('button', { name: 'Use Isolated local process' })
     expect(isolated).toHaveAttribute('aria-pressed', 'false')
@@ -683,7 +683,7 @@ describe('SettingsModal — plugin config form', () => {
     } as typeof state.kernelInfo
     render(<SettingsModal onClose={vi.fn()} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
   })
 
@@ -697,7 +697,7 @@ describe('SettingsModal — plugin config form', () => {
     })
     render(<SettingsModal onClose={vi.fn()} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
 
     await waitFor(() => expect(restartKernel).toHaveBeenCalledWith('canvas'))
@@ -713,7 +713,7 @@ describe('SettingsModal — plugin config form', () => {
     })
     render(<SettingsModal onClose={vi.fn()} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
   })
 
@@ -754,7 +754,7 @@ describe('SettingsModal — plugin config form', () => {
     ))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
     fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
@@ -770,7 +770,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(await screen.findByPlaceholderText('anthropic/claude-opus-4-8'), {
       target: { value: 'edited-model' },
     })
-    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
     fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
@@ -911,7 +911,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
     fireEvent.change(model, { target: { value: 'staged-model' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
 
     expect(screen.getByRole('button', { name: 'Restarting…' })).toBeDisabled()

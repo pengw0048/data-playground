@@ -5819,11 +5819,13 @@ def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
 
 def _workspace_placement_resource(
         row: WorkspacePlacement, *, detached: bool,
-        canvas_version: int | None = None) -> dict:
+        canvas_version: int | None = None,
+        updated_at: datetime.datetime | None = None) -> dict:
     return {
         "id": _workspace_ref(row.target_kind, row.target_id), "kind": row.target_kind,
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
+        **({"updatedAt": _core_utc_iso(updated_at)} if updated_at is not None else {}),
         **({"canvasVersion": canvas_version}
            if row.target_kind == "canvas" and canvas_version is not None else {}),
     }
@@ -6984,6 +6986,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                     detached=(placement.target_kind == "dataset"
                               and placement.target_id not in live_datasets),
                     canvas_version=row.canvas_version,
+                    updated_at=row.updated_at,
                 ))
         has_more = len(rows) > limit
         last_row = page_rows[-1] if page_rows else None
@@ -7078,10 +7081,23 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         placements = [*canvas_placements, *dataset_placements, *view_placements]
         dataset_ids = [row.target_id for row in placements if row.target_kind == "dataset"]
         canvas_ids = [row.target_id for row in placements if row.target_kind == "canvas"]
-        live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
-            CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
-        canvas_versions = dict(s.execute(select(Canvas.id, Canvas.version).where(
-            Canvas.id.in_(canvas_ids))).all()) if canvas_ids else {}
+        view_ids = [row.target_id for row in placements if row.target_kind == "dataset_view"]
+        dataset_rows = list(s.execute(select(
+            CatalogEntry.registration_id, CatalogEntry.updated_at,
+        ).where(CatalogEntry.registration_id.in_(dataset_ids))).all()) if dataset_ids else []
+        canvas_rows = list(s.execute(select(
+            Canvas.id, Canvas.version, Canvas.updated_at,
+        ).where(Canvas.id.in_(canvas_ids))).all()) if canvas_ids else []
+        view_rows = list(s.execute(select(
+            DatasetView.id, DatasetView.created_at,
+        ).where(DatasetView.id.in_(view_ids))).all()) if view_ids else []
+        live_datasets = {dataset_id for dataset_id, _updated_at in dataset_rows}
+        dataset_updated_at = dict(dataset_rows)
+        canvas_versions = {canvas_id: version for canvas_id, version, _updated_at in canvas_rows}
+        canvas_updated_at = {
+            canvas_id: updated_at for canvas_id, _version, updated_at in canvas_rows
+        }
+        view_updated_at = dict(view_rows)
 
         rows: list[tuple[tuple, dict]] = []
         for row in containers:
@@ -7090,10 +7106,16 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             rank = {"canvas": 1, "dataset": 2, "dataset_view": 3}[row.target_kind]
             live = (row.target_id in canvas_versions if row.target_kind == "canvas" else
                     row.target_id in live_datasets if row.target_kind == "dataset" else True)
+            updated_at = (
+                canvas_updated_at.get(row.target_id) if row.target_kind == "canvas" else
+                dataset_updated_at.get(row.target_id) if row.target_kind == "dataset" else
+                view_updated_at.get(row.target_id)
+            )
             rows.append(((row.ordinal, rank, row.name, row.id),
                          _workspace_placement_resource(
                              row, detached=not live,
-                             canvas_version=canvas_versions.get(row.target_id))))
+                             canvas_version=canvas_versions.get(row.target_id),
+                             updated_at=updated_at)))
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
         has_more = len(rows) > limit

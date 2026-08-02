@@ -117,6 +117,7 @@ function toGraph(doc: CanvasDoc) {
   return {
     id: doc.id,
     version: doc.version,
+    executionBackend: doc.executionBackend ?? null,
     requirements: doc.requirements ?? [],  // the canvas's declared pip deps → the kernel installs them
     parameters: doc.parameters ?? [],
     nodes: dataNodes.map((n) => ({

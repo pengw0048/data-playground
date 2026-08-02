@@ -9,8 +9,9 @@ const state = vi.hoisted(() => ({
   newFile: vi.fn(),
   kernelUp: true,
   saved: true,
-  kernelInfo: { capabilities: [] as string[] },
-  doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' },
+  kernelInfo: { capabilities: [] as string[], executionTargets: [] as Array<{ name: string; label: string; kind: 'interactive' | 'job'; description: string; substrate?: string }> },
+  doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' } as { id: string; name: string; executionBackend?: string },
+  setExecutionBackend: vi.fn(),
   renameFile: vi.fn(),
   deleteFile: vi.fn(),
   discardLocalDraft: vi.fn(),
@@ -70,6 +71,7 @@ beforeEach(() => {
   state.canvasRole = 'owner'
   state.currentDraftId = null
   state.localDrafts = []
+  state.kernelInfo.executionTargets = []
   state.doc = {
     id: 'canvas-1',
     name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review',
@@ -250,5 +252,22 @@ describe('TopBar Settings handoff', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
     expect(trigger).toHaveFocus()
+  })
+})
+
+describe('Canvas execution target', () => {
+  it('selects a configured runner from the Canvas top bar', async () => {
+    state.kernelInfo.executionTargets = [
+      { name: 'kernel', label: 'Canvas worker', kind: 'interactive', description: 'Reusable worker.', substrate: 'pod' },
+      { name: 'ray-data', label: 'Ray Jobs', kind: 'job', description: 'Submit a durable job.', substrate: 'ray-jobs' },
+    ]
+    render(<TopBar />)
+
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Execution target: Automatic' }))
+    expect(screen.getByText('Run this Canvas on')).toBeVisible()
+    await user.click(screen.getByRole('menuitemradio', { name: /Ray Jobs/ }))
+
+    expect(state.setExecutionBackend).toHaveBeenCalledWith('ray-data')
   })
 })

@@ -108,7 +108,7 @@ def test_placed_runner_manifest_probe_fails_closed_before_controller_allocation(
     deps = SimpleNamespace(
         catalog=SimpleNamespace(resolve_ref=lambda ref: ref),
         registry={}, node_specs={}, node_ir={}, runner=selected,
-        runners=[placed], chosen_backend=lambda _uid: "local-out-of-core",
+        runners=[placed], chosen_backend=lambda _uid, _requested=None: "local-out-of-core",
         pick_runner=lambda *_args: selected,
     )
     controller = RunController(deps, selected, lambda *_args: None)

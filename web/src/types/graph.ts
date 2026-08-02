@@ -161,6 +161,8 @@ export interface CanvasDoc {
   id: string
   name?: string
   version: number
+  /** Explicit whole-Canvas runner. Missing means automatic placement/workspace default. */
+  executionBackend?: string
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   requirements?: string[]  // pip specs this canvas needs; its kernel installs them (travels with the canvas)

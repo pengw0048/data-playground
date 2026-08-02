@@ -78,13 +78,30 @@ function yToDoc(base: CanvasDoc): CanvasDoc {
   })
   const es: CanvasEdge[] = []
   edges().forEach((e) => es.push(e))
-  return { ...base, name: (meta().get('name') as string) ?? base.name, nodes: ns, edges: es }
+  const hasExecutionBackend = meta().has('executionBackend')
+  const executionBackend = meta().get('executionBackend')
+  return {
+    ...base,
+    name: (meta().get('name') as string) ?? base.name,
+    // A missing key is a pre-execution-target replica, so keep the authoritative DB value. New
+    // replicas write null explicitly for Automatic; that makes a collaborative clear distinguishable
+    // from legacy Y state that never knew about this field.
+    executionBackend: !hasExecutionBackend
+      ? base.executionBackend
+      : typeof executionBackend === 'string' ? executionBackend : undefined,
+    nodes: ns,
+    edges: es,
+  }
 }
 
 // -- CanvasDoc → Y (diff the store doc into the shared state) ----------------- //
 function pushDocToY(doc: CanvasDoc): void {
   replica.doc.transact(() => {
     if (meta().get('name') !== doc.name) meta().set('name', doc.name)
+    const executionBackend = doc.executionBackend ?? null
+    if (!meta().has('executionBackend') || meta().get('executionBackend') !== executionBackend) {
+      meta().set('executionBackend', executionBackend)
+    }
     const nmap = nodes()
     const ids = new Set(doc.nodes.map((n) => n.id))
     nmap.forEach((_v, id) => { if (!ids.has(id)) nmap.delete(id) })

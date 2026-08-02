@@ -1164,6 +1164,42 @@ def test_ray_jobs_rejects_non_write_before_attempt_binding_or_submission(
         ))) == []
 
 
+def test_explicit_local_ray_target_never_falls_back_to_the_local_runner(
+        jobs_config, monkeypatch):
+    module, deps, _configured_runner, _client, _store = _runner(jobs_config)
+    monkeypatch.delenv("DP_RAY_JOBS_ADDRESS", raising=False)
+    runner = module.RayRunner(deps, recover=False)
+    monkeypatch.setattr(
+        runner.base, "run",
+        lambda *_args, **_kwargs: pytest.fail("explicit Ray target fell back locally"),
+    )
+
+    non_write = _graph()
+    non_write.execution_backend = "ray-data"
+    non_write_plan = compile_plan(
+        non_write, "map", deps.registry, deps.node_specs, deps.node_ir)
+    non_write_status = runner.run(
+        non_write_plan, non_write, "map", "distributed",
+        run_id=f"run_explicit_ray_non_write_{uuid.uuid4().hex}",
+    )
+    assert non_write_status.status == "failed"
+    assert "non-write results" in (non_write_status.error or "")
+
+    unsupported = _graph()
+    unsupported.execution_backend = "ray-data"
+    unsupported_plan = compile_plan(
+        unsupported, "write", deps.registry, deps.node_specs, deps.node_ir)
+    monkeypatch.setattr(runner, "_source_unsupported_reason", lambda *_args: None)
+    monkeypatch.setattr(
+        runner, "_ray_unsupported_reason", lambda _ir: "synthetic Ray incompatibility")
+    unsupported_status = runner.run(
+        unsupported_plan, unsupported, "write", "distributed",
+        run_id=f"run_explicit_ray_unsupported_{uuid.uuid4().hex}",
+    )
+    assert unsupported_status.status == "failed"
+    assert "synthetic Ray incompatibility" in (unsupported_status.error or "")
+
+
 def test_ray_jobs_prebind_failure_atomically_discards_allocated_attempt(
         jobs_config):
     _module, deps, runner, _client, _store = _runner(jobs_config)

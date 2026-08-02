@@ -92,7 +92,7 @@ vi.mock('./CatalogDiscovery', () => ({
   </div>,
 }))
 
-import { WorkspaceExplorer } from './WorkspaceExplorer'
+import { WorkspaceExplorer, workspaceTimestampLabel } from './WorkspaceExplorer'
 
 const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const, name: 'Workspace', version: 1, detached: false }
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
@@ -123,6 +123,15 @@ const CANONICAL_DATASET_CONTEXT = {
   committedAt: '2026-07-23T12:00:00Z',
   columns: [{ name: 'value', type: 'int64', provenance: 'provider' as const, capabilities: [], annotations: [] }],
 }
+
+describe('workspaceTimestampLabel', () => {
+  it('uses compact relative times and handles missing metadata', () => {
+    const now = Date.parse('2026-08-01T12:00:00Z')
+    expect(workspaceTimestampLabel('2026-08-01T11:58:00Z', now)).toBe('2m ago')
+    expect(workspaceTimestampLabel('2026-07-29T12:00:00Z', now)).toBe('3d ago')
+    expect(workspaceTimestampLabel(null, now)).toBe('—')
+  })
+})
 
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
@@ -665,6 +674,8 @@ describe('WorkspaceExplorer', () => {
 
     const views = await screen.findByRole('group', { name: 'Workspace view' })
     expect(within(views).getByRole('button', { name: 'list' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('Last modified')).toBeVisible()
+    expect(screen.getByText('Opened here')).toBeVisible()
     fireEvent.click(within(views).getByRole('button', { name: 'grid' }))
     expect(within(views).getByRole('button', { name: 'grid' })).toHaveAttribute('aria-pressed', 'true')
 

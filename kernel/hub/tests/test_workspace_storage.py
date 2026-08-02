@@ -2366,7 +2366,9 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
                 return db.conn().sql(
                     f"select error('{decoded_private_path}') as provider_failure")
 
-        monkeypatch.setattr(deps, "chosen_backend", lambda _uid=None: "local-out-of-core")
+        monkeypatch.setattr(
+            deps, "chosen_backend",
+            lambda _uid=None, _requested=None: "local-out-of-core")
         path_echoing_adapter = _PathEchoingAdapter()
         monkeypatch.setattr(
             deps, "resolve_adapter",
@@ -2431,7 +2433,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
                 ).model_dump()
 
         kernel_preview_backend = _KernelPreview()
-        monkeypatch.setattr(deps, "chosen_backend", lambda _uid=None: "kernel")
+        monkeypatch.setattr(
+            deps, "chosen_backend", lambda _uid=None, _requested=None: "kernel")
         monkeypatch.setattr(deps, "kernel_backend", lambda: kernel_preview_backend)
         kernel_preview = client.post("/api/run/preview", json={
             "graph": mutable_graph, "nodeId": mutable_source["id"], "k": 1,
@@ -4526,6 +4529,14 @@ def test_workspace_server_query_sorts_and_filters_the_complete_result(workspace_
             session.get(metadb.Canvas, newer["id"]).updated_at = datetime.datetime(
                 2026, 2, 1, tzinfo=datetime.timezone.utc)
 
+        default_page = metadb.workspace_browse(
+            folder["id"], uid=metadb.DEFAULT_USER_ID, limit=50)
+        default_by_name = {item["name"]: item for item in default_page["items"]}
+        assert default_by_name[f"workspace-{token}-older"]["updatedAt"] == (
+            "2026-01-01T00:00:00+00:00")
+        assert default_by_name[f"workspace-{token}-newer"]["updatedAt"] == (
+            "2026-02-01T00:00:00+00:00")
+
         with TestClient(app) as client:
             names: list[str] = []
             cursor: str | None = None
@@ -4557,6 +4568,9 @@ def test_workspace_server_query_sorts_and_filters_the_complete_result(workspace_
             recent_page = recent.json()
             assert [item["name"] for item in recent_page["items"]] == [
                 f"workspace-{token}-newer"]
+            assert recent_page["items"][0]["updatedAt"].startswith(
+                "2026-02-01T00:00:00")
+            assert recent_page["items"][0]["updatedAt"].endswith(("Z", "+00:00"))
             older_page = client.get(
                 f"/api/workspace/containers/{folder['id']}", params=[
                     ("limit", 1), ("sort", "updated"), ("order", "desc"),
@@ -4565,6 +4579,9 @@ def test_workspace_server_query_sorts_and_filters_the_complete_result(workspace_
             assert older_page.status_code == 200, older_page.text
             assert [item["name"] for item in older_page.json()["items"]] == [
                 f"workspace-{token}-older"]
+            assert older_page.json()["items"][0]["updatedAt"].startswith(
+                "2026-01-01T00:00:00")
+            assert older_page.json()["items"][0]["updatedAt"].endswith(("Z", "+00:00"))
 
             mismatched = client.get(
                 f"/api/workspace/containers/{folder['id']}", params=[

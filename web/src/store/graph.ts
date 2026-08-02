@@ -37,6 +37,7 @@ import {
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
 import { connectedBasePosition } from '../canvas/connectedPlacement'
+import { rememberCanvasOpenedAt } from './canvasRecents'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -1455,6 +1456,7 @@ interface Store {
   newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
+  setExecutionBackend: (backend: string | null) => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
@@ -4028,7 +4030,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!isCurrent()) return false
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
-      if (uid) localStorage.setItem(OPEN_KEY(uid), id)
+      if (uid) {
+        localStorage.setItem(OPEN_KEY(uid), id)
+        rememberCanvasOpenedAt(uid, id)
+      }
       // Opening any authoritative Canvas resolves first-run choice, including a Canvas created by
       // Workspace "Use data" rather than one of the banner's own buttons.
       set({ view: 'canvas', firstRunChoice: false })
@@ -4138,7 +4143,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!stored.ok) get().pushToast(stored.error!, 'error')
     }
     const uid = get().currentUser?.id
-    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), doc.id)
+      rememberCanvasOpenedAt(uid, doc.id)
+    }
     set({ view: 'canvas', firstRunChoice: false })
     if (signal && persistence === 'remote') void get().refreshFiles()
     return { ok: true, canvasId: doc.id, persistence }
@@ -4265,7 +4273,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!stored.ok) get().pushToast(stored.error!, 'error')
     }
     const uid = get().currentUser?.id
-    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), doc.id)
+      rememberCanvasOpenedAt(uid, doc.id)
+    }
     set({ view: 'canvas', firstRunChoice: false })
     get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
@@ -4277,6 +4288,13 @@ export const useStore = create<Store>((set, get) => ({
   setRequirements: (reqs) => {
     if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, requirements: reqs } }))
   },  // canvas pip deps; autosave persists
+  setExecutionBackend: (backend) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const normalized = backend?.trim() || undefined
+    if (get().doc.executionBackend === normalized) return
+    get().commit()
+    set((state) => ({ doc: { ...state.doc, executionBackend: normalized } }))
+  },
   setParameters: (parameters) => {
     if (!roleCanEdit(get().canvasRole)) return 'You do not have permission to edit Canvas parameters.'
     const currentDoc = get().doc
@@ -4403,7 +4421,10 @@ export const useStore = create<Store>((set, get) => ({
       view: 'canvas',
     })
     if (!options?.skipViewportFit && draft.doc.nodes.length > 0) get().requestViewportFit(get().doc)
-    try { localStorage.setItem(OPEN_KEY(principalId), draft.canvasId) } catch { /* visible writes happen through the draft store */ }
+    try {
+      localStorage.setItem(OPEN_KEY(principalId), draft.canvasId)
+      rememberCanvasOpenedAt(principalId, draft.canvasId)
+    } catch { /* visible writes happen through the draft store */ }
     if (!roleCanEdit(role)) get().pushToast('Opened the local draft read-only because current edit access is not confirmed', 'error')
     return true
   },

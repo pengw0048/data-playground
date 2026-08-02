@@ -1268,6 +1268,7 @@ class WorkspaceResource(Wire):
     placement_id: str | None = None
     version: int | None = None
     canvas_version: int | None = Field(default=None, ge=1)
+    updated_at: datetime.datetime | None = None
     catalog_folder_id: str | None = None
     catalog_folder_state: Literal["current", "detached"] | None = None
     catalog_folder_path: str | None = None
@@ -2619,6 +2620,20 @@ class BackendInfo(Wire):
     workers: list[WorkerInfo] = []
 
 
+class ExecutionTargetInfo(Wire):
+    """One configured whole-Canvas execution choice exposed to the editor.
+
+    ``name`` remains the stable runner identity persisted in a Canvas. The other fields are bounded
+    presentation metadata so the web client never has to turn implementation class names into UX.
+    Only registered runners are returned; unavailable integrations must not look selectable.
+    """
+    name: str
+    label: str
+    kind: Literal["interactive", "job"]
+    description: str
+    substrate: str | None = None
+
+
 class CapabilityView(Wire):
     """A plugin capability that contributes a VIEWER TAB, declaratively. `viewer.kind` names a generic
     renderer the SPA ships (e.g. 'grid' = media/image grid, 'json' = pretty-printed cell) — so a plugin
@@ -2640,6 +2655,7 @@ class KernelInfo(Wire):
     capabilities: list[str] = []
     capability_views: list[CapabilityView] = []  # plugin capabilities that declare a viewer tab (additive)
     backends: list[BackendInfo] = []  # real backend/worker topology + capacities (additive; runners kept)
+    execution_targets: list[ExecutionTargetInfo] = []
 
 
 class ProcessorDescriptor(Wire):
@@ -2889,6 +2905,12 @@ class ParameterBinding(Wire):
 class Graph(Wire):
     id: str = Field(default="canvas", min_length=1, max_length=512)
     version: int = Field(default=1, ge=0, le=MAX_SAFE_INTEGER)
+    execution_backend: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them

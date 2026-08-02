@@ -507,7 +507,7 @@ def test_run_api_preflight_surfaces_unsupported_destination_credential(
             isolated, "_claim_source_leases",
             lambda *_args, **_kwargs: pytest.fail("API dispatched before credential preflight"),
         )
-    monkeypatch.setattr(deps, "pick_runner", lambda _plan, _uid=None: isolated)
+    monkeypatch.setattr(deps, "pick_runner", lambda _plan, _uid=None, _requested=None: isolated)
     monkeypatch.setattr(runs_router, "get_deps", lambda: deps)
     graph = {
         "id": "credential-api-write", "version": 1,

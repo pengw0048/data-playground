@@ -2399,6 +2399,37 @@ def test_default_execution_is_the_per_canvas_kernel(tmp_path, monkeypatch):
         metadb.set_setting("backend", "", scope="global")
 
 
+def test_canvas_execution_target_overrides_defaults_and_fails_closed(tmp_path):
+    import types
+
+    from hub import metadb
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    plan = types.SimpleNamespace(acyclic=True)
+    metadb.set_setting("backend", "local-out-of-core", scope="global")
+    try:
+        assert d.pick_runner(plan, "alice", "local-subprocess").name == "local-subprocess"
+        with pytest.raises(ValueError, match="not configured"):
+            d.pick_runner(plan, "alice", "missing-runner")
+        with pytest.raises(ValueError, match="cannot run this graph"):
+            d.pick_runner(types.SimpleNamespace(acyclic=False), "alice", "local-subprocess")
+    finally:
+        metadb.set_setting("backend", "", scope="global")
+
+
+def test_kernel_info_describes_only_registered_canvas_execution_targets(tmp_path):
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    targets = {target.name: target for target in d.info().execution_targets}
+    assert set(targets) == {runner.name for runner in d.runners}
+    assert targets["kernel"].label == "Canvas worker"
+    assert targets["kernel"].kind == "interactive"
+    assert targets["kernel"].substrate == "local-process"
+    assert targets["local-subprocess"].kind == "job"
+
+
 def test_sandbox_blocks_dunder_escape():
     # the classic ().__class__.__mro__ escape must be rejected (finding #4)
     code = "def fn(row):\n    row['x'] = ().__class__.__mro__[-1].__subclasses__()\n    return row"
@@ -4084,7 +4115,10 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
 
 
 def test_canvas_crud_is_per_user():
-    doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
+    doc = {
+        "id": "cv1", "name": "My Canvas", "version": 3,
+        "executionBackend": "local-subprocess", "nodes": [], "edges": [],
+    }
     r = client.put("/api/canvas/cv1", json=doc).json()
     assert r == {"ok": True, "id": "cv1", "version": 1}
     listing = client.get("/api/canvas").json()

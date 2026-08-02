@@ -117,7 +117,7 @@ def lance_contract(tmp_path):
         registry=ProcessorRegistry(), node_builders={},
         node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
         node_ir={}, runners=[], runner=runner_capability,
-        pick_runner=lambda _plan, _uid: runner_capability,
+        pick_runner=lambda _plan, _uid, _requested=None: runner_capability,
     )
     try:
         yield lance, deps, graph, table
@@ -564,7 +564,7 @@ def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers
     deps.runner = runner
     deps.runners = []
     deps.node_ir = {}
-    deps.pick_runner = lambda _plan, _uid: runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: runner
     deps.controller = controller
     monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
     before_head = metadb.catalog_managed_local_write_head(create.destination)
@@ -959,7 +959,7 @@ def test_unsubmitted_replace_consumes_the_probed_head_and_loses_a_dispatch_race(
     deps.runner = runner
     deps.runners = []
     deps.node_ir = {}
-    deps.pick_runner = lambda _plan, _uid: runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: runner
     deps.controller = Controller()
     deps.run_index = {}
     deps.run_owner = {}
@@ -1459,7 +1459,7 @@ def test_unknown_destination_admission_api_returns_the_typed_envelope(contract, 
 def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):
     deps, graph = contract
     deps.runner = SimpleNamespace(supports_managed_local_write_intents=lambda: True)
-    deps.pick_runner = lambda _plan, _uid: object()
+    deps.pick_runner = lambda _plan, _uid, _requested=None: object()
     deps.runners = []
     deps.node_ir = {}
 
@@ -1474,7 +1474,7 @@ def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):
 def test_runner_without_typed_write_capability_is_not_mislabeled_managed(contract):
     deps, graph = contract
     deps.runner = object()
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     deps.runners = []
     deps.node_ir = {}
 
@@ -1573,7 +1573,7 @@ def test_write_admission_requires_a_registered_exact_input_and_recovers_after_re
     deps.node_ir = {}
     deps.runner = SimpleNamespace(estimate=lambda *_args: RunEstimate(
         rows=2, bytes=10, placement="local", needs_confirm=False))
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     estimate = TestClient(app).post("/api/run/estimate", json={
         "graph": payload, "targetNodeId": "source",
     })
@@ -1594,7 +1594,7 @@ def test_write_admission_requires_a_registered_exact_input_and_recovers_after_re
     assert admission.exact_run_readiness is not None
     assert admission.exact_run_readiness.ready is True
     assert admission.intent is not None
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     ready_estimate = TestClient(app).post("/api/run/estimate", json={
         "graph": payload, "targetNodeId": "source",
     })
@@ -2385,14 +2385,14 @@ def test_lance_append_admission_rejects_stale_head_and_one_of_two_admissions(
 def test_lance_append_requires_registration_and_in_process_runner(lance_contract):
     _lance, deps, graph, _table = lance_contract
     unsupported = object()
-    deps.pick_runner = lambda _plan, _uid: unsupported
+    deps.pick_runner = lambda _plan, _uid, _requested=None: unsupported
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", "85555555-5555-4555-8555-555555555555")
     assert admission.managed is False
     assert admission.mode == "append"
     assert admission.intent is None
 
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     write = next(node for node in graph.nodes if node.id == "write")
     write.data["config"]["filename"] = "missing.lance"
     missing = _write_admission_for_graph(

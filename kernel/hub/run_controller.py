@@ -99,6 +99,11 @@ class RunController:
     def plan_for_run(self, graph: Graph, target: str | None,
                      sizes: dict | None = None) -> list:
         """Return the regions this controller will actually own, or an empty local fallback."""
+        # A Canvas-level target names one whole-graph owner. Automatic mode may still split work by
+        # placement requirements; an explicit target must not be replaced by the controller's default
+        # region routing after admission has shown the user a different choice.
+        if graph.execution_backend is not None:
+            return []
         regions = self.plan(graph, target, sizes=sizes)
         if len(regions) <= 1 and (not regions or regions[0].backend == "default"):
             return []
@@ -177,7 +182,8 @@ class RunController:
             cone = g.upstream_chain(graph, target)  # only the nodes THIS run executes — not the whole canvas
             greq = placement.graph_requires(graph, self.deps.node_specs, nodes=cone)
             unsat = _hard_req(greq)  # collapsing runs the whole cone on the local default → no gpu/labels there
-            return [{"id": "r_all", "outputNode": target, "backend": "default", "worker": None,
+            return [{"id": "r_all", "outputNode": target,
+                     "backend": graph.execution_backend or "default", "worker": None,
                      "nodeIds": [n.id for n in cone], "tier": None,
                      "rows": rows, "confidence": conf,
                      "requires": _req_str(greq), "unsatisfied": unsat,

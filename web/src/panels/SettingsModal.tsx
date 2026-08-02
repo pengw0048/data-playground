@@ -21,11 +21,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 
 // App / workspace settings — a full-screen page with a left category nav (like Figma / most apps),
 // not a cramped modal. These are GLOBAL: the LLM agent (provider-agnostic; the key lives in the
-// kernel), the execution backend, and save/open destinations. Datasets are curated from Workspace;
+// kernel), the default execution target, and save/open destinations. The current Canvas chooses its
+// own target from the editor top bar. Datasets are curated from Workspace;
 // canvas-scoped settings live in the separate CanvasSettingsModal (opened from the file menu).
 const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },
-  { id: 'execution', label: 'Execution', icon: 'db' },
+  { id: 'execution', label: 'Compute defaults', icon: 'server' },
   { id: 'destinations', label: 'Destinations', icon: 'export' },
   { id: 'credentials', label: 'Credentials', icon: 'link' },
   { id: 'plugins', label: 'Plugins', icon: 'grid' },
@@ -46,8 +47,16 @@ const BUILTIN_RUNNER_PRESENTATION: Record<string, { label: string; guidance: str
     guidance: 'Runs each job in a separate process so a failed or cancelled job does not interrupt the app.',
   },
   kernel: {
-    label: 'Warm Canvas worker',
+    label: 'Canvas worker',
     guidance: 'Keeps one reusable worker for each Canvas and can continue after the app restarts.',
+  },
+  'local-pool': {
+    label: 'Local worker pool',
+    guidance: 'Uses one of the worker slots configured by the workspace operator.',
+  },
+  'ray-data': {
+    label: 'Ray Data',
+    guidance: 'Uses the configured Ray runner. The Canvas menu shows whether it is local or Ray Jobs.',
   },
 }
 const OBJECT_STORE_FIELDS: { key: string; placeholder: string }[] = [
@@ -139,7 +148,7 @@ function pluginActionCopy(plugin: PluginInfo, state: NonNullable<PluginInfo['sta
     if (kinds.has('catalog') || kinds.has('adapter')) actions.push('browse its data connections in Workspace')
     if (kinds.has('node') || kinds.has('processor')) actions.push('add its steps from a Canvas')
     if (kinds.has('pipeline-importer')) actions.push('import a supported pipeline from Transforms')
-    if (kinds.has('runner')) actions.push('choose its mode in Execution')
+    if (kinds.has('runner')) actions.push('choose it from the compute target in a Canvas top bar')
     return actions.length > 0
       ? `Next: ${actions.join('; ')}.`
       : 'This extension works in the background; there is nothing to configure in Settings.'
@@ -806,7 +815,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
           </span>
           <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || Boolean(pluginSecretClearingKey) || invalidPluginEdit || Boolean(conflict) || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
-        <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
+        <DialogDescription className="sr-only">Application and workspace settings: the agent model, default compute target, and output destinations.</DialogDescription>
 
         {conflict && (
           <div data-testid="settings-conflict-recovery" role="alert" className="flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/5 px-[18px] py-2 text-[11.5px] text-foreground">
@@ -904,8 +913,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   </label>
                 </Section>}
 
-                {active === 'execution' && <Section id="execution" title="Execution">
-                  {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide settings are managed by an administrator. You can still change how your own jobs run.</div>}
+                {active === 'execution' && <Section id="execution" title="Compute defaults">
+                  {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide defaults are managed by an administrator. Choose a target for the current Canvas from its top bar.</div>}
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
@@ -916,9 +925,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Choose how your jobs run</div>
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Default for Canvases without a target</div>
                   <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
-                    Leave Automatic selected unless you need a specific isolation or worker behavior.
+                    This is only a fallback. Choose where the current Canvas runs from the compute control in its top bar.
                   </p>
                   <div role="group" aria-label="Execution mode" className="flex flex-col gap-1.5">
                     <button
@@ -937,7 +946,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                           ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Recommended</Badge>
                           : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
                       </div>
-                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the default configured for Data Playground. Most people should leave this selected.</div>
+                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the deployment default and automatic resource placement.</div>
                     </button>
                     {runners.map((runner) => (
                       <button

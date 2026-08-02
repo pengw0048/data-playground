@@ -19,6 +19,7 @@ import { categoryOrder, kindAccent, color } from '../theme/tokens'
 import type { Category, WireType } from '../theme/tokens'
 import type { CanvasNode } from '../types/graph'
 import { NodeFinder, type ScreenRect } from './NodeFinder'
+import { NodeTypeIcon } from './NodeTypeIcon'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
@@ -735,8 +736,8 @@ export function Canvas() {
             <ContextMenuSubTrigger>Add {CONTEXT_CATEGORY_LABEL[category]}</ContextMenuSubTrigger>
             <ContextMenuSubContent className="max-h-80 w-56 overflow-y-auto">
               {specs.map((spec) => <ContextMenuItem key={spec.kind} onSelect={() => addNodeAtContext(spec.kind)}>
-                <span aria-hidden="true" className="grid h-5 w-5 shrink-0 place-items-center rounded border border-border bg-card text-[7.5px] font-bold uppercase text-muted-foreground">
-                  {(spec.tag ?? spec.kind).slice(0, 2)}
+                <span aria-hidden="true" className="grid h-5 w-5 shrink-0 place-items-center rounded border border-border bg-card text-muted-foreground">
+                  <NodeTypeIcon spec={spec} size={12} />
                 </span>
                 <span className="min-w-0 truncate">{spec.title}</span>
               </ContextMenuItem>)}

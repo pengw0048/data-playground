@@ -2812,6 +2812,7 @@ class RayRunner:
         from hub.placement import graph_requires
         from hub.backends import require_destination_credential_support
 
+        explicit_target = getattr(graph, "execution_backend", None) == self.name
         output_target = preflight_run_output_target(plan, target_node_id)
         if output_target is not None:
             # RayRunner is independently callable. Reject before credential resolution, IR lowering,
@@ -2851,7 +2852,7 @@ class RayRunner:
                 "whole-graph non-write results are owned by the local backend; add an explicit "
                 "write sink for Ray execution or run this target locally"
             )
-            if (self.jobs_address or labels
+            if (explicit_target or self.jobs_address or labels
                     or self._requires_ray(requires, graph, target_node_id)):
                 return self._unsupported_status(
                     graph, target_node_id, reason,
@@ -2859,7 +2860,7 @@ class RayRunner:
                 )
             return self.base.run(
                 plan, graph, target_node_id, placement, run_id=run_id)
-        if reason and self._requires_ray(requires, graph, target_node_id):
+        if reason and (explicit_target or self._requires_ray(requires, graph, target_node_id)):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
             return self.base.run(plan, graph, target_node_id, placement, run_id=run_id)  # safe fallback
@@ -2876,7 +2877,15 @@ class RayRunner:
                 sink_targets = self._resolve_sink_targets(ir)
             self._publication_lineage_parents(graph, sink_targets)
         except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
-            if self.jobs_address:
+            if explicit_target or self.jobs_address:
+                if not self.jobs_address:
+                    return self._unsupported_status(
+                        graph, target_node_id,
+                        self._stable_exception(
+                            "Ray sink preflight failed", exc, "sink_preflight_failed"
+                        ),
+                        run_id=run_id, plan=plan,
+                    )
                 raise
             logging.getLogger(__name__).exception("Ray sink preflight failed")
             if self._requires_ray(requires, graph, target_node_id):
