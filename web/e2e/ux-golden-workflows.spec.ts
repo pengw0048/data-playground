@@ -103,13 +103,42 @@ test.describe('researcher golden workflow @ux-smoke', () => {
   test('a changed graph invalidates the old result instead of treating it as current', async ({ page }) => {
     const doc = goldenCanvas(`ux-golden-stale-${randomUUID()}`, 'UX stale canvas', 'UX stale source')
     await installCanvas(page.request, doc)
+    const graph = {
+      id: doc.id,
+      version: doc.version,
+      requirements: doc.requirements ?? [],
+      nodes: doc.nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        position: node.position,
+        parentId: node.parentId ?? null,
+        data: {
+          title: node.data.title,
+          config: node.data.config,
+          status: node.data.status,
+          bypassed: node.data.bypassed,
+          disabled: node.data.disabled,
+        },
+      })),
+      edges: doc.edges,
+    }
+    const started = await page.request.post('/api/run', {
+      data: { graph, targetNodeId: 'filter', confirmed: true },
+    })
+    const startFailure = started.ok() ? '' : await started.text()
+    expect(started.ok(), startFailure).toBe(true)
+    const runId = (await started.json()).runId as string
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+      return (await response.json()).status
+    }, { timeout: 30_000 }).toBe('done')
 
     await page.goto(`/#/canvas/${doc.id}`)
     const filter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
-    await expect(filter).toContainText('500 rows · 12 ms')
+    await expect(filter).toContainText(/[\d,]+ rows · [\d,]+ ms/)
     await filter.click()
     await filter.getByPlaceholder('is_valid = true AND score > 0.5').fill("event = 'signup' OR amount > 0")
-    await expect(filter).not.toContainText('500 rows · 12 ms')
+    await expect(filter).not.toContainText(/[\d,]+ rows · [\d,]+ ms/)
   })
 
   test('reopens and downloads the native full result without navigating away', async ({ page }) => {
