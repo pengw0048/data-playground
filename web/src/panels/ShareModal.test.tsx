@@ -57,14 +57,14 @@ describe('ShareModal — server-authoritative sharing truth', () => {
     const currentUser = await screen.findByText(/Casey/)
     expect(currentUser).toHaveTextContent('can view')
     expect(currentUser).not.toHaveTextContent('owner')
-    expect(screen.getByRole('button', { name: 'Everyone in workspace (view-only)' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Workspace can view' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'Add' })).toBeNull()
   })
 
   it('keeps visibility unchanged on 403 and retries the exact mutation', async () => {
     mocks.addShare.mockRejectedValueOnce(httpError(403, 'forbidden')).mockResolvedValueOnce({ ok: true })
     render(<ShareModal onClose={vi.fn()} />)
-    const workspace = await screen.findByRole('button', { name: 'Everyone in workspace' })
+    const workspace = await screen.findByRole('button', { name: 'Workspace can edit' })
     const privateButton = screen.getByRole('button', { name: 'Private' })
 
     fireEvent.click(workspace)
@@ -81,7 +81,7 @@ describe('ShareModal — server-authoritative sharing truth', () => {
     let finish!: (value: { ok: boolean }) => void
     mocks.addShare.mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
     render(<ShareModal onClose={vi.fn()} />)
-    const workspace = await screen.findByRole('button', { name: 'Everyone in workspace' })
+    const workspace = await screen.findByRole('button', { name: 'Workspace can edit' })
 
     fireEvent.click(workspace)
 
