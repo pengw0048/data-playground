@@ -79,7 +79,7 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.getByRole('button', { name: destination, exact: true }).click()
     await expect(page.getByText(/Destination:/)).toContainText(`Workspace / ${destination}`)
     await page.getByRole('button', { name: `Move to ${destination}` }).click()
-    const status = page.getByRole('status')
+    const status = page.getByRole('status').filter({ hasText: `Moved “${canvas}” to Workspace / ${destination}.` })
     await expect(status).toContainText(`Moved “${canvas}” to Workspace / ${destination}.`)
     await page.getByRole('button', { name: 'Undo move' }).click()
     await expect(status).toHaveCount(0)
