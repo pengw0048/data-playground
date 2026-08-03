@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { hasConfiguredManagedSidecarMerge, roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
 import { color, status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { ProgressBar } from '../ui/controls'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
@@ -209,7 +210,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
           {/* step-progress (deterministic) when we have it, else the row-based fallback */}
-          <ProgressBar value={st.progress ?? (st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3)} />
+          <ProgressBar value={st.progress ?? (st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3)}
+            label={isManagedWrite ? 'Publishing dataset' : 'Run progress'} />
           <div className="my-2 text-[11.5px] text-muted-foreground">
             {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows
           </div>
@@ -525,14 +527,6 @@ function ReadableRunError({ raw, nodeTitle, config, details = false }: {
           <pre className="dp-mono mt-1.5 max-h-44 overflow-auto whitespace-pre-wrap text-[10px] leading-relaxed">{error.details}</pre>
         </details>
       )}
-    </div>
-  )
-}
-
-function ProgressBar({ value }: { value: number }) {
-  return (
-    <div className="h-1.5 overflow-hidden rounded bg-muted">
-      <div className="h-full rounded bg-primary transition-[width] duration-300" style={{ width: `${Math.min(100, Math.max(6, value * 100))}%` }} />
     </div>
   )
 }

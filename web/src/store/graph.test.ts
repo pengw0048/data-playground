@@ -1681,6 +1681,108 @@ describe('graph store — core authority ops', () => {
     )
   })
 
+  const fanOutDoc = (sinks: number) => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events' }
+    const nodes = [source]
+    const edges = []
+    for (let i = 0; i < sinks; i += 1) {
+      nodes.push(NODE(`sink${i}`, 'filter'))
+      edges.push({
+        id: `source-sink${i}`, source: 'source', target: `sink${i}`,
+        data: { wire: 'dataset' as const },
+      })
+    }
+    return { id: 'c', version: 1, name: 'fan out', requirements: [], nodes, edges }
+  }
+
+  it('rerun all dispatches one whole-graph run instead of one run per sink', async () => {
+    const doc = fanOutDoc(8)
+    useStore.setState({ doc, runs: {}, graphRun: null, toasts: [] })
+    const perNode = doc.nodes.map((node) => ({ nodeId: node.id, status: 'done', ms: 3 }))
+    apiMocks.run.mockResolvedValue({
+      runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 0, totalRows: null, ms: 0, placement: 'local', progress: 0,
+      perNode: doc.nodes.map((node) => ({ nodeId: node.id, status: 'queued' })), outputs: [],
+    })
+    apiMocks.runStatus.mockResolvedValue({
+      runId: 'graph-run', status: 'done', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 0, totalRows: null, ms: 40, placement: 'local', progress: 1,
+      perNode, outputs: [],
+    })
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toBeNull())
+    expect(apiMocks.run).toHaveBeenCalledTimes(1)
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'c' }), undefined, false, expect.any(String),
+    )
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    // the single pass reports every step, so each executed node ends with its own result readout
+    expect(useStore.getState().doc.nodes.every((node) => node.data.status === 'latest')).toBe(true)
+    expect(useStore.getState().doc.nodes.filter((node) => node.data.lastRun)).toHaveLength(9)
+    expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('lets the user stop the single whole-graph run', async () => {
+    const doc = fanOutDoc(2)
+    useStore.setState({
+      doc, graphRun: {
+        canvasId: doc.id, runId: 'graph-run', status: {
+          runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+          rowsProcessed: 0, ms: 4, placement: 'local', progress: 0.5,
+          perNode: [
+            { nodeId: 'source', status: 'done' },
+            { nodeId: 'sink0', status: 'running' },
+            { nodeId: 'sink1', status: 'queued' },
+          ], outputs: [],
+        },
+      },
+    })
+
+    await useStore.getState().cancelGraphRun()
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('graph-run')
+    expect(useStore.getState().graphRun).toBeNull()
+    expect(useStore.getState().doc.nodes.some((node) => node.data.status === 'running')).toBe(false)
+  })
+
+  it('keeps rerun all on per-sink dispatch when a sink publishes a Write', async () => {
+    const doc = fanOutDoc(2)
+    doc.nodes.push(NODE('publish', 'write'))
+    doc.edges.push({ id: 'sink0-publish', source: 'sink0', target: 'publish', data: { wire: 'dataset' as const } })
+    useStore.setState({ doc, runs: {}, graphRun: null, toasts: [] })
+    apiMocks.estimate.mockResolvedValue({ rows: 5, placement: 'local', needsConfirm: false })
+    apiMocks.runStatus.mockResolvedValue({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'sink1',
+      rowsProcessed: 5, ms: 5, placement: 'local', perNode: [], outputs: [],
+    })
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(useStore.getState().runs.sink1?.phase).toBe('done'))
+    expect(apiMocks.estimate).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().graphRun).toBeNull()
+    expect(apiMocks.run).not.toHaveBeenCalledWith(
+      expect.anything(), undefined, expect.anything(), expect.anything(),
+    )
+  })
+
+  it('falls back to per-sink dispatch when the whole-graph pass needs a size confirmation', async () => {
+    const doc = fanOutDoc(3)
+    useStore.setState({ doc, runs: {}, graphRun: null, toasts: [] })
+    apiMocks.run.mockRejectedValue(new KernelError(
+      409, 'run needs confirmation', 'run_confirmation_required'))
+    apiMocks.estimate.mockResolvedValue({ rows: 5, placement: 'local', needsConfirm: true })
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(apiMocks.estimate).toHaveBeenCalledTimes(3))
+    expect(apiMocks.run).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().graphRun).toBeNull()
+  })
+
   it('explains why rerun all cannot start a legacy graph with no terminal sink', () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }
