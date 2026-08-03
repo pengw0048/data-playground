@@ -128,10 +128,10 @@ export function AgentDock() {
                   </div>
                   <div className="mt-1" data-testid="agent-disclosure-values">
                     {disclosure.rowValuesMayLeave
-                      ? 'Sample row values may leave this deployment under the active AgentDataPolicy.'
-                      : 'Sample row values will not leave this deployment (metadata-only). Catalog names and columns may still be sent to the model.'}
+                      ? 'Sample row values may be sent to the model, as allowed by the workspace data policy.'
+                      : 'Sample row values stay in this deployment. Dataset and column names may still be sent to the model.'}
                   </div>
-                  <div className="mt-1">Earlier requests and results shown here are display-only; they are not sent with this request.</div>
+                  <div className="mt-1">Each request is sent on its own.</div>
                 </div>
               )}
               {completedRequests.length === 0 && <div className="text-[11.5px] leading-relaxed text-muted-foreground">

@@ -133,7 +133,7 @@ describe('collaboration relay handshake', () => {
     const frames = socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>)
     expect(frames.filter((frame) => frame.type === 'yjs')).toEqual([])
     expect(frames.filter((frame) => frame.type === 'sync-ready')).toEqual([])
-    expect(useStore.getState().toasts.at(-1)?.msg).toContain('available synchronized peer')
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('Connecting to collaborators')
   })
 
   it('reconnects promptly when a directed sync request cannot enter the socket queue', () => {

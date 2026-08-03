@@ -413,7 +413,7 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
   if (requestedMissing) return <div>
     <button onClick={() => history.back()} className="mb-4 text-[12px] font-semibold text-primary">Back</button>
     <h2 className="text-lg font-bold">Version unavailable</h2>
-    <p className="mt-2 text-[12px] leading-5 text-muted-foreground">This deep link names a version that does not exist or is no longer accessible. No newer version was substituted.</p>
+    <p className="mt-2 text-[12px] leading-5 text-muted-foreground">This link points to a version that no longer exists or isn’t accessible.</p>
     <VersionList versions={detail.versions} selected={null} onSelect={onSelectVersion} />
   </div>
   if (!selected) return null

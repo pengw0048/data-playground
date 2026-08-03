@@ -94,9 +94,9 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     fireEvent.click(screen.getByLabelText('Required'))
     fireEvent.click(screen.getByLabelText('Default'))
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'env:PRIVATE' } })
-    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+    expect(screen.getByRole('alert')).toHaveTextContent('must be plain text, not a secret')
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'FILE:/private/token' } })
-    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+    expect(screen.getByRole('alert')).toHaveTextContent('must be plain text, not a secret')
 
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 's3://public-bucket/key' } })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()

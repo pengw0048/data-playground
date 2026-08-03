@@ -327,7 +327,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
       else await api.createUser(name)
       setNewUser({ name: '', password: '' })
       await refreshUsers()
-      setMemberNotice({ kind: 'success', message: `Added ${name}. This applied immediately; staged Settings are unchanged.` })
+      setMemberNotice({ kind: 'success', message: `Added ${name}. This applied immediately.` })
       pushToast(`Added ${name}`, 'success')
     } catch (e) {
       const message = `Could not add ${name}: ${errorMessage(e)}`
@@ -576,7 +576,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
       const saved = credForm.id ? await api.updateCred(credForm.id, body) : await api.createCred(body)
       setCreds((prev) => credForm.id ? prev.map((c) => c.id === saved.id ? saved : c) : [...prev, saved])
       setCredForm(emptyCredForm(credForm.kind))
-      const message = `${isEdit ? 'Saved' : 'Added'} credential ${name}. This applied immediately; staged Settings are unchanged.`
+      const message = `${isEdit ? 'Saved' : 'Added'} credential ${name}. This applied immediately.`
       setCredentialNotice({ kind: 'success', message })
       pushToast(`Saved credential ${name}`, 'success')
     } catch (e) {
@@ -601,7 +601,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
       await api.deleteCred(c.id)
       setCreds((prev) => prev.filter((x) => x.id !== c.id))
       if (credForm.id === c.id) setCredForm(emptyCredForm(credForm.kind))
-      setCredentialNotice({ kind: 'success', message: `Removed credential ${c.name}. This applied immediately; staged Settings are unchanged.` })
+      setCredentialNotice({ kind: 'success', message: `Removed credential ${c.name}. This applied immediately.` })
       pushToast(`Removed credential ${c.name}`, 'success')
     } catch (e) {
       const message = `Could not remove credential ${c.name}: ${errorMessage(e)}`
@@ -616,8 +616,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     try {
       const result = await api.restartKernel(canvasId)
       const message = result.restarted
-        ? 'Canvas worker restart requested. This applied immediately; staged Settings are unchanged.'
-        : 'No active Canvas worker. The next run starts fresh; staged Settings are unchanged.'
+        ? 'Canvas worker restart requested.'
+        : 'No active Canvas worker. The next run starts fresh.'
       setKernelNotice({ kind: 'success', message })
       pushToast(result.restarted ? 'Canvas worker restarting…' : 'The next run starts a fresh Canvas worker.', 'success')
     } catch (e) {
@@ -693,7 +693,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
       finishPluginSecretClear(
         target,
         result.revision,
-        `${target.field.label} now uses its environment/default value. This applied immediately; staged Settings are unchanged.`,
+        `${target.field.label} now uses its environment/default value. This applied immediately.`,
       )
       pushToast(`Cleared ${target.field.label} stored reference`, 'success')
     } catch (error) {
@@ -705,7 +705,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
           finishPluginSecretClear(
             target,
             latest.revision,
-            `${target.field.label} was already cleared. It now uses its environment/default value; staged Settings are unchanged.`,
+            `${target.field.label} was already cleared. It now uses its environment/default value.`,
           )
         } else {
           const conflict = error instanceof KernelError && error.status === 409
@@ -850,7 +850,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
           <div role="alert" className="flex items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-[18px] py-2 text-[11.5px] text-destructive">
             <div className="min-w-0 flex-1">
               <div>{saveFailure.message}</div>
-              <div className="mt-0.5 text-[10.5px]">The save was not confirmed. Settings are never partially committed; your edits remain here.</div>
+              <div className="mt-0.5 text-[10.5px]">The save was not confirmed. Your edits remain here.</div>
             </div>
             <Button variant="outline" size="sm" onClick={save} disabled={saving}>Retry save</Button>
           </div>
@@ -930,7 +930,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
                       <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart Canvas worker'}</Button>
-                      <span className="text-[10.5px] text-muted-foreground">Applies immediately; it does not save staged Settings. Clears warm state for this Canvas; the next run starts fresh.</span>
+                      <span className="text-[10.5px] text-muted-foreground">Restarts this Canvas immediately. Unsaved Settings remain unsaved.</span>
                     </div>
                   )}
                   {kernelNotice && <div role={kernelNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', kernelNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
@@ -1066,9 +1066,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
 
                 {canGlobal && active === 'credentials' && <Section id="credentials" title="Credentials">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Named credentials a destination or the agent references. Fields store references (`env:VAR` / `file:/path`), never the secret bytes.
+                    Named credentials a destination or the agent references. Fields store references (env:VAR or file:/path), never the secret bytes.
                   </p>
-                  <div className="mb-2 text-[10.5px] text-muted-foreground">Credential changes apply immediately; they do not wait for Save or change other staged Settings.</div>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Credential changes apply immediately.</div>
                   <div className="mb-3 flex flex-col gap-1">
                     {creds.map((c) => (
                       <div key={c.id} className="flex items-center gap-2 text-xs text-foreground">
@@ -1113,7 +1113,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                       <Input value={credForm.fields.apiKey ?? ''} placeholder="env:ANTHROPIC_API_KEY or file:/run/secrets/agent_key" aria-label="apiKey"
                         onChange={(e) => setCredField('apiKey', e.target.value)} />
                     )}
-                    <div className="mt-1.5 text-[10.5px] text-muted-foreground">References only (`env:VAR` / `file:/path`). A blank field is left unchanged; leave all blank to use the environment.</div>
+                    <div className="mt-1.5 text-[10.5px] text-muted-foreground">References only (env:VAR or file:/path). A blank field is left unchanged; leave all blank to use the environment.</div>
                     <div className="mt-2 flex gap-1.5">
                       <Button onClick={saveCred} disabled={!credForm.name.trim() || credentialSaving || Boolean(credentialDeletingId)} className="shrink-0">{credentialSaving ? 'Saving credential…' : credForm.id ? 'Save credential' : 'Add credential'}</Button>
                       {credForm.id && <Button variant="outline" onClick={() => setCredForm(emptyCredForm(credForm.kind))} disabled={credentialSaving} className="shrink-0">Cancel</Button>}
@@ -1230,7 +1230,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
         <DialogContent className="max-w-[410px]">
           <DialogTitle>Clear stored plugin secret reference?</DialogTitle>
           <DialogDescription>
-            {pluginSecretTarget && <>This immediately removes only the stored <strong>{pluginSecretTarget.field.label}</strong> reference for <strong>{pluginSecretTarget.pack}</strong>. It does not save or discard other staged Settings. The field will use its environment/default value.</>}
+            {pluginSecretTarget && <>This immediately removes the stored <strong>{pluginSecretTarget.field.label}</strong> reference for <strong>{pluginSecretTarget.pack}</strong>. The field will use its environment/default value.</>}
           </DialogDescription>
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => setPluginSecretTarget(null)}>Cancel</Button>

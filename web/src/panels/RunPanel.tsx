@@ -103,7 +103,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   if (isConfiguredMerge) return (
     <div className="p-3.5">
       <Label>COLUMN MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write uses a version-aware column merge rather than an ordinary overwrite.</div>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges columns into the existing dataset.</div>
       <MergeColumnsControl nodeId={nodeId} />
     </div>
   )
@@ -111,7 +111,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   if (isConfiguredUpsert) return (
     <div className="p-3.5">
       <Label>KEYED UPSERT</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write uses a version-aware keyed upsert rather than an ordinary overwrite.</div>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write updates matching rows in the existing dataset.</div>
       <UpsertControl nodeId={nodeId} />
     </div>
   )
@@ -302,7 +302,7 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
   if (!isBound) return declaration.default == null ? 'A binding is required because this parameter has no default.' : null
   if (declaration.type === 'string') {
     if (typeof value !== 'string') return 'Enter a string value.'
-    if (isBuiltInSecretRef(value)) return 'Secret references are not public run parameters.'
+    if (isBuiltInSecretRef(value)) return 'Secrets can’t be used as run parameters.'
     if (declaration.constraints?.minLength != null && value.length < declaration.constraints.minLength) return `Minimum length is ${declaration.constraints.minLength}.`
     if (declaration.constraints?.maxLength != null && value.length > declaration.constraints.maxLength) return `Maximum length is ${declaration.constraints.maxLength}.`
   } else if (declaration.type === 'integer') {

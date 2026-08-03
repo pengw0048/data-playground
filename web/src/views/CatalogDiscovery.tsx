@@ -1112,7 +1112,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
         : status === 404 || status === 410
           ? 'This selected version is no longer available.'
           : `Couldn't load this selected version: ${errorMessage(error)}.`
-      setRequestedExactError(`${prefix} Latest was not substituted.`)
+      setRequestedExactError(`${prefix} Your selection is unchanged.`)
     } finally {
       if (request === requestedExactRequest.current) setRequestedExactLoading(false)
     }

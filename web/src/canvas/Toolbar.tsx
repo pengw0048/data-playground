@@ -126,7 +126,7 @@ export function Toolbar() {
 
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setLocatorOpen(true) }} />
 
-              <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
+              <Tooltip label={`${agentOpen ? 'Close' : 'Open'} Agent`}>
                 <button
                   type="button"
                   aria-pressed={agentOpen}

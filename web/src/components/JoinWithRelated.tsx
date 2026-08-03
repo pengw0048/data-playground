@@ -461,7 +461,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                   className="mt-1 rounded border border-border p-2"><strong>{item.name}</strong> — {item.reason}</div>)}
               </details>}
               {!loading && page?.refinementRequired && <div className="mt-3 rounded border border-amber-300/50 bg-amber-50 p-2 text-[10.5px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                {page.scopeNote ?? 'Results are truncated to a bounded working set. Refine search or folder to inspect omitted datasets.'}
+                {page.scopeNote ?? 'Showing the first matches only. Refine the search or folder to see the rest.'}
               </div>}
             </> : <>
               <button type="button" className="mb-3 text-[11px] font-semibold text-primary"

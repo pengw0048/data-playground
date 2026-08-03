@@ -206,7 +206,7 @@ function declarationListError(values: CanvasParameterDeclaration[]): string | nu
     if (limits?.minimum != null && limits?.maximum != null && limits.minimum > limits.maximum) return `'${value.name}' minimum exceeds maximum.`
     if (limits?.minLength != null && limits?.maxLength != null && limits.minLength > limits.maxLength) return `'${value.name}' minLength exceeds maxLength.`
     if (value.default != null) {
-      if (value.type === 'string' && (typeof value.default !== 'string' || isBuiltInSecretRef(value.default))) return `'${value.name}' default must be a public string, not a SecretRef.`
+      if (value.type === 'string' && (typeof value.default !== 'string' || isBuiltInSecretRef(value.default))) return `'${value.name}' default must be plain text, not a secret.`
       if (value.type === 'integer' && !Number.isSafeInteger(value.default)) return `'${value.name}' default must be a safe integer.`
       if (value.type === 'float' && (typeof value.default !== 'number' || !Number.isFinite(value.default))) return `'${value.name}' default must be finite.`
       if (value.type === 'boolean' && typeof value.default !== 'boolean') return `'${value.name}' default must be boolean.`

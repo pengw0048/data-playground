@@ -589,7 +589,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Last known provider commit.*stale/i)
     expect(screen.queryByRole('button', { name: 'Revision selection unavailable' })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -617,7 +617,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -637,7 +637,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Choose a new dataset above to create a new binding/i)
     expect(screen.queryByRole('button', { name: /follow current latest explicitly/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -661,7 +661,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       })
     render1(data)
 
-    expect(await screen.findByText(/Permission to open the selected version was lost.*latest was not substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Permission to open the selected version was lost.*Your selection is unchanged/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry selected version' }))
     expect(await screen.findByText('Datasets · Saved version · 1 row · 0 columns')).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')

@@ -802,7 +802,7 @@ function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
     <div className="px-5 py-6 text-center">
       <div className="mb-1 text-[12px] font-semibold text-foreground">Whole-dataset profile</div>
       <p className="mb-3 text-[11px] text-muted-foreground">
-        {disabled ? 'Editors can estimate and start full-dataset profile jobs.' : 'Estimate the scan first. Starting it is a separate choice.'}
+        {disabled ? 'Editors can estimate and start full-dataset profile jobs.' : 'Estimate the scan first.'}
       </p>
       <div className="flex items-center justify-center gap-2">
         <button onClick={onEstimate} disabled={disabled}
@@ -1468,7 +1468,7 @@ export function FullResult({
   )
   if (data.notPreviewable) return (
     <FullResultMessage title={`${viewLabel} cannot be previewed`}
-      reason={data.reason ?? 'This artifact adapter does not provide a bounded interactive preview.'}
+      reason={data.reason ?? 'This output can’t be previewed here.'}
       chrome={modeChrome} action={exportAction} />
   )
   const cols = (data.columns ?? []) as ColumnSchema[]

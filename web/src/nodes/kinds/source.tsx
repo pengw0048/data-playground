@@ -643,7 +643,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
       {selectedExact && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Checking selected version…</div>}
       {selectedExact && detailState === 'unavailable' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Selected version is missing or compacted. Selection preserved; latest was not substituted.
+          Selected version is missing or compacted. Your selection is unchanged.
           {staleLastKnown}{' '}
           {registrationReplaced && 'The current catalog entry now points to a different dataset. '}
           {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another saved version</button>}
@@ -654,19 +654,19 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
       )}
       {selectedExact && detailState === 'permission' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Permission to open the selected version was lost. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          Permission to open the selected version was lost. Your selection is unchanged.{staleLastKnown}{' '}
           <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry selected version</button>
         </div>
       )}
       {selectedExact && detailState === 'offline' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          The provider is offline, so the selected version could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          The provider is offline, so the selected version could not be verified. Your selection is unchanged.{staleLastKnown}{' '}
           <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry provider</button>
         </div>
       )}
       {selectedExact && detailState === 'error' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          The selected version could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          The selected version could not be verified. Your selection is unchanged.{staleLastKnown}{' '}
           <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry verification</button>
         </div>
       )}

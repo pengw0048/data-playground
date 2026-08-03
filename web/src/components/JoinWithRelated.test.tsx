@@ -101,7 +101,7 @@ describe('JoinWithRelated', () => {
     expect(screen.queryByText('Possible key matches')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Show possible key matches (1)' }))
     expect(screen.getByText('Possible key matches')).toBeVisible()
-    expect(screen.getByText(/Results are truncated/)).toBeVisible()
+    expect(screen.getByText(/Showing the first matches only/)).toBeVisible()
 
     fireEvent.click(screen.getByRole('button', { name: /users/ }))
     expect(screen.getByText('Not measured')).toBeVisible()
