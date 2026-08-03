@@ -177,6 +177,17 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('an edge is named by the steps it connects, not their internal ids', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect.poll(async () => page.locator('.react-flow__edge').count()).toBe(1)
+
+    const name = await page.locator('.react-flow__edge').first().getAttribute('aria-label')
+    expect(name).toBe('Edge from source to filter')
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
