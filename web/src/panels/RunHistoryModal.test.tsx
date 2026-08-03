@@ -1431,7 +1431,8 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
 
     expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
-    expect(screen.getByText('sum(count) vs task')).toBeInTheDocument()
+    expect(screen.getByText('sum(count)')).toBeInTheDocument()  // y axis label, not a repeated caption
+    expect(screen.queryByText('sum(count) vs task')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Preview sample' })).not.toBeInTheDocument()
     expect(screen.queryByText(/NotPreviewable/)).not.toBeInTheDocument()
     expect(apiMock.preview).not.toHaveBeenCalled()
@@ -1529,9 +1530,7 @@ describe('durable full results', () => {
     expect(await screen.findByRole('img', {
       name: 'bar chart, showing 2000 capped groups',
     })).toBeInTheDocument()
-    expect(screen.getByText(
-      'sum(count) vs task · Showing 2,000 groups · display capped',
-    )).toBeInTheDocument()
+    expect(screen.getByText('Showing 2,000 groups · display capped')).toBeInTheDocument()
     expect(screen.getByText(/Interactive view reached its 2,000 group display limit/)).toBeInTheDocument()
     expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 2,001 rows')
     expect(screen.getByText(/2,001/)).toBe(screen.getByTestId('full-result-status'))
