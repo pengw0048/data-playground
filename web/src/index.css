@@ -79,6 +79,14 @@
   --code-bg: #f5f5f5;
   --code-text: #24303f;
   --code-sql: #1f6f5c;
+  /* status as TEXT/glyph — darker than the canvas-fill hexes in tokens.ts so every status
+     reads at 4.5:1 on the chip surface. Fills keep the tokens.ts values. */
+  --status-latest: #117e39;
+  --status-stale: #8f641a;
+  --status-running: #0071bd;
+  --status-failed: #d32e22;
+  --status-queued: #636e82;
+  --status-draft: #646f81;
   --dots: #c9c9c9;              /* React Flow background dots */
   --scrollbar-thumb: #c8c8c8;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
@@ -103,6 +111,12 @@
   --code-bg: #1a1e26;
   --code-text: #d7dde5;
   --code-sql: #6fd0b4;
+  --status-latest: #18b452;
+  --status-stale: #d89827;
+  --status-running: #0f9fff;
+  --status-failed: #e97a72;
+  --status-queued: #919aab;
+  --status-draft: #a9b0bc;
   --dots: #2a2f39;
   --scrollbar-thumb: #3a404c;
   color-scheme: dark;  /* native controls (scrollbars, form widgets) render dark */

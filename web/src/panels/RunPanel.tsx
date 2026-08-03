@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { hasConfiguredManagedSidecarMerge, roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
-import { color, status as statusTok } from '../theme/tokens'
+import { color, status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
@@ -494,7 +494,7 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
         return (
           <div key={p.nodeId} className="flex flex-col gap-0.5">
             <div className="flex items-center gap-2 text-[11px]">
-              <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: s.color }}>{s.glyph}</span>
+              <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: statusText[p.status as keyof typeof statusText] ?? statusText.queued }}>{s.glyph}</span>
               <span className={cn(p.status === 'failed' ? 'font-semibold text-destructive' : 'text-muted-foreground')}>{p.label ?? p.nodeId}</span>
               <span className="flex-1" />
               {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}

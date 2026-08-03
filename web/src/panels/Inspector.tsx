@@ -6,7 +6,7 @@ import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useInputColumns, useSchemaWarnings } from '../nodes/fields'
 import { codeHash, outputPortId } from '../nodes/schema'
-import { status as statusTok } from '../theme/tokens'
+import { status as statusTok, statusText } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog, type SaveDialogDraft } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
@@ -331,7 +331,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
           {/* a note is an annotation — it never runs, so a run status (draft/stale/…) is meaningless */}
           {kind === 'note' ? <span>annotation</span>
-            : showRunStatus ? <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</> : null}
+            : showRunStatus ? <><span style={{ color: statusText[node.data.status] ?? statusText.draft }}>{st.glyph}</span> {st.label}</> : null}
           {inspectorBlurb && <span title={inspectorBlurb} className="min-w-0 leading-relaxed text-muted-foreground/70">
             {kind === 'note' || showRunStatus ? '· ' : ''}{inspectorBlurb}
           </span>}

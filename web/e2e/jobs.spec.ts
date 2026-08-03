@@ -383,3 +383,56 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toHaveAttribute('aria-expanded', 'true')
 })
+
+test('reads job status chips at WCAG AA in both themes @ux-smoke', async ({ page }) => {
+  const statuses = ['done', 'failed', 'running', 'queued'] as const
+  await page.route('**/api/canvas', async (route) => {
+    await route.fulfill({ json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }] })
+  })
+  await page.route('**/api/jobs?*', async (route) => {
+    await route.fulfill({ json: {
+      items: statuses.map((status, index) => ({
+        ...failedJob, id: `chip-${status}`, runId: `run-${status}`, attempt: `run-${status}`, status,
+        createdAt: `2026-07-1${index + 1}T12:00:00Z`,
+      })),
+      nextCursor: null, hasMore: false,
+    } })
+  })
+
+  await page.goto('/#/jobs')
+  await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+
+  for (const theme of ['light', 'dark'] as const) {
+    await page.evaluate((value) => {
+      if (value === 'dark') document.documentElement.setAttribute('data-theme', 'dark')
+      else document.documentElement.removeAttribute('data-theme')
+    }, theme)
+
+    const measured = await page.evaluate(() => {
+      const parse = (value: string) => value.match(/[\d.]+/g)!.slice(0, 3).map(Number)
+      const channel = (v: number) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : (((v / 255) + 0.055) / 1.055) ** 2.4)
+      const luminance = ([r, g, b]: number[]) => 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+      const behind = (element: Element) => {
+        for (let node: Element | null = element; node; node = node.parentElement) {
+          const background = getComputedStyle(node).backgroundColor
+          if (background && !background.startsWith('rgba(0, 0, 0, 0)')) return parse(background)
+        }
+        return [255, 255, 255]
+      }
+      return Array.from(document.querySelectorAll('[data-testid="job-status"]'), (element) => {
+        const style = getComputedStyle(element)
+        const a = luminance(parse(style.color))
+        const b = luminance(behind(element))
+        return {
+          label: element.textContent ?? '',
+          ratio: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05),
+        }
+      })
+    })
+
+    expect(measured.map((chip) => chip.label), `${theme}: status chips`).toEqual([...statuses])
+    for (const chip of measured) {
+      expect(chip.ratio, `${theme} "${chip.label}" chip contrast`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+})
