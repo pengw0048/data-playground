@@ -1062,7 +1062,7 @@ function ExportCluster({
   )
 }
 
-function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
+export function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void
   fillAvailableHeight?: boolean
 }) {

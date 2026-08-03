@@ -1973,6 +1973,55 @@ def test_high_precision_decimal_previews_exactly():
     assert isinstance(row["price"], float) and row["price"] == 9.99  # small decimal stays numeric
 
 
+def test_out_of_range_integers_serialize_as_exact_digits():
+    # JSON.parse rounds any integer past 2^53, so an int64/uint64 outside that range must reach the
+    # browser as its exact digits; everything the browser can hold exactly stays a JSON number.
+    import pyarrow as pa
+    from hub.executors.engine import _table_to_rows
+    tbl = pa.table({
+        "i64": pa.array([9223372036854775807, 9223372036854775806, -9223372036854775808,
+                         9007199254740991, -9007199254740991, 42, None], type=pa.int64()),
+        "u64": pa.array([18446744073709551615, 18446744073709551614, 9007199254740992,
+                         9007199254740991, 0, 7, None], type=pa.uint64()),
+    })
+    rows = _table_to_rows(tbl)
+    assert [r["i64"] for r in rows] == [
+        "9223372036854775807", "9223372036854775806", "-9223372036854775808",
+        9007199254740991, -9007199254740991, 42, None,
+    ]
+    assert [r["u64"] for r in rows] == [
+        "18446744073709551615", "18446744073709551614", "9007199254740992",
+        9007199254740991, 0, 7, None,
+    ]
+    assert rows[0]["i64"] != rows[1]["i64"]  # neighbouring int64s stay distinguishable
+    assert _table_to_rows(pa.table({"b": pa.array([True, False])})) == [{"b": True}, {"b": False}]
+
+
+def test_large_integer_preview_matches_the_stats_tab(tmp_path):
+    # Stats and the Rows grid must show the same digits for one column, and it stays typed as an int.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = str(tmp_path / "bigints.parquet")
+    pq.write_table(pa.table({"id": pa.array(
+        [9223372036854775807, 9223372036854775806, 42, 42], type=pa.int64())}), path)
+    graph = {"id": "bigints", "version": 1, "nodes": [
+        N("src", "source", {"uri": path}),
+        N("dedup", "dedup", {"on": ""}),
+    ], "edges": [E("src", "dedup")]}
+
+    preview = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "dedup", "k": 50}).json()
+    assert preview["columns"][0]["type"] == "int"        # still an integer → the grid right-aligns it
+    ids = {row["id"] for row in preview["rows"]}
+    assert ids == {"9223372036854775807", "9223372036854775806", 42}, preview["rows"]
+
+    profile = client.post("/api/run/profile", json={"graph": graph, "nodeId": "src"}).json()
+    stats = profile["columns"][0]
+    assert (stats["min"], stats["max"], stats["distinct"]) == ("42", "9223372036854775807", 3)
+    assert stats["max"] in ids
+
+
 def test_plugin_run_applies_lowering(tmp_path):
     # the critical bug: plugin lowerings were dropped on a full run → untransformed writes
     from hub.sdk import NodeSpec, PortSpec, ctx
