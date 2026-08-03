@@ -705,7 +705,8 @@ export interface ColumnProfile {
   distinctIsApproximate: boolean
   min?: string | null
   max?: string | null
-  mean?: number | null
+  /** A non-finite mean arrives as the token 'NaN' | 'Infinity' | '-Infinity'. */
+  mean?: number | string | null
 }
 
 export interface ProfileResult {

@@ -654,6 +654,10 @@ function ResultModeToggle({ mode, onChange, fullLabel = 'Full result' }: {
 
 const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 3 })
 
+// JSON has no number form for non-finite floats, so the wire carries them as these tokens.
+const NON_FINITE_TOKENS = new Set(['NaN', 'Infinity', '-Infinity'])
+const isNonFiniteToken = (v: unknown): v is string => typeof v === 'string' && NON_FINITE_TOKENS.has(v)
+
 // Per-column stats over the previewed sample (null%/distinct/min/max/mean). Whole-dataset stats are a
 // cancellable job: every row is covered, while distinct remains approximate.
 function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: string; multiOutput: boolean }) {
@@ -932,7 +936,10 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
               </td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.min ?? ''}>{c.min ?? '—'}</td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.max ?? ''}>{c.max ?? '—'}</td>
-              <td className="px-2 py-1 text-muted-foreground">{c.mean != null ? fmtNum(c.mean) : '—'}</td>
+              <td className="px-2 py-1 text-muted-foreground">
+                {c.mean == null ? '—' : typeof c.mean === 'number' ? fmtNum(c.mean)
+                  : <span className="font-semibold text-amber-700 dark:text-amber-300">{c.mean}</span>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -1106,6 +1113,9 @@ export function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = fal
 
 function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value == null) return <span className="text-muted-foreground/60">·</span>
+  if (isNonFiniteToken(value) && isNumericCol(col.type)) {
+    return <span className="font-semibold text-amber-700 dark:text-amber-300">{value}</span>
+  }
   if (col.capabilities.includes('media') && canRenderDirectMedia(value, col.mediaKind)) {
     return <MediaCellRenderer column={col.name} value={value} mediaKind={col.mediaKind} viewport="compact" />
   }

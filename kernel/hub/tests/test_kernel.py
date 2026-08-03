@@ -2022,6 +2022,65 @@ def test_large_integer_preview_matches_the_stats_tab(tmp_path):
     assert stats["max"] in ids
 
 
+NON_FINITE_CSV = b"id,ratio\n1,1.5\n2,Infinity\n3,-Infinity\n4,NaN\n"
+
+
+def test_non_finite_floats_preview_as_tokens_not_nulls():
+    # JSON has no number form for +/-Infinity and NaN. Serializing them as null told the user the file
+    # had missing data it does not have, so "drop the nulls" silently discarded blown-up values.
+    import pyarrow as pa
+    from hub.executors.engine import _table_to_rows
+    row = _table_to_rows(pa.table({
+        "ratio": pa.array([float("inf")], type=pa.float64()),
+        "drop": pa.array([float("-inf")], type=pa.float64()),
+        "mean": pa.array([float("nan")], type=pa.float64()),
+        "embedding": pa.array([[1.0, float("nan")]], type=pa.list_(pa.float64())),
+    }))[0]
+    assert row == {"ratio": "Infinity", "drop": "-Infinity", "mean": "NaN",
+                   "embedding": [1.0, "NaN"]}
+
+    t = _upload("nonfinite.csv", NON_FINITE_CSV).json()
+    sampled = client.post("/api/data/sample", json={"uri": t["uri"], "k": 10}).json()
+    assert [r["ratio"] for r in sampled["rows"]] == [1.5, "Infinity", "-Infinity", "NaN"]
+
+
+def test_canvas_preview_of_non_finite_floats_is_not_a_kernel_error():
+    # The kernel's /preview returns a plain dict, which FastAPI encodes with allow_nan=False — one NaN
+    # cell failed the whole response and the canvas blamed the (healthy) kernel for a data condition.
+    from fastapi import FastAPI
+
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+
+    t = _upload("nonfinite-canvas.csv", NON_FINITE_CSV).json()
+    g = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": t["uri"]})], "edges": []}
+    deps = get_deps()
+    kernel = FastAPI()
+
+    @kernel.post("/preview")
+    def _kernel_preview():
+        return preview_node(Graph(**g), "src", 10, deps.resolve_adapter, deps.registry,
+                            deps.node_builders, deps.node_specs, storage=deps.storage).model_dump()
+
+    kernel_reply = TestClient(kernel, raise_server_exceptions=False).post("/preview")
+    assert kernel_reply.status_code == 200, "kernel /preview must encode non-finite floats"
+    assert [r["ratio"] for r in kernel_reply.json()["rows"]] == [1.5, "Infinity", "-Infinity", "NaN"]
+
+    hub_reply = client.post("/api/run/preview", json={"graph": g, "nodeId": "src", "k": 10})
+    assert hub_reply.status_code == 200, hub_reply.text
+    assert not hub_reply.json()["error"] and not hub_reply.json()["notPreviewable"]
+
+
+def test_profile_reports_non_finite_stats():
+    t = _upload("nonfinite-stats.csv", NON_FINITE_CSV).json()
+    g = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": t["uri"]})], "edges": []}
+    r = client.post("/api/run/profile", json={"graph": g, "nodeId": "src"})
+    assert r.status_code == 200, r.text
+    ratio = next(c for c in r.json()["columns"] if c["name"] == "ratio")
+    assert (ratio["min"], ratio["max"], ratio["mean"]) == ("-Infinity", "Infinity", "NaN")
+    assert ratio["nulls"] == 0
+
+
 def test_plugin_run_applies_lowering(tmp_path):
     # the critical bug: plugin lowerings were dropped on a full run → untransformed writes
     from hub.sdk import NodeSpec, PortSpec, ctx
