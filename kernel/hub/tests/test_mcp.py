@@ -754,6 +754,32 @@ def test_run_canvas_executes_to_completion():
     assert out["status"] == "done" and out["error"] is None and out["targetNodeId"] == f
 
 
+def test_run_canvas_publishes_a_managed_dataset_with_a_durable_owner():
+    from hub import metadb
+
+    cid = data("create_canvas", {})["canvasId"]
+    s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
+    name = f"mcp_managed_{uuid.uuid4().hex[:8]}"
+    w = data("add_node", {"canvasId": cid, "kind": "write", "config": {
+        "filename": f"{name}.parquet", "writeMode": "overwrite"}})["nodeId"]
+    data("connect", {"canvasId": cid, "sourceId": s, "targetId": w})
+
+    out = data("run_canvas", {"canvasId": cid, "confirm": True})
+    assert out["status"] == "done", out["error"]
+    task = metadb.durable_task(out["runId"])
+    assert task is not None and task["task_kind"] == "managed_local_write"
+    receipt = out["outputs"][0]["writeReceipt"]
+    assert receipt["revisionId"] and receipt["durable"] is True
+    logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == receipt["revisionId"]
+    jobs = metadb.list_workspace_runs(
+        metadb.resolve_user(metadb.DEFAULT_USER_ID), run_id=task["id"])
+    assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
+
+    metadb.delete_canvas_cascade(cid)
+
+
 def test_run_canvas_unknown_destination_is_a_tool_error():
     cid = data("create_canvas", {})["canvasId"]
     s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
