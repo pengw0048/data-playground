@@ -464,12 +464,19 @@ def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
             continue
         for param in getattr(spec, "params", []):
             param_type = getattr(param, "type", None)
+            required = getattr(param, "required", False)
             if param.name not in config or config[param.name] is None:
-                if (param_type in ("int", "float") and getattr(param, "required", False)
-                        and getattr(param, "default", None) is None):
+                if required and getattr(param, "default", None) is None:
                     errors.append(f"node '{node.id}' parameter '{param.name}' is required")
                 continue
             value = config[param.name]
+            if (required and param_type in ("string", "text", "code", "select")
+                    and (not isinstance(value, str) or not value.strip())):
+                errors.append(f"node '{node.id}' parameter '{param.name}' is required")
+                continue
+            if required and param_type == "columns" and not value:
+                errors.append(f"node '{node.id}' parameter '{param.name}' is required")
+                continue
             if param_type == "int" and (type(value) is not int or not -(2**53 - 1) <= value <= 2**53 - 1):
                 errors.append(
                     f"node '{node.id}' parameter '{param.name}' must be a complete safe integer")

@@ -81,7 +81,8 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              blurb="Take a repeatable sample of rows"),
     NodeSpec(kind="filter", title="filter", category="shape", tag="filter",
              inputs=[_in()], outputs=[_out()], can_bypass=True,
-             params=[ParamSpec(name="predicate", type="string", label="predicate (SQL)")],
+             params=[ParamSpec(
+                 name="predicate", type="string", label="Predicate (SQL)", required=True)],
              blurb="Keep rows that match a condition"),
     NodeSpec(kind="select", title="select", category="shape", tag="select",
              inputs=[_in()], outputs=[_out()], can_bypass=True,

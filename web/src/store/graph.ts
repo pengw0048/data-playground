@@ -1693,14 +1693,20 @@ function downloadDraft(draft: LocalCanvasDraft): void {
 function invalidUpstreamReason(
   doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts'],
 ): string | null {
+  return invalidUpstream(doc, id, numericDrafts)?.reason ?? null
+}
+
+function invalidUpstream(
+  doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts'],
+): { nodeId: string; reason: string } | null {
   const seen = new Set<string>()
-  const walk = (nid: string): string | null => {
+  const walk = (nid: string): { nodeId: string; reason: string } | null => {
     if (seen.has(nid)) return null
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
     if (!n) return null
     const ownReason = nodeInvalidReason(n, undefined, numericDrafts[n.id])
-    if (ownReason) return ownReason
+    if (ownReason) return { nodeId: n.id, reason: ownReason }
     for (const source of doc.edges.filter((e) => e.target === nid).map((e) => e.source)) {
       const reason = walk(source)
       if (reason) return reason
@@ -3486,16 +3492,21 @@ export const useStore = create<Store>((set, get) => ({
     }
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
     const candidates = sinks.map((node) => ({
-      node, invalidReason: invalidUpstreamReason(doc, node.id, numericParamDrafts),
+      node, invalid: invalidUpstream(doc, node.id, numericParamDrafts),
     }))
-    const valid = candidates.filter(({ invalidReason }) => !invalidReason)
+    const valid = candidates.filter(({ invalid }) => !invalid)
     const invalidSkipped = sinks.length - valid.length
     const perSink = () => { valid.forEach(({ node }) => get().requestRun(node.id)) }
     if (!invalidSkipped && !requiresTargetedDispatch(doc, sinks)) startGraphRun(get, set, perSink)
     else perSink()
     if (invalidSkipped) {
+      const first = candidates.find(({ invalid }) => invalid)?.invalid
+      if (first) {
+        get().select(first.nodeId)
+        get().requestNodeReveal(doc.id, first.nodeId)
+      }
       get().pushToast(
-        candidates.find(({ invalidReason }) => invalidReason)?.invalidReason
+        first?.reason
           ?? `Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with invalid node parameters`,
         'error',
       )
@@ -5823,6 +5834,11 @@ const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>
 function requiresTargetedDispatch(doc: CanvasDoc, sinks: CanvasNode[]): boolean {
   return (doc.parameters?.length ?? 0) > 0
     || doc.nodes.some((node) => node.type === 'write' && !isDisabled(doc, node.id))
+    || doc.nodes.some((node) => {
+      if (node.parentId || node.type === 'source' || node.type === 'sql' || node.type === 'section'
+          || isDisabled(doc, node.id)) return false
+      return Boolean(getSpec(node.type)?.inputs.length) && !nodeRunnable(doc, node.id)
+    })
     || sinks.some((node) => nodeOutputs(node).length > 1)
 }
 

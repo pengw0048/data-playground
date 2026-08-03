@@ -282,6 +282,38 @@ def test_numeric_plugin_parameters_accept_zero_signs_and_finite_exponents(config
     assert graph_mod.parameter_errors(_graph([_node("numeric", spec.kind, config)], []), {spec.kind: spec}) == []
 
 
+@pytest.mark.parametrize("config", [{}, {"query": None}, {"query": ""}, {"query": "   "}])
+def test_required_text_parameters_reject_missing_and_blank_values(config: dict):
+    spec = NodeSpec(
+        kind="text-plugin", title="text plugin", category="query",
+        outputs=[PortSpec(id="out")],
+        params=[ParamSpec(name="query", type="string", required=True)],
+    )
+    errors = graph_mod.parameter_errors(
+        _graph([_node("text", spec.kind, config)], []), {spec.kind: spec})
+    assert errors == ["node 'text' parameter 'query' is required"]
+
+
+def test_empty_filter_is_rejected_by_every_execution_ingress_before_work_starts():
+    graph = _graph(
+        [_node("source", "source", {"uri": "events"}),
+         _node("filter", "filter", {"predicate": ""})],
+        [_edge("source-filter", "source", "filter")],
+    )
+    expected = "node 'filter' parameter 'predicate' is required"
+    assert expected in graph_mod.validation_error(graph, SPECS)[0]
+
+    payload = graph.model_dump(by_alias=True)
+    for path, body in [
+        ("/api/run/preview", {"graph": payload, "nodeId": "filter"}),
+        ("/api/run", {"graph": payload, "targetNodeId": "filter", "confirmed": True}),
+    ]:
+        response = client.post(path, json=body)
+        assert response.status_code == 400, (path, response.status_code, response.text)
+        assert response.json()["code"] == "invalid_graph"
+        assert expected in response.json()["detail"]
+
+
 def test_multi_inputs_and_dynamic_section_outputs_preserve_valid_contracts():
     # union and SQL both intentionally accept many edges on their single logical input. SQL exposes
     # those relations as input/input2/…; its NodeSpec must describe what the executor already supports.

@@ -30,6 +30,14 @@ export function nodeInvalidReason(
     const pairs = parseJoinKeys(String(node.data.config.on ?? ''), String(node.data.config.condition ?? ''))
     if (pairs?.length === 0) return 'Choose at least one left and right column.'
   }
+  if (node.type === 'filter') {
+    const conditions = filterBuilderConditions(node.data.config)
+    if (conditions) {
+      if (conditions.length === 0) return 'Add a filter condition.'
+      return filterBuilderReason(conditions, inputColumns)
+    }
+    if (!String(node.data.config.predicate ?? '').trim()) return 'Predicate (SQL) is required'
+  }
   const spec = backendSpecs[node.type]
   if (!spec) return null
   for (const p of spec.params) {
@@ -67,10 +75,6 @@ export function nodeInvalidReason(
         if (missing.length) return `${p.label ?? p.name} references unavailable column${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`
       }
     }
-  }
-  if (node.type === 'filter') {
-    const conditions = filterBuilderConditions(node.data.config)
-    if (conditions) return filterBuilderReason(conditions, inputColumns)
   }
   return null
 }

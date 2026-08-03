@@ -100,6 +100,7 @@ import {
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
+import '../nodes/kinds/filter'
 import type { CatalogTable, CanvasTransformReference } from '../types/api'
 import type { CanvasDoc } from '../types/graph'
 import {
@@ -121,7 +122,12 @@ Object.defineProperty(globalThis, 'localStorage', {
 
 const NODE = (id: string, type = 'source') => ({
   id, type, position: { x: 0, y: 0 },
-  data: { title: id, config: {}, status: 'draft' as const, history: [] },
+  data: {
+    title: id,
+    config: type === 'filter' ? { predicate: 'true' } : {},
+    status: 'draft' as const,
+    history: [],
+  },
 })
 
 const CURRENT_NODE = (id: string, type = 'source') => ({
@@ -1690,7 +1696,9 @@ describe('graph store — core authority ops', () => {
     const nodes = [source]
     const edges = []
     for (let i = 0; i < sinks; i += 1) {
-      nodes.push(NODE(`sink${i}`, 'filter'))
+      const sink = NODE(`sink${i}`, 'filter')
+      sink.data.config = { predicate: 'true' }
+      nodes.push(sink)
       edges.push({
         id: `source-sink${i}`, source: 'source', target: `sink${i}`,
         data: { wire: 'dataset' as const },
@@ -1698,6 +1706,46 @@ describe('graph store — core authority ops', () => {
     }
     return { id: 'c', version: 1, name: 'fan out', requirements: [], nodes, edges }
   }
+
+  it('selects and reveals an incomplete Filter before rerun all can submit it', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events' }
+    const filter = NODE('filter', 'filter')
+    filter.data.config = { predicate: '' }
+    const doc = {
+      id: 'c', version: 1, name: 'filter preflight', requirements: [], nodes: [source, filter],
+      edges: [{ id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' as const } }],
+    }
+    useStore.setState({ doc, selectedId: null, selectedIds: [], nodeRevealRequest: null, toasts: [] })
+
+    useStore.getState().rerunAll()
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState()).toMatchObject({
+      selectedId: 'filter', selectedIds: ['filter'],
+      nodeRevealRequest: { canvasId: 'c', nodeId: 'filter' },
+    })
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'Predicate (SQL) is required',
+    }])
+  })
+
+  it('keeps an unrelated disconnected draft out of a valid rerun-all dispatch', async () => {
+    const doc = fanOutDoc(1)
+    const draft = NODE('draft-filter', 'filter')
+    draft.data.config = { predicate: '' }
+    doc.nodes.push(draft)
+    useStore.setState({ doc, runs: {}, graphRun: null, toasts: [] })
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'sink0'))
+    expect(apiMocks.run).not.toHaveBeenCalledWith(
+      expect.anything(), undefined, expect.anything(), expect.anything(),
+    )
+    expect(useStore.getState().graphRun).toBeNull()
+  })
 
   it('rerun all dispatches one whole-graph run instead of one run per sink', async () => {
     const doc = fanOutDoc(8)
@@ -5792,7 +5840,7 @@ describe('graph store — core authority ops', () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.parquet' }
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [],
       parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
       nodes: [source, target], edges: [{ id: 'edge', source: 'source', target: 'target' }] }
@@ -5825,7 +5873,7 @@ describe('graph store — core authority ops', () => {
 
   it('opens the shared parameter gate before a panel-only estimate', async () => {
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [],
       parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
       nodes: [target], edges: [] }
@@ -5848,7 +5896,7 @@ describe('graph store — core authority ops', () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.parquet' }
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const write = NODE('write', 'write')
     write.data.config = { filename: { parameterRef: 'output' } }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [],
@@ -5920,7 +5968,7 @@ describe('graph store — core authority ops', () => {
 
   it('treats every Play as a fresh one-shot parameter authorization and preserves prior values', async () => {
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [],
       parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
       nodes: [target], edges: [] }
@@ -5951,7 +5999,7 @@ describe('graph store — core authority ops', () => {
 
   it('invalidates parameter-derived previews immediately and fences a slow preview response', async () => {
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [],
       parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
       nodes: [target], edges: [] }
@@ -5979,7 +6027,7 @@ describe('graph store — core authority ops', () => {
 
   it('fences a slow full-profile preflight after rebinding without cancelling background work', async () => {
     const target = NODE('target', 'filter')
-    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    target.data.config = { predicate: 'threshold > 0', threshold: { parameterRef: 'threshold' } }
     const parameters = [{ name: 'threshold', type: 'integer' as const, required: true }]
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], parameters,
       nodes: [target], edges: [] }
