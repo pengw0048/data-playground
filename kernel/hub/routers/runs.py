@@ -887,6 +887,14 @@ def _write_admission_for_graph(
         runner = _route_by_capability(
             deps, _pick_runner(deps, plan, uid, graph), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
+        if not managed:
+            published = metadb.catalog_managed_local_write_head(logical_uri)
+            if (published is not None and published.get("state") == "active"
+                    and published.get("revision_id")):
+                raise HTTPException(
+                    409,
+                    f"'{spec.name}' publishes dataset versions, and the selected execution target "
+                    "cannot publish datasets. Choose another target for this Canvas, then run again.")
         execution_resolve = getattr(runner, "resolve_adapter", None)
         if managed and runner is getattr(deps, "runner", None) and callable(execution_resolve):
             try:
@@ -938,8 +946,8 @@ def _write_admission_for_graph(
     if not managed:
         if supplied is not None:
             raise HTTPException(
-                409, "the selected destination uses provider-neutral sink semantics; "
-                "discard the managed-local admission and retry")
+                409, "This Write can no longer publish a dataset version to the selected "
+                "destination. Check its destination and execution target, then run again.")
         return WriteAdmission(
             node_id=node_id,
             managed=False,

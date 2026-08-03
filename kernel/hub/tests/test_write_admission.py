@@ -2511,3 +2511,26 @@ def test_local_runner_consumes_lance_append_intent_and_recovers_exact_receipt(
     lance.write_dataset(pa.table({"value": [99]}), table.uri, mode="append")
     assert LanceAdapter().open_revision(table.uri, receipt.revision_id).fetchall() == [
         (1,), (2,), (3,)]
+
+
+def _routed(deps, runner):
+    return SimpleNamespace(**{**vars(deps), "runner": runner,
+                              "pick_runner": lambda _plan, _uid: runner})
+
+
+def test_a_target_that_cannot_publish_is_refused_for_a_published_dataset(contract):
+    deps, graph = contract
+    receipt = _publish(deps, _write_admission_for_graph(
+        deps, graph, "write", "researcher", "44444444-4444-4444-8444-444444444444"), [1, 2])
+    published = _managed_publication_counts()
+
+    with pytest.raises(HTTPException) as refusal:
+        _write_admission_for_graph(
+            _routed(deps, SimpleNamespace(name="plugin-backend")), graph, "write", "researcher",
+            "55555555-5555-4555-8555-555555555555")
+
+    assert refusal.value.status_code == 409
+    assert "cannot publish datasets" in refusal.value.detail
+    assert _managed_publication_counts() == published
+    assert metadb.catalog_managed_local_write_head(
+        deps.storage.output_uri("output", ".parquet"))["revision_id"] == receipt.revision_id
