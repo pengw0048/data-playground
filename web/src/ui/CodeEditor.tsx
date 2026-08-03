@@ -76,8 +76,9 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
   }
   columnStore.columns = completions ?? []
   const dark = useResolvedTheme() === 'dark'  // @monaco-editor/react re-applies `theme` reactively
+  // nokey keeps React Flow's window-level key handlers (Space pans the canvas) out of the editor.
   return (
-    <div style={{ border: '1px solid hsl(var(--border))', borderRadius: 8, overflow: 'hidden', height }}>
+    <div className="nokey" style={{ border: '1px solid hsl(var(--border))', borderRadius: 8, overflow: 'hidden', height }}>
       <Editor
         language={language}
         theme={dark ? 'dp-dark' : 'dp-light'}
