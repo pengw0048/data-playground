@@ -34,9 +34,21 @@ installs and runs Chromium only.
 
 | Input | Status |
 | --- | --- |
-| **Keyboard** | Supported — focusable controls, menus, and editable fields |
+| **Keyboard** | Supported — focusable controls, menus, and editable fields. Connecting two existing nodes still requires a pointer |
 | **Mouse / trackpad** | Supported — primary interaction for the canvas, rail, inspector, and panels |
 | Touch / stylus | Not supported |
 
 Graph editing assumes pointer hover, precise drag-to-connect, and multi-panel mouse workflows. A
 tablet or phone layout would need a separate interaction design, not a scaled-down desktop shell.
+
+## Text scaling
+
+| | Status |
+| --- | --- |
+| **Browser / page zoom** | Supported to 200% at the minimum viewport |
+| **Browser default font size** | **No effect** |
+
+Type sizes throughout the app are absolute (`text-[12.5px]` and similar, plus `body { font-size:
+13px }`), so raising the browser's default font size does not enlarge the interface. Use page zoom
+instead. Making the default font size work would mean converting well over a thousand call sites to
+relative units, which is not planned.
