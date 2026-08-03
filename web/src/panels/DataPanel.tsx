@@ -1229,9 +1229,9 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
           transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
         <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
-      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">
-        {yLabel} vs {xLabel}{scopeSummary && <> · {scopeSummary}</>}
-      </div>
+      {scopeSummary && (
+        <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{scopeSummary}</div>
+      )}
       {omitted > 0 && (
         <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
           {omittedMessage}
