@@ -206,6 +206,26 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(selectionOutline.width).not.toBe('0px')
   })
 
+  test('keyboard: a Workspace dialog traps focus and returns it on Escape', async ({ page }) => {
+    await fresh(page)
+    await backToWorkspace(page)
+    const newFolder = page.getByRole('button', { name: 'New folder' })
+    await newFolder.focus()
+    await page.keyboard.press('Enter')
+    const dialog = page.getByRole('dialog', { name: 'New folder' })
+    await expect(dialog).toBeVisible()
+
+    // Tab past the end of the dialog; focus must wrap inside it, never reach the page behind.
+    for (let i = 0; i < 12; i++) {
+      await page.keyboard.press('Tab')
+      const inside = await dialog.evaluate((el) => el.contains(document.activeElement))
+      expect(inside, `Tab ${i + 1} left the dialog`).toBe(true)
+    }
+
+    await page.keyboard.press('Escape')
+    await expect(dialog).toHaveCount(0)
+    await expect(newFolder).toBeFocused()
+  })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.

@@ -134,7 +134,7 @@ describe('Catalog discovery request and mutation truth', () => {
 
     expect(screen.getByText(/Choose a Parquet, CSV, JSON, Arrow, Feather, or IPC file/i)).toBeVisible()
     expect(screen.getByText(/Paste a path or URL, or browse storage/i)).toBeVisible()
-    fireEvent.change(container.querySelector('input[type="file"]')!, {
+    fireEvent.change(document.querySelector('input[type="file"]')!, {
       target: { files: [new File(['id\n1\n'], 'local.csv', { type: 'text/csv' })] },
     })
     await waitFor(() => expect(onUploadDataset).toHaveBeenCalledWith(expect.objectContaining({ name: 'local.csv' })))
@@ -145,7 +145,7 @@ describe('Catalog discovery request and mutation truth', () => {
     const onClose = vi.fn()
     render(<AddDataModal onClose={onClose} onUploadDataset={vi.fn()} onCompleted={vi.fn()} />)
 
-    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.keyDown(document, { key: 'Escape' })
 
     expect(onClose).toHaveBeenCalledOnce()
   })
@@ -962,9 +962,10 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     openCatalogDetails()
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
 
-    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.keyDown(document, { key: 'Escape' })
     const discardDialog = screen.getByRole('dialog', { name: 'Discard unsaved changes?' })
-    expect(screen.getByRole('region', { name: 'orders' })).toBeInTheDocument()
+    // hidden: the open dialog correctly takes the rest of the page out of the accessibility tree
+    expect(screen.getByRole('region', { name: 'orders', hidden: true })).toBeInTheDocument()
     fireEvent.click(within(discardDialog).getByRole('button', { name: 'Keep editing' }))
 
     fireEvent.click(screen.getByTestId('detail-save'))
