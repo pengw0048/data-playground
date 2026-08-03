@@ -2013,6 +2013,9 @@ def _conform(tbl: "pa.Table", schema: "pa.Schema", node) -> "pa.Table":
                              f"safely reconciled ({detail or e}); a transform must emit one schema") from e
 
 
+_JS_SAFE_INT = 2**53 - 1  # Number.MAX_SAFE_INTEGER
+
+
 def _table_to_rows(table_or_rows) -> list[dict]:
     import decimal
     rows = table_or_rows if isinstance(table_or_rows, list) else table_or_rows.to_pylist()
@@ -2024,6 +2027,10 @@ def _table_to_rows(table_or_rows) -> list[dict]:
                 # disagrees with the exact value the run writes to parquet (faithful preview).
                 fv = float(v)
                 r[k] = fv if decimal.Decimal(repr(fv)) == v else str(v)
+            elif isinstance(v, int) and not -_JS_SAFE_INT <= v <= _JS_SAFE_INT:
+                # same rule for integers: a number while the browser can hold it exactly, else the
+                # exact digits as a string — JSON.parse rounds anything past 2^53 to a double.
+                r[k] = str(v)
             elif isinstance(v, (bytes, bytearray)):
                 r[k] = f"<{len(v)} bytes>"
             elif hasattr(v, "isoformat"):
