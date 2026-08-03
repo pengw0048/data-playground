@@ -83,7 +83,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.goto('/#/jobs?canvas=not-accessible&node=exact-node&backend=exact-backend')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Runs and background tasks' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
   await expect(page.getByRole('region', { name: 'Job filters' })).toBeVisible()
   await expect(page.getByRole('option', { name: 'Canvas from link (not in this list)' })).toHaveCount(1)
   await expect(page.getByLabel('Filter jobs by canvas', { exact: true })).toHaveValue('not-accessible')
@@ -127,7 +127,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.getByRole('button', { name: 'Failed', exact: true }).click()
   await expect(page).toHaveURL(/#\/jobs\?status=failed/)
 
-  await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
+  await page.getByTestId('job-row-run-failed').click()
   await expect(page.getByRole('alert')).toContainText('destination unavailable')
   await expect(page.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute(
     'href', '#/canvas/canvas-jobs?node=publish')
@@ -136,15 +136,15 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByText('Submitted graph')).toHaveCount(0)
   await page.goBack()
   await expect(page).toHaveURL(/#\/jobs\?status=failed$/)
-  await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
+  await page.getByTestId('job-row-run-failed').click()
   await page.reload()
   await expect(page.getByRole('alert')).toContainText('destination unavailable')
 
   await page.getByRole('button', { name: 'Load more' }).click()
   await expect(page.getByText(/Couldn’t load more Jobs/)).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
   await page.getByRole('button', { name: 'Retry load more' }).click()
-  await expect(page.getByRole('button', { name: 'Open run run-older in Climate analysis' })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-older')).toBeVisible()
 })
 
 test('a completed Jobs row stays concise and opens human-named retained results @ux-smoke', async ({ page }) => {
@@ -176,9 +176,7 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   }))
 
   await page.goto('/#/jobs')
-  const row = page.getByRole('button', {
-    name: 'Open run run-complete in Climate analysis', expanded: false,
-  })
+  const row = page.getByTestId('job-row-run-complete')
   await expect(row).toContainText('done')
   await expect(row).toContainText('2 outputs available')
   await expect(row).toContainText('1 row')
@@ -211,7 +209,7 @@ test('defaults to my Jobs and can show visible work from other users @ux-smoke',
   })
 
   await page.goto('/#/jobs')
-  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
   expect(requestedScopes[0]).toBeNull()
   await expect(page.getByText(/Ada/)).toHaveCount(0)
 
@@ -363,8 +361,8 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   })
 
   await page.goto('/#/jobs')
-  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
-  await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
+  await expect(page.getByTestId('job-row-merge-task-1')).toBeVisible()
+  await page.getByTestId('job-row-merge-task-1').click()
   const exactDataset = page.getByRole('link', { name: 'Open dataset' })
   await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
   await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
@@ -381,7 +379,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await viewer.getByRole('button', { name: 'Back to Jobs' }).click()
   await expect(page).toHaveURL(/#\/jobs\?run=merge-task-1$/)
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.getByTestId('job-row-merge-task-1')).toHaveAttribute('aria-expanded', 'true')
 })
 
 test('reads job status chips at WCAG AA in both themes @ux-smoke', async ({ page }) => {
