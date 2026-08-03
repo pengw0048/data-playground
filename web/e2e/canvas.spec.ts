@@ -2795,7 +2795,7 @@ test.describe('Data Playground canvas', () => {
       // destination for the typed append journey below.
       const providerPublication = inspector.getByLabel('Write publication')
       await expect(providerPublication.getByText('Mode', { exact: true }).locator('..'))
-        .toContainText('Overwrite provider output')
+        .toContainText('Replace the existing output')
       await expect(providerPublication.getByLabel('Write readiness'))
         .toContainText('Ready to run')
       let fixtureRunId: string | undefined
@@ -2827,7 +2827,7 @@ test.describe('Data Playground canvas', () => {
       await page.getByRole('combobox', { name: 'write mode' }).selectOption('append')
       const appendPublication = inspector.getByLabel('Write publication')
       await expect(appendPublication.getByText('Mode', { exact: true }).locator('..'))
-        .toContainText('Overwrite provider output')
+        .toContainText('Replace the existing output')
       await expect(appendPublication.getByLabel('Write readiness'))
         .toContainText('Run finished. The selected backend wrote the output.')
       const appendDetails = appendPublication.locator('details')

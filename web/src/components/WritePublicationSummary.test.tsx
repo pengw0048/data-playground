@@ -122,7 +122,7 @@ describe('WritePublicationSummary task-first output states', () => {
 
     const summary = screen.getByLabelText('Write publication')
     expect(summary).toHaveTextContent('Output name')
-    expect(summary).toHaveTextContent('Overwrite provider output')
+    expect(summary).toHaveTextContent('Replace the existing output')
     expect(summary).toHaveTextContent('Run finished. The selected backend wrote the output.')
     expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })

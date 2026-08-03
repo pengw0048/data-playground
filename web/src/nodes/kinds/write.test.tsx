@@ -59,8 +59,8 @@ describe('Write card — typed local mode truth', () => {
     const data = useStore.getState().doc.nodes[0].data
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
 
-    expect(screen.getByRole('option', { name: 'append (exact head)' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'replace output' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Append (exact version)' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Replace output' })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /create \/ replace/ })).not.toBeInTheDocument()
   })
 

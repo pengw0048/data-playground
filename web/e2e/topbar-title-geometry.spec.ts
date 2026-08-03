@@ -54,7 +54,7 @@ async function expectRunControlsOperable(page: Page, fullName: string) {
   await page.keyboard.press('Escape')
 
   await page.getByTestId('kernel-badge').click()
-  await expect(page.getByText('Execution kernel', { exact: true })).toBeVisible()
+  await expect(page.getByText('Canvas worker', { exact: true })).toBeVisible()
   await page.keyboard.press('Escape')
 
   const rerun = page.getByRole('button', { name: 'Rerun all' })

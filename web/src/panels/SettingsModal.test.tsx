@@ -643,7 +643,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
-    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restart Canvas worker' })).toBeNull()
   })
 
   it('offers Restart kernel for an explicit user runner selection', async () => {
@@ -657,7 +657,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart Canvas worker' }))
 
     await waitFor(() => expect(restartKernel).toHaveBeenCalledWith('canvas'))
   })
@@ -673,7 +673,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Execution' }))
-    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restart Canvas worker' })).toBeNull()
   })
 
   it('keeps every edit when the atomic save fails and retries without claiming success', async () => {
@@ -843,7 +843,7 @@ describe('SettingsModal — plugin config form', () => {
     const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
     fireEvent.change(model, { target: { value: 'staged-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Execution' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart Canvas worker' }))
 
     expect(screen.getByRole('button', { name: 'Restarting…' })).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Restarting…' }))

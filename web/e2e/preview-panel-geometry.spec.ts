@@ -137,7 +137,7 @@ test('docks a rightmost Transform preview above the toolbar at 1280x720', async 
     expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(toolbarBox!.y + 0.5)
     const badge = page.getByTestId('kernel-badge')
     await badge.click()
-    await expect(page.getByText('Execution kernel', { exact: true })).toBeVisible()
+    await expect(page.getByText('Canvas worker', { exact: true })).toBeVisible()
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Fit view', exact: true }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()

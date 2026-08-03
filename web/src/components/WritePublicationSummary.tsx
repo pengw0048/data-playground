@@ -11,9 +11,9 @@ export function publicationMode(mode: WriteAdmission['mode'] | undefined): strin
 }
 
 function writeMode(mode: WriteAdmission['mode'] | undefined): string {
-  if (mode === 'append') return 'Append provider output'
-  if (mode === 'replace' || mode === 'overwrite') return 'Overwrite provider output'
-  if (mode === 'create') return 'Create provider output'
+  if (mode === 'append') return 'Append to the existing output'
+  if (mode === 'replace' || mode === 'overwrite') return 'Replace the existing output'
+  if (mode === 'create') return 'Create a new output'
   return 'Write mode is not available yet'
 }
 

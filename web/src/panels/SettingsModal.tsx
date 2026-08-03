@@ -496,10 +496,10 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     try {
       const result = await api.restartKernel(canvasId)
       const message = result.restarted
-        ? 'Kernel restart requested. This applied immediately.'
-        : 'No live kernel to restart. The next run starts fresh.'
+        ? 'Canvas worker restart requested. This applied immediately.'
+        : 'No worker to restart. The next run starts fresh.'
       setKernelNotice({ kind: 'success', message })
-      pushToast(result.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+      pushToast(result.restarted ? 'Canvas worker restarting…' : 'No worker running — one starts on the next run', 'success')
     } catch (e) {
       const message = `Could not restart kernel: ${errorMessage(e)}`
       setKernelNotice({ kind: 'error', message })
@@ -746,7 +746,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs. Workspace default uses the workspace choice; if it is unset, the deployment default applies.</div>
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
-                      <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
+                      <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart Canvas worker'}</Button>
                       <span className="text-[10.5px] text-muted-foreground">Applies immediately. The next run starts fresh.</span>
                     </div>
                   )}
