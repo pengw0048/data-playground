@@ -262,7 +262,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div className="dp-mono mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 p-2.5 text-[11px] text-muted-foreground">
             {run?.error ?? st?.error ?? 'unknown error'}
           </div>
-          {st && <RunOutputs outputs={st.outputs} />}
+          {st?.status === 'failed' && <RunOutputs outputs={st.outputs} />}
           <div className="mt-3 flex gap-2">
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved
