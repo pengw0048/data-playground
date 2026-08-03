@@ -378,7 +378,10 @@ export function Canvas() {
 
   const rfEdges: Edge[] = useMemo(
     () => {
-      const title = (id: string) => doc.nodes.find((n) => n.id === id)?.data.title || id
+      // Large canvases can have as many edges as nodes. Resolve display names once rather than
+      // rescanning every node for every edge while building React Flow's controlled edge list.
+      const titles = new Map(doc.nodes.map((node) => [node.id, node.data.title || node.id]))
+      const title = (id: string) => titles.get(id) || id
       return doc.edges.map((e) => ({
         id: e.id, source: e.source, target: e.target,
         sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
