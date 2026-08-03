@@ -18,6 +18,7 @@ import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { CatalogTable, DatasetRevisionDetail, JoinAnalysis, JoinSuggestion } from '../types/api'
 import { parseJoinKeys, serializeJoinKeys } from '../nodes/joinKeys'
+import { joinHowOption } from '../nodes/joinHow'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type ColumnSchema, type DatasetRef } from '../types/graph'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -493,7 +494,7 @@ function JoinConfigurationSummary({ nodeId, canEdit }: { nodeId: string; canEdit
   const on = String(config.on ?? '')
   const condition = String(config.condition ?? '')
   const pairs = parseJoinKeys(on, condition)
-  const how = String(config.how ?? 'inner')
+  const how = joinHowOption(config.how, getBackendSpec('join')?.params.find((p) => p.name === 'how')?.options)
   const advancedPredicate = condition.trim() ? condition : on
 
   return <Section title="Join configuration">
@@ -1035,6 +1036,8 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
               <select id={`source-header-${nodeId}`} aria-label="CSV header row" value={String(config.header ?? 'auto')}
                 onChange={(event) => updateConfig(nodeId, { header: event.target.value })}
                 className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
+                {!['auto', 'yes', 'no'].includes(String(config.header ?? 'auto'))
+                  && <option value={String(config.header)}>{String(config.header)}</option>}
                 <option value="auto">auto</option><option value="yes">yes</option><option value="no">no</option>
               </select>
             </>}
