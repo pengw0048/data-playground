@@ -327,6 +327,7 @@ def _csv_kwargs(options: dict | None) -> dict:
 
 DATE_ORDERS = ("day-first", "month-first")
 _DATE_PROBE_ROWS = 2048
+_NAMED_COLUMNS = 4
 
 
 def _date_order(fmt: str | None) -> str | None:
@@ -392,7 +393,9 @@ def csv_date_order_notices(uri: str, options: dict | None = None) -> list[str]:
     target = _read_uri(uri)
     if not target.lower().endswith((".csv", ".tsv")) or glob.has_magic(target):
         return []
-    if not is_object_uri(target):
+    if is_object_uri(target):
+        db.ensure_object_store()
+    else:
         local = paths.checked_local_path(target)
         if local is None or not os.path.isfile(local):
             return []
@@ -410,8 +413,11 @@ def csv_date_order_notices(uri: str, options: dict | None = None) -> list[str]:
         if ambiguous:
             other = "month-first" if order == "day-first" else "day-first"
             raw, parsed = ambiguous[0][1], ambiguous[0][2]
+            named = [name for name, _, _ in ambiguous[:_NAMED_COLUMNS]]
+            if len(ambiguous) > _NAMED_COLUMNS:
+                named.append(f"{len(ambiguous) - _NAMED_COLUMNS} more column(s)")
             notices.append(
-                f"Dates in {', '.join(name for name, _, _ in ambiguous)} were read {order} ({fmt}), "
+                f"Dates in {', '.join(named)} were read {order} ({fmt}), "
                 f"so {raw} became {parsed}. The same values also read {other} ({swapped}). "
                 "Set the source's CSV date order if that is what the file means."
             )
