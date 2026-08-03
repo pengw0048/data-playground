@@ -602,7 +602,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.queryByPlaceholderText('Name')).toBeNull()
     expect(plugins).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use This machine' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
       { global: 2, user: 4 },
@@ -632,8 +632,8 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
     expect(screen.getByText('Your default compute target')).toBeVisible()
-    expect(screen.getByText('Local streaming')).toBeVisible()
-    expect(screen.getByText('Isolated local process')).toBeVisible()
+    expect(screen.getByText('This machine')).toBeVisible()
+    expect(screen.getByText('Isolated process')).toBeVisible()
     expect(screen.getByText('Canvas worker')).toBeVisible()
     expect(screen.getByText('Acme batch')).toBeVisible()
     expect(screen.getByText(/Runs through a provider configured for this workspace/)).toBeVisible()
@@ -663,11 +663,11 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
-    const isolated = screen.getByRole('button', { name: 'Use Isolated local process' })
+    const isolated = screen.getByRole('button', { name: 'Use Isolated process' })
     expect(isolated).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(isolated)
     expect(isolated).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByRole('group', { name: 'Compute target' })).toHaveTextContent('Isolated local process')
+    expect(screen.getByRole('group', { name: 'Compute target' })).toHaveTextContent('Isolated process')
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
@@ -755,7 +755,7 @@ describe('SettingsModal — plugin config form', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
 
     fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use This machine' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenNthCalledWith(
@@ -771,7 +771,7 @@ describe('SettingsModal — plugin config form', () => {
       target: { value: 'edited-model' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Use Local streaming' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use This machine' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
@@ -840,15 +840,12 @@ describe('SettingsModal — plugin config form', () => {
     expect(screen.getByPlaceholderText('Name')).toHaveValue('Taylor')
   })
 
-  it('adds a collaboration member without asking for a password while authentication is off', async () => {
+  it('hides account management while authentication is off', async () => {
     render(<SettingsModal onClose={vi.fn()} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Members' }))
 
-    fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'Taylor' } })
-    expect(screen.queryByLabelText('Initial password')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Add member' }))
-    await waitFor(() => expect(createUser).toHaveBeenCalledWith('Taylor'))
-    expect(screen.getByText(/sign-in is off, so adding a name does not grant access/i)).toBeVisible()
+    await screen.findByRole('button', { name: 'Agent' })
+    expect(screen.queryByRole('button', { name: 'Members' })).toBeNull()
+    expect(createUser).not.toHaveBeenCalled()
   })
 
   it('requires an initial password of at least six characters when authentication is on', async () => {

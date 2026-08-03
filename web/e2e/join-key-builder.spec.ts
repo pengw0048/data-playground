@@ -70,7 +70,7 @@ test.describe('Join key builder', () => {
       }, { timeout: 750 }).then(() => true).catch(() => false)
       const feedback = page.getByTestId('toast').filter({ hasText: 'Choose at least one left and right column.' })
       await expect(feedback).toHaveCount(0)
-      await page.getByRole('button', { name: 'Rerun all' }).click()
+      await page.getByRole('button', { name: 'Run all' }).click()
       await expect(feedback).toHaveCount(1)
       expect(await dispatched).toBe(false)
     } finally {

@@ -71,7 +71,7 @@ test('reports a stopped hub within 5s and recovers the local draft after restart
     await expect(target).toBeDisabled()
     await expect(page.getByTestId('autosave')).toContainText(/offline/i)
     await expect(page.getByTestId('autosave')).not.toContainText(/saved/i)
-    await expect(page.getByRole('button', { name: 'Rerun all' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Run all' })).toBeDisabled()
     await expect(page.getByTestId('inspector').getByRole('button', { name: 'Offline — run unavailable' }))
       .toHaveAttribute('aria-disabled', 'true')
 
@@ -97,7 +97,7 @@ test('reports a stopped hub within 5s and recovers the local draft after restart
     await page.goto(`${base}/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.getByTestId('canvas-title')).toContainText(recoveredName)
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
-    await expect(page.getByRole('button', { name: 'Rerun all' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Run all' })).toBeEnabled()
 
     await page.reload()
     await expect(page.getByTestId('canvas-title')).toContainText(recoveredName)

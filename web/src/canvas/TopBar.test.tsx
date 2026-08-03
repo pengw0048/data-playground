@@ -10,7 +10,8 @@ const state = vi.hoisted(() => ({
   kernelUp: true,
   saved: true,
   kernelInfo: { capabilities: [] as string[], executionTargets: [] as Array<{ name: string; label: string; kind: 'interactive' | 'job'; description: string; substrate?: string }> },
-  doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review' } as { id: string; name: string; executionBackend?: string },
+  doc: { id: 'canvas-1', name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review', nodes: [] as Array<{ data: { status?: string } }> } as { id: string; name: string; executionBackend?: string; nodes: Array<{ data: { status?: string } }> },
+  authEnabled: false,
   setExecutionBackend: vi.fn(),
   renameFile: vi.fn(),
   deleteFile: vi.fn(),
@@ -77,6 +78,7 @@ beforeEach(() => {
   state.doc = {
     id: 'canvas-1',
     name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review',
+    nodes: [],
   }
   document.documentElement.removeAttribute('data-theme')
 })
@@ -191,7 +193,7 @@ describe('CanvasTitle', () => {
 
   it('drops an in-progress rename when browser navigation activates another Canvas', async () => {
     const user = userEvent.setup()
-    state.doc = { id: 'canvas-a', name: 'Canvas A original' }
+    state.doc = { id: 'canvas-a', name: 'Canvas A original', nodes: [] }
     const { rerender } = render(<CanvasTitle />)
 
     await user.click(screen.getByTestId('canvas-title'))
@@ -199,7 +201,7 @@ describe('CanvasTitle', () => {
     await user.clear(staleInput)
     await user.type(staleInput, 'Canvas A in progress')
 
-    state.doc = { id: 'canvas-b', name: 'Canvas B original' }
+    state.doc = { id: 'canvas-b', name: 'Canvas B original', nodes: [] }
     state.renameFile.mockClear()
     fireEvent.change(staleInput, { target: { value: 'Late stale Canvas A edit' } })
     expect(state.renameFile).not.toHaveBeenCalled()
@@ -255,6 +257,15 @@ describe('TopBar Settings handoff', () => {
 
 describe('Canvas execution target', () => {
   it('starts the whole graph from the primary run control', async () => {
+    render(<TopBar />)
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Run all' }))
+
+    expect(state.rerunAll).toHaveBeenCalledTimes(1)
+  })
+
+  it('calls the primary action Rerun all after a prior attempt', async () => {
+    state.doc.nodes = [{ data: { status: 'latest' } }]
     render(<TopBar />)
 
     await userEvent.setup().click(screen.getByRole('button', { name: 'Rerun all' }))

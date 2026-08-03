@@ -43,7 +43,7 @@ async function openCanvas(page: Page, canvasId: string, expectedName: string) {
   await expect(page.getByTestId('inspector')).toHaveCount(0)
   await expect(page.getByTestId('canvas-title')).toHaveText(expectedName)
   await expect(page.getByRole('button', { name: /Execution target:/ })).toBeEnabled()
-  await expect(page.getByRole('button', { name: 'Rerun all' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Run all' })).toBeEnabled()
   await expect(page.getByTestId('share-btn')).toBeVisible()
   await page.evaluate(() => document.fonts.ready)
 }
@@ -57,13 +57,13 @@ async function expectRunControlsOperable(page: Page, fullName: string) {
   await expect(page.getByText('Run this Canvas on', { exact: true })).toBeVisible()
   await page.keyboard.press('Escape')
 
-  const rerun = page.getByRole('button', { name: 'Rerun all' })
-  await expect(rerun).toBeEnabled()
-  await rerun.click()
+  const run = page.getByRole('button', { name: 'Run all' })
+  await expect(run).toBeEnabled()
+  await run.click()
 
   await page.getByTestId('share-btn').click()
   const shareDialog = page.getByRole('dialog')
-    .filter({ has: page.getByRole('heading', { name: 'Share this canvas' }) })
+    .filter({ has: page.getByRole('heading', { name: 'Copy Canvas link' }) })
   await expect(shareDialog).toBeVisible()
   await shareDialog.getByRole('button', { name: 'Close' }).click()
 }

@@ -39,11 +39,11 @@ const INHERIT = '__default__'
 const NO_CRED = '__none__'
 const BUILTIN_RUNNER_PRESENTATION: Record<string, { label: string; guidance: string }> = {
   'local-out-of-core': {
-    label: 'Local streaming',
+    label: 'This machine',
     guidance: 'Streams larger data through this machine without requiring it all to fit in memory.',
   },
   'local-subprocess': {
-    label: 'Isolated local process',
+    label: 'Isolated process',
     guidance: 'Runs each job in a separate process so a failed or cancelled job does not interrupt the app.',
   },
   kernel: {
@@ -314,7 +314,15 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
   // receives global_settings, so there is no need for a permissive fallback while identity loads.
   const canGlobal = currentUser?.capabilities?.includes('global_settings') === true
-  const categories = canGlobal ? CATS : CATS.filter((c) => c.id === 'execution')
+  const categories = canGlobal
+    ? CATS.filter((category) => authEnabled || category.id !== 'members')
+    : CATS.filter((category) => category.id === 'execution')
+
+  useEffect(() => {
+    if (!categories.some((category) => category.id === active)) {
+      setActive(categories[0]?.id ?? 'execution')
+    }
+  }, [active, authEnabled, canGlobal])
 
   const addUser = async () => {
     const name = newUser.name.trim()
@@ -782,7 +790,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
         </div>}
         {!field.secret && pcfg[plugin.name] && hasOwn(pcfg[plugin.name], field.key) && !canonicalPluginValue(field, rawPval(plugin.name, field.key)).valid && <div className="mt-1 text-[10.5px] text-destructive">Enter a finite {field.type === 'int' ? 'integer' : 'number'}.</div>}
         {field.secret && <>
-          <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on Save leaves the stored reference unchanged.</div>
+          <div className="mt-1 text-[10.5px] text-muted-foreground">Enter an environment variable or file reference, such as env:VAR or file:/path. Leave it blank to keep the current reference.</div>
           <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
             {isSet ? <Button
               variant="link"
@@ -790,7 +798,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
               disabled={saving || clearing || Boolean(pluginSecretClearingKey) || Boolean(stagedSecret)}
               onClick={() => setPluginSecretTarget({ pack: plugin.name, field })}
             >{clearing ? 'Clearing…' : 'Clear…'}</Button> : <span>Using environment/default.</span>}
-            <span>{isSet ? 'Clearing applies immediately; it does not wait for Save.' : 'No stored reference.'}</span>
+            <span>{isSet ? 'Clear takes effect immediately.' : 'No stored reference.'}</span>
           </div>
           {stagedSecret && isSet && <div className="mt-1 text-[10.5px] text-muted-foreground">Blank the staged replacement before clearing the stored reference.</div>}
           {secretNotice && <div role={secretNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-1 text-[10.5px]', secretNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
@@ -916,10 +924,9 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                       onChange={(e) => setG((prev) => ({ ...prev, agentDataPolicyEndpointIsLocal: e.target.checked }))}
                     />
                     <span>
-                        Treat this Base URL as local or self-hosted
+                        Allow preview values for this endpoint
                       <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
-                        When set, sample values may reach that endpoint without the sample-values opt-in.
-                        Allows preview values to reach this endpoint without changing the data policy above.
+                        Use only for a local or self-hosted endpoint you trust.
                       </span>
                     </span>
                   </label>
@@ -1175,16 +1182,13 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   </div>
                 </Section>}
 
-                {canGlobal && active === 'members' && <Section id="members" title="Members">
+                {canGlobal && authEnabled && active === 'members' && <Section id="members" title="Members">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Canvas collaborators.
-                    {authEnabled
-                      ? ' Creating a member also creates their sign-in account.'
-                      : ' Sign-in is off, so adding a name does not grant access.'}
+                    Canvas collaborators. Creating a member also creates their sign-in account.
                   </p>
-                  {authEnabled && <div className="mb-2 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                  <div className="mb-2 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
                     Set an initial password. The member can change it after signing in.
-                  </div>}
+                  </div>
                   <div className="mb-2.5 flex flex-col gap-1">
                     {users.map((usr) => (
                       <div key={usr.id} className="flex items-center gap-2 text-xs text-foreground">

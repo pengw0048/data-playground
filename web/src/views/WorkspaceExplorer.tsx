@@ -2167,7 +2167,7 @@ function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResourc
 
 function WorkspaceListHeader() {
   return <div aria-hidden="true" className="mb-1 grid grid-cols-[minmax(0,1fr)_130px_130px_16px] gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-    <span>Name</span><span>Last modified</span><span>Opened here</span><span />
+    <span>Name</span><span>Last modified</span><span>Last opened</span><span />
   </div>
 }
 

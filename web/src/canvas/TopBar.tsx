@@ -56,6 +56,10 @@ export function TopBar() {
   const rerunAll = useStore((s) => s.rerunAll)
   const cancelGraphRun = useStore((s) => s.cancelGraphRun)
   const graphRun = useStore((s) => s.graphRun)
+  const hasRunEvidence = useStore((s) => s.doc.nodes.some((node) => (
+    Boolean(node.data.status) && node.data.status !== 'draft'
+  )))
+  const authEnabled = useStore((s) => s.authEnabled)
   const graphProgress = rerunAllProgress(graphRun)
   // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
   // buttons whenever collab is active — pressing with empty history is a harmless no-op
@@ -171,13 +175,16 @@ export function TopBar() {
               disabled={!canEdit || !kernelUp || (!!graphRun && !graphRun.runId)}
               title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Offline — reconnect before running'
                 : graphRun?.runId ? 'Stop the whole-graph run'
-                  : graphRun ? 'Starting the whole-graph run' : 'Re-run the whole graph'}
+                  : graphRun ? 'Starting the whole-graph run'
+                    : hasRunEvidence ? 'Re-run the whole graph' : 'Run the whole graph'}
               size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
               {graphRun?.runId
                 ? <><Icon name="stop" size={12} /> Stop {graphProgress.done}/{graphProgress.total}</>
                 : graphRun
                   ? <><span className="dp-running-glyph">●</span> Starting…</>
-                : <><Icon name="refresh" size={13} /> Rerun all</>}
+                : hasRunEvidence
+                  ? <><Icon name="refresh" size={13} /> Rerun all</>
+                  : <><Icon name="play" size={13} /> Run all</>}
             </Button>
             {graphRun?.status && (
               <span className="absolute -bottom-2 left-1 right-1 block">
@@ -186,8 +193,8 @@ export function TopBar() {
               </span>
             )}
           </span>
-          <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
-            <Icon name="link" size={13} /> Share
+          <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title={authEnabled ? 'Share this canvas' : 'Copy a link to this canvas'} size="sm" className="rounded-full">
+            <Icon name="link" size={13} /> {authEnabled ? 'Share' : 'Copy link'}
           </Button>
         </div>
       </div>

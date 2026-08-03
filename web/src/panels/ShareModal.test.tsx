@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   state: {
     doc: { id: 'canvas-1' },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
+    authEnabled: true,
     users: [
       { id: 'alice', name: 'Alice' },
       { id: 'bob', name: 'Bob' },
@@ -35,6 +36,7 @@ describe('ShareModal — server-authoritative sharing truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.canvasRole = 'owner'
+    mocks.state.authEnabled = true
     mocks.state.currentUser = { id: 'alice', name: 'Alice' }
     mocks.getShares.mockResolvedValue({
       visibility: 'private',
@@ -130,5 +132,15 @@ describe('ShareModal — server-authoritative sharing truth', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Failed to fetch')
     expect(screen.getByText('Bob')).toBeInTheDocument()
+  })
+
+  it('shows only a direct link when authentication is off', async () => {
+    mocks.state.authEnabled = false
+    render(<ShareModal onClose={vi.fn()} />)
+
+    expect(screen.getByRole('heading', { name: 'Copy Canvas link' })).toBeVisible()
+    expect(screen.getByTestId('copy-link')).toBeVisible()
+    expect(screen.queryByText('Visibility')).toBeNull()
+    expect(screen.queryByText('Collaborators')).toBeNull()
   })
 })

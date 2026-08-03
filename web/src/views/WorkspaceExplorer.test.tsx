@@ -738,7 +738,7 @@ describe('WorkspaceExplorer', () => {
     const views = await screen.findByRole('group', { name: 'Workspace view' })
     expect(within(views).getByRole('button', { name: 'list' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByText('Last modified')).toBeVisible()
-    expect(screen.getByText('Opened here')).toBeVisible()
+    expect(screen.getByText('Last opened')).toBeVisible()
     fireEvent.click(within(views).getByRole('button', { name: 'grid' }))
     expect(within(views).getByRole('button', { name: 'grid' })).toHaveAttribute('aria-pressed', 'true')
 

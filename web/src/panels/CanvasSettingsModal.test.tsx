@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
       resultRetention: { history: 'inherit' as 'inherit' | 'latest' | 'recent' },
     },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
+    authEnabled: true,
     kernelInfo: { resultStorage: { id: 'workspace-managed', label: 'Local workspace', kind: 'local' } },
     renameFile: vi.fn(),
     setRequirements: vi.fn(),
@@ -34,6 +35,7 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.canvasRole = 'owner'
+    mocks.state.authEnabled = true
     mocks.getShares.mockResolvedValue({ visibility: 'private', shares: [] })
     mocks.addShare.mockResolvedValue({ ok: true })
     mocks.state.doc.parameters = []
@@ -108,5 +110,13 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     expect(screen.getByText('Local workspace')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Result history'), { target: { value: 'recent' } })
     expect(mocks.state.setResultRetention).toHaveBeenCalledWith('recent')
+  })
+
+  it('hides unenforceable visibility controls when authentication is off', () => {
+    mocks.state.authEnabled = false
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+
+    expect(screen.getByDisplayValue('Revenue canvas')).toBeVisible()
+    expect(screen.queryByText('Visibility')).toBeNull()
   })
 })

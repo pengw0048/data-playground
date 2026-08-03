@@ -26,6 +26,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const setResultRetention = useStore((s) => s.setResultRetention)
   const setParameters = useStore((s) => s.setParameters)
   const resultStorage = useStore((s) => s.kernelInfo?.resultStorage)
+  const authEnabled = useStore((s) => s.authEnabled)
   const canEdit = roleCanEdit(canvasRole)
   const isOwner = canvasRole === 'owner'
   const sharing = useCanvasSharing(doc.id, isOwner)
@@ -69,24 +70,24 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
           <span className="flex items-center text-muted-foreground"><Icon name="grid" size={14} /></span>
           <DialogTitle className="text-sm font-semibold">Canvas settings</DialogTitle>
         </div>
-        <DialogDescription className="sr-only">Settings for the current canvas: its name, visibility, and dependencies.</DialogDescription>
+        <DialogDescription className="sr-only">Settings for the current Canvas: its name, dependencies, and stored results.</DialogDescription>
 
         <div className="flex max-h-[min(76vh,760px)] flex-col gap-4 overflow-y-auto p-4">
           <div className="rounded-md bg-muted px-2.5 py-1.5 text-[10.5px] text-muted-foreground">{access}</div>
-          {sharing.error && (
+          {authEnabled && sharing.error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-[11.5px] text-destructive">
               <span className="min-w-0 flex-1">{sharing.error}</span>
               {sharing.retryable && <Button type="button" variant="outline" size="sm" onClick={sharing.retry} disabled={busy} className="h-6 px-2 text-[10.5px]">Retry</Button>}
             </div>
           )}
-          {sharing.pending && sharing.pending !== 'load' && (
+          {authEnabled && sharing.pending && sharing.pending !== 'load' && (
             <div role="status" className="text-[10.5px] text-muted-foreground">Saving sharing changes…</div>
           )}
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Name</Label>
             <Input value={name} disabled={!canEdit} onChange={(event) => { setName(event.target.value); renameFile(event.target.value) }} placeholder="untitled" />
           </div>
-          <div>
+          {authEnabled && <div>
             <div className="mb-1.5 text-[11.5px] text-muted-foreground">Visibility</div>
             {sharing.visibility === null && sharing.pending === 'load' ? (
               <div className="text-[11.5px] text-muted-foreground">Loading visibility…</div>
@@ -108,7 +109,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
             <div className="mt-2 text-[10.5px] text-muted-foreground">
               {isOwner ? <>Invite specific people from the <b>Share</b> button.</> : 'Only the canvas owner can change visibility.'}
             </div>
-          </div>
+          </div>}
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Dependencies (pip)</Label>
             <textarea

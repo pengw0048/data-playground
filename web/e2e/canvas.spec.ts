@@ -446,7 +446,7 @@ test.describe('Data Playground canvas', () => {
       await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' }))
         .toContainText(`Workspace/${parent}/${child}`)
 
-      await page.getByRole('button', { name: 'Rerun all' }).click()
+      await page.getByRole('button', { name: 'Run all' }).click()
       await expect(page.getByRole('button', { name: 'Confirm run…' })).toBeVisible()
 
       await page.getByTestId('app-menu').click()
@@ -1202,9 +1202,9 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('agent-configure')).toBeVisible()
   })
 
-  test('the top bar has Rerun all, not Export', async ({ page }) => {
+  test('the top bar has Run all on a new Canvas, not Export', async ({ page }) => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: /rerun all/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Run all' })).toBeVisible()
     await expect(page.getByRole('button', { name: /^export$/i })).toHaveCount(0)
   })
 
@@ -1792,15 +1792,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/\d+ cpu/)).toHaveCount(0)
   })
 
-  test('settings Members creates a user', async ({ page }) => {
+  test('settings hides account management while authentication is off', async ({ page }) => {
     await goToWorkspace(page)
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
-    await page.getByRole('button', { name: 'Members' }).click()
-    const name = `Member ${Date.now()}`
-    await page.getByPlaceholder('Name').fill(name)
-    await page.getByRole('button', { name: 'Add member' }).click()
-    await expect(page.getByText(name, { exact: true })).toBeVisible() // new member appears in the roster
+    await expect(page.getByRole('button', { name: 'Members' })).toHaveCount(0)
   })
 
   test('a section editor uses canvas containment instead of inline nodes', async ({ page }) => {
@@ -2312,24 +2308,13 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(6)
   })
 
-  test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
-    // seed a collaborator via the API (there's no in-app user switching anymore) — bootstrap picks it up
-    await page.request.post('/api/users', { data: { name: 'Dana' }, headers: { 'X-DP-User': 'local' } })
+  test('the link dialog does not offer unenforceable sharing controls in open mode', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('share-btn').click()
-    await expect(page.getByText('Share this canvas')).toBeVisible()
-    // a read-only workspace tier is offered alongside the editable one
-    await expect(page.getByRole('button', { name: 'Workspace can view' })).toBeVisible()
-    // flip visibility to workspace (exact — 'view-only' shares the prefix)
-    await page.getByRole('button', { name: 'Workspace can edit', exact: true }).click()
-    // add Dana as a collaborator (the collaborator picker is the first combobox; a role picker sits beside it)
-    const select = page.getByRole('combobox').first()
-    await select.selectOption({ label: 'Dana' })
-    const addBtn = page.locator('button', { hasText: 'Add' }).last()
-    await expect(addBtn).toBeEnabled()
-    await addBtn.click()
-    await expect(page.getByText('Dana', { exact: false })).toBeVisible() // added to collaborators
-    await expect(page.locator('option[value="viewer"]').first()).toBeAttached() // viewer role is assignable end-to-end
+    await expect(page.getByRole('heading', { name: 'Copy Canvas link' })).toBeVisible()
+    await expect(page.getByTestId('copy-link')).toBeVisible()
+    await expect(page.getByText('Visibility')).toHaveCount(0)
+    await expect(page.getByText('Collaborators')).toHaveCount(0)
   })
 
   test('the Canvas menu opens version history with a restore action', async ({ page }) => {
