@@ -152,8 +152,21 @@ test('keeps an anchored data preview and restores it after maximize at 1440x900'
     await expect(panel).toHaveAttribute('data-presentation', 'anchored')
     await panel.getByRole('button', { name: 'Maximize' }).click()
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'maximized')
+
+    const body = page.getByTestId('panel-data').getByTestId('full-result-body')
+    await expect(body).toBeVisible()
+    const rows = await body.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      bottom: element.getBoundingClientRect().bottom,
+    }))
+    const cardBottom = await page.getByTestId('panel-data')
+      .evaluate((element) => (element.firstElementChild as HTMLElement).getBoundingClientRect().bottom)
+    expect(rows.clientHeight, 'a maximized preview must use the height, not stop at the docked cap').toBeGreaterThan(500)
+    expect(Math.abs(rows.bottom - cardBottom)).toBeLessThanOrEqual(1)
+
     await page.getByTestId('panel-data').getByRole('button', { name: 'Restore' }).click()
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'anchored')
+    expect(await body.evaluate((element) => element.clientHeight)).toBeLessThanOrEqual(440)
   } finally {
     await removeCanvas(page, canvasId)
   }

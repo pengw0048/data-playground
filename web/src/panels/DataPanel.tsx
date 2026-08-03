@@ -380,7 +380,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const canTryNext = res.hasMore === true || (res.hasMore == null && res.rows.length > 0)
 
   return withOutputPorts(
-    <div className="dp-dark text-foreground">
+    <div className={cn('dp-dark text-foreground', fillAvailableHeight && 'flex min-h-0 flex-1 flex-col')}>
       {/* tab bar + row-count */}
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
         {!special && detail == null && tabs.map((t) => (
@@ -445,7 +445,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       ) : isMetric ? (
         <MetricValue rows={res.rows} />
       ) : detail != null && res.rows[detail] ? (
-        <RowDetail columns={resultColumns} row={res.rows[detail]} />
+        <RowDetail columns={resultColumns} row={res.rows[detail]} fillAvailableHeight={fillAvailableHeight} />
       ) : activeTab === 'rows' ? (
         <>
           {/* an empty result over a PREVIEWED SAMPLE isn't necessarily 'nothing matches' — a selective
@@ -456,11 +456,13 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
               run this node to check the full dataset.
             </div>
           )}
-          <RowsTable columns={resultColumns} rows={res.rows} onRowClick={setDetail} />
+          <RowsTable columns={resultColumns} rows={res.rows} onRowClick={setDetail}
+            fillAvailableHeight={fillAvailableHeight} />
         </>
       ) : activeTab === 'stats' ? (
         <StatsView key={`${nodeId}:${selectedPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
-          nodeId={nodeId} portId={selectedPortId} multiOutput={outputPorts.length > 1} />
+          nodeId={nodeId} portId={selectedPortId} multiOutput={outputPorts.length > 1}
+          fillAvailableHeight={fillAvailableHeight} />
       ) : (
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
@@ -656,7 +658,9 @@ const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigit
 
 // Per-column stats over the previewed sample (null%/distinct/min/max/mean). Whole-dataset stats are a
 // cancellable job: every row is covered, while distinct remains approximate.
-function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: string; multiOutput: boolean }) {
+function StatsView({ nodeId, portId, multiOutput, fillAvailableHeight = false }: {
+  nodeId: string; portId?: string; multiOutput: boolean; fillAvailableHeight?: boolean
+}) {
   const doc = useStore((s) => s.doc)
   const preview = useStore((s) => s.previews[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -768,7 +772,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
     }
     const res = job.identityVerified === false ? undefined : job.status?.profile
     if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState title="Full profile failed" reason="full profile completed without statistics" onRetry={canEdit ? () => prepareFullProfile(nodeId, portId) : undefined} /></div>
-    return <ProfileTable res={res} toggle={toggle} />
+    return <ProfileTable res={res} toggle={toggle} fillAvailableHeight={fillAvailableHeight} />
   }
   if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>
   if (st.err) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={st.err} onRetry={loadSample} /></div>
@@ -783,7 +787,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
         title="Sample profile unavailable"
         reason={res.reason ?? 'Statistics cannot be estimated from the current preview.'}
         modeToggle={toggle} />
-  return <ProfileTable res={res} toggle={toggle} />
+  return <ProfileTable res={res} toggle={toggle} fillAvailableHeight={fillAvailableHeight} />
 }
 
 function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
@@ -885,7 +889,9 @@ function FullProfileProgress({ job, toggle, onCancel }: {
   )
 }
 
-function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }) {
+function ProfileTable({ res, toggle, fillAvailableHeight = false }: {
+  res: ProfileResult; toggle: ReactNode; fillAvailableHeight?: boolean
+}) {
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
   const wholeDataset = res.completeness === 'complete'
   const previewSample = res.completeness === 'sample'
@@ -893,7 +899,7 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
   const scopeLabel = completeSample ? 'Complete sampled result' : wholeDataset ? 'Whole dataset' : previewSample ? 'Preview sample' : 'Profile scope unknown'
   const rowVerb = wholeDataset ? 'scanned' : previewSample ? 'inspected' : 'reported'
   return (
-    <div className="max-h-[360px] overflow-auto">
+    <div className={cn('overflow-auto', fillAvailableHeight ? 'min-h-0 flex-1' : 'max-h-[360px]')}>
       <div className="flex items-center justify-between px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
         <div>
           <div className="font-medium text-foreground">
@@ -946,9 +952,11 @@ export function SampleProvenanceSummary({ provenance }: { provenance: SampleProv
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
-function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<string, unknown> }) {
+function RowDetail({ columns, row, fillAvailableHeight = false }: {
+  columns: ColumnSchema[]; row: Record<string, unknown>; fillAvailableHeight?: boolean
+}) {
   return (
-    <div className="max-h-[440px] overflow-auto py-1">
+    <div className={cn('overflow-auto py-1', fillAvailableHeight ? 'min-h-0 flex-1' : 'max-h-[440px]')}>
       {columns.map((c) => (
         <div key={c.name} className="flex gap-2.5 border-b border-border px-3 py-2">
           <div className="w-[130px] flex-[0_0_130px]">
