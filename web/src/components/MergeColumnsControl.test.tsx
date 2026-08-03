@@ -21,7 +21,10 @@ vi.mock('../api/client', () => ({
   toMergeColumnsGraph: (doc: any, writeId: string) => ({ id: doc.id, version: doc.version, requirements: [], parameters: [], nodes: doc.nodes.filter((node: any) => ['source', 'select', writeId].includes(node.id)), edges: doc.edges }),
   KernelError: class KernelError extends Error {
     status: number
-    constructor(status: number, message: string) { super(message); this.status = status }
+    reason?: string
+    constructor(status: number, message: string, _code?: string, _retryable?: boolean, _field?: string, reason?: string) {
+      super(message); this.status = status; this.reason = reason
+    }
   },
 }))
 
@@ -145,7 +148,8 @@ describe('MergeColumnsControl', () => {
     resolve?.(preflight)
     await waitFor(() => expect(screen.queryByText('Ready to merge saved versions')).not.toBeInTheDocument())
 
-    mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
+    mocks.preflight.mockRejectedValueOnce(
+      new KernelError(409, 'The destination dataset has moved on from the Source version this merge is pinned to. Use its current version and try again.', 'conflict', false, undefined, 'stale_expected_head'))
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     expect(await screen.findByText(/Nothing changed automatically/)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Reset setup' })).toBeVisible()
@@ -154,7 +158,8 @@ describe('MergeColumnsControl', () => {
   })
 
   it('retargets Source uri and exact revision only after the explicit current-head action', async () => {
-    mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
+    mocks.preflight.mockRejectedValueOnce(
+      new KernelError(409, 'The destination dataset has moved on from the Source version this merge is pinned to. Use its current version and try again.', 'conflict', false, undefined, 'stale_expected_head'))
     render(<MergeColumnsControl nodeId="write" />)
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await screen.findByText(/Nothing changed automatically/)
@@ -194,10 +199,11 @@ describe('MergeColumnsControl', () => {
     render(<MergeColumnsControl nodeId="write" />)
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await screen.findByText('Ready to merge saved versions')
-    mocks.submit.mockRejectedValueOnce(new KernelError(409, 'merge-columns destination head must equal the exact Source revision'))
+    mocks.submit.mockRejectedValueOnce(
+      new KernelError(409, 'The destination dataset has moved on from the Source version this merge is pinned to. Use its current version and try again.', 'conflict', false, undefined, 'stale_expected_head'))
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent("destination's current version")
+    expect(await screen.findByRole('alert')).toHaveTextContent('has moved on from the Source version')
     expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionState).toBeUndefined()
     expect(screen.getByRole('button', { name: 'Check setup' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Run column merge' })).toBeDisabled()

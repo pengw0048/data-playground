@@ -522,7 +522,8 @@ def test_caller_manifest_cannot_retarget_a_source_to_another_dataset(tmp_path):
         runs._bind_local_run_manifest(_graph(first_uri), second_manifest, deps, "source")
 
     assert getattr(exc.value, "status_code", None) == 409
-    assert getattr(exc.value, "detail", None) == "local_run_input_manifest_does_not_match_graph"
+    assert getattr(exc.value, "detail", None) == (
+        "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.")
 
 
 def test_caller_local_file_manifest_cannot_retarget_another_registered_source(tmp_path):
@@ -547,7 +548,8 @@ def test_caller_local_file_manifest_cannot_retarget_another_registered_source(tm
         runs._bind_local_run_manifest(first_graph, second_manifest, deps, "source")
 
     assert exc.value.status_code == 409
-    assert exc.value.detail == "local_run_input_manifest_does_not_match_graph"
+    assert exc.value.detail == (
+        "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.")
 
 
 def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(tmp_path):

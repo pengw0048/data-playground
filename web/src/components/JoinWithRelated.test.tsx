@@ -26,8 +26,16 @@ vi.mock('../api/client', () => ({
     joinWithRelated: mocks.confirm,
     getCanvas: mocks.getCanvas,
   },
+  KernelError: class KernelError extends Error {
+    status: number
+    code?: string
+    constructor(status: number, message: string, code?: string) {
+      super(message); this.status = status; this.code = code
+    }
+  },
 }))
 
+import { KernelError } from '../api/client'
 import { JoinWithRelated } from './JoinWithRelated'
 
 const inspectorTrigger = 'Find join candidates'
@@ -370,7 +378,8 @@ describe('JoinWithRelated', () => {
   })
 
   it('keeps the current candidate confirmable when revision history is unavailable', async () => {
-    mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
+    mocks.relatedRevisions.mockRejectedValueOnce(
+      new KernelError(501, 'This data source does not keep version history.', 'not_implemented'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
@@ -382,7 +391,8 @@ describe('JoinWithRelated', () => {
   })
 
   it('keeps opaque bindings and diagnostic codes out of the related-data review', async () => {
-    mocks.relatedRevisions.mockRejectedValueOnce(new Error('related_dataset_revision_history_unavailable'))
+    mocks.relatedRevisions.mockRejectedValueOnce(
+      new KernelError(501, 'This data source does not keep version history.', 'not_implemented'))
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: inspectorTrigger }))
     await screen.findByText('Related data')
@@ -392,7 +402,7 @@ describe('JoinWithRelated', () => {
     expect(screen.queryByText('Version history is unavailable for this dataset.')).toBeNull()
     expect(screen.queryByText('Details')).not.toBeInTheDocument()
     expect(screen.queryByText('reg-users@current')).not.toBeInTheDocument()
-    expect(screen.queryByText('related_dataset_revision_history_unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText('does not keep version history')).not.toBeInTheDocument()
   })
 
   it('loads retained revision pages without losing the selected exact revision', async () => {

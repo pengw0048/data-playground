@@ -110,7 +110,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
   const [preflightKey, setPreflightKey] = useState<string | null>(null)
   const [task, setTask] = useState<MergeColumnsTask | null>(null)
   const [receipt, setReceipt] = useState<WriteReceipt | null>(null)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<unknown>('')
   const [busy, setBusy] = useState<'preflight' | 'submit' | 'cancel' | 'retry' | 'retarget' | null>(null)
   const actionGeneration = useRef(0)
   const taskGeneration = useRef(0)
@@ -161,7 +161,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     try {
       const result = await api.mergeColumnsPreflight(request)
       if (sequence === actionGeneration.current) { setPreflight(result); setPreflightKey(key) }
-    } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) }
+    } catch (caught) { if (sequence === actionGeneration.current) setError(caught) }
     finally { if (sequence === actionGeneration.current) setBusy(null) }
   }, [requestFor, withSubmission])
 
@@ -179,7 +179,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
         const page = await api.workspaceJobs({ runId: taskId, limit: 1 })
         if (sequence === taskGeneration.current && !actionBusy.current) setReceipt(page.items[0]?.outputReceipt ?? null)
       }
-    } catch (caught) { if (sequence === taskGeneration.current && !actionBusy.current) setError(cleanError(caught)) }
+    } catch (caught) { if (sequence === taskGeneration.current && !actionBusy.current) setError(caught) }
   }, [])
 
   useEffect(() => {
@@ -226,7 +226,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
           persist({ ...next, submissionState: undefined })
           setPreflight(null); setPreflightKey(null)
         }
-        setError(cleanError(caught))
+        setError(caught)
       }
     } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
@@ -249,7 +249,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
           persist({ ...config, submissionState: undefined })
           setPreflight(null); setPreflightKey(null)
         }
-        setError(cleanError(caught))
+        setError(caught)
       }
     } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
@@ -259,7 +259,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     taskGeneration.current += 1
     actionBusy.current = true
     setBusy('cancel'); setError('')
-    try { const result = await api.cancelMergeColumnsTask(config.taskId); if (sequence === actionGeneration.current) setTask(result) } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
+    try { const result = await api.cancelMergeColumnsTask(config.taskId); if (sequence === actionGeneration.current) setTask(result) } catch (caught) { if (sequence === actionGeneration.current) setError(caught) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const retry = async () => {
     if (!config.taskId) return
@@ -267,7 +267,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     taskGeneration.current += 1
     actionBusy.current = true
     setBusy('retry'); setError('')
-    try { const result = await api.retryMergeColumnsTask(config.taskId, newSubmissionId()); if (sequence === actionGeneration.current) setTask(result) } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
+    try { const result = await api.retryMergeColumnsTask(config.taskId, newSubmissionId()); if (sequence === actionGeneration.current) setTask(result) } catch (caught) { if (sequence === actionGeneration.current) setError(caught) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const reAdmit = () => {
     actionGeneration.current += 1
@@ -302,7 +302,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
       })
       persist({ ...config, submissionId: newSubmissionId(), semanticKey: undefined, submissionState: undefined, taskId: undefined })
       setTask(null); setReceipt(null); setPreflight(null); setPreflightKey(null)
-    } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) }
+    } catch (caught) { if (sequence === actionGeneration.current) setError(caught) }
     finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const changed = (next: MergeColumnsConfig) => {
@@ -329,11 +329,10 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
   const addRule = () => changed({ ...config, rules: [...(config.rules ?? []), { source: '', target: '', mode: 'add' }] })
   const removeRule = (index: number) => changed({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })
   const taskTerminal = task && ['done', 'failed', 'cancelled'].includes(task.status)
-  // The durable diagnostic is authoritative. The current #583 preflight contract has no
-  // operation-specific code, so recognize only its exact public head-mismatch detail; never infer
-  // a destination move from an unrelated message that merely contains "stale".
+  // Recognize a moved destination only from the durable diagnostic or the response's stable
+  // `reason`; never from error prose that merely contains "stale".
   const staleHead = task?.mergeColumns?.diagnosticCode === 'stale_expected_head'
-    || error === 'merge-columns destination head must equal the exact Source revision'
+    || (error instanceof KernelError && error.reason === 'stale_expected_head')
   const responseUnknown = !task && config.submissionState === 'response_unknown'
   const recoveryAvailable = responseUnknown
     && !!config.submissionId && config.semanticKey === currentSemanticKey
@@ -381,7 +380,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
       <div className="mt-0.5">The canvas changed after submission. A second run is blocked; undo those edits to recover the same submission, or inspect Jobs for the result.</div>
       <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery('')}>Open Jobs</Button>
     </div>}
-    {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error === 'merge-columns destination head must equal the exact Source revision' ? "The saved Source version no longer matches the destination's current version." : error}</div>}
+    {!!error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{cleanError(error)}</div>}
     {!compact && <div className="mt-2 flex gap-1">
       {!task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null}>{busy === 'preflight' ? 'Checking…' : 'Check setup'}</Button>}
       {!task && !config.taskId && !responseUnknown && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Run column merge'}</Button>}

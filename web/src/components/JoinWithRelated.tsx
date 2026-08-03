@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
 import type { DatasetRevisionPage, RelatedDatasetCandidate, RelatedDatasetPage } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../types/graph'
@@ -59,8 +59,8 @@ function revisionLabel(index: number, committedAt?: string | null) {
   return `Saved version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
 }
 
-function friendlyRevisionError(error: string) {
-  if (error.includes('related_dataset_revision_history_unavailable')) {
+function friendlyRevisionError(error: unknown) {
+  if (error instanceof KernelError && error.code === 'not_implemented') {
     return 'Version history is unavailable for this dataset.'
   }
   return 'Version history could not be loaded. You can still join the current version.'
@@ -139,7 +139,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const [loadingRevisions, setLoadingRevisions] = useState(false)
   const [loadingMoreRevisions, setLoadingMoreRevisions] = useState(false)
   const [revising, setRevising] = useState(false)
-  const [revisionError, setRevisionError] = useState('')
+  const [revisionError, setRevisionError] = useState<unknown>(null)
   const [how, setHow] = useState<'inner' | 'left' | 'right' | 'outer'>('inner')
   const [loading, setLoading] = useState(false)
   const [confirming, setConfirming] = useState(false)
@@ -202,18 +202,16 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   useEffect(() => {
     if (!candidateBase) {
       setRevisions(null)
-      setRevisionError('')
+      setRevisionError(null)
       setRequestedRevisionId('')
       return
     }
     let active = true
     setLoadingRevisions(true)
-    setRevisionError('')
+    setRevisionError(null)
     api.relatedDatasetRevisions(candidateBase.identity, { limit: 20 }).then(
       (next) => { if (active) setRevisions(next) },
-      (reason) => {
-        if (active) setRevisionError(reason instanceof Error ? reason.message : String(reason))
-      },
+      (reason) => { if (active) setRevisionError(reason) },
     ).finally(() => { if (active) setLoadingRevisions(false) })
     return () => { active = false }
   }, [candidateBase])
@@ -295,11 +293,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     setRequestedRevisionId(revisionId)
     if (!revisionId) {
       setCandidate(candidateBase)
-      setRevisionError('')
+      setRevisionError(null)
       return
     }
     setRevising(true)
-    setRevisionError('')
+    setRevisionError(null)
     try {
       const reviewed = await api.reviewRelatedDatasetRevision(page.source, candidateBase, revisionId, {
         q: q.trim() || undefined,
@@ -307,7 +305,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
       })
       setCandidate(reviewed)
     } catch (reason) {
-      setRevisionError(reason instanceof Error ? reason.message : String(reason))
+      setRevisionError(reason)
     } finally {
       setRevising(false)
     }
@@ -316,7 +314,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const loadMoreRevisions = async () => {
     if (!candidateBase || !revisions?.nextCursor) return
     setLoadingMoreRevisions(true)
-    setRevisionError('')
+    setRevisionError(null)
     try {
       const next = await api.relatedDatasetRevisions(candidateBase.identity, {
         limit: 20, cursor: revisions.nextCursor,
@@ -330,7 +328,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
         }
       })
     } catch (reason) {
-      setRevisionError(reason instanceof Error ? reason.message : String(reason))
+      setRevisionError(reason)
     } finally {
       setLoadingMoreRevisions(false)
     }
@@ -508,7 +506,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                       onClick={() => void loadMoreRevisions()}>
                       {loadingMoreRevisions ? 'Loading…' : 'Load more versions'}
                     </Button>}
-                    {revisionError && <span role="status" className="ml-2 text-muted-foreground">
+                    {!!revisionError && <span role="status" className="ml-2 text-muted-foreground">
                       {friendlyRevisionError(revisionError)}
                       {requestedRevisionId && <Button type="button" size="sm" variant="outline"
                         className="ml-2 h-7" disabled={revising}

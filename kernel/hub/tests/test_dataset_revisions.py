@@ -223,7 +223,7 @@ def test_lance_as_of_resolution_is_inclusive_bounded_and_advertised(tmp_path):
         params={"asOf": (first_at - datetime.timedelta(microseconds=1)).isoformat()},
     )
     assert before_first.status_code == 410
-    assert before_first.json()["detail"] == "dataset_revision_unavailable"
+    assert before_first.json()["detail"] == "This dataset version is no longer available."
 
     after_head = client.get(
         f"/api/catalog/tables/{table['id']}/revisions/resolve",
@@ -253,7 +253,7 @@ def test_as_of_resolution_rejects_ambiguous_evidence_and_capability_absence(monk
         params={"asOf": "2026-07-16T12:00:00Z"},
     )
     assert ambiguous.status_code == 409
-    assert ambiguous.json()["detail"] == "dataset_revision_resolution_ambiguous"
+    assert ambiguous.json()["detail"] == "The version at that time cannot be determined for this data source."
 
     class ExactOnlyAdapter(AmbiguousAdapter):
         revision_selectors = frozenset({"exact", "latest"})
@@ -267,7 +267,7 @@ def test_as_of_resolution_rejects_ambiguous_evidence_and_capability_absence(monk
         params={"asOf": "2026-07-16T12:00:00Z"},
     )
     assert unavailable.status_code == 501
-    assert unavailable.json()["detail"] == "dataset_revision_as_of_unavailable"
+    assert unavailable.json()["detail"] == "This data source cannot look up a version by date."
 
 
 def test_revision_timestamp_normalization_is_limited_to_core_owned_evidence():
@@ -414,7 +414,7 @@ def test_missing_lance_revision_is_a_stable_unavailable_error(tmp_path):
     dataset_id = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]["datasetId"]
     response = client.get(f"/api/catalog/revisions/{dataset_id}/999999")
     assert response.status_code == 410
-    assert response.json()["detail"] == "dataset_revision_unavailable"
+    assert response.json()["detail"] == "This dataset version is no longer available."
     assert response.json()["code"] == "resource_gone"
 
 
@@ -430,7 +430,7 @@ def test_compacted_lance_revision_is_unavailable_without_opening_latest(tmp_path
         f"/api/catalog/revisions/{first['datasetId']}/{first['revisionId']}")
     assert response.status_code == 410
     assert response.json() == {
-        "detail": "dataset_revision_unavailable",
+        "detail": "This dataset version is no longer available.",
         "code": "resource_gone", "retryable": False,
     }
     latest = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
@@ -438,9 +438,9 @@ def test_compacted_lance_revision_is_unavailable_without_opening_latest(tmp_path
 
 
 @pytest.mark.parametrize(("failure", "status", "detail", "code", "retryable"), [
-    (PermissionError("denied"), 403, "dataset_revision_permission_lost",
+    (PermissionError("denied"), 403, "You no longer have permission to read this dataset.",
      "permission_denied", False),
-    (RevisionProviderOffline("offline"), 503, "dataset_revision_provider_offline",
+    (RevisionProviderOffline("offline"), 503, "This data source is offline. Try again once it is reachable.",
      "service_unavailable", True),
 ])
 def test_exact_revision_normalizes_recoverable_provider_failures(
@@ -536,7 +536,7 @@ def test_inaccessible_lance_revision_maps_to_permission_lost_at_adapter_and_api(
 
     assert response.status_code == 403
     assert response.json() == {
-        "detail": "dataset_revision_permission_lost",
+        "detail": "You no longer have permission to read this dataset.",
         "code": "permission_denied", "retryable": False,
     }
 
