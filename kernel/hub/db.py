@@ -110,6 +110,8 @@ def _apply_session(c: duckdb.DuckDBPyConnection) -> None:
     # Keep unqualified relation/function resolution deterministic.  `main` still exposes the run's
     # generated views; arbitrary attached/custom schemas cannot silently enter the search path.
     c.execute("SET search_path = 'main'")
+    # Bind naive timestamps to UTC, not the host clock, so one file gives one answer on every machine.
+    c.execute("SET TimeZone = 'UTC'")
     # Do NOT auto-install/auto-load extensions: unknown schemes must not silently add network access.
     # Object-store access loads httpfs explicitly in ensure_object_store(), so authenticated sessions
     # also disable its direct HTTP(S) and Hugging Face filesystems. S3FileSystem remains available,

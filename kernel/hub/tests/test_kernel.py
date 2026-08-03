@@ -1691,6 +1691,37 @@ def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tm
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #
+def test_naive_timestamps_bind_to_utc_not_the_host_timezone(tmp_path):
+    """One file, one answer: a naive timestamp is UTC everywhere, and the tz label says UTC."""
+    import json
+    import subprocess
+    import sys
+
+    from hub import db
+    csv = tmp_path / "timestamps.csv"
+    csv.write_text("id,t\n1,2026-01-02T03:04:05\n2,2026-06-15T22:30:00+09:00\n")
+    g = {"id": "tz", "version": 1, "nodes": [N("s", "source", {"uri": str(csv)})], "edges": []}
+    expected = ["2026-01-02T03:04:05+00:00", "2026-06-15T13:30:00+00:00"]
+
+    body = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 10}).json()
+    assert [r["t"] for r in body["rows"]] == expected
+    assert [c["physicalType"] for c in body["columns"] if c["name"] == "t"] == ["timestamp[us, tz=UTC]"]
+    with db.run_scope():  # a cursor does not inherit the base connection's timezone
+        assert db.conn().execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+
+    script = (
+        "import json\n"
+        "from fastapi.testclient import TestClient\n"
+        "from hub.main import app\n"
+        f"body = TestClient(app).post('/api/run/preview', json={{'graph': {g!r}, 'nodeId': 's', 'k': 10}}).json()\n"
+        "print(json.dumps([r['t'] for r in body['rows']]))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, timeout=120,
+                         env={**os.environ, "TZ": "Asia/Tokyo"})
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == expected
+
+
 def test_aggregate_keeps_group_key():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
