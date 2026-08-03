@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useUpdateNodeInternals } from '@xyflow/react'
 import { register, nodeOutputs, type NodeComponentProps } from '../registry'
 import { Port } from '../Port'
-import { useStore, nodeRunnable, roleCanEdit } from '../../store/graph'
+import { useStore, nodeRunnable, unsetSourceReason, roleCanEdit } from '../../store/graph'
 import { status as statusTok } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
 import { Tooltip } from '../../ui/Tooltip'
@@ -23,6 +23,7 @@ function Section({ id, data, selected }: NodeComponentProps) {
   const rename = useStore((s) => s.rename)
   const openPanel = useStore((s) => s.openPanels[id])
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  const blocked = useStore((s) => unsetSourceReason(s.doc, id))
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const kernelUp = useStore((s) => s.kernelUp)
   const [editing, setEditing] = useState(false)
@@ -66,7 +67,7 @@ function Section({ id, data, selected }: NodeComponentProps) {
           )}
           <span className={editing ? 'flex-1' : undefined} />
           <span className="rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">SECTION</span>
-          <Tooltip label={!kernelUp ? 'Hub offline — run unavailable' : runnable ? 'Run up to here' : 'Connect a source to run'}>
+          <Tooltip label={!kernelUp ? 'Hub offline — run unavailable' : runnable ? 'Run up to here' : blocked ?? 'Connect a source to run'}>
             <button aria-label="Run section" aria-disabled={!canEdit || !kernelUp || !runnable} onClick={(e) => { e.stopPropagation(); if (canEdit && kernelUp && runnable) requestRun(id) }}
               className={cn('grid h-[22px] w-6 place-items-center rounded-md', canEdit && kernelUp && runnable ? 'cursor-pointer text-muted-foreground' : 'cursor-not-allowed text-muted-foreground/40')}>
               <Icon name="play" size={13} />
