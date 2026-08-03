@@ -2406,7 +2406,7 @@ test.describe('Data Playground canvas', () => {
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
     await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
     await backToWorkspace(page)
-    await expect(page.getByRole('complementary', { name: 'Primary navigation' }).getByText('Local', { exact: true })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Primary navigation' }).getByText('Local', { exact: true })).toBeVisible()
     await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
