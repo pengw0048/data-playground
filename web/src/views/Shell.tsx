@@ -89,10 +89,12 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
       else setView(v)
     }} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}
+      aria-current={view === v ? 'page' : undefined}
       aria-label={collapsed ? (badge ? `${label}, ${badge} unread` : label) : undefined}
       className={cn('h-auto w-full gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
         collapsed ? 'justify-center' : 'justify-start',
-        view === v && 'bg-accent text-accent-foreground')}>
+        // forced colours flattens bg-accent, so the current view needs a border to stay visible
+        view === v && 'bg-accent text-accent-foreground forced-colors:border forced-colors:border-[Highlight]')}>
       <span className="relative inline-flex">
         <Icon name={icon} size={15} />
         {!!badge && badge > 0 && (
@@ -109,7 +111,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   )
 
   return (
-    <aside data-testid="workspace-rail" aria-label="Primary navigation"
+    <nav data-testid="workspace-rail" aria-label="Primary navigation"
       className={cn('flex h-full flex-col border-r border-border bg-card p-2 transition-[width] duration-150', collapsed ? 'w-[56px] flex-[0_0_56px]' : 'w-[220px] flex-[0_0_220px]')}>
       <div className={cn('flex items-center gap-2 pb-3 pt-1', collapsed ? 'justify-center px-0' : 'px-2')}>
         {!collapsed && (
@@ -162,7 +164,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         )}
       </div>
       {pwOpen && <ChangePasswordModal onClose={() => setPwOpen(false)} />}
-    </aside>
+    </nav>
   )
 }
 
