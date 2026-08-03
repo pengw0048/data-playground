@@ -992,7 +992,7 @@ function WorkspaceMixedExplorer() {
         <form aria-label="Workspace search" onSubmit={(event) => {
           event.preventDefault()
           if (searchDraftPending) setWorkspaceSearchQuery(searchDraft)
-        }} className="flex min-w-[220px] max-w-sm flex-1 items-center gap-1 rounded-md border border-border bg-card px-2">
+        }} className="flex min-w-[220px] max-w-sm flex-1 items-center gap-1 rounded-md border border-border bg-card px-2 focus-within:border-primary focus-within:ring-1 focus-within:ring-ring">
           <Icon name="search" size={13} />
           <input aria-label="Search views, datasets, canvases, and containers" value={searchDraft}
             onChange={(event) => setSearchDraft(event.target.value)} placeholder="Search Workspace"

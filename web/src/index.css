@@ -157,6 +157,9 @@ input, textarea, select { font-family: inherit; }
 .react-flow__edge-path { stroke: var(--wire); stroke-width: 1.5; }
 .react-flow__edge.selected .react-flow__edge-path,
 .react-flow__edge:hover .react-flow__edge-path { stroke: #7f8792; }
+/* edges are tabbable but React Flow resets their outline, and WireEdge sets the path inline —
+   these variables are how the inline style picks up keyboard focus */
+.react-flow__edge:focus-visible { --dp-edge-focus-stroke: var(--focus); --dp-edge-focus-width: 3; }
 .react-flow__node { font-family: var(--font-sans); }
 /* Keyboard focus model: React Flow nodes are tabbable (nodesFocusable default true). Tab reaches a
    node; Enter/Space selects it; arrow keys move a selected node when editable. Selection (mouse or
