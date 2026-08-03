@@ -3691,6 +3691,25 @@ def test_ambiguous_csv_date_order_is_disclosed_and_overridable(tmp_path):
         assert csv_date_order_notices(p, {"dateOrder": "month-first"}) == []
 
 
+def test_csv_date_order_notice_probe_obeys_the_shared_local_root(tmp_path, monkeypatch):
+    from hub import paths
+    from hub.plugins.adapters import csv_date_order_notices
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "inside.csv"
+    outside = tmp_path / "outside.csv"
+    body = "id,order_date\n1,01/02/2026\n2,03/04/2026\n"
+    inside.write_text(body)
+    outside.write_text(body)
+    monkeypatch.setattr(paths.auth, "auth_enabled", lambda: True)
+    monkeypatch.setattr(paths, "allowed_roots", lambda: [str(allowed.resolve())])
+
+    assert csv_date_order_notices(str(inside))
+    with pytest.raises(PermissionError, match="outside the allowed roots"):
+        csv_date_order_notices(str(outside))
+
+
 def test_unambiguous_csv_dates_read_unchanged_and_silently(tmp_path):
     from hub import db
     from hub.plugins.adapters import DuckDBAdapter, csv_date_order_notices

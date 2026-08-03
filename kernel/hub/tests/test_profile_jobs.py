@@ -1858,6 +1858,9 @@ def test_profile_projection_watermark_prevents_evicted_identity_resurrection(
         monkeypatch.setattr(metadb, "_PROFILE_LATEST_MAX", 2)
         canvas_id = "profile-watermark"
         _create_profile_canvas(metadb, canvas_id)
+        # This scenario models late progress from a live worker. Register that owner so a concurrent
+        # boot-time reaper cannot legitimately terminalize the fixture halfway through the assertion.
+        metadb.claim_kernel(canvas_id, "profile-kernel", "profile-kernel-token")
         orders = []
         for index in range(3):
             run_id = f"profile-plan-{index}"
