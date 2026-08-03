@@ -333,7 +333,7 @@ describe('Catalog discovery request and mutation truth', () => {
       onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This exact revision is unavailable or no longer retained. Latest was not substituted.')
+      'This exact version is unavailable or no longer retained. Your selection is unchanged.')
     expect(screen.queryByTestId('detail-preview-scroll')).not.toBeInTheDocument()
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)

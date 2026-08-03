@@ -153,7 +153,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Clear…' }))
 
     const confirmation = screen.getByRole('heading', { name: 'Clear stored plugin secret reference?' }).closest('[role="dialog"]')
-    expect(confirmation).toHaveTextContent('It does not save or discard other staged Settings.')
+    expect(confirmation).toHaveTextContent('This immediately removes the stored Token reference')
     expect(confirmation).not.toHaveTextContent('env:DP_X_TOKEN')
     fireEvent.click(screen.getByRole('button', { name: 'Clear stored reference' }))
 
@@ -500,7 +500,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.change(model, { target: { value: 'edited-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(state.pushToast).toHaveBeenCalledWith('Settings were not saved: save failed', 'error'))
-    expect(screen.getByRole('alert')).toHaveTextContent('The save was not confirmed. Settings are never partially committed; your edits remain here.')
+    expect(screen.getByRole('alert')).toHaveTextContent('The save was not confirmed. Your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()  // no false success
   })
@@ -687,7 +687,7 @@ describe('SettingsModal — plugin config form', () => {
 
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Settings were not saved: HTTP 500: write failed')
-    expect(alert).toHaveTextContent('The save was not confirmed. Settings are never partially committed; your edits remain here.')
+    expect(alert).toHaveTextContent('The save was not confirmed. Your edits remain here.')
     expect(screen.getByDisplayValue('edited-model')).toBeVisible()
     expect(screen.getByDisplayValue('http://edited.example')).toBeVisible()
     expect(screen.queryByText('Saved')).toBeNull()
@@ -776,7 +776,7 @@ describe('SettingsModal — plugin config form', () => {
     expect(createCred).toHaveBeenCalledOnce()
     resolveCreate?.({ id: 'slow', name: 'Slow credential', kind: 'object_store', fields: {} })
 
-    expect(await screen.findByText(/applied immediately; staged Settings are unchanged/)).toBeVisible()
+    expect(await screen.findByText(/applied immediately/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
     expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
     expect(putSettingsBatch).not.toHaveBeenCalled()

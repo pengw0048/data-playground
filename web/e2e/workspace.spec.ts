@@ -472,7 +472,7 @@ test('keeps an exact Source binding through provider outage and retries at the s
   try {
     await page.goto(`/#/canvas/${canvasId}`)
     await expect(page.getByText(
-      /provider is offline.*selected version could not be verified.*latest was not substituted/i,
+      /provider is offline.*selected version could not be verified.*Your selection is unchanged/i,
     )).toBeVisible()
 
     providerAvailable = true

@@ -1150,7 +1150,7 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
             {values.map(([label, value]) => <ConnectionFact key={label} label={label} value={value} />)}
           </dl>
           {exact && detailState === 'loading' && <div role="status" className="text-muted-foreground">Loading selected version fields…</div>}
-          {exact && detailState === 'unavailable' && <div role="alert" className="text-destructive">The selected version is unavailable. The current dataset was not substituted.</div>}
+          {exact && detailState === 'unavailable' && <div role="alert" className="text-destructive">The selected version is unavailable. Your selection is unchanged.</div>}
           {exact && detailState === 'permission' && <div role="alert" className="text-destructive">Permission to inspect the selected version was lost.</div>}
           {exact && detailState === 'offline' && <div role="alert" className="text-destructive">The provider is offline; selected version fields cannot be checked.</div>}
           {exact && detailState === 'error' && <div role="alert" className="text-destructive">Selected version fields could not be loaded.</div>}

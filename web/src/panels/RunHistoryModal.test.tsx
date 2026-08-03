@@ -211,7 +211,7 @@ describe('admitted run inputs', () => {
     await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
     expect(await screen.findByText('permission lost')).toBeInTheDocument()
     expect(screen.getByText('provider offline')).toBeInTheDocument()
-    expect(screen.getByText(/missing or compacted.*Latest was not substituted/i)).toBeInTheDocument()
+    expect(screen.getByText(/missing or was compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.getByText(/provider is offline or unavailable/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Open Catalog revision detail' })).not.toBeInTheDocument()
   })

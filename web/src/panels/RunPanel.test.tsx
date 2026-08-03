@@ -155,10 +155,10 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     mocks.state.runs.target.parameterBindings = [{ name: 'uri', value: 'file:/private/token' }]
     rerender(<RunPanel nodeId="target" />)
-    expect(screen.getByRole('alert')).toHaveTextContent('Secret references')
+    expect(screen.getByRole('alert')).toHaveTextContent('Secrets can’t be used')
     mocks.state.runs.target.parameterBindings = [{ name: 'uri', value: 'ENV:PRIVATE_VALUE' }]
     rerender(<RunPanel nodeId="target" />)
-    expect(screen.getByRole('alert')).toHaveTextContent('Secret references')
+    expect(screen.getByRole('alert')).toHaveTextContent('Secrets can’t be used')
   })
 
   it('offers one shared Edit parameters path back to a fresh estimate', () => {

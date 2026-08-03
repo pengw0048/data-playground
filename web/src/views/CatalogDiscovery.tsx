@@ -995,11 +995,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       if (request !== requestedExactRequest.current) return
       const status = statusOf(error)
       const prefix = status === 403
-        ? 'You do not have permission to open this exact revision.'
+        ? 'You do not have permission to open this exact version.'
         : status === 404 || status === 410
-          ? 'This exact revision is unavailable or no longer retained.'
-          : `Couldn't load this exact revision: ${errorMessage(error)}.`
-      setRequestedExactError(`${prefix} Latest was not substituted.`)
+          ? 'This exact version is unavailable or no longer retained.'
+          : `Couldn’t load this exact version: ${errorMessage(error)}.`
+      setRequestedExactError(`${prefix} Your selection is unchanged.`)
     } finally {
       if (request === requestedExactRequest.current) setRequestedExactLoading(false)
     }

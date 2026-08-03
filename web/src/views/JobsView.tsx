@@ -525,7 +525,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
-        {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
+        {item.cancelRequested && <div className="text-amber-700">Cancelling — waiting for the job to stop.</div>}
         {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
       </div>}
       <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
