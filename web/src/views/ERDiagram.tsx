@@ -699,17 +699,23 @@ export function ERDiagram() {
       if (!s || !t) return
       const mappedColumn = e.columns?.[0]
       const pipeline = e.pipelineNames?.length === 1 ? e.pipelineNames[0] : null
+      const cardinality = e.cardinality?.value
       out.push({
         id: `l${i}`, source: s, target: t, selectable: false,
         sourceHandle: 'node-source',
         targetHandle: expandedEntities && mappedColumn
           && fieldsByTable[t]?.some((field) => field.name === mappedColumn)
           ? `column-in:${mappedColumn}` : 'node-target',
-        // Long generated pipeline identifiers turn a dense graph into an unreadable wall of text.
-        // Keep concise human names on the wire; the column endpoint already explains mapped data.
-        label: expandedEntities && pipeline && pipeline.length <= 28 ? pipeline : undefined,
-        ariaLabel: pipeline ? `Produced by ${pipeline}` : 'Lineage',
-        labelStyle: { fontSize: 9.5 },
+        // Semantic zoom exposes proven cardinality first. Unknown stays unlabeled rather than being
+        // guessed from layout or row samples; a concise pipeline name remains the fallback context.
+        label: expandedEntities
+          ? cardinality ?? (pipeline && pipeline.length <= 28 ? pipeline : undefined)
+          : undefined,
+        ariaLabel: [
+          cardinality ? `Cardinality ${cardinality}, ${e.cardinality?.evidence}` : 'Cardinality not reported',
+          pipeline ? `produced by ${pipeline}` : null,
+        ].filter(Boolean).join(', '),
+        labelStyle: { fontSize: cardinality ? 10 : 9.5, fontWeight: cardinality ? 600 : 400 },
         markerEnd: { type: MarkerType.ArrowClosed },
         style: { stroke: 'hsl(var(--muted-foreground))', strokeWidth: 1.5 },
       })

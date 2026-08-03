@@ -6270,8 +6270,47 @@
         "title": "KeyInfo",
         "type": "object"
       },
+      "LineageCardinality": {
+        "description": "A provider-backed relationship count, never a graph-layout inference.",
+        "properties": {
+          "evidence": {
+            "enum": [
+              "declared",
+              "measured"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "value": {
+            "enum": [
+              "1:1",
+              "1:N",
+              "N:1",
+              "N:M"
+            ],
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "evidence"
+        ],
+        "title": "LineageCardinality",
+        "type": "object"
+      },
       "LineageEdge": {
         "properties": {
+          "cardinality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LineageCardinality"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "child": {
             "title": "Child",
             "type": "string"

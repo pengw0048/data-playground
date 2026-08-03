@@ -606,6 +606,8 @@ export interface LineageEdge {
   /** Provider-reported mapped columns. Empty means the graph has no column-level evidence. */
   columns?: string[]
   pipelineNames?: string[]
+  /** Proven by the source. Missing means the relationship count is unknown. */
+  cardinality?: { value: Exclude<Cardinality, 'unknown'>; evidence: 'declared' | 'measured' } | null
 }
 export interface LineageResult { rootUri: string; nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
 

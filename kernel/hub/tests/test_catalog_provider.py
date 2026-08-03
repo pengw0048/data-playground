@@ -313,7 +313,7 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
 
     from hub import metadb, workspace_providers
     from hub.main import app
-    from hub.models import LineageEdge, LineageNode, LineageResult
+    from hub.models import LineageCardinality, LineageEdge, LineageNode, LineageResult
 
     suffix = uuid.uuid4().hex
     mount_id = f"lineage-mount-{suffix}"
@@ -372,7 +372,11 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
                     LineageNode(id=physical_root, name="raw_video_v2", uri=physical_root),
                 ],
                 edges=[LineageEdge(
-                    parent=physical_parent, child=physical_root, fact_count=2)],
+                    parent=physical_parent,
+                    child=physical_root,
+                    fact_count=2,
+                    cardinality=LineageCardinality(value="1:N", evidence="measured"),
+                )],
             )
 
     provider = Provider()
@@ -408,6 +412,8 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
     assert graph.root_uri == source_uri
     assert graph.nodes[1].name == "raw_video_v2"
     assert graph.edges[0].child == source_uri
+    assert graph.edges[0].cardinality == LineageCardinality(
+        value="1:N", evidence="measured")
     assert "secret-bucket" not in serialized and suffix not in graph.nodes[0].uri
 
     with TestClient(app) as client:
@@ -420,6 +426,9 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
     assert routed["rootUri"] == source_uri
     assert {node["name"] for node in routed["nodes"]} >= {
         "raw_video_v1", "raw_video_v2",
+    }
+    assert routed["edges"][0]["cardinality"] == {
+        "value": "1:N", "evidence": "measured",
     }
     assert "secret-bucket" not in response.text
 
@@ -437,6 +446,49 @@ def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
     assert opened.status_code == 200, opened.text
     assert opened.json()["name"] == "raw_video_v1"
     assert "secret-bucket" not in opened.text
+
+
+def test_lineage_merge_preserves_only_consistent_reported_cardinality():
+    from hub.models import LineageCardinality, LineageEdge, LineageNode, LineageResult
+    from hub.routers.catalog import _merge_lineage_graphs
+
+    root = "mem://root"
+    agreed = "mem://agreed"
+    conflicted = "mem://conflicted"
+    unknown = "mem://unknown"
+    nodes = [
+        LineageNode(id=uri, name=uri.removeprefix("mem://"), uri=uri)
+        for uri in (root, agreed, conflicted, unknown)
+    ]
+    declared = LineageResult(root_uri=root, nodes=nodes, edges=[
+        LineageEdge(
+            parent=root, child=agreed, fact_count=1,
+            cardinality=LineageCardinality(value="1:N", evidence="declared"),
+        ),
+        LineageEdge(
+            parent=root, child=conflicted, fact_count=1,
+            cardinality=LineageCardinality(value="1:1", evidence="declared"),
+        ),
+        LineageEdge(parent=root, child=unknown, fact_count=1),
+    ])
+    measured = LineageResult(root_uri=root, nodes=nodes, edges=[
+        LineageEdge(
+            parent=root, child=agreed, fact_count=2,
+            cardinality=LineageCardinality(value="1:N", evidence="measured"),
+        ),
+        LineageEdge(
+            parent=root, child=conflicted, fact_count=1,
+            cardinality=LineageCardinality(value="N:1", evidence="measured"),
+        ),
+    ])
+
+    merged = _merge_lineage_graphs(root, [declared, measured], max_nodes=10)
+    by_child = {edge.child: edge for edge in merged.edges}
+    assert by_child[agreed].fact_count == 3
+    assert by_child[agreed].cardinality == LineageCardinality(
+        value="1:N", evidence="measured")
+    assert by_child[conflicted].cardinality is None
+    assert by_child[unknown].cardinality is None
 
 
 def test_bounded_pages_reject_overlimit_and_nonadvancing_cursors():

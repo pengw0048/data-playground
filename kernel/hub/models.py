@@ -743,12 +743,20 @@ class LineageNode(Wire):
 LineageEdgeLabel = Annotated[str, Field(min_length=1, max_length=512)]
 
 
+class LineageCardinality(Wire):
+    """A provider-backed relationship count, never a graph-layout inference."""
+
+    value: Literal["1:1", "1:N", "N:1", "N:M"]
+    evidence: Literal["declared", "measured"]
+
+
 class LineageEdge(Wire):
     parent: str
     child: str
     fact_count: int = Field(ge=1)
     columns: list[LineageEdgeLabel] = Field(default_factory=list, max_length=64)
     pipeline_names: list[LineageEdgeLabel] = Field(default_factory=list, max_length=16)
+    cardinality: LineageCardinality | None = None
 
 
 class LineageFieldMapping(Wire):

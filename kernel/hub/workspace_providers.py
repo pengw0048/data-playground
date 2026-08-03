@@ -535,6 +535,7 @@ def provider_dataset_lineage(uri: str, *, depth: int, max_nodes: int):
                 fact_count=edge.fact_count,
                 columns=edge.columns,
                 pipeline_names=edge.pipeline_names,
+                cardinality=edge.cardinality,
             )
             for edge in item.edges
         ],

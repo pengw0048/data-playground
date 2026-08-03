@@ -72,6 +72,7 @@ from hub.models import (
     InstalledProcessorSource,
     JoinSuggestion,
     KernelInfo,
+    LineageCardinality,
     LineageEdge,
     LineageFactsPage,
     LineageNode,
@@ -779,11 +780,28 @@ def _merge_lineage_graphs(
                 continue
             pair = (edge.parent, edge.child)
             fact = facts.setdefault(pair, {
-                "count": 0, "columns": set(), "pipelines": set(),
+                "count": 0, "columns": set(), "pipelines": set(), "cardinalities": set(),
             })
             fact["count"] = int(fact["count"]) + edge.fact_count
             cast(set[str], fact["columns"]).update(edge.columns)
             cast(set[str], fact["pipelines"]).update(edge.pipeline_names)
+            if edge.cardinality is not None:
+                cast(set[tuple[str, str]], fact["cardinalities"]).add((
+                    edge.cardinality.value, edge.cardinality.evidence,
+                ))
+
+    def merged_cardinality(fact: dict[str, object]) -> LineageCardinality | None:
+        reported = cast(set[tuple[str, str]], fact["cardinalities"])
+        values = {value for value, _evidence in reported}
+        if len(values) != 1:
+            return None
+        return LineageCardinality.model_validate({
+            "value": next(iter(values)),
+            "evidence": "measured" if any(
+                evidence == "measured" for _, evidence in reported
+            ) else "declared",
+        })
+
     return LineageResult(
         root_uri=root_uri,
         nodes=list(ordered.values()),
@@ -794,6 +812,7 @@ def _merge_lineage_graphs(
                 fact_count=int(fact["count"]),
                 columns=sorted(cast(set[str], fact["columns"]))[:64],
                 pipeline_names=sorted(cast(set[str], fact["pipelines"]))[:16],
+                cardinality=merged_cardinality(fact),
             )
             for (parent, child), fact in sorted(facts.items())
         ],
@@ -801,7 +820,11 @@ def _merge_lineage_graphs(
     )
 
 
-@router.get("/catalog/lineage", response_model=LineageResult)
+@router.get(
+    "/catalog/lineage",
+    response_model=LineageResult,
+    response_model_exclude_none=True,
+)
 def lineage(
         uri: str = Query(..., max_length=8192), depth: int = 6,
         max_nodes: int = Query(500, alias="maxNodes"),

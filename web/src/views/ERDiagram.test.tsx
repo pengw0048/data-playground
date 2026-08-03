@@ -386,6 +386,7 @@ describe('ERDiagram request truth', () => {
           factCount: 1,
           columns: ['id'],
           pipelineNames: ['publish_customers'],
+          cardinality: { value: '1:N', evidence: 'measured' },
         },
         {
           parent: ORDERS.uri,
@@ -404,7 +405,8 @@ describe('ERDiagram request truth', () => {
     await waitFor(() => expect(screen.getByTestId('edge-shape-l0')).toHaveAttribute(
       'data-target-handle', 'column-in:id',
     ))
-    expect(screen.getByTestId('edge-shape-l0')).toHaveTextContent('publish_customers')
+    expect(screen.getByTestId('edge-shape-l0')).toHaveTextContent('1:N')
+    expect(screen.getByTestId('edge-shape-l0')).not.toHaveTextContent('publish_customers')
     expect(screen.getByTestId('edge-shape-l1')).toBeEmptyDOMElement()
   })
 
