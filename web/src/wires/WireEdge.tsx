@@ -46,6 +46,8 @@ export function WireEdge(props: EdgeProps) {
   return (
     <BaseEdge
       id={id}
+      data-source={source}
+      data-target={target}
       path={path}
       markerEnd={active ? 'url(#dp-arrow-active)' : selected ? 'url(#dp-arrow-sel)' : markerEnd}
       interactionWidth={28}
