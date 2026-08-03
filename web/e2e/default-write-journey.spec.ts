@@ -513,6 +513,27 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
         return status.status
       }, { timeout: 40_000 }).toBe('done')
 
+      // A fresh hub has no process-local node state. Reopening the saved Canvas must rebuild its
+      // completed badges and exact published result from durable run/catalog evidence.
+      const recoveredCanvas = await ok<{
+        latestNodeIds: string[]
+        failedNodeIds: string[]
+        staleNodeIds: string[]
+        results: Array<{ runId: string; output: { publicationKind: string } }>
+      }>(
+        await page.request.post(`${base}/api/run/current-results`, { data: { graph } }),
+        'recover Canvas result badges after restart',
+      )
+      expect(recoveredCanvas.latestNodeIds).toEqual(['source', 'write'])
+      expect(recoveredCanvas.failedNodeIds).toEqual([])
+      expect(recoveredCanvas.staleNodeIds).toEqual([])
+      expect(recoveredCanvas.results).toEqual([
+        expect.objectContaining({
+          runId: started.runId,
+          output: expect.objectContaining({ publicationKind: 'catalog' }),
+        }),
+      ])
+
       // Make a cheaper, ordinary Source run the newest record. Every check below must still resolve
       // the original recovered managed Write by identity instead of silently substituting latest.
       const later = await ok<{ runId: string }>(await page.request.post(`${base}/api/run`, {

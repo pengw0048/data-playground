@@ -12756,7 +12756,8 @@ def retained_run_output_candidates(
                 and item.get("node_id", item.get("nodeId")) == target_node_id
                 and item.get("port_id", item.get("portId")) == port_id
                 and item.get("outcome") == "committed"
-                and item.get("publication_kind", item.get("publicationKind")) == "result"
+                and item.get("publication_kind", item.get("publicationKind"))
+                in ("result", "catalog")
                 and item.get("uri")
             ), None)
             # Once a target has an authoritative projection, bounded history must never resurrect an
@@ -12838,7 +12839,7 @@ def retained_run_output_candidates(
             and item.get("node_id") == target_node_id
             and item.get("port_id") == port_id
             and item.get("outcome") == "committed"
-            and item.get("publication_kind") == "result"
+            and item.get("publication_kind") in ("result", "catalog")
             and item.get("uri")
         ), None)
         if output is not None:
@@ -12872,7 +12873,7 @@ def retained_run_output_candidates(
             and item.get("node_id") == target_node_id
             and item.get("port_id") == port_id
             and item.get("outcome") == "committed"
-            and item.get("publication_kind") == "result"
+            and item.get("publication_kind") in ("result", "catalog")
             and item.get("uri")
         ), None)
         if output is not None:
@@ -12903,8 +12904,22 @@ def retained_run_output_candidates(
 
 
 def canvas_result_latest(canvas_id: str) -> list[dict]:
-    """Return the bounded current-result projections for one Canvas."""
+    """Return the bounded current-result projections for one Canvas.
+
+    Managed local writes predate ``CanvasResultLatest`` and complete through the durable-task
+    transaction rather than ``RunState`` publication.  Until a later terminal attempt creates the
+    dedicated projection, rebuild the same bounded view from that Canvas's retained run history.
+    The router still revalidates the exact execution manifest, catalog head, and readable artifact;
+    this fallback is only candidate discovery, never proof that an old result is current.
+    """
     with session() as s:
+        def json_list(value: str | None) -> list:
+            try:
+                parsed = json.loads(value or "[]")
+            except (TypeError, ValueError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+
         rows = list(s.scalars(select(CanvasResultLatest).where(
             CanvasResultLatest.canvas_id == str(canvas_id),
         ).order_by(CanvasResultLatest.target_node_id)))
@@ -12929,7 +12944,62 @@ def canvas_result_latest(canvas_id: str) -> list[dict]:
                     row.result_execution_manifest_sha256),
                 "result_outputs": outputs,
             })
-        return result
+        projected_targets = {item["target_node_id"] for item in result}
+        history = list(s.scalars(select(RunRecord).where(
+            RunRecord.canvas_id == str(canvas_id),
+            RunRecord.job_type == "run",
+            RunRecord.target_node_id.is_not(None),
+            RunRecord.status.in_(_TERMINAL_RUN),
+        ).order_by(
+            RunRecord.target_node_id,
+            RunRecord.created_at.desc(),
+            RunRecord.id.desc(),
+        )))
+        by_target: dict[str, list[RunRecord]] = {}
+        for row in history:
+            target = str(row.target_node_id)
+            if target not in projected_targets:
+                by_target.setdefault(target, []).append(row)
+        for target, attempts in by_target.items():
+            terminal = attempts[0]
+            terminal_outputs = json_list(terminal.outputs)
+            terminal_per_node = json_list(terminal.per_node)
+            terminal_doc = {
+                "run_id": terminal.run_id,
+                "status": terminal.status,
+                "job_type": terminal.job_type,
+                "target_node_id": terminal.target_node_id,
+                "target_port_id": terminal.target_port_id,
+                "total_rows": terminal.rows,
+                "ms": terminal.ms,
+                "error": terminal.error,
+                "outputs": terminal_outputs,
+                "per_node": terminal_per_node or None,
+            }
+            successful = next((attempt for attempt in attempts if (
+                attempt.status == "done" and any(
+                    isinstance(output, dict)
+                    and output.get("outcome") == "committed"
+                    and output.get("publication_kind", output.get("publicationKind"))
+                    in ("result", "catalog")
+                    and output.get("uri")
+                    for output in json_list(attempt.outputs)
+                )
+            )), None)
+            result.append({
+                "target_node_id": target,
+                "terminal_run_id": terminal.run_id,
+                "terminal_status": terminal.status,
+                "terminal_execution_manifest_sha256": (
+                    terminal.execution_manifest_sha256),
+                "terminal_doc": terminal_doc,
+                "result_run_id": successful.run_id if successful is not None else None,
+                "result_execution_manifest_sha256": (
+                    successful.execution_manifest_sha256 if successful is not None else None),
+                "result_outputs": (
+                    json_list(successful.outputs) if successful is not None else []),
+            })
+        return sorted(result, key=lambda item: item["target_node_id"])
 
 
 def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:

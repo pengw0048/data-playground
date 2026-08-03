@@ -48,6 +48,7 @@ from hub.execution_manifest import (
     execution_manifest_admission,
     execution_manifest_parameter_intent_matches,
 )
+from hub.local_run_inputs import LOCAL_FILE_INPUT_PROVIDER
 from hub.plugins.adapters import (
     RevisionPermissionLost,
     RevisionProviderOffline,
@@ -527,10 +528,7 @@ def _resolve_local_run_manifest(
                         "this run.")
                 if isinstance(dataset_ref, dict) or not materialize_local_files:
                     raise RuntimeError("source has no provider-native exact revision")
-                from hub.local_run_inputs import (
-                    LOCAL_FILE_INPUT_PROVIDER,
-                    snapshot_local_file_input,
-                )
+                from hub.local_run_inputs import snapshot_local_file_input
                 revision_id, candidate = snapshot_local_file_input(
                     uri=uri,
                     config=cfg if isinstance(cfg, dict) else {},
@@ -4199,7 +4197,9 @@ def _merge_retained_parameter_bindings(
 
 
 def _retained_current_output(
-        candidate: dict, target, current_cone: Graph, deps) -> RunOutput:
+        candidate: dict, target, current_cone: Graph, deps, *,
+        allow_local_snapshot_registration: bool = False,
+        ) -> RunOutput:
     """Prove one server-selected retained candidate matches the current target cone."""
     try:
         output = RunOutput.model_validate(candidate["output"])
@@ -4207,6 +4207,27 @@ def _retained_current_output(
         raise _retained_editor_error(
             409, "retained upstream output metadata is invalid",
             APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE) from exc
+    if output.publication_kind == "catalog":
+        receipt = output.write_receipt
+        expected_version = output.version or (
+            receipt.publication.backend_version if receipt is not None else None)
+        try:
+            current_table = (
+                deps.catalog.get_table(receipt.dataset_id) if receipt is not None else None)
+        except Exception as exc:
+            raise _retained_editor_error(
+                409, "the published dataset is no longer available",
+                APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+        if (
+            receipt is None
+            or current_table is None
+            or not expected_version
+            or str(current_table.uri).rstrip("/") != str(output.uri).rstrip("/")
+            or current_table.version != expected_version
+        ):
+            raise _retained_editor_error(
+                409, "the published dataset has changed",
+                APIErrorCode.RETAINED_UPSTREAM_STALE)
     manifest_sha256 = candidate["execution_manifest_sha256"]
     retained = (
         metadb.execution_manifest(str(manifest_sha256))
@@ -4298,6 +4319,18 @@ def _retained_current_output(
         except Exception:
             revision_adapter = None
         retained_ref = retained_config.get("datasetRef")
+        if (
+            binding
+            and binding["dataset_id"] == admitted["dataset_id"]
+            and isinstance(retained_ref, dict)
+            and retained_ref.get("datasetId") == admitted["dataset_id"]
+            and retained_ref.get("revisionId") == admitted["revision_id"]
+            and admitted.get("provider") == LOCAL_FILE_INPUT_PROVIDER
+            and allow_local_snapshot_registration
+        ):
+            return metadb.local_file_input_revision_artifact(
+                admitted["dataset_id"], admitted["revision_id"]
+            ) is not None
         return bool(
             binding
             and isinstance(revision_adapter, DatasetRevisionAdapter)
@@ -4329,13 +4362,32 @@ def _retained_current_output(
     # without treating a moved latest head as an edit to this result.
     current_for_digest = current_cone.model_copy(deep=True)
     current_for_digest._parameter_bindings = copy.deepcopy(retained_canonical)
+    retained_write_intent = (
+        WriteIntent.model_validate(admission["write_intent"])
+        if admission.get("write_intent") is not None else None
+    )
+    if retained_write_intent is not None:
+        # Admission restores this private dispatch value onto its graph, but the original manifest
+        # carries the same intent in the dedicated ``writeIntent`` field.  Remove the duplicate
+        # before rebuilding both sides so a reopened editor graph and its retained manifest use the
+        # same semantic identity.
+        for digest_graph in (retained_graph, retained_cone, current_for_digest):
+            digest_target = next(
+                (node for node in digest_graph.nodes if node.id == target.id), None)
+            if digest_target is None:
+                raise _retained_editor_error(
+                    409, "current upstream execution plan cannot be verified",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+            digest_config = dict(digest_target.data.get("config") or {})
+            digest_config.pop("_admittedWriteIntent", None)
+            digest_target.data["config"] = digest_config
     try:
         rebuilt_retained_digest, _ = build_execution_manifest(
             retained_graph,
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
         current_digest, _ = build_execution_manifest(
@@ -4343,7 +4395,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
         retained_digest, _ = build_execution_manifest(
@@ -4351,7 +4403,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
     except ExecutionManifestError as exc:
@@ -4372,6 +4424,7 @@ def _current_retained_result(
         graph: Graph, canvas_id: str, node_id: str, port_id: str,
         uid: str, deps, *,
         requested_bindings: list[ParameterBinding] | None = None,
+        allow_local_snapshot_registration: bool = False,
         ) -> RetainedResultIdentity:
     """Select the newest retained result current under its own persisted bindings.
 
@@ -4421,7 +4474,8 @@ def _current_retained_result(
                     409, "current result targets a different output",
                     APIErrorCode.RETAINED_UPSTREAM_STALE)
             output = _retained_current_output(
-                candidate, target, current_cone, deps)
+                candidate, target, current_cone, deps,
+                allow_local_snapshot_registration=allow_local_snapshot_registration)
         except (APIError, ExecutionManifestError, ValueError):
             continue
         if requested_bindings is not None:
@@ -4431,7 +4485,9 @@ def _current_retained_result(
             graph_mod.resolve_source_refs(requested_cone, deps.catalog.resolve_ref)
             _reject_invalid(requested_cone, deps, node_id)
             try:
-                _retained_current_output(candidate, target, requested_cone, deps)
+                _retained_current_output(
+                    candidate, target, requested_cone, deps,
+                    allow_local_snapshot_registration=allow_local_snapshot_registration)
             except (APIError, ExecutionManifestError, ValueError):
                 raise _retained_editor_error(
                     409, "current result parameter bindings changed",
@@ -4769,7 +4825,8 @@ def recover_canvas_results(
                 break
             try:
                 identity = _current_retained_result(
-                    req.graph, canvas_id, target_id, port_id, uid, deps)
+                    req.graph, canvas_id, target_id, port_id, uid, deps,
+                    allow_local_snapshot_registration=True)
             except APIError:
                 valid = False
                 break

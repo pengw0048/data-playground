@@ -1286,6 +1286,16 @@ def test_kernel_default_admits_and_publishes_managed_create(tmp_path, monkeypatc
     assert _managed_revision_count(logical_uri) == 1
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
+    projection = metadb.canvas_result_latest(str(graph.id))
+    assert len(projection) == 1
+    assert projection[0]["terminal_run_id"] == task["id"]
+    assert projection[0]["result_run_id"] == task["id"]
+    assert projection[0]["result_outputs"][0]["publication_kind"] == "catalog"
+    monkeypatch.setattr(runs, "get_deps", lambda: deps)
+    recovered = runs.recover_canvas_results(
+        runs.CanvasResultRecoveryRequest(graph=graph), uid)
+    assert recovered.latest_node_ids == ["source", "write"]
+    assert recovered.failed_node_ids == []
 
     metadb.delete_canvas_cascade(str(graph.id))
     deps.storage.close()
