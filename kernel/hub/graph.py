@@ -469,12 +469,10 @@ def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
         for param in getattr(spec, "params", []):
             param_type = getattr(param, "type", None)
             required = getattr(param, "required", False)
-            # The acceptance guard added here is deliberately scoped to Filter. Historically the
-            # descriptor schema used ``required`` as an editor hint for several operations whose
-            # preview refusal or runtime supplies a more useful contract; enforcing every string
-            # descriptor here would change those established execution semantics.
-            required_filter_predicate = (
-                node.type == "filter" and param.name == "predicate" and required)
+            # An incomplete Filter is a valid saved draft but not an executable graph. Keep that
+            # run-admission rule here instead of marking the descriptor parameter required: the
+            # latter would also reject draft copy/import workflows before the researcher can edit it.
+            required_filter_predicate = node.type == "filter" and param.name == "predicate"
             if param.name not in config or config[param.name] is None:
                 if ((param_type in ("int", "float") and required
                      and getattr(param, "default", None) is None)

@@ -25,15 +25,17 @@ test('a structured Filter condition must be corrected before it can run', async 
     await expect(inspector.getByRole('button', { name: 'Run', exact: true })).toBeVisible()
 
     await filter.getByText('add condition', { exact: true }).click()
+    const column = filter.getByPlaceholder('column')
+    await column.fill('id')
     const value = filter.getByPlaceholder('value')
     await expect(value).toBeVisible({ timeout: 15_000 })
-    await expect(filter).toContainText('Enter a number for id')
-    await expect(inspector).toContainText('Enter a number for id')
+    await expect(filter).toContainText('Enter a value for id')
+    await expect(inspector).toContainText('Enter a value for id')
     await expect(inspector.getByRole('button', { name: 'Run', exact: true })).toBeDisabled()
 
     await value.fill('7')
-    await expect(filter).not.toContainText('Enter a number for id')
-    await expect(inspector).not.toContainText('Enter a number for id')
+    await expect(filter).not.toContainText('Enter a value for id')
+    await expect(inspector).not.toContainText('Enter a value for id')
 
     let runId: string | undefined
     page.on('response', async (response) => {

@@ -249,9 +249,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
               ? 'Hide data'
               : !kernelUp
                 ? `Offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
-                : invalid ?? (runnable
-                    ? kind === 'chart' ? 'View chart result' : 'View data'
-                    : blocked ?? `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`)}
+                : runnable
+                  ? invalid ?? (kind === 'chart' ? 'View chart result' : 'View data')
+                  : blocked ?? `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`}
             active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
             onClick={() => (openPanel === 'data'
               ? closePanel(id)
@@ -263,7 +263,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={!kernelUp ? 'Offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? blocked ?? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review saved-dataset column merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
+              label={!kernelUp ? 'Offline — run unavailable' : busy ? 'Stop' : !runnable
+                ? blocked ?? 'Connect a source to run'
+                : invalid ?? (configuredManagedSidecarMerge ? 'Review saved-dataset column merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
               disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
