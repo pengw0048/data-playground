@@ -119,19 +119,16 @@ async function edgeNodeCrossings(page: Page): Promise<string[]> {
     }))
     const failures: string[] = []
     for (const edge of edges) {
-      const label = edge.getAttribute('aria-label')
-        ?? edge.querySelector('[aria-label^="Edge from "]')?.getAttribute('aria-label')
-        ?? ''
-      const endpoints = /^Edge from (.+) to (.+)$/.exec(label)
       const path = edge.querySelector<SVGPathElement>('.react-flow__edge-path')
+      const endpoints = [path?.dataset.source, path?.dataset.target]
       const matrix = path?.getScreenCTM()
-      if (!endpoints || !path || !matrix) {
-        failures.push(`unmeasurable edge: ${label || edge.id}`)
+      if (!endpoints[0] || !endpoints[1] || !path || !matrix) {
+        failures.push(`unmeasurable edge: ${edge.getAttribute('aria-label') || edge.id}`)
         continue
       }
       const length = path.getTotalLength()
       for (const node of nodes) {
-        if (node.id === endpoints[1] || node.id === endpoints[2]) continue
+        if (node.id === endpoints[0] || node.id === endpoints[1]) continue
         let crossing = false
         for (let distance = 2; distance < length - 2; distance += 3) {
           const pathPoint = path.getPointAtLength(distance)

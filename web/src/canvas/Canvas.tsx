@@ -394,15 +394,23 @@ export function Canvas() {
   const warnedIds = useMemo(() => new Set(warnedKey ? warnedKey.split(',') : []), [warnedKey])
 
   const rfEdges: Edge[] = useMemo(
-    () => doc.edges.map((e) => ({
-      id: e.id, source: e.source, target: e.target,
-      sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
-      // Match node selection: React Flow receives a controlled edge list, so selection must be
-      // reflected from the store or an edge click is lost on the next render.
-      selected: selectedIds.includes(e.id),
-      type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
-    })),
-    [doc.edges, selectedIds, warnedIds],
+    () => {
+      // Large canvases can have as many edges as nodes. Resolve display names once rather than
+      // rescanning every node for every edge while building React Flow's controlled edge list.
+      const titles = new Map(doc.nodes.map((node) => [node.id, node.data.title || node.id]))
+      const title = (id: string) => titles.get(id) || id
+      return doc.edges.map((e) => ({
+        id: e.id, source: e.source, target: e.target,
+        sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
+        // React Flow would otherwise name the edge with internal node ids
+        ariaLabel: `Edge from ${title(e.source)} to ${title(e.target)}`,
+        // Match node selection: React Flow receives a controlled edge list, so selection must be
+        // reflected from the store or an edge click is lost on the next render.
+        selected: selectedIds.includes(e.id),
+        type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
+      }))
+    },
+    [doc.edges, doc.nodes, selectedIds, warnedIds],
   )
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
