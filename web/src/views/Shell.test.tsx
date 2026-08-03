@@ -87,6 +87,17 @@ describe('Shell primary navigation', () => {
     expect(screen.queryByText('local mode')).not.toBeInTheDocument()
   })
 
+  it('marks the current view in the navigation landmark', () => {
+    render(<Shell />)
+    const nav = screen.getByRole('navigation', { name: 'Primary navigation' })
+
+    expect(screen.getByTestId('rail-inbox')).toHaveAttribute('aria-current', 'page')
+    for (const other of ['workspace', 'jobs', 'transforms']) {
+      expect(screen.getByTestId(`rail-${other}`)).not.toHaveAttribute('aria-current')
+    }
+    expect(nav).toContainElement(screen.getByTestId('rail-inbox'))
+  })
+
   it('does not let an older unread-count response overwrite a mark-all refresh', async () => {
     let resolveOlder: (value: { count: number }) => void = () => {}
     let resolveLatest: (value: { count: number }) => void = () => {}
