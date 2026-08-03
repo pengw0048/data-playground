@@ -177,6 +177,36 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('forced colours: focus and selection survive without box-shadow', async ({ page }) => {
+    await page.emulateMedia({ forcedColors: 'active' })
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const node = page.locator('.react-flow__node').first()
+    await expect(node).toBeVisible()
+
+    // Focus first: clicking the node would select it and add the shelf controls to the tab order.
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    expect(await tabUntil(page, node, 80)).toBe(true)
+    expect(await node.evaluate((el) => el.matches(':focus-visible'))).toBe(true)
+    const focusOutline = await node.evaluate((el) => {
+      const s = getComputedStyle(el)
+      return { style: s.outlineStyle, width: s.outlineWidth }
+    })
+    expect(focusOutline.style, 'focused node needs an outline in forced colours').not.toBe('none')
+    expect(focusOutline.width).not.toBe('0px')
+
+    await node.click()
+    const card = node.locator('[data-dp-card][data-selected]')
+    await expect(card).toHaveCount(1)
+    const selectionOutline = await card.evaluate((el) => {
+      const s = getComputedStyle(el)
+      return { style: s.outlineStyle, width: s.outlineWidth }
+    })
+    expect(selectionOutline.style, 'selected node needs an outline in forced colours').not.toBe('none')
+    expect(selectionOutline.width).not.toBe('0px')
+  })
+
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
