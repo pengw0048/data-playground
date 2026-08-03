@@ -177,6 +177,35 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('contrast: the primary button and the canvas focus ring pass in light mode', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const node = page.locator('.react-flow__node').first()
+    await expect(node).toBeVisible()
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    expect(await tabUntil(page, node, 80)).toBe(true)
+
+    const measured = await page.evaluate(() => {
+      const parse = (value: string) => value.match(/[\d.]+/g)!.slice(0, 3).map(Number)
+      const channel = (v: number) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : (((v / 255) + 0.055) / 1.055) ** 2.4)
+      const luminance = ([r, g, b]: number[]) => 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+      const contrast = (a: string, b: string) => {
+        const [x, y] = [luminance(parse(a)), luminance(parse(b))]
+        return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05)
+      }
+      const share = getComputedStyle(document.querySelector('[data-testid="share-btn"]')!)
+      const focused = getComputedStyle(document.activeElement!)
+      const canvas = getComputedStyle(document.querySelector('.react-flow')!)
+      return {
+        shareLabel: contrast(share.color, share.backgroundColor),
+        focusRing: contrast(focused.boxShadow.match(/rgb\([^)]*\)/)![0], canvas.backgroundColor),
+      }
+    })
+
+    expect(measured.shareLabel, 'Share button label on its own fill').toBeGreaterThanOrEqual(4.5)
+    expect(measured.focusRing, 'canvas focus ring against the canvas').toBeGreaterThanOrEqual(3)
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
