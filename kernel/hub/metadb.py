@@ -11253,9 +11253,17 @@ def _canvas_result_history_records(
     records = list(s.scalars(select(RunRecord).where(
         RunRecord.canvas_id == canvas.id,
     ).order_by(RunRecord.id).with_for_update()))
+    # Retention limits successful Canvas results. Other history artifacts (for
+    # example, the committed prefix of a failed named-output run) keep their
+    # existing RunRecord ownership until the bounded Jobs record is pruned.
+    retained: set[str] = {
+        record.id for record in records
+        if not (record.job_type == "run" and record.status == "done")
+        and record.outputs != "[]"
+    }
     policy = _canvas_result_history_policy(s, canvas)
     if policy.history != "recent":
-        return records, set()
+        return records, retained
     cutoff = _utc_datetime(_db_now(s)) - datetime.timedelta(days=policy.max_age_days)
     eligible = sorted(
         (
@@ -11272,7 +11280,6 @@ def _canvas_result_history_records(
             record.id,
         ),
     )
-    retained: set[str] = set()
     per_target: dict[str, int] = {}
     for record in eligible:
         target = str(record.target_node_id)
