@@ -2509,7 +2509,8 @@ test.describe('Data Playground canvas', () => {
     await picker.getByRole('button', { name: /^movies\b/i }).click()
     await expect(source.getByRole('button', { name: 'Change dataset' })).toContainText('movies')
 
-    await expect(page.getByRole('status')).toContainText('Preview out of date')
+    await expect(page.getByRole('status').filter({ hasText: 'Preview out of date' }))
+      .toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
     await expect(page.getByText('purchase', { exact: true })).toHaveCount(0)
   })
