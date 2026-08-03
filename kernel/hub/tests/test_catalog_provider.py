@@ -913,7 +913,7 @@ with TestClient(app) as client:
         "graph": mutable_graph, "targetNodeId": mutable_source["id"], "confirmed": True,
     })
     assert rejected.status_code == 409, rejected.text
-    assert "mutable-only" in rejected.json()["detail"]
+    assert "cannot pin an exact version" in rejected.json()["detail"]
     assert os.environ["DP_CATALOG_MOUNTS"] not in json.dumps(graph)
     Path(os.environ["ACCEPTANCE_STATE"]).write_text(json.dumps({
         "canvas_id": canvas_id, "run_id": run_id, "source_id": source["id"],

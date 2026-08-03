@@ -172,16 +172,16 @@ def _request_sha256(request: MergeColumnsRequestV1) -> str:
     try:
         base = ExactDatasetRef.model_validate(source_config.get("datasetRef"))
     except Exception as exc:
-        raise APIError(409, "merge-columns requires one exact Source revision",
+        raise APIError(409, "Merging columns needs a Source step pinned to one dataset version.",
                        code=APIErrorCode.CONFLICT, retryable=False) from exc
     if base.kind != "exact":
-        raise APIError(409, "merge-columns requires one exact Source revision",
+        raise APIError(409, "Merging columns needs a Source step pinned to one dataset version.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     try:
         spec = api_sink_spec(
             _node_config(write), write.data.get("title") if isinstance(write.data, dict) else None)
     except ValueError:
-        raise APIError(409, "merge-columns requires the default managed-local Parquet destination",
+        raise APIError(409, "Merging columns needs a Write step that saves a managed Parquet dataset.",
                        code=APIErrorCode.CONFLICT, retryable=False) from None
     payload = json.dumps({
         "canvasId": request.graph.id,
@@ -204,13 +204,13 @@ def _shape(request: MergeColumnsRequestV1):
     """Accept only Source -> Select -> Write with ordinary ports and no execution modifiers."""
     graph = request.graph
     if len(graph.nodes) != 3 or len(graph.edges) != 2:
-        raise APIError(409, "merge-columns requires exactly Source -> Select -> Write",
+        raise APIError(409, "Merging columns needs exactly Source → Select → Write.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     write = next((node for node in graph.nodes if node.type == "write"), None)
     select = next((node for node in graph.nodes if node.type == "select"), None)
     source = next((node for node in graph.nodes if node.type == "source"), None)
     if write is None or select is None or source is None:
-        raise APIError(409, "merge-columns requires Source -> Select -> Write",
+        raise APIError(409, "Merging columns needs one Source step, one Select step and one Write step.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     incoming = {(edge.source, edge.target, edge.source_handle, edge.target_handle) for edge in graph.edges}
     if incoming != {(source.id, select.id, None, None), (select.id, write.id, None, None)}:
@@ -219,15 +219,17 @@ def _shape(request: MergeColumnsRequestV1):
         if {(edge.source, edge.target) for edge in graph.edges} != expected or any(
                 edge.source_handle not in (None, "out") or edge.target_handle not in (None, "in")
                 for edge in graph.edges):
-            raise APIError(409, "merge-columns requires Source -> Select -> Write default ports",
-                           code=APIErrorCode.CONFLICT, retryable=False)
+            raise APIError(
+                409, "Merging columns needs Source connected to Select and Select connected to "
+                "Write, using the default ports.",
+                code=APIErrorCode.CONFLICT, retryable=False)
     if any(bool(node.data.get("disabled") or node.data.get("bypassed"))
            for node in (source, select, write) if isinstance(node.data, dict)):
-        raise APIError(409, "merge-columns rejects disabled or bypassed nodes",
+        raise APIError(409, "Merging columns cannot include disabled or bypassed steps.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     config = _node_config(select)
     if set(config) != {"select"} or not isinstance(config.get("select"), str):
-        raise APIError(409, "merge-columns Select must contain only a deterministic select expression",
+        raise APIError(409, "The Select step must contain only a select expression.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     return source, select, write
 
@@ -238,8 +240,8 @@ def _actor_and_canvas(request: MergeColumnsRequestV1, uid: str) -> str:
         canvas = session.get(metadb.Canvas, canvas_id)
         role = metadb.canvas_role(canvas_id, uid)
         if canvas is None or role not in ("owner", "editor"):
-            raise APIError(404, "merge-columns canvas not found", code=APIErrorCode.CANVAS_NOT_FOUND,
-                           retryable=False)
+            raise APIError(404, "This Canvas was not found, or you cannot edit it.",
+                           code=APIErrorCode.CANVAS_NOT_FOUND, retryable=False)
         return str(canvas.owner_id)
 
 
@@ -250,15 +252,16 @@ def _prepared(request: MergeColumnsRequestV1, uid: str):
     try:
         base = ExactDatasetRef.model_validate(source_cfg.get("datasetRef"))
     except Exception as exc:
-        raise APIError(409, "merge-columns requires one exact Source revision",
+        raise APIError(409, "Merging columns needs a Source step pinned to one dataset version.",
                        code=APIErrorCode.CONFLICT, retryable=False) from exc
     source_uri = source_cfg.get("uri")
     binding = metadb.catalog_revision_binding_for_uri(str(source_uri)) if source_uri else None
     exact_uri = metadb.managed_local_file_revision_artifact(base.dataset_id, base.revision_id)
     if (base.kind != "exact" or binding is None or binding["dataset_id"] != base.dataset_id
             or exact_uri is None or str(source_uri) != exact_uri):
-        raise APIError(409, "merge-columns Source must be an exact managed-local Parquet revision",
-                       code=APIErrorCode.CONFLICT, retryable=False)
+        raise APIError(
+            409, "Merging columns needs a Source pinned to a version of a managed Parquet dataset.",
+            code=APIErrorCode.CONFLICT, retryable=False)
     deps = get_deps()
     try:
         spec = api_sink_spec(
@@ -266,17 +269,19 @@ def _prepared(request: MergeColumnsRequestV1, uid: str):
         logical_uri = preflight_sink(spec, deps.workspace, deps.storage, deps.resolve_adapter)
         adapter = deps.resolve_adapter(logical_uri)
     except (ValueError, NotImplementedError):
-        raise APIError(409, "merge-columns requires the default managed-local Parquet destination",
+        raise APIError(409, "Merging columns needs a Write step that saves a managed Parquet dataset.",
                        code=APIErrorCode.CONFLICT, retryable=False) from None
     if (type(deps.catalog) is not InMemoryCatalog
             or not is_core_managed_local_file_sink(spec, logical_uri, adapter, deps.storage)):
-        raise APIError(409, "merge-columns requires the default managed-local Parquet destination",
+        raise APIError(409, "Merging columns needs a Write step that saves a managed Parquet dataset.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     head = metadb.catalog_managed_local_write_head(logical_uri)
     if (head is None or head.get("state") != "active" or head.get("dataset_id") != base.dataset_id
             or head.get("revision_id") != base.revision_id):
-        raise APIError(409, "merge-columns destination head must equal the exact Source revision",
-                       code=APIErrorCode.CONFLICT, retryable=False)
+        raise APIError(
+            409, "The destination dataset has moved on from the Source version this merge is "
+            "pinned to. Use its current version and try again.",
+            code=APIErrorCode.CONFLICT, retryable=False, reason="stale_expected_head")
     sparse_submission = "merge:" + request.submission_id
     sparse_request = SparseOutputAdmissionRequest(
         owner_id=canvas_owner, canvas_id=str(request.graph.id), submission_id=sparse_submission,
@@ -291,8 +296,10 @@ def _prepared(request: MergeColumnsRequestV1, uid: str):
             preparation.base_schema, preparation.sidecar_schema,
             list(preparation.identity_columns), request.rules)
     except (SparseOutputError, MergeColumnsError) as exc:
-        raise APIError(422, "merge-columns admission is invalid", code=APIErrorCode.VALIDATION_ERROR,
-                       retryable=False) from exc
+        raise APIError(
+            422, "The columns to merge could not be prepared. Check the identity columns and the "
+            "mappings.",
+            code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
     return (deps, canvas_owner, base, logical_uri, spec, head, sparse_request, preparation,
             output_schema)
 
@@ -322,7 +329,7 @@ def _preflight_response(preparation, base, head, output_schema, rules, identity_
 def _task_view(task_id: str, uid: str) -> MergeColumnsTaskV1:
     value = metadb.merge_columns_task_view(task_id, uid, producer_kind="sparse-output")
     if value is None:
-        raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND, retryable=False)
     raw = value.get("mergeColumns")
     return MergeColumnsTaskV1(
         task_id=str(value["taskId"]), status=str(value["status"]),
@@ -360,33 +367,36 @@ def _managed_sidecar_request_sha256(
 def _managed_sidecar_error(exc: Exception) -> APIError:
     message = str(exc)
     if message == "row_reference_target_mismatch":
-        return APIError(422, message, code=APIErrorCode.ROW_REFERENCE_TARGET_MISMATCH,
-                        retryable=False)
+        return APIError(422, "These rows reference a different dataset than the one being updated.",
+                        code=APIErrorCode.ROW_REFERENCE_TARGET_MISMATCH, retryable=False)
     if message == "identity_reference_required":
-        return APIError(422, message, code=APIErrorCode.IDENTITY_REFERENCE_REQUIRED,
-                        retryable=False)
+        return APIError(422, "These rows need a row reference to the dataset being updated.",
+                        code=APIErrorCode.IDENTITY_REFERENCE_REQUIRED, retryable=False)
     if message == "identity_reference_unavailable":
-        return APIError(422, message, code=APIErrorCode.IDENTITY_REFERENCE_UNAVAILABLE,
-                        retryable=False)
+        return APIError(422, "The row references needed for this merge could not be read.",
+                        code=APIErrorCode.IDENTITY_REFERENCE_UNAVAILABLE, retryable=False)
     if "head moved" in message or "expected head" in message:
-        return APIError(409, "managed sidecar merge destination head moved",
-                        code=APIErrorCode.CONFLICT, retryable=False)
+        return APIError(
+            409, "The destination dataset changed before this merge could start. Refresh and try "
+            "again.",
+            code=APIErrorCode.CONFLICT, retryable=False)
     if "unavailable" in message:
-        return APIError(410, "managed sidecar merge revision is unavailable",
+        return APIError(410, "A dataset version this merge needs is no longer available.",
                         code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    return APIError(422, "managed sidecar merge admission is invalid",
+    return APIError(422, "This merge request is invalid. Check the identity columns and the "
+                    "mappings.",
                     code=APIErrorCode.VALIDATION_ERROR, retryable=False)
 
 
 def _managed_sidecar_task_view(task_id: str, uid: str) -> ManagedSidecarMergeTaskV1:
     view = metadb.merge_columns_task_view(task_id, uid, producer_kind="managed-sidecar")
     if view is None:
-        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND,
                        retryable=False)
     try:
         intent = ManagedSidecarMergeIntentV1.model_validate(view["managed_sidecar_merge_intent"])
     except (KeyError, ValueError) as exc:
-        raise APIError(409, "managed sidecar merge task admission is invalid",
+        raise APIError(409, "This merge's saved settings could not be read.",
                        code=APIErrorCode.CONFLICT, retryable=False) from exc
     receipt = view.get("output_receipt")
     return ManagedSidecarMergeTaskV1(
@@ -424,15 +434,15 @@ def submit(request: MergeColumnsRequestV1, uid: str = Depends(current_user)) -> 
         # Compare only caller-owned canonical semantics; do not reopen a moved source/head on replay.
         current = metadb.merge_columns_task_request_sha256(task_id)
         if current != _request_sha256(request):
-            raise APIError(409, "merge-columns submission request changed", code=APIErrorCode.CONFLICT,
-                           retryable=False)
+            raise APIError(409, "This merge was already submitted with different settings.",
+                           code=APIErrorCode.CONFLICT, retryable=False)
         dispatch(task_id, get_deps())
         return _task_view(task_id, uid)
     (deps, canvas_owner, base, logical_uri, spec, head, sparse_request, _preparation,
      output_schema) = _prepared(
         request, uid)
     if json.loads(_preparation.documents["evidence"])["status"] != "complete":
-        raise APIError(409, "merge-columns requires complete identity coverage",
+        raise APIError(409, "Every row must be identified before columns can be merged.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     sparse_id: str | None = None
     try:
@@ -481,7 +491,7 @@ def submit(request: MergeColumnsRequestV1, uid: str = Depends(current_user)) -> 
             metadb.release_unclaimed_merge_sparse_output(sparse_id)
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
     except (SparseOutputError, MergeColumnsError, ValueError) as exc:
-        raise APIError(422, "merge-columns submission is invalid", code=APIErrorCode.VALIDATION_ERROR,
+        raise APIError(422, "This merge request is invalid.", code=APIErrorCode.VALIDATION_ERROR,
                        retryable=False) from exc
     dispatch(task["id"], deps)
     return _task_view(task["id"], uid)
@@ -519,7 +529,7 @@ def submit_managed_sidecar_merge(
     if existing is not None:
         view = _managed_sidecar_task_view(task_id, uid)
         if metadb.merge_columns_task_request_sha256(task_id) != request_sha256:
-            raise APIError(409, "managed sidecar merge submission id is already used for another intent",
+            raise APIError(409, "That submission id was already used for a different merge.",
                            code=APIErrorCode.CONFLICT, retryable=False)
         dispatch(task_id, get_deps())
         return view
@@ -557,7 +567,7 @@ def managed_sidecar_status(
 @router.post("/merge-columns/{task_id}/cancel", response_model=MergeColumnsTaskV1)
 def cancel(task_id: str, uid: str = Depends(current_user)) -> MergeColumnsTaskV1:
     if metadb.cancel_merge_columns_task(task_id, uid, producer_kind="sparse-output") is None:
-        raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND, retryable=False)
     return _task_view(task_id, uid)
 
 
@@ -565,7 +575,7 @@ def cancel(task_id: str, uid: str = Depends(current_user)) -> MergeColumnsTaskV1
 def cancel_managed_sidecar_merge(
         task_id: str, uid: str = Depends(current_user)) -> ManagedSidecarMergeTaskV1:
     if metadb.cancel_merge_columns_task(task_id, uid, producer_kind="managed-sidecar") is None:
-        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND,
                        retryable=False)
     return _managed_sidecar_task_view(task_id, uid)
 
@@ -583,7 +593,7 @@ def retry(task_id: str, request: _RetryRequest, uid: str = Depends(current_user)
     except ValueError as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
     if retried is None:
-        raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND, retryable=False)
     dispatch(task_id, get_deps())
     return _task_view(task_id, uid)
 
@@ -598,7 +608,7 @@ def retry_managed_sidecar_merge(
     except ValueError as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
     if retried is None:
-        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+        raise APIError(404, "This merge was not found.", code=APIErrorCode.NOT_FOUND,
                        retryable=False)
     dispatch(task_id, get_deps())
     return _managed_sidecar_task_view(task_id, uid)

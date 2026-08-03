@@ -262,34 +262,34 @@ def _reservoir_provenance(
 def _map_dataset_view_error(exc: Exception) -> APIError:
     if isinstance(exc, metadb.DatasetViewSubmissionConflict):
         return APIError(
-            409, "DatasetView submission id belongs to a different request",
+            409, "That submission id was already used for a different saved view.",
             code=APIErrorCode.CONFLICT, retryable=False)
     if isinstance(exc, metadb.WorkspaceVersionConflict):
         return APIError(
-            409, "DatasetView source placement changed; retry the request",
+            409, "The source dataset moved while the view was being saved. Try again.",
             code=APIErrorCode.CONFLICT, retryable=True)
     if isinstance(exc, metadb.DatasetViewGone):
         return APIError(
-            410, "DatasetView submission was deleted",
+            410, "This saved view was deleted.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False)
     if isinstance(exc, (RevisionPermissionLost, PermissionError)):
         return APIError(
-            403, "DatasetView source permission was lost",
+            403, "You no longer have permission to read this view's source dataset.",
             code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     if isinstance(exc, (RevisionProviderOffline, ConnectionError, TimeoutError,
                         workspace_providers.ProviderDatasetOffline)):
         return APIError(
-            503, "DatasetView source provider is offline",
+            503, "This view's data source is offline. Try again once it is reachable.",
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     if isinstance(exc, (RevisionUnavailable, ManagedSourceReadError, KeyError,
                         workspace_providers.ProviderDatasetGone,
                         workspace_providers.ProviderDatasetUnavailable)):
         return APIError(
-            410, "DatasetView exact source revision is unavailable",
+            410, "The dataset version this view is pinned to is no longer available.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False)
     if isinstance(exc, (_DatasetViewUnsupported, SQLPolicyError, duckdb.Error, ValueError)):
         return APIError(
-            422, "DatasetView definition is not executable for this exact source",
+            422, "This view cannot be built from the pinned version of its source dataset.",
             code=APIErrorCode.VALIDATION_ERROR, retryable=False)
     raise exc
 

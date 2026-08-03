@@ -692,18 +692,18 @@ def _provider_dataset_sources(refs: list[str], uid: str) -> list[dict]:
 def _provider_dataset_action_error(exc: Exception) -> None:
     if isinstance(exc, workspace_providers.ProviderDatasetGone):
         raise APIError(
-            410, "provider dataset was deleted; relink it explicitly",
+            410, "This data source was deleted. Link it again to keep using it.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     if isinstance(exc, workspace_providers.ProviderDatasetOffline):
         raise APIError(
-            503, "provider dataset is offline",
+            503, "This data source is offline. Try again once it is reachable.",
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
         ) from exc
     if isinstance(exc, workspace_providers.ProviderDatasetUnavailable):
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
     _workspace_action_error(exc)

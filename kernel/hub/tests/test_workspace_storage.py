@@ -2209,14 +2209,17 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             "inputManifest": preview.json()["inputManifest"],
         })
         assert denied.status_code == 403
-        assert denied.json()["detail"] == "permission to read an exact input revision was lost"
+        assert denied.json()["detail"] == (
+            "You no longer have permission to read the pinned version of an input dataset.")
         exact_adapter.failure = "offline"
         offline = client.post("/api/run", json={
             "graph": graph, "targetNodeId": source["id"],
             "inputManifest": preview.json()["inputManifest"],
         })
         assert offline.status_code == 503
-        assert offline.json()["detail"] == "exact input revision provider is offline"
+        assert offline.json()["detail"] == (
+            "The data source for a pinned input version is offline. Try again once it is "
+            "reachable.")
         assert dispatched is False
         assert set(deps.run_index) == run_index_before
         exact_adapter.failure = None
@@ -2231,8 +2234,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         })
         assert unavailable.status_code == 409, unavailable.text
         assert unavailable.json()["detail"] == (
-            "provider dataset binding is unavailable; install or restore a compatible provider "
-            "and dataset adapter")
+            "This data source is unavailable because its plugin is missing. Install or restore "
+            "the plugin, then try again.")
         assert "offline" not in unavailable.text
         assert "secret" not in unavailable.text
         assert dispatched is False
@@ -2249,7 +2252,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             "providerDatasetRefs": [provider_resource["id"]],
         })
         assert sanitized.status_code == 503
-        assert sanitized.json()["detail"] == "provider dataset is offline"
+        assert sanitized.json()["detail"] == (
+            "This data source is offline. Try again once it is reachable.")
         assert "tenant" not in sanitized.text
         monkeypatch.setattr(provider, "resolve", normal_resolve)
 
@@ -2265,8 +2269,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         })
         assert incompatible.status_code == 409, incompatible.text
         assert incompatible.json()["detail"] == (
-            "provider dataset binding is unavailable; install or restore a compatible provider "
-            "and dataset adapter")
+            "This data source is unavailable because its plugin is missing. Install or restore "
+            "the plugin, then try again.")
         assert "secret" not in incompatible.text
         incompatible_add = client.post(
             f"/api/workspace/canvases/{created.json()['id']}/datasets",
@@ -2475,7 +2479,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             "graph": mutable_graph, "targetNodeId": mutable_source["id"],
         })
         assert rejected.status_code == 409, rejected.text
-        assert "mutable-only" in rejected.json()["detail"]
+        assert "cannot pin an exact version" in rejected.json()["detail"]
         assert dispatched is False
         assert set(deps.run_index) == run_index_before
         fabricated = client.post("/api/run", json={
@@ -2489,7 +2493,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             }],
         })
         assert fabricated.status_code == 409, fabricated.text
-        assert "mutable-only" in fabricated.json()["detail"]
+        assert "cannot pin an exact version" in fabricated.json()["detail"]
         assert dispatched is False
         assert set(deps.run_index) == run_index_before
 
@@ -2505,7 +2509,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             "providerDatasetRefs": [provider_resource["id"]],
         })
         assert gone_use.status_code == 410, gone_use.text
-        assert gone_use.json()["detail"] == "provider dataset was deleted; relink it explicitly"
+        assert gone_use.json()["detail"] == (
+            "This data source was deleted. Link it again to keep using it.")
         gone_add = client.post(
             f"/api/workspace/canvases/{created.json()['id']}/datasets",
             json={
@@ -2523,7 +2528,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         # The admission occurrence is detached, but the canonical dataset remains current. This
         # run now reaches normal exact-capability admission instead of substituting a 410.
         assert gone.status_code == 409, gone.text
-        assert "mutable-only" in gone.json()["detail"]
+        assert "cannot pin an exact version" in gone.json()["detail"]
         assert "secret" not in gone.text
         assert dispatched is False
         assert set(deps.run_index) == run_index_before

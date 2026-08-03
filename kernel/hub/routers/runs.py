@@ -296,12 +296,13 @@ def _external_wait_request(deps, graph, target_node_id: str | None):
     if (len(graph.nodes) != 2 or len(external) != 1 or target is None or target.type != "write"
             or edge is None or edge.source != external[0].id or edge.target != target.id
             or edge.source_handle not in (None, "out") or edge.target_handle not in (None, "in")):
-        raise HTTPException(409, "external-wait tasks require exactly one fixture-to-Write edge")
+        raise HTTPException(
+            409, "An external wait run needs exactly one external step connected to one Write step.")
     cfg = external[0].data.get("config", {}) if isinstance(external[0].data, dict) else {}
     if (not isinstance(cfg, dict)
             or set(cfg) - {"operation", "documentJson", "outputSchema"}
             or not isinstance(cfg.get("outputSchema"), list) or not cfg["outputSchema"]):
-        raise HTTPException(409, "external-wait node configuration is not supported")
+        raise HTTPException(409, "This external step's settings are not supported.")
     from hub.external_wait import ExternalWaitSubmitRequest
     try:
         return ExternalWaitSubmitRequest(
@@ -309,7 +310,7 @@ def _external_wait_request(deps, graph, target_node_id: str | None):
             idempotency_key="admission", operation=cfg.get("operation", "conformance.success"),
             document_json=cfg.get("documentJson", "{}"))
     except ValueError as exc:
-        raise HTTPException(409, "external-wait node configuration is invalid") from exc
+        raise HTTPException(409, "This external step's settings are invalid.") from exc
 
 
 def _node_config(node) -> dict:
@@ -339,50 +340,50 @@ def _bounded_fanout_write_shape(graph, target_node_id: str | None):
     write = by_id.get(target_node_id)
     if (write is None or write.type != "write" or len(checkpoint_nodes) != 1):
         raise HTTPException(
-            409,
-            "bounded fan-out tasks require exactly "
-            "Source -> Select(checkpoint) -> Select(*) -> Write")
+            409, "This run needs exactly Source → Select (checkpointed) → Select → Write.")
     checkpoint_select = checkpoint_nodes[0]
     if checkpoint_select.type != "select":
-        raise HTTPException(409, "bounded fan-out requires checkpoint:true on a Select node")
+        raise HTTPException(409, "Only a Select step can be checkpointed.")
     ck_cfg = _node_config(checkpoint_select)
     if ck_cfg != {"select": "*", "checkpoint": True}:
         raise HTTPException(
-            409, "bounded fan-out checkpoint Select requires exact "
-            "{\"select\":\"*\",\"checkpoint\":true}")
+            409, "The checkpointed Select step must select every column, with no other settings.")
     edges = list(graph.edges)
     write_in = next((edge for edge in edges if edge.target == write.id), None)
     if write_in is None:
-        raise HTTPException(409, "bounded fan-out Write requires one inbound edge")
+        raise HTTPException(409, "The Write step needs exactly one incoming connection.")
     identity_select = by_id.get(write_in.source)
     if identity_select is None or identity_select.type != "select":
-        raise HTTPException(409, "bounded fan-out requires identity Select before Write")
+        raise HTTPException(409, "The Write step must be fed by a Select step.")
     from hub.identity_projection import validate_identity_select_config
     try:
         validate_identity_select_config(_node_config(identity_select))
     except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(
+            409, "The Select step before Write must select every column, with no other settings.",
+        ) from exc
     identity_in = next((edge for edge in edges if edge.target == identity_select.id), None)
     if identity_in is None or identity_in.source != checkpoint_select.id:
         raise HTTPException(
-            409, "bounded fan-out requires checkpoint Select feeding identity Select")
+            409, "The checkpointed Select step must feed the Select step before Write.")
     checkpoint_in = next((edge for edge in edges if edge.target == checkpoint_select.id), None)
     if checkpoint_in is None:
-        raise HTTPException(409, "bounded fan-out checkpoint Select requires one inbound edge")
+        raise HTTPException(
+            409, "The checkpointed Select step needs exactly one incoming connection.")
     source = by_id.get(checkpoint_in.source)
     if source is None or source.type != "source":
-        raise HTTPException(409, "bounded fan-out tasks require exactly one built-in Source")
+        raise HTTPException(409, "This run needs exactly one Source step.")
     for edge in (checkpoint_in, identity_in, write_in):
         if (edge.source_handle not in (None, "out")
                 or edge.target_handle not in (None, "in")):
             raise HTTPException(
-                409, "bounded fan-out edges must be source:out -> target:in")
+                409, "Every connection must join a step's output to the next step's input.")
     expected = {source.id, checkpoint_select.id, identity_select.id, write.id}
     if {node.id for node in graph.nodes} != expected:
-        raise HTTPException(409, "bounded fan-out tasks reject extra nodes")
+        raise HTTPException(409, "This run cannot include extra steps.")
     if any(_node_bypassed_or_disabled(node)
            for node in (source, checkpoint_select, identity_select, write)):
-        raise HTTPException(409, "bounded fan-out tasks reject disabled or bypassed nodes")
+        raise HTTPException(409, "This run cannot include disabled or bypassed steps.")
     return source, checkpoint_select, identity_select, write
 
 
@@ -400,10 +401,10 @@ def _linear_checkpoint_shape(graph, target_node_id: str | None):
     if (len(graph.nodes) != 3 or len(graph.edges) != 2 or write is None or write.type != "write"
             or len(checkpoint_nodes) != 1):
         raise HTTPException(
-            409, "linear checkpoint tasks require exactly Source -> Select(checkpoint) -> Write")
+            409, "This run needs exactly Source → Select (checkpointed) → Write.")
     select = checkpoint_nodes[0]
     if select.type != "select":
-        raise HTTPException(409, "linear checkpoint requires checkpoint:true on the Select node")
+        raise HTTPException(409, "Only the Select step can be checkpointed.")
     edges = list(graph.edges)
     select_in = next((edge for edge in edges if edge.target == select.id), None)
     write_in = next((edge for edge in edges if edge.target == write.id), None)
@@ -413,15 +414,16 @@ def _linear_checkpoint_shape(graph, target_node_id: str | None):
             or write_in.source_handle not in (None, "out")
             or write_in.target_handle not in (None, "in")):
         raise HTTPException(
-            409, "linear checkpoint tasks require source:out -> select:in and select:out -> write:in")
+            409, "Source must connect to Select and Select must connect to Write, "
+            "using the default ports.")
     source = by_id.get(select_in.source)
     if source is None or source.type != "source":
-        raise HTTPException(409, "linear checkpoint tasks require exactly one built-in Source")
+        raise HTTPException(409, "This run needs exactly one Source step.")
     other_ids = {node.id for node in graph.nodes} - {source.id, select.id, write.id}
     if other_ids:
-        raise HTTPException(409, "linear checkpoint tasks reject extra nodes")
+        raise HTTPException(409, "This run cannot include extra steps.")
     if any(_node_bypassed_or_disabled(node) for node in (source, select, write)):
-        raise HTTPException(409, "linear checkpoint tasks reject disabled or bypassed nodes")
+        raise HTTPException(409, "This run cannot include disabled or bypassed steps.")
     # Reject unsupported Write modes and Select extras early via later admission; keep shape only here.
     return source, select, write
 
@@ -490,27 +492,27 @@ def _resolve_local_run_manifest(
             adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
         except PermissionError as exc:
             raise APIError(
-                403, "permission to read the provider dataset was lost",
+                403, "You no longer have permission to read this data source.",
                 code=APIErrorCode.PERMISSION_DENIED, retryable=False,
             ) from exc
         except workspace_providers.ProviderDatasetGone as exc:
             raise APIError(
-                410, "local_run_input_revision_unavailable",
+                410, "The pinned version of an input dataset is no longer available.",
                 code=APIErrorCode.RESOURCE_GONE, retryable=False,
             ) from exc
         except workspace_providers.ProviderDatasetOffline as exc:
             raise APIError(
-                503, "provider dataset is offline",
+                503, "This data source is offline. Try again once it is reachable.",
                 code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
             ) from exc
         except workspace_providers.ProviderDatasetUnavailable as exc:
             raise APIError(
-                409, ("provider dataset binding is unavailable; install or restore a compatible "
-                      "provider and dataset adapter"),
+                409, ("This data source is unavailable because its plugin is missing. Install or "
+                      "restore the plugin, then try again."),
                 code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
             ) from exc
         if binding is None and provider_dataset_id is None:
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         dataset_ref = cfg.get("datasetRef")
         try:
@@ -520,7 +522,8 @@ def _resolve_local_run_manifest(
             if not exact:
                 if provider_dataset_id is not None:
                     raise ManifestInputError(
-                        "provider dataset is mutable-only and cannot enter an immutable run manifest")
+                        "This data source cannot pin an exact version, so it cannot be used in "
+                        "this run.")
                 if isinstance(dataset_ref, dict) or not materialize_local_files:
                     raise RuntimeError("source has no provider-native exact revision")
                 from hub.local_run_inputs import (
@@ -557,7 +560,7 @@ def _resolve_local_run_manifest(
                         preview_revision = getattr(adapter, "preview_revision", None)
                         if not callable(preview_revision):
                             raise ManifestInputError(
-                                "exact input revision has no bounded preview capability")
+                                "This data source cannot preview a pinned version.")
                         preview_revision(uri, revision_id, limit=preview_limit)
                 provider = str(getattr(adapter, "name", "") or "")
             else:
@@ -571,19 +574,20 @@ def _resolve_local_run_manifest(
             ) from exc
         except (PermissionError, RevisionPermissionLost) as exc:
             raise APIError(
-                403, "permission to read an exact input revision was lost",
+                403, "You no longer have permission to read the pinned version of an input dataset.",
                 code=APIErrorCode.PERMISSION_DENIED, retryable=False,
             ) from exc
         except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError) as exc:
             raise APIError(
-                503, "exact input revision provider is offline",
+                503, ("The data source for a pinned input version is offline. Try again once "
+                      "it is reachable."),
                 code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
             ) from exc
         except Exception as exc:  # missing pins and provider errors never permit a fallback to head
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
         if not revision_id or not provider:
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         manifest.append({
             "node_id": str(node.id),
@@ -607,37 +611,39 @@ def _bind_local_run_manifest(
             node_builders=getattr(deps, "node_builders", None))
     except (PermissionError, RevisionPermissionLost) as exc:
         raise APIError(
-            403, "permission to read an exact input revision was lost",
+            403, "You no longer have permission to read the pinned version of an input dataset.",
             code=APIErrorCode.PERMISSION_DENIED, retryable=False,
         ) from exc
     except workspace_providers.ProviderDatasetGone as exc:
         raise APIError(
-            410, "local_run_input_revision_unavailable",
+            410, "The pinned version of an input dataset is no longer available.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError,
             workspace_providers.ProviderDatasetOffline) as exc:
         raise APIError(
-            503, "exact input revision provider is offline",
+            503, ("The data source for a pinned input version is offline. Try again once it "
+                  "is reachable."),
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
         ) from exc
     except workspace_providers.ProviderDatasetUnavailable as exc:
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
     except LocalRunInputError as exc:
         if "mutable-only" in str(exc):
             raise APIError(
-                409, "provider dataset is mutable-only and cannot enter an immutable run manifest",
+                409, ("This data source cannot pin an exact version, so it cannot be used in "
+                      "this run."),
                 code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
             ) from exc
         unavailable = "unavailable" in str(exc)
         raise APIError(
             410 if unavailable else 409,
-            "local_run_input_revision_unavailable" if unavailable
-            else "local_run_input_manifest_does_not_match_graph",
+            "The pinned version of an input dataset is no longer available." if unavailable
+            else "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.",
             code=APIErrorCode.RESOURCE_GONE if unavailable else APIErrorCode.INVALID_REQUEST,
             retryable=False,
         ) from exc
@@ -1266,7 +1272,7 @@ def _provider_inspection_graph(graph, target_node_id: str | None, deps):
         ) from exc
     except workspace_providers.ProviderDatasetGone as exc:
         raise APIError(
-            410, "provider dataset was deleted; relink it explicitly",
+            410, "This data source was deleted. Link it again to keep using it.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     except workspace_providers.ProviderDatasetOffline as exc:
@@ -1276,8 +1282,8 @@ def _provider_inspection_graph(graph, target_node_id: str | None, deps):
         ) from exc
     except workspace_providers.ProviderDatasetUnavailable as exc:
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
 
@@ -1373,7 +1379,7 @@ def _input_drift(
             graph, target_node_id, preview_manifest, require_bound_revisions=False)
     except LocalRunInputError as exc:
         raise APIError(
-            409, "local_run_input_manifest_does_not_match_graph",
+            409, "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.",
             code=APIErrorCode.INVALID_REQUEST, retryable=False,
         ) from exc
     try:

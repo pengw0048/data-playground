@@ -405,19 +405,19 @@ def _revision_adapter(uri: str) -> object:
     try:
         adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
     except workspace_providers.ProviderDatasetOffline as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except PermissionError as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     if not (workspace_providers.provider_dataset_supports_exact(adapter)
             if workspace_providers.is_provider_dataset_uri(uri)
             else isinstance(adapter, DatasetRevisionAdapter)):
-        raise APIError(501, "dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
     return adapter
 
@@ -426,7 +426,7 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     try:
         provider_uri = workspace_providers.provider_dataset_uri_for_identity(table_id)
     except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     if provider_uri is not None:
         # A canonical Workspace provider Source is not a mutable Catalog registration.  Its
@@ -437,7 +437,7 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     table = get_table(table_id)
     binding = metadb.catalog_revision_binding_for_uri(table.uri)
     if binding is None:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return table, binding
 
@@ -447,13 +447,13 @@ def _revision_binding_for_dataset_id(dataset_id: str) -> dict:
     try:
         provider_uri = workspace_providers.provider_dataset_uri_for_identity(dataset_id)
     except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     if provider_uri is not None:
         return {"dataset_id": dataset_id, "uri": provider_uri}
     binding = metadb.catalog_revision_binding(dataset_id)
     if binding is None:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return binding
 
@@ -506,15 +506,15 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
         adapter = _revision_adapter(table.uri)
         rows, next_cursor = adapter.revision_history(table.uri, limit=limit, cursor=cursor)
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionPage(items=[
         _revision(binding["dataset_id"], row, adapter) for row in rows],
@@ -530,27 +530,27 @@ def resolve_dataset_revision(table_id: str,
     if as_of is not None:
         capabilities = _revision_capabilities(adapter)
         if "as_of" not in capabilities.selectors:
-            raise APIError(501, "dataset_revision_as_of_unavailable",
+            raise APIError(501, "This data source cannot look up a version by date.",
                            code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
         if as_of.tzinfo is None or as_of.utcoffset() is None:
-            raise APIError(422, "dataset_revision_as_of_timezone_required",
+            raise APIError(422, "Include a time zone in the as-of timestamp.",
                            code=APIErrorCode.VALIDATION_ERROR, retryable=False)
         as_of = as_of.astimezone(datetime.timezone.utc)
     try:
         raw = adapter.resolve_revision(table.uri, as_of=as_of)
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except RevisionResolutionAmbiguous:
-        raise APIError(409, "dataset_revision_resolution_ambiguous",
+        raise APIError(409, "The version at that time cannot be determined for this data source.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     committed_at = _core_owned_committed_at(raw.get("committed_at"), adapter)
     if as_of is not None:
@@ -574,7 +574,7 @@ def resolve_dataset_revision(table_id: str,
         if (not isinstance(ordering_timestamp, datetime.datetime)
                 or ordering_timestamp.tzinfo is None or ordering_timestamp.utcoffset() is None
                 or ordering_timestamp.astimezone(datetime.timezone.utc) > as_of):
-            raise APIError(409, "dataset_revision_resolution_ambiguous",
+            raise APIError(409, "The version at that time cannot be determined for this data source.",
                            code=APIErrorCode.CONFLICT, retryable=False)
         # An as-of resolution becomes durable exact-reference evidence, so return the validated
         # absolute instant rather than the provider's offset-free transport representation.
@@ -630,16 +630,16 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             )
             resolved_revision_id = str(raw["revision_id"])
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except (RevisionUnavailable, RowIdentityError, ManagedSourceReadError, OSError,
             workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     preview_rows = _table_to_rows(raw_preview_rows)
     revision_name = raw.get("name")
@@ -996,18 +996,18 @@ def list_related_dataset_revisions(body: RelatedDatasetRevisionsBody) -> Dataset
             get_deps().catalog, get_deps().resolve_adapter, body.identity,
             limit=body.limit, cursor=body.cursor)
     except NotImplementedError as exc:
-        raise APIError(501, "related_dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
     except (RevisionPermissionLost, PermissionError) as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline) as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except (KeyError, ValueError) as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
@@ -1024,18 +1024,18 @@ def review_related_dataset_revision(body: RelatedDatasetRevisionReviewBody) -> R
             deps.catalog, deps.resolve_adapter, deps.storage, body.source, body.candidate,
             body.revision_id, q=body.q, folder=body.folder)
     except NotImplementedError as exc:
-        raise APIError(501, "related_dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
     except (RevisionPermissionLost, PermissionError) as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline) as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except (KeyError, ValueError) as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc

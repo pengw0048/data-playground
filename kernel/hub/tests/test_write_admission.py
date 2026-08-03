@@ -1568,7 +1568,8 @@ def test_write_admission_requires_a_registered_exact_input_and_recovers_after_re
     with pytest.raises(run_routes.APIError) as excinfo:
         run_routes._resolve_local_run_manifest(graph, "write", deps)
     assert excinfo.value.status_code == 410
-    assert excinfo.value.detail == "local_run_input_revision_unavailable"
+    assert excinfo.value.detail == (
+        "The pinned version of an input dataset is no longer available.")
 
     deps.node_ir = {}
     deps.runner = SimpleNamespace(estimate=lambda *_args: RunEstimate(
