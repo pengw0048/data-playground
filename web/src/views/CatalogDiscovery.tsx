@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FocusEvent } from 'react'
 import { useStore } from '../store/graph'
 import { api, KernelError } from '../api/client'
 import { color, radius } from '../theme/tokens'
@@ -36,6 +36,13 @@ const sameRevision = (
   && left.datasetId === right.datasetId && left.revisionId === right.revisionId
 const revisionLabel = (revision: { datasetId: string; revisionId: string }) =>
   `${revision.datasetId}@${revision.revisionId}`
+
+function selectSuggestedNameOnce(event: FocusEvent<HTMLInputElement>) {
+  const input = event.currentTarget
+  if (input.dataset.initialNameSelected) return
+  input.dataset.initialNameSelected = 'true'
+  input.select()
+}
 
 function friendlyColumnType(type: string): string {
   const normalized = type.trim().toLowerCase()
@@ -741,7 +748,7 @@ function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void
   }
   return <CatalogModal label="Create folder" onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
-      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
+      <input autoFocus aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
         placeholder="prod/images" className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
@@ -774,7 +781,7 @@ function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
   }
   return <CatalogModal label={`Rename ${path}`} onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
-      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={selectSuggestedNameOnce} aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2">

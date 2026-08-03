@@ -188,6 +188,11 @@ test.describe('accessibility gate @ux-smoke', () => {
     await expect(name).toHaveValue('untitled')
     await page.keyboard.type('Quarterly revenue')
     await expect(name).toHaveValue('Quarterly revenue')
+
+    await dialog.getByRole('button', { name: 'Cancel' }).focus()
+    await name.focus()
+    await page.keyboard.type(' v2')
+    await expect(name).toHaveValue('Quarterly revenue v2')
   })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
