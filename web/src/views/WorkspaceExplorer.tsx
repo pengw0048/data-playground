@@ -11,6 +11,7 @@ import type {
   WorkspaceCanonicalDatasetContext, WorkspaceQueryCapabilities, WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
+import { Modal } from '../ui/Modal'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu'
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
@@ -2035,23 +2036,6 @@ function MoveCanvasDialog({ resources, sourceContainer, sourcePath, onClose, onM
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void move()} disabled={busy || !canvasDestination(container, 'move') || container?.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
   </Modal>
-}
-
-function Modal({ label, onClose, children }: { label: string; onClose: () => void; children: ReactNode }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
-
-  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
-    <div role="dialog" aria-modal="true" aria-label={label} className="grid w-[460px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
-      <div className="flex items-center gap-2"><h2 className="flex-1 text-[15px] font-bold">{label}</h2><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      {children}
-    </div>
-  </div>
 }
 
 function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResource; size: number }) {

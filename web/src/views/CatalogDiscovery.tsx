@@ -3,6 +3,7 @@ import { useStore } from '../store/graph'
 import { api, KernelError } from '../api/client'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { Modal } from '../ui/Modal'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
@@ -578,7 +579,7 @@ export function CatalogDiscovery({
       </div>
 
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
-      {batchUnregisterTargets && <CatalogModal label={`Unregister ${batchUnregisterTargets.length} dataset${batchUnregisterTargets.length === 1 ? '' : 's'}`} onClose={batchUnregistering ? () => undefined : () => setBatchUnregisterTargets(null)}>
+      {batchUnregisterTargets && <Modal label={`Unregister ${batchUnregisterTargets.length} dataset${batchUnregisterTargets.length === 1 ? '' : 's'}`} onClose={batchUnregistering ? () => undefined : () => setBatchUnregisterTargets(null)}>
         <p className="text-[12px] leading-5 text-muted-foreground">
           Remove these entries from the catalog? The underlying data is not deleted. Each entry is checked separately, so some may remain if they changed.
         </p>
@@ -589,7 +590,7 @@ export function CatalogDiscovery({
           <button type="button" onClick={() => setBatchUnregisterTargets(null)} disabled={batchUnregistering} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
           <button type="button" onClick={() => void deleteSelected()} disabled={batchUnregistering} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{batchUnregistering ? 'Removing…' : 'Unregister'}</button>
         </div>
-      </CatalogModal>}
+      </Modal>}
 
     </div>
   )
@@ -698,29 +699,6 @@ interface FolderActions {
   onDeleted: (path: string) => void
 }
 
-function CatalogModal({ label, onClose, children }: {
-  label: string; onClose: () => void; children: React.ReactNode
-}) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
-
-  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
-    <div role="dialog" aria-modal="true" aria-label={label}
-      className="grid w-[460px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl"
-      onClick={(event) => event.stopPropagation()}>
-      <div className="flex items-center gap-2">
-        <h2 className="flex-1 text-[15px] font-bold text-foreground">{label}</h2>
-        <button type="button" onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button>
-      </div>
-      {children}
-    </div>
-  </div>
-}
 
 function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const pushToast = useStore((state) => state.pushToast)
@@ -739,7 +717,7 @@ function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <CatalogModal label="Create folder" onClose={onClose}>
+  return <Modal label="Create folder" onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
       <input autoFocus aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
         placeholder="prod/images" className="dp-input" />
@@ -750,7 +728,7 @@ function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void
       <button type="button" onClick={() => void create()} disabled={!path.trim() || busy}
         className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating…' : 'Create'}</button>
     </div>
-  </CatalogModal>
+  </Modal>
 }
 
 function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
@@ -772,7 +750,7 @@ function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <CatalogModal label={`Rename ${path}`} onClose={onClose}>
+  return <Modal label={`Rename ${path}`} onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
       <input autoFocus aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
@@ -782,7 +760,7 @@ function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
       <button type="button" onClick={() => void rename()} disabled={!name.trim() || name.trim() === path || busy}
         className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button>
     </div>
-  </CatalogModal>
+  </Modal>
 }
 
 function CatalogFolderDeleteDialog({ node, onClose, onDeleted }: {
@@ -803,7 +781,7 @@ function CatalogFolderDeleteDialog({ node, onClose, onDeleted }: {
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <CatalogModal label={`Delete ${node.path}`} onClose={onClose}>
+  return <Modal label={`Delete ${node.path}`} onClose={onClose}>
     <p className="text-[12px] leading-5 text-muted-foreground">
       Delete this folder? Its {node.tableCount} dataset{node.tableCount === 1 ? '' : 's'} and any subfolders move to {parent ? `“${parent}”` : 'the top level'}. The datasets are not deleted.
     </p>
@@ -813,7 +791,7 @@ function CatalogFolderDeleteDialog({ node, onClose, onDeleted }: {
       <button type="button" onClick={() => void remove()} disabled={busy}
         className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button>
     </div>
-  </CatalogModal>
+  </Modal>
 }
 
 function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revision, sourceIdentity, mutable }:
@@ -1566,20 +1544,20 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
         </div>
         </div>
       </div>
-      {confirmUnregister && <CatalogModal label={`Remove ${table.name} from catalog`} onClose={deleting ? () => undefined : () => setConfirmUnregister(false)}>
+      {confirmUnregister && <Modal label={`Remove ${table.name} from catalog`} onClose={deleting ? () => undefined : () => setConfirmUnregister(false)}>
         <p className="text-[12px] leading-5 text-muted-foreground">Remove this entry from Data Playground? The underlying data is not deleted.</p>
         <div className="flex justify-end gap-2">
           <button type="button" onClick={() => setConfirmUnregister(false)} disabled={deleting} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
           <button type="button" onClick={() => void unregister()} disabled={deleting} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{deleting ? 'Removing…' : 'Remove'}</button>
         </div>
-      </CatalogModal>}
-      {confirmDiscard && <CatalogModal label="Discard unsaved changes?" onClose={() => setConfirmDiscard(false)}>
+      </Modal>}
+      {confirmDiscard && <Modal label="Discard unsaved changes?" onClose={() => setConfirmDiscard(false)}>
         <p className="text-[12px] leading-5 text-muted-foreground">Your dataset edits have not been saved.</p>
         <div className="flex justify-end gap-2">
           <button type="button" onClick={() => setConfirmDiscard(false)} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Keep editing</button>
           <button type="button" onClick={() => { setConfirmDiscard(false); onClose() }} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground">Discard and leave</button>
         </div>
-      </CatalogModal>}
+      </Modal>}
     </div>
   )
 }
@@ -1672,15 +1650,6 @@ export function AddDataModal({
   const [registerOpen, setRegisterOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
 
-  useEffect(() => {
-    if (registerOpen || uploading) return
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose, registerOpen, uploading])
-
   const upload = async (file?: File) => {
     if (!file || uploading) return
     setUploading(true)
@@ -1699,15 +1668,7 @@ export function AddDataModal({
     }} />
   }
 
-  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
-    <div role="dialog" aria-modal="true" aria-label="Add data" data-testid="add-data-modal"
-      className="flex w-[660px] max-w-full flex-col gap-4 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
-      <div className="flex items-center gap-2">
-        <div className="flex-1">
-          <h2 className="text-[15px] font-bold text-foreground">Add data</h2>
-        </div>
-        <button onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
-      </div>
+  return <Modal label="Add data" onClose={onClose} testId="add-data-modal" className="w-[660px] gap-4" dismissible={!uploading}>
       <div className="grid gap-3 sm:grid-cols-2">
         <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="upload-local-file-title">
           <h3 id="upload-local-file-title" className="text-[13px] font-semibold text-foreground">Upload a local file</h3>
@@ -1732,8 +1693,7 @@ export function AddDataModal({
           </button>
         </section>
       </div>
-    </div>
-  </div>
+  </Modal>
 }
 
 function CatalogFolderSelect({ value, onChange, disabled = false, testId }: {
@@ -1791,13 +1751,6 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [browseOpen, setBrowseOpen] = useState(false)
-  const closeRef = useRef<HTMLButtonElement>(null)
-  useEffect(() => { closeRef.current?.focus() }, [])
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
   const stem = uri.trim().replace(/\/+$/, '').split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') ?? ''
   const submit = async () => {
     const u = uri.trim()
@@ -1824,15 +1777,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
     finally { setBusy(false) }
   }
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={(event) => {
-      if (event.target === event.currentTarget) onClose()
-    }}>
-      <div role="dialog" aria-modal="true" aria-label="Register a dataset" data-testid="register-modal"
-        className="flex w-[460px] max-w-full flex-col gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center gap-2">
-          <h2 className="flex-1 text-[15px] font-bold text-foreground">Register an accessible path or URI</h2>
-          <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
-        </div>
+    <Modal label="Register an accessible path or URI" onClose={onClose} testId="register-modal">
         <p className="text-[11.5px] leading-relaxed text-muted-foreground">Enter a file path or storage URL that Data Playground can access.</p>
         {formError && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11.5px] text-destructive">{formError}</div>}
         <Field label="Path / URI">
@@ -1854,10 +1799,9 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
           <button onClick={() => void submit()} disabled={busy || !uri.trim()} data-testid="register-submit"
             className="rounded-md bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background disabled:opacity-50">{busy ? 'Registering…' : 'Register'}</button>
         </div>
-      </div>
       {browseOpen && <FileDialog mode="open" title="Browse kernel-visible storage" onClose={() => setBrowseOpen(false)}
         onPick={({ uri: pickedUri }) => { setUri(pickedUri); setFormError(null); setBrowseOpen(false) }} />}
-    </div>
+    </Modal>
   )
 }
 

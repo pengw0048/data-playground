@@ -1106,7 +1106,7 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Create canvas' }))
     expect(screen.getByRole('dialog', { name: 'Create canvas' })).toBeVisible()
 
-    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.keyDown(document, { key: 'Escape' })
 
     expect(screen.queryByRole('dialog', { name: 'Create canvas' })).not.toBeInTheDocument()
   })
