@@ -177,6 +177,19 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('a prefilled name dialog replaces its suggestion instead of appending to it', async ({ page }) => {
+    await fresh(page)
+    await backToWorkspace(page)
+    await page.getByRole('button', { name: 'Create canvas' }).first().click()
+    const dialog = page.getByRole('dialog', { name: 'Create canvas' })
+    await expect(dialog).toBeVisible()
+
+    const name = dialog.getByRole('textbox')
+    await expect(name).toHaveValue('untitled')
+    await page.keyboard.type('Quarterly revenue')
+    await expect(name).toHaveValue('Quarterly revenue')
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')

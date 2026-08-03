@@ -1534,7 +1534,7 @@ function NewCanvasDialog({ container, onClose, onCreated }: {
   return <Modal label="Create canvas" onClose={onClose}>
     <p className="text-[12px] text-muted-foreground">Folder: <strong className="text-foreground">{container.name}</strong></p>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
-      <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
@@ -1571,7 +1571,7 @@ function FolderCreateDialog({ parent, path, onClose, onCreated }: {
   return <Modal label="New folder" onClose={onClose}>
     <p className="text-[12px] text-muted-foreground">Parent: <strong className="text-foreground">{breadcrumb(path)}</strong></p>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder name
-      <input autoFocus aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
@@ -1596,7 +1596,7 @@ function FolderRenameDialog({ resource, path, onClose, onRenamed }: {
   return <Modal label={`Rename ${resource.name}`} onClose={onClose}>
     <p className="text-[12px] text-muted-foreground">Location: <strong className="text-foreground">{breadcrumb(path.slice(0, -1))}</strong></p>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder name
-      <input autoFocus aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
@@ -1653,7 +1653,7 @@ function CanvasRenameDialog({ resource, onClose, onRenamed }: {
   }
   return <Modal label={`Rename ${resource.name}`} onClose={close}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
-      <input autoFocus aria-label="Canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={close} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>

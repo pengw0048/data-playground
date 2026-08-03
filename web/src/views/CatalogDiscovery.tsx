@@ -741,7 +741,7 @@ function CatalogFolderCreateDialog({ onClose, onCreated }: { onClose: () => void
   }
   return <CatalogModal label="Create folder" onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
-      <input autoFocus aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder path" value={path} onChange={(event) => setPath(event.target.value)}
         placeholder="prod/images" className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
@@ -774,7 +774,7 @@ function CatalogFolderRenameDialog({ path, onClose, onRenamed }: {
   }
   return <CatalogModal label={`Rename ${path}`} onClose={onClose}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Folder path
-      <input autoFocus aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+      <input autoFocus onFocus={(event) => event.currentTarget.select()} aria-label="Folder path" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2">
