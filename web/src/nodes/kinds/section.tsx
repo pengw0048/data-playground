@@ -3,7 +3,7 @@ import { useUpdateNodeInternals } from '@xyflow/react'
 import { register, nodeOutputs, type NodeComponentProps } from '../registry'
 import { Port } from '../Port'
 import { useStore, nodeRunnable, roleCanEdit } from '../../store/graph'
-import { status as statusTok } from '../../theme/tokens'
+import { status as statusTok, statusText } from '../../theme/tokens'
 import { Icon } from '../../ui/Icon'
 import { Tooltip } from '../../ui/Tooltip'
 import { cn } from '@/lib/utils'
@@ -50,7 +50,7 @@ function Section({ id, data, selected }: NodeComponentProps) {
       )}>
         {/* header */}
         <div className="flex items-center gap-[7px] rounded-t-lg border-b border-border bg-card px-2.5 py-2">
-          <span className="w-3 text-center text-xs" style={{ color: st.color }} title={st.label}>{st.glyph}</span>
+          <span className="w-3 text-center text-xs" style={{ color: statusText[data.status] ?? statusText.draft }} title={st.label}>{st.glyph}</span>
           {editing ? (
             <input
               autoFocus value={val} onChange={(e) => setVal(e.target.value)} onClick={(e) => e.stopPropagation()}

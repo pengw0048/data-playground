@@ -81,6 +81,20 @@ export const status: Record<StatusKey, { color: string; glyph: string; label: st
   done: { color: color.latest, glyph: '✓', label: 'done' },  // per-node run completion
 }
 
+// Status rendered as text or a glyph. Theme-aware (index.css) because the fill hexes above fail
+// WCAG AA as text on the light chip surface.
+export const statusText: Record<StatusKey, string> = {
+  draft: 'var(--status-draft)',
+  checking: 'var(--status-queued)',
+  latest: 'var(--status-latest)',
+  stale: 'var(--status-stale)',
+  queued: 'var(--status-queued)',
+  running: 'var(--status-running)',
+  failed: 'var(--status-failed)',
+  unknown: 'var(--status-queued)',
+  done: 'var(--status-latest)',
+}
+
 export const radius = { chip: 4, button: 6, node: 8, panel: 8, section: 8 } as const
 
 export const shadow = {

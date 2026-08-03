@@ -3,7 +3,7 @@ import { api, type CanvasFile, type DatasetTaskKind, type WorkspaceJobDto, type 
 import type { WriteReceipt } from '../types/api'
 import { datasetViewerHash, routeHash } from '../router'
 import { useStore } from '../store/graph'
-import { status as statusTok } from '../theme/tokens'
+import { status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { FullResult } from '../panels/DataPanel'
 import { fmtMs } from '../panels/RunHistoryModal'
@@ -521,7 +521,7 @@ function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
       className="grid w-full grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35 md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
       <span className="flex flex-wrap items-center gap-1.5">
-        <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
+        <Badge data-testid="job-status" variant="secondary" className="capitalize" style={{ color: statusText[item.status as keyof typeof statusText] ?? statusText.draft }}>{item.status}</Badge>
         {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
       </span>
       <span className="min-w-0">

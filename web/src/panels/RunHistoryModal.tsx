@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, type PerNodeStat, type RunRecordDto } from '../api/client'
 import { useStore } from '../store/graph'
-import { status as statusTok } from '../theme/tokens'
+import { status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
@@ -55,7 +55,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     onClick={() => hasNodes && setOpen(isOpen ? null : r.id)}
                   >
                     <span className="w-3 text-center text-muted-foreground">{hasNodes ? (isOpen ? '▾' : '▸') : ''}</span>
-                    <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
+                    <span className="w-3 text-center" style={{ color: statusText[r.status as keyof typeof statusText] ?? statusText.draft }}>{st.glyph}</span>
                     <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
                     <Badge variant="outline" className="w-[54px] justify-center capitalize">{r.jobType}</Badge>
                     <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">

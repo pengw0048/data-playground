@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useUpdateNodeInternals } from '@xyflow/react'
-import { kindAccent, status as statusTok } from '../theme/tokens'
+import { kindAccent, status as statusTok, statusText } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import {
@@ -139,7 +139,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
             <div className="flex items-center gap-[7px]">
               <span
                 className={cn('w-3 text-center text-xs leading-none', data.status === 'running' && 'dp-running-glyph')}
-                style={{ color: st.color }}
+                style={{ color: statusText[data.status] ?? statusText.draft }}
                 title={st.label}
               >
                 {st.glyph}
