@@ -47,7 +47,7 @@ async function canvasesFor(page: Page): Promise<Array<{ id: string }>> {
   })
 }
 
-async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown[] }> {
+async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown[]; edges: unknown[] }> {
   return page.evaluate(async (canvas) => {
     const userId = localStorage.getItem('dp-user')
     const response = await fetch(`/api/canvas/${encodeURIComponent(canvas)}`, {
@@ -545,6 +545,26 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
+  })
+
+  test('a toolbar operation continues from the sole selected compatible node', async ({ page }) => {
+    await fresh(page)
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node-source')).toHaveClass(/selected/)
+
+    await addNode(page, 'Shape', 'filter')
+
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('?')[0].split('/').pop()!)
+    await expect.poll(async () => {
+      const saved = await canvasFor(page, canvasId)
+      const nodeTypes = Object.fromEntries((saved.nodes as Array<{ id: string; type: string }>).map((node) => [node.id, node.type]))
+      return (saved.edges as Array<{ source: string; target: string }>).map((edge) => ({
+        source: nodeTypes[edge.source], target: nodeTypes[edge.target],
+      }))
+    }).toEqual([{ source: 'source', target: 'filter' }])
   })
 
   test('selection keeps category add while the output port creates one atomic connected step', async ({ page }) => {
@@ -1190,18 +1210,16 @@ test.describe('Data Playground canvas', () => {
       const action = title === 'source' ? 'More' : title === 'transform' ? 'Edit code' : 'Output versions'
       const shelf = addedNode.getByRole('button', { name: action }).locator('..')
       await expect(shelf).toBeVisible()
-      const shelfBox = await boxOf(shelf)
-      expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the visible Canvas`).toBe(true)
-      expect(overlaps(shelfBox, await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
+      await expect.poll(async () => contains(
+        await boxOf(page.locator('.react-flow')),
+        await boxOf(shelf),
+      ), { message: `${title} action shelf is outside the visible Canvas` }).toBe(true)
+      expect(overlaps(await boxOf(shelf), await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
     }
 
     const nodes = page.locator('.react-flow__node')
     await expect(nodes).toHaveCount(3)
-    const connections = [[nodes.nth(0), nodes.nth(1)], [nodes.nth(1), nodes.nth(2)]] as const
-    for (const [index, [from, to]] of connections.entries()) {
-      await connectHandles(page, from, to.locator('.react-flow__handle-left').first())
-      await expect(page.locator('.react-flow__edge')).toHaveCount(index + 1)
-    }
+    await expect(page.locator('.react-flow__edge')).toHaveCount(2)
 
     await page.getByRole('button', { name: 'Edit code' }).click()
     await expect(page.locator('.monaco-editor').first()).toBeVisible({ timeout: 15_000 })

@@ -349,6 +349,11 @@ export const api = {
     req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+  workspaceRemoveDetachedDataset: (placementId: string, body: { expectedVersion: number }) =>
+    req<{ ok: boolean; placementId: string }>(
+      `/workspace/placements/${encodeURIComponent(placementId)}/detached-dataset`, {
+        method: 'DELETE', body: JSON.stringify(body),
+      }),
   workspaceBatch: (body: {
     action: 'delete_canvases' | 'move'
     items: Array<{ placementId: string; expectedVersion: number; expectedCanvasVersion?: number }>

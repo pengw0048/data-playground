@@ -4779,6 +4779,28 @@ def workspace_delete_placement(placement_id: str, *, expected_version: int) -> N
             _workspace_version_conflict("placement", placement_id, expected_version)
 
 
+def workspace_delete_detached_dataset_placement(
+        placement_id: str, *, expected_version: int) -> dict:
+    """Remove one stale local Dataset shortcut, never a live Catalog-backed Dataset."""
+    with _workspace_write_session() as s:
+        row = _workspace_placement_locked(s, placement_id)
+        if row.version != expected_version:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        if row.target_kind != "dataset":
+            raise ValueError("only an unavailable dataset can be removed with this action")
+        live = s.scalar(select(CatalogEntry.registration_id).where(
+            CatalogEntry.registration_id == row.target_id))
+        if live is not None:
+            raise ValueError("this dataset is still available; remove it from the Catalog instead")
+        removed = s.execute(delete(WorkspacePlacement).where(
+            WorkspacePlacement.id == placement_id,
+            WorkspacePlacement.version == expected_version,
+        ).execution_options(synchronize_session=False))
+        if removed.rowcount != 1:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        return {"ok": True, "placementId": placement_id}
+
+
 def _dataset_view_row_doc(row: DatasetView) -> dict:
     try:
         definition = json.loads(row.definition_doc)

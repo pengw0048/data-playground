@@ -259,6 +259,35 @@ def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
     assert metadb.workspace_builtin_dataset_identity(uri) != original
 
 
+def test_only_a_detached_dataset_placement_can_be_removed(workspace_scope):
+    uri = workspace_scope["uri"]
+    with metadb.session() as session:
+        placement = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == workspace_scope["dataset_id"],
+        ))
+        assert placement is not None
+        placement_id, placement_version = placement.id, placement.version
+
+    with TestClient(app) as client:
+        live = client.request(
+            "DELETE", f"/api/workspace/placements/{placement_id}/detached-dataset",
+            json={"expectedVersion": placement_version},
+        )
+        assert live.status_code == 422
+
+        metadb.catalog_delete_entry(uri)
+        removed = client.request(
+            "DELETE", f"/api/workspace/placements/{placement_id}/detached-dataset",
+            json={"expectedVersion": placement_version},
+        )
+        assert removed.status_code == 200, removed.text
+        assert removed.json() == {"ok": True, "placementId": placement_id}
+
+    with metadb.session() as session:
+        assert session.get(metadb.WorkspacePlacement, placement_id) is None
+
+
 def test_historical_missing_canvas_placement_is_not_a_workspace_resource(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     container = metadb.workspace_create_container(

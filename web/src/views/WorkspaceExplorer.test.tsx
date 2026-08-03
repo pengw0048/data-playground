@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
   unregisterTable: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRemoveDetachedDataset: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
 }))
@@ -166,6 +166,7 @@ describe('WorkspaceExplorer', () => {
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
     mocks.unregisterTable.mockResolvedValue({ ok: true })
+    mocks.workspaceRemoveDetachedDataset.mockResolvedValue({ ok: true, placementId: 'dataset-placement' })
     mocks.removeProviderDataset.mockResolvedValue({ ok: true, removedFrom: 'warehouse' })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
     mocks.previewDatasetView.mockResolvedValue({
@@ -710,7 +711,7 @@ describe('WorkspaceExplorer', () => {
     ))
   })
 
-  it('disables unsupported query controls before browsing a connected source', async () => {
+  it('hides unsupported query controls before browsing a connected source', async () => {
     const providerRoot = {
       ...EXTERNAL_FOLDER,
       id: 'container:mount.bHVtYS1zdGFnaW5n',
@@ -736,12 +737,12 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    expect(await screen.findByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
-    expect(screen.getByRole('option', { name: 'Source order' })).toBeInTheDocument()
-    expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toBeDisabled()
-    expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      "Sorting and type filters aren't available for this source.",
-    )
+    expect(await screen.findByRole('button', {
+      name: 'Open dataset observations from Connected source warehouse · fixture',
+    })).toBeVisible()
+    expect(screen.queryByRole('combobox', { name: 'Sort Workspace' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
+    expect(screen.queryByText("Sorting and type filters aren't available for this source.")).not.toBeInTheDocument()
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
     )
@@ -771,10 +772,9 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('region', { name: 'Connected sources' })).not.toBeInTheDocument()
     fireEvent.click(await screen.findByRole('button', { name: 'Open folder luma-staging from Connected source luma-staging · fixture' }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
-    expect(screen.getByRole('combobox', { name: 'Sort Workspace' })).toBeDisabled()
-    expect(screen.getByTestId('workspace-query-capability-note')).toHaveTextContent(
-      "Sorting and type filters aren't available in this view.",
-    )
+    expect(screen.queryByRole('combobox', { name: 'Sort Workspace' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
+    expect(screen.queryByText("Sorting and type filters aren't available in this view.")).not.toBeInTheDocument()
   })
 
   it('moves multiple selected Canvases with one atomic Workspace request', async () => {
@@ -1099,6 +1099,16 @@ describe('WorkspaceExplorer', () => {
       containerId: 'workspace-local-root', expectedContainerVersion: 1, name: 'Exact destination',
     }))
     expect(store.openFile).toHaveBeenCalledWith('created-1')
+  })
+
+  it('closes a Workspace dialog with Escape', async () => {
+    render(<WorkspaceExplorer />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Create canvas' }))
+    expect(screen.getByRole('dialog', { name: 'Create canvas' })).toBeVisible()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog', { name: 'Create canvas' })).not.toBeInTheDocument()
   })
 
   it('creates a locally owned Canvas in a source-only provider folder and reuses its request id on retry', async () => {
@@ -1429,7 +1439,13 @@ describe('WorkspaceExplorer', () => {
     mocks.tableByRegistration.mockRejectedValueOnce(Object.assign(new Error('not found'), { status: 404 }))
     render(<WorkspaceExplorer />)
 
-    expect(await screen.findByText(/This Workspace placement is detached/)).toBeVisible()
+    expect(await screen.findByText(/The file behind this dataset is no longer available/)).toBeVisible()
+    expect(screen.queryByText(/placement is detached/i)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove from Workspace…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove', exact: true }))
+    await waitFor(() => expect(mocks.workspaceRemoveDetachedDataset).toHaveBeenCalledWith(
+      DATASET.placementId, { expectedVersion: DATASET.version },
+    ))
   })
 
   it('keeps the loaded page visible when loading the next page fails', async () => {

@@ -81,6 +81,16 @@ function Source({ id, data }: NodeComponentProps) {
   const [results, setResults] = useState<CatalogTable[] | null>(null)  // null = not yet searched
   const [resultsError, setResultsError] = useState<string | null>(null)
   const [searchRevision, setSearchRevision] = useState(0)
+
+  useEffect(() => {
+    if (!registerOpen || registering) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRegisterOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [registerOpen, registering])
+
   const btnRef = useRef<HTMLButtonElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const catalog = useStore((s) => s.catalog)

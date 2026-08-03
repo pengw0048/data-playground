@@ -279,7 +279,7 @@ describe('NodeCard result summary', () => {
       </TooltipProvider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Review failure' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Fix error' }))
     expect(useStore.getState().openPanels).toEqual({ target: 'run' })
   })
 })

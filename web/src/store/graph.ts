@@ -38,6 +38,7 @@ import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
 import { connectedBasePosition } from '../canvas/connectedPlacement'
 import { rememberCanvasOpenedAt } from './canvasRecents'
+import { presentRunError } from '../lib/runErrors'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -1484,7 +1485,17 @@ export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'tran
 function friendlyJoinInputRefusal(message: string): string | null {
   const prefix = 'invalid graph: '
   if (!message.startsWith(prefix)) return null
-  const clauses = message.slice(prefix.length).split('; ')
+  const rawClauses = message.slice(prefix.length).split('; ')
+  if (rawClauses.length === 1
+      && /^Join node '[^']+' needs at least one left and right column or an advanced condition$/.test(rawClauses[0])) {
+    return 'Choose the left and right columns that should match in this Join.'
+  }
+  // A newly drawn edge can arrive without a semantic Join handle. The following missing-port
+  // clauses carry the actionable state; the edge id is implementation detail and is safe to omit.
+  const clauses = rawClauses.filter((clause) => (
+    !/^edge '[^']+' must identify Join input 'a' or 'b' on node '[^']+'$/.test(clause)
+  ))
+  if (!clauses.length) return null
   const parsed = clauses.map((clause) => (
     /^Join node '([^']+)' requires exactly one incoming edge on input '([ab])'$/.exec(clause)
   ))
@@ -1504,12 +1515,12 @@ function friendlyJoinInputRefusal(message: string): string | null {
   return null
 }
 
-// The kernel is authoritative for graph validity. These metadata calls otherwise intentionally
-// tolerate an offline kernel, but a deliberate invalid_graph refusal needs a visible explanation.
+// The kernel is authoritative for graph validity. User-requested target actions surface a product
+// explanation; passive whole-Canvas metadata refreshes deliberately stay quiet.
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
   const message = friendlyJoinInputRefusal(error.message)
-    ?? (error.message || 'The graph cannot run.')
+    ?? 'This branch is not ready to run. Check its connections and required fields.'
   if (!state.toasts.some((toast) => toast.kind === 'error' && toast.msg === message)) {
     state.pushToast(message, 'error')
   }
@@ -3002,7 +3013,13 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
       } } }))
-      get().pushToast((e as Error).message || 'Could not estimate the run', 'error')
+      if (!surfaceInvalidGraphRefusal(get(), e)) {
+        const target = get().doc.nodes.find((node) => node.id === id)
+        get().pushToast(presentRunError((e as Error).message, {
+          nodeTitle: target?.data.title,
+          config: target?.data.config,
+        }).summary, 'error')
+      }
       return
     }
     if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
@@ -3355,6 +3372,7 @@ export const useStore = create<Store>((set, get) => ({
         return
       }
       const errorMessage = runStartErrorMessage(e, writeAdmission)
+      const target = get().doc.nodes.find((node) => node.id === id)
       const preserveWriteSubmission = Boolean(
         writeAdmission?.managed && writeAdmission.intent
         && (!(e instanceof KernelError) || e.status >= 500),
@@ -3367,7 +3385,12 @@ export const useStore = create<Store>((set, get) => ({
         } : {}),
       } } }))
       get().updateData(id, { status: 'failed' })
-      get().pushToast(errorMessage, 'error')
+      if (!surfaceInvalidGraphRefusal(get(), e)) {
+        get().pushToast(presentRunError(errorMessage, {
+          nodeTitle: target?.data.title,
+          config: target?.data.config,
+        }).summary, 'error')
+      }
     }
   },
 
@@ -4789,7 +4812,10 @@ export const useStore = create<Store>((set, get) => ({
         : await api.schema(doc, undefined, undefined, parameterBindings)
       if (seq === _schemaSeq) set({ schemas })
     }
-    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline: keep last-known */ }
+    // This is a background metadata refresh, not a user-requested whole-Canvas run. An unfinished
+    // sibling branch must not interrupt opening the Canvas; keep the last known schema until the
+    // user runs or inspects the affected branch directly.
+    catch { /* offline or an unfinished sibling branch: keep last-known */ }
     // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
     try {
       const sizes = parameterBindings === undefined
@@ -4797,7 +4823,7 @@ export const useStore = create<Store>((set, get) => ({
         : await api.graphSizes(doc, undefined, parameterBindings)
       if (seq === _schemaSeq) set({ sizes })
     }
-    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline / no sources countable: keep last-known */ }
+    catch { /* offline, unavailable source, or unfinished sibling branch: keep last-known */ }
   },
 
   setAgentOpen: (v) => {
@@ -5074,16 +5100,6 @@ const _PERNODE_STATUS: Record<string, NodeStatus> = {
   queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
 }
 
-// A user-facing toast message from a runner's raw error: drop the engine's exception-class noise
-// ("BinderException: Binder Error: …") and the internal "Candidate bindings" line, keeping the
-// "at '<node>':" attribution + the human "Hint:" line. The full raw error still shows in the run panel.
-function cleanRunError(raw?: string | null): string {
-  if (!raw) return 'Run failed'
-  const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !/^candidate bindings/i.test(l))
-  if (!lines.length) return 'Run failed'
-  lines[0] = lines[0].replace(/((?:at '[^']+': )?)[A-Za-z]*(?:Exception|Error): (?:[A-Za-z]+ Error: )?/, '$1')
-  return lines.join(' — ')
-}
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
 // a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
 // giving up because the kernel became unreachable. Without it an intermediate node animates forever.
@@ -5764,7 +5780,10 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         writeAdmission: undefined, writeSubmissionId: undefined,
         writeAdmissionFingerprint: undefined,
       } } }))
-      if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
+      if (status.status === 'failed') get().pushToast(presentRunError(status.error, {
+        nodeTitle: target?.data.title,
+        config: target?.data.config,
+      }).summary, 'error')
       const g = get()
       const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
       g.updateData(nodeId, {

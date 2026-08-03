@@ -653,6 +653,11 @@ class Deps:
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
+            try:
+                self.catalog.get_table(uri)
+                continue  # preserve the user-facing name, folder, tags, and description already stored
+            except KeyError:
+                pass  # an orphaned physical output still needs to be recovered into the catalog
             name = os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
             self.catalog.register_output(name=name, uri=uri, parents=[], pipeline="canvas")  # content-addressed version
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,

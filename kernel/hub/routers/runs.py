@@ -1624,6 +1624,11 @@ def _invalid_graph(
         graph, deps, target_node_id: str | None = None, *,
         enforce_join_condition: bool = True) -> tuple[str, bool] | None:
     """Compatibility wrapper around the shared graph-ingress validator."""
+    # A target run is allowed to coexist with unfinished work elsewhere on the Canvas. Validate
+    # exactly the executable dependency cone that compile/run will consume; whole-Canvas analysis
+    # endpoints still pass no target and therefore remain strict about every node and edge.
+    if target_node_id is not None:
+        graph = _target_execution_graph(graph, target_node_id)
     return graph_mod.validation_error(
         graph, getattr(deps, "node_specs", {}), getattr(deps, "node_builders", {}), target_node_id,
         enforce_join_condition=enforce_join_condition)

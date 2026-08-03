@@ -562,6 +562,29 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.state.run).not.toHaveBeenCalled()
   })
 
+  it('explains one failed run once while keeping the raw engine detail available', () => {
+    const raw = `at 'chart': BinderException: Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'\nCandidate functions:\navg(DOUBLE) -> DOUBLE`
+    mocks.state.doc.nodes[0] = {
+      ...mocks.state.doc.nodes[0], type: 'chart',
+      data: { title: 'Chart', status: 'failed', config: { agg: 'avg', y: 'subject' } },
+    }
+    mocks.state.runs.target = {
+      phase: 'failed', error: raw,
+      status: {
+        runId: 'failed-chart', status: 'failed', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 0, ms: 12, placement: 'local', perNode: [],
+        outputs: [{ nodeId: 'target', portId: 'out', outcome: 'failed', error: raw }],
+      },
+    }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getAllByText('“subject” is a text column. Average needs a number column. Choose a numeric column or change the summary.')).toHaveLength(1)
+    expect(screen.getByText('failed')).toBeVisible()
+    expect(screen.getByText(/Candidate functions:/)).not.toBeVisible()
+    expect(screen.getByText('Details')).toBeVisible()
+  })
+
   it('makes Retry repeat an ordinary failed run instead of stopping at a new estimate', () => {
     mocks.state.runs.target = { phase: 'failed', error: 'Transform failed' }
 

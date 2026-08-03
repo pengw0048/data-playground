@@ -493,6 +493,10 @@ class WorkspaceDeleteFolderBody(_StrictAuthBody):
     expected_version: int = Field(ge=1)
 
 
+class WorkspaceDeletePlacementBody(_StrictAuthBody):
+    expected_version: int = Field(ge=1)
+
+
 class NativeCanvasValidateBody(_StrictAuthBody):
     filename: str = Field(min_length=1, max_length=256)
     import_id: UUID = Field(alias="importId", strict=False)
@@ -1148,6 +1152,19 @@ def move_workspace_canvas(placement_id: str, body: WorkspaceMoveCanvasBody,
             uid=uid, placement_id=placement_id, expected_version=body.expected_version,
             container_id=body.container_id,
             expected_container_version=body.expected_container_version)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.delete("/workspace/placements/{placement_id}/detached-dataset")
+def delete_detached_workspace_dataset(
+        placement_id: str, body: WorkspaceDeletePlacementBody,
+        uid: str = Depends(current_user)) -> dict:
+    """Remove only a stale local Dataset shortcut after its Catalog registration is gone."""
+    del uid  # Local placement authority is installation-local; authentication is the guard.
+    try:
+        return metadb.workspace_delete_detached_dataset_placement(
+            placement_id, expected_version=body.expected_version)
     except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
         _workspace_action_error(exc)
 

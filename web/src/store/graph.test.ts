@@ -1729,7 +1729,7 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
-  it('surfaces invalid_graph refusals from execution and size-metadata endpoints', async () => {
+  it('surfaces invalid_graph refusals from user execution but keeps background metadata quiet', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }
     const target = NODE('target', 'filter')
@@ -1742,13 +1742,14 @@ describe('graph store — core authority ops', () => {
     apiMocks.estimate.mockRejectedValue(refusal)
 
     await useStore.getState().requestRun('target')
-    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'This branch is not ready to run. Check its connections and required fields.',
+    }])
 
     useStore.setState({ toasts: [] })
     apiMocks.graphSizes.mockRejectedValue(refusal)
     await useStore.getState().refreshSchemas()
-    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
-    expect(useStore.getState().toasts).toHaveLength(1)
+    expect(useStore.getState().toasts).toEqual([])
   })
 
   it.each([
@@ -1760,10 +1761,9 @@ describe('graph store — core authority ops', () => {
       `invalid graph: Join node 'join-1' requires exactly one incoming edge on input '${port}'`,
       'invalid_graph',
     )
-    apiMocks.schema.mockRejectedValue(refusal)
-    apiMocks.graphSizes.mockRejectedValue(refusal)
+    apiMocks.estimate.mockRejectedValue(refusal)
 
-    await useStore.getState().refreshSchemas()
+    await useStore.getState().requestRun('target')
 
     expect(useStore.getState().toasts).toMatchObject([{
       kind: 'error', msg: `This Join needs a ${role} dataset before it can run.`,
@@ -1776,34 +1776,52 @@ describe('graph store — core authority ops', () => {
       "invalid graph: Join node 'join-1' requires exactly one incoming edge on input 'a'; Join node 'join-1' requires exactly one incoming edge on input 'b'",
       'invalid_graph',
     )
-    apiMocks.schema.mockRejectedValue(refusal)
-    apiMocks.graphSizes.mockRejectedValue(refusal)
+    apiMocks.estimate.mockRejectedValue(refusal)
 
-    await useStore.getState().refreshSchemas()
+    await useStore.getState().requestRun('target')
 
     expect(useStore.getState().toasts).toMatchObject([{
       kind: 'error', msg: 'This Join needs a left dataset and a right dataset before it can run.',
     }])
   })
 
-  it('preserves an aggregated refusal when another structural error is present', async () => {
+  it('hides an unassigned edge id while explaining both missing Join inputs', async () => {
+    const refusal = new KernelError(
+      400,
+      "invalid graph: edge 'e-2-7092' must identify Join input 'a' or 'b' on node 'join-1-7091'; Join node 'join-1-7091' requires exactly one incoming edge on input 'a'; Join node 'join-1-7091' requires exactly one incoming edge on input 'b'",
+      'invalid_graph',
+    )
+    apiMocks.estimate.mockRejectedValue(refusal)
+
+    await useStore.getState().requestRun('target')
+
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'This Join needs a left dataset and a right dataset before it can run.',
+    }])
+  })
+
+  it('keeps an aggregated structural refusal out of the primary toast', async () => {
     const message = "invalid graph: edge 'e' references missing source node 'gone'; Join node 'j' requires exactly one incoming edge on input 'b'"
     const refusal = new KernelError(400, message, 'invalid_graph')
-    apiMocks.graphSizes.mockRejectedValue(refusal)
+    apiMocks.estimate.mockRejectedValue(refusal)
 
-    await useStore.getState().refreshSchemas()
+    await useStore.getState().requestRun('target')
 
-    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: message }])
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'This branch is not ready to run. Check its connections and required fields.',
+    }])
   })
 
   it('does not reinterpret a CustomJoin refusal as the built-in Join contract', async () => {
     const message = "invalid graph: CustomJoin node 'custom-1' requires exactly one incoming edge on input 'b'"
     const refusal = new KernelError(400, message, 'invalid_graph')
-    apiMocks.graphSizes.mockRejectedValue(refusal)
+    apiMocks.estimate.mockRejectedValue(refusal)
 
-    await useStore.getState().refreshSchemas()
+    await useStore.getState().requestRun('target')
 
-    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: message }])
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'This branch is not ready to run. Check its connections and required fields.',
+    }])
   })
 
   it('keeps preview inputs for full runs and refreshes moved heads only after acceptance', async () => {

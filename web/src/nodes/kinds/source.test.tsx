@@ -144,6 +144,17 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
   })
 
+  it('closes the Source registration dialog with Escape', async () => {
+    const data = { title: 'source', status: 'draft', config: {} }
+    render1(data)
+
+    requestSourceEntryAction('s1', 'browse')
+    expect(await screen.findByRole('dialog', { name: 'Register path or URL' })).toBeVisible()
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog', { name: 'Register path or URL' })).not.toBeInTheDocument()
+  })
+
   it('ignores Inspector entry actions when the Source is read-only', () => {
     const fileClick = vi.spyOn(HTMLInputElement.prototype, 'click')
     render1({ title: 'source', status: 'draft', config: {} })

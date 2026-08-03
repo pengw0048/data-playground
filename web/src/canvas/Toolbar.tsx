@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { useReactFlow, useViewport } from '@xyflow/react'
 import { allSpecs } from '../nodes'
+import { firstCompatibleInput, nodeOutputs } from '../nodes/registry'
 import { useStore, roleCanEdit } from '../store/graph'
 import { categoryOrder, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
@@ -25,6 +26,7 @@ export function Toolbar() {
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
   const doc = useStore((s) => s.doc)
   const addNode = useStore((s) => s.addNode)
+  const addConnectedNode = useStore((s) => s.addConnectedNode)
   const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
@@ -59,8 +61,28 @@ export function Toolbar() {
   const add = (kind: string) => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     const base = { x: c.x - 116, y: c.y - 40 }
-    const pos = safeToolbarPosition(useStore.getState().doc.nodes, base)
-    addNode(kind, pos)
+    const state = useStore.getState()
+    const pos = safeToolbarPosition(state.doc.nodes, base)
+    const source = state.selectedIds.length === 1
+      ? state.doc.nodes.find((node) => node.id === state.selectedIds[0])
+      : undefined
+    const output = source
+      ? nodeOutputs(source).find((port) => port.id === 'out') ?? nodeOutputs(source)[0]
+      : undefined
+    const input = output ? firstCompatibleInput(kind, output.wire) : undefined
+    const connected = source && output && input
+      ? addConnectedNode(kind, pos, {
+          source: source.id,
+          sourceHandle: output.id,
+          targetHandle: input.id,
+          wire: output.wire,
+        })
+      : null
+    if (!connected) addNode(kind, pos)
+    else {
+      const current = useStore.getState()
+      current.requestNodeReveal(current.doc.id, connected.id)
+    }
     setOpen(null)
   }
 
@@ -223,13 +245,14 @@ function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {
         </button>
       </Tooltip>
       {/* portal popover positioned once against the button (no percentage-based jump) */}
-      <Popover anchorRef={ref} open={open} onClose={onClose} width={210} placement="top" align="left">
+      <Popover anchorRef={ref} open={open} onClose={onClose} width={210} maxHeight={540} placement="top" align="left">
         <div className="px-2 py-[5px] text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
           {CATEGORY_LABEL[cat]}
         </div>
         {specs.map((s) => (
           <button
             key={s.kind}
+            aria-label={s.title}
             onClick={(e) => { e.stopPropagation(); onPick(s.kind) }}
             className="flex w-full items-center gap-[9px] rounded-md px-2 py-[7px] text-left hover:bg-accent"
           >

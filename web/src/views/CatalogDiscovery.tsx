@@ -701,6 +701,14 @@ interface FolderActions {
 function CatalogModal({ label, onClose, children }: {
   label: string; onClose: () => void; children: React.ReactNode
 }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose])
+
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={label}
       className="grid w-[460px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl"
@@ -1663,6 +1671,15 @@ export function AddDataModal({
   const fileRef = useRef<HTMLInputElement>(null)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
+
+  useEffect(() => {
+    if (registerOpen || uploading) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose, registerOpen, uploading])
 
   const upload = async (file?: File) => {
     if (!file || uploading) return

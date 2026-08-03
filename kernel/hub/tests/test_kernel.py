@@ -3129,6 +3129,23 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
 
 
+def test_restart_recovery_preserves_an_existing_output_display_name(tmp_path):
+    import duckdb
+    from hub.deps import Deps
+
+    workspace = str(tmp_path / "ws")
+    data_dir = str(tmp_path / "data")
+    first = Deps(workspace, data_dir)
+    uri = first.storage.output_uri("support-tickets-a1b2c3", ".parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id) TO '{uri}' (FORMAT PARQUET)")
+    first.catalog.register_output(
+        name="support_tickets", uri=uri, parents=[], pipeline="upload")
+
+    restarted = Deps(workspace, data_dir)
+
+    assert restarted.catalog.get_table(uri).name == "support_tickets"
+
+
 def test_catalog_output_receipt_attests_exact_unmanaged_version(tmp_path):
     from hub import metadb
 

@@ -42,7 +42,15 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await expect(chart).toContainText('4 rows', { timeout: 15_000 })
     await page.getByRole('button', { name: 'Close' }).click()
     await chart.getByRole('button', { name: 'View chart result' }).click()
-    await expect(page.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
+    const resultChart = page.getByRole('img', { name: 'bar chart, saved result' })
+    await expect(resultChart).toBeVisible()
+    const bars = await resultChart.locator('rect').evaluateAll((elements) => elements.map((element) => {
+      const rect = element as SVGRectElement
+      return { x: Number(rect.getAttribute('x')), width: Number(rect.getAttribute('width')) }
+    }))
+    expect(bars.length).toBeGreaterThan(0)
+    expect(Math.min(...bars.map((bar) => bar.x))).toBeGreaterThanOrEqual(48)
+    expect(Math.max(...bars.map((bar) => bar.x + bar.width))).toBeLessThanOrEqual(624)
     await expect(page.getByRole('button', { name: 'Preview sample' })).toHaveCount(0)
     await expect(page.getByTestId('panel-data').getByTitle('Refresh')).toHaveCount(0)
     await expect(chart.locator('[title="latest"]')).toBeVisible()

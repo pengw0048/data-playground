@@ -12,6 +12,7 @@ import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt }
 import type { CanvasDoc, CanvasParameterDeclaration } from '../types/graph'
 import type { DatasetViewerCanvasReturn } from '../router'
 import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
+import { presentRunError } from '../lib/runErrors'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -259,10 +260,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <span className="text-destructive">✕</span>
             <span className="text-[13px] font-semibold text-destructive">run failed</span>
           </div>
-          <div className="dp-mono mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 p-2.5 text-[11px] text-muted-foreground">
-            {run?.error ?? st?.error ?? 'unknown error'}
-          </div>
-          {st && <RunOutputs outputs={st.outputs} />}
+          <ReadableRunError raw={run?.error ?? st?.error} nodeTitle={target?.data.title}
+            config={target?.data.config} details />
+          {st && <RunOutputs outputs={st.outputs} showErrors={false} />}
           <div className="mt-3 flex gap-2">
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved
@@ -457,7 +457,7 @@ function formatByteEstimate(value: number): string {
   return `${amount} ${units[unit]}`
 }
 
-function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
+function RunOutputs({ outputs, showErrors = true }: { outputs: RunOutput[]; showErrors?: boolean }) {
   if (outputs.length === 0) return null
   return (
     <div aria-label="Run outputs" className="mt-2.5 flex flex-col gap-1.5">
@@ -477,7 +477,7 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
                     : 'bg-muted text-muted-foreground',
               )}>{output.outcome}</span>
             </div>
-            {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+            {showErrors && output.error && <ReadableRunError raw={output.error} />}
           </div>
         )
       })}
@@ -500,11 +500,31 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
               {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
             </div>
             {p.status === 'failed' && p.error && (
-              <div className="dp-mono ml-[18px] whitespace-pre-wrap rounded bg-destructive/10 px-2 py-1 text-[10.5px] text-muted-foreground">{p.error}</div>
+              <div className="ml-[18px]"><ReadableRunError raw={p.error} /></div>
             )}
           </div>
         )
       })}
+    </div>
+  )
+}
+
+function ReadableRunError({ raw, nodeTitle, config, details = false }: {
+  raw?: string | null
+  nodeTitle?: string
+  config?: Record<string, unknown>
+  details?: boolean
+}) {
+  const error = presentRunError(raw, { nodeTitle, config })
+  return (
+    <div className="mt-2 rounded-lg bg-destructive/10 p-2.5 text-[11px] text-destructive">
+      <div className="leading-relaxed">{error.summary}</div>
+      {details && error.details && error.details !== error.summary && (
+        <details className="mt-2 text-muted-foreground">
+          <summary className="cursor-pointer select-none font-semibold text-foreground">Details</summary>
+          <pre className="dp-mono mt-1.5 max-h-44 overflow-auto whitespace-pre-wrap text-[10px] leading-relaxed">{error.details}</pre>
+        </details>
+      )}
     </div>
   )
 }

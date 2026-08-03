@@ -196,7 +196,8 @@ def resolve_config(node: GraphNode) -> dict:
     if t == "filter":
         return {"predicate": cfg.get("predicate", "")}
     if t == "assert":  # a data-quality gate: rows where `predicate` is not TRUE = violations
-        return {"predicate": cfg.get("predicate", ""), "severity": cfg.get("severity", "warn")}
+        # A visible check must be a gate unless the author explicitly changes it to a warning.
+        return {"predicate": cfg.get("predicate", ""), "severity": cfg.get("severity", "error")}
     if t == "select":
         return {"expr": cfg.get("select") or cfg.get("expr") or ""}
     if t == "sql":

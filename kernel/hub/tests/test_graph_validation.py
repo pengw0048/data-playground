@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from hub import graph as graph_mod
 from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.ir import resolve_config
 from hub.main import app
 from hub.models import Graph, GraphEdge, GraphNode
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, ParamSpec, PortSpec
@@ -27,6 +28,12 @@ def _edge(edge_id: str, source: str, target: str, source_handle: str | None = No
 
 def _graph(nodes: list[GraphNode], edges: list[GraphEdge]) -> Graph:
     return Graph(id="validation", nodes=nodes, edges=edges)
+
+
+def test_assert_defaults_to_a_blocking_check():
+    severity = next(param for param in SPECS["assert"].params if param.name == "severity")
+    assert severity.default == "error"
+    assert resolve_config(_node("quality", "assert"))["severity"] == "error"
 
 
 @pytest.mark.parametrize(("graph", "message"), [
@@ -155,6 +162,25 @@ def test_execution_and_plan_ingresses_reject_a_join_without_a_match_condition():
         response = client.post(path, json=body)
         assert response.status_code == 400, (path, response.status_code, response.text)
         assert "needs at least one left and right column" in response.text
+
+
+def test_target_preview_ignores_an_unfinished_sibling_branch():
+    graph = {
+        "id": "target-cone-preview", "version": 1,
+        "nodes": [
+            _node("healthy", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("other", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _wire("unfinished", "join"),
+        ],
+        "edges": [
+            {"id": "other-left", "source": "other", "target": "unfinished", "targetHandle": "a"},
+        ],
+    }
+
+    preview = client.post("/api/run/preview", json={"graph": graph, "nodeId": "healthy"})
+
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["rows"]
 
 
 def test_background_graph_metadata_allows_finishing_an_incomplete_join(monkeypatch):

@@ -176,7 +176,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              # shows). severity=error fails the run before any downstream write commits (P0-DATA-01).
              outputs=[_out(id="pass", label="passes"), _out(label="violations")],
              params=[ParamSpec(name="predicate", type="text", label="must hold for every row (SQL)"),
-                     ParamSpec(name="severity", type="select", options=["warn", "error"], default="warn")],
+                     ParamSpec(name="severity", type="select", options=["error", "warn"], default="error")],
              blurb="Check every row against a rule — error severity blocks downstream writes"),
     NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
              inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset

@@ -141,6 +141,15 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(onCompleted).toHaveBeenCalled()
   })
 
+  it('closes the add-data dialog with Escape when no upload is running', () => {
+    const onClose = vi.fn()
+    render(<AddDataModal onClose={onClose} onUploadDataset={vi.fn()} onCompleted={vi.fn()} />)
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
   it('states the kernel path convention and keeps an unreachable registration actionable', async () => {
     mocks.registerDataset.mockRejectedValue(new Error('HTTP 400: cannot read /mounted/missing.parquet'))
     render(<AddDataModal onClose={vi.fn()} onUploadDataset={vi.fn()} onCompleted={vi.fn()} />)

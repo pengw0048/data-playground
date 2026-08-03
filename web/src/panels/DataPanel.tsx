@@ -1163,13 +1163,24 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
   const y0 = yPix(Math.min(Math.max(0, yMin), yMax))  // 0 clamped into the plotted range → the baseline row
   const numX = pts.every((p) => typeof p.x === 'number')
   const xs = pts.map((p) => Number(p.x)), xMin = Math.min(...xs), xMax = Math.max(...xs), xSpan = xMax - xMin || 1
-  const xPix = (i: number) => (type === 'scatter' && numX)
-    ? padL + ((xs[i] - xMin) / xSpan) * plotW
-    : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
-  const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01) ? v.toExponential(1) : (Math.round(v * 100) / 100).toString())
+  const bandW = plotW / pts.length
+  const xPix = (i: number) => type === 'bar'
+    ? padL + (i + 0.5) * bandW
+    : (type === 'scatter' && numX)
+      ? padL + ((xs[i] - xMin) / xSpan) * plotW
+      : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
+  const fmt = (v: number) => new Intl.NumberFormat(undefined, {
+    notation: Math.abs(v) >= 1_000 ? 'compact' : 'standard',
+    maximumFractionDigits: Math.abs(v) < 0.01 ? 3 : 1,
+  }).format(v)
   const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
-  const barW = Math.max(2, (plotW / pts.length) * 0.7)
+  // Bars occupy the centre of an ordinal band. A point scale puts the first and last centres on the
+  // plot boundary, clipping both bars; cap the minimum width to the band so dense charts stay inside.
+  const barW = Math.min(bandW, Math.max(1, bandW * 0.72))
   const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+  const yTicks = yMax === yMin
+    ? [yMin]
+    : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
   const unit = grouped ? 'group' : 'point'
   const units = pts.length === 1 ? unit : `${unit}s`
   const scopeSummary = completeness === 'capped'
@@ -1184,20 +1195,28 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
   return (
     <div className="p-3">
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart, ${ariaScope}`}>
-        {/* y axis: zero/baseline + min/max labels */}
+        {/* y axis: labelled grid plus the zero baseline when it is in range */}
         <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
-        <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="hsl(var(--border))" />
-        {[yMax, yMin].map((v, k) => (
-          <text key={k} x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10" fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+        {yTicks.map((v, index) => (
+          <g key={index}>
+            <line x1={padL} y1={yPix(v)} x2={W - padR} y2={yPix(v)}
+              stroke="hsl(var(--border))" strokeOpacity={index === 0 ? 1 : 0.55} />
+            <text x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10"
+              fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+          </g>
         ))}
         {(type === 'bar') && pts.map((p, i) => (
           <rect key={i} x={xPix(i) - barW / 2} y={Math.min(yPix(p.y), y0)} width={barW}
-            height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85} />
+            height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85}>
+            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
+          </rect>
         ))}
         {(type === 'area') && <polygon points={`${padL},${y0} ${line} ${xPix(pts.length - 1)},${y0}`} fill="hsl(var(--primary))" opacity={0.2} />}
         {(type === 'line' || type === 'area') && <polyline points={line} fill="none" stroke="hsl(var(--primary))" strokeWidth={1.75} />}
         {(type === 'scatter' || type === 'line' || type === 'area') && pts.map((p, i) => (
-          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85} />
+          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85}>
+            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
+          </circle>
         ))}
         {/* x tick labels */}
         {tickIdx.map((i) => (
@@ -1205,6 +1224,9 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
             {String(pts[i]?.x).slice(0, 10)}
           </text>
         ))}
+        <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
+          fill="hsl(var(--muted-foreground))" fontWeight="600"
+          transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
         <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
       <div className="mt-1 text-center text-[10.5px] text-muted-foreground">

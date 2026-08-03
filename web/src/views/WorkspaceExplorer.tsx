@@ -1039,31 +1039,28 @@ function WorkspaceMixedExplorer() {
       </div>}
 
       {!searchQuery && !loading && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
-        <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
+        {sortSupported && <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
           setSortMode(event.target.value as typeof sortMode)
           setSelectedResourceIds(new Set())
-        }} disabled={!sortSupported} title={!sortSupported ? queryCapabilities.reason ?? undefined : undefined}
+        }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
-          <option value="source">{sortSupported ? 'Default order' : 'Source order'}</option>
+          <option value="source">Default order</option>
           <option value="name-asc">Name A–Z</option>
           <option value="name-desc">Name Z–A</option>
           <option value="updated-desc">Recently updated</option>
           <option value="updated-asc">Least recently updated</option>
-        </select>
-        <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
+        </select>}
+        {kindFilterSupported && <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
           setKindFilter(event.target.value as typeof kindFilter)
           setSelectedResourceIds(new Set())
-        }} disabled={!kindFilterSupported} title={!kindFilterSupported ? queryCapabilities.reason ?? undefined : undefined}
+        }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="all">All types</option>
           <option value="container">Folders</option>
           <option value="canvas">Canvases</option>
           <option value="dataset">Datasets</option>
           <option value="dataset_view">Saved views</option>
-        </select>
-        {(!sortSupported || !kindFilterSupported) && queryCapabilities.reason
-          && <span data-testid="workspace-query-capability-note"
-            className="min-w-[240px] max-w-[560px] flex-1 text-[11px] leading-snug text-muted-foreground">{queryCapabilities.reason}</span>}
+        </select>}
         {error && (sortMode !== 'source' || kindFilter !== 'all') && <button type="button" onClick={() => {
           setSortMode('source')
           setKindFilter('all')
@@ -1211,7 +1208,24 @@ function WorkspaceMixedExplorer() {
         pushToast('DatasetView deleted', 'success')
         setWorkspaceResource(`container:${containerId}`)
       }} />}
-      {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
+      {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail}
+        onRegister={() => {
+          setSelectedDetached(null)
+          setWorkspaceResource(`container:${containerId}`)
+          setAddDataOpen(true)
+        }}
+        onRemoved={async () => {
+          if (!selectedDetached.placementId || selectedDetached.version == null) {
+            throw new Error('Reload this dataset before removing it')
+          }
+          await api.workspaceRemoveDetachedDataset(selectedDetached.placementId, {
+            expectedVersion: selectedDetached.version,
+          })
+          setSelectedDetached(null)
+          setWorkspaceResource(`container:${containerId}`)
+          reload()
+          pushToast('Unavailable dataset removed from Workspace', 'success')
+        }} />}
       {addDataOpen && <AddDataModal onClose={() => setAddDataOpen(false)} onUploadDataset={uploadDataset}
         onCompleted={reload} />}
       {createOpen && canvasDestination(container, 'create') && <NewCanvasDialog container={container!} onClose={() => setCreateOpen(false)}
@@ -2024,6 +2038,14 @@ function MoveCanvasDialog({ resources, sourceContainer, sourcePath, onClose, onM
 }
 
 function Modal({ label, onClose, children }: { label: string; onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose])
+
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={label} className="grid w-[460px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2"><h2 className="flex-1 text-[15px] font-bold">{label}</h2><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
@@ -2531,11 +2553,47 @@ function RelinkResourceDialog({ resource, onClose, onRelinked }: {
   </Modal>
 }
 
-function DetachedResource({ resource, onClose }: { resource: WorkspaceResource; onClose: () => void }) {
+function DetachedResource({ resource, onClose, onRegister, onRemoved }: {
+  resource: WorkspaceResource
+  onClose: () => void
+  onRegister: () => void
+  onRemoved: () => Promise<void>
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    if (busy) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [busy, onClose])
+  const remove = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try { await onRemoved() }
+    catch (caught) { setError(errorMessage(caught)); setBusy(false) }
+  }
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] flex-col border-l border-border bg-card p-5 shadow-xl">
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
-      <p className="mt-5 text-[13px] leading-6 text-muted-foreground">This Workspace placement is detached: its local dataset is no longer available. Its stable placement remains visible, but there is no dataset detail to show.</p>
+      <p className="mt-5 text-[13px] leading-6 text-muted-foreground">The file behind this dataset is no longer available. Register it again, or remove this unavailable item from Workspace.</p>
+      <div className="mt-5 flex gap-2">
+        <button type="button" onClick={onRegister}
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background">Register data…</button>
+        <button type="button" onClick={() => setConfirming(true)}
+          className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-destructive">Remove from Workspace…</button>
+      </div>
+      {confirming && <div className="mt-4 rounded-lg border border-destructive/25 bg-destructive/5 p-3">
+        <p className="text-[12px] leading-5 text-muted-foreground">Remove this unavailable item? This does not delete any source file.</p>
+        {error && <div role="alert" className="mt-2 text-[12px] text-destructive">{error}</div>}
+        <div className="mt-3 flex justify-end gap-2">
+          <button type="button" disabled={busy} onClick={() => setConfirming(false)} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+          <button type="button" disabled={busy} onClick={() => void remove()} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Removing…' : 'Remove'}</button>
+        </div>
+      </div>}
     </div>
   </div>
 }
