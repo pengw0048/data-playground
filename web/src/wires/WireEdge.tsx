@@ -49,7 +49,13 @@ export function WireEdge(props: EdgeProps) {
       path={path}
       markerEnd={active ? 'url(#dp-arrow-active)' : selected ? 'url(#dp-arrow-sel)' : markerEnd}
       interactionWidth={28}
-      style={{ stroke, strokeWidth: active ? 2.2 : 1.5, strokeDasharray: warned && !active && !selected ? '5 3' : undefined, transition: 'stroke .15s' }}
+      // React Flow owns the focusable <g>, so keyboard focus reaches this path through CSS variables
+      style={{
+        stroke: `var(--dp-edge-focus-stroke, ${stroke})`,
+        strokeWidth: `var(--dp-edge-focus-width, ${active ? 2.2 : 1.5})`,
+        strokeDasharray: warned && !active && !selected ? '5 3' : undefined,
+        transition: 'stroke .15s',
+      }}
     />
   )
 }

@@ -177,6 +177,42 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('focus: the Workspace search box and a focused edge are visibly indicated', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await page.locator('.react-flow__node').first().hover()
+    // Wire the two nodes so there is an edge to focus.
+    const from = page.locator('.react-flow__node').first().locator('.react-flow__handle-right')
+    const to = page.locator('.react-flow__node').nth(1).locator('.react-flow__handle-left')
+    await from.dragTo(to)
+    const edge = page.locator('.react-flow__edge').first()
+    await expect(edge).toBeVisible()
+
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    expect(await tabUntil(page, edge, 80)).toBe(true)
+    const edgeStroke = await edge.evaluate((element) => {
+      const path = element.querySelector('.react-flow__edge-path')!
+      const style = getComputedStyle(path)
+      return { stroke: style.stroke, width: style.strokeWidth, focusVisible: element.matches(':focus-visible') }
+    })
+    expect(edgeStroke.focusVisible).toBe(true)
+    expect(parseFloat(edgeStroke.width), 'a focused edge must be drawn thicker than a resting one').toBeGreaterThan(1.5)
+
+    await backToWorkspace(page)
+    const search = page.getByRole('textbox', { name: /Search views, datasets/ })
+    await search.focus()
+    const ring = await search.evaluate((element) => {
+      const box = element.closest('form')!
+      const style = getComputedStyle(box)
+      return { boxShadow: style.boxShadow, outlineStyle: style.outlineStyle, ownOutline: getComputedStyle(element).outlineStyle }
+    })
+    const indicated = (ring.boxShadow !== 'none' && ring.boxShadow.includes('rgb'))
+      || ring.outlineStyle !== 'none' || ring.ownOutline !== 'none'
+    expect(indicated, `focused search box needs an indicator; got ${JSON.stringify(ring)}`).toBe(true)
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
