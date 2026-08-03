@@ -1,5 +1,4 @@
 import { expect, test } from '@playwright/test'
-import { createHash } from 'node:crypto'
 
 test('deep-links an exact Transform and atomically creates its target Canvas', async ({ page, request }) => {
   const createdUser = await request.post('/api/users', {
@@ -34,15 +33,15 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await page.goto(`/#/transforms/${encodeURIComponent(transform.id)}?version=${transform.version}`)
   await expect(page.getByRole('heading', { name: title })).toBeVisible()
   const implementation = page.getByRole('region', { name: 'Implementation source' })
+  const implementationDetails = implementation.locator('details')
+  await expect(implementationDetails).not.toHaveAttribute('open')
+  await implementation.getByText('Implementation source', { exact: true }).click()
   await expect(implementation).toContainText("row['score'] = 1.0")
-  await implementation.getByText('Source integrity').click()
-  await expect(implementation).toContainText(
-    `SHA-256 ${createHash('sha256').update(sourceCode).digest('hex')}`,
-  )
-  await expect(page.getByRole('button', { name: `Use exact ${transform.version}` })).toBeEnabled()
+  await expect(implementation).not.toContainText('SHA-256')
+  await expect(page.getByRole('button', { name: `Use ${transform.version}` })).toBeEnabled()
   expect(new URL(page.url()).hash).toContain(`version=${transform.version}`)
 
-  await page.getByRole('button', { name: `Use exact ${transform.version}` }).click()
+  await page.getByRole('button', { name: `Use ${transform.version}` }).click()
   await page.getByLabel('New Canvas name').fill(`Exact ${title}`)
   await page.getByRole('button', { name: 'Create and open' }).click()
   await expect(page).toHaveURL(/#\/canvas\/[^?]+\?node=[^&]+$/)
@@ -58,9 +57,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await expect(page).toHaveURL(canvasUrl)
   const canvasDefinition = page.getByRole('region', { name: 'Library processor definition' })
   await expect(canvasDefinition).toContainText(sourceCode)
-  await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).not.toBeVisible()
-  await canvasDefinition.getByText('Technical details').click()
-  await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).toBeVisible()
+  await expect(canvasDefinition.getByText(`${transform.id}@${transform.version}`)).toHaveCount(0)
   await page.getByRole('button', { name: 'Close' }).click()
   await expect(page).toHaveURL(canvasUrl)
 

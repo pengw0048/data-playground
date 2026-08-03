@@ -39,6 +39,10 @@ describe('CanvasCopyModal', () => {
     const onClose = vi.fn()
     render(<CanvasCopyModal source={{ canvasId: 'source', version: 7, name: 'Research' }} onClose={onClose} />)
     expect(await screen.findByText(/Destination:/)).toHaveTextContent('Workspace')
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', {
+      limit: 100,
+      source: 'local',
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Review copy' }))
     await screen.findByText('2 nodes · 1 connections · 0 requirements')
     const request = {
@@ -48,7 +52,7 @@ describe('CanvasCopyModal', () => {
     }
     expect(mocks.validateCanvasCopy).toHaveBeenCalledWith(expect.objectContaining(request))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Duplicate and open' }))
     await waitFor(() => expect(openFile).toHaveBeenCalledWith('copied-canvas'))
     expect(mocks.createCanvasCopy).toHaveBeenCalledWith(expect.objectContaining({
       ...request,
@@ -56,6 +60,31 @@ describe('CanvasCopyModal', () => {
       confirmWarnings: false,
     }))
     expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('starts a file-manager duplicate in its current local folder', async () => {
+    const root = {
+      id: 'container:workspace-local-root', kind: 'container' as const, name: 'Workspace',
+      version: 3, detached: false, source: 'local' as const,
+    }
+    const research = {
+      id: 'container:research', kind: 'container' as const, name: 'Research',
+      version: 8, detached: false, source: 'local' as const,
+    }
+    mocks.workspaceBrowse.mockResolvedValueOnce({
+      container: research, items: [], hasMore: false, completeness: 'complete', sources: [],
+    })
+
+    render(<CanvasCopyModal source={{ canvasId: 'source', version: 7, name: 'Research' }}
+      initialDestination={{ containerId: 'research', path: [root, research] }} onClose={() => {}} />)
+
+    expect(await screen.findByText(/Destination:/)).toHaveTextContent('Research')
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('research', { limit: 100, source: 'local' })
+    expect(screen.getByRole('navigation', { name: 'Choose copy destination' })).toHaveTextContent('WorkspaceResearch')
+    fireEvent.click(screen.getByRole('button', { name: 'Review copy' }))
+    await waitFor(() => expect(mocks.validateCanvasCopy).toHaveBeenCalledWith(expect.objectContaining({
+      containerId: 'research', expectedContainerVersion: 8,
+    })))
   })
 
   it('keeps one copy UUID across a lost-response retry and requires warning acknowledgement', async () => {
@@ -88,7 +117,7 @@ describe('CanvasCopyModal', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review copy' }))
     await screen.findByText('2 nodes · 1 connections · 0 requirements')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Duplicate and open' }))
     expect(await screen.findByRole('status')).toHaveTextContent(
       'Creating your Canvas… This request has been submitted and cannot be cancelled.')
     const cancel = screen.getByRole('button', { name: 'Cancel' })

@@ -87,7 +87,7 @@ describe('CanvasInboxPopover', () => {
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
 
-    const trigger = await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' })
+    const trigger = await screen.findByRole('button', { name: 'Inbox, 2 unread' })
     expect(trigger).toHaveTextContent('2')
     expect(screen.getByTestId('canvas-inbox-unread-badge')).toHaveClass('right-0', 'top-0')
     expect(screen.getByTestId('canvas-inbox-unread-badge')).not.toHaveClass('-right-1', '-top-1')
@@ -108,7 +108,7 @@ describe('CanvasInboxPopover', () => {
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
 
-    const trigger = await screen.findByRole('button', { name: 'Inbox, no unread outcomes' })
+    const trigger = await screen.findByRole('button', { name: 'Inbox' })
     expect(screen.queryByTestId('canvas-inbox-unread-badge')).not.toBeInTheDocument()
     await user.click(trigger)
     expect(await screen.findByText('You’re all caught up.')).toBeInTheDocument()
@@ -117,7 +117,7 @@ describe('CanvasInboxPopover', () => {
   it('marks all unread outcomes with one atomic request without leaving Canvas', async () => {
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
-    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' }))
+    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread' }))
     const preview = await screen.findByRole('dialog', { name: 'Inbox preview' })
 
     await user.click(within(preview).getByRole('button', { name: 'Mark all read' }))
@@ -125,14 +125,14 @@ describe('CanvasInboxPopover', () => {
     await waitFor(() => expect(mocks.inboxMarkAllRead).toHaveBeenCalledTimes(1))
     expect(mocks.inboxMarkRead).not.toHaveBeenCalled()
     expect(within(preview).getByText('You’re all caught up.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Inbox, no unread outcomes' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Inbox' })).toBeInTheDocument()
     expect(mocks.setInboxQuery).not.toHaveBeenCalled()
   })
 
   it('opens an authorized job while marking its outcome read', async () => {
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
-    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' }))
+    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread' }))
     const preview = await screen.findByRole('dialog', { name: 'Inbox preview' })
 
     const openJobs = within(preview).getAllByRole('button', { name: 'Open job' })
@@ -158,7 +158,7 @@ describe('CanvasInboxPopover', () => {
     })
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
-    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' }))
+    await user.click(await screen.findByRole('button', { name: 'Inbox, 2 unread' }))
     const preview = await screen.findByRole('dialog', { name: 'Inbox preview' })
 
     expect(within(preview).getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
@@ -172,10 +172,10 @@ describe('CanvasInboxPopover', () => {
     const user = userEvent.setup()
     render(<CanvasInboxPopover />)
 
-    const trigger = await screen.findByRole('button', { name: 'Inbox, 2 unread outcomes' })
+    const trigger = await screen.findByRole('button', { name: 'Inbox, 2 unread' })
     await user.click(trigger)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t load Inbox: network lost')
-    expect(screen.getByRole('button', { name: 'Inbox, 2 unread outcomes' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Inbox, 2 unread' })).toBeInTheDocument()
   })
 })

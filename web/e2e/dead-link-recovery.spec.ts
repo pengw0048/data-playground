@@ -18,7 +18,7 @@ test('replaces an unknown route with Workspace without borrowing a Canvas', asyn
 
     await page.evaluate(() => { location.hash = '#/not-a-route' })
     await expect(page).toHaveURL(/#\/workspace$/)
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
     await expect(page.getByTestId('toolbar')).toHaveCount(0)
     await page.goBack()
     await expect(page).toHaveURL(canvasUrl)
@@ -27,7 +27,7 @@ test('replaces an unknown route with Workspace without borrowing a Canvas', asyn
     await page.evaluate(() => { location.hash = '#//another-unknown-route' })
     await expect(page).toHaveURL(/#\/workspace$/)
     await page.reload()
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
     await page.goBack()
     await expect(page).toHaveURL(canvasUrl)
 
@@ -53,7 +53,7 @@ test('recovers from unavailable Transform and distribution-report deep links', a
   await expect(page.getByRole('alert')).toContainText(/not found/i)
   await page.getByRole('button', { name: 'Back to Transforms' }).click()
   await expect(page).toHaveURL(/#\/transforms\?q=robot$/)
-  await expect(page.getByText('Select a Transform to inspect its exact versions and use it.')).toBeVisible()
+  await expect(page.getByText('Select a Transform to inspect its versions and use it.')).toBeVisible()
   await page.goBack()
   await expect(page).toHaveURL(/#\/workspace$/)
 

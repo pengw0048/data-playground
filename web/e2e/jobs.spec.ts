@@ -11,13 +11,12 @@ const failedJob = {
 }
 
 const jobFilterLabels = [
-  'Filter jobs by status',
   'Filter jobs by canvas',
-  'Filter jobs by node',
-  'Filter jobs by backend',
+  'Filter jobs by step',
+  'Filter jobs by compute target',
   'Filter jobs from time',
   'Filter jobs to time',
-  'Filter jobs by text',
+  'Filter jobs by search',
 ]
 
 async function expectJobsFiltersToFit(page: Page) {
@@ -84,26 +83,22 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.goto('/#/jobs?canvas=not-accessible&node=exact-node&backend=exact-backend')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Runs and background tasks' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
-  await page.getByText('Advanced filters', { exact: true }).click()
-  await expect(page.getByRole('option', { name: 'Exact canvas ID: not-accessible' })).toHaveCount(1)
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Job filters' })).toBeVisible()
+  await expect(page.getByRole('option', { name: 'Canvas from link (not in this list)' })).toHaveCount(1)
   await expect(page.getByLabel('Filter jobs by canvas', { exact: true })).toHaveValue('not-accessible')
-  await expect(page.getByRole('option', { name: 'Exact node ID: exact-node' })).toHaveCount(1)
-  await expect(page.getByLabel('Filter jobs by node', { exact: true })).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
-  await expect(page.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toHaveCount(1)
-  await expect(page.getByLabel('Filter jobs by backend', { exact: true })).toHaveValue('exact-backend')
+  await expect(page.getByLabel('Filter jobs by step', { exact: true })).toHaveValue('exact-node')
+  await expect(page.getByLabel('Filter jobs by compute target', { exact: true })).toHaveValue('exact-backend')
   await expect(page.getByLabel(/Filter jobs by canvas id \(exact\)/i)).toHaveCount(0)
-  await expect(page.getByLabel(/Filter jobs by node id \(exact\)/i)).toHaveCount(0)
+  await expect(page.getByLabel(/Filter jobs by canvas step id \(exact\)/i)).toHaveCount(0)
   await expect(page.getByLabel(/Filter jobs by backend id \(exact\)/i)).toHaveCount(0)
   await page.evaluate(() => { location.hash = '#/jobs?node=orphan-node' })
   await expect(page).toHaveURL(/#\/jobs\?node=orphan-node$/)
   await page.reload()
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await page.getByText('Advanced filters', { exact: true }).click()
-  await expect(page.getByRole('option', { name: 'Exact node ID: orphan-node' })).toHaveCount(1)
-  await expect(page.getByLabel('Filter jobs by node', { exact: true }))
-    .toHaveValue(JSON.stringify([null, 'orphan-node']))
-  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption('')
+  await expect(page.getByLabel('Filter jobs by step', { exact: true })).toHaveValue('orphan-node')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/#\/jobs$/)
   for (const width of [1024, 1280, 1440]) {
     await page.setViewportSize({ width, height: 720 })
@@ -111,41 +106,45 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   }
   await page.setViewportSize({ width: 1280, height: 720 })
   await expect(page.getByRole('button', { name: /retired-identity-task/ })).toHaveCount(0)
-  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('')
-  await page.getByLabel('Filter jobs by backend', { exact: true }).selectOption('')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('canvas-jobs')
   await expect(page).toHaveURL(/canvas=canvas-jobs/)
-  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption(JSON.stringify(['canvas-jobs', 'publish']))
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('publish')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/canvas=canvas-jobs&node=publish/)
-  await page.getByLabel('Filter jobs by backend', { exact: true }).selectOption('local')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('local')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
   await expect(page).toHaveURL(/backend=local/)
-  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by step', { exact: true }).press('Enter')
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('')
-  await page.getByLabel('Filter jobs by backend', { exact: true }).selectOption('')
-  await page.getByLabel('Filter jobs by status').selectOption('failed')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).fill('')
+  await page.getByLabel('Filter jobs by compute target', { exact: true }).press('Enter')
+  await page.getByRole('button', { name: 'Failed', exact: true }).click()
   await expect(page).toHaveURL(/#\/jobs\?status=failed/)
 
-  await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
+  await page.getByTestId('job-row-run-failed').click()
   await expect(page.getByRole('alert')).toContainText('destination unavailable')
-  await expect(page.getByRole('link', { name: 'Open node' })).toHaveAttribute(
+  await expect(page.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute(
     'href', '#/canvas/canvas-jobs?node=publish')
   await expect(page).toHaveURL(/run=run-failed/)
-  await page.getByText('Technical evidence', { exact: true }).click()
-  await page.getByRole('button', { name: /Execution manifest/ }).click()
-  await expect(page.getByText('Submitted graph')).toBeVisible()
-  await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Submitted graph')).toHaveCount(0)
   await page.goBack()
   await expect(page).toHaveURL(/#\/jobs\?status=failed$/)
-  await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
+  await page.getByTestId('job-row-run-failed').click()
   await page.reload()
   await expect(page.getByRole('alert')).toContainText('destination unavailable')
 
   await page.getByRole('button', { name: 'Load more' }).click()
   await expect(page.getByText(/Couldn’t load more Jobs/)).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
   await page.getByRole('button', { name: 'Retry load more' }).click()
-  await expect(page.getByRole('button', { name: 'Open run run-older in Climate analysis' })).toBeVisible()
+  await expect(page.getByTestId('job-row-run-older')).toBeVisible()
 })
 
 test('a completed Jobs row stays concise and opens human-named retained results @ux-smoke', async ({ page }) => {
@@ -177,9 +176,7 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   }))
 
   await page.goto('/#/jobs')
-  const row = page.getByRole('button', {
-    name: 'Open run run-complete in Climate analysis', expanded: false,
-  })
+  const row = page.getByTestId('job-row-run-complete')
   await expect(row).toContainText('done')
   await expect(row).toContainText('2 outputs available')
   await expect(row).toContainText('1 row')
@@ -190,8 +187,40 @@ test('a completed Jobs row stays concise and opens human-named retained results 
   await expect(page.getByRole('button', { name: 'Open result 1' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open result 2' })).toBeVisible()
   await expect(page.getByText(/transform:clean/)).toBeHidden()
-  await page.getByText('Technical evidence', { exact: true }).click()
-  await expect(page.getByText(/Result 1 · transform:clean, Result 2 · transform:rejected/)).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+  await expect(page.getByText(/transform:clean|transform:rejected/)).toHaveCount(0)
+})
+
+test('defaults to my Jobs and can show visible work from other users @ux-smoke', async ({ page }) => {
+  const requestedScopes: Array<string | null> = []
+  await page.route('**/api/canvas', async (route) => route.fulfill({
+    json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }],
+  }))
+  await page.route('**/api/jobs?*', async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get('scope')
+    requestedScopes.push(scope)
+    await route.fulfill({ json: {
+      items: scope === 'all'
+        ? [{ ...failedJob, isMine: false, createdById: 'peer', createdByName: 'Ada' }]
+        : [{ ...failedJob, isMine: true, createdById: 'local', createdByName: 'Local' }],
+      nextCursor: null,
+      hasMore: false,
+    } })
+  })
+
+  await page.goto('/#/jobs')
+  await expect(page.getByTestId('job-row-run-failed')).toBeVisible()
+  expect(requestedScopes[0]).toBeNull()
+  await expect(page.getByText(/Ada/)).toHaveCount(0)
+
+  await page.getByTestId('jobs-scope-all').click()
+  await expect(page).toHaveURL(/#\/jobs\?scope=all$/)
+  await expect(page.getByText(/Ada/)).toBeVisible()
+  expect(requestedScopes).toContain('all')
+
+  await page.getByTestId('jobs-scope-mine').click()
+  await expect(page).toHaveURL(/#\/jobs$/)
+  await expect(page.getByText(/Ada/)).toHaveCount(0)
 })
 
 test('long shared-prefix Canvas names keep their suffixes visible without widening Jobs @ux-smoke', async ({ page }) => {
@@ -291,6 +320,19 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.route('**/api/canvas', async (route) => route.fulfill({ json: [{ id: 'canvas-merge', name: 'Column enrichment', version: 1, role: 'editor' }] }))
   await page.route('**/api/jobs?*', async (route) => route.fulfill({ json: { items: [mergeJob], nextCursor: null, hasMore: false } }))
   await page.route('**/api/canvas/canvas-merge/runs/merge-task-1/manifest', async (route) => route.fulfill({ json: { availability: 'not_recorded' } }))
+  await page.route((url) => decodeURIComponent(url.pathname) === '/api/workspace/resources/dataset:dataset-1', async (route) => route.fulfill({
+    json: {
+      resource: {
+        id: 'dataset:dataset-1', kind: 'dataset', name: 'Published column enrichment', resourceId: 'dataset-1',
+        detached: false, source: 'local',
+      },
+      ancestors: [{
+        id: 'container:workspace-local-root', kind: 'container', name: 'Workspace',
+        detached: false, source: 'local',
+      }],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    },
+  }))
   await page.route('**/api/catalog/tables/dataset-1?registration=true', async (route) => route.fulfill({
     json: { ...template, id: 'dataset-1', name: 'Published column enrichment' },
   }))
@@ -319,25 +361,76 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   })
 
   await page.goto('/#/jobs')
-  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
-  await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
+  await expect(page.getByTestId('job-row-merge-task-1')).toBeVisible()
+  await page.getByTestId('job-row-merge-task-1').click()
   const exactDataset = page.getByRole('link', { name: 'Open dataset' })
-  await page.getByText('Technical evidence', { exact: true }).click()
-  await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
-  await expect(page.getByText('rev-published')).toBeVisible()
+  await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
   await expect(page.getByRole('link', { name: 'Open dataset' })).toHaveCount(1)
   await expect(exactDataset).toHaveAttribute(
     'href',
-    '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-published&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-task-1',
+    '#/workspace/dataset%3Adataset-1?revision=rev-published&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-task-1',
   )
   await exactDataset.click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
   const viewer = page.getByRole('region', { name: 'Published column enrichment' })
-  await expect(viewer).toContainText('Current exact version')
-  await expect(viewer).toContainText('Current exact version · view-only')
+  await expect(viewer).toContainText('Current version')
+  await expect(viewer).toContainText('Current version · view-only')
   await expect(viewer.getByRole('row', { name: '1 0.8' })).toBeVisible()
   await viewer.getByRole('button', { name: 'Back to Jobs' }).click()
   await expect(page).toHaveURL(/#\/jobs\?run=merge-task-1$/)
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.getByTestId('job-row-merge-task-1')).toHaveAttribute('aria-expanded', 'true')
+})
+
+test('reads job status chips at WCAG AA in both themes @ux-smoke', async ({ page }) => {
+  const statuses = ['done', 'failed', 'running', 'queued'] as const
+  await page.route('**/api/canvas', async (route) => {
+    await route.fulfill({ json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }] })
+  })
+  await page.route('**/api/jobs?*', async (route) => {
+    await route.fulfill({ json: {
+      items: statuses.map((status, index) => ({
+        ...failedJob, id: `chip-${status}`, runId: `run-${status}`, attempt: `run-${status}`, status,
+        createdAt: `2026-07-1${index + 1}T12:00:00Z`,
+      })),
+      nextCursor: null, hasMore: false,
+    } })
+  })
+
+  await page.goto('/#/jobs')
+  await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+
+  for (const theme of ['light', 'dark'] as const) {
+    await page.evaluate((value) => {
+      if (value === 'dark') document.documentElement.setAttribute('data-theme', 'dark')
+      else document.documentElement.removeAttribute('data-theme')
+    }, theme)
+
+    const measured = await page.evaluate(() => {
+      const parse = (value: string) => value.match(/[\d.]+/g)!.slice(0, 3).map(Number)
+      const channel = (v: number) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : (((v / 255) + 0.055) / 1.055) ** 2.4)
+      const luminance = ([r, g, b]: number[]) => 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+      const behind = (element: Element) => {
+        for (let node: Element | null = element; node; node = node.parentElement) {
+          const background = getComputedStyle(node).backgroundColor
+          if (background && !background.startsWith('rgba(0, 0, 0, 0)')) return parse(background)
+        }
+        return [255, 255, 255]
+      }
+      return Array.from(document.querySelectorAll('[data-testid="job-status"]'), (element) => {
+        const style = getComputedStyle(element)
+        const a = luminance(parse(style.color))
+        const b = luminance(behind(element))
+        return {
+          label: element.textContent ?? '',
+          ratio: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05),
+        }
+      })
+    })
+
+    expect(measured.map((chip) => chip.label), `${theme}: status chips`).toEqual([...statuses])
+    for (const chip of measured) {
+      expect(chip.ratio, `${theme} "${chip.label}" chip contrast`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
 })

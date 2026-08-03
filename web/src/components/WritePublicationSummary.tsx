@@ -1,7 +1,8 @@
 import { datasetViewerHash, type DatasetViewerCanvasReturn } from '../router'
 import type {
-  RunOutput, WriteAdmission, WriteReceipt, WriteSchemaDrift,
+  RunOutput, WriteAdmission, WriteReceipt,
 } from '../types/api'
+import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
 
 export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
   if (mode === 'create') return 'Create a new dataset'
@@ -11,9 +12,9 @@ export function publicationMode(mode: WriteAdmission['mode'] | undefined): strin
 }
 
 function writeMode(mode: WriteAdmission['mode'] | undefined): string {
-  if (mode === 'append') return 'Append provider output'
-  if (mode === 'replace' || mode === 'overwrite') return 'Overwrite provider output'
-  if (mode === 'create') return 'Create provider output'
+  if (mode === 'append') return 'Append to output'
+  if (mode === 'replace' || mode === 'overwrite') return 'Replace output'
+  if (mode === 'create') return 'Create output'
   return 'Write mode is not available yet'
 }
 
@@ -43,107 +44,7 @@ export function PublishedDatasetResult({ receipt, name = receipt.name, returnToC
   </div>
 }
 
-function schemaText(fields: { name: string; type: string }[]): string {
-  return fields.length ? fields.map((field) => `${field.name}: ${field.type}`).join(', ') : 'unknown'
-}
-
-function partitionText(partitions: { field: string }[]): string {
-  return partitions.length ? partitions.map((partition) => partition.field).join(', ') : 'unpartitioned'
-}
-
-function SchemaDriftEvidence({ evidence }: { evidence: WriteSchemaDrift }) {
-  const visible = evidence.compatibility.fields.slice(0, 12)
-  const hidden = evidence.compatibility.fields.length - visible.length
-  return <div aria-label="Schema comparison" className="rounded border border-border bg-background px-2 py-1.5">
-    <div className="font-semibold text-foreground">
-      Exact schema comparison · {evidence.compatibility.status}
-    </div>
-    <div>
-      Compared head <span className="font-mono">
-        {evidence.comparedHead.datasetId}@{evidence.comparedHead.revisionId}
-      </span>
-    </div>
-    <div className={evidence.requiresConfirmation ? 'font-semibold text-amber-700 dark:text-amber-300' : ''}>
-      {evidence.requiresConfirmation
-        ? 'Structural schema drift requires explicit confirmation.'
-        : 'No structural schema drift requires confirmation.'}
-    </div>
-    {visible.map((field, index) => <div key={`${field.kind}:${field.fieldId ?? ''}:${field.oldName ?? ''}:${field.newName ?? ''}:${index}`}>
-      {field.kind} · {field.status} · {field.oldName ?? '—'} → {field.newName ?? '—'} · {field.reason}
-    </div>)}
-    {hidden > 0 && <div>{hidden} more retained comparison fields are not shown.</div>}
-  </div>
-}
-
-function AdmissionDetails({ label, admission }: { label: string; admission: WriteAdmission }) {
-  const runtimeSchema = admission.intent?.schemaMode === 'runtime'
-  return <>
-    <div><strong>{label}:</strong> node <span className="font-mono">{admission.nodeId}</span> · {admission.managed ? 'managed' : 'provider-neutral'} · mode <span className="font-mono">{admission.mode}</span></div>
-    <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
-    <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
-    <div><strong>Schema:</strong> {runtimeSchema
-      ? 'Full output schema will be validated during this run.'
-      : schemaText(admission.expectedSchema)}</div>
-    <div><strong>Partitions:</strong> {partitionText(admission.partitions)}</div>
-    {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
-    {admission.intent && <>
-      <div><strong>Frozen destination:</strong> <span className="font-mono">{admission.intent.destination.logicalUri}</span> · {admission.intent.destination.name} · {admission.intent.destination.provider}{admission.intent.destination.datasetId ? ` · dataset ${admission.intent.destination.datasetId}` : ''}</div>
-      <div><strong>Idempotency key:</strong> <span className="font-mono">{admission.intent.idempotencyKey}</span></div>
-      <div><strong>Frozen provenance:</strong> <span className="font-mono">{JSON.stringify(admission.intent.provenance)}</span></div>
-    </>}
-  </>
-}
-
-function sameAdmission(left: WriteAdmission | null | undefined, right: WriteAdmission | null | undefined): boolean {
-  if (!left || !right) return false
-  return left.mode === right.mode && left.destination === right.destination
-    && left.intent?.idempotencyKey === right.intent?.idempotencyKey
-}
-
-function PublicationDetails({ admission, outcomeAdmission, receipt, schemaDrift, outputs = [] }: {
-  admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null
-  schemaDrift?: WriteSchemaDrift | null; outputs?: RunOutput[]
-}) {
-  if (!admission && !outcomeAdmission && !receipt && outputs.length === 0) return null
-  return <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
-    <div className="mt-2 grid gap-1 break-all">
-      {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
-      {outcomeAdmission && <AdmissionDetails label="Completed admission" admission={outcomeAdmission} />}
-      {admission && !sameAdmission(admission, outcomeAdmission)
-        && <AdmissionDetails label={outcomeAdmission ? 'Next admission' : 'Admission'} admission={admission} />}
-      {receipt && <>
-        <div><strong>Receipt:</strong> <span className="font-mono">{receipt.datasetId}@{receipt.revisionId}</span></div>
-        <div><strong>Durable:</strong> yes</div>
-        <div><strong>Head:</strong> <span className="font-mono">{receipt.head.datasetId}@{receipt.head.revisionId}</span>{receipt.head.committedAt ? ` · committed ${receipt.head.committedAt}` : ''} · retention {receipt.head.retentionOwner}</div>
-        <div><strong>Rows:</strong> {receipt.rows.toLocaleString()}</div>
-        <div><strong>Bytes:</strong> {receipt.bytes.toLocaleString()}</div>
-        <div><strong>Receipt schema:</strong> {schemaText(receipt.schema)}</div>
-        <div><strong>Receipt partitions:</strong> {partitionText(receipt.partitions)}</div>
-        <div><strong>Publication provider:</strong> <span className="font-mono">{receipt.publication.provider}</span></div>
-        <div><strong>Logical URI:</strong> <span className="font-mono">{receipt.publication.logicalUri}</span></div>
-        <div><strong>Artifact URI:</strong> <span className="font-mono">{receipt.publication.artifactUri}</span></div>
-        <div><strong>Publication sequence:</strong> {receipt.publication?.publishSequence ?? 'unknown'}</div>
-        <div><strong>Idempotency key:</strong> <span className="font-mono">{receipt.publication?.idempotencyKey ?? 'unknown'}</span></div>
-        <div><strong>Catalog version:</strong> {receipt.publication?.catalogVersion ?? 'unknown'}</div>
-        {receipt.parentHead && <div><strong>Parent:</strong> <span className="font-mono">{receipt.parentHead.datasetId}@{receipt.parentHead.revisionId}</span></div>}
-        <div><strong>Backend:</strong> {receipt.publication?.backendVersion ?? 'unknown'}</div>
-        {receipt.executionManifestSha256 && <div><strong>Execution manifest:</strong> <span className="font-mono">{receipt.executionManifestSha256}</span></div>}
-      </>}
-      {outputs.map((output) => <div key={`${output.nodeId}:${output.portId}`} className="mt-1 rounded border border-border bg-background p-1.5" aria-label="Write output evidence">
-        <div><strong>Output:</strong> <span className="font-mono">{output.nodeId}:{output.portId}</span>{output.portLabel ? ` · ${output.portLabel}` : ''}</div>
-        <div><strong>Outcome:</strong> {output.outcome} · {output.publicationKind} · {output.wire}</div>
-        {output.uri && <div><strong>URI:</strong> <span className="font-mono">{output.uri}</span></div>}
-        {output.table && <div><strong>Table:</strong> <span className="font-mono">{output.table}</span></div>}
-        {output.version && <div><strong>Version:</strong> <span className="font-mono">{output.version}</span></div>}
-        {output.rows != null && <div><strong>Output rows:</strong> {output.rows.toLocaleString()}</div>}
-        {output.error && <div className="text-destructive"><strong>Error:</strong> {output.error}</div>}
-      </div>)}
-    </div>
-  </details>
-}
-
-export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false, publishing = false, returnToCanvas }: {
+export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, compact = false, completed = false, publishing = false, returnToCanvas }: {
   outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean; publishing?: boolean
   returnToCanvas?: DatasetViewerCanvasReturn
 }) {
@@ -157,6 +58,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
+  const schemaChanges = schemaDrift?.compatibility.fields.filter(isMeaningfulSchemaChange) ?? []
   const runtimeSchema = summaryAdmission?.intent?.schemaMode === 'runtime'
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
@@ -174,13 +76,25 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
           <span className="font-semibold text-foreground">Mode</span>
           <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
         </div>}
-      {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Exact run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+      {schemaDrift && (schemaDrift.requiresConfirmation || schemaChanges.length > 0) && <div
+        aria-label="Schema changes" className="rounded border border-amber-300/60 bg-amber-50/60 px-2 py-1.5 text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
+        <span className="font-semibold">Schema changes</span>
+        {schemaChanges.length > 0 ? <ul className="mt-1 list-disc pl-4">
+          {schemaChanges.slice(0, 8).map((field, index) => <li key={`${field.fieldId ?? field.oldName ?? field.newName}:${index}`}>
+            {field.oldName && field.newName && field.oldName !== field.newName
+              ? `${field.oldName} → ${field.newName}`
+              : field.newName ?? field.oldName ?? 'A column'}: {field.reason.replaceAll('_', ' ')}
+          </li>)}
+          {schemaChanges.length > 8 ? <li>{schemaChanges.length - 8} more changes</li> : null}
+        </ul> : <div className="mt-1">The destination schema could not be confirmed automatically.</div>}
+      </div>}
+      {summaryAdmission?.exactRunReadiness?.ready === false ? <div aria-label="Run readiness" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Fix before running:</strong> {summaryAdmission.exactRunReadiness.message}
       </div> : summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Fix before running:</strong> {summaryAdmission.blocker}
       </div> : receipt ? null
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
-            {providerNeutral ? 'Run finished. The selected backend wrote the output.' : 'Run finished, but the published dataset could not be confirmed.'}
+            {providerNeutral ? 'Run finished. Output was written.' : 'Run finished, but the dataset could not be confirmed.'}
           </div>
         : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Writing output…</div>
         : schemaDrift?.requiresConfirmation ? <div aria-label="Write readiness" className="text-amber-700 dark:text-amber-300">
@@ -195,7 +109,5 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
       {receipt && <PublishedDatasetResult receipt={receipt} name={displayedName}
         returnToCanvas={returnToCanvas} />}
     </div>
-    <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt}
-      schemaDrift={schemaDrift} outputs={outputs} />
   </section>
 }

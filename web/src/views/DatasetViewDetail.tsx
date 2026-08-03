@@ -32,7 +32,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       if (request !== previewGeneration.current) return
       const exactUnavailable = caught instanceof KernelError && caught.status === 410
       setError(exactUnavailable
-        ? 'This exact revision is no longer available. The view did not substitute the current head.'
+        ? 'This saved version is no longer available. The view did not open a newer version instead.'
         : errorMessage(caught))
     } finally {
       if (request === previewGeneration.current) setLoading(false)
@@ -80,9 +80,9 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
         <div className="grid gap-4 text-[11px]">
           <section className="grid gap-1 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Exact dataset revision</div>
+            <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Saved dataset version</div>
             <div className="font-semibold">{committedAt ? `Committed ${committedAt}` : 'Commit time not provided'}</div>
-            <div className="text-muted-foreground">Pinned to the saved revision; preview and reports do not follow a newer dataset head.</div>
+            <div className="text-muted-foreground">This view keeps using the saved version; previews and reports do not switch to newer data.</div>
           </section>
           <section className="grid gap-1.5">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Definition</div>
@@ -95,27 +95,26 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
             </div>}
             <div>{definition.sampling.kind === 'all'
               ? 'All matching rows'
-              : `Deterministic reservoir · ${definition.sampling.size.toLocaleString()} rows · seed ${definition.sampling.seed}`}</div>
+              : `Reproducible sample · ${definition.sampling.size.toLocaleString()} rows`}</div>
             {evidence && <div className="rounded-md border border-border p-2 text-muted-foreground">
               <div><strong className="text-foreground">Sampling evidence:</strong> {evidence.returnedRows.toLocaleString()} rows returned{evidence.totalRows != null ? ` from ${evidence.totalRows.toLocaleString()}` : ''}</div>
               {evidence.limitations.map((limitation) => <div key={limitation} className="mt-1">{limitation}</div>)}
             </div>}
           </section>
           <section className="grid gap-2">
-            <div className="flex items-center gap-2"><div className="flex-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Bounded preview</div>
-              {!loading && <button onClick={() => void load()} className="font-semibold text-primary underline">Refresh exact preview</button>}</div>
-            {loading ? <div role="status" className="rounded-md border border-border p-3 text-muted-foreground">Replaying the exact definition…</div>
+            <div className="flex items-center gap-2"><div className="flex-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Preview</div>
+              {!loading && <button onClick={() => void load()} className="font-semibold text-primary underline">Refresh preview</button>}</div>
+            {loading ? <div role="status" className="rounded-md border border-border p-3 text-muted-foreground">Loading this saved view…</div>
               : error ? <div role="alert" className="rounded-md border border-destructive/30 p-3 text-destructive"><div>{error}</div><button onClick={() => void load()} className="mt-2 font-semibold underline">Retry</button></div>
                 : preview ? <PreviewTable preview={preview} /> : null}
           </section>
           <DistributionReportLauncher definition={definition} />
-          <DatasetViewTechnicalDetails definition={definition} />
         </div>
       </div>
       <footer className="border-t border-border p-4">
         {deleteError && <div role="alert" className="mb-2 text-[11px] text-destructive">Couldn't delete this view: {deleteError}</div>}
         {confirmDelete ? <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-2 text-[11px]">
-          <span className="min-w-0 flex-1">Delete this view and release its revision hold? The submission remains tombstoned.</span>
+          <span className="min-w-0 flex-1">Delete this saved view? The underlying dataset and its saved versions are not deleted.</span>
           <button onClick={() => setConfirmDelete(false)} disabled={deleting} className="font-semibold underline">Cancel</button>
           <button onClick={() => void remove()} disabled={deleting} className="rounded bg-destructive px-2 py-1 font-semibold text-destructive-foreground disabled:opacity-50">{deleting ? 'Deleting…' : 'Delete'}</button>
         </div> : <button onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-destructive"><Icon name="trash" size={13} /> Delete view</button>}
@@ -124,28 +123,8 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
   </div>
 }
 
-function DatasetViewTechnicalDetails({ definition }: { definition: DatasetViewDefinition }) {
-  return <details data-testid="dataset-view-technical-details" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
-    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
-      <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.datasetId}</dd>
-      <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{definition.datasetRef.revisionId}</dd>
-      <dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{definition.id}</dd>
-      <dt>Semantic SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.semanticSha256}</dd>
-      <dt>Definition SHA-256</dt><dd className="break-all font-mono text-foreground">{definition.definitionSha256}</dd>
-      {definition.sampleProvenance && <><dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{definition.sampleProvenance.identity}</dd></>}
-      <dt>Retention owner</dt><dd className="font-mono text-foreground">{definition.retentionOwner}</dd>
-      <dt>Creator ID</dt><dd className="break-all font-mono text-foreground">{definition.creatorId}</dd>
-      <dt>Schema version</dt><dd className="font-mono text-foreground">{definition.schemaVersion}</dd>
-      <dt>Container ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.containerId}</dd>
-      <dt>Placement ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.placementId}</dd>
-      <dt>Source registration ID</dt><dd className="break-all font-mono text-foreground">{definition.placement.sourceRegistrationId}</dd>
-    </dl>
-  </details>
-}
-
 function PreviewTable({ preview }: { preview: DatasetViewPreview }) {
-  if (!preview.rows.length) return <div className="rounded-md border border-border p-3 text-muted-foreground">This exact definition returned no rows.</div>
+  if (!preview.rows.length) return <div className="rounded-md border border-border p-3 text-muted-foreground">This saved view returned no rows.</div>
   return <div>
     <div className="mb-1 text-[10px] text-muted-foreground">Showing {preview.rows.length.toLocaleString()}{preview.rowCount != null ? ` of ${preview.rowCount.toLocaleString()}` : ''} rows{preview.hasMore ? ` · truncated at ${preview.rowLimit}` : ''}</div>
     <div className="max-h-[300px] overflow-auto rounded-md border border-border">

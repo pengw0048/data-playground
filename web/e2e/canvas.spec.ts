@@ -1,8 +1,8 @@
 import { copyFile, mkdir, unlink } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import { test, expect, type Page, type Locator } from '@playwright/test'
+import { test, expect, type APIRequestContext, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
-import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
+import { backToWorkspace, createCanvasFromWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 // These specs encode, as assertions, the interaction/visual invariants behind bugs a human had
 // to find by hand (menu positioning, node overlap, disabled affordances, no forced popups, the
@@ -29,7 +29,7 @@ async function confirmRun(page: Page, action: 'managed' | 'ordinary' = 'managed'
   await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
   await runPanel.getByRole('button', {
     name: action === 'managed'
-      ? 'Publish a new version'
+      ? 'Publish output'
       : /^(?:Run with unknown row count|Run [\d,]+ rows)$/,
   }).click()
 }
@@ -38,18 +38,35 @@ async function confirmRun(page: Page, action: 'managed' | 'ordinary' = 'managed'
 // Keep the assertion in one journey so later steps cannot depend on resetting shared metadata.
 async function canvasesFor(page: Page): Promise<Array<{ id: string }>> {
   return page.evaluate(async () => {
-    const response = await fetch('/api/canvas')
+    const userId = localStorage.getItem('dp-user')
+    const response = await fetch('/api/canvas', {
+      headers: userId ? { 'X-DP-User': userId } : {},
+    })
     if (!response.ok) throw new Error(`Canvas list failed: ${response.status}`)
     return response.json()
   })
 }
 
-async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown[] }> {
+async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown[]; edges: unknown[] }> {
   return page.evaluate(async (canvas) => {
-    const response = await fetch(`/api/canvas/${encodeURIComponent(canvas)}`)
+    const userId = localStorage.getItem('dp-user')
+    const response = await fetch(`/api/canvas/${encodeURIComponent(canvas)}`, {
+      headers: userId ? { 'X-DP-User': userId } : {},
+    })
     if (!response.ok) throw new Error(`Canvas fetch failed: ${response.status}`)
     return response.json()
   }, canvasId)
+}
+
+async function useFreshFirstRunUser(page: Page, request: APIRequestContext, label: string) {
+  const created = await request.post('/api/users', {
+    data: { name: `${label} ${Date.now()} ${Math.random().toString(16).slice(2)}` },
+    headers: { 'X-DP-User': 'local' },
+  })
+  expect(created.ok()).toBe(true)
+  const userId = (await created.json() as { id: string }).id
+  await page.addInitScript((id) => localStorage.setItem('dp-user', id), userId)
+  return userId
 }
 
 async function canvasZoom(page: Page): Promise<number> {
@@ -68,8 +85,8 @@ async function addNode(page: Page, category: string, kindTitle: string) {
 
 async function openSettledAppMenu(page: Page) {
   const menu = page.getByRole('menu', { name: 'Data Playground menu' })
-  // Some journeys have just selected "New Canvas". Wait for that menu's closing portal to
-  // unmount before opening the next one, or the locator can resolve to the stale animated copy.
+  // Wait for a preceding menu selection's closing portal to unmount before opening the next one,
+  // or the locator can resolve to the stale animated copy.
   await expect(menu).toBeHidden()
   await page.getByTestId('app-menu').click()
   await expect(menu).toBeVisible()
@@ -102,19 +119,16 @@ async function edgeNodeCrossings(page: Page): Promise<string[]> {
     }))
     const failures: string[] = []
     for (const edge of edges) {
-      const label = edge.getAttribute('aria-label')
-        ?? edge.querySelector('[aria-label^="Edge from "]')?.getAttribute('aria-label')
-        ?? ''
-      const endpoints = /^Edge from (.+) to (.+)$/.exec(label)
       const path = edge.querySelector<SVGPathElement>('.react-flow__edge-path')
+      const endpoints = [path?.dataset.source, path?.dataset.target]
       const matrix = path?.getScreenCTM()
-      if (!endpoints || !path || !matrix) {
-        failures.push(`unmeasurable edge: ${label || edge.id}`)
+      if (!endpoints[0] || !endpoints[1] || !path || !matrix) {
+        failures.push(`unmeasurable edge: ${edge.getAttribute('aria-label') || edge.id}`)
         continue
       }
       const length = path.getTotalLength()
       for (const node of nodes) {
-        if (node.id === endpoints[1] || node.id === endpoints[2]) continue
+        if (node.id === endpoints[0] || node.id === endpoints[1]) continue
         let crossing = false
         for (let distance = 2; distance < length - 2; distance += 3) {
           const pathPoint = path.getPointAtLength(distance)
@@ -135,24 +149,8 @@ async function edgeNodeCrossings(page: Page): Promise<string[]> {
 // Start each node-touching test on a FRESH empty canvas — the metadata DB persists canvases, so
 // without this a prior test's nodes would leak in and break count assertions.
 async function fresh(page: Page) {
-  await page.goto('/')
-  // A new workspace deliberately lands on the explicit first-run choice. Tests that need a Canvas
-  // take that same user-visible action instead of depending on bootstrap to create a remote blank.
-  const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
-  await expect.poll(() => page.evaluate(() => (
-    location.hash.startsWith('#/canvas/')
-      || Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Start a blank Canvas')
-  ))).toBe(true)
-  if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
-  await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
-  const previous = await page.evaluate(() => location.hash)
-  const menu = await openSettledAppMenu(page)
-  await menu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
-  // The previous canvas is often empty too. Waiting only for zero rendered nodes can therefore return
-  // before async create + file refresh + navigation finish, and the test would mutate the old canvas.
-  await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
+  await createCanvasFromWorkspace(page)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
-  await expect(menu).toBeHidden()
 }
 
 async function enablePipelineImporter(page: Page) {
@@ -211,7 +209,8 @@ async function waitForCollabRoom(page: Page, canvasId: string) {
 }
 
 test.describe('Data Playground canvas', () => {
-  test('direct first-entry example fits every node once at 1280x720 and preserves manual viewport control @first-run', async ({ page }) => {
+  test('direct first-entry example fits every node once at 1280x720 and preserves manual viewport control @first-run', async ({ page, request }) => {
+    await useFreshFirstRunUser(page, request, 'First-run direct example')
     let exampleId: string | null = null
     try {
       await page.goto('/')
@@ -424,7 +423,44 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
-  test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page }) => {
+  test('first-run examples keep the selected folder and the primary run control responds @first-run', async ({ page, request }) => {
+    await useFreshFirstRunUser(page, request, 'First-run folder example')
+    const suffix = Date.now()
+    const parent = `First-run Research ${suffix}`
+    const child = `Experiment ${suffix}`
+    let exampleId = ''
+    try {
+      await page.goto('/#/workspace')
+      for (const folder of [parent, child]) {
+        await page.getByRole('button', { name: 'New folder' }).click()
+        await page.getByLabel('Folder name').fill(folder)
+        await page.getByRole('button', { name: 'Create', exact: true }).click()
+        await expect(page.getByRole('dialog', { name: 'New folder' })).toHaveCount(0)
+      }
+      await expect(page.getByRole('navigation', { name: 'Workspace path' }))
+        .toContainText(`${parent}/${child}`)
+
+      await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
+      await expect(page.locator('.react-flow__node')).toHaveCount(5)
+      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+      await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' }))
+        .toContainText(`Workspace/${parent}/${child}`)
+
+      await page.getByRole('button', { name: 'Run all' }).click()
+      await expect(page.getByRole('button', { name: 'Confirm run…' })).toBeVisible()
+
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Back to Workspace', { exact: true }).click()
+      await expect(page.getByRole('navigation', { name: 'Workspace path' }))
+        .toContainText(`${parent}/${child}`)
+      await expect(page.getByRole('button', { name: 'Open canvas Purchases per user' })).toBeVisible()
+    } finally {
+      if (exampleId) await page.request.delete(`/api/canvas/${encodeURIComponent(exampleId)}`)
+    }
+  })
+
+  test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page, request }) => {
+    await useFreshFirstRunUser(page, request, 'First-run replacement safety')
     await page.goto('/')
     expect(await canvasesFor(page)).toEqual([])
     await expect(page.getByRole('button', { name: 'Start a blank Canvas' })).toBeVisible()
@@ -452,10 +488,7 @@ test.describe('Data Playground canvas', () => {
 
     // An edit made while the mutation revalidates run history must stay on this Canvas and reach
     // durable storage; cancelling this click gives the existing autosave debounce time to finish.
-    const exampleHash = await page.evaluate(() => location.hash)
-    const exampleMenu = await openSettledAppMenu(page)
-    await exampleMenu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
-    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(exampleHash)
+    await createCanvasFromWorkspace(page, 'untitled')
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     const blankHash = await page.evaluate(() => location.hash)
@@ -471,8 +504,9 @@ test.describe('Data Playground canvas', () => {
 
     await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
     await expect.poll(() => historyRequestStarted).toBe(true)
-    await page.getByRole('button', { name: '+ Add a source' }).click()
+    await page.getByRole('button', { name: 'Choose dataset' }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.getByTestId('source-search')).toBeVisible()
     releaseHistory()
     await expect(page.getByText(/Canvas changed while preparing the example; your edit was kept/)).toBeVisible()
     expect((await page.evaluate(() => location.hash)).split('?')[0]).toBe(blankHash.split('?')[0])
@@ -487,10 +521,7 @@ test.describe('Data Playground canvas', () => {
     await page.keyboard.press('Escape')
 
     // A lost PUT response retains a version-fenced local draft; it must not turn into a speculative create.
-    const editedHash = await page.evaluate(() => location.hash)
-    const responseLossMenu = await openSettledAppMenu(page)
-    await responseLossMenu.getByRole('menuitem', { name: 'New Canvas', exact: true }).click()
-    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(editedHash)
+    await createCanvasFromWorkspace(page, 'untitled')
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const responseLossId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     let abortedPut = false
@@ -536,15 +567,37 @@ test.describe('Data Playground canvas', () => {
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
   })
 
-  test('category browsing is the only global add entry', async ({ page }) => {
+  test('the bottom toolbar uses direct categories without a redundant global add entry', async ({ page }) => {
     await fresh(page)
     await page.setViewportSize({ width: 1280, height: 720 })
     await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await expect(page.getByRole('button', { name: 'Shape', exact: true })).toBeVisible()
     await addNode(page, 'Shape', 'sample')
-    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
+  })
+
+  test('a toolbar operation continues from the sole selected compatible node', async ({ page }) => {
+    await fresh(page)
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node-source')).toHaveClass(/selected/)
+
+    await addNode(page, 'Shape', 'filter')
+
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('?')[0].split('/').pop()!)
+    await expect.poll(async () => {
+      const saved = await canvasFor(page, canvasId)
+      const nodeTypes = Object.fromEntries((saved.nodes as Array<{ id: string; type: string }>).map((node) => [node.id, node.type]))
+      return (saved.edges as Array<{ source: string; target: string }>).map((edge) => ({
+        source: nodeTypes[edge.source], target: nodeTypes[edge.target],
+      }))
+    }).toEqual([{ source: 'source', target: 'filter' }])
   })
 
   test('selection keeps category add while the output port creates one atomic connected step', async ({ page }) => {
@@ -615,7 +668,7 @@ test.describe('Data Playground canvas', () => {
     const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
     const search = locator.getByRole('textbox', { name: 'Search existing nodes' })
     await search.fill('duplicate-off-screen')
-    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('failed · disabled')
+    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('stale · disabled')
     await search.press('Enter')
 
     await expect(locator).toBeHidden()
@@ -942,6 +995,10 @@ test.describe('Data Playground canvas', () => {
 
       const transformId = await transform.getAttribute('data-id')
       expect(transformId).toBeTruthy()
+      await expect.poll(async () => {
+        const saved = await page.request.get(`/api/canvas/${canvasId}`).then((response) => response.json())
+        return saved.nodes.some((node: { id: string }) => node.id === transformId)
+      }).toBe(true)
       const beforeDrag = await page.request.get(`/api/canvas/${canvasId}`).then((response) => response.json())
       const beforePosition = beforeDrag.nodes.find((node: { id: string }) => node.id === transformId).position
       const dragBox = await boxOf(transform)
@@ -990,6 +1047,21 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Query', 'sql')
     const run = page.getByRole('button', { name: 'Connect a source to run' })
     await expect(run).toBeVisible()
+    await expect(run).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  test('an auto-connected node says the source needs a dataset, not that it needs a source', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    // the toolbar connects the new node to the selected one, so this filter has an upstream source
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect.poll(async () => page.locator('.react-flow__edge').count()).toBe(1)
+
+    await expect(page.getByRole('button', { name: 'Connect a source to run' })).toHaveCount(0)
+    const run = page.getByRole('button', { name: /^Choose a dataset in / }).last()
+    await expect(run).toBeAttached()
     await expect(run).toHaveAttribute('aria-disabled', 'true')
   })
 
@@ -1102,7 +1174,7 @@ test.describe('Data Playground canvas', () => {
     const viewportControls = page.getByTestId('canvas-viewport-controls')
     await expect(addControls).toHaveAttribute('role', 'group')
     await expect(viewportControls).toHaveAttribute('role', 'group')
-    await expect(addControls.getByText('Add', { exact: true })).toBeVisible()
+    await expect(addControls.getByText('Add', { exact: true })).toHaveCount(0)
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Add next step' })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
@@ -1130,9 +1202,9 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('agent-configure')).toBeVisible()
   })
 
-  test('the top bar has Rerun all, not Export', async ({ page }) => {
+  test('the top bar has Run all on a new Canvas, not Export', async ({ page }) => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: /rerun all/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Run all' })).toBeVisible()
     await expect(page.getByRole('button', { name: /^export$/i })).toHaveCount(0)
   })
 
@@ -1186,21 +1258,15 @@ test.describe('Data Playground canvas', () => {
       const action = title === 'source' ? 'More' : title === 'transform' ? 'Edit code' : 'Output versions'
       const shelf = addedNode.getByRole('button', { name: action }).locator('..')
       await expect(shelf).toBeVisible()
-      const shelfBox = await boxOf(shelf)
-      expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the visible Canvas`).toBe(true)
-      expect(overlaps(shelfBox, await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
+      await expect.poll(async () => contains(
+        await boxOf(page.locator('.react-flow')),
+        await boxOf(shelf),
+      ), { message: `${title} action shelf is outside the visible Canvas` }).toBe(true)
+      expect(overlaps(await boxOf(shelf), await boxOf(toolbar)), `${title} action shelf overlaps the toolbar`).toBe(false)
     }
 
     const nodes = page.locator('.react-flow__node')
     await expect(nodes).toHaveCount(3)
-    for (const [from, to] of [[nodes.nth(0), nodes.nth(1)], [nodes.nth(1), nodes.nth(2)]] as const) {
-      const sourcePort = await boxOf(from.locator('.react-flow__handle.source'))
-      const targetPort = await boxOf(to.locator('.react-flow__handle.target'))
-      await page.mouse.move(sourcePort.x + sourcePort.width / 2, sourcePort.y + sourcePort.height / 2)
-      await page.mouse.down()
-      await page.mouse.move(targetPort.x + targetPort.width / 2, targetPort.y + targetPort.height / 2)
-      await page.mouse.up()
-    }
     await expect(page.locator('.react-flow__edge')).toHaveCount(2)
 
     await page.getByRole('button', { name: 'Edit code' }).click()
@@ -1221,19 +1287,23 @@ test.describe('Data Playground canvas', () => {
       const action = title === 'source' ? 'More' : title === 'transform' ? 'Edit code' : 'Output versions'
       const shelf = addedNode.getByRole('button', { name: action }).locator('..')
       await expect(shelf).toBeVisible()
-      const shelfBox = await boxOf(shelf)
-      expect(contains(await boxOf(page.locator('.react-flow')), shelfBox), `${title} action shelf is outside the reference Canvas`).toBe(true)
-      expect(overlaps(shelfBox, await boxOf(page.getByTestId('toolbar'))), `${title} action shelf overlaps the reference toolbar`).toBe(false)
+      await expect.poll(async () => contains(
+        await boxOf(page.locator('.react-flow')),
+        await boxOf(shelf),
+      ), { message: `${title} action shelf is outside the reference Canvas` }).toBe(true)
+      expect(overlaps(await boxOf(shelf), await boxOf(page.getByTestId('toolbar'))), `${title} action shelf overlaps the reference toolbar`).toBe(false)
     }
   })
 
-  test('the app menu opens a fresh empty Canvas', async ({ page }) => {
+  test('the app menu returns to Workspace, where a fresh Canvas is created', async ({ page }) => {
     await fresh(page) // start on a known-empty new file (shared DB persists canvases across tests)
     await addNode(page, 'Shape', 'filter')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    await page.getByTestId('app-menu').click()
-    await expect(page.getByText('New Canvas')).toBeVisible()
-    await page.getByText('New Canvas').click()
+    const menu = await openSettledAppMenu(page)
+    await expect(menu.getByRole('menuitem', { name: 'New Canvas', exact: true })).toHaveCount(0)
+    await menu.getByRole('menuitem', { name: 'Back to Workspace', exact: true }).click()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
+    await createCanvasFromWorkspace(page, 'Canvas from Workspace')
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
   })
 
@@ -1269,7 +1339,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByLabel('New Canvas name').fill('E2E independent copy')
     await page.getByRole('button', { name: 'Review copy' }).click()
     await expect(page.getByText('1 nodes · 0 connections · 0 requirements')).toBeVisible()
-    await page.getByRole('button', { name: 'Create and open' }).click()
+    await page.getByRole('button', { name: 'Duplicate and open' }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
     const copyId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     const copied = await (await page.request.get(`/api/canvas/${copyId}`)).json()
@@ -1284,7 +1354,7 @@ test.describe('Data Playground canvas', () => {
   test('copies a resolved registered Source without a dependency acknowledgement at 1280x720', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await fresh(page)
-    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await page.getByRole('button', { name: /Purchases per user/ }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(5)
 
     const source = page.locator('.react-flow__node-source')
@@ -1298,11 +1368,11 @@ test.describe('Data Playground canvas', () => {
     const original = await page.evaluate(() => location.hash)
     const menu = await openSettledAppMenu(page)
     await menu.getByTestId('copy-canvas').click()
-    const dialog = page.getByRole('dialog', { name: 'Save a copy' })
+    const dialog = page.getByRole('dialog', { name: 'Duplicate canvas' })
     await dialog.getByRole('button', { name: 'Review copy' }).click()
     await expect(dialog.getByText('5 nodes · 4 connections · 0 requirements')).toBeVisible()
     await expect(dialog.getByRole('checkbox')).toHaveCount(0)
-    const create = dialog.getByRole('button', { name: 'Create and open' })
+    const create = dialog.getByRole('button', { name: 'Duplicate and open' })
     await expect(create).toBeEnabled()
     const dialogBox = await boxOf(dialog)
     expect(dialogBox.x).toBeGreaterThanOrEqual(0)
@@ -1370,8 +1440,8 @@ test.describe('Data Playground canvas', () => {
         },
       }),
     }))
-    await page.route('**/api/canvas', (route) => {
-      if (route.request().method() !== 'POST') return route.continue()
+    await page.route('**/api/canvas*', (route) => {
+      if (new URL(route.request().url()).pathname !== '/api/canvas' || route.request().method() !== 'POST') return route.continue()
       return route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ detail: 'forbidden' }) })
     })
 
@@ -1391,8 +1461,8 @@ test.describe('Data Playground canvas', () => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     let destinationPosts = 0
-    await page.route('**/api/canvas', async (route) => {
-      if (route.request().method() === 'POST') destinationPosts += 1
+    await page.route('**/api/canvas*', async (route) => {
+      if (new URL(route.request().url()).pathname === '/api/canvas' && route.request().method() === 'POST') destinationPosts += 1
       await route.continue()
     })
 
@@ -1459,8 +1529,8 @@ test.describe('Data Playground canvas', () => {
       if (route.request().method() === 'DELETE') destinationDeletes += 1
       await route.continue()
     })
-    await page.route('**/api/canvas', async (route) => {
-      if (route.request().method() !== 'POST') return route.continue()
+    await page.route('**/api/canvas*', async (route) => {
+      if (new URL(route.request().url()).pathname !== '/api/canvas' || route.request().method() !== 'POST') return route.continue()
       const destination = route.request().postDataJSON() as { id: string }
       collidedId = destination.id
       const seed = await page.request.post('/api/canvas', {
@@ -1519,8 +1589,8 @@ test.describe('Data Playground canvas', () => {
     const canvasCommitted = new Promise<void>((resolve) => { markCanvasCommitted = resolve })
     let markCreateRouteDone!: () => void
     const createRouteDone = new Promise<void>((resolve) => { markCreateRouteDone = resolve })
-    await page.route('**/api/canvas', async (route) => {
-      if (route.request().method() !== 'POST') return route.continue()
+    await page.route('**/api/canvas*', async (route) => {
+      if (new URL(route.request().url()).pathname !== '/api/canvas' || route.request().method() !== 'POST') return route.continue()
       createdId = (route.request().postDataJSON() as { id: string }).id
       const response = await route.fetch() // commit remotely, but hold the response from the browser
       markCanvasCommitted()
@@ -1575,8 +1645,8 @@ test.describe('Data Playground canvas', () => {
     const canvasCommitted = new Promise<void>((resolve) => { markCanvasCommitted = resolve })
     let markCreateRouteDone!: () => void
     const createRouteDone = new Promise<void>((resolve) => { markCreateRouteDone = resolve })
-    await page.route('**/api/canvas', async (route) => {
-      if (route.request().method() !== 'POST') return route.continue()
+    await page.route('**/api/canvas*', async (route) => {
+      if (new URL(route.request().url()).pathname !== '/api/canvas' || route.request().method() !== 'POST') return route.continue()
       createdId = (route.request().postDataJSON() as { id: string }).id
       await route.fetch() // the insert committed, but its success response will never reach the browser
       markCanvasCommitted()
@@ -1607,9 +1677,8 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings modal edits and saves the agent config', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
@@ -1619,22 +1688,24 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings reports effective plugin activation and placement', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await page.getByRole('button', { name: 'Plugins' }).click()
 
     const builtin = page.getByTestId('plugin-status-default-catalog')
     await expect(builtin).toContainText('active')
-    await expect(builtin).toContainText('catalog')
-    await expect(builtin).toContainText('required at startup')
-    await expect(builtin).toContainText('Placement: application')
+    await expect(builtin).toContainText('Catalog')
+    await expect(builtin).toContainText('Browse its data connections in Workspace')
+    await builtin.getByText('Installation details').click()
+    await expect(builtin).toContainText('Features: catalog')
+    await expect(builtin).toContainText('Starts with: application')
+    await expect(builtin).toContainText('Required when Data Playground starts.')
   })
 
   test('settings keeps dirty edits across owned dismissals and warns before unload', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await goToWorkspace(page)
+    const settingsTrigger = page.getByTestId('rail-settings')
+    await settingsTrigger.click()
     const settings = page.getByTestId('settings-modal')
     const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
     await expect(model).toBeVisible()
@@ -1663,11 +1734,10 @@ test.describe('Data Playground canvas', () => {
     await expect(confirm).toBeVisible()
     await confirm.getByRole('button', { name: 'Discard' }).click()
     await expect(settings).toHaveCount(0)
-    await expect(page.getByTestId('app-menu')).toBeFocused()
+    await expect(settingsTrigger).toBeFocused()
 
     // A clean modal still closes immediately with no confirmation.
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+    await settingsTrigger.click()
     await expect(settings).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(settings).toHaveCount(0)
@@ -1675,42 +1745,58 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('settings manages destinations', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()               // Settings lives in the app menu now
-    await page.getByText('Settings', { exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
-    await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
-    // datasets live on the Tables page now, not in Settings — add an output destination (a real, consumed setting)
-    await page.getByPlaceholder('e.g. S3 exports').fill('scratch')
-    await page.getByPlaceholder('/path/to/dir').fill('/tmp/dp-scratch')
-    await page.getByPlaceholder('/path/to/dir').press('Enter')
-    await expect(page.getByText('scratch', { exact: true })).toBeVisible() // destination added to the list
-  })
-
-  test('settings Execution explains built-in runners without exposing local worker ids', async ({ page }) => {
+    const listedRoot = resolve(process.cwd(), '.e2e-workspace/data/ux-fixtures')
+    const emptyRoot = resolve(process.cwd(), `.e2e-workspace/destination-empty-${Date.now()}`)
+    await mkdir(emptyRoot, { recursive: true })
     await goToWorkspace(page)
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
-    await page.getByRole('button', { name: 'Execution' }).click()
-    await expect(page.getByText('When to use each runner', { exact: true })).toBeVisible()
-    await expect(page.getByText(/streams and spills data/i)).toBeVisible()
-    await expect(page.getByText(/isolated in its own OS process/i)).toBeVisible()
-    await expect(page.getByText(/durable worker per Canvas/i)).toBeVisible()
-    // Capacity remains visible, but an implementation-specific local worker id is not researcher-facing.
-    await expect(page.getByText('local-out-of-core:local')).toHaveCount(0)
-    await expect(page.getByText(/\d+ cpu/).first()).toBeVisible()
+    await page.getByRole('button', { name: 'Destinations' }).click()  // master-detail: switch to the Destinations pane
+    await expect(page.getByLabel('Destination name')).toBeVisible()
+    await expect(page.getByLabel('Destination root or prefix')).toBeVisible()
+    const addDestination = async (name: string, root: string) => {
+      await page.getByLabel('Destination name').fill(name)
+      await page.getByLabel('Destination root or prefix').fill(root)
+      await page.getByRole('button', { name: 'Add', exact: true }).click()
+      await expect(page.getByText(name, { exact: true })).toBeVisible()
+      await expect(page.getByText('Save to preview', { exact: true }).last()).toBeVisible()
+    }
+    await addDestination('fixture files', listedRoot)
+    await addDestination('empty scratch', emptyRoot)
+
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Preview files in fixture files' })).toBeVisible()
+    await page.getByRole('button', { name: 'Preview files in fixture files' }).click()
+    await expect(page.getByRole('status').filter({ hasText: '1 item · manifest.json' }))
+      .toBeVisible()
+
+    await page.getByRole('button', { name: 'Preview files in empty scratch' }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'No files found.' }))
+      .toBeVisible()
   })
 
-  test('settings Members creates a user', async ({ page }) => {
-    await page.goto('/')
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Settings', { exact: true }).click()
+  test('settings Execution explains selectable modes without exposing local worker ids', async ({ page }) => {
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
-    await page.getByRole('button', { name: 'Members' }).click()
-    const name = `Member ${Date.now()}`
-    await page.getByPlaceholder('Name').fill(name)
-    await page.getByRole('button', { name: 'Add member' }).click()
-    await expect(page.getByText(name, { exact: true })).toBeVisible() // new member appears in the roster
+    await page.getByRole('button', { name: 'Compute defaults' }).click()
+    await expect(page.getByText('Your default compute target', { exact: true })).toBeVisible()
+    const automatic = page.getByRole('button', { name: 'Use Automatic execution' })
+    await automatic.click()
+    await expect(automatic).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByText(/streams larger data through this machine/i)).toBeVisible()
+    await expect(page.getByText(/separate process.*does not interrupt the app/i)).toBeVisible()
+    await expect(page.getByText(/reusable worker for each Canvas/i)).toBeVisible()
+    // Implementation-specific worker ids and capacity are not researcher-facing choices.
+    await expect(page.getByText('local-out-of-core:local')).toHaveCount(0)
+    await expect(page.getByText(/\d+ cpu/)).toHaveCount(0)
+  })
+
+  test('settings hides account management while authentication is off', async ({ page }) => {
+    await goToWorkspace(page)
+    await page.getByTestId('rail-settings').click()
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Members' })).toHaveCount(0)
   })
 
   test('a section editor uses canvas containment instead of inline nodes', async ({ page }) => {
@@ -1794,26 +1880,42 @@ test.describe('Data Playground canvas', () => {
     await expect(pred).toHaveValue('amount > 0')
   })
 
-  test('the Inspector keeps new Transform execution controls advanced and summarizes a configured GPU requirement', async ({ page }) => {
-    await fresh(page)
-    const inspector = page.getByTestId('inspector')
-    await addNode(page, 'Compute', 'transform') // auto-selected; transform can declare compute needs
-    const advanced = inspector.getByText('Advanced execution')
-    await expect(advanced.locator('..')).not.toHaveAttribute('open')
-    await expect(inspector.getByText('Resources (placement)')).not.toBeVisible()
-    await expect(inspector.getByText('Materialization')).not.toBeVisible()
-    const advancedOutputSchema = inspector.getByText('Advanced output schema')
-    await expect(advancedOutputSchema.locator('..')).not.toHaveAttribute('open')
-    await expect(inspector.getByText('Output schema (contract)')).not.toBeVisible()
-    await advanced.click()
-    await expect(inspector.getByText('Resources (placement)')).toBeVisible()
-    const gpus = inspector.locator('label').filter({ hasText: 'GPUs' }).locator('input')
-    await gpus.fill('8')
-    await expect(gpus).toHaveValue('8') // written to config.requires → routes to a GPU worker at run time
-    await advanced.click()
-    await expect(inspector.getByText('8 GPUs')).toBeVisible()
-    await inspector.getByRole('button', { name: 'Edit resources' }).click()
-    await expect(gpus).toHaveValue('8')
+  test('the Inspector uses Automatic compute and can clear a legacy Transform resource override', async ({ page }) => {
+    const canvasId = `legacy-transform-compute-${Date.now()}`
+    try {
+      const created = await page.request.post('/api/canvas', { data: {
+        id: canvasId, name: 'Legacy Transform compute', version: 1, requirements: [], edges: [], nodes: [{
+          id: 'transform', type: 'transform', position: { x: 280, y: 180 }, data: {
+            title: 'Legacy Transform', status: 'draft', config: {
+              source: 'adhoc', code: 'def fn(row):\n    return row',
+              requires: { gpu: 8, gpuType: 'a100' },
+            },
+          },
+        }],
+      } })
+      expect(created.ok()).toBeTruthy()
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      await page.getByText('Legacy Transform', { exact: true }).click()
+      const inspector = page.getByTestId('inspector')
+      await expect(inspector.getByText('Runtime requirement · Automatic', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Legacy override · 8 GPUs · a100', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Output columns', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Run behavior', { exact: true })).toHaveCount(0)
+
+      await inspector.getByRole('button', { name: 'Use runtime default' }).click()
+      await expect(inspector.getByText('Runtime requirement · Automatic', { exact: true })).toBeVisible()
+      await expect(inspector.getByText('Legacy override · 8 GPUs · a100', { exact: true })).toHaveCount(0)
+      await expect(inspector.getByRole('button', { name: 'Use runtime default' })).toHaveCount(0)
+      await expect.poll(async () => {
+        const saved = await canvasFor(page, canvasId)
+        const nodes = saved.nodes as Array<{
+          id: string; data: { config: { requires?: unknown } }
+        }>
+        return nodes.find((node) => node.id === 'transform')?.data.config.requires
+      }).toBeUndefined()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
   })
 
   test('the Inspector summarizes configured output schemas and exposes stale ones for review', async ({ page }) => {
@@ -1848,17 +1950,15 @@ test.describe('Data Playground canvas', () => {
       const configuredNode = page.getByTestId('rf__node-transform')
       await expect(configuredNode.getByRole('button', { name: 'return input', exact: true })).toBeVisible()
       await configuredNode.getByText('TRANSFORM', { exact: true }).click()
-      await expect(inspector.getByText('1 declared column')).toBeVisible()
-      await inspector.getByRole('button', { name: 'Edit output schema' }).click()
+      await inspector.getByRole('button', { name: '1 cols' }).click()
       await expect(inspector.locator('input[value="clean_id"]')).toBeVisible()
 
       await page.goto(`/#/canvas/${staleId}`)
       const staleNode = page.getByTestId('rf__node-transform')
       await expect(staleNode.getByRole('button', { name: 'return current_input', exact: true })).toBeVisible()
       await staleNode.getByText('TRANSFORM', { exact: true }).click()
-      await expect(inspector.getByText('Needs review')).toBeVisible()
-      await inspector.getByRole('button', { name: 'Review output schema' }).click()
-      await expect(inspector.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
+      await expect(inspector.getByText(/code changed after these output columns were saved/i)).toBeVisible()
+      await expect(inspector.locator('input[value="clean_id"]')).toBeVisible()
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(configuredId)}`)
       await page.request.delete(`/api/canvas/${encodeURIComponent(staleId)}`)
@@ -1900,21 +2000,20 @@ test.describe('Data Playground canvas', () => {
       const inspector = page.getByTestId('inspector')
       await page.getByText('TRANSFORM', { exact: true }).click()
       await expect(inspector.getByText('TRANSFORM', { exact: true })).toBeVisible()
-      await inspector.getByText('Advanced execution').click()
-      await expect(inspector.getByTestId('checkpoint-toggle')).toBeDisabled()
-      await expect(inspector.getByText('Checkpoints are available only for Source → Select → Write.')).toBeVisible()
+      await expect(inspector.getByText('Run behavior')).toHaveCount(0)
+      await expect(inspector.getByTestId('checkpoint-toggle')).toHaveCount(0)
 
       await page.goto(`/#/canvas/${supportedId}`)
       await page.getByText('SELECT', { exact: true }).click()
       await expect(inspector.getByText('SELECT', { exact: true })).toBeVisible()
-      const advanced = inspector.getByText('Advanced execution')
-      await advanced.click()
+      const runBehavior = inspector.getByText('Run behavior')
+      await runBehavior.click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeEnabled()
       await inspector.getByTestId('checkpoint-toggle').click()
-      await expect(page.locator('.react-flow__node').getByTitle(/Checkpointed/)).toBeVisible()
-      await advanced.click()
-      await expect(inspector.getByText('Checkpointed output')).toBeVisible()
-      await inspector.getByRole('button', { name: 'Edit materialization' }).click()
+      await expect(page.locator('.react-flow__node').getByTitle(/saved for reuse/)).toBeVisible()
+      await expect(inspector.getByText(/Saved result/).locator('..')).toContainText('Reused by later runs')
+      await runBehavior.click()
+      await inspector.getByRole('button', { name: 'Change' }).click()
       await expect(inspector.getByTestId('checkpoint-toggle')).toBeVisible()
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(unsupportedId)}`)
@@ -1941,6 +2040,10 @@ test.describe('Data Playground canvas', () => {
     const editor = page.locator('.monaco-editor').first()
     await expect(editor).toBeVisible({ timeout: 15_000 })
     await expect(editor).toContainText('SELECT') // the node's default SQL, editable full-screen
+    await editor.click()
+    await page.keyboard.press('ControlOrMeta+a')
+    await page.keyboard.type('SELECT user_id FROM input')
+    await expect(editor).toContainText('SELECT user_id FROM input')
     await page.keyboard.press('Escape')
     await expect(page.locator('.monaco-editor')).toHaveCount(0) // Esc closes it
   })
@@ -1948,33 +2051,72 @@ test.describe('Data Playground canvas', () => {
   test('the app menu goes to Workspace and the rail destinations remain operable', async ({ page }) => {
     await fresh(page)
     await backToWorkspace(page)
-    await expect(page.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Create canvas' })).toBeEnabled()
     await expect(page.getByRole('button', { name: 'Add dataset' })).toHaveCount(0)
     await expect(await workspaceResource(page, 'dataset', 'images')).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
     await page.getByTestId('rail-workspace').click()
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
   })
 
   test('the relationships graph preserves Dataset lineage context and widens to the catalog', async ({ page }) => {
+    test.setTimeout(75_000)
     await page.setViewportSize({ width: 1280, height: 720 })
-    await fresh(page)
+    const lineageCanvasId = `lineage-navigation-${Date.now()}`
+    const lineageOutput = `lineage-navigation-${Date.now()}.parquet`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: lineageCanvasId,
+      name: 'Lineage navigation fixture',
+      version: 1,
+      requirements: [],
+      nodes: [
+        { id: 'source', type: 'source', position: { x: 80, y: 120 }, data: { title: 'events', config: { uri: 'events' } } },
+        { id: 'write', type: 'write', position: { x: 420, y: 120 }, data: { title: lineageOutput, config: { filename: lineageOutput, writeMode: 'overwrite' } } },
+      ],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${lineageCanvasId}`)
+    const writeCard = page.locator('.react-flow__node[data-id="write"]')
+    await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
+    const publication = page.getByTestId('inspector').getByLabel('Write publication')
+    await page.getByTestId('inspector').getByRole('button', { name: 'Run', exact: true }).click()
+    await confirmRun(page)
+    await expect(publication.getByLabel('Published result')).toContainText('Published', { timeout: 30_000 })
     await backToWorkspace(page)
     await openWorkspaceDataset(page, 'events')
     await page.getByTestId('detail-relationships').click()
     // Dataset lineage owns a stable, shareable route rather than opening the global join graph.
-    await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText('Lineage', { exact: true }).first()).toBeVisible({ timeout: 10_000 })
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
     await expect(page).toHaveURL(/#\/relationships\?.*focus=.*&mode=lineage.*returnResource=/)
     const entities = page.locator('.react-flow__node')
-    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
+    const eventField = entities.filter({ hasText: 'events' }).first().getByText('user_id')
+    for (let attempt = 0; attempt < 5 && !(await eventField.isVisible()); attempt += 1) {
+      const zoomIn = page.getByRole('button', { name: 'Zoom In' })
+      if (await zoomIn.isDisabled()) break
+      await zoomIn.click()
+    }
+    await expect(eventField).toBeVisible({ timeout: 10_000 })
 
     const focusedHash = new URL(page.url()).hash
     await page.reload()
     await expect(page).toHaveURL((url) => url.hash === focusedHash)
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
-    await expect(entities.filter({ hasText: 'events' }).first().getByText('user_id')).toBeVisible({ timeout: 10_000 })
+    for (let attempt = 0; attempt < 5 && !(await eventField.isVisible()); attempt += 1) {
+      const zoomIn = page.getByRole('button', { name: 'Zoom In' })
+      if (await zoomIn.isDisabled()) break
+      await zoomIn.click()
+    }
+    await expect(eventField).toBeVisible({ timeout: 10_000 })
+
+    // Lineage is navigation, not a static poster: opening a neighbouring card lands on that
+    // dataset's normal detail page, and browser Back restores the graph and its route context.
+    await page.getByRole('button', { name: /^Open dataset / }).first().click()
+    await expect(page.getByTestId('dataset-viewer')).toBeVisible()
+    await page.goBack()
+    await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
 
     await page.getByRole('button', { name: 'Back to dataset' }).click()
     await expect(page.getByTestId('dataset-viewer')).toBeVisible()
@@ -1982,11 +2124,12 @@ test.describe('Data Playground canvas', () => {
 
     await page.getByTestId('detail-relationships').click()
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
-    // "show all" widens to the whole catalog. Assert against the selected fixture profile so the
-    // normal PR smoke keeps its starter-data contract while the full matrix proves the large catalog.
+    // Switch to ER before widening to the catalog: a lineage graph always retains a concrete root.
+    await page.getByTestId('er-mode-joins').click()
     await page.getByTestId('er-clear-focus').click()
     const expandedTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'images'
     await expect(entities.filter({ hasText: expandedTable }).first()).toBeVisible({ timeout: 10_000 })
+    await page.request.delete(`/api/canvas/${lineageCanvasId}`)
   })
 
   test('relationship fitting keeps show-all entities clear of controls at compact and reference viewports', async ({ page }) => {
@@ -2165,24 +2308,13 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(6)
   })
 
-  test('the Share dialog sets visibility and adds a collaborator', async ({ page }) => {
-    // seed a collaborator via the API (there's no in-app user switching anymore) — bootstrap picks it up
-    await page.request.post('/api/users', { data: { name: 'Dana' }, headers: { 'X-DP-User': 'local' } })
+  test('the link dialog does not offer unenforceable sharing controls in open mode', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('share-btn').click()
-    await expect(page.getByText('Share this canvas')).toBeVisible()
-    // a read-only workspace tier is offered alongside the editable one
-    await expect(page.getByRole('button', { name: 'Everyone in workspace (view-only)' })).toBeVisible()
-    // flip visibility to workspace (exact — 'view-only' shares the prefix)
-    await page.getByRole('button', { name: 'Everyone in workspace', exact: true }).click()
-    // add Dana as a collaborator (the collaborator picker is the first combobox; a role picker sits beside it)
-    const select = page.getByRole('combobox').first()
-    await select.selectOption({ label: 'Dana' })
-    const addBtn = page.locator('button', { hasText: 'Add' }).last()
-    await expect(addBtn).toBeEnabled()
-    await addBtn.click()
-    await expect(page.getByText('Dana', { exact: false })).toBeVisible() // added to collaborators
-    await expect(page.locator('option[value="viewer"]').first()).toBeAttached() // viewer role is assignable end-to-end
+    await expect(page.getByRole('heading', { name: 'Copy Canvas link' })).toBeVisible()
+    await expect(page.getByTestId('copy-link')).toBeVisible()
+    await expect(page.getByText('Visibility')).toHaveCount(0)
+    await expect(page.getByText('Collaborators')).toHaveCount(0)
   })
 
   test('the Canvas menu opens version history with a restore action', async ({ page }) => {
@@ -2219,8 +2351,6 @@ test.describe('Data Playground canvas', () => {
     await page.goto(`/#/canvas/${canvasId}`)
     const queued = page.locator('.react-flow__node', { hasText: 'Persisted queued' })
     const running = page.locator('.react-flow__node', { hasText: 'Persisted running' })
-    await expect(queued.locator('[title="stale"]')).toBeVisible()
-    await expect(running.locator('[title="stale"]')).toBeVisible()
     await expect(page.locator('.dp-running-glyph')).toHaveCount(0)
     await page.waitForTimeout(900) // isolate any bootstrap debounce before observing the restore
     const beforeRestore = await page.request.get(`/api/canvas/${canvasId}`)
@@ -2237,8 +2367,8 @@ test.describe('Data Playground canvas', () => {
       await page.getByTestId('app-menu').click()
       await page.getByText('Version history').click()
       await page.getByRole('button', { name: 'Restore' }).first().click()
-      await expect(queued.locator('[title="stale"]')).toBeVisible()
-      await expect(running.locator('[title="stale"]')).toBeVisible()
+      await expect(queued).toBeVisible()
+      await expect(running).toBeVisible()
       await expect(page.locator('.dp-running-glyph')).toHaveCount(0)
       await page.waitForTimeout(900) // longer than the local autosave debounce
       expect(saves).toEqual([])
@@ -2261,7 +2391,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
-  test('run history lazily inspects the retained execution manifest @ux-smoke', async ({ page }) => {
+  test('run history can create a Canvas without exposing the retained execution manifest @ux-smoke', async ({ page }) => {
     await fresh(page)
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     const digest = 'c'.repeat(64)
@@ -2299,13 +2429,10 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     await expect(page.getByText(digest)).toHaveCount(0)
-    await page.getByRole('button', { name: /Execution manifest/ }).click()
-
-    await expect(page.getByText(digest)).toBeVisible()
-    await expect(page.getByText('Submitted graph')).toBeVisible()
-    await expect(page.getByText(/events@revision-1/)).toBeVisible()
-    await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
-    await page.getByRole('button', { name: 'Clone as new Canvas…' }).click()
+    await expect(page.getByText('Saved run setup')).toHaveCount(0)
+    await expect(page.getByText('Submitted graph')).toHaveCount(0)
+    await expect(page.getByText(/events@revision-1/)).toHaveCount(0)
+    await page.getByRole('button', { name: 'Create Canvas from run' }).click()
     await page.getByRole('button', { name: 'Review copy' }).click()
     await expect(page.getByText('1 nodes · 0 connections · 0 requirements')).toBeVisible()
     expect(cloneRequest).toMatchObject({
@@ -2318,7 +2445,7 @@ test.describe('Data Playground canvas', () => {
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
     await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
     await backToWorkspace(page)
-    await expect(page.getByText('local mode')).toBeVisible() // truthful session context on the Workspace shell
+    await expect(page.getByRole('navigation', { name: 'Primary navigation' }).getByText('Local', { exact: true })).toBeVisible()
     await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
@@ -2397,7 +2524,7 @@ test.describe('Data Playground canvas', () => {
     }))
 
     const inspector = page.getByTestId('inspector')
-    await expect(inspector.locator('[title^="Local catalog · Current version"]')).toBeVisible()
+    await expect(inspector.locator('[title^="Datasets · Current version"]')).toBeVisible()
     await expect(inspector.getByLabel('Dataset URI')).toHaveCount(0)
     await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
     await inspector.getByRole('button', { name: 'View data' }).click()
@@ -2409,7 +2536,8 @@ test.describe('Data Playground canvas', () => {
     await picker.getByRole('button', { name: /^movies\b/i }).click()
     await expect(source.getByRole('button', { name: 'Change dataset' })).toContainText('movies')
 
-    await expect(page.getByRole('status')).toContainText('Preview out of date')
+    await expect(page.getByRole('status').filter({ hasText: 'Preview out of date' }))
+      .toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
     await expect(page.getByText('purchase', { exact: true })).toHaveCount(0)
   })
@@ -2545,7 +2673,7 @@ test.describe('Data Playground canvas', () => {
 
       await openDataset.click()
       const viewer = page.getByTestId('dataset-viewer')
-      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
       const viewerBack = viewer.getByRole('button', { name: 'Back to Canvas' })
       await expect(viewerBack).toBeFocused()
       await expect(page.getByTestId('catalog-search')).toHaveCount(0)
@@ -2564,15 +2692,16 @@ test.describe('Data Playground canvas', () => {
         ),
       )
       await alternateRevision.click()
-      await expect(viewer.getByTestId('dataset-version-identity')).toContainText(
-        `${exact.datasetId}@${alternateRevisionId}`,
-      )
+      await expect(viewer.getByTestId('dataset-version-context')).toHaveText('Previous version')
+      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
+      await expect(viewer).not.toContainText(`${exact.datasetId}@${alternateRevisionId}`)
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
 
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
       const inspector = page.getByTestId('inspector')
       await expect(inspector).toContainText('DATASET')
-      await expect(inspector).toContainText(`Exact version ${exact.revisionId}`)
+      await expect(inspector).toContainText('Saved version')
+      await expect(inspector).not.toContainText(exact.revisionId)
       const returnedSource = page.locator('.react-flow__node[data-id="source"]')
       await expect(returnedSource).toHaveClass(/selected/)
       await expect(returnedSource).toContainText('Unsaved researcher title')
@@ -2583,7 +2712,7 @@ test.describe('Data Playground canvas', () => {
       await expect(page).toHaveURL(
         new RegExp(
           `#\\/workspace\\/dataset%3A${encodeURIComponent(exact.datasetId)}`
-          + `\\?scope=datasets&revision=${encodeURIComponent(alternateRevisionId)}`
+          + `\\?revision=${encodeURIComponent(alternateRevisionId)}`
           + `&revisionDataset=${encodeURIComponent(exact.datasetId)}`
           + `&returnCanvas=${encodeURIComponent(canvasId)}&returnNode=source$`,
         ),
@@ -2592,7 +2721,8 @@ test.describe('Data Playground canvas', () => {
 
       await page.goForward()
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
-      await expect(page.getByTestId('inspector')).toContainText(`Exact version ${exact.revisionId}`)
+      await expect(page.getByTestId('inspector')).toContainText('Saved version')
+      await expect(page.getByTestId('inspector')).not.toContainText(exact.revisionId)
       await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
 
       const staleViewerHash = `#/workspace/${encodeURIComponent(`dataset:${exact.datasetId}`)}?${new URLSearchParams({
@@ -2657,7 +2787,7 @@ test.describe('Data Playground canvas', () => {
       await expect(publication).toContainText(filename)
       await expect(publication).toContainText('Create a new dataset')
       await expect(publication).toContainText('Ready to run')
-      await expect(publication.locator('details')).not.toHaveAttribute('open')
+      await expect(publication.getByText('Diagnostics', { exact: true })).toHaveCount(0)
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await confirmRun(page)
       const firstReceipt = publication.getByRole('link', { name: 'Open dataset' })
@@ -2670,23 +2800,19 @@ test.describe('Data Playground canvas', () => {
       await expect(cardSummary).toHaveText(`Published · ${publishedName}`)
       expect(await cardSummary.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBeTruthy()
 
-      const publicationDetails = publication.locator('details')
-      const receiptRow = publicationDetails.getByText('Receipt:', { exact: true }).locator('..')
-      const firstReceiptId = (await receiptRow.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
-      expect(firstReceiptId).toBeTruthy()
-      const firstRevision = firstReceiptId?.split('@').at(-1)
+      const firstHref = await firstReceipt.getAttribute('href')
+      expect(firstHref).toBeTruthy()
+      const firstRevision = new URLSearchParams(firstHref!.split('?', 2)[1]).get('revision')
       expect(firstRevision).toBeTruthy()
       await expect(firstReceipt).toHaveAttribute('href', new RegExp(`revision=${encodeURIComponent(firstRevision!)}`))
       const summaryMode = publication.getByText('Mode', { exact: true }).locator('..')
       await expect(summaryMode).toContainText('Create a new dataset')
-      await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
-      await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      await expect(receiptRow).not.toContainText(firstReceiptId!, { timeout: 20_000 })
       const secondReceipt = publication.getByRole('link', { name: 'Open dataset' })
-      const secondReceiptId = (await receiptRow.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
-      const secondRevision = secondReceiptId?.split('@').at(-1)
+      await expect(secondReceipt).not.toHaveAttribute('href', firstHref!, { timeout: 20_000 })
+      const secondHref = await secondReceipt.getAttribute('href')
+      const secondRevision = new URLSearchParams(secondHref!.split('?', 2)[1]).get('revision')
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
       await expect(secondReceipt).toHaveAttribute('href', new RegExp(`revision=${encodeURIComponent(secondRevision!)}`))
@@ -2696,11 +2822,11 @@ test.describe('Data Playground canvas', () => {
       await secondReceipt.click()
       const viewer = page.getByTestId('dataset-viewer')
       await expect(viewer).toBeVisible()
-      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
+      await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
       await expect(viewer.getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
       await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=write$`))
-      await expect(page.getByTestId('inspector').getByLabel('Write publication')).toContainText(filename)
+      await expect(page.getByTestId('inspector').getByLabel('Write publication')).toContainText(publishedName)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
       await page.request.put('/api/settings', { data: {
@@ -2752,7 +2878,7 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
       await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
+      await runPanel.getByRole('button', { name: 'Publish output', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
@@ -2795,7 +2921,7 @@ test.describe('Data Playground canvas', () => {
       // destination for the typed append journey below.
       const providerPublication = inspector.getByLabel('Write publication')
       await expect(providerPublication.getByText('Mode', { exact: true }).locator('..'))
-        .toContainText('Overwrite provider output')
+        .toContainText('Replace output')
       await expect(providerPublication.getByLabel('Write readiness'))
         .toContainText('Ready to run')
       let fixtureRunId: string | undefined
@@ -2827,12 +2953,11 @@ test.describe('Data Playground canvas', () => {
       await page.getByRole('combobox', { name: 'write mode' }).selectOption('append')
       const appendPublication = inspector.getByLabel('Write publication')
       await expect(appendPublication.getByText('Mode', { exact: true }).locator('..'))
-        .toContainText('Overwrite provider output')
+        .toContainText('Replace output')
       await expect(appendPublication.getByLabel('Write readiness'))
-        .toContainText('Run finished. The selected backend wrote the output.')
-      const appendDetails = appendPublication.locator('details')
-      await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
-      await expect(appendDetails).toContainText(/Next admission:.*mode append/)
+        .toContainText('Run finished. Output was written.')
+      await expect(appendPublication).not.toContainText('Completed run setup')
+      await expect(appendPublication).not.toContainText('Next run setup')
       await expect.poll(() => captured).toBeTruthy()
 
       // Hold the UI request only after it contains its frozen intent. A competing admission from the
@@ -2864,7 +2989,10 @@ test.describe('Data Playground canvas', () => {
         await route.continue()
       })
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      const staleAdmission = page.getByText(/write admission is stale/i).last()
+      const staleAdmission = page.getByText(
+        'Destination changed before this run started. Review the latest version and try again.',
+        { exact: true },
+      ).last()
       const confirmation = page.getByTestId('panel-run').getByText('CONFIRM RUN')
       await expect(confirmation.or(staleAdmission).first()).toBeVisible({ timeout: 15_000 })
       if (await confirmation.isVisible()) await confirmRun(page)
@@ -2892,30 +3020,24 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
       await expect(runPanel.getByText('CONFIRM RUN')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Publish a new version', exact: true }).click()
+      await runPanel.getByRole('button', { name: 'Publish output', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
       const publication = inspector.getByLabel('Write publication')
       const receipt = publication.getByRole('link', { name: 'Open dataset' })
       await expect(receipt).toBeVisible({ timeout: 20_000 })
-      const details = publication.locator('details')
-      await details.locator('summary').click()
-      await expect(details).toContainText(/Receipt:\s*\S+@3/)
+      await expect(receipt).toHaveAttribute('href', /revision=3/)
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
 
       await page.reload()
       await page.getByTestId('app-menu').click()
       await page.getByText('Run history', { exact: true }).click()
-      const historyReceipt = page.getByLabel(/Write receipt for run/).first()
-      await expect(historyReceipt).not.toHaveAttribute('open')
-      await expect(historyReceipt.getByText('durable revision 3')).not.toBeVisible()
-      await historyReceipt.locator('summary').click()
-      await expect(historyReceipt).toContainText('durable revision 3')
-      await expect(historyReceipt).toContainText('parent 2')
-      await expect(historyReceipt).toContainText(/backend \d/)
-      await expect(historyReceipt).not.toContainText('/outputs/')
+      const historyOutput = page.getByText('6,000 rows written', { exact: true }).locator('..')
+      await expect(historyOutput).toContainText('published')
+      await expect(historyOutput).toContainText(filename.replace(/\.lance$/, ''))
+      await expect(historyOutput.getByRole('button', { name: 'Open dataset' })).toBeVisible()
     } finally {
       await page.unrouteAll({ behavior: 'wait' })
       await page.request.put('/api/settings', { data: {
@@ -2929,6 +3051,7 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Sources & sinks', 'source')
     await page.locator('.react-flow__node').getByRole('button', { name: /Select dataset/ }).click()
     await page.getByText('Register accessible path / URI…').click()
+    await page.getByRole('button', { name: 'Browse storage' }).click()
     await expect(page.getByText('Open a dataset')).toBeVisible() // the open dialog over destinations
     const dialog = page.getByRole('dialog', { name: 'Open a dataset' })
     await expect(dialog.getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
@@ -2975,7 +3098,7 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByRole('button', { name: 'Delete' })).toBeVisible()
     await expect(inspector.getByLabel('Dataset URI')).toBeHidden()
 
-    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await inspector.getByText('Manual source settings', { exact: true }).click()
     const manualUri = inspector.getByLabel('Dataset URI')
     await expect(manualUri).toBeVisible()
     await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
@@ -2988,10 +3111,12 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByLabel('CSV header row')).toHaveCount(0)
 
     await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
-    await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    const registerDialog = page.getByRole('dialog', { name: 'Register path or URL' })
+    await expect(registerDialog).toBeVisible()
+    await expect(registerDialog.getByRole('button', { name: 'Browse storage' })).toBeVisible()
     await expect(inspector).toBeVisible()
-    await page.keyboard.press('Escape')
-    await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+    await registerDialog.getByRole('button', { name: 'Cancel' }).click()
+    await expect(registerDialog).toHaveCount(0)
     await expect(inspector).toBeVisible()
 
     await inspector.getByRole('button', { name: 'Select dataset' }).click()
@@ -3019,7 +3144,7 @@ test.describe('Data Playground canvas', () => {
       await addNode(page, 'Sources & sinks', 'source')
       const source = page.locator('.react-flow__node-source')
       const inspector = page.getByTestId('inspector')
-      await inspector.getByText('Advanced source configuration', { exact: true }).click()
+      await inspector.getByText('Manual source settings', { exact: true }).click()
       await inspector.getByLabel('Dataset URI').fill(uri)
 
       const blockedEstimatePromise = page.waitForResponse((response) =>
@@ -3033,15 +3158,18 @@ test.describe('Data Playground canvas', () => {
       })
 
       const runPanel = page.getByTestId('panel-run')
-      await expect(runPanel.getByLabel('Exact run readiness')).toContainText('Not exact-run-ready')
+      await expect(runPanel.getByLabel('Run readiness')).toContainText('Not ready to run')
       await expect(runPanel.getByRole('button', {
-        name: 'Exact input registration required',
+        name: 'Register inputs to run',
       })).toBeDisabled()
       await runPanel.getByRole('button', { name: 'Close' }).click()
 
       await source.getByRole('button', { name: 'Select dataset' }).click()
       await page.getByText('Register accessible path / URI…', { exact: true }).click()
-      await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+      const registerDialog = page.getByRole('dialog', { name: 'Register path or URL' })
+      await expect(registerDialog).toBeVisible()
+      await registerDialog.getByRole('button', { name: 'Browse storage' }).click()
+      await expect(page.getByRole('dialog', { name: 'Open a dataset' })).toBeVisible()
       const registrationPromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === '/api/catalog/register'
         && response.request().method() === 'POST')
@@ -3108,7 +3236,6 @@ test.describe('Data Playground canvas', () => {
       await goToWorkspace(page)
       await openWorkspaceDataset(page, original.name)
 
-      await page.getByText('Edit catalog details', { exact: true }).click()
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()
       const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {

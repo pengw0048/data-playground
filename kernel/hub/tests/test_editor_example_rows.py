@@ -282,7 +282,7 @@ def test_example_rows_use_the_kernel_preview_transport_when_selected(monkeypatch
             ).model_dump()
 
     deps = get_deps()
-    monkeypatch.setattr(deps, "chosen_backend", lambda _uid: "kernel")
+    monkeypatch.setattr(deps, "chosen_backend", lambda _uid, _requested=None: "kernel")
     monkeypatch.setattr(deps, "kernel_backend", lambda: FakeKernel())
 
     response = _preview(_graph(), fixture)

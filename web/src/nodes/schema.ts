@@ -160,6 +160,14 @@ function referencedColumns(node: CanvasNode): string[] {
     case 'dedup': return plain(str('on'))
     case 'aggregate': return plain(str('groupBy'))
     case 'filter': case 'assert': return exprColumns(str('predicate'))
+    case 'chart': {
+      const x = str('x')
+      const y = str('y')
+      return [
+        ...(str('xMode') === 'expression' ? exprColumns(x) : (plainColumns(x) ?? [])),
+        ...(str('yMode') === 'expression' ? exprColumns(y) : (plainColumns(y) ?? [])),
+      ]
+    }
     case 'window': return [...plain(str('partitionBy')), ...plain(str('orderBy'))]
     case 'fill': return plain(str('columns'))
     case 'unnest': return plain(str('column'))

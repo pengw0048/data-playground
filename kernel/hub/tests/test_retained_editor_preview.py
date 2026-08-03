@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from hub import execution_manifest, metadb
 from hub.deps import get_deps
 from hub.main import app
-from hub.models import ParameterBinding, SampleResult
+from hub.models import ParameterBinding, RunStatus, SampleResult
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.routers import runs as runs_router
 
@@ -497,6 +497,100 @@ def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_s
     assert expired.json()["retryable"] is False
 
 
+def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retained_sample):
+    graph, run_id, output = retained_sample
+
+    recovered = client.post("/api/run/current-results", json={"graph": graph})
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json() == {
+        "latestNodeIds": ["sample", "source"],
+        "failedNodeIds": [],
+        "staleNodeIds": [],
+        "unknownNodeIds": [],
+        "results": [{
+            "runId": run_id,
+            "executionManifestSha256": metadb.canvas_result_latest(
+                graph["id"])[0]["result_execution_manifest_sha256"],
+            "parameterBindings": [],
+            "output": output,
+        }],
+    }
+
+    os.unlink(output["uri"])
+    missing = client.post("/api/run/current-results", json={"graph": graph})
+    assert missing.status_code == 200, missing.text
+    assert missing.json() == {
+        "latestNodeIds": [],
+        "failedNodeIds": [],
+        "staleNodeIds": ["sample", "source"],
+        "unknownNodeIds": [],
+        "results": [],
+    }
+
+
+def test_canvas_reopen_keeps_transient_result_check_unknown(retained_sample, monkeypatch):
+    graph, _run_id, _output = retained_sample
+    monkeypatch.setattr(
+        runs_router, "_retained_result_readability", lambda _identity, _deps: "unknown")
+
+    recovered = client.post("/api/run/current-results", json={"graph": graph})
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json() == {
+        "latestNodeIds": [],
+        "failedNodeIds": [],
+        "staleNodeIds": [],
+        "unknownNodeIds": ["sample", "source"],
+        "results": [],
+    }
+
+
+def test_failed_rerun_stays_visible_without_discarding_prior_current_result(retained_sample):
+    graph, successful_run_id, output = retained_sample
+    projection = metadb.canvas_result_latest(graph["id"])[0]
+    manifest_sha256 = projection["result_execution_manifest_sha256"]
+    assert manifest_sha256 is not None
+    with metadb.session() as session:
+        manifest = session.get(metadb.ExecutionManifest, manifest_sha256)
+        assert manifest is not None
+        manifest_doc = manifest.semantic_doc
+
+    failed_run_id = f"run_{uuid.uuid4().hex}"
+    metadb.bind_run_owner(failed_run_id, metadb.DEFAULT_USER_ID, graph["id"])
+    failed = RunStatus(
+        runId=failed_run_id,
+        status="failed",
+        targetNodeId="sample",
+        error="test failure",
+    )
+    metadb.save_run_state(
+        failed_run_id,
+        failed.model_dump(),
+        canvas_id=graph["id"],
+        execution_manifest_sha256=manifest_sha256,
+        execution_manifest_doc=manifest_doc,
+    )
+
+    recovered = client.post("/api/run/current-results", json={"graph": graph})
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json() == {
+        "latestNodeIds": ["source"],
+        "failedNodeIds": ["sample"],
+        "staleNodeIds": [],
+        "unknownNodeIds": [],
+        "results": [{
+            "runId": successful_run_id,
+            "executionManifestSha256": manifest_sha256,
+            "parameterBindings": [],
+            "output": output,
+        }],
+    }
+    retained = _retained_result(graph)
+    assert retained.status_code == 200, retained.text
+    assert retained.json()["runId"] == successful_run_id
+
+
 def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_path):
     with _retained_sample(tmp_path) as (graph, run_id, _output):
         graph["nodes"][0]["data"]["config"].pop("datasetRef")
@@ -958,21 +1052,22 @@ def test_canvas_prefers_newer_terminal_result_before_history_projection(tmp_path
         assert response.json()["runId"] == newer_run_id
         assert metadb.list_runs(graph["id"]) == history_before
 
-        # Without comparable terminal evidence for A, choosing either candidate would be a guess.
+        # The Canvas projection is now the authoritative current-result identity. B remains current
+        # even after the bounded live state for the older run is reclaimed.
         with metadb.session() as session:
             older_state = session.get(metadb.RunState, older_run_id)
             assert older_state is not None
             session.delete(older_state)
-        ambiguous = _retained_result(graph)
-        assert ambiguous.status_code == 404, ambiguous.text
-        assert ambiguous.json()["code"] == "retained_upstream_unavailable"
+        retained = _retained_result(graph)
+        assert retained.status_code == 200, retained.text
+        assert retained.json()["runId"] == newer_run_id
         assert metadb.list_runs(graph["id"]) == history_before
 
 
-def test_terminal_state_does_not_outlive_history_retention_for_editor_reuse(tmp_path):
+def test_canvas_result_outlives_bounded_history_for_editor_reuse(tmp_path):
     with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
-        # Normal history pruning removes the admission together with the RunRecord. A still-retained
-        # operational RunState must not resurrect that older result as editor history.
+        # Run history is bounded metadata. The Canvas-lifetime current-result projection owns the
+        # exact manifest and input evidence independently, so pruning history cannot erase reopen.
         with metadb.session() as session:
             record = session.scalar(
                 metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
@@ -982,11 +1077,11 @@ def test_terminal_state_does_not_outlive_history_retention_for_editor_reuse(tmp_
             session.delete(admission)
 
         response = _preview(graph)
-        assert response.status_code == 404, response.text
-        assert response.json()["code"] == "retained_upstream_unavailable"
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
 
 
-def test_projected_history_is_never_overridden_by_live_state(tmp_path):
+def test_corrupt_history_output_does_not_override_canvas_current_result(tmp_path):
     with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
         with metadb.session() as session:
             record = session.scalar(
@@ -995,8 +1090,8 @@ def test_projected_history_is_never_overridden_by_live_state(tmp_path):
             record.outputs = "[]"
 
         response = _preview(graph)
-        assert response.status_code == 404, response.text
-        assert response.json()["code"] == "retained_upstream_unavailable"
+        assert response.status_code == 200, response.text
+        assert response.json()["editorTestInput"]["runId"] == run_id
 
 
 def test_logical_workspace_source_registration_change_invalidates_reuse(tmp_path):

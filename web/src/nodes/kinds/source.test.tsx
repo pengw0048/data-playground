@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ReactFlowProvider } from '@xyflow/react'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -25,6 +25,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
     mocks.destinations.mockResolvedValue({ destinations: [{ id: 'local', name: 'Workspace', backend: 'local', root: '/data' }], backends: ['local'] })
     mocks.browseDestination.mockResolvedValue({ path: '', entries: [{ name: 'new.csv', kind: 'file', uri: 'file:///data/new.csv' }], writable: true })
+    mocks.registerFile.mockReset()
     mocks.mkdirDestination.mockResolvedValue({ ok: true })
     mocks.datasetRevisions.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
     mocks.datasetRevisionCapabilities.mockResolvedValue({
@@ -86,6 +87,14 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     await waitFor(() => expect(search).toHaveFocus())
   })
 
+  it('opens an entry action requested while a new Source is still mounting', async () => {
+    requestSourceEntryAction('s1', 'select')
+    render1({ title: 'source', status: 'draft', config: {} })
+
+    const search = await screen.findByTestId('source-search')
+    await waitFor(() => expect(search).toHaveFocus())
+  })
+
   it('does not route an Inspector entry action to a different Source', async () => {
     const sourceData = (title: string) => ({ title, status: 'draft', config: {} })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -107,6 +116,43 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     const [first, second] = useStore.getState().doc.nodes
     expect(first.data.config.tableId).toBeUndefined()
     expect(second.data.config.tableId).toBe('t1')
+  })
+
+  it('registers a pasted path or URL from the direct Source entry action', async () => {
+    const data = { title: 'source', status: 'draft', config: {} }
+    mocks.registerFile.mockResolvedValue({
+      id: 'registered', name: 'events', uri: 's3://datasets/events.parquet', rowCount: 1,
+      columns: [{ name: 'event', type: 'string', capabilities: [] }],
+    })
+    useStore.setState({ doc: {
+      id: 'c', name: 'test', version: 1, edges: [],
+      nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }],
+    } } as any)
+    render1(data)
+
+    requestSourceEntryAction('s1', 'browse')
+    const dialog = await screen.findByRole('dialog', { name: 'Register path or URL' })
+    expect(dialog.parentElement?.parentElement).toBe(document.body)
+    fireEvent.change(within(dialog).getByLabelText('Dataset path or URL'), {
+      target: { value: 's3://datasets/events.parquet' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Register' }))
+
+    await waitFor(() => expect(mocks.registerFile).toHaveBeenCalledWith('s3://datasets/events.parquet'))
+    expect(useStore.getState().doc.nodes[0].data.config).toEqual({
+      uri: 's3://datasets/events.parquet', tableId: 'registered',
+    })
+  })
+
+  it('closes the Source registration dialog with Escape', async () => {
+    const data = { title: 'source', status: 'draft', config: {} }
+    render1(data)
+
+    requestSourceEntryAction('s1', 'browse')
+    expect(await screen.findByRole('dialog', { name: 'Register path or URL' })).toBeVisible()
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog', { name: 'Register path or URL' })).not.toBeInTheDocument()
   })
 
   it('ignores Inspector entry actions when the Source is read-only', () => {
@@ -153,7 +199,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 1 column')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 0 rows · 1 column')).toBeInTheDocument()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
     expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
@@ -172,7 +218,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('fixture · Version empty-r7 · 0 rows · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 0 rows · 0 columns')).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
@@ -192,7 +238,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId },
     } })
 
-    expect(await screen.findByText('fixture · Selected version · 12 rows · 1 column')).toBeInTheDocument()
+    expect(await screen.findByText('fixture · Saved version · 12 rows · 1 column')).toBeInTheDocument()
     expect(screen.queryByText(/intentionally-long-opaque/i)).not.toBeInTheDocument()
   })
 
@@ -212,7 +258,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     useStore.setState({ kernelUp: false, catalog: [] } as any)
     render1({ title: 'source', status: 'draft', config: {} })
     fireEvent.click(screen.getByText(/select dataset/i))
-    expect(await screen.findByText(/Kernel offline/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Offline — datasets unavailable/i)).toBeInTheDocument()
     await waitFor(() => expect(mocks.tablesPage).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByText(/Failed to fetch/i)).toBeNull()
@@ -397,6 +443,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     render1({ title: 'orders source', status: 'draft', config: oldConfig })
     fireEvent.click(screen.getByText('orders'))
     fireEvent.click(screen.getByText(/Register accessible path/i))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Register path or URL' })).getByRole('button', { name: 'Browse storage' }))
     fireEvent.click(await screen.findByText('new.csv'))
 
     expect(await screen.findByText(/Couldn't open file: HTTP 422/i)).toBeInTheDocument()
@@ -432,7 +479,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ], nextCursor: null, hasMore: false })
     render1(source.data)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Pin exact revision/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /Pin a version/i }))
     fireEvent.click(screen.getAllByRole('button').find((button) => button.textContent?.startsWith('1'))!)
 
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({
@@ -471,7 +518,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     render1(data)
 
-    expect(await screen.findByText('Local catalog · Version rev-1 · 1,000 rows · 4 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1,000 rows · 4 columns')).toBeInTheDocument()
     expect(screen.queryByText(/Current head/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Field evidence/i)).not.toBeInTheDocument()
   })
@@ -542,7 +589,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Last known provider commit.*stale/i)
     expect(screen.queryByRole('button', { name: 'Revision selection unavailable' })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -570,7 +617,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -590,7 +637,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ))
     render1(data)
 
-    expect(await screen.findByText(/Selected version is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Selected version is missing or compacted.*Your selection is unchanged/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Choose a new dataset above to create a new binding/i)
     expect(screen.queryByRole('button', { name: /follow current latest explicitly/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
@@ -614,9 +661,9 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       })
     render1(data)
 
-    expect(await screen.findByText(/Permission to open the selected version was lost.*latest was not substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Permission to open the selected version was lost.*Your selection is unchanged/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry selected version' }))
-    expect(await screen.findByText('Local catalog · Version 7 · 1 row · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1 row · 0 columns')).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -661,7 +708,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     fireEvent.click(control)
     expect(screen.getByText('Jul 16, 2026, 15:38:00 UTC')).toBeInTheDocument()
     expect(screen.getByLabelText('As-of UTC date and time')).toBeInTheDocument()
-    expect(await screen.findByText('Local catalog · Version rev-pin · 1 row · 0 columns')).toBeInTheDocument()
+    expect(await screen.findByText('Datasets · Saved version · 1 row · 0 columns')).toBeInTheDocument()
   })
 
   it('stores UTC as-of intent with exact and as-of capabilities after history is ready', async () => {
@@ -683,7 +730,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.resolveDatasetRevision.mockResolvedValue(resolved)
     render1(source.data)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Choose exact or as-of revision' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose a saved or as-of version' }))
     expect(screen.getByText(/latest provider commit at or before this UTC instant \(inclusive\)/i)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('As-of UTC date and time'), { target: { value: localIntent } })
     fireEvent.click(screen.getByRole('button', { name: 'Resolve once' }))
@@ -712,7 +759,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.resolveDatasetRevision.mockResolvedValue(resolved)
     render1(source.data)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Choose revision as of a time' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose version by time' }))
     expect(mocks.datasetRevisions).not.toHaveBeenCalled()
     fireEvent.change(screen.getByLabelText('As-of UTC date and time'), { target: { value: localIntent } })
     fireEvent.click(screen.getByRole('button', { name: 'Resolve once' }))

@@ -798,7 +798,7 @@ class InMemoryCatalog:
                 return False
             token = (id_or_name if metadb.object_attempt_is_managed(id_or_name)
                      else doc["uri"])
-            metadb.catalog_delete_entry(token)
+            metadb.catalog_delete_entry(token, remove_workspace_placement=True)
             self._emb_dirty += 1  # its embedding row went with it
         return True
 
@@ -808,7 +808,8 @@ class InMemoryCatalog:
         with self._lock:
             removed = metadb.catalog_delete_entry(
                 id_or_name, expected_registration_id=expected_registration_id,
-                expected_metadata_revision=expected_revision, report_result=True)
+                expected_metadata_revision=expected_revision, report_result=True,
+                remove_workspace_placement=True)
             if removed:
                 self._emb_dirty += 1
             return bool(removed)

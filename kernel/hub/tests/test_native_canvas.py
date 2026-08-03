@@ -25,6 +25,9 @@ def _doc(canvas_id: str, *, dataset_ref: dict | None = None) -> dict:
     config = {"datasetRef": dataset_ref} if dataset_ref is not None else {"uri": "events"}
     return {
         "id": canvas_id, "name": "portable report", "version": 4,
+        # Execution targets name deployment-local infrastructure and therefore do not cross the
+        # portable native-Canvas boundary; imported Canvases return to Automatic.
+        "executionBackend": "ray-data",
         "requirements": ["requests>=2"], "parameters": [
             {"name": "limit", "type": "integer", "default": 10},
         ],
@@ -63,6 +66,7 @@ def test_export_is_viewer_readable_and_omits_identity_and_run_history():
         envelope = response.json()
         assert envelope["format"] == native_canvas.FORMAT
         assert envelope["canvas"].get("id") is None
+        assert envelope["canvas"].get("executionBackend") is None
         assert envelope["canvas"]["nodes"][0]["data"]["status"] == "draft"
         assert "lastRun" not in envelope["canvas"]["nodes"][0]["data"]
         assert "history" not in envelope["canvas"]["nodes"][0]["data"]
@@ -99,6 +103,18 @@ def test_native_canvas_preserves_supported_placement_state(auto_placed: bool):
     assert envelope["canvas"]["nodes"][0]["data"]["autoPlaced"] is auto_placed
     parsed = native_canvas.parse_envelope(envelope, filename="placement.dp-canvas.json")
     assert parsed["canvas"]["nodes"][0]["data"]["autoPlaced"] is auto_placed
+
+
+def test_native_canvas_preserves_result_retention_policy():
+    doc = _doc("native-result-retention")
+    doc["resultRetention"] = {"history": "recent"}
+
+    envelope = native_canvas.export_envelope(doc, get_deps())
+    parsed = native_canvas.parse_envelope(
+        envelope, filename="result-retention.dp-canvas.json")
+
+    assert envelope["canvas"]["resultRetention"] == {"history": "recent"}
+    assert parsed["canvas"]["resultRetention"] == {"history": "recent"}
 
 
 def test_native_canvas_rejects_non_boolean_placement_state():

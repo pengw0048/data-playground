@@ -12,6 +12,16 @@ const NUMERIC_TYPE_RANK: Record<string, number> = {
   double: 5, float64: 5,
 }
 
+export function isMeaningfulSchemaChange(field: SchemaFieldCompatibility): boolean {
+  if (field.kind !== 'unchanged') return true
+  const reason = field.reason.toLowerCase()
+  if (reason === 'logical type is unchanged'
+    || reason === 'logical type is unchanged; nullability is not proven on both versions') return false
+  if (reason.startsWith('logical types ') && reason.includes(' are equivalent')
+    && !reason.includes('; field became ')) return false
+  return true
+}
+
 function typeChange(beforeRaw: string, afterRaw: string): [SchemaCompatibilityStatus, string] {
   const before = beforeRaw.trim().toLowerCase()
   const after = afterRaw.trim().toLowerCase()

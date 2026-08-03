@@ -366,6 +366,31 @@ def test_settings_batch_rejects_duplicate_invalid_scope_and_unbounded_changes():
     assert metadb.get_setting(key, "global") is None
 
 
+def test_canvas_result_retention_is_a_strict_workspace_policy():
+    baseline = _snapshot()
+    valid = _batch(baseline, [{
+        "scope": "global",
+        "key": "canvasResultRetention",
+        "value": {"history": "recent"},
+    }])
+    assert valid.status_code == 200, valid.text
+    assert metadb.get_setting("canvasResultRetention", "global") == {"history": "recent"}
+
+    for scope, value in (
+        ("user", {"history": "latest"}),
+        ("global", {"history": "forever"}),
+        ("global", {"history": "latest", "location": "export-destination"}),
+    ):
+        before = _snapshot()
+        rejected = _batch(before, [{
+            "scope": scope,
+            "key": "canvasResultRetention",
+            "value": value,
+        }])
+        assert rejected.status_code == 400, rejected.text
+        assert _snapshot()["revision"] == before["revision"]
+
+
 def test_settings_batch_secret_validation_matches_single_setting_contract():
     plugin_name = f"dp_settings_secret_{uuid.uuid4().hex}"
     secret_key = f"plugin.{plugin_name}.token"

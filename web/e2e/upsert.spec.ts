@@ -119,17 +119,17 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
     const writeCard = page.locator('.react-flow__node[data-id="write"]')
     await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const inspector = page.getByTestId('inspector')
-    const control = inspector.getByLabel('Certified keyed upsert')
+    const control = inspector.getByLabel('Keyed upsert setup')
     await expect(control).toBeVisible()
-    await control.getByRole('button', { name: 'Check eligibility' }).click()
-    const projection = control.getByLabel('Upsert projection')
-    await expect(projection).toContainText('Eligible keyed upsert')
+    await control.getByRole('button', { name: 'Check setup' }).click()
+    const projection = control.getByLabel('Upsert check')
+    await expect(projection).toContainText('Ready to update')
     await expect(projection).toContainText('1 matched · 2 inserted · 2 unchanged')
-    await expect(projection).toContainText('Output schema: id: int, value: string')
+    await expect(projection).toContainText('Result columns: id: int, value: string')
 
     const submitted = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upsert')
       && response.request().method() === 'POST')
-    await control.getByRole('button', { name: 'Run keyed upsert' }).click()
+    await control.getByRole('button', { name: 'Update dataset' }).click()
     const task = await json<{ taskId: string }>(await submitted, 'submit browser keyed upsert')
     const published = control.getByLabel('Published result')
     await expect(published).toBeVisible({ timeout: 20_000 })
@@ -147,7 +147,6 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
     await expect(exactDataset).toHaveAttribute(
       'href',
       `#/workspace/${encodeURIComponent(`dataset:${receipt!.datasetId}`)}?${new URLSearchParams({
-        scope: 'datasets',
         revision: receipt!.revisionId,
         revisionDataset: receipt!.datasetId,
         returnCanvas: canvasId,
@@ -155,13 +154,9 @@ test('certifies the real Write Inspector keyed-upsert journey and exact revision
       })}`,
     )
     await exactDataset.click()
-    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
-    const datasetDetails = page.getByTestId('detail-dataset-details')
-    await datasetDetails.locator('summary').click()
-    const revisionTechnicalDetails = page.getByTestId('revision-technical-details')
-    await revisionTechnicalDetails.locator('summary').click()
-    await expect(revisionTechnicalDetails.getByText('Parent revision', { exact: true })).toBeVisible()
-    await expect(revisionTechnicalDetails.getByText(target.revisionId, { exact: true })).toBeVisible()
+    await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
+    await expect(page.getByTestId('dataset-version-context')).toHaveText('Current version')
+    await expect(page.getByTestId('dataset-viewer')).not.toContainText(`${receipt!.datasetId}@${receipt!.revisionId}`)
 
     // Reopen exactly the immutable base and upserted head through the ordinary revision APIs.
     const finalHead = await json<{ datasetId: string; revisionId: string }>(

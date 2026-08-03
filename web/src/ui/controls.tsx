@@ -3,6 +3,16 @@ import { color, radius } from '../theme/tokens'
 import { cn } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 
+export function ProgressBar({ value, label }: { value: number; label?: string }) {
+  return (
+    <div role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100}
+      aria-valuenow={Math.round(Math.min(1, Math.max(0, value)) * 100)}
+      className="h-1.5 overflow-hidden rounded bg-muted">
+      <div className="h-full rounded bg-primary transition-[width] duration-300" style={{ width: `${Math.min(100, Math.max(6, value * 100))}%` }} />
+    </div>
+  )
+}
+
 export function Segmented<T extends string>({ options, value, onChange, accent = color.focus }: {
   options: { value: T; label: string }[]
   value: T
@@ -51,14 +61,15 @@ export const miniInputClass = 'h-7 px-2 py-1 text-[11.5px] md:text-[11.5px] text
 export const miniSelectClass =
   'h-7 w-full cursor-pointer rounded-md border border-input bg-transparent px-2 text-[11.5px] text-foreground outline-none focus:ring-1 focus:ring-ring focus:ring-offset-0'
 
-export function MiniInput({ value, onChange, placeholder, mono, onBlur, invalid }: {
+export function MiniInput({ value, onChange, placeholder, mono, onBlur, invalid, ariaLabel }: {
   value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean; onBlur?: () => void
-  invalid?: boolean
+  invalid?: boolean; ariaLabel?: string
 }) {
   return (
     <Input
       value={value}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       aria-invalid={invalid || undefined}
       onChange={(e) => onChange(e.target.value)}
       onBlur={onBlur}
@@ -71,6 +82,9 @@ export function MiniInput({ value, onChange, placeholder, mono, onBlur, invalid 
 export function MiniSelect<T extends string>({ value, options, onChange }: {
   value: T; options: { value: T; label: string }[]; onChange: (v: T) => void
 }) {
+  // A value no option carries would otherwise render as the first option, showing a setting the
+  // node is not configured with.
+  const unlisted = value !== '' && !options.some((o) => o.value === value)
   return (
     <select
       value={value}
@@ -78,6 +92,7 @@ export function MiniSelect<T extends string>({ value, options, onChange }: {
       onClick={(e) => e.stopPropagation()}
       className={cn(miniSelectClass, 'appearance-none')}
     >
+      {unlisted && <option value={value}>{value}</option>}
       {options.map((o) => (
         <option key={o.value} value={o.value}>{o.label}</option>
       ))}

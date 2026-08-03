@@ -226,12 +226,12 @@ describe('FileDialog request and open-mutation truth', () => {
     const input = screen.getByRole('textbox', { name: 'New folder name' })
     fireEvent.change(input, { target: { value: ' padded ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    expect(await screen.findByText(/one exact folder name/i)).toBeVisible()
+    expect(await screen.findByText(/one folder name without surrounding spaces/i)).toBeVisible()
     expect(mocks.mkdirDestination).not.toHaveBeenCalled()
 
     fireEvent.change(input, { target: { value: '../outside' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    expect(await screen.findByText(/one exact folder name/i)).toBeVisible()
+    expect(await screen.findByText(/one folder name without surrounding spaces/i)).toBeVisible()
     expect(mocks.mkdirDestination).not.toHaveBeenCalled()
 
     fireEvent.change(input, { target: { value: 'daily' } })

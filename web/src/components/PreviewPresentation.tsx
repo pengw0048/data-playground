@@ -60,7 +60,8 @@ export function PreviewSummary({
 }) {
   const summary = data.sampleProvenance ? samplingSummary(data.sampleProvenance) : null
   const warning = showWarning ? previewWarning(data, unit, surface, suppressSourceCapWarning) : null
-  if (!showRange && !summary && !warning) return null
+  const notices = data.parseNotices ?? []
+  if (!showRange && !summary && !warning && notices.length === 0) return null
   return (
     <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -68,6 +69,9 @@ export function PreviewSummary({
         {summary && <span>{summary}</span>}
       </div>
       {warning && <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">{warning}</div>}
+      {notices.map((notice) => (
+        <div key={notice} className="mt-1 font-medium text-amber-700 dark:text-amber-300">{notice}</div>
+      ))}
     </div>
   )
 }
@@ -96,9 +100,8 @@ export function PreviewDetails({ provenance, stale = false }: {
     <details className="text-[10.5px] text-muted-foreground" data-testid="preview-details">
       <summary className="cursor-pointer select-none py-1 font-medium hover:text-foreground">Preview details</summary>
       <div className="space-y-0.5 pb-1">
-        {stale && <div>These retained rows are from the bound version below, not a refreshed preview.</div>}
+        {stale && <div>These saved rows are from the version below, not a refreshed preview.</div>}
         <div>{counts}</div>
-        <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
         {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
       </div>
     </details>

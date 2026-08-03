@@ -12,15 +12,125 @@ and a user returning to a failed, cancelled, or recovered job.
 
 Every acceptance run follows this workflow:
 
-1. Discover or register a dataset.
-2. Inspect a sample and profile.
-3. Explore relationships and lineage.
-4. Add the dataset to an explicitly chosen canvas.
-5. Build and preview a transformation.
-6. Change the graph and see prior results invalidated.
-7. Estimate, run, monitor, cancel, or recover full work.
-8. Inspect and export a complete artifact.
-9. Leave and return through a durable, shareable link without losing context.
+1. Create a named project folder and work inside it.
+2. Discover or register a dataset.
+3. Inspect a sample and profile.
+4. Explore relationships and lineage.
+5. Add the dataset to an explicitly chosen canvas.
+6. Build and preview a transformation.
+7. Change the graph and see prior results invalidated.
+8. Estimate, run, monitor, cancel, or recover full work.
+9. Inspect and export a complete artifact.
+10. Create a related Canvas or example and confirm it stays in the current folder.
+11. Leave and return through a durable, shareable link without losing context or location.
+
+## Cold-start comprehension gate
+
+Functional browser tests answer whether a known control still works. They do not answer whether a
+first-time researcher can discover the control, predict its effect, or decide which information can
+be ignored. Every release candidate therefore starts with one cold UI-only pass before the reviewer
+may inspect source code, test selectors, network traffic, logs, or API responses.
+
+Use a fresh database and browser profile. Run the pass at 1280×720 and 1440×900, first with one item,
+then with more than 50 items. The reviewer receives a research goal, never menu names, routes, control
+labels, or implementation terms. Before every action they record:
+
+1. the result they are trying to achieve;
+2. the visible clue that suggests this action;
+3. the result they expect after taking it;
+4. the actual result and whether any product knowledge or guessing was required.
+
+Stop and record a blocker when no evidence-based next step is visible within 30 seconds, or after two
+guesses. Reaching the end through persistence does not turn a blocked or confusing path into a pass.
+Each visible sentence must help a researcher choose an action, understand a result, or recover from a
+failure. Internal identity, placement, runner, integrity, and scheduler evidence belongs in
+Diagnostics unless it changes one of those decisions.
+
+Use this baseline prompt for an independent browser reviewer:
+
+> You are a data researcher opening Data Playground for the first time. Start on the home page and
+> use only visible UI. Create a folder named Research, find the built-in events data, create and name
+> a Canvas in Research, keep only purchase events, add a Python Transform that creates
+> amount_with_tax, confirm its output columns, run it,
+> and save the result. Leave the Canvas, find the result from Workspace or Jobs, reopen the same
+> Transform, and continue editing. From that Canvas, create one runnable example and verify both the
+> original and the example remain in Research. Before each click, state your goal, the visible clue
+> for that action, and what you expect to happen. Do not inspect source code, tests, DOM test IDs, developer
+> tools, network requests, or APIs; do not enter a deep link. If the next step is not clear within
+> 30 seconds or two guesses, stop and record a blocker. Record every unexplained term, unnecessary
+> click, missing feedback, and failed recovery. Finally change the upstream filter and verify that an
+> old result is not presented as current.
+
+The report separates task completion from comprehension. It includes the decision log, screenshots
+for every blocker, time to first useful action, total clicks, backtracks, unsupported guesses, and
+P0/P1/P2 issues with the smallest product correction. Only after this report is frozen may an
+engineer use APIs and logs to diagnose causes.
+
+Automated `@cold-user` coverage should enforce observable parts of this contract: no API-created
+Canvas or deep-link setup, visible data-entry choices on an empty Canvas, one continuous dataset-to-
+Source flow, normal-language version labels, no editable fields whose values execution ignores, no
+native browser prompts, and a journey that runs work, consumes its artifact, leaves, reopens, mutates
+upstream state, and verifies invalidation or recovery. It must also create from a nested folder,
+exercise page navigation in a folder containing more than 50 resources, move multiple selected
+Canvases from one page, and verify that a new Canvas or example inherits the current folder. A
+configured provider must appear as one explicit Connected source folder; opening it must preserve
+the source in Back/breadcrumb navigation, and unsupported sort/filter controls must be disabled with
+a reason before the user tries them. Locators must not encode the product path as a substitute for
+the independent cold review.
+
+## Failure-finding pass
+
+The golden workflow proves one useful path; it does not prove that the product remains coherent when
+the same object is reached from another page or when the researcher returns later. Before release
+sign-off, run a separate failure-finding pass that inventories every top-level page and every action
+surface (primary button, overflow menu, context menu, keyboard, drag/drop, multi-select, and direct
+reopen link). Compare the same Canvas, dataset, run, result, and user across Workspace, Canvas, Jobs,
+Inbox, dataset detail, lineage, and Settings.
+
+The reviewer deliberately looks through these lenses:
+
+| Lens | Failure to seek |
+| --- | --- |
+| Product language | Internal storage, scheduler, identity, version, or transport terms shown where they do not help a decision; one concept given several labels. |
+| Cross-surface consistency | Different state, owner, destination, count, or available action for the same object on different pages. |
+| Discoverability and defaults | A visible control that silently does nothing, a useful action hidden behind an unrelated panel, or a default path that needs configuration before producing anything useful. |
+| Data and execution truth | Frontend formatting or serialization that changes values, hides scope, invents freshness, or reports a smaller sample as complete. |
+| Guard parity | UI, keyboard, agent/MCP, retry, and whole-graph paths applying different validation, confirmation, ownership, or cancellation rules. |
+| Lifecycle continuity | Folder, selection, viewport, result, job ownership, or recovery context lost after navigation, reload, restart, upstream mutation, cancellation, or partial failure. |
+| Scale and presentation | Controls overlap or disappear at supported viewports, zoom, long names, empty state, 50+ items, dense graphs, dark mode, forced colours, or reduced motion. |
+
+Freeze the black-box evidence before reading implementation details. For every finding record the
+starting state, visible clue, action, expected result, actual result, screenshot or trace, severity,
+and smallest product correction. A path that eventually succeeds after guessing still fails the
+comprehension gate. After the black-box pass, inspect API responses, persisted state, and logs to
+distinguish a presentation defect from incorrect backend truth; then add an observable regression
+test at the boundary that failed.
+
+Use this prompt for an autonomous failure-finding and correction loop:
+
+> Act as a skeptical first-time researcher, then as the same researcher returning on day 20. Do not
+> inspect source code, test IDs, network traffic, or APIs during the first pass. Inventory every
+> top-level page and every visible way to act on a Canvas, dataset, run, result, folder, member, and
+> setting. Complete a real create → inspect → transform → run → publish → leave → reopen workflow.
+> Repeat it from a nested folder and a connected source, with more than 50 resources and a dense
+> graph. Use mouse, keyboard, right-click, multi-select, drag/drop, zoom, and durable links. Compare
+> the same object and action across Workspace, Canvas, Jobs, Inbox, dataset detail, lineage, and
+> Settings. Restart the application, mutate an upstream dataset, cancel and retry work, and inject a
+> slow, unavailable, permission-denied, partial, and stale response. Test 1280×720 and 1440×900,
+> 200% browser zoom, long names, light/dark themes, forced colours, and reduced motion. Build data
+> containing integers beyond JavaScript's safe range, non-finite floats, whitespace-only strings,
+> timezone-sensitive timestamps, ambiguous dates, and malformed rows; verify displayed values and
+> exported artifacts against persisted backend truth. Treat unexplained vocabulary, inconsistent
+> labels or state, silent clicks, hidden default-path requirements, lost context, and validation that
+> differs between UI, whole-graph, retry, keyboard, or agent/MCP paths as defects even if the task can
+> eventually be completed. Stop each path after 30 seconds or two guesses without a visible clue.
+> Prove that the running service loaded the exact candidate artifacts, including optional plugins,
+> and that external fixtures existed before startup discovery. Do not accept matching metadata alone:
+> reconcile summary counts and schema with visible rows, pages, exports, and persisted data. Record
+> evidence and the smallest correction for every finding. Only then inspect code, APIs, and logs,
+> implement the corrections, add regression coverage at the failed boundary, and rerun the complete
+> continuous workflow. Do not weaken known truthfulness, scope, confirmation, recovery, or exact-value
+> behavior to make a test pass.
 
 ## Deterministic fixtures
 
@@ -39,6 +149,12 @@ relationship-dense datasets. The generated
 unavailable, permission-denied, stale-reference, partial-failure, and recovery scenarios. These fixtures
 need neither external credentials nor a private service.
 
+Fixture setup and candidate installation are part of the acceptance boundary. Create configured
+catalogs before the application starts so startup discovery sees the same state as a real deployment.
+Build and install exact wheels for the kernel and every local plugin rather than relying on a package
+manager's path-dependency cache. Record the candidate commit and artifact paths in the run evidence.
+A green test against a cached package is not evidence for the candidate under review.
+
 ## Invariants
 
 - A result is never presented as current after its graph or canvas scope changed.
@@ -48,6 +164,8 @@ need neither external credentials nor a private service.
 - Full work exposes estimate, progress, cancellation, terminal state, and recovery evidence.
 - A reproducible view has durable navigation state, and all core actions have a keyboard path.
 - Supported desktop viewports preserve access to essential controls without silently hiding them.
+- Summary counts, schema, visible rows, paging, exports, and persisted data agree for the same scope.
+- Connected sources remain discoverable even when the local folder fills one or more result pages.
 
 ## Result scope and export contract
 

@@ -16,14 +16,21 @@ export type CanvasCopySource = {
   name: string
 }
 
-export function CanvasCopyModal({ source, onClose, onCreated }: {
+type CanvasCopyDestination = {
+  containerId: string
+  path: WorkspaceResource[]
+}
+
+export function CanvasCopyModal({ source, initialDestination, onClose, onCreated }: {
   source: CanvasCopySource
+  initialDestination?: CanvasCopyDestination
   onClose: () => void
   onCreated?: () => void
 }) {
   const principalId = useStore((state) => state.currentUser?.id ?? null)
   const view = useStore((state) => state.view)
   const session = useRef({ principalId, view })
+  const initialDestinationRef = useRef(initialDestination)
   const alive = useRef(true)
   const [copyId] = useState(() => crypto.randomUUID())
   const [name, setName] = useState(`${source.name || 'Untitled canvas'} copy`)
@@ -56,7 +63,7 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
   const load = async (containerId: string, nextPath?: WorkspaceResource[]) => {
     setLoadingDestination(true); setError(''); setValidation(null); setConfirmed(false)
     try {
-      const page = await api.workspaceBrowse(containerId, { limit: 100 })
+      const page = await api.workspaceBrowse(containerId, { limit: 100, source: 'local' })
       if (!page.container) throw new Error('Workspace destination is unavailable')
       if (!alive.current) return
       setContainer(page.container)
@@ -70,7 +77,10 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
       if (alive.current) setLoadingDestination(false)
     }
   }
-  useEffect(() => { void load(ROOT_ID) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const initial = initialDestinationRef.current
+    void load(initial?.containerId ?? ROOT_ID, initial?.path)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const invalidate = () => { setValidation(null); setConfirmed(false); setError('') }
   const validate = async () => {
@@ -118,9 +128,9 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
       onEscapeKeyDown={(event) => { if (creating) event.preventDefault() }}
       onPointerDownOutside={(event) => { if (creating) event.preventDefault() }}
       className="dp-modal-overlay flex max-h-[86vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-3 overflow-y-auto">
-      <DialogTitle>{source.subjectId ? 'Clone retained run as new Canvas' : 'Save a copy'}</DialogTitle>
+      <DialogTitle>{source.subjectId ? 'Clone saved run as new Canvas' : 'Duplicate canvas'}</DialogTitle>
       <DialogDescription>
-        Creates a private, editable snapshot owned by you. Shares, collaborators, credentials, history, outputs, and Inbox state are not copied.
+        Create an independent, editable copy in a Workspace folder.
       </DialogDescription>
       <label className="grid gap-1 text-[11px] text-muted-foreground">New Canvas name
         <input aria-label="New Canvas name" className="dp-input" value={name} disabled={busy}
@@ -161,7 +171,7 @@ export function CanvasCopyModal({ source, onClose, onCreated }: {
         <Button variant="outline" onClick={onClose} disabled={creating}>Cancel</Button>
         {!validation ? <Button onClick={() => void validate()} disabled={!request || busy}>{busy ? 'Validating…' : 'Review copy'}</Button>
           : <Button onClick={() => void create()} disabled={busy || !validation.canImport || (validation.requiresConfirmation && !confirmed)}>
-            {busy ? 'Creating…' : 'Create and open'}
+            {busy ? 'Creating…' : source.subjectId ? 'Create and open' : 'Duplicate and open'}
           </Button>}
       </div>
     </DialogContent>

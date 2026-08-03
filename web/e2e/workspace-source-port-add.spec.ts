@@ -77,7 +77,10 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
     await expectToolbarInsideCanvas(page, 1440)
 
     await page.setViewportSize({ width: 1280, height: 720 })
-    await sourcePort.press('Enter')
+    await expectToolbarInsideCanvas(page, 1280)
+    await sourcePort.focus()
+    await expect(sourcePort).toBeFocused()
+    await page.keyboard.press('Enter')
     const finder = page.getByRole('dialog', { name: 'Connect to an operation' })
     await expect(finder).not.toHaveAttribute('aria-modal')
     await expect(page.locator('.dp-modal-overlay')).toHaveCount(0)

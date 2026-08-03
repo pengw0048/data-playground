@@ -3,11 +3,10 @@ import { api, type CanvasFile, type DatasetTaskKind, type WorkspaceJobDto, type 
 import type { WriteReceipt } from '../types/api'
 import { datasetViewerHash, routeHash } from '../router'
 import { useStore } from '../store/graph'
-import { status as statusTok } from '../theme/tokens'
+import { status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { FullResult } from '../panels/DataPanel'
 import { fmtMs } from '../panels/RunHistoryModal'
-import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,6 +21,7 @@ function queryFrom(params: URLSearchParams, cursor?: string): WorkspaceJobsQuery
   const status = params.get('status')
   return {
     limit: PAGE_SIZE, cursor,
+    scope: params.get('scope') === 'all' ? 'all' : undefined,
     status: STATUSES.includes(status as typeof STATUSES[number]) && status
       ? status as Exclude<typeof STATUSES[number], ''> : undefined,
     canvasId: params.get('canvas') || undefined,
@@ -52,7 +52,7 @@ const updateLabel = (updatedAt: string | null | undefined) => (
 )
 const refreshLabel = (refreshedAt: number) => new Date(refreshedAt).toLocaleTimeString()
 
-type QuickView = 'queued' | 'running' | 'failed' | 'recent' | 'all'
+type QuickView = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'recent' | 'all'
 
 function clearSelectionParams(params: URLSearchParams) {
   for (const key of SELECTION_QUERY_KEYS) params.delete(key)
@@ -65,7 +65,7 @@ function hasOrdinaryFilters(params: URLSearchParams): boolean {
 
 function selectedQuickView(params: URLSearchParams): QuickView | null {
   const status = params.get('status')
-  if (status === 'queued' || status === 'running' || status === 'failed') return status
+  if (status === 'queued' || status === 'running' || status === 'done' || status === 'failed' || status === 'cancelled') return status
   if (!status && params.get('after') && !params.get('before')) return 'recent'
   if (!status && !params.get('after') && !params.get('before')) return 'all'
   return null
@@ -77,12 +77,28 @@ const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
   merge_columns_write: 'Column merge',
 }
 
-function jobPhase(item: WorkspaceJobDto): string | null {
-  if (item.mergeColumns) return `Column merge · ${readable(item.mergeColumns.phase)}`
-  if (item.externalWait) return `External wait · ${readable(item.externalWait.phase)}`
-  if (item.checkpoint) return `Checkpoint · ${readable(item.checkpoint.phase)}`
-  if (item.boundedFanout) return `Fan-out · ${readable(item.boundedFanout.stage)}`
+function jobStep(item: WorkspaceJobDto): string | null {
+  if (item.mergeColumns) return item.mergeColumns.phase === 'failed' ? 'Column merge failed' : 'Merging columns'
+  if (item.externalWait) {
+    if (item.externalWait.phase === 'downloading') return 'Downloading data'
+    return `Waiting for external work · ${readable(item.externalWait.phase)}`
+  }
+  if (item.checkpoint) {
+    return item.checkpoint.phase === 'materializing'
+      ? 'Saving result for reuse'
+      : `Preparing reusable result · ${readable(item.checkpoint.phase)}`
+  }
+  if (item.boundedFanout) return 'Processing partitions'
   return null
+}
+
+function jobFailureMessage(error: string): string {
+  const message = error.trim()
+  if (/local run input revision is unavailable/i.test(message)) {
+    return 'An input dataset version used by this run is no longer available.'
+  }
+  return message.replace(/^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*/, '')
+    || 'This Job failed before a result was produced.'
 }
 
 function managedWriteRevisionReceipt(
@@ -103,9 +119,10 @@ export function JobsView() {
   const canvases = useStore((state) => state.files)
   const refreshFiles = useStore((state) => state.refreshFiles)
   const params = useMemo(() => new URLSearchParams(jobsQuery), [jobsQuery])
+  const scope = params.get('scope') === 'all' ? 'all' : 'mine'
   const filterKey = useMemo(() => {
     const copy = new URLSearchParams(params)
-    copy.delete('run'); copy.delete('output'); copy.delete('report')
+    clearSelectionParams(copy)
     return copy.toString()
   }, [params])
   const [items, setItems] = useState<WorkspaceJobDto[]>([])
@@ -123,8 +140,11 @@ export function JobsView() {
   const [acting, setActing] = useState('')
   const [copySource, setCopySource] = useState<CanvasCopySource | null>(null)
   const [selectedRunUnavailable, setSelectedRunUnavailable] = useState(false)
+  const [selectedRunLookupError, setSelectedRunLookupError] = useState('')
+  const [selectedRunRetry, setSelectedRunRetry] = useState(0)
   const request = useRef(0)
   const deepLinkRequest = useRef('')
+  const directInjectedJob = useRef<{ itemId: string; runId: string } | null>(null)
   const retryActions = useRef(new Map<string, string>())
 
   // Jobs only names canvases returned by the existing authorized list. Refresh it when entering the
@@ -142,19 +162,29 @@ export function JobsView() {
       setLoading(true); setError(''); setRefreshError(''); setLoadMoreError('')
       if (mode === 'initial') {
         setItems([]); setCursor(null); setHasMore(false); setLoadedMore(false); setHasActiveFirstPage(false); setLastSuccessfulRefresh(null)
+        directInjectedJob.current = null
         deepLinkRequest.current = ''
         setSelectedRunUnavailable(false)
+        setSelectedRunLookupError('')
       } else {
         // A selected run may have been injected from its direct link rather than the first page.
         // Recheck it after replacing the page so Refresh preserves that explicit selection.
+        directInjectedJob.current = null
         deepLinkRequest.current = ''
         setSelectedRunUnavailable(false)
+        setSelectedRunLookupError('')
       }
     }
     try {
       const page = await api.workspaceJobs(queryFrom(new URLSearchParams(filterKey), nextCursor))
       if (sequence !== request.current) return
       const visibleItems = page.items
+      const injected = directInjectedJob.current
+      if (injected && visibleItems.some((item) => item.id === injected.itemId)) {
+        // Once an ordinary page contains the linked Job it is no longer a synthetic row.
+        // Keep it when the user closes the direct link, even if the cursor has moved past it.
+        directInjectedJob.current = null
+      }
       if (!nextCursor) {
         setError('')
         setRefreshError('')
@@ -181,30 +211,49 @@ export function JobsView() {
   useEffect(() => {
     const runId = params.get('run')
     if (!runId) {
+      const injected = directInjectedJob.current
+      directInjectedJob.current = null
+      if (injected) setItems((current) => current.filter((item) => item.id !== injected.itemId))
       deepLinkRequest.current = ''
       setSelectedRunUnavailable(false)
+      setSelectedRunLookupError('')
       return
+    }
+    const previousInjected = directInjectedJob.current
+    if (previousInjected && previousInjected.runId !== runId) {
+      directInjectedJob.current = null
+      setItems((current) => current.filter((item) => item.id !== previousInjected.itemId))
     }
     if (loading) return
     if (items.some((item) => jobKey(item) === runId)) {
       setSelectedRunUnavailable(false)
+      setSelectedRunLookupError('')
       return
     }
-    const key = `${filterKey}\u0000${runId}`
+    const key = `${filterKey}\u0000${runId}\u0000${selectedRunRetry}`
     if (deepLinkRequest.current === key) return
     deepLinkRequest.current = key
     setSelectedRunUnavailable(false)
+    setSelectedRunLookupError('')
     let live = true
-    void api.workspaceJobs({ ...queryFrom(new URLSearchParams(filterKey)), limit: 1, runId })
+    // A copied Job URL identifies one exact run. Ordinary list filters describe the surrounding
+    // page and must not make that selected run look missing when it no longer matches them.
+    void api.workspaceJobs({ limit: 1, runId, ...(scope === 'all' ? { scope } : {}) })
       .then((page) => {
         if (!live) return
         const exact = page.items.find((item) => jobKey(item) === runId)
-        if (exact) setItems((current) => [exact, ...current.filter((item) => item.id !== exact.id)])
+        if (exact) {
+          directInjectedJob.current = { itemId: exact.id, runId }
+          setItems((current) => [exact, ...current.filter((item) => item.id !== exact.id)])
+        }
         else setSelectedRunUnavailable(true)
       })
-      .catch(() => { if (live) setSelectedRunUnavailable(true) })
+      .catch((caught) => {
+        if (!live) return
+        setSelectedRunLookupError(caught instanceof Error ? caught.message : String(caught))
+      })
     return () => { live = false }
-  }, [filterKey, items, loading, params])
+  }, [filterKey, items, loading, params, scope, selectedRunRetry])
   useEffect(() => {
     if (loadedMore || !hasActiveFirstPage) return
     const timer = window.setInterval(() => { if (!loading && !loadingMore) void load(undefined, 'refresh') }, 5000)
@@ -214,6 +263,13 @@ export function JobsView() {
   const update = (name: string, value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set(name, value); else next.delete(name)
+    clearSelectionParams(next)
+    setJobsQuery(next.toString())
+  }
+  const selectScope = (value: 'mine' | 'all') => {
+    const next = new URLSearchParams(params)
+    if (value === 'all') next.set('scope', value)
+    else next.delete('scope')
     clearSelectionParams(next)
     setJobsQuery(next.toString())
   }
@@ -231,7 +287,7 @@ export function JobsView() {
   }
   const selectQuickView = (view: QuickView) => {
     const next = new URLSearchParams(params)
-    if (view === 'queued' || view === 'running' || view === 'failed') {
+    if (view === 'queued' || view === 'running' || view === 'done' || view === 'failed' || view === 'cancelled') {
       next.set('status', view)
       next.delete('after'); next.delete('before')
     } else if (view === 'recent') {
@@ -280,24 +336,6 @@ export function JobsView() {
       setActionError(caught instanceof Error ? caught.message : String(caught))
     } finally { setActing('') }
   }
-  const nodeChoices = useMemo(() => currentPageNodeChoices(items), [items])
-  const backendChoices = useMemo(() => [...new Set(items.map((item) => item.backend).filter(Boolean))], [items])
-  const selectedNodeChoice = nodeChoiceValue(params.get('canvas'), params.get('node'))
-  const listedNode = nodeChoices.some((choice) => choice.value === selectedNodeChoice)
-  const backend = params.get('backend') ?? ''
-  const listedBackend = backendChoices.includes(backend)
-  const selectNode = (value: string) => {
-    if (!value) {
-      update('node', '')
-      return
-    }
-    const [canvasId, nodeId] = JSON.parse(value) as [string | null, string]
-    const next = new URLSearchParams(params)
-    if (canvasId) next.set('canvas', canvasId); else next.delete('canvas')
-    next.set('node', nodeId)
-    clearSelectionParams(next)
-    setJobsQuery(next.toString())
-  }
   const selectCanvas = (value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set('canvas', value); else next.delete('canvas')
@@ -334,8 +372,14 @@ export function JobsView() {
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
         <div><h1 className="text-[20px] font-bold text-foreground">Jobs</h1>
-          <p className="text-[11.5px] text-muted-foreground">{items.length || ordinaryFilters ? freshness ?? 'Persisted runs across accessible canvases' : 'Progress and results across accessible canvases'}</p></div>
+          {freshness && <p className="text-[11.5px] text-muted-foreground">{freshness}</p>}</div>
         <span className="flex-1" />
+        <div className="inline-flex rounded-md border border-border bg-background p-0.5" role="group" aria-label="Whose jobs">
+          <Button size="sm" variant={scope === 'mine' ? 'secondary' : 'ghost'} aria-pressed={scope === 'mine'}
+            onClick={() => selectScope('mine')} data-testid="jobs-scope-mine">My jobs</Button>
+          <Button size="sm" variant={scope === 'all' ? 'secondary' : 'ghost'} aria-pressed={scope === 'all'}
+            onClick={() => selectScope('all')} data-testid="jobs-scope-all">All users</Button>
+        </div>
         <Button variant="outline" size="sm" onClick={() => void load(undefined, 'refresh')} disabled={loading || loadingMore}>
           <Icon name="refresh" size={13} /> Refresh
         </Button>
@@ -344,52 +388,40 @@ export function JobsView() {
       <section aria-label="Job quick views" className="flex flex-wrap items-center gap-2 border-b border-border bg-card/60 px-4 py-3 sm:px-7">
         <span className="mr-1 text-[11.5px] text-muted-foreground">Show</span>
         {([
-          ['queued', 'Queued'], ['running', 'Running'], ['failed', 'Failed'], ['recent', 'Recent'], ['all', 'All'],
+          ['queued', 'Queued'], ['running', 'Running'], ['done', 'Completed'], ['failed', 'Failed'], ['cancelled', 'Cancelled'], ['recent', 'Recent'], ['all', 'All'],
         ] as [QuickView, string][]).map(([view, label]) => <Button key={view} size="sm" variant={quickView === view ? 'default' : 'outline'} onClick={() => selectQuickView(view)}>{label}</Button>)}
       </section>
 
-      <details className="group border-b border-border bg-card/30 px-4 py-2 text-[11.5px] xl:px-7">
-        <summary className="cursor-pointer text-muted-foreground">Advanced filters</summary>
-        <section aria-label="Job filters" className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2">
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Status
-            <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              {STATUSES.map((value) => <option key={value} value={value}>{value || 'All states'}</option>)}
-            </select></label>
-          <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Node
-            <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              <option value="">All nodes on loaded Jobs</option>
-              {!listedNode && selectedNodeChoice && <option value={selectedNodeChoice}>Exact node ID: {params.get('node')}</option>}
-              {nodeChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
-            </select></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Backend
-            <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-              <option value="">All backends on loaded Jobs</option>
-              {!listedBackend && backend && <option value={backend}>Exact backend ID: {backend}</option>}
-              {backendChoices.map((backend) => <option key={backend} value={backend}>{backend}</option>)}
-            </select></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
-            <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-          <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
-            <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-          <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
-        </section>
-      </details>
+      <section aria-label="Job filters" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-2 border-b border-border bg-card/30 px-4 py-3 text-[11.5px] xl:px-7">
+        <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
+        <Filter label="Step" name="node" value={params.get('node') ?? ''} onChange={update} placeholder="Any step" />
+        <Filter label="Compute target" name="backend" value={params.get('backend') ?? ''} onChange={update} placeholder="Any target" />
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
+          <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
+          <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <Filter label="Search" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
+      </section>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
         {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
         {loading && <div className="p-5 text-[12.5px] text-muted-foreground">Loading Jobs…</div>}
         {!loading && error && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-[12.5px] text-destructive">Couldn’t load Jobs: {error} <button className="ml-2 font-semibold underline" onClick={() => void load()}>Retry</button></div>}
         {!loading && refreshError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t refresh Jobs: {refreshError} Showing previously loaded jobs.</div>}
+        {!loading && !error && selectedRunLookupError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">
+          Couldn’t open the linked Job: {selectedRunLookupError}. The Jobs list below is still available.
+          <Button variant="outline" size="sm" className="ml-2" onClick={() => setSelectedRunRetry((attempt) => attempt + 1)}>Retry</Button>
+          <Button variant="outline" size="sm" className="ml-2" onClick={clearSelection}>Back to Jobs</Button>
+        </div>}
         {!loading && !error && selectedRunUnavailable && <div className="mb-3 rounded-lg border border-border bg-card p-5 text-center text-[12.5px] text-muted-foreground"><p>This Job is unavailable or you no longer have access.</p><Button variant="outline" size="sm" className="mt-3" onClick={clearSelection}>Back to Jobs</Button></div>}
-        {!loading && !error && items.length === 0 && !selectedRunUnavailable && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No Jobs match these filters.' : 'No Jobs yet. Run a Canvas to see its progress and results here.'}</div>}
+        {!loading && !error && items.length === 0 && !selectedRunUnavailable && !selectedRunLookupError && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">{ordinaryFilters ? 'No jobs match these filters.' : 'No jobs yet.'}</div>}
         {items.length > 0 && <section aria-labelledby="jobs-list-heading">
           <h2 id="jobs-list-heading" className="mb-2 text-[12px] font-semibold text-foreground">Runs and background tasks</h2>
-          <div className="min-w-[900px] overflow-hidden rounded-lg border border-border bg-card">
-            <div className="grid grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
-              <span>State</span><span>Context</span><span>Outcome</span><span>Duration</span><span>Backend</span><span>Recorded</span>
+          <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-card">
+            <div className="grid grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
+              <span>State</span><span>Context</span><span>Outcome</span><span className="hidden md:block">Duration</span><span className="hidden xl:block">Compute</span><span className="hidden md:block">Recorded</span>
             </div>
-            {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
+            {items.map((item) => <JobRow key={item.id} item={item} showAuthor={scope === 'all'} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} returnQuery={jobsQuery} />)}
           </div>
         </section>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
@@ -397,14 +429,14 @@ export function JobsView() {
       </div>
 
       {selected && selectedOutput?.outcome === 'committed' && selectedOutput.uri && (
-        <aside aria-label="Retained result" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
-          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Retained result<span className="flex-1" /><button aria-label="Close retained result" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
+        <aside aria-label="Saved result" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
+          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Saved result<span className="flex-1" /><button aria-label="Close saved result" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
           <FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId} publicationKind={selectedOutput.publicationKind} name={selectedOutput.table ?? selectedOutput.portLabel ?? selectedOutput.portId} />
         </aside>
       )}
       {selected && checkpointOutput && (
-        <aside aria-label="Retained checkpoint" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
-          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Retained checkpoint · {checkpointOutput.checkpointNodeId}<span className="flex-1" /><button aria-label="Close retained checkpoint" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
+        <aside aria-label="Saved checkpoint" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
+          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Saved checkpoint · {checkpointOutput.checkpointNodeId}<span className="flex-1" /><button aria-label="Close saved checkpoint" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
           <FullResult uri={checkpointOutput.clientKey} total={checkpointOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={checkpointOutput.clientKey} portId={checkpointOutput.outputPortId} publicationKind="result" name={checkpointOutput.checkpointNodeId} />
         </aside>
       )}
@@ -417,33 +449,14 @@ function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[];
   const listed = canvases.some((canvas) => canvas.id === value)
   return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Canvas
     <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
-      <option value="">All accessible canvases</option>
-      {!listed && value && <option value={value}>Exact canvas ID: {value}</option>}
+      <option value="">All canvases</option>
+      {!listed && value && <option value={value}>Canvas from link (not in this list)</option>}
       {canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvasLabel(canvas)}</option>)}
     </select></label>
 }
 
 function canvasLabel(canvas: CanvasFile): string {
   return `${canvas.name || 'Untitled canvas'} · ${canvas.id}`
-}
-
-function nodeChoiceValue(canvasId: string | null, nodeId: string | null): string {
-  return nodeId ? JSON.stringify([canvasId || null, nodeId]) : ''
-}
-
-function currentPageNodeChoices(items: WorkspaceJobDto[]) {
-  const choices = new Map<string, { value: string; label: string }>()
-  for (const item of items) {
-    if (!item.targetNodeId || !item.canvasId) continue
-    const value = nodeChoiceValue(item.canvasId, item.targetNodeId)
-    if (choices.has(value)) continue
-    const node = item.nodeLabel || `Node ${item.targetNodeId}`
-    choices.set(value, {
-      value,
-      label: `${node} · ${item.canvasName || 'Untitled canvas'} (${item.canvasId}) · ${item.targetNodeId}`,
-    })
-  }
-  return [...choices.values()]
 }
 
 function Filter({ label, name, value, onChange, placeholder }: { label: string; name: string; value: string; onChange: (name: string, value: string) => void; placeholder?: string }) {
@@ -471,12 +484,11 @@ function JobSubject({ name }: { name: string }) {
   )
 }
 
-function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
+function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; showAuthor: boolean; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const publishedRevision = managedWriteRevisionReceipt(item, committed)
   const rows = item.rows ?? item.profile?.rowCount ?? null
-  const phase = jobPhase(item)
   const report = item.distributionReport
   const dataset = item.datasetContext
   const datasetHref = publishedRevision
@@ -485,11 +497,10 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       ? datasetViewerHash(dataset.datasetId, dataset.revisionId ?? undefined, { view: 'jobs', query: returnQuery })
       : null
   const active = item.status === 'queued' || item.status === 'running'
-  const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
     : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
     : item.canvasName || 'Unavailable canvas'
-  const context = report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report'
+  const context = report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete saved report' : 'Sampled report'
     : dataset ? `Dataset ${dataset.name || dataset.datasetId}`
       : item.nodeLabel || 'Whole canvas'
   const outcome = report ? report.measuredRows == null ? 'Report pending' : `${report.measuredRows.toLocaleString()} measured rows`
@@ -504,33 +515,41 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
                     : 'In progress'
   const outcomeDetail = item.error ? 'Open for failure details' : !report && rows != null ? rowLabel(rows) : null
   const duration = item.ms != null ? fmtMs(item.ms) : active ? 'In progress' : 'Unavailable'
+  const author = showAuthor
+    ? ` · ${item.isMine === false ? item.createdByName || item.createdById || 'Another user' : 'You'}`
+    : ''
+  const recorded = item.createdAt ? new Date(item.createdAt).toLocaleString() : null
+  const step = jobStep(item)
   return <article className="border-b border-border last:border-b-0">
-    <button type="button" onClick={onSelect} aria-expanded={expanded}
-      aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
-      className="grid w-full grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
+    <button type="button" onClick={onSelect} aria-expanded={expanded} data-testid={`job-row-${jobKey(item)}`}
+      aria-label={`Open job, ${subject}, ${context}${author}, ${outcome}, ${recorded ?? duration}`}
+      className="grid w-full grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35 md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
       <span className="flex flex-wrap items-center gap-1.5">
-        <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
+        <Badge data-testid="job-status" variant="secondary" className="capitalize" style={{ color: statusText[item.status as keyof typeof statusText] ?? statusText.draft }}>{item.status}</Badge>
         {active && item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}
       </span>
       <span className="min-w-0">
         {!report && !dataset
           ? <JobSubject name={subject} />
           : <span className="block truncate font-semibold text-foreground">{subject}</span>}
-        <span className="block truncate text-muted-foreground">{context}</span>
+        <span className="block truncate text-muted-foreground">{context}{author}</span>
       </span>
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
-      <span className="text-muted-foreground">{duration}</span>
-      <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
-      <span className="whitespace-nowrap text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
+      <span className="hidden text-muted-foreground md:block">{duration}</span>
+      <span className="hidden truncate text-muted-foreground xl:block" title={item.backend}>{item.backend}</span>
+      <span className="hidden whitespace-nowrap text-[10.5px] text-muted-foreground md:block">{recorded ?? '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
+      {step && <div role="status" aria-label="Job progress" className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground sm:col-span-2">
+        <span><strong className="text-foreground">Current step</strong> · {step}</span>
+        {item.boundedFanout && <span>{item.boundedFanout.completedPartitions} of {item.boundedFanout.partitionCount} partitions complete</span>}
+      </div>}
       {(item.cancelRequested || item.error) && <div className="grid gap-1 sm:col-span-2">
         {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
-        {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}
+        {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{jobFailureMessage(item.error)}</div>}
       </div>}
       <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
-        {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
-        {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
+        {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId ?? undefined)}>Open in Canvas</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
         {datasetHref && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={datasetHref}>Open dataset</a>}
         {!publishedRevision && committed.map((output, index) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>
@@ -538,31 +557,8 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         </button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
+        {onClone && <Button size="sm" variant="outline" onClick={onClone}>Duplicate Canvas</Button>}
       </div>
-      <details className="sm:col-span-2 rounded-md border border-border bg-background px-3 py-2">
-        <summary className="cursor-pointer font-semibold text-muted-foreground">Technical evidence</summary>
-        <div className="mt-3 grid gap-2">
-          <div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>
-          {committed.length > 0 && <div><strong>Retained results:</strong> {committed.map((output, index) =>
-            `Result ${index + 1} · ${output.nodeId}:${output.portId}`).join(', ')}</div>}
-          {item.canvasId && <ExecutionManifestDetail canvasId={item.canvasId} subjectId={item.id} summary={item} onClone={onClone} />}
-          {item.taskId && <>
-            {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}
-            {item.externalWait && <div><strong>External provider:</strong> {item.externalWait.providerKind} · provider attempt #{item.externalWait.attemptNumber}</div>}
-            {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
-            {item.boundedFanout && <div><strong>Fan-out:</strong> {item.boundedFanout.completedPartitions}/{item.boundedFanout.partitionCount ?? '—'} partitions{item.boundedFanout.failedPartitions ? ` · ${item.boundedFanout.failedPartitions} failed` : ''} · checkpoint {item.boundedFanout.checkpoint} · gather {item.boundedFanout.gather}{item.boundedFanout.diagnosticCode ? ` · ${item.boundedFanout.diagnosticCode}` : ''}</div>}
-            {item.mergeColumns && <div><strong>Column merge:</strong> {readable(item.mergeColumns.phase)} · candidate {item.mergeColumns.candidate}{item.mergeColumns.reused ? ' (reused)' : ''}{item.mergeColumns.candidateRows != null ? ` · ${item.mergeColumns.candidateRows.toLocaleString()} rows` : ''}{item.mergeColumns.diagnosticCode ? ` · ${item.mergeColumns.diagnosticCode}` : ''}</div>}
-            <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
-            {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
-            {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="w-fit rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
-          </>}
-          {publishedRevision && <ExactRevisionReceipt receipt={publishedRevision} />}
-        </div>
-      </details>
     </div>}
   </article>
-}
-
-function ExactRevisionReceipt({ receipt }: { receipt: WriteReceipt }) {
-  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
 }

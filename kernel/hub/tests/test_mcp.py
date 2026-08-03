@@ -95,6 +95,38 @@ def test_tools_list_every_tool_has_a_schema():
         assert t["description"] and t["inputSchema"]["type"] == "object"
 
 
+def test_stdio_server_rebinds_after_workspace_deps_are_replaced(tmp_path, monkeypatch):
+    from hub import deps as deps_module
+
+    original = get_deps()
+    # Record the current singleton with monkeypatch so teardown restores it after set_workspace's
+    # ordinary whole-object replacement. This reproduces a long-lived stdio server spanning that
+    # production lifecycle boundary without leaking the temporary workspace into later tests.
+    monkeypatch.setattr(deps_module, "_deps", original)
+    lifecycle_server = build_server(base_url="http://test.local")
+    replacement = deps_module.set_workspace(
+        str(tmp_path / "workspace"), str(tmp_path / "data"), maintain_storage=False,
+    )
+    expected = CatalogTable(
+        id="replacement", name="replacement", uri="memory://replacement",
+        columns=[ColumnSchema(name="id", type="int")],
+    )
+
+    def page(query):
+        return CatalogPage(
+            items=[expected], total=1, offset=query.offset, limit=query.limit, has_more=False,
+        )
+
+    monkeypatch.setattr(replacement.catalog, "list_page", page)
+    response = lifecycle_server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "search_catalog", "arguments": {"limit": 1}},
+    })
+
+    assert response["result"]["structuredContent"]["datasets"][0]["id"] == "replacement"
+    assert lifecycle_server.pg.deps is replacement
+
+
 # --------------------------------------------------------------------------- #
 # Catalog / discovery
 # --------------------------------------------------------------------------- #
@@ -720,6 +752,32 @@ def test_run_canvas_executes_to_completion():
     # a single sink → nodeId is inferred
     out = data("run_canvas", {"canvasId": cid, "confirm": True})
     assert out["status"] == "done" and out["error"] is None and out["targetNodeId"] == f
+
+
+def test_run_canvas_publishes_a_managed_dataset_with_a_durable_owner():
+    from hub import metadb
+
+    cid = data("create_canvas", {})["canvasId"]
+    s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
+    name = f"mcp_managed_{uuid.uuid4().hex[:8]}"
+    w = data("add_node", {"canvasId": cid, "kind": "write", "config": {
+        "filename": f"{name}.parquet", "writeMode": "overwrite"}})["nodeId"]
+    data("connect", {"canvasId": cid, "sourceId": s, "targetId": w})
+
+    out = data("run_canvas", {"canvasId": cid, "confirm": True})
+    assert out["status"] == "done", out["error"]
+    task = metadb.durable_task(out["runId"])
+    assert task is not None and task["task_kind"] == "managed_local_write"
+    receipt = out["outputs"][0]["writeReceipt"]
+    assert receipt["revisionId"] and receipt["durable"] is True
+    logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == receipt["revisionId"]
+    jobs = metadb.list_workspace_runs(
+        metadb.resolve_user(metadb.DEFAULT_USER_ID), run_id=task["id"])
+    assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
+
+    metadb.delete_canvas_cascade(cid)
 
 
 def test_run_canvas_unknown_destination_is_a_tool_error():

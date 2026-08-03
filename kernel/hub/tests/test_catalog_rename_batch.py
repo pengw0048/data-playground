@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from hub.deps import get_deps
@@ -44,6 +46,54 @@ def test_register_with_full_payload_then_rename(tmp_path):
         "id": t["id"], "expectedRegistrationId": current["registrationId"],
         "expectedRevision": current["metadataRevision"],
     }]})
+
+
+def test_versioned_remove_can_delete_one_ordinary_local_source_file(tmp_path):
+    uri = _csv(tmp_path, "delete-source")
+    created = client.post("/api/catalog/register", json={"uri": uri}).json()
+    current = client.get(f"/api/catalog/tables/{created['id']}").json()
+    assert current["sourceDeleteAllowed"] is True
+    resource_id = f"dataset:{current['registrationId']}"
+    assert client.get(f"/api/workspace/resources/{resource_id}").status_code == 200
+
+    removed = client.delete(f"/api/catalog/tables/{created['id']}", params={
+        "expected_registration_id": current["registrationId"],
+        "expected_revision": current["metadataRevision"],
+        "delete_source": "true",
+    })
+
+    assert removed.status_code == 200, removed.text
+    assert removed.json() == {
+        "ok": True, "sourceDeleted": True, "sourceMissing": False, "warning": None,
+    }
+    assert not Path(uri).exists()
+    assert client.get(f"/api/catalog/tables/{created['id']}").status_code == 404
+    assert client.get(f"/api/workspace/resources/{resource_id}").status_code == 404
+
+
+def test_stale_source_delete_keeps_both_registration_and_file(tmp_path):
+    uri = _csv(tmp_path, "stale-delete-source")
+    created = client.post("/api/catalog/register", json={"uri": uri}).json()
+    current = client.get(f"/api/catalog/tables/{created['id']}").json()
+    changed = client.put(f"/api/catalog/tables/{created['id']}/metadata", json={
+        "description": "changed",
+    })
+    assert changed.status_code == 200, changed.text
+
+    removed = client.delete(f"/api/catalog/tables/{created['id']}", params={
+        "expected_registration_id": current["registrationId"],
+        "expected_revision": current["metadataRevision"],
+        "delete_source": "true",
+    })
+
+    assert removed.status_code == 409
+    assert Path(uri).is_file()
+    latest = client.get(f"/api/catalog/tables/{created['id']}")
+    assert latest.status_code == 200
+    client.delete(f"/api/catalog/tables/{created['id']}", params={
+        "expected_registration_id": current["registrationId"],
+        "expected_revision": latest.json()["metadataRevision"],
+    })
 
 
 def test_batch_delete_is_bounded_versioned_and_reports_each_result(tmp_path):

@@ -7,14 +7,16 @@ and distinguishes an honest "needs a full pass" from a real error (bad cell/quer
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Any
 
 from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable, TransformSyntaxError, UserCodeError
 from hub.executors.schema import apply_derived_references, derived_schemas_for_engine
+from hub.ir import resolve_config
 from hub.models import Graph, SampleResult, dataset_ref_identity
-from hub.plugins.adapters import revision_adapter_for_uri
+from hub.plugins.adapters import csv_date_order_notices, revision_adapter_for_uri
 from hub.sampling import provenance_for_graph
 from hub.sandbox import run_with_timeout
 from hub.storage import ManagedSourceReadError
@@ -30,6 +32,20 @@ PREVIEW_BUDGET_S = 8.0
 # it is NOT here.)
 _CODE_CELL_KINDS = ("transform", "section")
 _LOCAL_SAMPLE_ADAPTERS = {"duckdb", "lance"}
+
+
+def _parse_notices(graph: Graph, node_id: str) -> list[str]:
+    """Ambiguous text-parsing choices every source feeding `node_id` had to make."""
+    notices: list[str] = []
+    for node in g.upstream_chain(graph, node_id):
+        if node.type != "source":
+            continue
+        config = resolve_config(node)
+        uri = config.get("uri")
+        if isinstance(uri, str) and uri:
+            with contextlib.suppress(Exception):  # a disclosure must never fail the preview
+                notices += csv_date_order_notices(uri, config.get("options"))
+    return list(dict.fromkeys(notices))
 
 
 class _PreviewAdapter:
@@ -197,6 +213,7 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                     limit_reason=None if reservoir_preview else "preview-scan",
                     limit_scope=None if reservoir_preview else "each-source",
                     sample_provenance=provenance,
+                    parse_notices=_parse_notices(graph, node_id),
                 )
 
     def on_timeout() -> None:

@@ -5,6 +5,7 @@ import { roleCanEdit, useStore } from '../store/graph'
 import type { CatalogTable, ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask, MergeColumnRule } from '../types/api'
 import type { ColumnSchema, NodeConfig } from '../types/graph'
 import { Button } from '@/components/ui/button'
+import { ConfirmationDialog } from './ConfirmationDialog'
 
 type Exact = { kind: 'exact'; datasetId: string; revisionId: string }
 export interface ManagedSidecarMergeConfig {
@@ -105,7 +106,8 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
   const [baseQuery, setBaseQuery] = useState('')
   const [baseOptions, setBaseOptions] = useState<CatalogTable[]>([])
   const [baseLoading, setBaseLoading] = useState(false)
-  const [suggestionSchemas, setSuggestionSchemas] = useState<{ base: ColumnSchema[]; sidecar: ColumnSchema[]; declared: string[] } | null>(null)
+  const [suggestionSchemas, setSuggestionSchemas] = useState<{ base: ColumnSchema[]; sidecar: ColumnSchema[]; declared: string[]; baseName?: string } | null>(null)
+  const [confirmExit, setConfirmExit] = useState(false)
   const admissionGeneration = useRef(0)
   const catalogGeneration = useRef(0)
   const latestRequestKey = useRef<string | null>(null)
@@ -151,7 +153,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
       api.tableByRegistration(config.base.datasetId).catch(() => null),
     ]).then(([base, sidecarDetail, table]) => {
       if (live) setSuggestionSchemas({ base: base.preview.columns, sidecar: sidecarDetail.preview.columns,
-        declared: table?.keys?.find((key) => key.confidence === 'declared')?.columns ?? [] })
+        declared: table?.keys?.find((key) => key.confidence === 'declared')?.columns ?? [], baseName: table?.name })
     })
       .catch(() => { if (live) setSuggestionSchemas(null) })
     return () => { live = false }
@@ -214,7 +216,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     const sequence = ++admissionGeneration.current
     const next = ensureSubmission()
     const request = requestFor(next, sidecar)
-    if (!request) { setError('Choose one direct exact sidecar Source and one destination base first.'); return }
+    if (!request) { setError('Connect one saved dataset version and choose a destination first.'); return }
     const key = requestKey(request)
     setBusy('preflight'); setError(''); setPreflight(null); setPreflightKey(null)
     try {
@@ -344,12 +346,12 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
   const draftError = useMemo(() => {
     const identities = config.identityColumns ?? []
     const rules = config.rules ?? []
-    if (!identities.length) return 'Choose at least one identity column before checking this draft.'
-    if (identities.some((identity) => !identity.trim())) return 'Identity columns cannot be blank.'
+    if (!identities.length) return 'Choose at least one matching column before checking this setup.'
+    if (identities.some((identity) => !identity.trim())) return 'Matching columns cannot be blank.'
     const identityNames = new Set<string>()
     for (const identity of identities) {
       const key = asciiFold(identity)
-      if (identityNames.has(key)) return `Identity column “${identity}” is duplicated in this draft.`
+      if (identityNames.has(key)) return `Matching column “${identity}” is duplicated.`
       identityNames.add(key)
     }
     if (!rules.length) return 'Add at least one payload mapping before checking this draft.'
@@ -360,25 +362,25 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
       for (const identity of identities) {
         const base = baseFields.get(identity)
         const source = sidecarFields.get(identity)
-        if (!base || !source) return `Identity “${identity}” is not present in both exact draft schemas.`
-        if (base.type !== source.type) return `Identity “${identity}” has incompatible draft types (${source.type} → ${base.type}).`
+        if (!base || !source) return `Matching column “${identity}” is not present in both datasets.`
+        if (base.type !== source.type) return `Matching column “${identity}” has incompatible types (${source.type} → ${base.type}).`
       }
     }
 
     const sourceNames = new Set<string>()
     const targetNames = new Set<string>()
     for (const rule of rules) {
-      if (!rule.source.trim() || !rule.target.trim()) return 'Every mapping needs both a sidecar and destination column.'
+      if (!rule.source.trim() || !rule.target.trim()) return 'Every mapping needs both an input and destination column.'
       const sourceKey = asciiFold(rule.source)
       const targetKey = asciiFold(rule.target)
-      if (identityNames.has(sourceKey)) return 'An identity column cannot also be a payload mapping.'
+      if (identityNames.has(sourceKey)) return 'A matching column cannot also be added or replaced.'
       if (sourceNames.has(sourceKey)) return `Sidecar payload “${rule.source}” is mapped more than once.`
       if (targetNames.has(targetKey)) return `Destination column “${rule.target}” has conflicting mappings.`
       sourceNames.add(sourceKey); targetNames.add(targetKey)
       if (suggestedFields) {
         const source = sidecarFields.get(rule.source)
         const target = baseFields.get(rule.target)
-        if (!source) return `Sidecar payload “${rule.source}” is not present in the exact draft schema.`
+        if (!source) return `Input column “${rule.source}” is not present in the saved dataset.`
         if (rule.mode === 'add' && target) return `“${rule.target}” already exists in the destination draft; use replace or choose a new column.`
         if (rule.mode === 'replace' && !target) return `“${rule.target}” is not in the destination draft; use add or choose an existing column.`
         if (target && source.type !== target.type) return `Mapping “${rule.source}” → “${rule.target}” has incompatible draft types (${source.type} → ${target.type}).`
@@ -387,43 +389,59 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     if (suggestedFields) {
       const payload = suggestedFields.sidecar.filter((field) => !identityNames.has(asciiFold(field.name)))
       const unused = payload.filter((field) => !sourceNames.has(asciiFold(field.name)))
-      if (unused.length) return `Add explicit mappings for sidecar payload: ${unused.map((field) => field.name).join(', ')}.`
+      if (unused.length) return `Add explicit mappings for input columns: ${unused.map((field) => field.name).join(', ')}.`
     }
     return null
   }, [config.identityColumns, config.rules, suggestedFields])
   if (!node) return null
   if (!enabled) return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-[10.5px] text-muted-foreground">
-    <div className="font-semibold text-foreground">Merge an exact managed sidecar</div>
-    <div className="mt-0.5">Use a direct exact Source as a published sidecar, then choose the current head and explicit column mappings.</div>
+    <div className="font-semibold text-foreground">Merge columns into a dataset</div>
     {!compact && <Button size="sm" variant="outline" className="mt-2 h-6 px-2 text-[10px]" disabled={!canEdit}
-      onClick={() => persist({ identityColumns: [], rules: [] })}>Configure managed sidecar merge</Button>}
+      onClick={() => persist({ identityColumns: [], rules: [] })}>Set up column merge</Button>}
   </div>
 
-  return <div aria-label="Managed sidecar column merge" className={compact ? 'mt-2 text-[10.5px]' : 'mt-3 rounded-md border border-border bg-muted/30 p-2'}>
+  const sidecarSourceId = doc.edges.find((edge) => edge.target === nodeId)?.source
+  const sidecarName = doc.nodes.find((candidate) => candidate.id === sidecarSourceId)?.data.title?.trim() || 'Connected dataset'
+  const selectedBaseName = suggestionSchemas?.baseName || baseQuery.trim() || 'Selected dataset'
+
+  return <div aria-label="Column merge setup" className={compact ? 'mt-2 text-[10.5px]' : 'mt-3 rounded-md border border-border bg-muted/30 p-2'}>
     {!compact && <><div className="font-semibold text-[11px] text-foreground">Add or replace columns in an existing dataset</div>
-      <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">The upstream transform already published this exact sidecar. This action merges only the declared payload columns into a core-owned local dataset; it never writes back to an external provider.</div></>}
-    {!sidecar && <div role="alert" className="mt-2 text-[10.5px] text-destructive">Connect one exact managed-local Source directly to this Write before configuring the merge.</div>}
-    {sidecar && <div className="mt-2 rounded border border-border bg-background p-2 text-[10px] text-muted-foreground"><strong className="text-foreground">Exact sidecar Source</strong><div className="mt-0.5 break-all font-mono">{sidecar.datasetId}@{sidecar.revisionId}</div></div>}
-    {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Destination base (current exact head)
+      </>}
+    {!sidecar && <div role="alert" className="mt-2 text-[10.5px] text-destructive">Connect a saved dataset directly to this Write first.</div>}
+    {sidecar && <div className="mt-2 rounded border border-border bg-background p-2 text-[10px] text-muted-foreground"><strong className="text-foreground">Input data</strong><div className="mt-0.5 truncate">{sidecarName}</div></div>}
+    {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Destination (current version)
       <input aria-label="Search destination bases" disabled={!canEdit || intentLocked} value={baseQuery} onChange={(event) => setBaseQuery(event.target.value)} placeholder="Search the catalog…" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
       {baseLoading && <span className="mt-1 block text-[10px]">Searching catalog…</span>}
-      {!intentLocked && baseOptions.length > 0 && <div className="mt-1 max-h-28 overflow-auto rounded border border-border bg-background">{baseOptions.map((table) => <button type="button" key={table.id} onClick={() => void selectBase(table)} className="block w-full border-b border-border px-2 py-1 text-left text-[10px] hover:bg-accent last:border-b-0"><strong className="block truncate text-foreground">{table.name}</strong><span>registration {table.registrationId ?? table.id} · catalog version {table.version ?? 'unavailable'} · format not advertised · {table.columns.map((field) => `${field.name}: ${field.type}`).join(', ') || 'schema unavailable'}</span></button>)}</div>}
+      {!intentLocked && baseOptions.length > 0 && <div className="mt-1 max-h-28 overflow-auto rounded border border-border bg-background">{baseOptions.map((table) => <button type="button" key={table.id} onClick={() => void selectBase(table)} className="block w-full border-b border-border px-2 py-1 text-left text-[10px] hover:bg-accent last:border-b-0"><strong className="block truncate text-foreground">{table.name}</strong><span>{table.rowCount == null ? 'Row count unavailable' : `${table.rowCount.toLocaleString()} rows`} · {table.columns.length.toLocaleString()} columns</span></button>)}</div>}
     </label>}
-    {selectedBase && <div className="mt-2 rounded border border-border bg-background p-2 text-[10px] text-muted-foreground"><strong className="text-foreground">Destination exact base</strong><div className="mt-0.5 break-all font-mono">{selectedBase.datasetId}@{selectedBase.revisionId}</div></div>}
-    {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Identity columns
-      <input aria-label="Managed sidecar identity columns" disabled={!canEdit || intentLocked} value={(config.identityColumns ?? []).join(', ')} onChange={(event) => change({ ...config, identityColumns: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
+    {selectedBase && <div className="mt-2 rounded border border-border bg-background p-2 text-[10px] text-muted-foreground"><strong className="text-foreground">Target dataset</strong><div className="mt-0.5 truncate">{selectedBaseName}</div></div>}
+    {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Matching columns
+      <input aria-label="Saved dataset matching columns" disabled={!canEdit || intentLocked} value={(config.identityColumns ?? []).join(', ')} onChange={(event) => change({ ...config, identityColumns: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
     </label>}
-    {identityCandidates.length > 0 && !compact && <div className="mt-1 flex flex-wrap items-center gap-1"><span className="text-[10px] text-muted-foreground">Suggested draft identities:</span>{identityCandidates.map((candidate) => <Button key={candidate.join('\u0000')} size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => useSuggestion(candidate)} disabled={!canEdit || intentLocked}>Use {candidate.join(', ')}</Button>)}<span className="text-[10px] text-muted-foreground">Preflight remains authoritative.</span></div>}
-    {!compact && <div className="mt-2 space-y-1"><div className="text-[10.5px] text-muted-foreground">Sidecar payload → destination column</div>
-      {(config.rules ?? []).map((rule, index) => <div key={index} className="grid grid-cols-[1fr_74px_1fr_24px] gap-1"><input aria-label={`Managed sidecar source column ${index + 1}`} value={rule.source} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, source: event.target.value }; change({ ...config, rules }) }} placeholder="sidecar field" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><select aria-label={`Managed sidecar mode ${index + 1}`} value={rule.mode} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, mode: event.target.value as MergeColumnRule['mode'] }; change({ ...config, rules }) }} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select><input aria-label={`Managed sidecar target column ${index + 1}`} value={rule.target} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, target: event.target.value }; change({ ...config, rules }) }} placeholder="base field" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><button aria-label={`Remove managed sidecar rule ${index + 1}`} disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })} className="text-muted-foreground hover:text-destructive">×</button></div>)}
+    {identityCandidates.length > 0 && !compact && <div className="mt-1 flex flex-wrap items-center gap-1"><span className="text-[10px] text-muted-foreground">Suggested:</span>{identityCandidates.map((candidate) => <Button key={candidate.join('\u0000')} size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => useSuggestion(candidate)} disabled={!canEdit || intentLocked}>Use {candidate.join(', ')}</Button>)}</div>}
+    {!compact && <div className="mt-2 space-y-1"><div className="text-[10.5px] text-muted-foreground">Input column → target column</div>
+      {(config.rules ?? []).map((rule, index) => <div key={index} className="grid grid-cols-[1fr_74px_1fr_24px] gap-1"><input aria-label={`Saved dataset source column ${index + 1}`} value={rule.source} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, source: event.target.value }; change({ ...config, rules }) }} placeholder="input column" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><select aria-label={`Saved dataset merge mode ${index + 1}`} value={rule.mode} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, mode: event.target.value as MergeColumnRule['mode'] }; change({ ...config, rules }) }} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select><input aria-label={`Destination column ${index + 1}`} value={rule.target} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, target: event.target.value }; change({ ...config, rules }) }} placeholder="destination column" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><button aria-label={`Remove column mapping ${index + 1}`} disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })} className="text-muted-foreground hover:text-destructive">×</button></div>)}
       <div className="flex gap-1"><Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: [...(config.rules ?? []), { source: '', target: '', mode: 'add' }] })}>Add mapping</Button>{suggestedFields && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" disabled={!canEdit || intentLocked} onClick={addSuggestedRules}>Add suggested rules</Button>}</div>
     </div>}
-    {preflight && <div aria-label="Managed sidecar preflight" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><div className="font-semibold text-foreground">{preflight.eligible ? 'Eligible exact sidecar merge' : 'Not eligible'}</div><div className="mt-0.5 break-all font-mono">base {preflight.base.datasetId}@{preflight.base.revisionId}</div><div className="break-all font-mono">sidecar {preflight.sidecar.datasetId}@{preflight.sidecar.revisionId}</div><div>Identity order: <span className="font-mono">{preflight.identityColumns.join(', ') || 'none'}</span></div><div>Mappings: {preflight.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div><div>Coverage: {coverageLine(preflight.coverage)}</div><div>Base: {preflight.coverage.base.rows.toLocaleString()} rows · {preflight.coverage.base.uniqueIdentities.toLocaleString()} unique · {preflight.coverage.base.nullRows.toLocaleString()} null · {preflight.coverage.base.duplicateGroups.toLocaleString()} duplicate groups / {preflight.coverage.base.duplicateRows.toLocaleString()} duplicate rows</div><div>Sidecar: {preflight.coverage.candidate.rows.toLocaleString()} rows · {preflight.coverage.candidate.uniqueIdentities.toLocaleString()} unique · {preflight.coverage.candidate.nullRows.toLocaleString()} null · {preflight.coverage.candidate.duplicateGroups.toLocaleString()} duplicate groups / {preflight.coverage.candidate.duplicateRows.toLocaleString()} duplicate rows</div><div>Expected head: <span className="font-mono">{preflight.expectedHead.revisionId}</span></div><div>Resulting schema: {preflight.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') || 'no fields'}</div></div>}
-    {task && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><div className="font-semibold text-foreground">{task.mergeColumns?.phase?.replaceAll('_', ' ') ?? task.status}</div><div className="mt-0.5">Candidate {task.mergeColumns?.candidate ?? 'pending'}{task.mergeColumns?.reused ? ' · reused' : ''}</div><div className="mt-1 flex flex-wrap gap-1"><Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: task.taskId }).toString())}>Open in Jobs</Button>{task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}{task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}{task.receipt && <a className="rounded border border-border bg-card px-2 py-1 text-[10px] font-medium text-foreground hover:bg-accent" href={datasetViewerHash(task.receipt.datasetId, task.receipt.revisionId, { canvasId: doc.id, nodeId })}>Open published child</a>}{task.base && <a className="rounded border border-border bg-card px-2 py-1 text-[10px] font-medium text-foreground hover:bg-accent" href={datasetViewerHash(task.base.datasetId, task.base.revisionId, { canvasId: doc.id, nodeId })}>Open exact base</a>}</div></div>}
-    {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><strong className="text-foreground">Tracked durable Task</strong><div>The task is loading, unavailable, or belongs to another submitter. It is never treated as a new admission; its submitter can inspect it in Jobs.</div><Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: config.taskId! }).toString())}>Open in Jobs</Button></div>}
-    {responseUnknown && !recoveryAvailable && <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10.5px] text-muted-foreground"><strong className="text-foreground">Previous submission outcome is unresolved</strong><div>The request changed after submission. Inspect Jobs or restore the same request to recover its durable outcome.</div></div>}
+    {preflight && <div aria-label="Column merge check" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><div className="font-semibold text-foreground">{preflight.eligible ? 'Ready to merge' : 'Not ready to merge'}</div><div>Matching columns: <span className="font-mono">{preflight.identityColumns.join(', ') || 'none'}</span></div><div>Changes: {preflight.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div><div>Coverage: {coverageLine(preflight.coverage)}</div><div>Target: {preflight.coverage.base.rows.toLocaleString()} rows · {preflight.coverage.base.uniqueIdentities.toLocaleString()} unique keys · {preflight.coverage.base.nullRows.toLocaleString()} missing keys · {preflight.coverage.base.duplicateGroups.toLocaleString()} duplicate groups</div><div>Input: {preflight.coverage.candidate.rows.toLocaleString()} rows · {preflight.coverage.candidate.uniqueIdentities.toLocaleString()} unique keys · {preflight.coverage.candidate.nullRows.toLocaleString()} missing keys · {preflight.coverage.candidate.duplicateGroups.toLocaleString()} duplicate groups</div><div>Result columns: {preflight.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') || 'no fields'}</div></div>}
+    {task && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><div className="font-semibold text-foreground">{task.status === 'done' ? 'Merge complete' : task.status === 'failed' ? 'Merge failed' : task.status === 'cancelled' ? 'Merge cancelled' : 'Merge in progress'}</div><div className="mt-1 flex flex-wrap gap-1"><Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: task.taskId }).toString())}>Open in Jobs</Button>{task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}{task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}{task.receipt && <a className="rounded border border-border bg-card px-2 py-1 text-[10px] font-medium text-foreground hover:bg-accent" href={datasetViewerHash(task.receipt.datasetId, task.receipt.revisionId, { canvasId: doc.id, nodeId })}>Open merged dataset</a>}{task.base && <a className="rounded border border-border bg-card px-2 py-1 text-[10px] font-medium text-foreground hover:bg-accent" href={datasetViewerHash(task.base.datasetId, task.base.revisionId, { canvasId: doc.id, nodeId })}>Open original dataset</a>}</div></div>}
+    {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><strong className="text-foreground">Submitted job</strong><div>The job is loading, unavailable, or belongs to another submitter. This does not start a new setup; its submitter can inspect it in Jobs.</div><Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: config.taskId! }).toString())}>Open in Jobs</Button></div>}
+    {responseUnknown && !recoveryAvailable && <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10.5px] text-muted-foreground"><strong className="text-foreground">Previous submission outcome is unresolved</strong><div>The request changed after submission. Inspect Jobs or restore the same request to recover its saved result.</div></div>}
     {draftError && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{draftError}</div>}
-    {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error}</div>}
-    {!compact && <div className="mt-2 flex flex-wrap gap-1">{!task && !config.taskId && !responseUnknown && <><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null || !!draftError}>{busy === 'preflight' ? 'Checking…' : 'Check eligibility'}</Button><Button size="sm" className="h-7 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || !!draftError || !preflight?.eligible || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Start managed merge'}</Button></>}{recoveryAvailable && <Button size="sm" className="h-7 text-[10.5px]" onClick={() => void recover()} disabled={!canEdit || busy !== null}>{busy === 'submit' ? 'Recovering…' : 'Recover previous submission'}</Button>}{taskTerminal && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => change({ ...config, taskId: undefined, submissionState: undefined })} disabled={!canEdit || busy !== null}>Start new admission</Button>}{!config.taskId && !responseUnknown && <Button size="sm" variant="ghost" className="h-7 text-[10.5px]" onClick={() => { if (window.confirm('Discard this unsubmitted managed-sidecar merge draft?')) updateConfig(nodeId, { managedSidecarMerge: undefined }) }} disabled={!canEdit || busy !== null}>Exit merge setup</Button>}{staleHead && <div className="basis-full text-[10px] text-muted-foreground">The destination moved. The exact sidecar has not changed. <Button size="sm" variant="outline" className="ml-1 h-6 px-2 text-[10px]" onClick={() => void refreshBase()} disabled={!canEdit || busy !== null}>Refresh destination head</Button></div>}</div>}
+    {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{staleHead ? "The saved destination version is no longer current." : error}</div>}
+    {!compact && <div className="mt-2 flex flex-wrap gap-1">{!task && !config.taskId && !responseUnknown && <><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null || !!draftError}>{busy === 'preflight' ? 'Checking…' : 'Check setup'}</Button><Button size="sm" className="h-7 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || !!draftError || !preflight?.eligible || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Start merge'}</Button></>}{recoveryAvailable && <Button size="sm" className="h-7 text-[10.5px]" onClick={() => void recover()} disabled={!canEdit || busy !== null}>{busy === 'submit' ? 'Recovering…' : 'Recover previous submission'}</Button>}{taskTerminal && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => change({ ...config, taskId: undefined, submissionState: undefined })} disabled={!canEdit || busy !== null}>Start new setup</Button>}{!config.taskId && !responseUnknown && <Button size="sm" variant="ghost" className="h-7 text-[10.5px]" onClick={() => setConfirmExit(true)} disabled={!canEdit || busy !== null}>Exit merge setup</Button>}{staleHead && <div className="basis-full text-[10px] text-muted-foreground">The destination has a newer version. The input data has not changed. <Button size="sm" variant="outline" className="ml-1 h-6 px-2 text-[10px]" onClick={() => void refreshBase()} disabled={!canEdit || busy !== null}>Use current destination version</Button></div>}</div>}
+    <ConfirmationDialog
+      open={confirmExit}
+      title="Exit merge setup?"
+      description="Discard this unsubmitted merge setup? This cannot be undone."
+      confirmLabel="Discard setup"
+      onCancel={() => setConfirmExit(false)}
+      onConfirm={() => {
+        setConfirmExit(false)
+        if (!config.taskId && config.submissionState !== 'response_unknown') {
+          updateConfig(nodeId, { managedSidecarMerge: undefined })
+        }
+      }}
+    />
   </div>
 }

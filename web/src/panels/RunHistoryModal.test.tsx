@@ -114,6 +114,22 @@ describe('DurationTrend — a native SVG bar per run', () => {
     expect(screen.getByText('max 200 ms')).toBeInTheDocument()
     expect(screen.getByText('Run duration · last 2')).toBeInTheDocument()
   })
+
+  it('keeps short runs readable when one slow run sets the maximum', () => {
+    const spread: RunRecordDto[] = [
+      { id: 'r5', status: 'done', ms: 371, outputs: [] },
+      { id: 'r4', status: 'done', ms: 30, outputs: [] },
+      { id: 'r3', status: 'done', ms: 11, outputs: [] },
+      { id: 'r2', status: 'done', ms: 11, outputs: [] },
+      { id: 'r1', status: 'done', ms: 11, outputs: [] },
+    ]
+    const { container } = render(<DurationTrend runs={spread} />)
+    const heights = [...container.querySelectorAll('rect')].map((rect) => Number(rect.getAttribute('height')))
+
+    expect(screen.getByText('Run duration · last 5 · log scale')).toBeInTheDocument()
+    expect(heights.filter((height) => height <= 2)).toHaveLength(0)
+    expect(new Set(heights).size).toBe(3)
+  })
 })
 
 describe('PerNodeBreakdown — per-node horizontal bars', () => {
@@ -158,7 +174,7 @@ describe('admitted run inputs', () => {
     preview: { columns: [], rows: [{ value: 1 }], hasMore: false, rowLimit: 100 as const },
   })
 
-  it('preserves manifest order and opens the admitted exact revision through Catalog', async () => {
+  it('preserves input order and shows useful saved-version facts without internal identities', async () => {
     useStore.setState({ doc: {
       id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [
         { id: 'source-b', type: 'source', position: { x: 0, y: 0 }, data: { title: 'Customers', status: 'latest', config: {}, history: [] } },
@@ -177,17 +193,18 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
+    await user.click(await screen.findByRole('button', { name: /Input data/i }))
     const list = screen.getByRole('list')
     const items = within(list).getAllByRole('listitem')
     expect(items).toHaveLength(2)
     expect(within(items[0]).getByText('Source Orders')).toBeInTheDocument()
     expect(within(items[1]).getByText('Source Customers')).toBeInTheDocument()
     expect(await within(items[0]).findByText('Orders dataset')).toBeInTheDocument()
-    expect(within(items[0]).getByText('Exact revision revision-a')).toBeInTheDocument()
-    expect(within(items[0]).getByText(/Reference intent was not stored/)).toBeInTheDocument()
-    await user.click(within(items[0]).getByRole('button', { name: 'Open Catalog revision detail' }))
+    expect(within(items[0]).queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(within(items[0]).queryByText('revision-a')).not.toBeInTheDocument()
+    await user.click(within(items[0]).getByRole('button', { name: 'Show saved version details' }))
     expect(within(items[0]).getByText('12')).toBeInTheDocument()
+    expect(within(items[0]).queryByText('parent-1')).not.toBeInTheDocument()
     expect(apiMock.datasetRevision).toHaveBeenCalledWith('dataset-a', 'revision-a')
   })
 
@@ -208,12 +225,12 @@ describe('admitted run inputs', () => {
     const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    await user.click(await screen.findByRole('button', { name: /Admitted Sources/i }))
+    await user.click(await screen.findByRole('button', { name: /Input data/i }))
     expect(await screen.findByText('permission lost')).toBeInTheDocument()
     expect(screen.getByText('provider offline')).toBeInTheDocument()
-    expect(screen.getByText(/missing or compacted.*Latest was not substituted/i)).toBeInTheDocument()
+    expect(screen.getByText(/no longer available.*newer version was not opened/i)).toBeInTheDocument()
     expect(screen.getByText(/provider is offline or unavailable/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Open Catalog revision detail' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show saved version details' })).not.toBeInTheDocument()
   })
 
   it('labels a pre-manifest run as legacy evidence', async () => {
@@ -222,13 +239,13 @@ describe('admitted run inputs', () => {
     }])
     render(<RunHistoryModal onClose={() => {}} />)
 
-    expect(await screen.findByText('No admitted input manifest was recorded for this legacy run.')).toBeInTheDocument()
+    expect(await screen.findByText('Input data details were not saved for this older run.')).toBeInTheDocument()
     expect(apiMock.datasetRevision).not.toHaveBeenCalled()
   })
 })
 
-describe('execution manifest inspection', () => {
-  it('loads the immutable detail lazily and renders every recorded contract section', async () => {
+describe('run-to-Canvas action', () => {
+  it('keeps the useful action without exposing the execution manifest', async () => {
     const digest = 'a'.repeat(64)
     apiMock.listRuns.mockResolvedValue([{
       id: 'manifest-history', runId: 'manifest-run', jobType: 'run', status: 'failed',
@@ -248,22 +265,14 @@ describe('execution manifest inspection', () => {
         descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
       },
     })
-    const user = userEvent.setup()
     render(<RunHistoryModal onClose={() => {}} />)
 
-    const toggle = await screen.findByRole('button', { name: /Execution manifest/ })
+    expect(await screen.findByRole('button', { name: 'Create Canvas from run' })).toBeVisible()
     expect(screen.queryByText(digest)).not.toBeInTheDocument()
+    expect(screen.queryByText('Saved run setup')).not.toBeInTheDocument()
+    expect(screen.queryByText('Submitted graph')).not.toBeInTheDocument()
+    expect(screen.queryByText(/dataset-1@revision-1/)).not.toBeInTheDocument()
     expect(apiMock.executionManifest).not.toHaveBeenCalled()
-    await user.click(toggle)
-
-    expect(await screen.findByText(digest)).toBeVisible()
-    expect(await screen.findByText('Submitted graph')).toBeVisible()
-    expect(screen.getByText('Admitted write intent')).toBeVisible()
-    expect(screen.getByText('Runtime descriptor snapshot')).toBeVisible()
-    expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
-    expect(screen.getByText(/dataset-1@revision-1/)).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
-    expect(apiMock.executionManifest).toHaveBeenCalledWith('history-canvas', 'manifest-history')
   })
 })
 
@@ -319,6 +328,22 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Export result' }))
     expect(screen.getByRole('menuitem', { name: 'Export all rows' })).toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: /current page/i })).not.toBeInTheDocument()
+  })
+
+  it('renders non-finite numbers as themselves rather than as the NULL marker', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [{ name: 'ratio', type: 'float', capabilities: [] }],
+      rows: [{ ratio: 1.5 }, { ratio: 'Infinity' }, { ratio: '-Infinity' }, { ratio: 'NaN' },
+             { ratio: null }],
+      rowCount: 5, hasMore: false, truncated: false, completeness: 'complete',
+    })
+
+    render(<FullResult uri="/outputs/nonfinite.parquet" total={5} {...fullIdentity} />)
+
+    expect(await screen.findByText('Infinity')).toBeInTheDocument()
+    expect(screen.getByText('-Infinity')).toBeInTheDocument()
+    expect(screen.getByText('NaN')).toBeInTheDocument()
+    expect(screen.getAllByText('·')).toHaveLength(1)  // only the one genuinely missing value
   })
 
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
@@ -452,10 +477,8 @@ describe('durable full results', () => {
     render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
     expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Technical details' }))
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/run-direct/)
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/target:out/)
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(/Statecommitted/)
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('run-direct')).not.toBeInTheDocument()
   })
 
   it('does not mislabel an authorization failure as expiration', async () => {
@@ -474,17 +497,14 @@ describe('durable full results', () => {
       completeness: 'unknown', wire: 'dataset', notPreviewable: false, ...response,
     })
 
-    const user = userEvent.setup()
     render(<FullResult uri="/outputs/opaque.parquet" total={105} {...fullIdentity} />)
 
     expect(await screen.findByText(title)).toBeInTheDocument()
     expect(screen.getByText(response.reason)).toBeInTheDocument()
     expect(screen.queryByText(/Complete artifact/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Export all rows' })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Technical details' }))
-    expect(screen.getByTestId('full-result-technical-details')).toHaveTextContent(
-      /run-direct.*target:out.*Statecommitted/s,
-    )
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('run-direct')).not.toBeInTheDocument()
   })
 
   it('lets HEAD preflight decide exportability for a result URI without a file suffix', async () => {
@@ -509,7 +529,7 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Export all rows' }))
 
     await waitFor(() => expect(useStore.getState().toasts.at(-1)).toMatchObject({
-      kind: 'error', msg: 'Could not start full-result export: artifact is not exportable',
+      kind: 'error', msg: 'Couldn’t start download: artifact is not exportable',
     }))
     expect(anchorClick).not.toHaveBeenCalled()
     expect(document.querySelector('iframe[data-full-result-download]')).toBeNull()
@@ -524,8 +544,8 @@ describe('durable full results', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Open full result' }))
 
-    expect(await screen.findByText('Full result identity unavailable')).toBeInTheDocument()
-    expect(screen.getByText(/has no durable run identity/i)).toBeInTheDocument()
+    expect(await screen.findByText('Full result unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/older run did not record which saved result/i)).toBeInTheDocument()
     expect(apiMock.runOutputSample).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Export all rows' })).not.toBeInTheDocument()
   })
@@ -593,16 +613,9 @@ describe('durable full results', () => {
     expect(screen.getByText('existing')).toBeVisible()
     expect(screen.getByText('published')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open dataset' })).toBeVisible()
-    const receipt = await screen.findByLabelText('Write receipt for run lance-write-history')
-    expect(receipt).not.toHaveAttribute('open')
-    expect(within(receipt).getByText(/durable revision 8/i)).not.toBeVisible()
-    fireEvent.click(within(receipt).getByText('Technical receipt'))
-    expect(receipt).toHaveAttribute('open')
-    expect(within(receipt).getByText(/durable revision 8/i)).toBeVisible()
-    expect(receipt).toHaveTextContent(/dataset dataset-lance/i)
-    expect(receipt).toHaveTextContent(/parent 7/i)
-    expect(receipt).toHaveTextContent(/backend 8\.0\.0/i)
-    expect(receipt).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('dataset-lance')).not.toBeInTheDocument()
+    expect(screen.queryByText('8.0.0')).not.toBeInTheDocument()
   })
 
   it('renders typed user-code exceptions with an edit action and no full-pass retry', async () => {
@@ -1273,15 +1286,8 @@ describe('durable full results', () => {
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
       'failed-named-output-run', 'target', 'pass', 50, 0,
     ))
-    const trigger = screen.getByRole('button', { name: 'Technical details' })
-    expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    await user.click(trigger)
-    expect(trigger).toHaveAttribute('aria-expanded', 'true')
-    const details = screen.getByTestId('full-result-technical-details')
-    expect(details).toHaveTextContent(/failed-named-output-run/)
-    expect(details).toHaveTextContent(/target:pass/)
-    expect(within(details).getByText('State')).toBeInTheDocument()
-    expect(within(details).getByText('committed')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByText('failed-named-output-run')).not.toBeInTheDocument()
   })
 
   it('does not carry a same-named port selection across a nodeId change', () => {
@@ -1436,14 +1442,17 @@ describe('durable full results', () => {
     })
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'chart', position: { x: 0, y: 0 },
-      data: { title: 'Tasks', status: 'latest', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
+      data: { title: 'Tasks', status: 'failed', config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [] },
     }] }
     useStore.setState({
       doc, canvasRole: 'owner', profileJobs: {},
-      previews: { target: boundPreview(doc, 'target', {
-        columns: [], rows: [], truncated: false, notPreviewable: true,
-        reason: 'grouped charts require a full pass',
-      }) },
+      previews: { target: {
+        ...boundPreview(doc, 'target', {
+          columns: [], rows: [], truncated: false, notPreviewable: true,
+          reason: 'grouped charts require a full pass',
+        }),
+        error: "at 'target': NotPreviewable: an old preview request failed",
+      } },
       runs: { target: { phase: 'done', status: {
         runId: 'chart-exact-run', status: 'done', targetNodeId: 'target',
         rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
@@ -1453,9 +1462,12 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
-    expect(screen.getByText('sum(count) vs task')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
+    expect(screen.getByText('sum(count)')).toBeInTheDocument()  // y axis label, not a repeated caption
+    expect(screen.queryByText('sum(count) vs task')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Preview sample' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/NotPreviewable/)).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
     expect(apiMock.runOutputSample).toHaveBeenCalledWith('chart-exact-run', 'target', 'out', 2_000, 0)
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
   })
@@ -1493,7 +1505,7 @@ describe('durable full results', () => {
 
     const { container } = render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByRole('img', { name: 'bar chart, retained result' })).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
     expect(container.querySelectorAll('svg rect')).toHaveLength(1)
     expect(screen.getByText('3 Y values omitted because they were null, blank, or non-numeric.')).toBeInTheDocument()
     expect(screen.getByText('valid-valu')).toBeInTheDocument()
@@ -1550,9 +1562,7 @@ describe('durable full results', () => {
     expect(await screen.findByRole('img', {
       name: 'bar chart, showing 2000 capped groups',
     })).toBeInTheDocument()
-    expect(screen.getByText(
-      'sum(count) vs task · Showing 2,000 groups · display capped',
-    )).toBeInTheDocument()
+    expect(screen.getByText('Showing 2,000 groups · display capped')).toBeInTheDocument()
     expect(screen.getByText(/Interactive view reached its 2,000 group display limit/)).toBeInTheDocument()
     expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 2,001 rows')
     expect(screen.getByText(/2,001/)).toBe(screen.getByTestId('full-result-status'))

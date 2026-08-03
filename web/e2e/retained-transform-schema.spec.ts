@@ -15,7 +15,7 @@ async function eventsTable(page: import('@playwright/test').Page): Promise<Catal
 test('a parameterized retained Transform result types Join keys across reload and invalidates after an edit', async ({ page }) => {
   test.setTimeout(45_000)
   const events = await eventsTable(page)
-  const canvasId = `retained-transform-schema-${Date.now()}`
+  const canvasId = `retained-transform-schema-${Date.now()}-${crypto.randomUUID()}`
   const transformCode = "def fn(row):\n    return {**row, 'amount_doubled': row['amount'] * 2}"
   const graph = {
     id: canvasId, name: 'Retained Transform schema', version: 1, requirements: [],

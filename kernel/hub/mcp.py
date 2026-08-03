@@ -1319,12 +1319,21 @@ def _tool_specs(pg: Playground) -> list[dict]:
 # JSON-RPC 2.0 dispatch.
 # --------------------------------------------------------------------------- #
 class MCPServer:
-    def __init__(self, playground: Playground):
+    def __init__(
+            self, playground: Playground, *, deps_provider: Callable[[], Any] | None = None):
         self.pg = playground
+        # A stdio server can outlive the composition-root Deps object. ``set_workspace`` replaces
+        # that singleton when the process is reconfigured, so refresh the Playground at message
+        # boundaries instead of retaining adapters/storage from the retired workspace forever.
+        # Direct Playground users and per-request HTTP servers remain fixed unless they explicitly
+        # supply this provider.
+        self._deps_provider = deps_provider
         self._tools = {t["name"]: t for t in _tool_specs(playground)}
 
     # -- public: pure message → message (or None for a notification) ------- #
     def handle(self, msg: Any) -> Any:
+        if self._deps_provider is not None:
+            self.pg.deps = self._deps_provider()
         if isinstance(msg, list):  # JSON-RPC batch (pre-2025-06-18 clients) — reply to each in kind
             if not msg:  # an empty batch is itself an Invalid Request (JSON-RPC 2.0 §6)
                 return _err_response(None, -32600, "invalid request — empty batch")
@@ -1472,7 +1481,10 @@ def build_server(base_url: str | None = None, user_id: str | None = None) -> MCP
         # resolve_user silently falls back to the default 'local' user for an unknown id — a typo'd
         # --user would then act as the bootstrap admin. Fail loudly instead.
         raise SystemExit(f"--user '{user_id}' is not a known user id")
-    return MCPServer(Playground(get_deps(), uid, base_url or settings.base_url))
+    return MCPServer(
+        Playground(get_deps(), uid, base_url or settings.base_url),
+        deps_provider=get_deps,
+    )
 
 
 def build_http_server(user_id: str) -> MCPServer:

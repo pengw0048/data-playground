@@ -64,10 +64,10 @@ describe('KernelBadge', () => {
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
     fireEvent.click(badge)  // opening the popover triggers the status fetch (no request while closed)
-    expect(await screen.findByText('Execution kernel')).toBeInTheDocument()
+    expect(await screen.findByText('Canvas worker')).toBeInTheDocument()
     expect(await screen.findByText(/3 cached/)).toBeInTheDocument()
     expect(screen.getByText(/2m 5s/)).toBeInTheDocument()  // 125s uptime
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · warm'))
   })
 
   it('degrades to offline (keeping the badge) when the kernel-state fetch fails', async () => {
@@ -75,7 +75,7 @@ describe('KernelBadge', () => {
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
     fireEvent.click(badge)  // open → the fetch fails → the dot degrades to offline
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · offline'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · offline'))
   })
 
   it('shows cold (not offline) for a genuinely absent lease', async () => {
@@ -83,14 +83,14 @@ describe('KernelBadge', () => {
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
     fireEvent.click(badge)  // open → fetch returns no lease → cold
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · cold'))
   })
 
   it('calls restartKernel and refreshes when Restart is clicked', async () => {
     mocks.kernelState.mockResolvedValue({ exists: true, state: 'ready', stale: false })
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     fireEvent.click(await screen.findByTestId('kernel-badge'))
-    const restart = await screen.findByRole('button', { name: /Restart kernel/ })
+    const restart = await screen.findByRole('button', { name: /Restart worker/ })
     mocks.kernelState.mockClear()
 
     fireEvent.click(restart)
@@ -104,7 +104,7 @@ describe('KernelBadge', () => {
     mocks.kernelState.mockResolvedValue({ exists: false })
     const { rerender } = render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · cold'))
     mocks.kernelState.mockClear()
 
     const succeeded = previewState(1, { result: previewResult() })
@@ -113,7 +113,7 @@ describe('KernelBadge', () => {
     rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
 
     await waitFor(() => expect(mocks.kernelState).toHaveBeenCalledWith('canvas-1'))
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · warm'))
     mocks.kernelState.mockClear()
 
     // A normal retry removes the prior result while loading, then records a top-level failure.
@@ -146,7 +146,7 @@ describe('KernelBadge', () => {
     }
     rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     expect(mocks.kernelState).not.toHaveBeenCalled()
-    expect(badge).toHaveTextContent('kernel · warm')
+    expect(badge).toHaveTextContent('worker · warm')
 
     mocks.kernelState.mockResolvedValue({ exists: false })
     mocks.state.previews = {
@@ -154,7 +154,7 @@ describe('KernelBadge', () => {
     }
     rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     await waitFor(() => expect(mocks.kernelState).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · cold'))
   })
 
   it('disables Restart on a view-only canvas', async () => {
@@ -162,7 +162,7 @@ describe('KernelBadge', () => {
     mocks.kernelState.mockResolvedValue({ exists: true, state: 'ready', stale: false })
     render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     fireEvent.click(await screen.findByTestId('kernel-badge'))
-    expect(await screen.findByRole('button', { name: /Restart kernel/ })).toBeDisabled()
+    expect(await screen.findByRole('button', { name: /Restart worker/ })).toBeDisabled()
   })
 
   it('resets to the new canvas on switch (never shows the previous canvas state)', async () => {
@@ -171,7 +171,7 @@ describe('KernelBadge', () => {
     mocks.kernelState.mockResolvedValue({ exists: true, state: 'ready', stale: false })
     const { rerender } = render(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
     const badge = await screen.findByTestId('kernel-badge')
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · warm'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · warm'))
 
     mocks.kernelState.mockResolvedValue({ exists: false })  // canvas B has no live kernel
     mocks.kernelState.mockClear()
@@ -180,7 +180,7 @@ describe('KernelBadge', () => {
       source: previewState(9, { canvasId: 'canvas-B', result: previewResult() }),
     }
     rerender(<KernelBadge kernelUp kernelInfo={kernelInfo} />)
-    await waitFor(() => expect(badge).toHaveTextContent('kernel · cold'))
+    await waitFor(() => expect(badge).toHaveTextContent('worker · cold'))
     expect(mocks.kernelState).toHaveBeenCalledTimes(1)  // canvas refresh only; existing success is the new baseline
   })
 })

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { roleCanEdit, useStore } from '../store/graph'
+import { roleCanEdit, useStore, type GraphRunState } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
+import { ProgressBar } from '../ui/controls'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -23,12 +24,20 @@ import { VersionHistoryModal } from '../panels/VersionHistoryModal'
 import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../theme/mode'
-import { KernelBadge } from './KernelBadge'
+import type { ExecutionTargetInfo, KernelInfo } from '../types/api'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 import { CanvasInboxPopover } from './CanvasInboxPopover'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
+
+/** Step counts for the single whole-graph pass; the run reports every node it will execute. */
+function rerunAllProgress(graphRun: GraphRunState | null) {
+  const perNode = graphRun?.status?.perNode ?? []
+  const done = perNode.filter((step) => step.status === 'done' || step.status === 'failed').length
+  return { done, total: perNode.length, value: graphRun?.status?.progress ?? 0 }
+}
 
 type OpenSettingsDetail = HTMLElement | {
   category?: string
@@ -45,6 +54,13 @@ export function TopBar() {
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const rerunAll = useStore((s) => s.rerunAll)
+  const cancelGraphRun = useStore((s) => s.cancelGraphRun)
+  const graphRun = useStore((s) => s.graphRun)
+  const hasRunEvidence = useStore((s) => s.doc.nodes.some((node) => (
+    Boolean(node.data.status) && node.data.status !== 'draft'
+  )))
+  const authEnabled = useStore((s) => s.authEnabled)
+  const graphProgress = rerunAllProgress(graphRun)
   // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
   // buttons whenever collab is active — pressing with empty history is a harmless no-op
   const canUndo = useStore((s) => s.past.length > 0) || crdtUndoActive()
@@ -112,7 +128,7 @@ export function TopBar() {
   const navigateToWorkspace = (resourceId: string | null | undefined) => {
     const store = useStore.getState()
     if (resourceId === undefined) {
-      // No placement was proven (local draft/unplaced Canvas): retain the existing generic entry.
+      // No placement was proven (local draft/unplaced Canvas): retain the generic entry.
       store.setView('workspace')
       return
     }
@@ -124,8 +140,8 @@ export function TopBar() {
   return (
     <>
       <div data-layout-region="canvas-top-chrome"
-        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
-        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12, pointerEvents: 'none' }}>
+        <div style={{ pointerEvents: 'auto' }} className="flex w-fit min-w-0 max-w-full items-center gap-2 overflow-hidden">
           <AppMenu
             onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)}
             onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)}
@@ -141,20 +157,44 @@ export function TopBar() {
           <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <CanvasTitle />
-          <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
+          {canEdit && currentDraft?.syncState === 'conflict'
+            ? <button data-testid="autosave" type="button" aria-label="Sync conflict — choose how to continue"
+                title={currentDraft.lastError} onClick={() => useStore.getState().notifyLocalDraftConflict(currentDraft.draftId)}
+                className="ml-0.5 shrink-0 rounded px-1 text-[11px] font-semibold text-destructive underline decoration-dotted underline-offset-2 hover:bg-accent">· {saveLabel}</button>
+            : <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Offline — server save state is unknown. Edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>}
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
             <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
             <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
           </span>
         </div>
-        <div data-testid="canvas-run-controls" className="flex items-center gap-2.5">
+        <div data-testid="canvas-run-controls" style={{ pointerEvents: 'auto' }} className="flex items-center gap-2.5">
           <PeerAvatars />
-          <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
-          <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
-            <Icon name="refresh" size={13} /> Rerun all
-          </Button>
-          <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title="Share this canvas" size="sm" className="rounded-full">
-            <Icon name="link" size={13} /> Share
+          <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
+          <span className="relative">
+            <Button onClick={() => graphRun ? void cancelGraphRun() : rerunAll()}
+              disabled={!canEdit || !kernelUp || (!!graphRun && !graphRun.runId)}
+              title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Offline — reconnect before running'
+                : graphRun?.runId ? 'Stop the whole-graph run'
+                  : graphRun ? 'Starting the whole-graph run'
+                    : hasRunEvidence ? 'Re-run the whole graph' : 'Run the whole graph'}
+              size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
+              {graphRun?.runId
+                ? <><Icon name="stop" size={12} /> Stop {graphProgress.done}/{graphProgress.total}</>
+                : graphRun
+                  ? <><span className="dp-running-glyph">●</span> Starting…</>
+                : hasRunEvidence
+                  ? <><Icon name="refresh" size={13} /> Rerun all</>
+                  : <><Icon name="play" size={13} /> Run all</>}
+            </Button>
+            {graphRun?.status && (
+              <span className="absolute -bottom-2 left-1 right-1 block">
+                <ProgressBar value={graphProgress.value}
+                  label={`Re-running the whole graph — ${graphProgress.done} of ${graphProgress.total} steps done`} />
+              </span>
+            )}
+          </span>
+          <Button data-testid="share-btn" onClick={() => setShareOpen(true)} title={authEnabled ? 'Share this canvas' : 'Copy a link to this canvas'} size="sm" className="rounded-full">
+            <Icon name="link" size={13} /> {authEnabled ? 'Share' : 'Copy link'}
           </Button>
         </div>
       </div>
@@ -172,6 +212,78 @@ export function TopBar() {
       {copyOpen && <CanvasCopyModal source={{ canvasId: useStore.getState().doc.id, version: useStore.getState().doc.version, name: useStore.getState().doc.name ?? 'Untitled canvas' }} onClose={() => setCopyOpen(false)} />}
     </>
   )
+}
+
+const AUTOMATIC_EXECUTION = '__automatic__'
+
+function ExecutionTargetMenu({ kernelUp, kernelInfo, canEdit }: {
+  kernelUp: boolean
+  kernelInfo: KernelInfo | null
+  canEdit: boolean
+}) {
+  const selected = useStore((state) => state.doc.executionBackend)
+  const setExecutionBackend = useStore((state) => state.setExecutionBackend)
+  const targets = kernelInfo?.executionTargets ?? []
+  const selectedTarget = targets.find((target) => target.name === selected)
+  const unavailable = selected && !selectedTarget
+  const label = selectedTarget?.label ?? (unavailable ? 'Target unavailable' : 'Automatic')
+  const grouped = (kind: ExecutionTargetInfo['kind']) => targets.filter((target) => target.kind === kind)
+
+  const targetItem = (target: ExecutionTargetInfo) => (
+    <DropdownMenuRadioItem key={target.name} value={target.name} className="items-start py-2 pl-8">
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex items-center gap-2 text-[12px] font-semibold text-foreground">
+          {target.label}
+          {target.substrate && <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">{target.substrate}</span>}
+        </span>
+        <span className="whitespace-normal text-[10.5px] leading-snug text-muted-foreground">{target.description}</span>
+      </span>
+    </DropdownMenuRadioItem>
+  )
+
+  return <DropdownMenu modal={false}>
+    <DropdownMenuTrigger asChild>
+      <button type="button" disabled={!kernelUp || !canEdit}
+        aria-label={`Execution target: ${label}`}
+        title={!canEdit ? 'View-only Canvas' : !kernelUp ? 'Offline' : 'Choose where full Canvas runs execute'}
+        className="inline-flex h-8 max-w-[210px] items-center gap-1.5 rounded-full border border-border bg-card px-2.5 text-[11px] font-semibold text-foreground shadow-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${kernelUp && !unavailable ? 'bg-green-500' : 'bg-amber-500'}`} />
+        <Icon name="server" size={13} />
+        <span className="truncate">{label}</span>
+        <Icon name="chevronDown" size={11} />
+      </button>
+    </DropdownMenuTrigger>
+    <DropdownMenuContent align="end" className="w-[360px] p-1.5">
+      <div className="px-2 pb-1.5 pt-1 text-[11px] font-semibold text-foreground">Run this Canvas on</div>
+      <DropdownMenuRadioGroup value={selected ?? AUTOMATIC_EXECUTION}
+        onValueChange={(value) => setExecutionBackend(value === AUTOMATIC_EXECUTION ? null : value)}>
+        <DropdownMenuRadioItem value={AUTOMATIC_EXECUTION} className="items-start py-2 pl-8">
+          <span className="flex flex-col gap-0.5">
+            <span className="text-[12px] font-semibold text-foreground">Automatic</span>
+            <span className="whitespace-normal text-[10.5px] leading-snug text-muted-foreground">Use the workspace default and automatic resource placement.</span>
+          </span>
+        </DropdownMenuRadioItem>
+        {unavailable && <DropdownMenuRadioItem value={selected} disabled className="items-start py-2 pl-8">
+          <span className="flex flex-col gap-0.5">
+            <span className="text-[12px] font-semibold text-destructive">{selected}</span>
+            <span className="text-[10.5px] text-muted-foreground">This saved target is not configured on this deployment.</span>
+          </span>
+        </DropdownMenuRadioItem>}
+        {grouped('interactive').length > 0 && <>
+          <DropdownMenuSeparator />
+          <div className="px-2 py-1 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Interactive worker</div>
+          {grouped('interactive').map(targetItem)}
+        </>}
+        {grouped('job').length > 0 && <>
+          <DropdownMenuSeparator />
+          <div className="px-2 py-1 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">Full-run jobs</div>
+          {grouped('job').map(targetItem)}
+        </>}
+      </DropdownMenuRadioGroup>
+      <DropdownMenuSeparator />
+      <p className="px-2 py-1.5 text-[10px] leading-snug text-muted-foreground">Previews remain interactive; full runs use the target saved with this Canvas.</p>
+    </DropdownMenuContent>
+  </DropdownMenu>
 }
 
 // Live presence: avatars of other people currently on this canvas (realtime collab).
@@ -211,21 +323,26 @@ export function AppMenu({
   onCopy: () => void
   copyable: boolean
 }) {
-  const setJobsQuery = useStore((s) => s.setJobsQuery)
-  const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   const doc = useStore((s) => s.doc)
   const currentDraftId = useStore((s) => s.currentDraftId)
+  const currentDraftSyncing = useStore((s) => s.localDrafts.some((draft) => (
+    draft.draftId === s.currentDraftId && draft.syncState === 'syncing'
+  )))
   const canvasRole = useStore((s) => s.canvasRole)
   const deleteFile = useStore((s) => s.deleteFile)
   const discardLocalDraft = useStore((s) => s.discardLocalDraft)
   const [themeMode, setVisibleThemeMode] = useState<ThemeMode>(getThemeMode)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    canvasId: string; draftId: string | null; name: string
+  } | null>(null)
   useEffect(() => {
     const sync = () => setVisibleThemeMode(getThemeMode())
     window.addEventListener('dp-theme-change', sync)
     return () => window.removeEventListener('dp-theme-change', sync)
   }, [])
   return (
+    <>
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button data-testid="app-menu" title="Data Playground menu" aria-label="Data Playground menu"
@@ -235,7 +352,6 @@ export function AppMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">
         <DropdownMenuItem onSelect={onWorkspace}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New Canvas</DropdownMenuItem>
         <DropdownMenuItem data-testid="import-native-canvas" onSelect={() => setTimeout(onNativeImport)}><Icon name="import" size={14} /> Import native Canvas…</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
@@ -246,8 +362,6 @@ export function AppMenu({
         <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="runs and background tasks" /></DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>
           <DropdownMenuSubTrigger><Icon name="sun" size={14} /> Appearance</DropdownMenuSubTrigger>
@@ -261,17 +375,32 @@ export function AppMenu({
         </DropdownMenuSub>
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
         {canvasRole === 'owner' && <DropdownMenuSeparator />}
-        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
+        {canvasRole === 'owner' && <DropdownMenuItem disabled={currentDraftSyncing}
+          title={currentDraftSyncing ? 'Wait for syncing to finish before deleting this draft' : undefined}
+          onSelect={() => {
+          const target = { canvasId: doc.id, draftId: currentDraftId, name: doc.name || 'untitled' }
+          setTimeout(() => setDeleteTarget(target))
+        }} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftSyncing ? 'Syncing local draft…' : currentDraftId ? 'Delete this local draft' : 'Delete this Canvas'}</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>
+    <ConfirmationDialog
+      open={deleteTarget !== null}
+      title={deleteTarget?.draftId ? `Delete local draft “${deleteTarget.name}”?` : `Delete “${deleteTarget?.name ?? 'this Canvas'}”?`}
+      description={deleteTarget?.draftId
+        ? 'This permanently deletes the changes saved only in this browser. It does not delete a server Canvas. This cannot be undone.'
+        : 'This permanently deletes the Canvas for everyone who can access it. This cannot be undone.'}
+      confirmLabel={deleteTarget?.draftId ? 'Delete local draft' : 'Delete Canvas'}
+      onCancel={() => setDeleteTarget(null)}
+      onConfirm={() => {
+        const target = deleteTarget
+        setDeleteTarget(null)
+        if (!target) return
+        if (target.draftId) void discardLocalDraft(target.draftId)
+        else void deleteFile(target.canvasId)
+      }}
+    />
+    </>
   )
-}
-
-function MenuDestination({ label, detail }: { label: string; detail: string }) {
-  return <span className="flex min-w-0 flex-1 flex-col items-start leading-tight">
-    <span>{label}</span>
-    <span aria-hidden className="mt-0.5 whitespace-normal text-[10px] leading-tight text-muted-foreground">{detail}</span>
-  </span>
 }
 
 export function CanvasTitle() {
@@ -361,7 +490,7 @@ export function CanvasTitle() {
     aria-label={canEdit ? `Rename Canvas ${name}` : `Canvas ${name}, view only`}
     disabled={!canEdit}
     onClick={begin}
-    className="min-w-0 max-w-[min(42vw,520px)] truncate rounded-md px-1 py-0.5 text-left text-[13.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-default disabled:hover:bg-transparent"
+    className="min-w-0 max-w-[min(42vw,520px)] truncate rounded-md border border-transparent px-1 py-0.5 text-left text-[13.5px] font-semibold text-foreground hover:border-primary/40 hover:bg-primary/5 disabled:cursor-default disabled:hover:border-transparent disabled:hover:bg-transparent"
   >
     {name}
   </button>

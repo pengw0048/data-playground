@@ -33,6 +33,7 @@ function markdownTable(headers, rows) {
 
 const NESTED_WEBSERVER_PHASES = new Set([
   'e2e-workspace-cleanup',
+  'candidate-spa-build',
   'webserver-fixture-build',
   'webserver-database-migrate',
   'candidate-wheel-build',

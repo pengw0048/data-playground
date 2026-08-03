@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { useReactFlow, useViewport } from '@xyflow/react'
 import { allSpecs } from '../nodes'
+import { firstCompatibleInput, nodeOutputs } from '../nodes/registry'
 import { useStore, roleCanEdit } from '../store/graph'
-import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens'
+import { categoryOrder, type Category } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
@@ -11,6 +12,7 @@ import { locateNode } from './locateNode'
 import { cn } from '@/lib/utils'
 import { toolbarSafePosition, type ToolbarSafeBounds } from './toolbarPlacement'
 import { canvasFitOptions } from './viewportFit'
+import { NodeTypeIcon } from './NodeTypeIcon'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
   io: 'db', shape: 'sample', compute: 'fx', query: 'sql', inspect: 'note', control: 'code',
@@ -24,6 +26,7 @@ export function Toolbar() {
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
   const doc = useStore((s) => s.doc)
   const addNode = useStore((s) => s.addNode)
+  const addConnectedNode = useStore((s) => s.addConnectedNode)
   const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
@@ -58,13 +61,32 @@ export function Toolbar() {
   const add = (kind: string) => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
     const base = { x: c.x - 116, y: c.y - 40 }
-    const pos = safeToolbarPosition(useStore.getState().doc.nodes, base)
-    addNode(kind, pos)
+    const state = useStore.getState()
+    const pos = safeToolbarPosition(state.doc.nodes, base)
+    const source = state.selectedIds.length === 1
+      ? state.doc.nodes.find((node) => node.id === state.selectedIds[0])
+      : undefined
+    const output = source
+      ? nodeOutputs(source).find((port) => port.id === 'out') ?? nodeOutputs(source)[0]
+      : undefined
+    const input = output ? firstCompatibleInput(kind, output.wire) : undefined
+    const connected = source && output && input
+      ? addConnectedNode(kind, pos, {
+          source: source.id,
+          sourceHandle: output.id,
+          targetHandle: input.id,
+          wire: output.wire,
+        })
+      : null
+    if (!connected) addNode(kind, pos)
+    else {
+      const current = useStore.getState()
+      current.requestNodeReveal(current.doc.id, connected.id)
+    }
     setOpen(null)
   }
 
   const toolbarDensity = useToolbarDensity(toolbarRef)
-  const labelsVisible = toolbarDensity !== 'icons'
 
   const locate = (id: string) => {
     const nodes = useStore.getState().doc.nodes
@@ -86,9 +108,8 @@ export function Toolbar() {
       {doc.nodes.length > 0 && <CanvasViewportControls />}
       {canEdit && (
         <div ref={toolbarRef} data-testid="toolbar" data-density={toolbarDensity} className="absolute bottom-[22px] left-1/2 z-[16] -translate-x-1/2">
-          <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-2xl border border-border bg-card p-1.5 shadow-lg">
-            <div data-testid="toolbar-add-controls" role="group" aria-label="Add controls" className="flex min-w-0 items-center gap-1">
-              {labelsVisible && <span className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Add</span>}
+          <div className="flex max-w-[calc(100vw-24px)] items-center gap-1 rounded-lg border border-border bg-card p-1 shadow-lg">
+            <div data-testid="toolbar-add-controls" role="group" aria-label="Canvas tools" className="flex min-w-0 items-center gap-1">
               {cats.map((cat) => (
                 <CategoryButton
                   key={cat}
@@ -105,14 +126,13 @@ export function Toolbar() {
 
               <ToolbarIconButton label="Locate existing node" icon="search" onClick={() => { setOpen(null); setLocatorOpen(true) }} />
 
-              <Tooltip label={`Agent — ${agentOpen ? 'open' : 'closed'}`}>
+              <Tooltip label={`${agentOpen ? 'Close' : 'Open'} Agent`}>
                 <button
                   type="button"
                   aria-pressed={agentOpen}
                   onClick={() => setAgentOpen(!agentOpen)}
-                  className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
-                  // Agent brand accent (violet) — no design token expresses it; matches the AgentDock it opens.
-                  style={{ background: agentOpen ? '#efeaff' : 'linear-gradient(180deg,#f3effe,#ece5fc)', color: '#6b4bd6' }}
+                  className={cn('inline-flex items-center gap-[7px] rounded-md px-3 py-[7px] text-[12.5px] font-semibold',
+                    agentOpen ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground')}
                 >
                   <Icon name="sparkle" size={14} /> Agent
                 </button>
@@ -225,17 +245,20 @@ function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {
         </button>
       </Tooltip>
       {/* portal popover positioned once against the button (no percentage-based jump) */}
-      <Popover anchorRef={ref} open={open} onClose={onClose} width={210} placement="top" align="left">
+      <Popover anchorRef={ref} open={open} onClose={onClose} width={210} maxHeight={540} placement="top" align="left">
         <div className="px-2 py-[5px] text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
           {CATEGORY_LABEL[cat]}
         </div>
         {specs.map((s) => (
           <button
             key={s.kind}
+            aria-label={s.title}
             onClick={(e) => { e.stopPropagation(); onPick(s.kind) }}
             className="flex w-full items-center gap-[9px] rounded-md px-2 py-[7px] text-left hover:bg-accent"
           >
-            <span className="h-[15px] w-1 rounded-sm" style={{ background: kindAccent[s.kind] ?? color.text3 }} />
+            <span aria-hidden="true" className="grid h-6 w-6 shrink-0 place-items-center rounded border border-border bg-card text-muted-foreground">
+              <NodeTypeIcon spec={s} size={14} />
+            </span>
             <span className="flex flex-col">
               <span className="text-[12.5px] font-semibold text-foreground">{s.title}</span>
               <span className="text-[10px] text-muted-foreground">{s.blurb}</span>

@@ -1,6 +1,8 @@
 import type { CanvasDoc } from '../types/graph'
 
 export const MAX_LOCAL_CANVAS_DRAFTS = 20
+export const UNAVAILABLE_DRAFT_BASE_MESSAGE = 'The server Canvas is no longer available. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+export const READ_ONLY_DRAFT_BASE_MESSAGE = 'The server Canvas is available read-only. Your local draft is preserved; open the server copy or keep the draft as a new Canvas.'
 
 const INDEX_VERSION = 1
 const INDEX_KEY = (principalId: string) => `dp-canvas-drafts-v1:${encodeURIComponent(principalId)}`
@@ -20,6 +22,8 @@ export interface LocalCanvasDraft {
   doc: CanvasDoc
   /** Exact document sent by the first idempotent create attempt. */
   createAttemptDoc: CanvasDoc | null
+  /** Existing Canvas used to place a local-only create beside its originating folder. */
+  besideCanvasId?: string
   syncState: CanvasDraftSyncState
   lastLocalEditAt: string
   lastError?: string
@@ -58,13 +62,13 @@ function readIndex(principalId: string): { index: DraftIndex; errors: string[]; 
     if (!raw) return { index: { version: INDEX_VERSION, ids: [] }, errors: [] }
     const parsed = JSON.parse(raw) as Partial<DraftIndex>
     if (parsed.version !== INDEX_VERSION || !Array.isArray(parsed.ids)) {
-      throw new Error('draft index is corrupt')
+      throw new Error('saved-draft list is corrupt')
     }
     const errors: string[] = []
     const validIds: string[] = []
     for (const id of parsed.ids) {
       if (typeof id !== 'string' || !id) {
-        errors.push(storageMessage('read one indexed identity', new Error('draft identity is corrupt')))
+        errors.push(storageMessage('read one saved Canvas draft', new Error('draft reference is corrupt')))
       } else {
         validIds.push(id)
       }
@@ -98,9 +102,12 @@ function parseDraft(raw: string, principalId: string, draftId: string): LocalCan
     || (value.baseCanvasId !== null && value.baseCanvasId !== value.canvasId)
     || (value.baseVersion !== null && (!Number.isInteger(value.baseVersion) || Number(value.baseVersion) < 1))
     || (value.createAttemptDoc !== null && !isCanvasDoc(value.createAttemptDoc))
+    || (value.besideCanvasId !== undefined
+      && (typeof value.besideCanvasId !== 'string' || value.besideCanvasId.length === 0
+        || value.besideCanvasId === value.canvasId))
     || !['dirty', 'syncing', 'conflict', 'error'].includes(String(value.syncState))
     || typeof value.lastLocalEditAt !== 'string') {
-    throw new Error('draft record is corrupt')
+    throw new Error('saved draft is corrupt')
   }
   return value as LocalCanvasDraft
 }
@@ -114,11 +121,11 @@ export function readCanvasDrafts(principalId: string): DraftReadResult {
   for (const draftId of index.ids) {
     try {
       const raw = localStorage.getItem(RECORD_KEY(principalId, draftId))
-      if (!raw) throw new Error('draft record is missing')
+      if (!raw) throw new Error('saved draft is missing')
       const draft = parseDraft(raw, principalId, draftId)
       // A tab/browser restart cannot still have an in-flight request. Make retry truth explicit.
       drafts.push(draft.syncState === 'syncing'
-        ? { ...draft, syncState: 'dirty', lastError: 'The previous sync did not finish. Retry when the hub is reachable.' }
+        ? { ...draft, syncState: 'dirty', lastError: 'The previous sync did not finish. Retry when Data Playground is back online.' }
         : draft)
     } catch (recordError) {
       errors.push(storageMessage(`read ${draftId}`, recordError))
@@ -129,8 +136,10 @@ export function readCanvasDrafts(principalId: string): DraftReadResult {
 }
 
 export function writeCanvasDraft(draft: LocalCanvasDraft): DraftWriteResult {
-  if (!draft.principalId || draft.draftId !== draft.canvasId || draft.doc.id !== draft.canvasId) {
-    return { ok: false, error: 'Could not save local Canvas draft: invalid draft identity.' }
+  if (!draft.principalId || draft.draftId !== draft.canvasId || draft.doc.id !== draft.canvasId
+    || (draft.besideCanvasId !== undefined
+      && (!draft.besideCanvasId || draft.besideCanvasId === draft.canvasId))) {
+    return { ok: false, error: 'Could not save local Canvas draft: the draft metadata is invalid.' }
   }
   const { index, error } = readIndex(draft.principalId)
   if (error) return { ok: false, error }

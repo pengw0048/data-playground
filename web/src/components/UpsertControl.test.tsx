@@ -57,11 +57,11 @@ describe('UpsertControl', () => {
 
   it('projects preflight evidence then requires it before submitting', async () => {
     render(<UpsertControl nodeId="write" />)
-    const run = screen.getByRole('button', { name: 'Run keyed upsert' })
+    const run = screen.getByRole('button', { name: 'Update dataset' })
     expect(run).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await screen.findByText('Eligible keyed upsert')
-    expect(screen.getByLabelText('Upsert projection')).toHaveTextContent('2 matched · 1 inserted · 1 unchanged')
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
+    await screen.findByText('Ready to update')
+    expect(screen.getByLabelText('Upsert check')).toHaveTextContent('2 matched · 1 inserted · 1 unchanged')
     await waitFor(() => expect(run).toBeEnabled())
     fireEvent.click(run)
     await waitFor(() => expect(mocks.submit).toHaveBeenCalledTimes(1))
@@ -78,18 +78,18 @@ describe('UpsertControl', () => {
   it('renders a fail-closed typed error from preflight without submitting', async () => {
     mocks.preflight.mockRejectedValue(new Error('upsert rejected null or duplicate keys (rejected=0, duplicate=1, conflict=0)'))
     render(<UpsertControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
     await screen.findByText(/duplicate=1/)
     expect(mocks.submit).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: 'Run keyed upsert' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Update dataset' })).toBeDisabled()
   })
 
   it('surfaces a moved head as permanent and offers only a new admission', async () => {
     mocks.state = baseState({ keys: ['id'], taskId: 'task-1' })
     mocks.task.mockResolvedValue({ taskId: 'task-1', status: 'failed', datasetId: 'dataset-1', expectedHeadRevisionId: 'rev-1', payloadDatasetId: 'payload-1', payloadRevisionId: 'prev-1', diagnosticCode: 'stale_expected_head', canCancel: false, canRetry: false })
     render(<UpsertControl nodeId="write" />)
-    await screen.findByText(/The destination moved/)
-    expect(screen.getByRole('button', { name: 'Start new admission' })).toBeEnabled()
+    await screen.findByText(/The destination has a newer version/)
+    expect(screen.getByRole('button', { name: 'Start new setup' })).toBeEnabled()
   })
 
   it('shows the published evidence and exact revision after a done run', async () => {
@@ -101,7 +101,7 @@ describe('UpsertControl', () => {
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('dataset-1@rev-2')
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-2&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
+      '#/workspace/dataset%3Adataset-1?revision=rev-2&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
     )
     expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })

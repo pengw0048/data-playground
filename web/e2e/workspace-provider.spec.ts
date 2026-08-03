@@ -1,58 +1,49 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test } from '@playwright/test'
+import {
+  prepareProviderAcceptanceFixture,
+  providerAcceptanceNames,
+} from '../scripts/provider-acceptance-fixture.mjs'
 
 const enabled = process.env.DP_E2E_PROVIDER_ACCEPTANCE === '1'
 const providerRoot = process.env.DP_E2E_PROVIDER_ROOT
-const containerNameA = 'Browser provider collection A'
-const containerNameB = 'Browser provider collection B'
-const datasetNameA = 'Browser provider observations'
-const datasetNameB = 'Browser provider observations'
-const relatedDatasetName = 'Browser provider labels'
+const containerNameA = providerAcceptanceNames.containerA
+const containerNameB = providerAcceptanceNames.containerB
+const datasetNameA = providerAcceptanceNames.datasetA
+const datasetNameB = providerAcceptanceNames.datasetB
+const relatedDatasetName = providerAcceptanceNames.relatedDataset
 const typedDatasetName = 'Browser provider referenced observations'
 
 test.describe('provider Workspace Source acceptance', () => {
   test.skip(!enabled || !providerRoot, 'set DP_E2E_PROVIDER_ACCEPTANCE=1 and DP_E2E_PROVIDER_ROOT')
 
   test.beforeAll(() => {
-    const root = resolve(providerRoot!)
-    mkdirSync(root, { recursive: true })
-    writeFileSync(resolve(root, 'observations.csv'), 'id,value\n1,alpha\n2,beta\n')
-    writeFileSync(resolve(root, 'labels.csv'), 'id,label\n1,one\n2,two\n')
-    writeFileSync(resolve(root, 'catalog.json'), JSON.stringify({ resources: [
-      { placementId: 'browser-collection-a', kind: 'container', name: containerNameA },
-      { placementId: 'browser-collection-b', kind: 'container', name: containerNameB },
-      {
-        placementId: 'browser-observations-a', datasetId: 'browser-canonical-observations',
-        kind: 'dataset', name: datasetNameA, parentPlacementId: 'browser-collection-a',
-        uri: 'observations.csv', revisionId: 'browser-provider-revision-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'value', type: 'string' }],
-      },
-      {
-        placementId: 'browser-observations-b', datasetId: 'browser-canonical-observations',
-        kind: 'dataset', name: datasetNameB, parentPlacementId: 'browser-collection-b',
-        uri: 'observations.csv',
-        revisionId: 'browser-provider-revision-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'value', type: 'string' }],
-      },
-      {
-        placementId: 'browser-labels-a', datasetId: 'browser-canonical-labels',
-        kind: 'dataset', name: relatedDatasetName, parentPlacementId: 'browser-collection-a',
-        uri: 'labels.csv', revisionId: 'browser-provider-labels-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'label', type: 'string' }],
-      },
-    ] }))
+    prepareProviderAcceptanceFixture(providerRoot!)
   })
 
   test('replaces a provider-backed Source from the Workspace catalog without weakening its exact binding', async ({ page }) => {
     test.setTimeout(60_000)
-    const rootResponse = await page.request.get('/api/workspace/containers/workspace-local-root?limit=100')
+    const rootResponse = await page.request.get(
+      '/api/workspace/containers/workspace-local-root?limit=100&source=local',
+    )
     expect(rootResponse.ok()).toBeTruthy()
     const root = await rootResponse.json() as {
       container: { version: number }
+      connectedSources: Array<{ id: string; mountId?: string }>
+    }
+    const mount = root.connectedSources.find((item) => item.mountId === 'browser-provider')
+    expect(mount).toBeTruthy()
+    const mountResponse = await page.request.get(
+      `/api/workspace/containers/${encodeURIComponent(mount!.id.replace(/^container:/, ''))}?limit=100&source=provider`,
+    )
+    expect(mountResponse.ok()).toBeTruthy()
+    const mountPage = await mountResponse.json() as {
       items: Array<{ id: string; providerPlacementId?: string }>
     }
-    const collection = root.items.find((item) => item.providerPlacementId === 'browser-collection-a')
+    const collection = mountPage.items.find(
+      (item) => item.providerPlacementId === 'browser-collection-a',
+    )
     expect(collection).toBeTruthy()
     const collectionResponse = await page.request.get(
       `/api/workspace/containers/${encodeURIComponent(collection!.id.replace(/^container:/, ''))}?limit=100`,
@@ -138,14 +129,82 @@ test.describe('provider Workspace Source acceptance', () => {
     expect(config.datasetRef?.revisionId).not.toBe(originalConfig.datasetRef?.revisionId)
   })
 
+  test('moves a local Canvas into a connected source folder and undoes the local placement move', async ({ page }) => {
+    const name = `Connected source move ${Date.now()}`
+    const rootResponse = await page.request.get('/api/workspace/containers/workspace-local-root?limit=1&source=local')
+    expect(rootResponse.ok()).toBeTruthy()
+    const root = await rootResponse.json() as { container: { version: number } }
+    const createdResponse = await page.request.post('/api/workspace/canvases', { data: {
+      containerId: 'workspace-local-root', expectedContainerVersion: root.container.version, name,
+    } })
+    expect(createdResponse.ok(), await createdResponse.text()).toBeTruthy()
+    const created = await createdResponse.json() as { id: string }
+
+    await page.goto('/#/workspace')
+    await page.getByRole('button', { name: `More actions for ${name}` }).click()
+    await page.getByRole('menuitem', { name: 'Move' }).click()
+    const dialog = page.getByRole('dialog', { name: `Move ${name}` })
+    await dialog.getByRole('button', { name: /browser-provider.*connected source/i }).click()
+    const destination = dialog.getByRole('button', {
+      name: new RegExp(`${containerNameA}.*Canvas folder`, 'i'),
+    })
+    await expect(destination).toBeVisible({ timeout: 20_000 })
+    await destination.click()
+    await expect(dialog.getByText(/Destination:/)).toContainText(
+      `Workspace / browser-provider / ${containerNameA}`,
+    )
+
+    const moveRequestPromise = page.waitForRequest((request) =>
+      request.method() === 'POST' && new URL(request.url()).pathname === '/api/workspace/batch')
+    await dialog.getByRole('button', { name: `Move to ${containerNameA}` }).click()
+    const moveRequest = await moveRequestPromise
+    const moveResponse = await moveRequest.response()
+    expect(moveResponse?.ok(), await moveResponse?.text()).toBeTruthy()
+    const moveBody = moveRequest.postDataJSON() as {
+      containerId: string; expectedContainerVersion: number
+    }
+    const moveResult = await moveResponse!.json() as {
+      container: { id: string; localPlacement?: { containerId: string; containerVersion: number } }
+    }
+    expect(moveResult.container.localPlacement).toBeTruthy()
+    expect(moveBody).toEqual(expect.objectContaining({
+      containerId: moveResult.container.localPlacement!.containerId,
+      expectedContainerVersion: moveResult.container.localPlacement!.containerVersion,
+    }))
+    expect(moveBody.containerId).not.toBe(moveResult.container.id.replace(/^container:/, ''))
+    await expect(page.getByRole('status').filter({ hasText: `Moved “${name}”` })).toContainText(
+      `Moved “${name}” to Workspace / browser-provider / ${containerNameA}.`,
+    )
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/workspace/resources/canvas:${created.id}`)
+      const body = await response.json() as { resource: { parentId?: string } }
+      return body.resource.parentId
+    }).toBe(moveResult.container.id)
+
+    const undoRequestPromise = page.waitForRequest((request) =>
+      request.method() === 'POST' && new URL(request.url()).pathname === '/api/workspace/batch')
+    await page.getByRole('button', { name: 'Undo move' }).click()
+    await undoRequestPromise
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/workspace/resources/canvas:${created.id}`)
+      const body = await response.json() as { resource: { parentId?: string } }
+      return body.resource.parentId
+    }).toBe('container:workspace-local-root')
+    await expect(page.getByRole('button', { name: `Open canvas ${name}` })).toBeVisible()
+  })
+
   test('deduplicates canonical provider placements, then previews, runs, and inspects the exact Source in Chromium', async ({ page }) => {
     test.setTimeout(90_000)
     const providerCatalogBefore = readFileSync(resolve(providerRoot!, 'catalog.json'))
     const providerDatasetBefore = readFileSync(resolve(providerRoot!, 'observations.csv'))
     const providerLabelsBefore = readFileSync(resolve(providerRoot!, 'labels.csv'))
     await page.goto('/#/workspace')
+    const connectedSources = page.getByRole('region', { name: 'Connected sources' })
+    await connectedSources.getByRole('button', {
+      name: /Open folder browser-provider from Connected source browser-provider/,
+    }).click()
     const container = page.getByRole('button', {
-      name: new RegExp(`Open folder ${containerNameA} from Source-only mount browser-provider`),
+      name: new RegExp(`Open folder ${containerNameA} from Connected source browser-provider`),
     })
     await expect(container).toBeVisible({ timeout: 20_000 })
     const externalBrowse = page.waitForResponse((response) =>
@@ -161,7 +220,7 @@ test.describe('provider Workspace Source acceptance', () => {
     const localPlacement = externalPage.container.localPlacement
     expect(localPlacement).toBeTruthy()
     const resource = page.getByRole('button', {
-      name: new RegExp(`Open dataset ${datasetNameA} from Source-only mount browser-provider`),
+      name: new RegExp(`Open dataset ${datasetNameA} from Connected source browser-provider`),
     })
     await expect(resource).toBeVisible({ timeout: 20_000 })
     await resource.click()
@@ -170,11 +229,9 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(resource).toHaveCount(0)
     await expect(page.getByTestId('first-run-canvas-choice')).toHaveCount(0)
     const location = detail.getByText('Location', { exact: true }).locator('..')
-    await expect(location).toContainText('Mount browser-provider')
+    await expect(location).toContainText('Connected source browser-provider')
     await expect(location).toContainText(`${containerNameA} / ${datasetNameA}`)
     await expect(location.getByText('dp-file-catalog', { exact: true })).toBeVisible()
-    await expect(detail).toContainText('Workspace placement')
-    await expect(detail).toContainText('Canonical dataset IDbrowser-canonical-observations')
     const placementAId = externalPage.items.find((item) => item.providerPlacementId === 'browser-observations-a')?.id
     expect(placementAId).toBeTruthy()
     const placementA = await page.request.get(`/api/workspace/resources/${encodeURIComponent(placementAId!)}`)
@@ -251,16 +308,33 @@ test.describe('provider Workspace Source acceptance', () => {
     )?.id
     expect(typedPlacementId).toBeTruthy()
     const canonicalDetail = detail.getByTestId('canonical-provider-dataset-context')
-    await expect(canonicalDetail).toContainText('id · int')
-    await expect(canonicalDetail).toContainText('value · string')
-    await detail.getByText('Dataset details', { exact: true }).click()
-    await expect(detail.getByText('Version identity', { exact: true })).toBeVisible()
-    await expect(detail.getByText('browser-provider-revision-v1', { exact: true })).toBeVisible()
+    await expect(canonicalDetail.getByText('id', { exact: true }).first()).toBeVisible()
+    await expect(canonicalDetail.getByText('Integer', { exact: true })).toBeVisible()
+    await expect(canonicalDetail.getByText('value', { exact: true }).first()).toBeVisible()
+    await expect(canonicalDetail.getByText('Text', { exact: true })).toBeVisible()
+    const providerPreview = canonicalDetail.getByTestId('provider-dataset-preview-scroll')
+    await expect(providerPreview.getByText('alpha', { exact: true })).toBeVisible()
+    await expect(providerPreview.getByText('beta', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(detail.getByText('Version ID', { exact: true })).toHaveCount(0)
+    await expect(detail.getByText('browser-provider-revision-v1', { exact: true })).toHaveCount(0)
+
+    // The same connected-source dataset must keep its user-facing name when moving between the
+    // lineage and relationship graphs, even though it has no local Catalog registration.
+    await detail.getByRole('button', { name: 'Lineage' }).click()
+    await expect(page.getByTestId('er-focus-bar')).toContainText(datasetNameA)
+    await page.getByTestId('er-mode-joins').click()
+    await expect(page.getByTestId('er-focus-bar')).toContainText(`Focused: ${datasetNameA}`)
+    await expect(page.getByRole('button', { name: `Focus graph on ${datasetNameA}` })).toBeVisible()
+    await expect(page.getByTestId('er-focus-bar')).not.toContainText('workspace-provider:')
+    await page.getByTestId('er-back-to-dataset').click()
+    await expect(detail).toBeVisible()
+
     await detail.getByRole('button', { name: 'Use in Canvas' }).click()
 
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetNameA}` })
-    await expect(useDialog).toContainText('data and credentials are not copied')
-    await expect(useDialog).toContainText('locally owned overlay')
+    await expect(useDialog).toContainText('saves only the connection and display details')
+    await expect(useDialog).toContainText('The new Canvas stays in this Workspace')
     const writes: string[] = []
     page.on('request', (request) => {
       const path = new URL(request.url()).pathname
@@ -286,10 +360,10 @@ test.describe('provider Workspace Source acceptance', () => {
     expect(createBody.providerDatasetRefs).toHaveLength(1)
     expect(writes).toEqual(['/api/workspace/canvases'])
     const canvasLocation = page.getByRole('navigation', { name: 'Canvas Workspace location' })
-    await expect(canvasLocation).toContainText(`Workspace/${containerNameA}`)
+    await expect(canvasLocation).toContainText(`Workspace/browser-provider/${containerNameA}`)
     const source = page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })
     await expect(source).toHaveCount(1)
-    await expect(source).toContainText('dp-file-catalog · Selected version · 2 rows · 2 columns')
+    await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
     const canvasId = decodeURIComponent(
       new URL(page.url()).hash.split('/').pop()!.split('?')[0],
     )
@@ -328,12 +402,17 @@ test.describe('provider Workspace Source acceptance', () => {
     const exactProviderContext = exactProviderViewer.getByTestId('canonical-provider-dataset-context')
     await expect(exactProviderContext).toContainText('2 rows')
     await expect(exactProviderContext).toContainText('2 data columns')
-    await expect(exactProviderContext).toContainText('id · int')
-    await expect(exactProviderContext).toContainText('value · string')
+    await expect(exactProviderContext.getByText('id', { exact: true }).first()).toBeVisible()
+    await expect(exactProviderContext.getByText('Integer', { exact: true })).toBeVisible()
+    await expect(exactProviderContext.getByText('value', { exact: true }).first()).toBeVisible()
+    await expect(exactProviderContext.getByText('Text', { exact: true })).toBeVisible()
     await expect(exactProviderViewer.getByRole('button', { name: 'Use in Canvas' })).toHaveCount(0)
     await page.reload()
     await expect(page.getByTestId('provider-dataset-viewer')).toContainText('Selected version')
-    await expect(page.getByTestId('canonical-provider-dataset-context')).toContainText('value · string')
+    await expect(page.getByTestId('canonical-provider-dataset-context')
+      .getByText('value', { exact: true }).first()).toBeVisible()
+    await expect(page.getByTestId('canonical-provider-dataset-context')
+      .getByText('Text', { exact: true })).toBeVisible()
     const expectedCanvasReturnUrl = new URL(
       `/#/canvas/${encodeURIComponent(canvasId)}?node=${encodeURIComponent(exactProviderSource.id)}`,
       page.url(),
@@ -341,7 +420,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.getByTestId('provider-dataset-viewer').getByRole('button', { name: 'Back to Canvas' }).click()
     await expect(page).toHaveURL(expectedCanvasReturnUrl)
     await expect(page.locator(`.react-flow__node[data-id="${exactProviderSource.id}"]`)).toHaveClass(/selected/)
-    await expect(source).toContainText('dp-file-catalog · Selected version · 2 rows · 2 columns')
+    await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
 
     const beforeMutableReplacement = await (await page.request.get(`/api/canvas/${canvasId}`)).json()
     const beforeMutableConfig = beforeMutableReplacement.nodes.find(
@@ -368,7 +447,7 @@ test.describe('provider Workspace Source acceptance', () => {
 
     await page.goto(`/#/workspace/${encodeURIComponent(externalPage.container.id)}`)
     const typedResource = page.getByRole('button', {
-      name: new RegExp(`Open dataset ${typedDatasetName} from Source-only mount browser-provider`),
+      name: new RegExp(`Open dataset ${typedDatasetName} from Connected source browser-provider`),
     })
     await expect(typedResource).toBeVisible()
     await typedResource.click()
@@ -459,11 +538,18 @@ test.describe('provider Workspace Source acceptance', () => {
     await search.fill(datasetNameA)
     await search.press('Enter')
     const searchResults = page.getByTestId('workspace-search-results')
-    await expect(searchResults.getByText(`Placement path · ${containerNameA} / ${datasetNameA}`, { exact: true })).toBeVisible()
-    await expect(searchResults.getByText(`Placement path · ${containerNameB} / ${datasetNameB}`, { exact: true })).toBeVisible()
+    await expect(searchResults.getByText(
+      `browser-provider / ${containerNameA} / ${datasetNameA}`, { exact: true },
+    )).toBeVisible()
+    await expect(searchResults.getByText(
+      `browser-provider / ${containerNameB} / ${datasetNameB}`, { exact: true },
+    )).toBeVisible()
     await page.getByRole('button', { name: 'Clear Workspace search' }).click()
+    await page.getByRole('region', { name: 'Connected sources' }).getByRole('button', {
+      name: /Open folder browser-provider from Connected source browser-provider/,
+    }).click()
     const duplicateContainer = page.getByRole('button', {
-      name: new RegExp(`Open folder ${containerNameB} from Source-only mount browser-provider`),
+      name: new RegExp(`Open folder ${containerNameB} from Connected source browser-provider`),
     })
     await expect(duplicateContainer).toBeVisible({ timeout: 20_000 })
     const duplicateBrowse = page.waitForResponse((response) =>
@@ -478,12 +564,15 @@ test.describe('provider Workspace Source acceptance', () => {
     )?.id
     expect(placementBId).toBeTruthy()
     const duplicateResource = page.getByRole('button', {
-      name: new RegExp(`Open dataset ${datasetNameB} from Source-only mount browser-provider`),
+      name: new RegExp(`Open dataset ${datasetNameB} from Connected source browser-provider`),
     })
     await expect(duplicateResource).toBeVisible({ timeout: 20_000 })
     await duplicateResource.click()
     const duplicateDetail = page.getByRole('region', { name: datasetNameB })
-    await expect(duplicateDetail).toContainText(`Also observed at${containerNameA} / ${datasetNameA}`)
+    await expect(duplicateDetail.getByText('Other locations', { exact: true })).toBeVisible()
+    await expect(duplicateDetail.getByText(
+      `browser-provider / ${containerNameA} / ${datasetNameA}`, { exact: true },
+    )).toBeVisible()
     const placementBRequest = page.waitForResponse((response) =>
       decodeURIComponent(new URL(response.url()).pathname.split('/').pop() ?? '') === placementBId
       && response.request().method() === 'GET')
@@ -497,9 +586,9 @@ test.describe('provider Workspace Source acceptance', () => {
     )
     expect(canonicalBResponse.ok()).toBeTruthy()
     expect(await canonicalBResponse.json()).toEqual(canonicalA)
-    await duplicateDetail.getByText('Dataset details', { exact: true }).click()
-    await expect(duplicateDetail.getByText('Version identity', { exact: true })).toBeVisible()
-    await expect(duplicateDetail.getByText('browser-provider-revision-v1', { exact: true })).toBeVisible()
+    await expect(duplicateDetail.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(duplicateDetail.getByText('Version ID', { exact: true })).toHaveCount(0)
+    await expect(duplicateDetail.getByText('browser-provider-revision-v1', { exact: true })).toHaveCount(0)
     await duplicateDetail.getByRole('button', { name: 'Use in Canvas' }).click()
     const duplicateUseDialog = page.getByRole('dialog', { name: `Use ${datasetNameB}` })
     const chooseCanvas = duplicateUseDialog.getByRole('button', { name: /^Choose another Canvas/ })
@@ -532,7 +621,7 @@ test.describe('provider Workspace Source acceptance', () => {
       'This provider dataset is already present in the selected Canvas.',
       { exact: true },
     )).toBeVisible()
-    await expect(canvasLocation).toContainText(`Workspace/${containerNameA}`)
+    await expect(canvasLocation).toContainText(`Workspace/browser-provider/${containerNameA}`)
     await expect(source).toHaveCount(1)
 
     await source.getByText('DATASET', { exact: true }).click()
@@ -565,10 +654,14 @@ test.describe('provider Workspace Source acceptance', () => {
       has: page.getByRole('heading', { name: 'Run history' }),
     })
     await expect(history.getByText('2 rows', { exact: true }).first()).toBeVisible()
-    await history.getByRole('button', { name: /Admitted Sources/ }).click()
-    await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
-    await history.getByRole('button', { name: /Execution manifest/ }).click()
-    await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
+    const inputDataToggle = history.getByRole('button', { name: /Input data/ })
+    const inputData = inputDataToggle.locator('..')
+    await inputDataToggle.click()
+    await expect(inputData.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(inputData.getByText('available', { exact: true })).toBeVisible()
+    await expect(history.getByRole('button', { name: 'Create Canvas from run' })).toBeVisible()
+    await expect(history.getByText(/browser-provider-revision-v1/)).toHaveCount(0)
+    await expect(history.getByText('Saved run setup')).toHaveCount(0)
     await history.getByRole('button', { name: 'Close' }).click()
 
     const deepLink = await page.request.get(`/api/workspace/resources/canvas:${canvasId}`)
@@ -599,7 +692,7 @@ test.describe('provider Workspace Source acceptance', () => {
       /^\/api\/canvas\/[^/]+\/join-with-related$/,
       /^\/api\/catalog\/related-datasets(?:\/revisions|\/revision-review)?$/,
       /^\/api\/graph\/(plan|schema|estimate)$/,
-      /^\/api\/run(\/preview|\/estimate|\/input-drift)?$/,
+      /^\/api\/run(\/preview|\/estimate|\/input-drift|\/current-results)?$/,
     ].some((allowed) => allowed.test(path)))
     expect(unexpectedWrites).toEqual([])
     const writesBeforeUnavailableReturn = [...writes]
@@ -623,7 +716,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(page.getByText('Its Workspace location is unavailable.', { exact: true })).toBeVisible()
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace', { exact: true }).click()
-    await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    await expect(page).toHaveURL(/\/#\/workspace$/)
     expect(writes).toEqual(writesBeforeUnavailableReturn)
 
     let placementState: 'detached' | 'canonical-offline' = 'detached'
@@ -648,14 +741,15 @@ test.describe('provider Workspace Source acceptance', () => {
     })
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
     const detachedPlacement = page.getByRole('region', { name: datasetNameA })
-    await expect(detachedPlacement).toContainText('Placement state · detached')
-    await expect(detachedPlacement).toContainText('Canonical dataset state · current')
+    await expect(detachedPlacement).toContainText(
+      'This provider location is not available right now.',
+    )
+    await expect(detachedPlacement.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     placementState = 'canonical-offline'
     await page.goto('/#/workspace')
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
     const canonicalUnavailable = page.getByRole('region', { name: datasetNameA })
-    await expect(canonicalUnavailable).toContainText('Canonical dataset state · offline')
-    await expect(canonicalUnavailable).toContainText('Placement state · current')
+    await expect(canonicalUnavailable.getByRole('status')).toContainText(/not available|offline/i)
     await expect(canonicalUnavailable.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     expect(writes).toEqual(writesBeforeUnavailableReturn)
     writeFileSync(resolve(providerRoot!, 'catalog.json'), providerCatalogBefore)

@@ -2,7 +2,8 @@
 import type { WireType } from '../theme/tokens'
 import type { DatasetRevisionResolution } from './api'
 
-export type NodeStatus = 'draft' | 'latest' | 'stale' | 'queued' | 'running' | 'failed'
+export type NodeStatus =
+  | 'draft' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed'
 export type TransformSource = 'library' | 'adhoc'
 export type ProcessorMode =
   | 'map' | 'map_batches' | 'filter' | 'flat_map' | 'flat_map_generator'
@@ -87,6 +88,8 @@ export interface NodeConfig {
   chartType?: 'bar' | 'line' | 'scatter' | 'area'
   x?: string
   y?: string
+  xMode?: 'column' | 'expression'
+  yMode?: 'column' | 'expression'
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'
@@ -161,6 +164,10 @@ export interface CanvasDoc {
   id: string
   name?: string
   version: number
+  /** Explicit whole-Canvas runner. Missing means automatic placement/workspace default. */
+  executionBackend?: string
+  /** Full-result history override. The newest successful result always follows Canvas lifetime. */
+  resultRetention?: { history: 'inherit' | 'latest' | 'recent' }
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   requirements?: string[]  // pip specs this canvas needs; its kernel installs them (travels with the canvas)

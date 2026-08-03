@@ -126,7 +126,7 @@ export function FileDialog(props:
     const invalid = !name || name !== name.trim() || name === '.' || name === '..'
       || /[\\/]/.test(name) || [...name].some((char) => char.charCodeAt(0) < 32)
     if (invalid) {
-      setFolderError('Use one exact folder name without surrounding spaces, slashes, control characters, “.”, or “..”.')
+      setFolderError('Enter one folder name without surrounding spaces, slashes, control characters, “.”, or “..”.')
       return
     }
     setMakingFolder(true)

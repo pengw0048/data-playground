@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from hub import graph as graph_mod
 from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.ir import resolve_config
 from hub.main import app
 from hub.models import Graph, GraphEdge, GraphNode
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, ParamSpec, PortSpec
@@ -27,6 +28,12 @@ def _edge(edge_id: str, source: str, target: str, source_handle: str | None = No
 
 def _graph(nodes: list[GraphNode], edges: list[GraphEdge]) -> Graph:
     return Graph(id="validation", nodes=nodes, edges=edges)
+
+
+def test_assert_defaults_to_a_blocking_check():
+    severity = next(param for param in SPECS["assert"].params if param.name == "severity")
+    assert severity.default == "error"
+    assert resolve_config(_node("quality", "assert"))["severity"] == "error"
 
 
 @pytest.mark.parametrize(("graph", "message"), [
@@ -157,6 +164,25 @@ def test_execution_and_plan_ingresses_reject_a_join_without_a_match_condition():
         assert "needs at least one left and right column" in response.text
 
 
+def test_target_preview_ignores_an_unfinished_sibling_branch():
+    graph = {
+        "id": "target-cone-preview", "version": 1,
+        "nodes": [
+            _node("healthy", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _node("other", "source", {"uri": "events"}).model_dump(by_alias=True),
+            _wire("unfinished", "join"),
+        ],
+        "edges": [
+            {"id": "other-left", "source": "other", "target": "unfinished", "targetHandle": "a"},
+        ],
+    }
+
+    preview = client.post("/api/run/preview", json={"graph": graph, "nodeId": "healthy"})
+
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["rows"]
+
+
 def test_background_graph_metadata_allows_finishing_an_incomplete_join(monkeypatch):
     from hub.routers import runs as run_routes
 
@@ -254,6 +280,33 @@ def test_numeric_plugin_parameters_accept_zero_signs_and_finite_exponents(config
                 ParamSpec(name="ratio", type="float", default=0.5)],
     )
     assert graph_mod.parameter_errors(_graph([_node("numeric", spec.kind, config)], []), {spec.kind: spec}) == []
+
+
+def test_empty_filter_is_rejected_by_every_execution_ingress_before_work_starts():
+    graph = _graph(
+        [_node("source", "source", {"uri": "events"}),
+         _node("filter", "filter", {"predicate": ""})],
+        [_edge("source-filter", "source", "filter")],
+    )
+    expected = "node 'filter' parameter 'predicate' is required"
+    assert expected in graph_mod.validation_error(graph, SPECS)[0]
+
+    payload = graph.model_dump(by_alias=True)
+    for path, body in [
+        ("/api/run/preview", {"graph": payload, "nodeId": "filter"}),
+        ("/api/run", {"graph": payload, "targetNodeId": "filter", "confirmed": True}),
+    ]:
+        response = client.post(path, json=body)
+        assert response.status_code == 400, (path, response.status_code, response.text)
+        assert response.json()["code"] == "invalid_graph"
+        assert expected in response.json()["detail"]
+
+
+def test_section_child_filter_may_receive_its_predicate_from_the_parent_script():
+    child = _node("child-filter", "filter")
+    child.parent_id = "section"
+    graph = _graph([_node("section", "section", {"script": "emit(input)"}), child], [])
+    assert graph_mod.parameter_errors(graph, SPECS) == []
 
 
 def test_multi_inputs_and_dynamic_section_outputs_preserve_valid_contracts():

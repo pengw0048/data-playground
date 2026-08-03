@@ -71,16 +71,15 @@ export function DistributionReportLauncher({ definition }: { definition: Dataset
   return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-3">
     <div className="flex items-center gap-2"><div className="flex-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Distribution reports</div>
       <Button size="sm" variant="outline" onClick={() => void start()} disabled={busy}>{busy ? 'Preparing…' : 'Inspect distributions'}</Button></div>
-    <p className="text-[10.5px] text-muted-foreground">Creates a bounded retained report for this exact DatasetView; the preview Stats remain separate.</p>
     {estimate && <div role="dialog" aria-label="Confirm distribution report" className="grid gap-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px]">
       <strong>Confirmation required</strong>
-      <span>{estimate.reason === 'unknown_size' ? 'The retained metadata does not prove the scan size.' : 'This exact view exceeds the confirmation scan threshold.'} Estimated rows: {estimate.estimatedScanRows == null ? 'unknown' : count(estimate.estimatedScanRows)}; bytes: {estimate.estimatedScanBytes == null ? 'unknown' : count(estimate.estimatedScanBytes)}.</span>
-      <span>Bounded to {estimate.limits.reportedColumns} columns, {estimate.limits.topCategories} categories and {estimate.limits.histogramBuckets} buckets per section; deadline {estimate.limits.deadlineSeconds}s.</span>
+      <span>{estimate.reason === 'unknown_size' ? 'The saved report does not include a reliable scan size.' : 'This saved view exceeds the automatic scan limit.'} Estimated rows: {estimate.estimatedScanRows == null ? 'unknown' : count(estimate.estimatedScanRows)}; bytes: {estimate.estimatedScanBytes == null ? 'unknown' : count(estimate.estimatedScanBytes)}.</span>
+      <span>The report will include up to {estimate.limits.reportedColumns} columns, {estimate.limits.topCategories} categories, and {estimate.limits.histogramBuckets} ranges per column.</span>
       <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => setEstimate(null)} disabled={busy}>Cancel</Button><Button size="sm" onClick={() => void submit(true)} disabled={busy}>Confirm and start</Button></div>
     </div>}
     {error && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-2 text-[11px] text-destructive">{prepareMessage(error)} <button className="font-semibold underline" onClick={() => void load()}>Retry list</button></div>}
-    {loading ? <span className="text-[11px] text-muted-foreground">Loading retained reports…</span>
-      : reports.length === 0 ? <span className="text-[11px] text-muted-foreground">No retained reports yet.</span>
+    {loading ? <span className="text-[11px] text-muted-foreground">Loading saved reports…</span>
+      : reports.length === 0 ? <span className="text-[11px] text-muted-foreground">No saved reports yet.</span>
         : <ol className="grid gap-1">{reports.map((item) => <li key={item.reportId} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-border bg-background px-2 py-1.5 text-[10.5px]">
           <Badge variant="secondary" className="capitalize">{item.task.status}</Badge><span>{item.report ? `${count(item.report.measuredRows)} measured rows · ${item.report.complete ? 'complete' : 'sample'}` : 'No validated report document yet'}</span>
           <a className="font-semibold text-primary underline" href={reportHash(item.reportId)}>Open report</a><span className="ml-auto text-muted-foreground">{date(item.updatedAt)}</span>
@@ -147,7 +146,7 @@ export function DistributionReportPage({ reportId, compareReportId, backHref = r
     }
   }
 
-  if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading exact retained report…</div>
+  if (loading && !envelope) return <div className="p-6 text-[12px] text-muted-foreground">Loading saved report…</div>
   if (!envelope) return <div role="alert" className="m-4 grid gap-3 rounded border border-destructive/30 bg-destructive/10 p-4 text-[12px] text-destructive">
     <span>{unavailableMessage(refreshError)} <button className="font-semibold underline" onClick={() => void load(reportId, true)}>Retry</button></span>
     <a href={backHref} onClick={onClose ? (event) => {
@@ -161,12 +160,12 @@ export function DistributionReportPage({ reportId, compareReportId, backHref = r
   </div>
   const { task, report, viewSnapshot } = envelope
   return <div className="mx-auto grid max-w-6xl gap-4 p-4 sm:p-7">
-    <header className="flex flex-wrap items-start gap-3 border-b border-border pb-4"><div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Retained distribution report</div><h1 className="text-[20px] font-bold">{viewSnapshot.name}</h1><div className="mt-1 flex flex-wrap gap-2 text-[11px] text-muted-foreground"><Badge variant="secondary" className="capitalize">{task.status}</Badge><span>Updated {date(envelope.updatedAt)}</span>{task.progress != null && <span>{Math.round(task.progress * 100)}% complete</span>}</div></div>
+    <header className="flex flex-wrap items-start gap-3 border-b border-border pb-4"><div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Saved distribution report</div><h1 className="text-[20px] font-bold">{viewSnapshot.name}</h1><div className="mt-1 flex flex-wrap gap-2 text-[11px] text-muted-foreground"><Badge variant="secondary" className="capitalize">{task.status}</Badge><span>Updated {date(envelope.updatedAt)}</span>{task.progress != null && <span>{Math.round(task.progress * 100)}% complete</span>}</div></div>
       <a className="rounded-md border border-border bg-background px-2 py-1 text-[11px] font-semibold hover:bg-accent" href={routeHash('jobs', undefined, undefined, undefined, `run=${encodeURIComponent(task.id)}`)}>Open Jobs</a>
       {onClose && <Button size="sm" variant="outline" onClick={onClose}>Close</Button>}</header>
     {refreshError && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-3 text-[11px] text-destructive">{refreshMessage(refreshError)} Showing the last validated report. <button className="font-semibold underline" onClick={() => void load(reportId)}>Retry</button></div>}
     {actionError && <div role="alert" className="rounded border border-destructive/30 bg-destructive/10 p-3 text-[11px] text-destructive">Report action failed: {actionError}</div>}
-    {!report && <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[12px]"><strong>{task.status === 'failed' ? task.attempts.length >= task.maxAttempts ? 'Report failed and retries are exhausted before a validated document was retained.' : 'Report failed before a validated document was retained.' : task.status === 'cancelled' ? 'Report was cancelled before a validated document was retained.' : 'Computing exact retained report…'}</strong><span className="text-muted-foreground">Attempt {task.attempts.length} of {task.maxAttempts}{task.cancelRequested ? ' · cancellation requested' : ''}.</span>{task.error && <span role="alert" className="text-destructive">{taskErrorMessage(task.error)}</span>}<Actions task={task} busy={acting} onAction={act} /></section>}
+    {!report && <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[12px]"><strong>{task.status === 'failed' ? task.attempts.length >= task.maxAttempts ? 'Report failed and retries are exhausted before a validated document was saved.' : 'Report failed before a validated document was saved.' : task.status === 'cancelled' ? 'Report was cancelled before a validated document was saved.' : 'Computing saved report…'}</strong><span className="text-muted-foreground">Attempt {task.attempts.length} of {task.maxAttempts}{task.cancelRequested ? ' · cancellation requested' : ''}.</span>{task.error && <span role="alert" className="text-destructive">{taskErrorMessage(task.error)}</span>}<Actions task={task} busy={acting} onAction={act} /></section>}
     {report && <ReportPresentation key={reportId} report={report} view={viewSnapshot} compareReportId={compareReportId} />}
   </div>
 }
@@ -221,16 +220,12 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
   }
   return <>
     <section className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/20 p-3 text-[11px]">
-      <label htmlFor="compare-retained-report" className="font-semibold">Compare with retained report</label>
+      <label htmlFor="compare-retained-report" className="font-semibold">Compare with saved report</label>
       <select id="compare-retained-report" value={compareReportId ?? ''} onChange={(event) => { location.hash = reportHash(report.reportId, event.target.value || undefined) }} className="min-w-64 rounded border border-border bg-background px-2 py-1">
         <option value="">No comparison</option>
         {compareReportId && !reports.some((item) => item.reportId === compareReportId) && <option value={compareReportId}>{comparison ? `Linked report · ${count(comparison.coverage.right.measuredRows)} measured rows · ${comparison.coverage.right.complete ? 'complete' : 'sample'}` : 'Linked report · loading details'}</option>}
-        {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'retained report'}</option>)}
-      </select><span className="text-muted-foreground">Completed reports for this DatasetView only.</span>
-      {compareReportId && !comparison && <details data-testid="linked-report-technical-evidence" className="basis-full rounded border border-border bg-background px-2 py-1.5 text-[10px] text-muted-foreground">
-        <summary className="cursor-pointer font-semibold text-foreground">Linked report technical details</summary>
-        <div className="mt-1">Report ID <span className="break-all font-mono text-foreground">{compareReportId}</span></div>
-      </details>}
+        {reports.filter((item) => item.reportId !== report.reportId).map((item) => <option key={item.reportId} value={item.reportId}>{item.viewSnapshot.name} · {item.report ? `${count(item.report.measuredRows)} measured` : 'saved report'}</option>)}
+      </select><span className="text-muted-foreground">Completed reports for this saved view.</span>
     </section>
     {!compareReportId && <ReportDocument report={report} view={view} onExamples={openExamples} />}
     {compareReportId && !comparison && !comparisonError && <><span className="text-[11px] text-muted-foreground">Loading comparison…</span><ReportDocument report={report} view={view} onExamples={openExamples} /></>}
@@ -243,49 +238,27 @@ function ReportPresentation({ report, view, compareReportId }: { report: Distrib
 function ReportDocument({ report, view, onExamples }: { report: DistributionReportDocument; view: DatasetViewDefinition; onExamples: (target: ExampleTarget) => void }) {
   const coverage = report.sections.find((section): section is Extract<DistributionReportSection, { kind: 'coverage_schema' }> => section.kind === 'coverage_schema')
   const sections = report.sections.filter((section) => section.kind !== 'coverage_schema')
-  const sampling = view.sampling.kind === 'all' ? 'All matching rows' : `Reservoir sample of ${count(view.sampling.size)} rows · seed ${view.sampling.seed}`
+  const sampling = view.sampling.kind === 'all' ? 'All matching rows' : `Sample of ${count(view.sampling.size)} rows`
   return <><Evidence report={report} view={view} coverage={coverage} sampling={sampling} />
     <div className="grid gap-3">{sections.map((section) => <Section key={section.sectionId} section={section} measuredRows={report.measuredRows} reportId={report.reportId} onExamples={onExamples} />)}</div></>
 }
 
 function Evidence({ report, view, coverage, sampling }: { report: DistributionReportDocument; view: DatasetViewDefinition; coverage: Extract<DistributionReportSection, { kind: 'coverage_schema' }> | undefined; sampling: string }) {
   const committedAt = datasetRevisionTimeLabel(view.datasetRef.lastKnown?.committedAt, view.retentionOwner)
-  return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before distributions</div>
-    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Exact revision:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Population:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'complete for this view' : 'sample only; no full-population claim'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'coverage document unavailable'}</div></div>
-    {report.sampleProvenance && <div className="rounded border border-border bg-background p-2"><strong>Sample evidence:</strong> {count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div>}
+  return <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]"><div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Report coverage</div>
+    <div className="grid gap-1 sm:grid-cols-2"><div><strong>Dataset version:</strong> {committedAt ? `committed ${committedAt}` : 'saved commit time not recorded'}</div><div><strong>Rows:</strong> {sampling}</div><div><strong>Measured:</strong> {count(report.measuredRows)} rows · {report.complete ? 'all selected rows' : 'sample of selected rows'}</div><div><strong>Columns:</strong> {coverage ? `${coverage.reportedColumnCount} of ${coverage.selectedColumnCount} selected` : 'not available'}</div></div>
+    {report.sampleProvenance && <details className="rounded border border-border bg-background p-2"><summary className="cursor-pointer font-semibold">Sampling details</summary><div className="mt-1 text-muted-foreground">{count(report.sampleProvenance.returnedRows)} returned{report.sampleProvenance.totalRows != null ? ` of ${count(report.sampleProvenance.totalRows)}` : ' of unknown total'} · scanned {report.sampleProvenance.scannedRows == null ? 'unknown' : count(report.sampleProvenance.scannedRows)} · {report.sampleProvenance.strategy}{report.sampleProvenance.seed != null ? ` · seed ${report.sampleProvenance.seed}` : ''}</div></details>}
     {report.limitations.length > 0 && <ul className="list-disc pl-4 text-muted-foreground">{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul>}
-    <ReportTechnicalEvidence report={report} view={view} />
   </section>
-}
-
-function ReportTechnicalEvidence({ report, view }: { report: DistributionReportDocument; view: DatasetViewDefinition }) {
-  return <details data-testid="report-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
-    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
-      <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{report.reportId}</dd>
-      <dt>Task ID</dt><dd className="break-all font-mono text-foreground">{report.taskId}</dd>
-      <dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{report.datasetViewId}</dd>
-      <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{report.datasetId}</dd>
-      <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{report.revisionId}</dd>
-      <dt>Semantic SHA-256</dt><dd className="break-all font-mono text-foreground">{view.semanticSha256}</dd>
-      <dt>Definition SHA-256</dt><dd className="break-all font-mono text-foreground">{view.definitionSha256}</dd>
-      <dt>Report view SHA-256</dt><dd className="break-all font-mono text-foreground">{report.viewDefinitionSha256}</dd>
-      <dt>Computation version</dt><dd className="break-all font-mono text-foreground">{report.computationVersion}</dd>
-      {report.sampleProvenance && <><dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{report.sampleProvenance.identity}</dd></>}
-      <dt>Retention owner</dt><dd className="font-mono text-foreground">{view.retentionOwner}</dd>
-      <dt>Schema versions</dt><dd className="font-mono text-foreground">DatasetView {view.schemaVersion} · report {report.schemaVersion}</dd>
-    </dl>
-  </details>
 }
 
 function ComparisonDocument({ comparison, onExamples }: { comparison: DistributionReportComparison; onExamples: (target: ExampleTarget) => void }) {
   const { coverage } = comparison
   return <>
     <section className="grid gap-2 rounded-lg border border-border bg-muted/20 p-4 text-[11px]">
-      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Coverage before comparison</div>
+      <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Comparison coverage</div>
       <div className="grid gap-2 sm:grid-cols-2"><Identity label="Current report" identity={coverage.left} /><Identity label="Comparison report" identity={coverage.right} /></div>
-      <strong>{coverage.comparable ? 'Coverage is comparable.' : `Coverage is not comparable: ${coverageReason(coverage.reason)}.`}</strong>
-      <ComparisonTechnicalEvidence comparison={comparison} />
+      <strong>{coverage.comparable ? 'These reports can be compared.' : `These reports cannot be compared: ${coverageReason(coverage.reason)}.`}</strong>
     </section>
     <div className="grid gap-3">{comparison.columns.map((column) => {
       const authorized = coverage.comparable && column.comparable
@@ -301,34 +274,13 @@ function ComparisonDocument({ comparison, onExamples }: { comparison: Distributi
 }
 
 function Identity({ label, identity }: { label: string; identity: DistributionReportComparison['coverage']['left'] }) {
-  return <div><strong>{label}</strong><div>{count(identity.measuredRows)} measured rows · {identity.complete ? 'complete coverage' : 'sample coverage'}</div>{identity.sampleProvenance && <div className="text-muted-foreground">{identity.sampleProvenance.strategy} · {count(identity.sampleProvenance.returnedRows)} returned{identity.sampleProvenance.totalRows != null ? ` of ${count(identity.sampleProvenance.totalRows)}` : ''}</div>}</div>
+  return <div><strong>{label}</strong><div>{count(identity.measuredRows)} measured rows · {identity.complete ? 'all selected rows' : 'sample'}</div>{identity.sampleProvenance && <div className="text-muted-foreground">{count(identity.sampleProvenance.returnedRows)} sampled{identity.sampleProvenance.totalRows != null ? ` from ${count(identity.sampleProvenance.totalRows)}` : ''}</div>}</div>
 }
 
-function ComparisonTechnicalEvidence({ comparison }: { comparison: DistributionReportComparison }) {
-  return <details data-testid="comparison-technical-evidence" className="rounded-md border border-border bg-background px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
-    <div className="mt-2 grid gap-3 sm:grid-cols-2">
-      <ComparisonIdentityDetails label="Current report" identity={comparison.coverage.left} />
-      <ComparisonIdentityDetails label="Comparison report" identity={comparison.coverage.right} />
-    </div>
-  </details>
-}
-
-function ComparisonIdentityDetails({ label, identity }: { label: string; identity: DistributionReportComparison['coverage']['left'] }) {
-  return <div className="grid gap-1"><strong className="text-foreground">{label}</strong>
-    <div>Report ID <span className="break-all font-mono text-foreground">{identity.reportId}</span></div>
-    <div>DatasetView ID <span className="break-all font-mono text-foreground">{identity.datasetViewId}</span></div>
-    <div>Dataset ID <span className="break-all font-mono text-foreground">{identity.datasetId}</span></div>
-    <div>Revision ID <span className="break-all font-mono text-foreground">{identity.revisionId}</span></div>
-    <div>View definition SHA-256 <span className="break-all font-mono text-foreground">{identity.viewDefinitionSha256}</span></div>
-    <div>Computation version <span className="break-all font-mono text-foreground">{identity.computationVersion}</span></div>
-    <div>Sampling identity <span className="break-all font-mono text-foreground">{identity.samplingIdentity}</span></div>
-  </div>
-}
 
 function Delta({ column }: { column: DistributionReportComparison['columns'][number] }) {
   const delta = column.metricDelta
-  return <div className="rounded border border-primary/30 bg-primary/5 p-2"><strong>Server-authorized deltas (comparison − current)</strong>{column.missingCountDelta != null && <div>Missing: {signed(column.missingCountDelta)}</div>}{delta?.kind === 'numeric' && <><div>Finite: {signed(delta.countDelta)} · non-finite: {signed(delta.nonFiniteCountDelta)}</div><div>Min: {signed(delta.minDelta)} · max: {signed(delta.maxDelta)} · mean: {signed(delta.meanDelta)} · sd: {signed(delta.stddevDelta)}</div><div>Quantiles: {delta.quantiles.map((item) => `p${Math.round(item.probability * 100)} ${signed(item.valueDelta)}`).join(' · ')}</div><div>{delta.histogramReason === 'unequal_edges' ? 'Histogram bucket edges differ; distributions are shown side by side.' : `Histogram bucket deltas: ${delta.histogram?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div></>}{delta?.kind === 'temporal' && <div>{delta.bucketReason === 'unequal_edges' ? 'Temporal bucket edges differ; distributions are shown side by side.' : `Temporal bucket deltas: ${delta.buckets?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div>}{delta?.kind === 'categorical' && <div className="grid gap-1">{delta.categories.map((category) => <span key={`${typeof category.label}:${category.label}`}>{String(category.label)}: {category.leftCount == null ? 'outside current top-K' : count(category.leftCount)} / {category.rightCount == null ? 'outside comparison top-K' : count(category.rightCount)}{category.countDelta != null ? ` · ${signed(category.countDelta)}` : ''}</span>)}<span>Other: {delta.otherCountReason.replaceAll('_', ' ')}{delta.otherCountDelta != null ? ` · ${signed(delta.otherCountDelta)}` : ''}; distinct: {delta.distinctCountReason.replaceAll('_', ' ')}{delta.distinctCountDelta != null ? ` · ${signed(delta.distinctCountDelta)}` : ''}</span></div>}</div>
+  return <div className="rounded border border-primary/30 bg-primary/5 p-2"><strong>Change (comparison − current)</strong>{column.missingCountDelta != null && <div>Missing: {signed(column.missingCountDelta)}</div>}{delta?.kind === 'numeric' && <><div>Finite: {signed(delta.countDelta)} · non-finite: {signed(delta.nonFiniteCountDelta)}</div><div>Min: {signed(delta.minDelta)} · max: {signed(delta.maxDelta)} · mean: {signed(delta.meanDelta)} · sd: {signed(delta.stddevDelta)}</div><div>Quantiles: {delta.quantiles.map((item) => `p${Math.round(item.probability * 100)} ${signed(item.valueDelta)}`).join(' · ')}</div><div>{delta.histogramReason === 'unequal_edges' ? 'Histogram bucket edges differ; distributions are shown side by side.' : `Histogram bucket deltas: ${delta.histogram?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div></>}{delta?.kind === 'temporal' && <div>{delta.bucketReason === 'unequal_edges' ? 'Temporal bucket edges differ; distributions are shown side by side.' : `Temporal bucket deltas: ${delta.buckets?.map((bucket) => signed(bucket.countDelta)).join(', ') || 'none'}`}</div>}{delta?.kind === 'categorical' && <div className="grid gap-1">{delta.categories.map((category) => <span key={`${typeof category.label}:${category.label}`}>{String(category.label)}: {category.leftCount == null ? 'outside current top-K' : count(category.leftCount)} / {category.rightCount == null ? 'outside comparison top-K' : count(category.rightCount)}{category.countDelta != null ? ` · ${signed(category.countDelta)}` : ''}</span>)}<span>Other: {delta.otherCountReason.replaceAll('_', ' ')}{delta.otherCountDelta != null ? ` · ${signed(delta.otherCountDelta)}` : ''}; distinct: {delta.distinctCountReason.replaceAll('_', ' ')}{delta.distinctCountDelta != null ? ` · ${signed(delta.distinctCountDelta)}` : ''}</span></div>}</div>
 }
 
 function Section({ section, measuredRows, reportId, onExamples }: { section: DistributionReportSection; measuredRows: number; reportId: string; onExamples: (target: ExampleTarget) => void }) {
@@ -350,61 +302,42 @@ function Bar({ value, total }: { value: number; total: number }) {
 }
 
 function ExamplesDrawer({ target, examples, error, onClose, onRetry }: { target: ExampleTarget; examples: DistributionReportBucketExamples | null; error: ReportFailure | null; onClose: () => void; onRetry: () => void }) {
-  return <div className="fixed inset-0 z-50 flex justify-end bg-black/20" onMouseDown={onClose}><section role="dialog" aria-modal="true" aria-label="Bucket examples" className="grid h-full w-[520px] max-w-full content-start gap-3 overflow-auto border-l border-border bg-card p-5 shadow-xl" onMouseDown={(event) => event.stopPropagation()}><div className="flex items-center gap-2"><strong className="flex-1">Examples from measured bucket</strong><Button size="sm" variant="outline" onClick={onClose}>Close</Button></div><span className="text-[11px] text-muted-foreground">{target.bucketKind} bucket: {target.bucketLabel}</span>{!examples && !error && <span className="text-[11px] text-muted-foreground">Loading bounded examples…</span>}{error && <div role="alert" className="text-[11px] text-destructive">{examplesMessage(error)} <button className="font-semibold underline" onClick={onRetry}>Retry</button></div>}{examples && <><div className="grid gap-1 text-[11px]"><span><strong>{examples.columnName}</strong> · {count(examples.bucketCount)} measured rows in this {examples.bucketKind} bucket</span><span>Showing {examples.returnedRows} of up to {examples.rowLimit} bounded example rows{examples.truncated ? ' (truncated)' : ''}.</span></div>{examples.rows.length === 0 ? <span className="text-[11px] text-muted-foreground">This measured bucket has no available example rows.</span> : <pre className="overflow-auto rounded border border-border bg-muted/20 p-2 text-[10px]">{JSON.stringify(examples.rows, null, 2)}</pre>}</>}<ExamplesTechnicalEvidence target={target} examples={examples} /></section></div>
-}
-
-function ExamplesTechnicalEvidence({ target, examples }: { target: ExampleTarget; examples: DistributionReportBucketExamples | null }) {
-  return <details data-testid="examples-technical-evidence" className="rounded-md border border-border bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical evidence</summary>
-    <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1">
-      <dt>Report ID</dt><dd className="break-all font-mono text-foreground">{target.reportId}</dd>
-      <dt>Section ID</dt><dd className="break-all font-mono text-foreground">{target.sectionId}</dd>
-      <dt>Bucket ID</dt><dd className="break-all font-mono text-foreground">{target.bucketId}</dd>
-      {examples && <><dt>DatasetView ID</dt><dd className="break-all font-mono text-foreground">{examples.datasetViewId}</dd>
-        <dt>Dataset ID</dt><dd className="break-all font-mono text-foreground">{examples.datasetId}</dd>
-        <dt>Revision ID</dt><dd className="break-all font-mono text-foreground">{examples.revisionId}</dd>
-        <dt>View definition SHA-256</dt><dd className="break-all font-mono text-foreground">{examples.viewDefinitionSha256}</dd>
-        <dt>Computation version</dt><dd className="break-all font-mono text-foreground">{examples.computationVersion}</dd>
-        <dt>Sampling identity</dt><dd className="break-all font-mono text-foreground">{examples.samplingIdentity}</dd>
-        <dt>Example semantics</dt><dd className="break-all font-mono text-foreground">{examples.exampleSemantics}</dd>
-        <dt>Schema version</dt><dd className="font-mono text-foreground">{examples.schemaVersion}</dd></>}
-    </dl>
-  </details>
+  return <div className="fixed inset-0 z-50 flex justify-end bg-black/20" onMouseDown={onClose}><section role="dialog" aria-modal="true" aria-label="Bucket examples" className="grid h-full w-[520px] max-w-full content-start gap-3 overflow-auto border-l border-border bg-card p-5 shadow-xl" onMouseDown={(event) => event.stopPropagation()}><div className="flex items-center gap-2"><strong className="flex-1">Examples from measured bucket</strong><Button size="sm" variant="outline" onClick={onClose}>Close</Button></div><span className="text-[11px] text-muted-foreground">{target.bucketKind} bucket: {target.bucketLabel}</span>{!examples && !error && <span className="text-[11px] text-muted-foreground">Loading bounded examples…</span>}{error && <div role="alert" className="text-[11px] text-destructive">{examplesMessage(error)} <button className="font-semibold underline" onClick={onRetry}>Retry</button></div>}{examples && <><div className="grid gap-1 text-[11px]"><span><strong>{examples.columnName}</strong> · {count(examples.bucketCount)} measured rows in this {examples.bucketKind} bucket</span><span>Showing {examples.returnedRows} of up to {examples.rowLimit} bounded example rows{examples.truncated ? ' (truncated)' : ''}.</span></div>{examples.rows.length === 0 ? <span className="text-[11px] text-muted-foreground">This measured bucket has no available example rows.</span> : <pre className="overflow-auto rounded border border-border bg-muted/20 p-2 text-[10px]">{JSON.stringify(examples.rows, null, 2)}</pre>}</>}</section></div>
 }
 
 const signed = (value: number | null | undefined) => value == null ? 'unavailable' : `${value > 0 ? '+' : ''}${value}`
 function coverageReason(reason: DistributionReportComparison['coverage']['reason']) { return reason === 'full_sample_coverage_mismatch' ? 'one report is full coverage and the other is sampled' : reason === 'different_deterministic_samples' ? 'the reports use different deterministic samples' : reason.replaceAll('_', ' ') }
 function comparisonMessage(error: ReportFailure) { if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'The selected comparison is unavailable or not authorized.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Comparison is temporarily unavailable.'; if (error.status === 422) return 'The selected reports cannot be compared.'; return 'Comparison is currently unavailable.' }
-function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this exact revision is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the retained report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
+function examplesMessage(error: ReportFailure) { if (error.status === 410 || error.code === 'resource_gone') return 'Examples are unavailable because this dataset version is no longer available.'; if (error.status === 401 || error.status === 403 || error.status === 404 || error.code === 'permission_denied' || error.code === 'not_found') return 'Examples are unavailable for this bucket.'; if (error.status === 422) return 'This bucket is unsupported or no longer valid for the saved report.'; if (error.status === 503 || error.code === 'service_unavailable') return 'Examples are temporarily unavailable.'; return 'Examples are currently unavailable.' }
 
 function unavailableMessage(error: ReportFailure | null): string {
-  if (error?.code === 'permission_denied' || error?.status === 401 || error?.status === 403) return 'You are not authorized to open this retained report.'
-  if (error?.code === 'resource_gone' || error?.status === 410) return 'The exact retained revision required by this report is no longer available.'
-  if (error?.code === 'internal_error') return 'The retained report state could not be validated because it is corrupt.'
-  if (error?.code === 'service_unavailable' || error?.status != null && error.status >= 500) return 'The retained report service is temporarily unavailable.'
-  if (error?.code === 'not_found' || error?.status === 404) return 'This retained report does not exist, was deleted, or is not visible to you.'
-  return 'This retained report is currently unavailable.'
+  if (error?.code === 'permission_denied' || error?.status === 401 || error?.status === 403) return 'You are not authorized to open this saved report.'
+  if (error?.code === 'resource_gone' || error?.status === 410) return 'The saved dataset version required by this report is no longer available.'
+  if (error?.code === 'internal_error') return 'The saved report could not be opened because its data is invalid.'
+  if (error?.code === 'service_unavailable' || error?.status != null && error.status >= 500) return 'Saved reports are temporarily unavailable.'
+  if (error?.code === 'not_found' || error?.status === 404) return 'This saved report does not exist, was deleted, or is not visible to you.'
+  return 'This saved report is currently unavailable.'
 }
 
 function prepareMessage(error: ReportFailure): string {
-  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'You are not authorized to inspect distributions for this exact view.'
-  if (error.code === 'resource_gone' || error.status === 410) return 'The exact retained revision is no longer available; no new report was started.'
-  if (error.code === 'internal_error') return 'The retained report state failed server validation; no new report was started.'
-  if (error.code === 'not_found' || error.status === 404) return 'This exact view no longer exists or is not visible to you.'
+  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'You are not authorized to inspect distributions for this saved view.'
+  if (error.code === 'resource_gone' || error.status === 410) return 'The saved dataset version is no longer available; no new report was started.'
+  if (error.code === 'internal_error') return 'The saved report could not be validated; no new report was started.'
+  if (error.code === 'not_found' || error.status === 404) return 'This saved view no longer exists or is not visible to you.'
   return `Couldn’t prepare the report: ${error.detail}`
 }
 
 function refreshMessage(error: ReportFailure): string {
-  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'Permission to refresh this retained report was lost.'
-  if (error.code === 'resource_gone' || error.status === 410) return 'The exact retained revision is no longer available for refresh.'
-  if (error.code === 'internal_error') return 'The retained report state failed validation during refresh.'
+  if (error.code === 'permission_denied' || error.status === 401 || error.status === 403) return 'Permission to refresh this saved report was lost.'
+  if (error.code === 'resource_gone' || error.status === 410) return 'The saved dataset version is no longer available for refresh.'
+  if (error.code === 'internal_error') return 'The saved report could not be validated during refresh.'
   return `Couldn’t refresh this report: ${error.detail}.`
 }
 
 function taskErrorMessage(error: string): string {
-  if (error === 'distribution report revision unavailable') return 'The exact retained revision became unavailable before this report finished.'
-  if (error === 'distribution report snapshot invalid') return 'The retained report state failed validation before computation finished.'
+  if (error === 'distribution report revision unavailable') return 'The saved dataset version became unavailable before this report finished.'
+  if (error === 'distribution report snapshot invalid') return 'The saved report could not be validated before computation finished.'
   if (error === 'distribution report deadline') return 'Report computation exceeded its bounded deadline.'
-  if (error === 'distribution report computation failed') return 'Report computation failed before a validated document was retained.'
+  if (error === 'distribution report computation failed') return 'Report computation failed before a valid report could be saved.'
   return error
 }

@@ -55,6 +55,8 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0052_rejected_run_owner", "0051_canvas_result_latest"),
+        ("0051_canvas_result_latest", "0050_receipt_names"),
         ("0050_receipt_names", "0046_relationship_incident"),
         ("0046_relationship_incident", "0045_canvas_dataset_add_replays"),
         ("0045_canvas_dataset_add_replays", "0044_provider_lineage_identity"),
@@ -103,8 +105,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0050_receipt_names"]
-    assert metadb.expected_schema_head() == "0050_receipt_names"
+    assert scripts.get_heads() == ["0052_rejected_run_owner"]
+    assert metadb.expected_schema_head() == "0052_rejected_run_owner"
 
 
 def test_fresh_schema_omits_retired_row_identity_storage(tmp_path):
@@ -764,6 +766,12 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0052_rejected_run_owner.py": (
+            "34c3fa6e540e8c6d49565d9bbdd72d8dab8e736ee9836a90e520752f4f07bd65"
+        ),
+        "0051_canvas_result_latest.py": (
+            "4eca5ee93e6e1239ab99ca0b7a536c4447f6328c333adb97a5cdd36d8cf388c0"
+        ),
         "0050_backfill_receipt_names.py": (
             "a48889b47befd8798b8f86cac96a230e137bc4798f18030b0c69f315b19fe706"
         ),
@@ -913,6 +921,40 @@ def test_committed_migration_revisions_are_immutable():
         assert hashlib.sha256(revision_paths[name].read_bytes()).hexdigest() == expected_hash, (
             "committed migration revisions are immutable; add a forward migration instead"
         )
+
+
+def test_canvas_current_result_migration_has_a_retention_guard(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'canvas-current-result.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO users (id, name, is_admin, token_epoch, created_at) "
+                "VALUES ('result-owner', 'Result owner', 0, 0, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO canvases "
+                "(id, owner_id, name, version, doc, visibility, created_at, updated_at) "
+                "VALUES ('result-canvas', 'result-owner', 'Result Canvas', 1, '{}', "
+                "'private', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO canvas_result_latest "
+                "(id, canvas_id, target_node_id, terminal_run_id, terminal_status, "
+                "terminal_doc, terminal_submitted_at, terminal_at, result_outputs, updated_at) "
+                "VALUES ('result-latest', 'result-canvas', 'target', 'run-result', 'failed', "
+                "'{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '[]', CURRENT_TIMESTAMP)"))
+
+        with metadb.engine().connect() as connection:
+            with pytest.raises(RuntimeError, match="cannot downgrade"):
+                command.downgrade(
+                    metadb._alembic_cfg(connection), "0050_receipt_names")
+
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "DELETE FROM canvas_result_latest WHERE id = 'result-latest'"))
+        with metadb.engine().connect() as connection:
+            command.downgrade(metadb._alembic_cfg(connection), "0050_receipt_names")
+            assert "canvas_result_latest" not in inspect(connection).get_table_names()
+            command.upgrade(metadb._alembic_cfg(connection), "head")
 
 
 def test_transform_library_keys_backfill_and_round_trip_from_0024(tmp_path):

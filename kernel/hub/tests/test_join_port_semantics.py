@@ -8,7 +8,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from hub import db, ir, relationships
-from hub.executors.engine import BuildEngine
+from hub.executors.engine import BuildEngine, normalize_how
 from hub.executors.schema import schema_for_graph
 from hub.models import ColumnSchema, Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
@@ -207,3 +207,12 @@ def test_same_name_join_is_also_edge_order_independent():
     assert _rows(
         _graph(config, reversed_edges=True), adapter
     ) == _rows(_graph(config, reversed_edges=False), adapter)
+
+
+def test_offered_join_types_name_distinct_engine_joins():
+    # The Join card renders these options and stores the chosen one verbatim, so each must reach the
+    # engine as the join it names, and the offered default must be the engine's default.
+    how = next(param for param in SPECS["join"].params if param.name == "how")
+    assert how.options == ["inner", "left", "right", "outer"]
+    assert [normalize_how(option) for option in how.options] == ["inner", "left", "right", "full"]
+    assert normalize_how(how.default) == normalize_how("")

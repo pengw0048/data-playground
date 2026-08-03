@@ -2,8 +2,8 @@ import { defineConfig, devices } from '@playwright/test'
 import { MIN_VIEWPORT } from './support/min-viewport'
 
 // End-to-end tests drive the REAL app: the kernel (FastAPI + engine) serving the built SPA.
-// `npm run build` must run first (the kernel serves web/dist). The webServer block boots the
-// kernel on a test port and waits for /api/livez before the specs run.
+// The webServer rebuilds `web/dist`, packages that exact SPA into a disposable kernel wheel, boots
+// the kernel on a test port, and waits for /api/livez before the specs run.
 const PORT = process.env.DP_E2E_PORT ?? '8899'
 const fixtureProfile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
 const REFERENCE_VIEWPORT = { width: 1440, height: 900 }

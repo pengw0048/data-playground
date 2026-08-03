@@ -23,7 +23,10 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const canvasRole = useStore((s) => s.canvasRole)
   const renameFile = useStore((s) => s.renameFile)
   const setRequirements = useStore((s) => s.setRequirements)
+  const setResultRetention = useStore((s) => s.setResultRetention)
   const setParameters = useStore((s) => s.setParameters)
+  const resultStorage = useStore((s) => s.kernelInfo?.resultStorage)
+  const authEnabled = useStore((s) => s.authEnabled)
   const canEdit = roleCanEdit(canvasRole)
   const isOwner = canvasRole === 'owner'
   const sharing = useCanvasSharing(doc.id, isOwner)
@@ -67,24 +70,24 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
           <span className="flex items-center text-muted-foreground"><Icon name="grid" size={14} /></span>
           <DialogTitle className="text-sm font-semibold">Canvas settings</DialogTitle>
         </div>
-        <DialogDescription className="sr-only">Settings for the current canvas: its name, visibility, and dependencies.</DialogDescription>
+        <DialogDescription className="sr-only">Settings for the current Canvas: its name, dependencies, and stored results.</DialogDescription>
 
-        <div className="flex flex-col gap-4 p-4">
+        <div className="flex max-h-[min(76vh,760px)] flex-col gap-4 overflow-y-auto p-4">
           <div className="rounded-md bg-muted px-2.5 py-1.5 text-[10.5px] text-muted-foreground">{access}</div>
-          {sharing.error && (
+          {authEnabled && sharing.error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-[11.5px] text-destructive">
               <span className="min-w-0 flex-1">{sharing.error}</span>
               {sharing.retryable && <Button type="button" variant="outline" size="sm" onClick={sharing.retry} disabled={busy} className="h-6 px-2 text-[10.5px]">Retry</Button>}
             </div>
           )}
-          {sharing.pending && sharing.pending !== 'load' && (
+          {authEnabled && sharing.pending && sharing.pending !== 'load' && (
             <div role="status" className="text-[10.5px] text-muted-foreground">Saving sharing changes…</div>
           )}
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Name</Label>
             <Input value={name} disabled={!canEdit} onChange={(event) => { setName(event.target.value); renameFile(event.target.value) }} placeholder="untitled" />
           </div>
-          <div>
+          {authEnabled && <div>
             <div className="mb-1.5 text-[11.5px] text-muted-foreground">Visibility</div>
             {sharing.visibility === null && sharing.pending === 'load' ? (
               <div className="text-[11.5px] text-muted-foreground">Loading visibility…</div>
@@ -106,7 +109,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
             <div className="mt-2 text-[10.5px] text-muted-foreground">
               {isOwner ? <>Invite specific people from the <b>Share</b> button.</> : 'Only the canvas owner can change visibility.'}
             </div>
-          </div>
+          </div>}
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Dependencies (pip)</Label>
             <textarea
@@ -121,7 +124,31 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
               rows={3}
               className="dp-mono w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-[11.5px] text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-70"
             />
-            <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed on this canvas's kernel, then importable in <code>transform</code> cells. Travels with the canvas.</div>
+            <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed for this Canvas and available to <code>transform</code> cells. Travels with the Canvas.</div>
+          </div>
+          <div>
+            <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Results</Label>
+            <div className="grid grid-cols-[1fr_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
+              <div>
+                <div className="text-[11.5px] font-medium text-foreground">Stored results</div>
+              </div>
+              <select
+                aria-label="Result history"
+                value={doc.resultRetention?.history ?? 'inherit'}
+                disabled={!canEdit}
+                onChange={(event) => setResultRetention(
+                  event.target.value as 'inherit' | 'latest' | 'recent')}
+                className="h-8 rounded-md border border-border bg-background px-2 text-[11.5px] text-foreground outline-none focus:border-primary disabled:opacity-60"
+              >
+                <option value="inherit">Workspace default</option>
+                <option value="latest">Latest result</option>
+                <option value="recent">Recent run results</option>
+              </select>
+              <div className="text-[11.5px] font-medium text-foreground">Location</div>
+              <div className="text-right text-[11px] text-muted-foreground">
+                {resultStorage?.label ?? 'Workspace managed storage'}
+              </div>
+            </div>
           </div>
           <div>
             <div className="mb-1 flex items-center gap-2">
@@ -180,7 +207,7 @@ function declarationListError(values: CanvasParameterDeclaration[]): string | nu
     if (limits?.minimum != null && limits?.maximum != null && limits.minimum > limits.maximum) return `'${value.name}' minimum exceeds maximum.`
     if (limits?.minLength != null && limits?.maxLength != null && limits.minLength > limits.maxLength) return `'${value.name}' minLength exceeds maxLength.`
     if (value.default != null) {
-      if (value.type === 'string' && (typeof value.default !== 'string' || isBuiltInSecretRef(value.default))) return `'${value.name}' default must be a public string, not a SecretRef.`
+      if (value.type === 'string' && (typeof value.default !== 'string' || isBuiltInSecretRef(value.default))) return `'${value.name}' default must be plain text, not a secret.`
       if (value.type === 'integer' && !Number.isSafeInteger(value.default)) return `'${value.name}' default must be a safe integer.`
       if (value.type === 'float' && (typeof value.default !== 'number' || !Number.isFinite(value.default))) return `'${value.name}' default must be finite.`
       if (value.type === 'boolean' && typeof value.default !== 'boolean') return `'${value.name}' default must be boolean.`
@@ -244,9 +271,9 @@ function ParameterDeclarationEditor({ value, disabled, update, remove, moveUp, m
       <label><input type="checkbox" checked={value.default != null} disabled={disabled || value.required} onChange={(event) => update({ ...value, default: event.target.checked ? initialDefault(value.type) : undefined })} /> Default</label>
     </div>
     {value.default != null && !value.required && (value.type === 'dataset' ? <div className="mt-1.5 grid grid-cols-[90px_1fr] gap-1">
-      <select aria-label={`${value.name} default selection`} value={ref?.kind ?? 'latest'} disabled={disabled} onChange={(event) => update({ ...value, default: { kind: event.target.value, datasetId: ref?.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref?.revisionId ?? '' } : {}) } })} className={field}><option value="latest">Latest</option><option value="exact">Exact</option></select>
+      <select aria-label={`${value.name} default selection`} value={ref?.kind ?? 'latest'} disabled={disabled} onChange={(event) => update({ ...value, default: { kind: event.target.value, datasetId: ref?.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref?.revisionId ?? '' } : {}) } })} className={field}><option value="latest">Follow latest</option><option value="exact">Selected version</option></select>
       <Input aria-label={`${value.name} default dataset`} value={ref?.datasetId ?? ''} disabled={disabled} placeholder="Dataset identity" onChange={(event) => update({ ...value, default: { ...ref, kind: ref?.kind ?? 'latest', datasetId: event.target.value } })} className="h-7 text-[10.5px]" />
-      {ref?.kind === 'exact' && <Input aria-label={`${value.name} default revision`} value={ref.revisionId ?? ''} disabled={disabled} placeholder="Exact revision" onChange={(event) => update({ ...value, default: { ...ref, revisionId: event.target.value } })} className="col-start-2 h-7 text-[10.5px]" />}
+      {ref?.kind === 'exact' && <Input aria-label={`${value.name} default revision`} value={ref.revisionId ?? ''} disabled={disabled} placeholder="Version ID" onChange={(event) => update({ ...value, default: { ...ref, revisionId: event.target.value } })} className="col-start-2 h-7 text-[10.5px]" />}
     </div> : value.type === 'boolean' ? <select aria-label={`${value.name} default`} value={String(value.default)} disabled={disabled} onChange={(event) => setDefault(event.target.value)} className={`mt-1.5 ${field}`}><option value="true">true</option><option value="false">false</option></select>
       : <Input aria-label={`${value.name} default`} value={String(value.default)} disabled={disabled} type={value.type === 'date' ? 'date' : 'text'} placeholder={value.type === 'datetime' ? 'ISO 8601 with timezone' : 'Default'} onChange={(event) => setDefault(event.target.value)} className="mt-1.5 h-7 text-[10.5px]" />)}
     {(value.type === 'string' || value.type === 'integer' || value.type === 'float') && <div className="mt-1.5 grid grid-cols-2 gap-1">

@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import entry_points
@@ -16,30 +17,43 @@ from typing import Literal
 
 from hub import metadb
 from hub.catalog_provider import (
+    CatalogLineageProvider,
+    CatalogLineageResourceProvider,
     CatalogMount,
     CatalogResource,
+    MutableCatalogProvider,
     ProviderPage,
     ProviderSearchPage,
     ReadOnlyCatalogProvider,
     bounded_ancestors,
+    bounded_capabilities,
     bounded_dataset_detail,
     bounded_list_children,
+    bounded_lineage,
+    bounded_lineage_resource,
     bounded_resolve,
     bounded_search,
+    lineage_resource_key,
 )
 
 _EXTERNAL_PREFIX = "external."
+_MOUNT_CONTAINER_PREFIX = "mount."
 _PROVIDER_DATASET_URI_PREFIX = "workspace-provider://"
 _CURSOR_VERSION = 3
+_LOCAL_LENS_CURSOR_VERSION = 1
+_LOCAL_LENS_CURSOR_PREFIX = "local."
+_CONNECTED_LENS_CURSOR_VERSION = 1
+_CONNECTED_LENS_CURSOR_PREFIX = "provider."
+_MAX_CONNECTED_SEEN_BYTES = 2048
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
 _MAX_MISSING_PLACEMENT_PROBES = 8
 _MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
-# Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
-# actions may wait a little longer, but remain bounded and use the same isolated provider workers.
-_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
-_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
+# Passive Workspace browse must stay responsive even when a remote mount is slow. Allow one cold
+# catalog startup while keeping explicit dataset actions on a separate, longer bounded deadline.
+_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
+_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 20.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
 }
@@ -60,6 +74,14 @@ class ProviderDatasetGone(ProviderDatasetUnavailable):
 
 class ProviderDatasetOffline(ProviderDatasetUnavailable):
     """A valid provider dataset binding could not be read because its provider is offline."""
+
+
+class ProviderDatasetMutationUnsupported(ProviderDatasetUnavailable):
+    """The mounted provider did not explicitly authorize dataset removal."""
+
+
+class ProviderDatasetLineageUnsupported(ProviderDatasetUnavailable):
+    """The mounted provider does not expose lineage for its datasets."""
 
 
 class MountConfigError(ValueError):
@@ -159,6 +181,117 @@ def is_configured_mount_container(container_id: str) -> bool:
     return any(mounted.container_id == container_id for mounted in mounts)
 
 
+def mount_container_identity(mount_id: str) -> str:
+    """Stable, URL-safe identity for one configured source root."""
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or "\x00" in mount_id):
+        raise ValueError("invalid catalog mount identity")
+    encoded = base64.urlsafe_b64encode(mount_id.encode()).decode().rstrip("=")
+    return f"{_MOUNT_CONTAINER_PREFIX}{encoded}"
+
+
+def _decode_mount_container_identity(identity: str) -> str:
+    if not identity.startswith(_MOUNT_CONTAINER_PREFIX):
+        raise KeyError("invalid connected source reference")
+    try:
+        encoded = identity.removeprefix(_MOUNT_CONTAINER_PREFIX)
+        mount_id = base64.urlsafe_b64decode(
+            encoded + "=" * (-len(encoded) % 4)).decode()
+    except (UnicodeDecodeError, binascii.Error) as exc:
+        raise KeyError("invalid connected source reference") from exc
+    try:
+        if mount_container_identity(mount_id) != identity:
+            raise ValueError
+    except ValueError as exc:
+        raise KeyError("invalid connected source reference") from exc
+    return mount_id
+
+
+def is_connected_source_container(container_id: str) -> bool:
+    """Whether an identity belongs to the reserved connected-source namespace."""
+    return container_id.startswith(_MOUNT_CONTAINER_PREFIX)
+
+
+def _local_lens_cursor_encode(container_id: str, cursor: str) -> str:
+    raw = json.dumps(
+        [_LOCAL_LENS_CURSOR_VERSION, container_id, cursor], separators=(",", ":")
+    ).encode()
+    return _LOCAL_LENS_CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _local_lens_cursor_decode(container_id: str, cursor: str | None) -> str | None:
+    if cursor is None:
+        return None
+    if not cursor.startswith(_LOCAL_LENS_CURSOR_PREFIX) or len(cursor) > 16_384:
+        raise ValueError("invalid local Workspace cursor")
+    encoded = cursor.removeprefix(_LOCAL_LENS_CURSOR_PREFIX)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        version, bound_container, inner = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid local Workspace cursor") from exc
+    if (version != _LOCAL_LENS_CURSOR_VERSION or bound_container != container_id
+            or not isinstance(inner, str) or not inner or len(inner) > 16_384):
+        raise ValueError("invalid local Workspace cursor")
+    return inner
+
+
+def _connected_lens_cursor_encode(
+    identity: str,
+    fingerprint: str,
+    provider_cursor: str,
+    seen_placement_ids: list[str] | None,
+) -> str:
+    raw = json.dumps([
+        _CONNECTED_LENS_CURSOR_VERSION,
+        identity,
+        fingerprint,
+        provider_cursor,
+        seen_placement_ids,
+    ], separators=(",", ":")).encode()
+    encoded = (
+        _CONNECTED_LENS_CURSOR_PREFIX
+        + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    )
+    if len(encoded) > 4096:
+        raise ValueError("connected source cursor state is too large")
+    return encoded
+
+
+def _connected_lens_cursor_decode(
+    identity: str,
+    fingerprint: str,
+    cursor: str | None,
+) -> tuple[str | None, list[str] | None]:
+    if cursor is None:
+        return None, []
+    if not cursor.startswith(_CONNECTED_LENS_CURSOR_PREFIX) or len(cursor) > 4096:
+        raise ValueError("invalid connected source cursor")
+    encoded = cursor.removeprefix(_CONNECTED_LENS_CURSOR_PREFIX)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        version, bound_identity, bound_fingerprint, provider_cursor, seen = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid connected source cursor") from exc
+    valid_seen = (
+        seen is None
+        or isinstance(seen, list)
+        and all(isinstance(item, str) and item and len(item) <= 512 for item in seen)
+        and len(seen) == len(set(seen))
+        and len(json.dumps(seen, separators=(",", ":")).encode())
+        <= _MAX_CONNECTED_SEEN_BYTES
+    )
+    if (version != _CONNECTED_LENS_CURSOR_VERSION
+            or bound_identity != identity
+            or bound_fingerprint != fingerprint
+            or not isinstance(provider_cursor, str)
+            or not provider_cursor
+            or len(provider_cursor) > 512
+            or not valid_seen):
+        raise ValueError("invalid connected source cursor")
+    return provider_cursor, seen
+
+
 @functools.lru_cache(maxsize=64)
 def _provider_factory(name: str) -> Callable[[], object]:
     entry = next((item for item in entry_points(group="dataplay.catalog_providers")
@@ -177,6 +310,47 @@ def _load_provider(name: str) -> ReadOnlyCatalogProvider:
     if not isinstance(provider, ReadOnlyCatalogProvider):
         raise TypeError("entry point did not return a read-only catalog provider")
     return provider
+
+
+@functools.lru_cache(maxsize=64)
+def _provider_dataset_delete_enabled(
+    provider_name: str, mount_id: str, config_fingerprint: str,
+) -> bool:
+    """Cache one non-secret capability decision for the current mount configuration."""
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id
+                    and item.mount.provider == provider_name
+                    and item.config_fingerprint == config_fingerprint), None)
+    if mounted is None:
+        return False
+    try:
+        provider = _load_provider(provider_name)
+    except Exception:  # noqa: BLE001 -- an unavailable plugin cannot authorize a mutation
+        return False
+    result = bounded_capabilities(
+        provider, mounted.mount, timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
+    return bool(
+        result.state == "ready"
+        and result.item is not None
+        and result.item.delete_dataset
+        and isinstance(provider, MutableCatalogProvider)
+    )
+
+
+def _mounted_dataset_delete_enabled(mounted: _MountedProvider) -> bool:
+    return _provider_dataset_delete_enabled(
+        mounted.mount.provider, mounted.mount.id, mounted.config_fingerprint)
+
+
+def _mounted_dataset_can_delete(mounted: _MountedProvider, dataset_id: object) -> bool:
+    if not isinstance(dataset_id, str) or not _mounted_dataset_delete_enabled(mounted):
+        return False
+    try:
+        provider = _load_provider(mounted.mount.provider)
+        return bool(isinstance(provider, MutableCatalogProvider)
+                    and provider.can_delete_dataset(mounted.mount, dataset_id))
+    except Exception:  # noqa: BLE001 -- a failed capability check never grants mutation authority
+        return False
 
 
 def _mount_fingerprint(mounts: list[_MountedProvider], invalid: bool) -> str:
@@ -286,6 +460,164 @@ def provider_dataset_uri_for_identity(dataset_id: str) -> str | None:
     return f"{_PROVIDER_DATASET_URI_PREFIX}{dataset_id.removeprefix(prefix)}"
 
 
+def _provider_lineage_uri(mount_id: str, uri: str) -> str:
+    """Return a stable, non-reversible UI identity for a provider-owned lineage endpoint."""
+    return f"workspace-provider-lineage://{lineage_resource_key(mount_id, uri)}"
+
+
+def provider_dataset_lineage(uri: str, *, depth: int, max_nodes: int):
+    """Read one connected source's lineage while keeping physical provider URIs private."""
+    from hub.models import LineageEdge, LineageNode, LineageResult
+
+    dataset_identity = provider_dataset_identity(uri)
+    if dataset_identity is None:
+        raise ValueError("lineage requires a Workspace provider dataset URI")
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_identity.removeprefix("workspace-provider:"))
+    binding = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if binding is None:
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None or mounted.mount.provider != binding["provider"]:
+        raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetUnavailable(_activation_error()) from exc
+    if not isinstance(provider, CatalogLineageProvider):
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source does not provide lineage")
+    result = bounded_lineage(
+        provider,
+        mounted.mount,
+        binding["providerDatasetId"],
+        depth=depth,
+        max_nodes=max_nodes,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    if result.state == "unsupported":
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source does not provide lineage")
+    if result.state != "ready" or result.item is None:
+        if result.failure == "permission_lost":
+            raise PermissionError("permission to read provider lineage was lost")
+        if result.failure == "not_found":
+            raise ProviderDatasetGone("provider lineage dataset was deleted")
+        if result.failure == "offline":
+            raise ProviderDatasetOffline("provider lineage is temporarily unavailable")
+        raise ProviderDatasetUnavailable("provider returned invalid lineage")
+
+    item = result.item
+    aliases = {
+        node.uri: (
+            uri if node.uri == item.root_uri
+            else _provider_lineage_uri(mount_id, node.uri)
+        )
+        for node in item.nodes
+    }
+    return LineageResult(
+        root_uri=uri,
+        nodes=[
+            LineageNode(
+                id=aliases[node.uri],
+                name=node.name,
+                uri=aliases[node.uri],
+                kind=node.kind,
+            )
+            for node in item.nodes
+        ],
+        edges=[
+            LineageEdge(
+                parent=aliases[edge.parent],
+                child=aliases[edge.child],
+                fact_count=edge.fact_count,
+                columns=edge.columns,
+                pipeline_names=edge.pipeline_names,
+                cardinality=edge.cardinality,
+            )
+            for edge in item.edges
+        ],
+        truncated=item.truncated,
+    )
+
+
+def resolve_provider_lineage_resource(
+        root_uri: str, node_uri: str, name: str, *, uid: str) -> dict:
+    """Resolve one opaque provider-lineage neighbour to a current Workspace resource.
+
+    The browser never receives the physical provider URI.  On an explicit card click, provider
+    search returns a bounded candidate set and this server compares only its non-reversible lineage
+    aliases before caching the matched occurrence as a normal Workspace resource.
+    """
+    dataset_identity = provider_dataset_identity(root_uri)
+    if dataset_identity is None:
+        raise ValueError("lineage navigation requires a provider dataset root")
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_identity.removeprefix("workspace-provider:"))
+    if not re.fullmatch(r"workspace-provider-lineage://[0-9a-f]{64}", node_uri):
+        raise ValueError("lineage navigation requires an opaque provider node")
+    query = " ".join(str(name).split())
+    if not query or len(query.encode("utf-8")) > 512:
+        raise ValueError("lineage dataset name is invalid")
+    canonical = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if canonical is None:
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None or mounted.mount.provider != canonical["provider"]:
+        raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetUnavailable(_activation_error()) from exc
+    if isinstance(provider, CatalogLineageResourceProvider):
+        resolved = bounded_lineage_resource(
+            provider,
+            mounted.mount,
+            canonical["providerDatasetId"],
+            node_uri.removeprefix("workspace-provider-lineage://"),
+            query,
+            timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+        if resolved.state == "ready" and resolved.item is not None:
+            return _workspace_resource(resolved.item, mounted)
+        if resolved.failure == "permission_lost":
+            raise PermissionError("permission to open provider lineage was lost")
+        if resolved.failure == "not_found":
+            raise ProviderDatasetGone("lineage dataset is no longer available")
+        if resolved.failure == "offline":
+            raise ProviderDatasetOffline("provider lineage dataset is temporarily unavailable")
+        raise ProviderDatasetUnavailable("provider returned invalid lineage dataset details")
+
+    page = bounded_search(
+        provider,
+        mounted.mount,
+        query,
+        limit=100,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    if page.state == "unsupported":
+        raise ProviderDatasetLineageUnsupported(
+            "this connected source cannot open lineage neighbours")
+    if page.state != "ready":
+        raise ProviderDatasetOffline("provider lineage dataset search is unavailable")
+    matches = [
+        item for item in page.items
+        if item.kind == "dataset" and item.uri
+        and (
+            item.lineage_key == node_uri.removeprefix("workspace-provider-lineage://")
+            or _provider_lineage_uri(mount_id, item.uri) == node_uri
+        )
+    ]
+    if not matches:
+        raise ProviderDatasetGone("lineage dataset is not registered in this connected source")
+    match = sorted(matches, key=lambda item: item.placement_id)[0]
+    return _workspace_resource(match, mounted)
+
+
 class _BoundProviderDatasetAdapter:
     """Translate one synthetic stable URI into a provider-owned physical adapter binding.
 
@@ -299,10 +631,13 @@ class _BoundProviderDatasetAdapter:
         "revision_detail", "revision_schema", "open_revision_native_rows",
     }
 
-    def __init__(self, source_uri: str, physical_uri: str, adapter: object):
+    def __init__(
+        self, source_uri: str, physical_uri: str, adapter: object, *, readable: bool = True,
+    ):
         self.source_uri = source_uri
         self.physical_uri = physical_uri
         self.adapter = adapter
+        self.readable = readable
         self.name = str(getattr(adapter, "name", "") or "")
 
     def matches(self, uri: str) -> bool:
@@ -387,7 +722,8 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         adapter = resolve_physical(detail.uri)
     except Exception as exc:
         raise ProviderDatasetUnavailable("provider dataset adapter is unavailable") from exc
-    return _BoundProviderDatasetAdapter(uri, detail.uri, adapter)
+    return _BoundProviderDatasetAdapter(
+        uri, detail.uri, adapter, readable=detail.readable)
 
 
 def provider_dataset_supports_exact(adapter: object) -> bool:
@@ -435,8 +771,13 @@ def provider_dataset_inspection_graph(
     return bound
 
 
-def provider_dataset_source(resource_ref: str, *, uid: str,
-                            resolve_physical: Callable[[str], object]) -> dict:
+def provider_dataset_source(
+    resource_ref: str,
+    *,
+    uid: str,
+    resolve_physical: Callable[[str], object],
+    allow_lineage_metadata: bool = False,
+) -> dict:
     """Create one minimal Source config from a live stable provider dataset reference."""
     resolution = resolve(resource_ref, uid=uid)
     resource = resolution.get("resource")
@@ -479,7 +820,12 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     from hub.models import ExactDatasetRef
     from hub.plugins.adapters import RevisionPermissionLost, RevisionProviderOffline
     read_mode = "mutable"
-    if provider_dataset_supports_exact(adapter):
+    if isinstance(adapter, _BoundProviderDatasetAdapter) and not adapter.readable:
+        if not allow_lineage_metadata:
+            raise ProviderDatasetUnavailable(
+                "this lineage record is not a readable provider dataset")
+        read_mode = "lineage"
+    elif provider_dataset_supports_exact(adapter):
         try:
             evidence = adapter.resolve_revision(uri)
             revision_id = str(evidence.get("revision_id") or "")
@@ -507,11 +853,60 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     }
 
 
+def delete_provider_dataset(resource_ref: str, *, uid: str, actor: str) -> dict:
+    """Delete one current canonical dataset through its mounted provider authority."""
+    resolution = resolve(resource_ref, uid=uid)
+    resource = resolution.get("resource")
+    source = resolution.get("source") or {}
+    if (not isinstance(resource, dict) or resource.get("kind") != "dataset"
+            or resource.get("source") != "provider"):
+        raise ValueError("only a connected-source dataset can be removed here")
+    if source.get("completeness") != "complete" or resource.get("lastKnown"):
+        raise ProviderDatasetUnavailable(
+            "reload this dataset before removing it from its source")
+    mount_id = resource.get("mountId")
+    provider_dataset_id = resource.get("providerDatasetId")
+    if not isinstance(mount_id, str) or not isinstance(provider_dataset_id, str):
+        raise ProviderDatasetUnavailable("provider dataset identity is unavailable")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None:
+        raise ProviderDatasetUnavailable("connected source is not configured")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details remain private
+        raise ProviderDatasetOffline("connected source is unavailable") from exc
+    if (not isinstance(provider, MutableCatalogProvider)
+            or not _mounted_dataset_can_delete(mounted, provider_dataset_id)):
+        raise ProviderDatasetMutationUnsupported(
+            "this connected source does not support removing datasets")
+    try:
+        removed = provider.delete_dataset(
+            mounted.mount, provider_dataset_id, actor=actor)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise ProviderDatasetOffline(
+            "the connected source did not confirm whether the dataset was removed; reload it") from exc
+    except Exception as exc:  # noqa: BLE001 -- plugin details do not cross the product boundary
+        raise ProviderDatasetUnavailable(
+            "the connected source could not remove this dataset") from exc
+    if not removed:
+        raise ProviderDatasetGone("the dataset no longer exists in its connected source")
+    metadb.workspace_provider_mark_dataset_deleted(
+        mount_id=mount_id, provider_dataset_id=provider_dataset_id)
+    return {"ok": True, "removedFrom": mount_id}
+
+
 def provider_dataset_context(resource_ref: str, *, uid: str,
                              resolve_physical: Callable[[str], object]) -> dict:
     """Return only non-sensitive canonical facts proven by the exact Source admission path."""
     source = provider_dataset_source(
-        resource_ref, uid=uid, resolve_physical=resolve_physical)
+        resource_ref,
+        uid=uid,
+        resolve_physical=resolve_physical,
+        allow_lineage_metadata=True,
+    )
     config = source["data"]["config"]
     uri = str(config["uri"])
     dataset_identity = provider_dataset_identity(uri)
@@ -526,16 +921,21 @@ def provider_dataset_context(resource_ref: str, *, uid: str,
     dataset_ref = config.get("datasetRef")
     exact = dataset_ref if isinstance(dataset_ref, dict) else None
     provider_read_mode = config.get("providerReadMode")
-    if provider_read_mode not in {"exact", "mutable"}:
+    if provider_read_mode not in {"exact", "mutable", "lineage"}:
         raise ProviderDatasetUnavailable("canonical provider dataset read mode is unavailable")
     if provider_read_mode == "exact" and exact is None:
         raise ProviderDatasetUnavailable("canonical provider dataset revision is unavailable")
-    read_mode = "exact" if provider_read_mode == "exact" else "current"
+    read_mode = (
+        "exact" if provider_read_mode == "exact"
+        else "lineage" if provider_read_mode == "lineage"
+        else "current"
+    )
     return {
         "mountId": canonical["mountId"],
         "sourceBindingId": canonical["sourceBindingId"],
         "providerDatasetId": canonical["providerDatasetId"],
         "datasetIdentity": dataset_identity,
+        "sourceUri": uri,
         "readMode": read_mode,
         "revisionId": exact.get("revisionId") if exact is not None else None,
         "committedAt": (
@@ -614,7 +1014,13 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         ),
         "lastResolvedAt": binding["lastResolvedAt"],
         "localPlacement": local_placement,
-        "providerMutation": False,
+        "providerMutation": (
+            binding["kind"] == "dataset"
+            and state == "current"
+            and canonical_state in {None, "current"}
+            and _mounted_dataset_can_delete(
+                mounted, binding.get("providerDatasetId"))
+        ),
         "canCreateFolder": False,
         "canRenameFolder": False,
         "canDeleteFolder": False,
@@ -1254,16 +1660,227 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     }
 
 
+_PROVIDER_QUERY_REASON = "Sorting and type filters aren't available for this source."
+_MIXED_QUERY_REASON = "Sorting and type filters aren't available in this view."
+
+
+def _connected_source_resource(mounted: _MountedProvider) -> dict:
+    identity = mount_container_identity(mounted.mount.id)
+    return {
+        "id": f"container:{identity}",
+        "kind": "container",
+        "name": mounted.mount.id,
+        "parentId": f"container:{mounted.container_id}",
+        "source": "provider",
+        "mountId": mounted.mount.id,
+        "provider": mounted.mount.provider,
+        "referenceState": "current",
+        "localPlacement": None,
+        "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "folderMutationUnavailableReason": (
+            "This connected source is read-only and does not support Folder changes."
+        ),
+    }
+
+
+def _configured_connected_source(identity: str) -> _MountedProvider:
+    mount_id = _decode_mount_container_identity(identity)
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None:
+        raise KeyError("connected Workspace source is not configured")
+    return mounted
+
+
+def browse_local_source(
+    container_id: str,
+    *,
+    uid: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    sort: str | None = None,
+    order: str = "asc",
+    kinds: set[str] | frozenset[str] | None = None,
+    bind_cursor: bool = True,
+) -> dict:
+    """Browse only durable local metadata and discover configured provider roots separately."""
+    inner_cursor = (
+        _local_lens_cursor_decode(container_id, cursor) if bind_cursor else cursor
+    )
+    page = metadb.workspace_browse(
+        container_id,
+        uid=uid,
+        limit=limit,
+        cursor=inner_cursor,
+        sort=sort,
+        order=order,
+        kinds=kinds,
+    )
+    mounts, invalid = _configured_mounts()
+    connected_sources = [
+        _connected_source_resource(item)
+        for item in mounts
+        if item.container_id == container_id
+    ]
+    sources = [{
+        "id": "local",
+        "kind": "local",
+        "completeness": "page" if page["hasMore"] else "complete",
+    }]
+    if invalid:
+        sources.append(_source_status(
+            _Source("configuration"), "unavailable", _configured_source_error()))
+    next_cursor = page["nextCursor"]
+    return {
+        **page,
+        "nextCursor": (
+            _local_lens_cursor_encode(container_id, next_cursor)
+            if bind_cursor and next_cursor is not None else next_cursor
+        ),
+        "connectedSources": connected_sources,
+        "queryCapabilities": {
+            "sort": ["name", "updated"],
+            "kindFilter": True,
+            "reason": None,
+        },
+        "sources": sources,
+    }
+
+
+def browse_connected_source(
+    identity: str, *, uid: str, limit: int = 50, cursor: str | None = None,
+) -> dict:
+    """Browse exactly one configured mount root using only its opaque list cursor."""
+    mounted = _configured_connected_source(identity)
+    # A mount whose configured local parent no longer exists is not a reachable Workspace source.
+    metadb.workspace_resolve(f"container:{mounted.container_id}", uid=uid)
+    source = _Source("provider", mounted)
+    root = _connected_source_resource(mounted)
+    fingerprint = _mount_fingerprint([mounted], False)
+    provider_cursor, seen_placement_ids = _connected_lens_cursor_decode(
+        identity, fingerprint, cursor)
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception:  # noqa: BLE001 -- activation details/configuration stay private
+        status = _source_status(source, "unavailable", _activation_error())
+        return {
+            "container": root,
+            "items": [],
+            "connectedSources": [],
+            "queryCapabilities": {
+                "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+            },
+            "nextCursor": None,
+            "hasMore": False,
+            "completeness": "partial",
+            "sources": [status],
+        }
+    page = bounded_list_children(
+        provider,
+        mounted.mount,
+        None,
+        limit=max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT)),
+        cursor=provider_cursor,
+        timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
+    items = [
+        {
+            **_workspace_resource(item, mounted),
+            "parentId": f"container:{identity}",
+        }
+        for item in page.items
+    ]
+    seen_placement_ids = _extend_reconciliation_placements(
+        seen_placement_ids, page.items)
+    if (seen_placement_ids is not None
+            and len(json.dumps(
+                seen_placement_ids, separators=(",", ":")).encode()
+            ) > _MAX_CONNECTED_SEEN_BYTES):
+        seen_placement_ids = None
+    reconciliation_incomplete = False
+    if page.state == "ready" and page.next_cursor is None:
+        reconciliation_incomplete = (
+            seen_placement_ids is None
+            or _reconcile_complete_children(
+                provider,
+                mounted,
+                parent_provider_placement_id=None,
+                seen_provider_placement_ids=set(seen_placement_ids or []),
+            )
+        )
+    source_completeness = (
+        "page" if page.state == "ready" and page.next_cursor is not None
+        else "partial" if page.state == "ready" and reconciliation_incomplete
+        else "complete" if page.state == "ready"
+        else page.state
+    )
+    status = _source_status(
+        source,
+        source_completeness,
+        ("some missing placements could not be refreshed"
+         if reconciliation_incomplete else page.reason),
+    )
+    next_cursor = (
+        _connected_lens_cursor_encode(
+            identity,
+            fingerprint,
+            page.next_cursor,
+            seen_placement_ids,
+        )
+        if page.next_cursor is not None else None
+    )
+    return {
+        "container": root,
+        "items": items,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+        },
+        "nextCursor": next_cursor,
+        "hasMore": next_cursor is not None,
+        "completeness": (
+            "partial" if page.state != "ready" or reconciliation_incomplete
+            else "page" if next_cursor is not None
+            else "complete"
+        ),
+        "sources": [status],
+    }
+
+
+def mixed_browse_contract(page: dict) -> dict:
+    """Add explicit query truthfulness to the backward-compatible mixed page."""
+    return {
+        **page,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": [], "kindFilter": False, "reason": _MIXED_QUERY_REASON,
+        },
+    }
+
+
 def browse(container_id: str, *, uid: str, limit: int = 50,
            cursor: str | None = None) -> dict:
     """Browse local and mounted providers with one bounded, source-stable cursor."""
     limit = max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT))
     mounts, invalid = _configured_mounts()
+    if is_connected_source_container(container_id):
+        return browse_connected_source(
+            container_id, uid=uid, limit=limit, cursor=cursor)
     if container_id.startswith(_EXTERNAL_PREFIX):
-        return _remote_page(container_id, uid=uid, limit=limit, cursor=cursor,
-                            mounts=mounts, invalid=invalid)
-    return _mixed_page(container_id, uid=uid, limit=limit, cursor=cursor,
-                       mounts=mounts, invalid=invalid)
+        return mixed_browse_contract(_remote_page(
+            container_id, uid=uid, limit=limit, cursor=cursor,
+            mounts=mounts, invalid=invalid))
+    if not any(item.container_id == container_id for item in mounts) and not invalid:
+        # A normal local folder has one source, so it keeps ordinary sort/filter capabilities. Only
+        # a real mount point needs the bounded multi-source cursor and source-owned ordering.
+        return browse_local_source(
+            container_id, uid=uid, limit=limit, cursor=cursor, bind_cursor=False)
+    return mixed_browse_contract(_mixed_page(
+        container_id, uid=uid, limit=limit, cursor=cursor,
+        mounts=mounts, invalid=invalid))
 
 
 def _unavailable_resolution(source: _Source, completeness: str, error: str | None) -> dict:
@@ -1297,9 +1914,12 @@ def _cached_resolution(
         _binding_resource(item, mounted)
         for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
     ]
+    connected_root = (
+        [_connected_source_resource(mounted)] if source.kind == "provider" else []
+    )
     return {
         "resource": _binding_resource(binding, mounted),
-        "ancestors": [*local_ancestors, *cached_ancestors],
+        "ancestors": [*local_ancestors, *connected_root, *cached_ancestors],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
         "canonicalSourceBinding": metadb.workspace_provider_source_binding(
@@ -1322,11 +1942,32 @@ def _overlay_cached_resolution(
         _binding_resource(item, mounted)
         for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
     ]
+    connected_root = (
+        [_connected_source_resource(mounted)] if source.kind == "provider" else []
+    )
     return {
         "resource": resource,
-        "ancestors": [*local_ancestors, *cached_ancestors, _binding_resource(binding, mounted)],
+        "ancestors": [
+            *local_ancestors,
+            *connected_root,
+            *cached_ancestors,
+            _binding_resource(binding, mounted),
+        ],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
+    }
+
+
+def resolve_connected_source(identity: str, *, uid: str) -> dict:
+    """Resolve a virtual mount root and its durable local parent ancestry without provider I/O."""
+    mounted = _configured_connected_source(identity)
+    local_parent = metadb.workspace_resolve(
+        f"container:{mounted.container_id}", uid=uid)
+    source = _Source("provider", mounted)
+    return {
+        "resource": _connected_source_resource(mounted),
+        "ancestors": [*local_parent["ancestors"], local_parent["resource"]],
+        "source": _source_status(source, "complete"),
     }
 
 
@@ -1336,6 +1977,8 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         kind, identity = resource_ref.split(":", 1)
     except ValueError as exc:
         raise KeyError("invalid Workspace resource reference") from exc
+    if kind == "container" and is_connected_source_container(identity):
+        return resolve_connected_source(identity, uid=uid)
     if kind not in {"container", "dataset"} or not identity.startswith(_EXTERNAL_PREFIX):
         try:
             return metadb.workspace_resolve(resource_ref, uid=uid)
@@ -1471,7 +2114,10 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         ]
         current = {**current, "lastKnown": True}
     combined = [
-        *local_parent["ancestors"], local_parent["resource"], *provider_resources,
+        *local_parent["ancestors"],
+        local_parent["resource"],
+        _connected_source_resource(mounted),
+        *provider_resources,
     ]
     return {
         "resource": current,

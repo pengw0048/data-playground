@@ -13,6 +13,7 @@ from collections.abc import Mapping
 
 from hub import db, graph as graph_mod, metadb
 from hub.backends import DatasetRevisionAdapter, _PreparedNodeRegistration
+from hub.ir import SOURCE_OPTION_KEYS, SOURCE_OPTION_VALUES
 from hub.models import dataset_ref_identity
 from hub.plugins.adapters import (
     DuckDBAdapter,
@@ -114,12 +115,12 @@ def supports_local_file_snapshot(uri: str, adapter) -> bool:
 def _source_options(config: dict) -> dict[str, str]:
     options = {
         key: (str(config.get(key, "")).strip().lower()
-              if key == "header" else str(config.get(key, "")).strip())
-        for key in ("delimiter", "header") if str(config.get(key, "")).strip()
+              if key in SOURCE_OPTION_VALUES else str(config.get(key, "")).strip())
+        for key in SOURCE_OPTION_KEYS if str(config.get(key, "")).strip()
     }
     return {
         key: value for key, value in options.items()
-        if key != "header" or value in ("yes", "no")
+        if key not in SOURCE_OPTION_VALUES or value in SOURCE_OPTION_VALUES[key]
     }
 
 

@@ -85,7 +85,7 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.getByLabelText('Published result')).not.toHaveTextContent('revision-7')
   })
 
-  it('reloads exact schema comparison evidence from the receipt alone', () => {
+  it('shows only user-facing schema changes from a saved receipt', () => {
     const withDrift = {
       ...receipt,
       parentHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
@@ -103,13 +103,32 @@ describe('WritePublicationSummary task-first output states', () => {
     render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
       receipt={withDrift} completed />)
 
-    const details = screen.getByText('Technical details').closest('details')!
-    expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('Technical details'))
-    const comparisons = screen.getAllByLabelText('Schema comparison')
-    expect(comparisons[0]).toHaveTextContent('dataset-1@revision-6')
-    expect(comparisons[0]).toHaveTextContent('changed · unknown')
-    expect(comparisons[0]).toHaveTextContent('Structural schema drift requires explicit confirmation')
+    const changes = screen.getByLabelText('Schema changes')
+    expect(changes).toHaveTextContent('amount')
+    expect(changes).toHaveTextContent('field identity is missing or changed')
+    expect(changes).not.toHaveTextContent('dataset-1@revision-6')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+  })
+
+  it('does not present unchanged fields as schema changes', () => {
+    const unchangedReceipt = {
+      ...receipt,
+      schemaDrift: {
+        comparedHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
+        compatibility: { status: 'unknown', fields: [{
+          kind: 'unchanged', status: 'unknown', fieldId: null,
+          oldName: 'amount', newName: 'amount',
+          reason: 'logical type is unchanged; nullability is not proven on both versions',
+        }] },
+        requiresConfirmation: false,
+      },
+    } as any
+
+    render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
+      receipt={unchangedReceipt} completed />)
+
+    expect(screen.queryByLabelText('Schema changes')).not.toBeInTheDocument()
+    expect(screen.queryByText(/nullability is not proven/)).not.toBeInTheDocument()
   })
 
   it('does not promise a dataset for provider-neutral output', () => {
@@ -122,8 +141,8 @@ describe('WritePublicationSummary task-first output states', () => {
 
     const summary = screen.getByLabelText('Write publication')
     expect(summary).toHaveTextContent('Output name')
-    expect(summary).toHaveTextContent('Overwrite provider output')
-    expect(summary).toHaveTextContent('Run finished. The selected backend wrote the output.')
+    expect(summary).toHaveTextContent('Replace output')
+    expect(summary).toHaveTextContent('Run finished. Output was written.')
     expect(screen.queryByRole('link', { name: 'Open dataset' })).not.toBeInTheDocument()
   })
 
@@ -158,7 +177,7 @@ describe('WritePublicationSummary task-first output states', () => {
     expect(screen.getAllByText('output')).toHaveLength(1)
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1',
     )
   })
 
@@ -168,7 +187,7 @@ describe('WritePublicationSummary task-first output states', () => {
 
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1&returnCanvas=canvas-1&returnNode=write',
     )
   })
 })

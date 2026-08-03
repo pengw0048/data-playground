@@ -12,3 +12,16 @@ export function configuredProcessorRef(processor: unknown, version: unknown): st
   if (typeof processor !== 'string' || !processor) return undefined
   return `${processor}@${typeof version === 'string' && version ? version : '?'}`
 }
+
+export function processorModeLabel(mode: unknown): string {
+  switch (mode) {
+    case 'map': return 'Per row'
+    case 'map_batches': return 'In batches'
+    case 'filter': return 'Filter rows'
+    case 'flat_map':
+    case 'flat_map_generator': return 'Expand rows'
+    case 'callable': return 'Whole dataset'
+    case 'aggregate': return 'Aggregate rows'
+    default: return typeof mode === 'string' && mode ? mode : 'Defined by the Library'
+  }
+}

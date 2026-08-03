@@ -161,7 +161,7 @@ function openSocket(canvasId: string): void {
           latestYSyncRequestId = null
           if (!unavailableNoticeShown) {
             unavailableNoticeShown = true
-            st.pushToast('Live collaboration is waiting for an available synchronized peer', 'info')
+            st.pushToast('Connecting to collaborators…', 'info')
           }
           return
         }

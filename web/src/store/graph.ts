@@ -2,11 +2,12 @@ import { create } from 'zustand'
 import type { WireType } from '../theme/tokens'
 import type {
   CanvasDoc, CanvasEdge, CanvasNode, CanvasParameterBinding, CanvasParameterDeclaration,
-  NodeConfig, NodeData, NodeStatus, NodeVersion,
+  LastRun, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
-  CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
-  RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteReceipt,
+  CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, Placement, ProcessorDescriptor,
+  ProfileResult, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
+  WriteAdmission, WriteReceipt,
 } from '../types/api'
 import { canConnect, getSpec, nodeOutputs, portWire } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
@@ -26,7 +27,7 @@ import {
 import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
 import {
   canvasDocsEqual, canvasEditableContentEqual, deleteCanvasDraft, readCanvasDrafts, writeCanvasDraft,
-  type LocalCanvasDraft,
+  READ_ONLY_DRAFT_BASE_MESSAGE, UNAVAILABLE_DRAFT_BASE_MESSAGE, type LocalCanvasDraft,
 } from './canvasDrafts'
 import {
   isPristineExampleReplacement,
@@ -37,6 +38,8 @@ import {
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
 import { connectedBasePosition } from '../canvas/connectedPlacement'
+import { rememberCanvasOpenedAt } from './canvasRecents'
+import { presentRunError } from '../lib/runErrors'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -53,6 +56,18 @@ type OpenFileOptions = CanvasNavigationOptions & { serverCopy?: boolean }
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
 const PREVIEW_BINDINGS_KEY = (userId: string, canvasId: string) => `dp-preview-bindings-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
+const STALE_WRITE_ADMISSION_USER_MESSAGE = 'Destination changed before this run started. Review the latest version and try again.'
+
+function runStartErrorMessage(error: unknown, writeAdmission?: WriteAdmission): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (writeAdmission?.managed
+      && error instanceof KernelError
+      && error.status === 409
+      && message.toLowerCase().startsWith('write admission is stale')) {
+    return STALE_WRITE_ADMISSION_USER_MESSAGE
+  }
+  return message || 'Run failed to start'
+}
 
 export function roleCanEdit(role: CanvasRole | null | undefined): role is 'owner' | 'editor' {
   return role === 'owner' || role === 'editor'
@@ -155,6 +170,29 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
     return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
   }
   return walk(id)
+}
+
+/** Names the upstream source still missing a dataset — the usual reason a connected node cannot run. */
+export function unsetSourceReason(doc: CanvasDoc, id: string): string | null {
+  if (nodeRunnable(doc, id)) return null
+  const seen = new Set<string>()
+  const unset: string[] = []
+  const walk = (nid: string) => {
+    if (seen.has(nid)) return
+    seen.add(nid)
+    const node = doc.nodes.find((item) => item.id === nid)
+    if (!node) return
+    if (node.type === 'source') {
+      if (!node.data.config.uri) unset.push(node.data.title || 'the source')
+      return
+    }
+    for (const edge of doc.edges.filter((item) => item.target === nid)) walk(edge.source)
+  }
+  walk(id)
+  if (!unset.length) return null
+  return unset.length === 1
+    ? `Choose a dataset in “${unset[0]}”`
+    : `Choose a dataset in ${unset.length} upstream sources`
 }
 
 /**
@@ -543,6 +581,9 @@ export function writeAdmissionFingerprint(
   // target Write's lifecycle status, canvas presentation, and unrelated branches.
   return JSON.stringify({
     plan: targetExecutionPlanIdentity(doc, nodeId, undefined, true),
+    // The server resolves publication capability from the selected target, so an admission taken on
+    // one target must not be replayed on another.
+    executionBackend: doc.executionBackend ?? null,
     declarations: targetParameterDeclarations(doc, nodeId)
       .map((declaration) => canonicalIdentityValue({
         name: declaration.name,
@@ -629,6 +670,12 @@ interface RunState {
   parametersReady?: boolean
   parameterContractFingerprint?: string
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
+}
+
+export interface GraphRunState {
+  canvasId: string
+  runId?: string
+  status?: RunStatus
 }
 
 function managedWriteReceiptOutput(
@@ -1208,7 +1255,7 @@ export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[
 export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string; nodeIds?: string[] }
 export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
 export interface ToastAction { label: string; onClick: () => void | Promise<unknown> }
-export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string }
+export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string; sticky?: boolean }
 
 // Fit identity is deliberately geometry-only: transient run badges may settle while React Flow is
 // measuring, but a different node set or position must never consume an example's viewport request.
@@ -1232,6 +1279,7 @@ interface Store {
   specsVersion: number
   schemas: SchemaMap               // per-node, per-output-port columns; null port entry = untyped
   sizes: Record<string, { rows: number | null; confidence: string }>  // per-node size estimate (card hint)
+  graphRefusals: Record<string, string>  // per-node reason the kernel refused the graph, if any
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
@@ -1243,6 +1291,8 @@ interface Store {
   editorPreviews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
   runs: Record<string, RunState>
+  // The single whole-graph pass behind "Rerun all"; null when no such pass is in flight.
+  graphRun: GraphRunState | null
   profileJobs: Record<string, ProfileJobState>
   past: CanvasDoc[]
   future: CanvasDoc[]
@@ -1330,6 +1380,7 @@ interface Store {
   prepareWrite: (id: string) => Promise<WriteAdmission | undefined>
   run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
   rerunAll: () => void
+  cancelGraphRun: () => Promise<void>
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
   prepareFullProfile: (id: string, portId?: string) => Promise<void>
@@ -1359,7 +1410,7 @@ interface Store {
 
   // -- persistence --
   save: () => Promise<void>
-  loadDoc: (doc: CanvasDoc, role?: CanvasRole | null) => void
+  loadDoc: (doc: CanvasDoc, role?: CanvasRole | null, options?: { recoverServerState?: boolean }) => void
   applyExternalEdit: (canvasId?: string) => void
   // `targetCanvasId` binds a destructive replacement to the canvas the caller created. Imports use
   // it so a late response can never replace whichever canvas became active in the meantime.
@@ -1421,7 +1472,7 @@ interface Store {
   openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
   closeCodeFullscreen: () => void
   // transient notifications surfaced as toasts (errors/info) — so failures aren't silent
-  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string; actions?: ToastAction[]; dedupeKey?: string }[]
+  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string; actions?: ToastAction[]; dedupeKey?: string; sticky?: boolean }[]
   pushToast: (msg: string, kind?: 'error' | 'info' | 'success', options?: ToastOptions) => void
   dismissToast: (id: string) => void
   // realtime collaboration presence: other people currently on this canvas (live cursors + avatars)
@@ -1443,11 +1494,14 @@ interface Store {
   newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
+  setExecutionBackend: (backend: string | null) => void
+  setResultRetention: (history: 'inherit' | 'latest' | 'recent') => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
   openLocalDraft: (draftId: string, options?: CanvasNavigationOptions) => boolean
   retryLocalDraft: (draftId: string, options?: { notify?: boolean }) => Promise<void>
+  notifyLocalDraftConflict: (draftId: string) => void
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
   exportLocalDraft: (draftId: string) => void
@@ -1456,7 +1510,7 @@ interface Store {
 function hubExecutionAvailable(get: () => Store): boolean {
   if (get().kernelUp) return true
   get().pushToast(
-    'Hub offline — reconnect before starting or controlling execution.',
+    'Data Playground is offline — reconnect before starting or controlling a run.',
     'error',
     { dedupeKey: 'hub-offline-execution' },
   )
@@ -1469,7 +1523,17 @@ export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'tran
 function friendlyJoinInputRefusal(message: string): string | null {
   const prefix = 'invalid graph: '
   if (!message.startsWith(prefix)) return null
-  const clauses = message.slice(prefix.length).split('; ')
+  const rawClauses = message.slice(prefix.length).split('; ')
+  if (rawClauses.length === 1
+      && /^Join node '[^']+' needs at least one left and right column or an advanced condition$/.test(rawClauses[0])) {
+    return 'Choose the left and right columns that should match in this Join.'
+  }
+  // A newly drawn edge can arrive without a semantic Join handle. The following missing-port
+  // clauses carry the actionable state; the edge id is implementation detail and is safe to omit.
+  const clauses = rawClauses.filter((clause) => (
+    !/^edge '[^']+' must identify Join input 'a' or 'b' on node '[^']+'$/.test(clause)
+  ))
+  if (!clauses.length) return null
   const parsed = clauses.map((clause) => (
     /^Join node '([^']+)' requires exactly one incoming edge on input '([ab])'$/.exec(clause)
   ))
@@ -1489,12 +1553,38 @@ function friendlyJoinInputRefusal(message: string): string | null {
   return null
 }
 
-// The kernel is authoritative for graph validity. These metadata calls otherwise intentionally
-// tolerate an offline kernel, but a deliberate invalid_graph refusal needs a visible explanation.
+// The kernel is authoritative for graph validity. User-requested target actions surface a product
+// explanation; passive whole-Canvas metadata refreshes deliberately stay quiet.
+// Attribute an invalid_graph refusal to the nodes its clauses name, so the branch that cannot run
+// says so on the canvas.
+export function nodeGraphRefusals(error: unknown): Record<string, string> {
+  if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return {}
+  const clausesByNode = new Map<string, string[]>()
+  for (const clause of error.message.replace(/^invalid graph: /, '').split('; ')) {
+    for (const [, nodeId] of clause.matchAll(/node '([^']+)'/g)) {
+      clausesByNode.set(nodeId, [...(clausesByNode.get(nodeId) ?? []), clause])
+    }
+  }
+  return Object.fromEntries([...clausesByNode].map(([nodeId, clauses]) => {
+    const joinInputs = new Set(clauses.flatMap((clause) => {
+      const match = /requires exactly one incoming edge on input '([ab])'/.exec(clause)
+      return match ? [match[1]] : []
+    }))
+    if (joinInputs.has('a') && joinInputs.has('b')) return [nodeId, 'Connect left and right datasets']
+    if (joinInputs.has('a')) return [nodeId, 'Connect a left dataset']
+    if (joinInputs.has('b')) return [nodeId, 'Connect a right dataset']
+    if (clauses.some((clause) => /needs at least one left and right column/.test(clause))) {
+      return [nodeId, 'Choose the left and right columns to match']
+    }
+    if (clauses.some((clause) => /has no input port/.test(clause))) return [nodeId, 'Connect an input']
+    return [nodeId, 'This step is not ready to run']
+  }))
+}
+
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
   const message = friendlyJoinInputRefusal(error.message)
-    ?? (error.message || 'The graph cannot run.')
+    ?? 'This branch is not ready to run. Check its connections and required fields.'
   if (!state.toasts.some((toast) => toast.kind === 'error' && toast.msg === message)) {
     state.pushToast(message, 'error')
   }
@@ -1512,14 +1602,67 @@ function replaceDraft(drafts: LocalCanvasDraft[], draft: LocalCanvasDraft): Loca
     .sort((a, b) => b.lastLocalEditAt.localeCompare(a.lastLocalEditAt))
 }
 
+const DRAFT_SYNC_CONFLICT_MESSAGE = 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+const draftSyncConflictKey = (draftId: string) => `canvas-sync-conflict:${draftId}`
+
 function draftAfterStorageWrite(
   draft: LocalCanvasDraft, result: { ok: boolean; error?: string },
 ): LocalCanvasDraft {
   return result.ok ? draft : { ...draft, syncState: 'error', lastError: result.error }
 }
 
+function markUnavailableDraftBases(
+  drafts: LocalCanvasDraft[], accessibleCanvasRoles: ReadonlyMap<string, CanvasRole | undefined>,
+): { drafts: LocalCanvasDraft[]; errors: string[]; unavailableCanvasIds: string[] } {
+  const errors: string[] = []
+  const unavailableCanvasIds: string[] = []
+  const next = drafts.map((draft) => {
+    if (draft.baseCanvasId === null) return draft
+    const accessible = accessibleCanvasRoles.has(draft.baseCanvasId)
+    const role = accessibleCanvasRoles.get(draft.baseCanvasId)
+    const availabilityConflict = draft.syncState === 'conflict'
+      && (draft.lastError === UNAVAILABLE_DRAFT_BASE_MESSAGE
+        || draft.lastError === READ_ONLY_DRAFT_BASE_MESSAGE)
+    if (accessible && roleCanEdit(role)) {
+      // Only undo the conflict state synthesized by this authoritative-list check. A real version
+      // conflict must remain an explicit choice even when the Canvas is still accessible.
+      if (!availabilityConflict) return draft
+      const restored: LocalCanvasDraft = { ...draft, syncState: 'dirty', lastError: undefined }
+      const stored = writeCanvasDraft(restored)
+      if (!stored.ok && stored.error) errors.push(stored.error)
+      return draftAfterStorageWrite(restored, stored)
+    }
+    if (accessible) {
+      // Viewer access can inspect the server copy but cannot sync local edits. Keep the two explicit
+      // recovery choices visible, and never downgrade a real version conflict into this access state.
+      if (draft.syncState === 'conflict' && !availabilityConflict) return draft
+      const readOnly: LocalCanvasDraft = {
+        ...draft,
+        syncState: 'conflict',
+        lastError: READ_ONLY_DRAFT_BASE_MESSAGE,
+      }
+      const stored = writeCanvasDraft(readOnly)
+      if (!stored.ok && stored.error) errors.push(stored.error)
+      return draftAfterStorageWrite(readOnly, stored)
+    }
+    unavailableCanvasIds.push(draft.canvasId)
+    if (draft.syncState === 'conflict' && !availabilityConflict) return draft
+    if (draft.syncState === 'conflict' && draft.lastError === UNAVAILABLE_DRAFT_BASE_MESSAGE) return draft
+    const conflicted: LocalCanvasDraft = {
+      ...draft,
+      syncState: 'conflict',
+      lastError: UNAVAILABLE_DRAFT_BASE_MESSAGE,
+    }
+    const stored = writeCanvasDraft(conflicted)
+    if (!stored.ok && stored.error) errors.push(stored.error)
+    return draftAfterStorageWrite(conflicted, stored)
+  })
+  return { drafts: next, errors, unavailableCanvasIds }
+}
+
 function draftForDoc(principalId: string, doc: CanvasDoc, baseVersion: number | null,
-                     previous?: LocalCanvasDraft, createAttemptDoc?: CanvasDoc | null): LocalCanvasDraft {
+                     previous?: LocalCanvasDraft, createAttemptDoc?: CanvasDoc | null,
+                     besideCanvasId?: string): LocalCanvasDraft {
   return {
     draftId: doc.id,
     principalId,
@@ -1529,6 +1672,7 @@ function draftForDoc(principalId: string, doc: CanvasDoc, baseVersion: number | 
     name: doc.name || 'untitled',
     doc,
     createAttemptDoc: createAttemptDoc === undefined ? previous?.createAttemptDoc ?? null : createAttemptDoc,
+    besideCanvasId: besideCanvasId ?? previous?.besideCanvasId,
     syncState: 'dirty',
     lastLocalEditAt: new Date().toISOString(),
   }
@@ -1549,14 +1693,20 @@ function downloadDraft(draft: LocalCanvasDraft): void {
 function invalidUpstreamReason(
   doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts'],
 ): string | null {
+  return invalidUpstream(doc, id, numericDrafts)?.reason ?? null
+}
+
+function invalidUpstream(
+  doc: CanvasDoc, id: string, numericDrafts: Store['numericParamDrafts'],
+): { nodeId: string; reason: string } | null {
   const seen = new Set<string>()
-  const walk = (nid: string): string | null => {
+  const walk = (nid: string): { nodeId: string; reason: string } | null => {
     if (seen.has(nid)) return null
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
     if (!n) return null
     const ownReason = nodeInvalidReason(n, undefined, numericDrafts[n.id])
-    if (ownReason) return ownReason
+    if (ownReason) return { nodeId: n.id, reason: ownReason }
     for (const source of doc.edges.filter((e) => e.target === nid).map((e) => e.source)) {
       const reason = walk(source)
       if (reason) return reason
@@ -1620,7 +1770,12 @@ function invalidateCurrentResults(
     // Retain lastRun/history as durable output history, but stale the status that lets Canvas
     // present that output as the current result for the changed graph.
     nodes: doc.nodes.map((node) => (
-      affected.has(node.id) && node.data.status === 'latest'
+      affected.has(node.id) && (
+        node.data.status === 'latest'
+        || node.data.status === 'checking'
+        || node.data.status === 'unknown'
+        || node.data.status === 'failed'
+      )
         ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
         : node
     )),
@@ -1824,6 +1979,9 @@ function mutateNodeConfig(
     const sizes = Object.fromEntries(
       Object.entries(s.sizes).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
     )
+    const graphRefusals = Object.fromEntries(
+      Object.entries(s.graphRefusals).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
+    )
     // A Source picker registration changes the durable catalog identity even when its URI stays
     // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
     // the next Run re-estimates against the new registration instead of caching the old refusal.
@@ -1839,7 +1997,7 @@ function mutateNodeConfig(
         }
       }
     }
-    return { doc: { ...s.doc, nodes, edges }, runs, sizes }
+    return { doc: { ...s.doc, nodes, edges }, runs, sizes, graphRefusals }
   })
 }
 
@@ -1918,7 +2076,9 @@ export const useStore = create<Store>((set, get) => ({
   setWorkspaceResource: (resourceId) => {
     startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
-    set({ workspaceResourceId: resourceId, view: 'workspace' })
+    // A saved-version query belongs to exactly one dataset. Carrying it to a different resource
+    // can render the new dataset's title with the previous dataset's rows and revision status.
+    set({ workspaceResourceId: resourceId, workspaceDatasetQuery: '', view: 'workspace' })
   },
   workspaceSearchQuery: '',
   setWorkspaceSearchQuery: (query) => {
@@ -2052,7 +2212,7 @@ export const useStore = create<Store>((set, get) => ({
     if (options?.dedupeKey && get().toasts.some((toast) => toast.dedupeKey === options.dedupeKey)) return
     const id = `t_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 6)}`
     set((s) => ({ toasts: [...s.toasts, { id, kind, msg, ...options }] }))
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
+    if (!options?.sticky) setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   authEnabled: false,
@@ -2069,6 +2229,7 @@ export const useStore = create<Store>((set, get) => ({
   specsVersion: 0,
   schemas: {},
   sizes: {},
+  graphRefusals: {},
   selectedId: null,
   selectedIds: [],
   nodeRevealRequest: null,
@@ -2078,6 +2239,7 @@ export const useStore = create<Store>((set, get) => ({
   editorPreviews: {},
   previewBindings: {},
   runs: {},
+  graphRun: null,
   profileJobs: {},
   past: [],
   future: [],
@@ -2881,17 +3043,17 @@ export const useStore = create<Store>((set, get) => ({
     if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
+      get().pushToast('Review the saved-dataset column merge before running.', 'info')
       return
     }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Column merge uses its certified admission flow.', 'info')
+      get().pushToast('Review the column merge setup before running.', 'info')
       return
     }
     if (hasConfiguredUpsertWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Keyed upsert uses its certified admission flow.', 'info')
+      get().pushToast('Review the upsert setup before running.', 'info')
       return
     }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) {
@@ -2929,7 +3091,13 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
       } } }))
-      get().pushToast((e as Error).message || 'Could not estimate the run', 'error')
+      if (!surfaceInvalidGraphRefusal(get(), e)) {
+        const target = get().doc.nodes.find((node) => node.id === id)
+        get().pushToast(presentRunError((e as Error).message, {
+          nodeTitle: target?.data.title,
+          config: target?.data.config,
+        }).summary, 'error')
+      }
       return
     }
     if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
@@ -2937,13 +3105,13 @@ export const useStore = create<Store>((set, get) => ({
     if (get().doc.nodes.find((node) => node.id === id)?.type === 'write') {
       try {
         writeAdmission = await get().prepareWrite(id)
-        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+        if (!writeAdmission) throw new Error('The write destination changed while it was being checked. Review it and retry.')
       } catch (e) {
         set((s) => ({ runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? {}), phase: 'failed', estimate,
-          error: (e as Error).message || 'Could not admit the write',
+          error: (e as Error).message || 'Could not verify the write destination',
         } } }))
-        get().pushToast((e as Error).message || 'Could not admit the write', 'error')
+        get().pushToast((e as Error).message || 'Could not verify the write destination', 'error')
         return
       }
     }
@@ -3074,7 +3242,7 @@ export const useStore = create<Store>((set, get) => ({
       let writeAdmission: WriteAdmission | undefined
       if (doc.nodes.find((node) => node.id === id)?.type === 'write') {
         writeAdmission = await get().prepareWrite(id)
-        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+        if (!writeAdmission) throw new Error('The write destination changed while it was being checked. Review it and retry.')
       }
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate,
@@ -3149,17 +3317,17 @@ export const useStore = create<Store>((set, get) => ({
     if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
+      get().pushToast('Review the saved-dataset column merge before running.', 'info')
       return
     }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Column merge uses its certified admission flow.', 'info')
+      get().pushToast('Review the column merge setup before running.', 'info')
       return
     }
     if (hasConfiguredUpsertWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Keyed upsert uses its certified admission flow.', 'info')
+      get().pushToast('Review the upsert setup before running.', 'info')
       return
     }
     if (get().runs[id]?.estimate?.exactRunReadiness?.ready === false) {
@@ -3223,7 +3391,7 @@ export const useStore = create<Store>((set, get) => ({
           } } }))
         }
         writeAdmission = await get().prepareWrite(id)
-        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+        if (!writeAdmission) throw new Error('The write destination changed while it was being checked. Review it and retry.')
         if (writeAdmission.blocker) throw new Error(writeAdmission.blocker)
         if (confirmed && writeAdmission.managed && writeAdmission.intent !== confirmedWriteIntent) {
           set((s) => ({ runs: { ...s.runs, [id]: {
@@ -3242,7 +3410,7 @@ export const useStore = create<Store>((set, get) => ({
         set((s) => ({ runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
         } } }))
-        get().pushToast((e as Error).message || 'Could not admit the write', 'error')
+        get().pushToast((e as Error).message || 'Could not verify the write destination', 'error')
         return
       }
     }
@@ -3281,27 +3449,37 @@ export const useStore = create<Store>((set, get) => ({
         get().updateData(id, { status: 'stale' })
         return
       }
+      const errorMessage = runStartErrorMessage(e, writeAdmission)
+      const target = get().doc.nodes.find((node) => node.id === id)
       const preserveWriteSubmission = Boolean(
         writeAdmission?.managed && writeAdmission.intent
         && (!(e instanceof KernelError) || e.status >= 500),
       )
       set((s) => ({ runs: { ...s.runs, [id]: {
-        ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
+        ...(s.runs[id] ?? {}), phase: 'failed', error: errorMessage,
         ...(!preserveWriteSubmission ? {
           writeAdmission: undefined, writeSubmissionId: undefined,
           writeAdmissionFingerprint: undefined,
         } : {}),
       } } }))
       get().updateData(id, { status: 'failed' })
-      get().pushToast((e as Error).message || 'Run failed to start', 'error')
+      if (!surfaceInvalidGraphRefusal(get(), e)) {
+        get().pushToast(presentRunError(errorMessage, {
+          nodeTitle: target?.data.title,
+          config: target?.data.config,
+        }).summary, 'error')
+      }
     }
   },
 
-  // Re-run the whole graph: kick every runnable sink (a node with no outgoing edge); each pulls
-  // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
+  // Re-run the whole graph as ONE targetless run: the hub executes every node in topological order
+  // and reports per-node progress. Notes/unconnected nodes aren't runnable → skipped. A Write
+  // publication, a canvas parameter, an invalid node, or a size confirmation each own a decision the
+  // targetless pass cannot make, so those fall back to a run per runnable sink.
   rerunAll: () => {
     if (!roleCanEdit(get().canvasRole)) return
     if (!hubExecutionAvailable(get)) return
+    if (get().graphRun) return
     const { doc, numericParamDrafts } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
@@ -3317,18 +3495,36 @@ export const useStore = create<Store>((set, get) => ({
     }
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
     const candidates = sinks.map((node) => ({
-      node, invalidReason: invalidUpstreamReason(doc, node.id, numericParamDrafts),
+      node, invalid: invalidUpstream(doc, node.id, numericParamDrafts),
     }))
-    const valid = candidates.filter(({ invalidReason }) => !invalidReason)
-    valid.forEach(({ node }) => get().requestRun(node.id))
+    const valid = candidates.filter(({ invalid }) => !invalid)
     const invalidSkipped = sinks.length - valid.length
+    const perSink = () => { valid.forEach(({ node }) => get().requestRun(node.id)) }
+    if (!invalidSkipped && !requiresTargetedDispatch(doc, sinks)) startGraphRun(get, set, perSink)
+    else perSink()
     if (invalidSkipped) {
+      const first = candidates.find(({ invalid }) => invalid)?.invalid
+      if (first) {
+        get().select(first.nodeId)
+        get().requestNodeReveal(doc.id, first.nodeId)
+      }
       get().pushToast(
-        candidates.find(({ invalidReason }) => invalidReason)?.invalidReason
+        first?.reason
           ?? `Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with invalid node parameters`,
         'error',
       )
     }
+  },
+
+  cancelGraphRun: async () => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const current = get().graphRun
+    if (!current?.runId) return
+    await api.cancelRun(current.runId).catch(() => {})
+    if (get().graphRun?.runId !== current.runId) return
+    _polling.delete(current.runId)
+    set({ graphRun: null })
+    settleAnimatingNodes(set)
   },
 
   cancelRun: async (id) => {
@@ -3797,6 +3993,23 @@ export const useStore = create<Store>((set, get) => ({
       set({ users })
       const filesRefreshed = await get().refreshFiles()
       const files = get().files
+      if (filesRefreshed) {
+        // A browser draft based on a Canvas omitted by the authoritative server list is still user
+        // work, but it is no longer a valid startup destination. Preserve it as an explicit recovery
+        // choice in Workspace instead of mounting it as though its server execution state still exists.
+        const classified = markUnavailableDraftBases(
+          get().localDrafts,
+          new Map(files.map((file) => [file.id, file.role] as const)),
+        )
+        for (const canvasId of classified.unavailableCanvasIds) rememberRole(me.id, canvasId, null)
+        set((state) => ({
+          localDrafts: classified.drafts,
+          draftStorageErrors: classified.errors.length === 0
+            ? state.draftStorageErrors
+            : [...state.draftStorageErrors, ...classified.errors],
+        }))
+        for (const error of classified.errors) get().pushToast(error, 'error')
+      }
       // Do not infer a fresh workspace from an empty stale list: only an authoritative list can
       // establish that there is no existing Canvas. A local draft is user work too.
       set({ firstRunChoice: filesRefreshed && files.length === 0 && get().localDrafts.length === 0 })
@@ -3806,12 +4019,20 @@ export const useStore = create<Store>((set, get) => ({
       // last-opened / newest / a fresh file. A #/workspace or #/transforms link still loads a
       // current canvas underneath, then switches to that shell view below.
       const last = localStorage.getItem(OPEN_KEY(me.id))
-      const fallbackDraft = last ? get().localDrafts.find((draft) => draft.canvasId === last) : undefined
+      const startupDraft = (draft: LocalCanvasDraft) => (
+        draft.baseCanvasId === null || !filesRefreshed || files.some((file) => file.id === draft.baseCanvasId)
+      )
+      const fallbackDraft = last ? get().localDrafts.find((draft) => (
+        draft.canvasId === last && startupDraft(draft)
+      )) : undefined
       const fallback = last && files.some((f) => f.id === last) ? last : files[0]?.id
       // a deep-linked canvas that can't be opened (bad/revoked/other-user's link) must NOT discard
       // the last-opened file into a throwaway blank — fall back cleanly.
-      const routeDraft = route.view === 'canvas' && route.canvasId
+      const requestedRouteDraft = route.view === 'canvas' && route.canvasId
         ? get().localDrafts.find((draft) => draft.canvasId === route.canvasId)
+        : undefined
+      const routeDraft = requestedRouteDraft && startupDraft(requestedRouteDraft)
+        ? requestedRouteDraft
         : undefined
       if (ownsNavigation(navigationToken)) {
         const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId, {
@@ -3821,6 +4042,9 @@ export const useStore = create<Store>((set, get) => ({
           : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId, {
             navigationToken,
             skipViewportFit: !!route.nodeId,
+            // The local draft was retained as recovery work because its server base disappeared.
+            // Probe the explicit deep link itself instead of letting openFile remount that draft.
+            serverCopy: requestedRouteDraft !== undefined && routeDraft === undefined,
           }) : false
         if (ownsNavigation(navigationToken)) {
           if (opened && route.view === 'canvas' && route.canvasId && route.nodeId
@@ -3936,7 +4160,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!isCurrent()) return false
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
-      if (uid) localStorage.setItem(OPEN_KEY(uid), id)
+      if (uid) {
+        localStorage.setItem(OPEN_KEY(uid), id)
+        rememberCanvasOpenedAt(uid, id)
+      }
       // Opening any authoritative Canvas resolves first-run choice, including a Canvas created by
       // Workspace "Use data" rather than one of the banner's own buttons.
       set({ view: 'canvas', firstRunChoice: false })
@@ -3963,7 +4190,12 @@ export const useStore = create<Store>((set, get) => ({
   newFile: async (options) => {
     const generation = ++_fileNavigationGeneration
     const navigationToken = startNavigation()
-    const userId = get().currentUser?.id ?? null
+    const current = get()
+    const userId = current.currentUser?.id ?? null
+    // Folder inheritance is a convenience, never authority. Only use a Canvas that remains in the
+    // last confirmed accessible file list; a recovery draft may retain a dead server base version.
+    const besideCanvasId = current.files.some((file) => file.id === current.doc.id)
+      ? current.doc.id : undefined
     const doc = emptyDoc()
     const signal = options?.signal
     const isCurrent = () => !signal?.aborted
@@ -3981,7 +4213,9 @@ export const useStore = create<Store>((set, get) => ({
       // Do not abort this POST: once the server may have committed, an AbortError cannot tell us whether
       // this request owns doc.id. Wait for explicit insert evidence; a lost response leaves the empty
       // draft recoverable rather than risking a speculative DELETE of a pre-existing canvas.
-      const created = await api.createCanvas(doc)
+      const created = besideCanvasId
+        ? await api.createCanvas(doc, { besideCanvasId })
+        : await api.createCanvas(doc)
       if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
       if (!isCurrent()) {
         if (signal) await cleanUpCancelledRemoteDraft()
@@ -4026,7 +4260,7 @@ export const useStore = create<Store>((set, get) => ({
     }
     get().loadDoc(doc, 'owner')
     if (persistence === 'local-draft' && userId) {
-      const draft = draftForDoc(userId, doc, null, undefined, doc)
+      const draft = draftForDoc(userId, doc, null, undefined, doc, besideCanvasId)
       const stored = writeCanvasDraft(draft)
       const visibleDraft = draftAfterStorageWrite(draft, stored)
       set((state) => ({
@@ -4039,7 +4273,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!stored.ok) get().pushToast(stored.error!, 'error')
     }
     const uid = get().currentUser?.id
-    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), doc.id)
+      rememberCanvasOpenedAt(uid, doc.id)
+    }
     set({ view: 'canvas', firstRunChoice: false })
     if (signal && persistence === 'remote') void get().refreshFiles()
     return { ok: true, canvasId: doc.id, persistence }
@@ -4050,6 +4287,8 @@ export const useStore = create<Store>((set, get) => ({
     const navigationToken = startNavigation()
     const userId = get().currentUser?.id ?? null
     const current = get()
+    const besideCanvasId = current.files.some((file) => file.id === current.doc.id)
+      ? current.doc.id : undefined
     const candidate: ExampleReplacementSnapshot = {
       doc: current.doc,
       canvasRole: current.canvasRole,
@@ -4116,7 +4355,9 @@ export const useStore = create<Store>((set, get) => ({
         if (!saved.ok || saved.id !== doc.id) return { ok: false }
         doc.version = saved.version
       } else {
-        const created = await api.createCanvas(doc)
+        const created = besideCanvasId
+          ? await api.createCanvas(doc, { besideCanvasId })
+          : await api.createCanvas(doc)
         if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
       }
       if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
@@ -4148,7 +4389,7 @@ export const useStore = create<Store>((set, get) => ({
     if (persistence === 'local-draft' && userId) {
       const draft = draftForDoc(
         userId, doc, replacePristine ? current.serverVersion : null, undefined,
-        replacePristine ? null : doc,
+        replacePristine ? null : doc, replacePristine ? undefined : besideCanvasId,
       )
       const stored = writeCanvasDraft(draft)
       const visibleDraft = draftAfterStorageWrite(draft, stored)
@@ -4162,7 +4403,10 @@ export const useStore = create<Store>((set, get) => ({
       if (!stored.ok) get().pushToast(stored.error!, 'error')
     }
     const uid = get().currentUser?.id
-    if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), doc.id)
+      rememberCanvasOpenedAt(uid, doc.id)
+    }
     set({ view: 'canvas', firstRunChoice: false })
     get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
@@ -4174,6 +4418,21 @@ export const useStore = create<Store>((set, get) => ({
   setRequirements: (reqs) => {
     if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, requirements: reqs } }))
   },  // canvas pip deps; autosave persists
+  setExecutionBackend: (backend) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const normalized = backend?.trim() || undefined
+    if (get().doc.executionBackend === normalized) return
+    get().commit()
+    set((state) => ({ doc: { ...state.doc, executionBackend: normalized } }))
+  },
+  setResultRetention: (history) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    if ((get().doc.resultRetention?.history ?? 'inherit') === history) return
+    get().commit()
+    set((state) => ({
+      doc: { ...state.doc, resultRetention: { history } },
+    }))
+  },
   setParameters: (parameters) => {
     if (!roleCanEdit(get().canvasRole)) return 'You do not have permission to edit Canvas parameters.'
     const currentDoc = get().doc
@@ -4223,28 +4482,45 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   deleteFile: async (id) => {
+    const principalId = get().currentUser?.id ?? null
+    if (!principalId) {
+      get().pushToast('Your identity is not available yet', 'error')
+      return
+    }
     const targetRole = get().files.find((file) => file.id === id)?.role
       ?? (get().doc.id === id ? get().canvasRole : null)
     if (targetRole !== 'owner') {
       get().pushToast('Only the canvas owner can delete it', 'error')
       return
     }
-    // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)
-    const f = get().files.find((x) => x.id === id)
-    if (typeof window !== 'undefined' && !window.confirm(`Delete "${f?.name || 'this canvas'}"? This can't be undone.`)) return
-    let filesRefreshed = false
     try {
       await api.deleteCanvas(id)
-      filesRefreshed = await get().refreshFiles()
-    } catch { return } // do not navigate away from a Canvas whose deletion was not confirmed
+    } catch (error) {
+      if (get().currentUser?.id === principalId) {
+        const reason = error instanceof Error ? error.message : String(error)
+        get().pushToast(`Could not delete the Canvas: ${reason || 'request failed'}`, 'error')
+      }
+      return
+    }
+    // The successful DELETE is authoritative even when the follow-up list refresh is offline. Drop
+    // the stale card and edit role immediately so autosave cannot target a Canvas known to be gone.
+    if (get().currentUser?.id !== principalId) return
+    rememberRole(principalId, id, null)
+    set((state) => state.currentUser?.id !== principalId ? {} : {
+      files: state.files.filter((file) => file.id !== id),
+      ...(state.doc.id === id ? { canvasRole: null, agentOpen: false } : {}),
+    })
+    const filesRefreshed = await get().refreshFiles()
+    if (get().currentUser?.id !== principalId) return
     // only load a replacement (which navigates to the editor) if the deleted file was the one open
     // IN the editor; deleting from the Recents grid should just drop the card and stay in the shell.
     if (get().doc.id === id && get().view === 'canvas') {
       const next = get().files[0]?.id
-      if (next) await get().openFile(next)
+      if (next && await get().openFile(next)) return
+      if (get().currentUser?.id !== principalId || get().doc.id !== id || get().view !== 'canvas') return
       // Deleting the final Canvas must not manufacture a replacement. Reuse the complete first-run
       // choice only when the now-empty list and local-draft index were both read authoritatively.
-      else set({
+      set({
         view: 'workspace',
         firstRunChoice: filesRefreshed && get().localDrafts.length === 0,
       })
@@ -4271,7 +4547,11 @@ export const useStore = create<Store>((set, get) => ({
     ))
     if (!draft || !principalId) return false
     const role = draft.baseCanvasId === null ? 'owner' : cachedRole(principalId, draft.canvasId)
-    get().loadDoc(draft.doc, role)
+    // Local-only and conflict drafts have no authoritative server document to reattach against.
+    // Their graph remains inspectable, but server run/result recovery waits until a successful sync.
+    get().loadDoc(draft.doc, role, {
+      recoverServerState: draft.baseCanvasId !== null && draft.syncState !== 'conflict',
+    })
     set({
       currentDraftId: draft.draftId,
       serverVersion: draft.baseVersion,
@@ -4279,7 +4559,10 @@ export const useStore = create<Store>((set, get) => ({
       view: 'canvas',
     })
     if (!options?.skipViewportFit && draft.doc.nodes.length > 0) get().requestViewportFit(get().doc)
-    try { localStorage.setItem(OPEN_KEY(principalId), draft.canvasId) } catch { /* visible writes happen through the draft store */ }
+    try {
+      localStorage.setItem(OPEN_KEY(principalId), draft.canvasId)
+      rememberCanvasOpenedAt(principalId, draft.canvasId)
+    } catch { /* visible writes happen through the draft store */ }
     if (!roleCanEdit(role)) get().pushToast('Opened the local draft read-only because current edit access is not confirmed', 'error')
     return true
   },
@@ -4383,8 +4666,10 @@ export const useStore = create<Store>((set, get) => ({
 
     try {
       if (original.baseCanvasId === null) {
-        const created = await api.createCanvas(original.doc)
-        if (!created.ok || created.id !== original.canvasId) throw new Error('The hub returned an incompatible create result.')
+        const created = original.besideCanvasId
+          ? await api.createCanvas(original.doc, { besideCanvasId: original.besideCanvasId })
+          : await api.createCanvas(original.doc)
+        if (!created.ok || created.id !== original.canvasId) throw new Error('The server returned an incompatible create result.')
         if (created.created) {
           await finish(original.doc.version)
           return
@@ -4425,10 +4710,10 @@ export const useStore = create<Store>((set, get) => ({
       const conflict = error instanceof KernelError && (error.status === 404 || error.status === 409)
       const denied = error instanceof KernelError && (error.status === 401 || error.status === 403)
       const message = conflict
-        ? 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+        ? DRAFT_SYNC_CONFLICT_MESSAGE
         : denied
           ? 'Current access does not permit syncing this draft.'
-          : `Sync failed: ${error instanceof Error ? error.message : 'the hub is unreachable'}`
+          : `Sync failed: ${error instanceof Error ? error.message : 'Data Playground is unreachable'}`
       const failed: LocalCanvasDraft = {
         ...latest,
         syncState: conflict ? 'conflict' : denied ? 'error' : 'dirty',
@@ -4448,21 +4733,31 @@ export const useStore = create<Store>((set, get) => ({
         set({ accessDenied: true, canvasRole: null, agentOpen: false })
         void get().refreshFiles()
       }
-      get().pushToast(stored.ok ? message : stored.error!, 'error', conflict && stored.ok ? {
-        dedupeKey: `canvas-sync-conflict:${failed.draftId}`,
-        actions: [
-          ...(failed.baseCanvasId ? [{
-            label: 'Open server copy',
-            onClick: () => get().openFile(failed.baseCanvasId!, { serverCopy: true }),
-          }] : []),
-          {
-            label: 'Keep local draft as new Canvas',
-            onClick: () => get().forkLocalDraft(failed.draftId),
-          },
-        ],
-      } : undefined)
+      if (conflict && stored.ok) get().notifyLocalDraftConflict(failed.draftId)
+      else get().pushToast(stored.ok ? message : stored.error!, 'error')
       _draftSyncInFlight.delete(syncKey)
     }
+  },
+
+  notifyLocalDraftConflict: (draftId) => {
+    const draft = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === get().currentUser?.id
+    ))
+    if (draft?.syncState !== 'conflict') return
+    get().pushToast(DRAFT_SYNC_CONFLICT_MESSAGE, 'error', {
+      dedupeKey: draftSyncConflictKey(draft.draftId),
+      sticky: true,
+      actions: [
+        ...(draft.baseCanvasId ? [{
+          label: 'Open server copy',
+          onClick: () => get().openFile(draft.baseCanvasId!, { serverCopy: true }),
+        }] : []),
+        {
+          label: 'Keep local draft as new Canvas',
+          onClick: () => get().forkLocalDraft(draft.draftId),
+        },
+      ],
+    })
   },
 
   forkLocalDraft: async (draftId) => {
@@ -4495,6 +4790,7 @@ export const useStore = create<Store>((set, get) => ({
       localDrafts: replaceDraft(
         state.localDrafts.filter((draft) => draft.draftId !== original.draftId), fork,
       ),
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(original.draftId)),
     }))
     get().openLocalDraft(fork.draftId)
     await get().retryLocalDraft(fork.draftId)
@@ -4506,25 +4802,47 @@ export const useStore = create<Store>((set, get) => ({
       candidate.draftId === draftId && candidate.principalId === principalId
     ))
     if (!draft || !principalId) return
-    if (typeof window !== 'undefined' && !window.confirm(`Delete local draft “${draft.name}”? This can't be undone.`)) return
+    if (draft.syncState === 'syncing' || _draftSyncInFlight.has(`${principalId}:${draftId}`)) {
+      get().pushToast('Wait for this local draft to finish syncing before deleting it', 'info')
+      return
+    }
+    const wasOpen = get().doc.id === draft.canvasId && get().currentDraftId === draftId
+    const navigationToken = wasOpen ? startNavigation() : null
     const removed = deleteCanvasDraft(principalId, draftId)
     if (!removed.ok) {
       get().pushToast(removed.error!, 'error')
       return
     }
-    const wasOpen = get().doc.id === draft.canvasId && get().currentDraftId === draftId
     const inspectingServer = get().doc.id === draft.canvasId && get().currentDraftId === null
     set((state) => ({
       localDrafts: state.localDrafts.filter((candidate) => candidate.draftId !== draftId),
       currentDraftId: wasOpen ? null : state.currentDraftId,
       canvasRole: inspectingServer ? cachedRole(principalId, draft.canvasId) : state.canvasRole,
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(draftId)),
     }))
-    if (!wasOpen) return
-    if (draft.baseCanvasId && await get().openFile(draft.baseCanvasId)) return
+    if (!wasOpen || navigationToken === null) return
+    const stillOwnsDiscardNavigation = () => (
+      get().currentUser?.id === principalId
+      && ownsNavigation(navigationToken)
+      && get().doc.id === draft.canvasId
+      && get().currentDraftId === null
+    )
+    if (!stillOwnsDiscardNavigation()) return
+    if (draft.baseCanvasId) {
+      const openedBase = await get().openFile(draft.baseCanvasId, { navigationToken })
+      if (!stillOwnsDiscardNavigation() || openedBase) return
+    }
     const next = get().localDrafts[0]
-    if (next) get().openLocalDraft(next.draftId)
-    else if (get().files[0]) await get().openFile(get().files[0].id)
-    else await get().newFile()
+    if (next) get().openLocalDraft(next.draftId, { navigationToken })
+    else {
+      const fallback = get().files[0]
+      if (fallback) {
+        const openedFallback = await get().openFile(fallback.id, { navigationToken })
+        if (!stillOwnsDiscardNavigation() || openedFallback) return
+      }
+      if (!stillOwnsDiscardNavigation()) return
+      await get().newFile()
+    }
   },
 
   exportLocalDraft: (draftId) => {
@@ -4576,7 +4894,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   uploadDataset: async (file) => {
-    if (!get().kernelUp) { get().pushToast('Kernel offline — cannot upload a file', 'error'); return null }
+    if (!get().kernelUp) { get().pushToast('Offline — cannot upload a file', 'error'); return null }
     try {
       const t = await api.uploadFile(file)
       mergeIntoCatalog(set, [t])  // so the new dataset appears in pickers / the open canvas immediately
@@ -4603,9 +4921,13 @@ export const useStore = create<Store>((set, get) => ({
       const schemas = parameterBindings === undefined
         ? await api.schema(doc)
         : await api.schema(doc, undefined, undefined, parameterBindings)
-      if (seq === _schemaSeq) set({ schemas })
+      if (seq === _schemaSeq) set({ schemas, graphRefusals: {} })
     }
-    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline: keep last-known */ }
+    // A background metadata refresh must not interrupt opening the Canvas with a toast, so an
+    // invalid_graph refusal lands on the nodes it names instead.
+    catch (error) {
+      if (seq === _schemaSeq) set({ graphRefusals: nodeGraphRefusals(error) })
+    }
     // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
     try {
       const sizes = parameterBindings === undefined
@@ -4613,7 +4935,7 @@ export const useStore = create<Store>((set, get) => ({
         : await api.graphSizes(doc, undefined, parameterBindings)
       if (seq === _schemaSeq) set({ sizes })
     }
-    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline / no sources countable: keep last-known */ }
+    catch { /* offline, unavailable source, or unfinished sibling branch: keep last-known */ }
   },
 
   setAgentOpen: (v) => {
@@ -4644,12 +4966,14 @@ export const useStore = create<Store>((set, get) => ({
     await get().retryLocalDraft(draft.draftId)
   },
 
-  loadDoc: (doc, role = get().canvasRole) => {
+  loadDoc: (doc, role = get().canvasRole, options) => {
     _cfgEdit = { id: '', t: 0 }
-    // A canvas document is not execution authority. A queued/running badge saved in a snapshot can
-    // outlive its run, so settle it before the document is ever rendered. reattachRuns below may
-    // immediately replace these with the live run's authoritative per-node states.
-    const d = settleAnimatingDoc(doc)
+    // A canvas document is not execution authority. Any badge that claims a server-side result or
+    // run is checked before it is shown again; recovery below then installs readable retained
+    // results or reattaches a live run from the authoritative server state.
+    const d = options?.recoverServerState === false
+      ? doc
+      : prepareLoadedStatusDoc(doc)
     const agentLog = d.id === get().doc.id ? get().agentLog : []
     // Every loadDoc caller is installing a server response or a deliberately selected server
     // snapshot.  The subscriber observes a different object identity, so it needs this synchronous
@@ -4673,16 +4997,18 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {},
-        schemas: {}, sizes: {},
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, graphRun: null, profileJobs: {},
+        schemas: {}, sizes: {}, graphRefusals: {},
         numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {
       _settlingLoadedDoc = false
     }
-    recoverRetainedResultBindings(get, set, d)
-    reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
+    if (options?.recoverServerState !== false) {
+      recoverCanvasResults(get, set, d)
+      reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
+    }
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
 
@@ -4886,16 +5212,6 @@ const _PERNODE_STATUS: Record<string, NodeStatus> = {
   queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
 }
 
-// A user-facing toast message from a runner's raw error: drop the engine's exception-class noise
-// ("BinderException: Binder Error: …") and the internal "Candidate bindings" line, keeping the
-// "at '<node>':" attribution + the human "Hint:" line. The full raw error still shows in the run panel.
-function cleanRunError(raw?: string | null): string {
-  if (!raw) return 'Run failed'
-  const lines = raw.split('\n').map((l) => l.trim()).filter((l) => l && !/^candidate bindings/i.test(l))
-  if (!lines.length) return 'Run failed'
-  lines[0] = lines[0].replace(/((?:at '[^']+': )?)[A-Za-z]*(?:Exception|Error): (?:[A-Za-z]+ Error: )?/, '$1')
-  return lines.join(' — ')
-}
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
 // a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
 // giving up because the kernel became unreachable. Without it an intermediate node animates forever.
@@ -4907,6 +5223,20 @@ function settleAnimatingDoc(doc: CanvasDoc): CanvasDoc {
       return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
     }
     return n
+  })
+  return changed ? { ...doc, nodes } : doc
+}
+
+function prepareLoadedStatusDoc(doc: CanvasDoc): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((node) => {
+    if (node.data.status !== 'latest'
+        && node.data.status !== 'queued'
+        && node.data.status !== 'running'
+        && node.data.status !== 'failed'
+        && node.data.status !== 'unknown') return node
+    changed = true
+    return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
   })
   return changed ? { ...doc, nodes } : doc
 }
@@ -4937,48 +5267,72 @@ function applyPerNodeStatus(
   })
 }
 
-function recoverRetainedResultBindings(
+function recoverCanvasResults(
   get: () => Store,
   set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
   doc: CanvasDoc,
 ) {
   const generation = ++_retainedResultRecoveryGeneration
   const userId = get().currentUser?.id
-  for (const node of doc.nodes) {
-    if (node.type !== 'transform' || node.data.status !== 'latest'
-        || targetParameterDeclarations(doc, node.id).length === 0) continue
-    const planIdentity = previewPlanIdentity(doc, node.id, 'out')
-    const initialRun = get().runs[node.id]
-    // A preview binding is local user intent, not a full-result identity. Preserve it and let the
-    // server validate it explicitly during schema refresh; recover only a genuinely missing form.
-    if (initialRun?.parameterBindings !== undefined) continue
-    void api.retainedResult(doc, node.id, 'out').then((identity) => {
-      let installed = false
-      set((state) => {
-        const latestNode = state.doc.nodes.find((candidate) => candidate.id === node.id)
-        if (
-          generation !== _retainedResultRecoveryGeneration
+  const structure = structSig(doc)
+  void api.currentResults(doc).then((recovery) => {
+    let installedBindings = false
+    set((state) => {
+      if (generation !== _retainedResultRecoveryGeneration
           || state.doc.id !== doc.id
           || state.currentUser?.id !== userId
-          || latestNode?.data.status !== 'latest'
-          || previewPlanIdentity(state.doc, node.id, 'out') !== planIdentity
-          || state.runs[node.id] !== undefined
-          || identity.output.nodeId !== node.id
-          || identity.output.portId !== 'out'
-          || !Array.isArray(identity.parameterBindings)
-        ) return {}
-        installed = true
-        return { runs: { ...state.runs, [node.id]: {
-          phase: 'idle' as const,
-          parameterBindings: identity.parameterBindings,
-        } } }
+          || structSig(state.doc) !== structure) return {}
+      const latest = new Set(recovery.latestNodeIds)
+      const failed = new Set(recovery.failedNodeIds)
+      const unknown = new Set(recovery.unknownNodeIds ?? [])
+      let nodesChanged = false
+      const nodes = state.doc.nodes.map((node) => {
+        if (node.data.status !== 'checking') return node
+        const status: NodeStatus = failed.has(node.id)
+          ? 'failed'
+          : latest.has(node.id)
+            ? 'latest'
+            : unknown.has(node.id)
+              ? 'unknown' : 'stale'
+        nodesChanged = true
+        return { ...node, data: { ...node.data, status } }
       })
-      if (installed) void get().refreshSchemas()
-    }).catch(() => {
-      // Missing/stale/temporarily unavailable retained state remains unknown. Schema recovery and
-      // the result panel use the same server contract and may retry independently.
+      let runs = state.runs
+      for (const identity of recovery.results) {
+        const nodeId = identity.output.nodeId
+        const node = nodes.find((candidate) => candidate.id === nodeId)
+        if (node?.type !== 'transform'
+            || targetParameterDeclarations(state.doc, nodeId).length === 0
+            || runs[nodeId]?.parameterBindings !== undefined
+            || !Array.isArray(identity.parameterBindings)) continue
+        if (runs === state.runs) runs = { ...state.runs }
+        runs[nodeId] = {
+          ...(runs[nodeId] ?? { phase: 'idle' as const }),
+          parameterBindings: identity.parameterBindings,
+        }
+        installedBindings = true
+      }
+      return {
+        ...(nodesChanged ? { doc: { ...state.doc, nodes } } : {}),
+        ...(runs !== state.runs ? { runs } : {}),
+      }
     })
-  }
+    if (installedBindings) void get().refreshSchemas()
+  }).catch(() => {
+    set((state) => {
+      if (generation !== _retainedResultRecoveryGeneration
+          || state.doc.id !== doc.id
+          || state.currentUser?.id !== userId
+          || structSig(state.doc) !== structure) return {}
+      let changed = false
+      const nodes = state.doc.nodes.map((node) => {
+        if (node.data.status !== 'checking') return node
+        changed = true
+        return { ...node, data: { ...node.data, status: 'unknown' as NodeStatus } }
+      })
+      return changed ? { doc: { ...state.doc, nodes } } : {}
+    })
+  })
 }
 
 // On canvas open, recover normal active runs plus the latest durable profile per node/plan. Profiles
@@ -5232,6 +5586,12 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         continue
       }
       const nodeId = st.targetNodeId
+      if (current() && !nodeId && !get().graphRun) {  // the targetless "Rerun all" pass owns no node
+        set({ graphRun: { canvasId, runId: st.runId, status: st } })
+        applyPerNodeStatus(set, st.perNode)
+        pollGraphRun(get, set, canvasId, st.runId)
+        continue
+      }
       if (!current() || !nodeId || !get().doc.nodes.some((node) => node.id === nodeId)) continue
       set((s: Store) => {
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
@@ -5471,6 +5831,111 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
 
 const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>()
 
+/** Decisions a single targetless run cannot own: a Write needs its own destination admission and
+ * confirmation, a canvas parameter needs its binding panel, and named multi-output publication is
+ * declared against one target. */
+function requiresTargetedDispatch(doc: CanvasDoc, sinks: CanvasNode[]): boolean {
+  return (doc.parameters?.length ?? 0) > 0
+    || doc.nodes.some((node) => node.type === 'write' && !isDisabled(doc, node.id))
+    || doc.nodes.some((node) => {
+      if (node.parentId || node.type === 'source' || node.type === 'sql' || node.type === 'section'
+          || isDisabled(doc, node.id)) return false
+      return Boolean(getSpec(node.type)?.inputs.length) && !nodeRunnable(doc, node.id)
+    })
+    || sinks.some((node) => nodeOutputs(node).length > 1)
+}
+
+function startGraphRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  fallbackToSinks: () => void,
+) {
+  const doc = get().doc
+  set({ graphRun: { canvasId: doc.id } })
+  void api.run(doc, undefined, false, globalThis.crypto.randomUUID()).then((status) => {
+    if (get().graphRun?.canvasId !== doc.id) return
+    set({ graphRun: { canvasId: doc.id, runId: status.runId, status } })
+    applyPerNodeStatus(set, status.perNode)
+    pollGraphRun(get, set, doc.id, status.runId)
+  }).catch((e: unknown) => {
+    set({ graphRun: null })
+    // The size gate is a per-target decision with a per-target card; hand the click back to it.
+    if (e instanceof KernelError && e.code === 'run_confirmation_required') { fallbackToSinks(); return }
+    const message = (e as Error).message || 'Could not start the run'
+    if (!surfaceInvalidGraphRefusal(get(), e)) get().pushToast(presentRunError(message).summary, 'error')
+  })
+}
+
+/** A completed targetless pass measures every step, so each executed node carries its own readout. */
+function applyPerNodeResults(
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  perNode: RunStatus['perNode'],
+  placement: Placement,
+) {
+  const results = new Map<string, LastRun>()
+  for (const step of perNode ?? []) {
+    if (step.status !== 'done') continue
+    results.set(step.nodeId, {
+      ...(step.rows != null ? { rows: step.rows } : {}), ms: step.ms ?? 0, placement,
+    })
+  }
+  if (!results.size) return
+  set((s) => ({ doc: { ...s.doc, nodes: s.doc.nodes.map((node) => {
+    const lastRun = results.get(node.id)
+    return lastRun ? { ...node, data: { ...node.data, lastRun } } : node
+  }) } }))
+}
+
+function pollGraphRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  canvasId: string, runId: string,
+) {
+  const token = Symbol(runId)
+  _polling.set(runId, { token })
+  const owns = () => _polling.get(runId)?.token === token && get().graphRun?.runId === runId
+  const stop = () => { if (_polling.get(runId)?.token === token) _polling.delete(runId) }
+  let fails = 0
+  const tick = async () => {
+    if (!owns() || get().doc.id !== canvasId) { stop(); return }
+    let status: RunStatus
+    try {
+      status = await api.runStatus(runId)
+      fails = 0
+    } catch {
+      if (++fails <= 6) { setTimeout(tick, 800); return }
+      set({ graphRun: null })
+      settleAnimatingNodes(set)
+      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
+      stop()
+      return
+    }
+    if (!owns()) return
+    set((s) => ({ graphRun: { ...s.graphRun!, status } }))
+    applyPerNodeStatus(set, status.perNode)
+    if (status.status !== 'done' && status.status !== 'failed' && status.status !== 'cancelled') {
+      setTimeout(tick, 300)
+      return
+    }
+    set({ graphRun: null })
+    stop()
+    if (status.status === 'done') {
+      applyPerNodeResults(set, status.perNode, status.placement)
+      void get().refreshSchemas()
+      void get().refreshCatalog()
+    }
+    settleAnimatingNodes(set)
+    if (status.status === 'failed') {
+      const failed = status.perNode?.find((step) => step.status === 'failed')
+      const node = get().doc.nodes.find((item) => item.id === failed?.nodeId)
+      get().pushToast(presentRunError(status.error, {
+        nodeTitle: node?.data.title, config: node?.data.config,
+      }).summary, 'error')
+    }
+  }
+  setTimeout(tick, 200)
+}
+
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
                  nodeId: string, runId: string, reattachGeneration?: number,
                  writeOutcomeAdmission?: WriteAdmission) {
@@ -5505,7 +5970,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'idle' as const }), phase: 'idle' } } }))
       get().updateData(nodeId, { status: 'stale' })
       settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
-      get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
+      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
       stopPolling()
       return
     }
@@ -5538,7 +6003,10 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         writeAdmission: undefined, writeSubmissionId: undefined,
         writeAdmissionFingerprint: undefined,
       } } }))
-      if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
+      if (status.status === 'failed') get().pushToast(presentRunError(status.error, {
+        nodeTitle: target?.data.title,
+        config: target?.data.config,
+      }).summary, 'error')
       const g = get()
       const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
       g.updateData(nodeId, {

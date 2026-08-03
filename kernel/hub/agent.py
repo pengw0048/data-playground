@@ -382,7 +382,9 @@ def run_agent(
     """Run the tool-use loop; return {graph, transcript, summary}. `model`/`policy` injected in tests."""
     config = _agent_config()
     if _agent is None:
-        raise RuntimeError("agent extra not installed: from a clone, run `uv pip install -e 'kernel[agent]'`")
+        raise RuntimeError(
+            "the agent extra is not installed: from a clone, "
+            "run uv pip install -e 'kernel[agent]'")
     from pydantic_ai.usage import UsageLimits
 
     cfg_model, _, cfg_base = config

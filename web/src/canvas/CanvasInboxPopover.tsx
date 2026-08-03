@@ -130,8 +130,8 @@ export function CanvasInboxPopover() {
   const accessibleLabel = count == null
     ? 'Inbox'
     : count === 0
-      ? 'Inbox, no unread outcomes'
-      : `Inbox, ${count} unread outcomes`
+      ? 'Inbox'
+      : `Inbox, ${count} unread`
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -165,7 +165,7 @@ export function CanvasInboxPopover() {
         <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
           <div className="min-w-0 flex-1">
             <div className="text-[13px] font-semibold text-foreground">Inbox</div>
-            <div className="text-[10.5px] text-muted-foreground">Recent unread outcomes</div>
+            <div className="text-[10.5px] text-muted-foreground">Recent unread</div>
           </div>
           <Button
             variant="ghost"

@@ -16,6 +16,7 @@ import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCell
 import {
   editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
 } from '../components/PreviewPresentation'
+import { WhitespaceText } from '../components/WhitespaceText'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
   ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
@@ -58,6 +59,8 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
+  const isMetric = node?.type === 'metric'
+  const isChart = node?.type === 'chart'
   const outputPorts = node ? nodeOutputs(node) : []
   const [portSelection, setPortSelection] = useState<{ nodeId: string; portId?: string }>(() => ({
     nodeId, portId: preview?.portId,
@@ -167,12 +170,16 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     parameterBindingsKnown, planIdentity, bindingsIdentity,
   ])
   useEffect(() => {
+    // A Chart is a full-input visualization. Once a saved output exists, opening the
+    // panel reads that artifact directly instead of issuing a preview request that can only refuse.
+    if (isChart && selectedOutput?.uri) return
     if (editorPreview?.autoLoad !== false
         && (!preview || preview.portId !== requestPortId)) {
       previewAction(nodeId, 0, requestPortId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad])
+  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad,
+    isChart, selectedOutput?.uri])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
@@ -233,6 +240,30 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     </>
   )
 
+  const artifactPresentation: ArtifactPresentation | undefined = isChart
+    ? {
+        kind: 'chart',
+        type: String(node?.data.config.chartType ?? 'bar'),
+        xLabel: String(node?.data.config.x || 'All rows'),
+        grouped: node?.data.config.agg !== 'none',
+        yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
+          ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
+          : (node?.data.config.y ?? 'y')),
+      }
+    : isMetric ? { kind: 'metric' } : undefined
+
+  // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
+  // toggle or let an old preview error cover the last successful full result.
+  if (!editorPreview && isChart && selectedOutput?.uri) {
+    return withOutputPorts(<FullResult uri={selectedOutput.uri}
+      total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
+      runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+      publicationKind={selectedOutput.publicationKind}
+      name={String(node?.data.title || node?.id || 'result')}
+      presentation={artifactPresentation} fillAvailableHeight={fillAvailableHeight}
+      onRunUnavailable={() => requestRun(nodeId)} currentResult />)
+  }
+
   if (!preview || preview.portId !== requestPortId) {
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
@@ -272,19 +303,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
-  const isMetric = node?.type === 'metric'
-  const isChart = node?.type === 'chart'
-  const artifactPresentation: ArtifactPresentation | undefined = isChart
-    ? {
-        kind: 'chart',
-        type: String(node?.data.config.chartType ?? 'bar'),
-        xLabel: String(node?.data.config.x ?? 'x'),
-        grouped: node?.data.config.agg !== 'none',
-        yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
-          ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
-          : (node?.data.config.y ?? 'y')),
-      }
-    : isMetric ? { kind: 'metric' } : undefined
   const resultModeToggle = selectedOutput?.uri
     ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
         fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
@@ -363,7 +381,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const canTryNext = res.hasMore === true || (res.hasMore == null && res.rows.length > 0)
 
   return withOutputPorts(
-    <div className="dp-dark text-foreground">
+    <div className={cn('dp-dark text-foreground', fillAvailableHeight && 'flex min-h-0 flex-1 flex-col')}>
       {/* tab bar + row-count */}
       <div className="flex items-center gap-1.5 border-b border-border px-[11px] py-2">
         {!special && detail == null && tabs.map((t) => (
@@ -428,7 +446,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       ) : isMetric ? (
         <MetricValue rows={res.rows} />
       ) : detail != null && res.rows[detail] ? (
-        <RowDetail columns={resultColumns} row={res.rows[detail]} />
+        <RowDetail columns={resultColumns} row={res.rows[detail]} fillAvailableHeight={fillAvailableHeight} />
       ) : activeTab === 'rows' ? (
         <>
           {/* an empty result over a PREVIEWED SAMPLE isn't necessarily 'nothing matches' — a selective
@@ -439,11 +457,13 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
               run this node to check the full dataset.
             </div>
           )}
-          <RowsTable columns={resultColumns} rows={res.rows} onRowClick={setDetail} />
+          <RowsTable columns={resultColumns} rows={res.rows} onRowClick={setDetail}
+            fillAvailableHeight={fillAvailableHeight} />
         </>
       ) : activeTab === 'stats' ? (
         <StatsView key={`${nodeId}:${selectedPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
-          nodeId={nodeId} portId={selectedPortId} multiOutput={outputPorts.length > 1} />
+          nodeId={nodeId} portId={selectedPortId} multiOutput={outputPorts.length > 1}
+          fillAvailableHeight={fillAvailableHeight} />
       ) : (
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
@@ -637,9 +657,15 @@ function ResultModeToggle({ mode, onChange, fullLabel = 'Full result' }: {
 
 const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 3 })
 
+// JSON has no number form for non-finite floats, so the wire carries them as these tokens.
+const NON_FINITE_TOKENS = new Set(['NaN', 'Infinity', '-Infinity'])
+const isNonFiniteToken = (v: unknown): v is string => typeof v === 'string' && NON_FINITE_TOKENS.has(v)
+
 // Per-column stats over the previewed sample (null%/distinct/min/max/mean). Whole-dataset stats are a
 // cancellable job: every row is covered, while distinct remains approximate.
-function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: string; multiOutput: boolean }) {
+function StatsView({ nodeId, portId, multiOutput, fillAvailableHeight = false }: {
+  nodeId: string; portId?: string; multiOutput: boolean; fillAvailableHeight?: boolean
+}) {
   const doc = useStore((s) => s.doc)
   const preview = useStore((s) => s.previews[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -751,7 +777,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
     }
     const res = job.identityVerified === false ? undefined : job.status?.profile
     if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState title="Full profile failed" reason="full profile completed without statistics" onRetry={canEdit ? () => prepareFullProfile(nodeId, portId) : undefined} /></div>
-    return <ProfileTable res={res} toggle={toggle} />
+    return <ProfileTable res={res} toggle={toggle} fillAvailableHeight={fillAvailableHeight} />
   }
   if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>
   if (st.err) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={st.err} onRetry={loadSample} /></div>
@@ -766,7 +792,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
         title="Sample profile unavailable"
         reason={res.reason ?? 'Statistics cannot be estimated from the current preview.'}
         modeToggle={toggle} />
-  return <ProfileTable res={res} toggle={toggle} />
+  return <ProfileTable res={res} toggle={toggle} fillAvailableHeight={fillAvailableHeight} />
 }
 
 function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
@@ -776,7 +802,7 @@ function FullProfilePrompt({ toggle, onEstimate, disabled = false }: {
     <div className="px-5 py-6 text-center">
       <div className="mb-1 text-[12px] font-semibold text-foreground">Whole-dataset profile</div>
       <p className="mb-3 text-[11px] text-muted-foreground">
-        {disabled ? 'Editors can estimate and start full-dataset profile jobs.' : 'Estimate the scan first. Starting it is a separate choice.'}
+        {disabled ? 'Editors can estimate and start full-dataset profile jobs.' : 'Estimate the scan first.'}
       </p>
       <div className="flex items-center justify-center gap-2">
         <button onClick={onEstimate} disabled={disabled}
@@ -868,7 +894,9 @@ function FullProfileProgress({ job, toggle, onCancel }: {
   )
 }
 
-function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }) {
+function ProfileTable({ res, toggle, fillAvailableHeight = false }: {
+  res: ProfileResult; toggle: ReactNode; fillAvailableHeight?: boolean
+}) {
   const pct = (n: number) => (res.rowCount ? Math.round((n / res.rowCount) * 100) : 0)
   const wholeDataset = res.completeness === 'complete'
   const previewSample = res.completeness === 'sample'
@@ -876,7 +904,7 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
   const scopeLabel = completeSample ? 'Complete sampled result' : wholeDataset ? 'Whole dataset' : previewSample ? 'Preview sample' : 'Profile scope unknown'
   const rowVerb = wholeDataset ? 'scanned' : previewSample ? 'inspected' : 'reported'
   return (
-    <div className="max-h-[360px] overflow-auto">
+    <div className={cn('overflow-auto', fillAvailableHeight ? 'min-h-0 flex-1' : 'max-h-[360px]')}>
       <div className="flex items-center justify-between px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
         <div>
           <div className="font-medium text-foreground">
@@ -890,7 +918,7 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
               ? 'All rows were scanned; approximate distinct counts are marked ≈.'
               : previewSample
                 ? 'All metrics describe this preview sample only; approximate counts are marked ≈.'
-                : 'The kernel did not report whether these statistics cover a sample or the whole dataset.'}
+                : 'Data Playground did not report whether these statistics cover a sample or the whole dataset.'}
           </div>
           {res.sampleProvenance && <SampleProvenanceSummary provenance={res.sampleProvenance} />}
         </div>
@@ -915,7 +943,10 @@ function ProfileTable({ res, toggle }: { res: ProfileResult; toggle: ReactNode }
               </td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.min ?? ''}>{c.min ?? '—'}</td>
               <td className="max-w-[120px] truncate px-2 py-1 text-muted-foreground" title={c.max ?? ''}>{c.max ?? '—'}</td>
-              <td className="px-2 py-1 text-muted-foreground">{c.mean != null ? fmtNum(c.mean) : '—'}</td>
+              <td className="px-2 py-1 text-muted-foreground">
+                {c.mean == null ? '—' : typeof c.mean === 'number' ? fmtNum(c.mean)
+                  : <span className="font-semibold text-amber-700 dark:text-amber-300">{c.mean}</span>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -929,9 +960,11 @@ export function SampleProvenanceSummary({ provenance }: { provenance: SampleProv
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
-function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<string, unknown> }) {
+export function RowDetail({ columns, row, fillAvailableHeight = false }: {
+  columns: ColumnSchema[]; row: Record<string, unknown>; fillAvailableHeight?: boolean
+}) {
   return (
-    <div className="max-h-[440px] overflow-auto py-1">
+    <div className={cn('overflow-auto py-1', fillAvailableHeight ? 'min-h-0 flex-1' : 'max-h-[440px]')}>
       {columns.map((c) => (
         <div key={c.name} className="flex gap-2.5 border-b border-border px-3 py-2">
           <div className="w-[130px] flex-[0_0_130px]">
@@ -944,7 +977,9 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
                 mediaKind={c.mediaKind} viewport="detail" /></div>
             )}
             <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
-              {row[c.name] == null ? '·' : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
+              {row[c.name] == null ? '·'
+                : typeof row[c.name] === 'string' ? <WhitespaceText value={row[c.name] as string} />
+                : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
             </div>
           </div>
         </div>
@@ -1045,7 +1080,7 @@ function ExportCluster({
   )
 }
 
-function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
+export function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void
   fillAvailableHeight?: boolean
 }) {
@@ -1089,6 +1124,9 @@ function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
 
 function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value == null) return <span className="text-muted-foreground/60">·</span>
+  if (isNonFiniteToken(value) && isNumericCol(col.type)) {
+    return <span className="font-semibold text-amber-700 dark:text-amber-300">{value}</span>
+  }
   if (col.capabilities.includes('media') && canRenderDirectMedia(value, col.mediaKind)) {
     return <MediaCellRenderer column={col.name} value={value} mediaKind={col.mediaKind} viewport="compact" />
   }
@@ -1101,6 +1139,7 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>
   if (typeof value === 'object') return <span className="dp-mono">{JSON.stringify(value)}</span>  // struct/map — not [object Object]
+  if (typeof value === 'string') return <WhitespaceText value={value} />
   return <span>{String(value)}</span>
 }
 
@@ -1146,13 +1185,24 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
   const y0 = yPix(Math.min(Math.max(0, yMin), yMax))  // 0 clamped into the plotted range → the baseline row
   const numX = pts.every((p) => typeof p.x === 'number')
   const xs = pts.map((p) => Number(p.x)), xMin = Math.min(...xs), xMax = Math.max(...xs), xSpan = xMax - xMin || 1
-  const xPix = (i: number) => (type === 'scatter' && numX)
-    ? padL + ((xs[i] - xMin) / xSpan) * plotW
-    : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
-  const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01) ? v.toExponential(1) : (Math.round(v * 100) / 100).toString())
+  const bandW = plotW / pts.length
+  const xPix = (i: number) => type === 'bar'
+    ? padL + (i + 0.5) * bandW
+    : (type === 'scatter' && numX)
+      ? padL + ((xs[i] - xMin) / xSpan) * plotW
+      : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
+  const fmt = (v: number) => new Intl.NumberFormat(undefined, {
+    notation: Math.abs(v) >= 1_000 ? 'compact' : 'standard',
+    maximumFractionDigits: Math.abs(v) < 0.01 ? 3 : 1,
+  }).format(v)
   const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
-  const barW = Math.max(2, (plotW / pts.length) * 0.7)
+  // Bars occupy the centre of an ordinal band. A point scale puts the first and last centres on the
+  // plot boundary, clipping both bars; cap the minimum width to the band so dense charts stay inside.
+  const barW = Math.min(bandW, Math.max(1, bandW * 0.72))
   const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+  const yTicks = yMax === yMin
+    ? [yMin]
+    : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
   const unit = grouped ? 'group' : 'point'
   const units = pts.length === 1 ? unit : `${unit}s`
   const scopeSummary = completeness === 'capped'
@@ -1162,25 +1212,33 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
       : null
   const ariaScope = completeness === 'capped'
     ? `showing ${pts.length} capped ${units}`
-    : scope === 'preview' ? `${units}, preview sample` : 'retained result'
+    : scope === 'preview' ? `${units}, preview sample` : 'saved result'
 
   return (
     <div className="p-3">
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart, ${ariaScope}`}>
-        {/* y axis: zero/baseline + min/max labels */}
+        {/* y axis: labelled grid plus the zero baseline when it is in range */}
         <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
-        <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="hsl(var(--border))" />
-        {[yMax, yMin].map((v, k) => (
-          <text key={k} x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10" fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+        {yTicks.map((v, index) => (
+          <g key={index}>
+            <line x1={padL} y1={yPix(v)} x2={W - padR} y2={yPix(v)}
+              stroke="hsl(var(--border))" strokeOpacity={index === 0 ? 1 : 0.55} />
+            <text x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10"
+              fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+          </g>
         ))}
         {(type === 'bar') && pts.map((p, i) => (
           <rect key={i} x={xPix(i) - barW / 2} y={Math.min(yPix(p.y), y0)} width={barW}
-            height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85} />
+            height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85}>
+            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
+          </rect>
         ))}
         {(type === 'area') && <polygon points={`${padL},${y0} ${line} ${xPix(pts.length - 1)},${y0}`} fill="hsl(var(--primary))" opacity={0.2} />}
         {(type === 'line' || type === 'area') && <polyline points={line} fill="none" stroke="hsl(var(--primary))" strokeWidth={1.75} />}
         {(type === 'scatter' || type === 'line' || type === 'area') && pts.map((p, i) => (
-          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85} />
+          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85}>
+            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
+          </circle>
         ))}
         {/* x tick labels */}
         {tickIdx.map((i) => (
@@ -1188,11 +1246,14 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
             {String(pts[i]?.x).slice(0, 10)}
           </text>
         ))}
+        <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
+          fill="hsl(var(--muted-foreground))" fontWeight="600"
+          transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
         <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
-      <div className="mt-1 text-center text-[10.5px] text-muted-foreground">
-        {yLabel} vs {xLabel}{scopeSummary && <> · {scopeSummary}</>}
-      </div>
+      {scopeSummary && (
+        <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{scopeSummary}</div>
+      )}
       {omitted > 0 && (
         <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
           {omittedMessage}
@@ -1322,7 +1383,6 @@ export function FullResult({
   const previousOffsets = useRef<number[]>([])
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
-  const [technicalOpen, setTechnicalOpen] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
   const pageSize = presentation?.kind === 'chart' ? CHART_DISPLAY_LIMIT : PAGE
   const publishedDataset = publicationKind === 'catalog'
@@ -1335,7 +1395,6 @@ export function FullResult({
   useEffect(() => {
     previousOffsets.current = []
     setOffset(0)
-    setTechnicalOpen(false)
   }, [uri, runId, nodeId, portId])
   useEffect(() => {
     let live = true
@@ -1361,12 +1420,12 @@ export function FullResult({
       // Keep the inert frame for the page lifetime. Removing it on a timer can cancel a slow native
       // artifact stream; one tiny frame per user-requested download is the safer trade-off.
       pushToast(
-        `Full-result artifact download requested${reportedTotal == null ? ' · row count unknown.' : ` · ${reportedTotal.toLocaleString()} rows.`}`,
+        `Download started${reportedTotal == null ? '.' : ` · ${reportedTotal.toLocaleString()} rows.`}`,
         'info',
       )
     } catch (error) {
       const reason = error instanceof Error && error.message ? error.message : String(error)
-      pushToast(`Could not start full-result export: ${reason}`, 'error')
+      pushToast(`Couldn’t start download: ${reason}`, 'error')
     } finally {
       setExporting(false)
     }
@@ -1377,30 +1436,15 @@ export function FullResult({
       {exporting ? 'Preparing export…' : 'Export all rows'}
     </Button>
   ) : undefined
-  const technicalTrigger = hasRunIdentity ? (
-    <button type="button" aria-label="Technical details" aria-expanded={technicalOpen}
-      onClick={() => setTechnicalOpen((open) => !open)}
-      className="shrink-0 rounded px-1 py-0.5 text-[10.5px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
-      Details
-    </button>
-  ) : undefined
-  const technicalPanel = hasRunIdentity && technicalOpen ? (
-    <FullResultEvidence runId={runId!} nodeId={nodeId!} portId={portId!}
-      state={publishedDataset ? 'published' : 'committed'} />
-  ) : undefined
-  const technicalChrome = hasRunIdentity ? (
-    <>
-      <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-[11px] py-2">
-        {modeToggle}
-        {technicalTrigger}
-      </div>
-      {technicalPanel}
-    </>
+  const modeChrome = hasRunIdentity ? (
+    <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-[11px] py-2">
+      {modeToggle}
+    </div>
   ) : undefined
 
   if (!hasRunIdentity) return (
-    <FullResultMessage title={`${viewLabel} identity unavailable`}
-      reason="This history entry has no durable run identity, so the kernel cannot verify which output to read. Run the node again to create a verifiable result."
+    <FullResultMessage title={`${viewLabel} unavailable`}
+      reason="This older run did not record which saved result to open. Run this step again to create a result you can reopen."
       modeToggle={modeToggle} />
   )
   const runAction = onRunUnavailable ? (
@@ -1409,23 +1453,23 @@ export function FullResult({
     </Button>
   ) : undefined
 
-  if (err) return <ArtifactUnavailable error={err} chrome={technicalChrome}
+  if (err) return <ArtifactUnavailable error={err} chrome={modeChrome}
     label={viewLabel} action={exportAction} missingAction={runAction}
     onRetry={() => setRetry((n) => n + 1)} currentResult={currentResult} />
   if (!data) return <div className="dp-dark text-foreground">
-    {technicalChrome}
+    {modeChrome}
     <Skeleton />
   </div>
   if (data.error) return (
     <FullResultMessage title={`Couldn’t read ${viewLabel.toLowerCase()}`}
-      reason={data.reason ?? 'The kernel reported an error while reading this run output.'}
-      chrome={technicalChrome} action={exportAction}
+      reason={data.reason ?? 'Data Playground reported an error while reading this run output.'}
+      chrome={modeChrome} action={exportAction}
       onRetry={() => setRetry((n) => n + 1)} />
   )
   if (data.notPreviewable) return (
     <FullResultMessage title={`${viewLabel} cannot be previewed`}
-      reason={data.reason ?? 'This artifact adapter does not provide a bounded interactive preview.'}
-      chrome={technicalChrome} action={exportAction} />
+      reason={data.reason ?? 'This output can’t be previewed here.'}
+      chrome={modeChrome} action={exportAction} />
   )
   const cols = (data.columns ?? []) as ColumnSchema[]
   const rows = data.rows ?? []
@@ -1449,7 +1493,6 @@ export function FullResult({
             {' · '}{reportedTotal == null ? 'row count unknown' : `${reportedTotal.toLocaleString()} ${reportedTotal === 1 ? 'row' : 'rows'}`}
           </span>
           {modeToggle}
-          {technicalTrigger}
           {detail != null && (
             <button onClick={() => setDetail(null)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-semibold text-primary">
               <Icon name="chevronLeft" size={12} /> Row {offset + detail + 1}
@@ -1479,7 +1522,6 @@ export function FullResult({
           </div>
         )}
       </div>
-      {technicalPanel}
       {(data.completeness === 'capped' || data.limitScope || data.limitReason || data.sampleProvenance) && (
         <DataScopeBanner data={{ ...data, rowCount: reportedTotal }} offset={offset}
           unit={presentation?.kind === 'chart' ? (presentation.grouped ? 'groups' : 'points') : 'rows'}
@@ -1496,25 +1538,6 @@ export function FullResult({
             : <RowsTable columns={cols} rows={rows} onRowClick={setDetail}
               fillAvailableHeight={fillAvailableHeight} />}
     </div>
-  )
-}
-
-function FullResultEvidence({ runId, nodeId, portId, state }: {
-  runId: string
-  nodeId: string
-  portId: string
-  state: 'committed' | 'published'
-}) {
-  return (
-    <dl data-testid="full-result-technical-details"
-      className="grid min-w-0 grid-cols-[44px_minmax(0,1fr)] gap-x-2 gap-y-1 border-b border-border bg-muted/20 px-[11px] py-2 text-[10.5px] text-muted-foreground">
-      <dt className="font-medium text-foreground">Run</dt>
-      <dd className="dp-mono min-w-0 break-all">{runId}</dd>
-      <dt className="font-medium text-foreground">Output</dt>
-      <dd className="dp-mono min-w-0 break-all">{nodeId}:{portId}</dd>
-      <dt className="font-medium text-foreground">State</dt>
-      <dd>{state}</dd>
-    </dl>
   )
 }
 

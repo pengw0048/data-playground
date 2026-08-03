@@ -39,6 +39,18 @@ describe('existing node locator', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
+  it('accepts older saved nodes that have no run status', () => {
+    const legacyNode = node({
+      id: 'legacy-source', type: 'source',
+      data: { title: 'Imported source', config: {} } as CanvasNode['data'],
+    })
+
+    expect(findExistingNodes([legacyNode], '').results.map((result) => result.node.id)).toEqual(['legacy-source'])
+    expect(findExistingNodes([legacyNode], 'imported').results[0].labels).toEqual([])
+    render(<ExistingNodeLocator nodes={[legacyNode]} onPick={vi.fn()} onClose={vi.fn()} />)
+    expect(screen.getByRole('option')).toHaveTextContent('Imported source')
+  })
+
   it('retains and renders only the best 100 results while still reporting the full match count', () => {
     const nodes = [
       ...Array.from({ length: 100 }, (_, index) => node({ id: `node-${index}`, data: { title: `Target ${index}`, status: 'draft', config: {} } })),

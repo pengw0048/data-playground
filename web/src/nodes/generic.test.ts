@@ -12,6 +12,16 @@ describe('generic node registration', () => {
     expect(nodeInvalidReason(node({ on: '', condition: 'a.id = b.account_id OR a.email = b.email' }))).toBeNull()
   })
 
+  it('requires one complete Filter condition or non-empty raw SQL', () => {
+    const node = (config: Record<string, unknown>) => ({ type: 'filter', data: { config } })
+
+    expect(nodeInvalidReason(node({ predicate: '' }))).toBe('Predicate (SQL) is required')
+    expect(nodeInvalidReason(node({ predicate: '   ' }))).toBe('Predicate (SQL) is required')
+    expect(nodeInvalidReason(node({ predicate: '', filterBuilder: { conditions: [] } })))
+      .toBe('Add a filter condition.')
+    expect(nodeInvalidReason(node({ predicate: 'event = \'purchase\'' }))).toBeNull()
+  })
+
   it('preserves the installed fixture descriptor at every frontend registration boundary', () => {
     const descriptors = contractDescriptors as unknown as BackendNodeSpec[]
     expect(registerGenericNodes(descriptors)).toBe(2)

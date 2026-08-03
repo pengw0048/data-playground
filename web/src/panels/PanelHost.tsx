@@ -146,6 +146,7 @@ function PanelTitle({ nodeId, title, kind, dark, maximized, onToggleMax, onClose
 }) {
   const label = { data: 'data', run: 'run', history: 'output versions', lineage: 'lineage', section: 'section' }[kind]
   const runPreview = useStore((s) => s.runPreview)
+  const nodeType = useStore((s) => s.doc.nodes.find((node) => node.id === nodeId)?.type)
   return (
     <div
       style={{
@@ -158,7 +159,7 @@ function PanelTitle({ nodeId, title, kind, dark, maximized, onToggleMax, onClose
       <span style={{ fontSize: 12.5, fontWeight: 600 }}>{title}</span>
       <span style={{ fontSize: 12.5, color: dark ? 'var(--viewer-text-2)' : color.text3 }}>· {label}</span>
       <span style={{ flex: 1 }} />
-      {kind === 'data' && (
+      {kind === 'data' && nodeType !== 'chart' && (
         <button onClick={() => runPreview(nodeId)} title="Refresh" style={iconBtn(dark)}><Icon name="refresh" size={13} /></button>
       )}
       {onToggleMax && (

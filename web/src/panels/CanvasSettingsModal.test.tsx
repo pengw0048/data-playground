@@ -5,10 +5,16 @@ const mocks = vi.hoisted(() => ({
   getShares: vi.fn(),
   addShare: vi.fn(),
   state: {
-    doc: { id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[] },
+    doc: {
+      id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[],
+      resultRetention: { history: 'inherit' as 'inherit' | 'latest' | 'recent' },
+    },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
+    authEnabled: true,
+    kernelInfo: { resultStorage: { id: 'workspace-managed', label: 'Local workspace', kind: 'local' } },
     renameFile: vi.fn(),
     setRequirements: vi.fn(),
+    setResultRetention: vi.fn(),
     setParameters: vi.fn(),
   },
 }))
@@ -29,9 +35,11 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.canvasRole = 'owner'
+    mocks.state.authEnabled = true
     mocks.getShares.mockResolvedValue({ visibility: 'private', shares: [] })
     mocks.addShare.mockResolvedValue({ ok: true })
     mocks.state.doc.parameters = []
+    mocks.state.doc.resultRetention = { history: 'inherit' }
   })
 
   it('renders workspace_view accurately and disables document fields for a viewer', async () => {
@@ -88,11 +96,27 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     fireEvent.click(screen.getByLabelText('Required'))
     fireEvent.click(screen.getByLabelText('Default'))
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'env:PRIVATE' } })
-    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+    expect(screen.getByRole('alert')).toHaveTextContent('must be plain text, not a secret')
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'FILE:/private/token' } })
-    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+    expect(screen.getByRole('alert')).toHaveTextContent('must be plain text, not a secret')
 
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 's3://public-bucket/key' } })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows the managed result location and saves a Canvas history override', async () => {
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+
+    expect(screen.getByText('Local workspace')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Result history'), { target: { value: 'recent' } })
+    expect(mocks.state.setResultRetention).toHaveBeenCalledWith('recent')
+  })
+
+  it('hides unenforceable visibility controls when authentication is off', () => {
+    mocks.state.authEnabled = false
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+
+    expect(screen.getByDisplayValue('Revenue canvas')).toBeVisible()
+    expect(screen.queryByText('Visibility')).toBeNull()
   })
 })

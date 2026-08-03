@@ -81,39 +81,40 @@ class UpsertTaskV1(Wire):
 def _map_upsert_error(exc: Exception) -> APIError:
     message = str(exc)
     if "stale" in message:
-        return APIError(409, "upsert expected head moved before admission",
+        return APIError(409, "The dataset changed before this update could start. Refresh and try again.",
                         code=APIErrorCode.CONFLICT, retryable=False)
     if "unavailable" in message:
-        return APIError(410, "upsert base or payload revision is unavailable",
+        return APIError(410, "The data this update needs is no longer available.",
                         code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    return APIError(422, "upsert intent is not admissible",
+    return APIError(422, "This update cannot be applied. Check the key columns and the rows "
+                    "you are merging in.",
                     code=APIErrorCode.VALIDATION_ERROR, retryable=False)
 
 
 def _resolve(request: UpsertRequestV1):
     head = metadb.catalog_managed_local_head_for_dataset(request.dataset_id)
     if head is None:
-        raise APIError(404, "upsert requires a core managed-local dataset",
+        raise APIError(404, "Updating by key works only on datasets this app manages.",
                        code=APIErrorCode.NOT_FOUND, retryable=False)
     if head.get("state") != "active" or head.get("revision_id") is None:
-        raise APIError(409, "upsert destination head is not active",
+        raise APIError(409, "This dataset is not accepting updates right now.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     if request.expected_head_revision_id != str(head["revision_id"]):
-        raise APIError(409, "upsert destination head moved before submission",
+        raise APIError(409, "The dataset changed before this update was submitted. Refresh and try again.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     name = head.get("name")
     if not isinstance(name, str) or not name:
-        raise APIError(409, "upsert destination head has no stable name",
+        raise APIError(409, "The current version of this dataset has no name, so it cannot be updated.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     if metadb.managed_local_file_revision_artifact(
             request.payload_dataset_id, request.payload_revision_id) is None:
-        raise APIError(410, "upsert payload revision is unavailable",
+        raise APIError(410, "The new rows for this update are no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
         detail = metadb.managed_local_file_revision_detail(
             head["artifact_uri"], str(head["revision_id"]))
     except (KeyError, ValueError) as exc:
-        raise APIError(410, "upsert base revision is unavailable",
+        raise APIError(410, "The current version of this dataset is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     from hub.models import WriteDestination
 
@@ -128,8 +129,8 @@ def _resolve(request: UpsertRequestV1):
                 logical_uri=head["logical_uri"], name=name, dataset_id=request.dataset_id),
             output_schema=detail["table"].columns)
     except (ValueError, KeyedUpsertError) as exc:
-        raise APIError(422, "upsert intent is invalid", code=APIErrorCode.VALIDATION_ERROR,
-                       retryable=False) from exc
+        raise APIError(422, "This update request is invalid. Check the key columns.",
+                       code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
     return intent, base, payload
 
 
@@ -167,7 +168,7 @@ def submit(request: UpsertRequestV1, uid: str = Depends(current_user)) -> Upsert
                 or view.payload_dataset_id != request.payload_dataset_id
                 or view.payload_revision_id != request.payload_revision_id
                 or metadb.keyed_upsert_task_admission_keys(task_id) != list(request.keys)):
-            raise APIError(409, "upsert submission id is already used for another intent",
+            raise APIError(409, "That submission id was already used for a different update.",
                            code=APIErrorCode.CONFLICT, retryable=False)
         dispatch(task_id, get_deps())
         return view
@@ -185,7 +186,7 @@ def submit(request: UpsertRequestV1, uid: str = Depends(current_user)) -> Upsert
     except metadb.DurableTaskSubmissionConflict as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
     except ValueError as exc:
-        raise APIError(422, "upsert submission is invalid", code=APIErrorCode.VALIDATION_ERROR,
+        raise APIError(422, "This update request is invalid.", code=APIErrorCode.VALIDATION_ERROR,
                        retryable=False) from exc
     dispatch(task["id"], deps)
     return _task_view(task["id"], uid)

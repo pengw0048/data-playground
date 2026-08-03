@@ -39,6 +39,45 @@ describe('Yjs hydration decisions', () => {
     expect(sent).toHaveLength(1)
     expect(sent[0].byteLength).toBeGreaterThan(0)
   })
+
+  it('keeps the saved compute target when syncing with a legacy replica', () => {
+    useStore.setState({ doc: { ...doc, executionBackend: 'ray-data' } })
+    const legacy = new Y.Doc()
+    legacy.getMap('meta').set('name', 'Legacy peer')
+    startYSync(() => undefined)
+
+    completeYSync(b64(Y.encodeStateAsUpdate(legacy)))
+
+    expect(useStore.getState().doc.executionBackend).toBe('ray-data')
+  })
+
+  it('writes Automatic as an explicit collaborative value', () => {
+    useStore.setState({ doc: { ...doc, executionBackend: 'ray-data' } })
+    const sent: Uint8Array[] = []
+    startYSync((update) => sent.push(update))
+    hydrateIfEmpty()
+    useStore.setState({ doc: { ...doc, executionBackend: undefined } })
+
+    const replica = new Y.Doc()
+    for (const update of sent) Y.applyUpdate(replica, update)
+    expect(replica.getMap('meta').has('executionBackend')).toBe(true)
+    expect(replica.getMap('meta').get('executionBackend')).toBeNull()
+    replica.destroy()
+  })
+
+  it('round-trips the Canvas result-retention override', () => {
+    useStore.setState({ doc: { ...doc, resultRetention: { history: 'recent' } } })
+    const sent: Uint8Array[] = []
+    startYSync((update) => sent.push(update))
+    hydrateIfEmpty()
+
+    const replica = new Y.Doc()
+    for (const update of sent) Y.applyUpdate(replica, update)
+    expect(JSON.parse(String(replica.getMap('meta').get('resultRetention')))).toEqual({
+      history: 'recent',
+    })
+    replica.destroy()
+  })
 })
 
 describe('YSyncReplica readiness', () => {

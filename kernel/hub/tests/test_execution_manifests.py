@@ -550,7 +550,7 @@ def test_history_rejects_disagreeing_admission_and_state_manifest_owners():
         )
 
 
-def test_receipt_and_canvas_lineage_retain_manifest_after_run_owner_pruning(monkeypatch):
+def test_receipt_lineage_and_canvas_result_retain_manifest_after_run_owner_pruning(monkeypatch):
     _canvas("manifest-canvas")
     submission_id = str(uuid.uuid4())
     expected_run_id = metadb.local_run_submission_id(
@@ -645,14 +645,18 @@ def test_receipt_and_canvas_lineage_retain_manifest_after_run_owner_pruning(monk
     assert metadb.execution_manifest_sha256_for_run(run_id) == digest
     assert metadb.execution_manifest(digest) is not None
 
-    # Once the receipt is gone, the existing catalog bulk-delete lifecycle removes the last lineage
-    # owner and reclaims its candidate manifest in the same transaction.
+    # Once the receipt is gone, catalog deletion removes the lineage owner. The Canvas-lifetime
+    # current-result projection remains the final owner until the Canvas itself is deleted.
     with metadb.session() as session:
         session.delete(session.get(metadb.ManagedLocalLanceWriteReceipt, "write-key"))
     with metadb.session() as session:
         candidates = metadb._delete_catalog_children(session, ["file:///source.parquet"])
         session.flush()
         metadb._delete_unreferenced_execution_manifests(session, candidates)
+    assert metadb.execution_manifest_sha256_for_run(run_id) == digest
+    assert metadb.execution_manifest(digest) is not None
+
+    metadb.delete_canvas_cascade("manifest-canvas")
     assert metadb.execution_manifest_sha256_for_run(run_id) is None
     assert metadb.execution_manifest(digest) is None
 
@@ -663,6 +667,7 @@ def test_shared_manifest_survives_one_owner_and_legacy_history_is_explicit():
         _canvas(canvas_id)
     _admit("manifest-canvas", str(uuid.uuid4()), digest, payload)
     _admit("manifest-canvas-2", str(uuid.uuid4()), digest, payload)
+    metadb.bind_run_owner("legacy-run", "local", "legacy-canvas")
     metadb.record_run(
         canvas_id="legacy-canvas", target_node_id=None, job_type="run",
         status="failed", error="legacy", run_id="legacy-run",

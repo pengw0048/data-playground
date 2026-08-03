@@ -18,7 +18,7 @@ import re
 import tempfile
 import uuid
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -37,8 +37,8 @@ from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
     BoundedPreviewUnsupported, RevisionPermissionLost, RevisionProviderOffline,
-    RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
-    revision_adapter_for_uri,
+    RevisionResolutionAmbiguous, RevisionUnavailable, csv_date_order_notices, is_object_uri, path_of,
+    relation_columns, revision_adapter_for_uri,
 )
 from hub.plugins.capabilities import tag_columns
 from hub.plugins.importer import ImporterNotConfigured
@@ -72,7 +72,10 @@ from hub.models import (
     InstalledProcessorSource,
     JoinSuggestion,
     KernelInfo,
+    LineageCardinality,
+    LineageEdge,
     LineageFactsPage,
+    LineageNode,
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
@@ -395,29 +398,55 @@ def get_table(table_id: str, registration: bool = False) -> CatalogTable:
             binding = metadb.catalog_revision_binding(table_id)
             if binding is None:
                 raise KeyError(table_id)
-            return get_deps().catalog.get_table(binding["uri"])
-        return get_deps().catalog.get_table(table_id)
+            table = get_deps().catalog.get_table(binding["uri"])
+        else:
+            table = get_deps().catalog.get_table(table_id)
+        return table.model_copy(update={"source_delete_allowed": _source_delete_allowed(table)})
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")
+
+
+def _source_delete_allowed(table: CatalogTable) -> bool:
+    """Whether this exact built-in registration can offer an atomic source-file delete."""
+    from hub import paths
+    from hub.plugins.catalog import InMemoryCatalog
+
+    if type(get_deps().catalog) is not InMemoryCatalog or not table.registration_id:
+        return False
+    storage = metadb.catalog_entry_storage(table.registration_id)
+    if storage is None or storage["uri"] != table.uri or storage["managed"]:
+        return False
+    try:
+        raw_path = paths.local_path(table.uri)
+        local_path = paths.checked_local_path(table.uri)
+    except (PermissionError, ValueError):
+        return False
+    return bool(
+        raw_path
+        and local_path
+        and not glob.has_magic(raw_path)
+        and not os.path.islink(os.path.expanduser(raw_path))
+        and not os.path.isdir(local_path)
+    )
 
 
 def _revision_adapter(uri: str) -> object:
     try:
         adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
     except workspace_providers.ProviderDatasetOffline as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except PermissionError as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     if not (workspace_providers.provider_dataset_supports_exact(adapter)
             if workspace_providers.is_provider_dataset_uri(uri)
             else isinstance(adapter, DatasetRevisionAdapter)):
-        raise APIError(501, "dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
     return adapter
 
@@ -426,7 +455,7 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     try:
         provider_uri = workspace_providers.provider_dataset_uri_for_identity(table_id)
     except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     if provider_uri is not None:
         # A canonical Workspace provider Source is not a mutable Catalog registration.  Its
@@ -437,7 +466,7 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     table = get_table(table_id)
     binding = metadb.catalog_revision_binding_for_uri(table.uri)
     if binding is None:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return table, binding
 
@@ -447,13 +476,13 @@ def _revision_binding_for_dataset_id(dataset_id: str) -> dict:
     try:
         provider_uri = workspace_providers.provider_dataset_uri_for_identity(dataset_id)
     except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     if provider_uri is not None:
         return {"dataset_id": dataset_id, "uri": provider_uri}
     binding = metadb.catalog_revision_binding(dataset_id)
     if binding is None:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return binding
 
@@ -506,15 +535,15 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
         adapter = _revision_adapter(table.uri)
         rows, next_cursor = adapter.revision_history(table.uri, limit=limit, cursor=cursor)
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionPage(items=[
         _revision(binding["dataset_id"], row, adapter) for row in rows],
@@ -530,27 +559,27 @@ def resolve_dataset_revision(table_id: str,
     if as_of is not None:
         capabilities = _revision_capabilities(adapter)
         if "as_of" not in capabilities.selectors:
-            raise APIError(501, "dataset_revision_as_of_unavailable",
+            raise APIError(501, "This data source cannot look up a version by date.",
                            code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
         if as_of.tzinfo is None or as_of.utcoffset() is None:
-            raise APIError(422, "dataset_revision_as_of_timezone_required",
+            raise APIError(422, "Include a time zone in the as-of timestamp.",
                            code=APIErrorCode.VALIDATION_ERROR, retryable=False)
         as_of = as_of.astimezone(datetime.timezone.utc)
     try:
         raw = adapter.resolve_revision(table.uri, as_of=as_of)
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except RevisionResolutionAmbiguous:
-        raise APIError(409, "dataset_revision_resolution_ambiguous",
+        raise APIError(409, "The version at that time cannot be determined for this data source.",
                        code=APIErrorCode.CONFLICT, retryable=False)
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     committed_at = _core_owned_committed_at(raw.get("committed_at"), adapter)
     if as_of is not None:
@@ -574,7 +603,7 @@ def resolve_dataset_revision(table_id: str,
         if (not isinstance(ordering_timestamp, datetime.datetime)
                 or ordering_timestamp.tzinfo is None or ordering_timestamp.utcoffset() is None
                 or ordering_timestamp.astimezone(datetime.timezone.utc) > as_of):
-            raise APIError(409, "dataset_revision_resolution_ambiguous",
+            raise APIError(409, "The version at that time cannot be determined for this data source.",
                            code=APIErrorCode.CONFLICT, retryable=False)
         # An as-of resolution becomes durable exact-reference evidence, so return the validated
         # absolute instant rather than the provider's offset-free transport representation.
@@ -630,16 +659,16 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             )
             resolved_revision_id = str(raw["revision_id"])
     except (RevisionPermissionLost, PermissionError):
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline):
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except (RevisionUnavailable, RowIdentityError, ManagedSourceReadError, OSError,
             workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     preview_rows = _table_to_rows(raw_preview_rows)
     revision_name = raw.get("name")
@@ -721,7 +750,81 @@ def save_table_edit(table_id: str, req: CatalogEdit) -> CatalogTable:
         raise HTTPException(400, str(exc)) from exc
 
 
-@router.get("/catalog/lineage", response_model=LineageResult)
+def _merge_lineage_graphs(
+    root_uri: str,
+    graphs: list[LineageResult],
+    *,
+    max_nodes: int,
+) -> LineageResult:
+    """Merge provider and local lineage without exceeding the requested UI boundary."""
+    ordered: dict[str, LineageNode] = {}
+    for graph in graphs:
+        for node in graph.nodes:
+            if node.uri == root_uri:
+                ordered.setdefault(node.uri, node)
+    for graph in graphs:
+        for node in graph.nodes:
+            if len(ordered) >= max_nodes and node.uri not in ordered:
+                continue
+            ordered.setdefault(node.uri, node)
+    if root_uri not in ordered:
+        ordered[root_uri] = LineageNode(
+            id=root_uri, name=root_uri.rsplit("/", 1)[-1], uri=root_uri)
+
+    facts: dict[tuple[str, str], dict[str, object]] = {}
+    dropped = False
+    for graph in graphs:
+        for edge in graph.edges:
+            if edge.parent not in ordered or edge.child not in ordered:
+                dropped = True
+                continue
+            pair = (edge.parent, edge.child)
+            fact = facts.setdefault(pair, {
+                "count": 0, "columns": set(), "pipelines": set(), "cardinalities": set(),
+            })
+            fact["count"] = int(fact["count"]) + edge.fact_count
+            cast(set[str], fact["columns"]).update(edge.columns)
+            cast(set[str], fact["pipelines"]).update(edge.pipeline_names)
+            if edge.cardinality is not None:
+                cast(set[tuple[str, str]], fact["cardinalities"]).add((
+                    edge.cardinality.value, edge.cardinality.evidence,
+                ))
+
+    def merged_cardinality(fact: dict[str, object]) -> LineageCardinality | None:
+        reported = cast(set[tuple[str, str]], fact["cardinalities"])
+        values = {value for value, _evidence in reported}
+        if len(values) != 1:
+            return None
+        return LineageCardinality.model_validate({
+            "value": next(iter(values)),
+            "evidence": "measured" if any(
+                evidence == "measured" for _, evidence in reported
+            ) else "declared",
+        })
+
+    return LineageResult(
+        root_uri=root_uri,
+        nodes=list(ordered.values()),
+        edges=[
+            LineageEdge(
+                parent=parent,
+                child=child,
+                fact_count=int(fact["count"]),
+                columns=sorted(cast(set[str], fact["columns"]))[:64],
+                pipeline_names=sorted(cast(set[str], fact["pipelines"]))[:16],
+                cardinality=merged_cardinality(fact),
+            )
+            for (parent, child), fact in sorted(facts.items())
+        ],
+        truncated=dropped or any(graph.truncated for graph in graphs),
+    )
+
+
+@router.get(
+    "/catalog/lineage",
+    response_model=LineageResult,
+    response_model_exclude_none=True,
+)
 def lineage(
         uri: str = Query(..., max_length=8192), depth: int = 6,
         max_nodes: int = Query(500, alias="maxNodes"),
@@ -732,8 +835,27 @@ def lineage(
         root_uri = metadb.catalog_lineage_uri(uri)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return get_deps().catalog.lineage(root_uri, depth=max(1, min(int(depth), 20)),
-                                      max_nodes=max(1, min(int(max_nodes), 5000)))
+    bounded_depth = max(1, min(int(depth), 20))
+    bounded_nodes = max(1, min(int(max_nodes), 5000))
+    local = get_deps().catalog.lineage(
+        root_uri, depth=bounded_depth, max_nodes=bounded_nodes)
+    if not workspace_providers.is_provider_dataset_uri(root_uri):
+        return local
+    try:
+        connected = workspace_providers.provider_dataset_lineage(
+            root_uri, depth=bounded_depth, max_nodes=bounded_nodes)
+    except workspace_providers.ProviderDatasetLineageUnsupported:
+        return local
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        raise HTTPException(410, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return _merge_lineage_graphs(
+        root_uri, [connected, local], max_nodes=bounded_nodes)
 
 
 @router.get("/catalog/lineage/facts", response_model=LineageFactsPage)
@@ -829,6 +951,7 @@ def unregister_table(
     table_id: str,
     expected_registration_id: str = Query(..., min_length=1, max_length=128),
     expected_revision: str = Query(..., min_length=1, max_length=128),
+    delete_source: bool = Query(default=False),
 ) -> dict:
     """Remove one exact dataset only while its editable metadata still matches the caller's read."""
     from hub.plugins.catalog import InMemoryCatalog
@@ -837,6 +960,87 @@ def unregister_table(
     if type(cat) is not InMemoryCatalog:
         raise HTTPException(501, "catalog provider does not support versioned unregister")
     unregister = cat.unregister_if_revision
+    if delete_source:
+        from hub import paths
+
+        try:
+            current = cat.get_table(table_id)
+        except KeyError as exc:
+            raise HTTPException(404, f"table '{table_id}' not found") from exc
+        if (current.registration_id != expected_registration_id
+                or current.metadata_revision != expected_revision):
+            raise HTTPException(
+                409, "catalog metadata changed; reload before removing this dataset")
+        storage = metadb.catalog_entry_storage(expected_registration_id)
+        if storage is None or storage["uri"] != current.uri:
+            raise HTTPException(
+                409, "catalog registration changed; reload before removing this dataset")
+        if storage["managed"]:
+            raise HTTPException(
+                409, "managed outputs can be removed from Workspace, but their files use output retention")
+        try:
+            raw_path = paths.local_path(current.uri)
+            local_path = paths.checked_local_path(current.uri)
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(403, str(exc)) from exc
+        if raw_path is None or local_path is None or glob.has_magic(raw_path):
+            raise HTTPException(422, "only one ordinary local source file can be deleted here")
+        original_path = os.path.expanduser(raw_path)
+        if os.path.islink(original_path) or os.path.isdir(local_path):
+            raise HTTPException(
+                422, "only ordinary local source files can be deleted here; folders and links are kept")
+        staged_path: str | None = None
+        if os.path.exists(local_path):
+            if not os.path.isfile(local_path):
+                raise HTTPException(422, "this local source is not an ordinary file")
+            staged_path = os.path.join(
+                os.path.dirname(local_path),
+                f".dp-delete-{uuid.uuid4().hex}-{os.path.basename(local_path)}",
+            )
+            try:
+                os.replace(local_path, staged_path)
+            except OSError as exc:
+                raise HTTPException(409, "the source file could not be prepared for deletion") from exc
+        try:
+            removed = unregister(table_id, expected_registration_id, expected_revision)
+        except metadb.CatalogMetadataConflict as exc:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise HTTPException(409, str(exc)) from exc
+        except Exception:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise
+        if not removed:
+            if staged_path is not None and os.path.exists(staged_path) and not os.path.exists(local_path):
+                os.replace(staged_path, local_path)
+            raise HTTPException(404, f"table '{table_id}' not found")
+        source_deleted = False
+        warning = None
+        if staged_path is not None:
+            try:
+                os.unlink(staged_path)
+                source_deleted = True
+            except OSError:
+                restored = os.path.exists(local_path)
+                if not os.path.exists(local_path):
+                    try:
+                        os.replace(staged_path, local_path)
+                    except OSError:
+                        pass
+                    restored = os.path.exists(local_path)
+                warning = (
+                    "Dataset removed, but the source file could not be deleted and was kept."
+                    if restored else
+                    "Dataset removed, but the source file could not be deleted or restored "
+                    "to its original path. Contact the workspace operator."
+                )
+        return {
+            "ok": True,
+            "sourceDeleted": source_deleted,
+            "sourceMissing": staged_path is None,
+            "warning": warning,
+        }
     try:
         removed = unregister(table_id, expected_registration_id, expected_revision)
     except metadb.CatalogMetadataConflict as exc:
@@ -996,18 +1200,18 @@ def list_related_dataset_revisions(body: RelatedDatasetRevisionsBody) -> Dataset
             get_deps().catalog, get_deps().resolve_adapter, body.identity,
             limit=body.limit, cursor=body.cursor)
     except NotImplementedError as exc:
-        raise APIError(501, "related_dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
     except (RevisionPermissionLost, PermissionError) as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline) as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except (KeyError, ValueError) as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
@@ -1024,18 +1228,18 @@ def review_related_dataset_revision(body: RelatedDatasetRevisionReviewBody) -> R
             deps.catalog, deps.resolve_adapter, deps.storage, body.source, body.candidate,
             body.revision_id, q=body.q, folder=body.folder)
     except NotImplementedError as exc:
-        raise APIError(501, "related_dataset_revision_history_unavailable",
+        raise APIError(501, "This data source does not keep version history.",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
     except (RevisionPermissionLost, PermissionError) as exc:
-        raise APIError(403, "dataset_revision_permission_lost",
+        raise APIError(403, "You no longer have permission to read this dataset.",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError,
             workspace_providers.ProviderDatasetOffline) as exc:
-        raise APIError(503, "dataset_revision_provider_offline",
+        raise APIError(503, "This data source is offline. Try again once it is reachable.",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
     except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable) as exc:
-        raise APIError(410, "dataset_revision_unavailable",
+        raise APIError(410, "This dataset version is no longer available.",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
     except (KeyError, ValueError) as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
@@ -1260,6 +1464,7 @@ def data_sample(req: SampleRequest) -> SampleResult:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
     except PermissionError as e:
         raise HTTPException(403, str(e))
+    parse_notices: list[str] = []
     try:
         with source_read_scope(
                 deps.storage, [req.uri], owner=f"sample:{uuid.uuid4().hex}"):
@@ -1287,6 +1492,8 @@ def data_sample(req: SampleRequest) -> SampleResult:
                 except BoundedPreviewUnsupported as exc:
                     return SampleResult(not_previewable=True, reason=str(exc))
                 cols = relation_columns(rel)          # schema is metadata — no second scan needed
+                with contextlib.suppress(Exception):  # a disclosure must never fail the preview
+                    parse_notices = csv_date_order_notices(req.uri)
                 page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
                 rows = page[:req.k]
                 metadata_count = getattr(adapter, "metadata_count", None)
@@ -1335,6 +1542,7 @@ def data_sample(req: SampleRequest) -> SampleResult:
                                   limit_reason=("interactive-row-budget"
                                                 if budget_capped else None),
                                   limit_scope=("result-window" if budget_capped else None),
+                                  parse_notices=parse_notices,
                                   sample_provenance=provenance_for_dataset(
                                       req.uri, adapter, requested_rows=req.k,
                                       scanned_rows=None, returned_rows=len(rows), total_rows=exact_total,

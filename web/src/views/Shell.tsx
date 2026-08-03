@@ -16,6 +16,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 import { useCollapsibleRegion } from '../layoutPreferences'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 // The non-canvas shell keeps local resources in one Workspace explorer. Transforms and relationship
 // inspection remain their existing secondary surfaces.
@@ -46,7 +47,7 @@ export function Shell() {
     return () => { unreadRequest.current += 1 }
   }, [refreshUnread, view])
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
+    <div style={{ position: 'absolute', inset: 0, display: 'flex', background: 'hsl(var(--background))' }}>
       <Rail onSettings={openSettings} unreadCount={unreadCount} />
       <main style={{ position: 'relative', flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'workspace' && <WorkspaceExplorer />}
@@ -88,10 +89,12 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
       else setView(v)
     }} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}
+      aria-current={view === v ? 'page' : undefined}
       aria-label={collapsed ? (badge ? `${label}, ${badge} unread` : label) : undefined}
       className={cn('h-auto w-full gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
         collapsed ? 'justify-center' : 'justify-start',
-        view === v && 'bg-accent text-accent-foreground')}>
+        // forced colours flattens bg-accent, so the current view needs a border to stay visible
+        view === v && 'bg-accent text-accent-foreground forced-colors:border forced-colors:border-[Highlight]')}>
       <span className="relative inline-flex">
         <Icon name={icon} size={15} />
         {!!badge && badge > 0 && (
@@ -108,8 +111,8 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   )
 
   return (
-    <aside data-testid="workspace-rail" aria-label="Primary navigation"
-      className={cn('flex h-full flex-col border-r border-border bg-card p-3 transition-[width] duration-150', collapsed ? 'w-[64px] flex-[0_0_64px]' : 'w-[232px] flex-[0_0_232px]')}>
+    <nav data-testid="workspace-rail" aria-label="Primary navigation"
+      className={cn('flex h-full flex-col border-r border-border bg-card p-2 transition-[width] duration-150', collapsed ? 'w-[56px] flex-[0_0_56px]' : 'w-[220px] flex-[0_0_220px]')}>
       <div className={cn('flex items-center gap-2 pb-3 pt-1', collapsed ? 'justify-center px-0' : 'px-2')}>
         {!collapsed && (
           <span
@@ -147,7 +150,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         <span className="grid h-6 w-6 place-items-center rounded-full bg-primary/10 text-[11px] font-bold text-primary">{(currentUser?.name ?? '?').slice(0, 1).toUpperCase()}</span>
         <div className={cn('min-w-0 flex-1', collapsed && 'sr-only')}>
           <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] font-semibold text-foreground">{currentUser?.name ?? 'local'}</div>
-          <div className="text-[10px] text-muted-foreground">{authEnabled ? 'signed in' : 'local mode'}</div>
+          {authEnabled && <div className="text-[10px] text-muted-foreground">signed in</div>}
         </div>
         {authEnabled && (
           <>
@@ -161,7 +164,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         )}
       </div>
       {pwOpen && <ChangePasswordModal onClose={() => setPwOpen(false)} />}
-    </aside>
+    </nav>
   )
 }
 
@@ -260,6 +263,7 @@ function FilesContent() {
   const newFile = useStore((s) => s.newFile)
   const deleteFile = useStore((s) => s.deleteFile)
   const newFromExample = useStore((s) => s.newFromExample)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
   return (
     <>
       <ViewHeader title="Recents" action={
@@ -285,7 +289,7 @@ function FilesContent() {
                 {meta && <div style={{ fontSize: 11, color: color.text3, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta}</div>}
               </div>
             </button>
-            {f.role === 'owner' && <button type="button" title="Delete" aria-label={`Delete ${title}`} onClick={() => deleteFile(f.id)}
+            {f.role === 'owner' && <button type="button" title="Delete" aria-label={`Delete ${title}`} onClick={() => setDeleteTarget({ id: f.id, name: title })}
               style={{ position: 'absolute', right: 10, bottom: 12, border: 'none', background: 'transparent', color: color.text3, cursor: 'pointer', padding: 2, zIndex: 1 }}><Icon name="trash" size={13} /></button>}
           </div>
           )
@@ -312,6 +316,18 @@ function FilesContent() {
           </>
         )}
       </div>
+      <ConfirmationDialog
+        open={deleteTarget !== null}
+        title={`Delete “${deleteTarget?.name ?? 'this Canvas'}”?`}
+        description="This permanently deletes the Canvas for everyone who can access it. This cannot be undone."
+        confirmLabel="Delete Canvas"
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          const target = deleteTarget
+          setDeleteTarget(null)
+          if (target) void deleteFile(target.id)
+        }}
+      />
     </>
   )
 }

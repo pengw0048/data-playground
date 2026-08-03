@@ -98,34 +98,35 @@ describe('DatasetRevisionHistory', () => {
     mocks.datasetRevision.mockResolvedValue(detail('rev-historical'))
     render(<DatasetRevisionHistory table={TABLE} initialRevisionId="rev-historical" initialRevisionDatasetId="logical-receipt-id" />)
     await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('logical-receipt-id', 'rev-historical'))
-    expect(await screen.findByText('Historical exact version')).toBeInTheDocument()
-    expect(screen.getByTestId('revision-technical-details')).toHaveTextContent('rev-historical')
+    expect(await screen.findByText('Previous version')).toBeInTheDocument()
+    expect(screen.queryByText('rev-historical')).not.toBeInTheDocument()
     expect(mocks.datasetRevision).not.toHaveBeenCalledWith('logical-receipt-id', 'rev-current')
   })
 
   it('does not treat a revision without its logical dataset identity as an exact deep link', async () => {
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-current')], nextCursor: null, hasMore: false })
     render(<DatasetRevisionHistory table={TABLE} initialRevisionId="rev-historical" />)
-    await screen.findByText('rev-current')
+    await screen.findByTestId('revision-open-rev-current')
+    expect(screen.queryByText('rev-current')).not.toBeInTheDocument()
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
   it('distinguishes empty, unavailable, and provider-error history states', async () => {
     mocks.datasetRevisions.mockResolvedValueOnce({ items: [], nextCursor: null, hasMore: false })
     const first = render(<DatasetRevisionHistory table={TABLE} />)
-    expect(await screen.findByText('No retained revisions are available.')).toBeInTheDocument()
+    expect(await screen.findByText('No saved versions are available.')).toBeInTheDocument()
     first.unmount()
 
     mocks.datasetRevisions.mockRejectedValueOnce(new KernelError(410, 'gone'))
     const second = render(<DatasetRevisionHistory table={TABLE} />)
-    expect(await screen.findByText(/Revision history is unavailable.*No latest revision was substituted/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Version history is unavailable.*latest version was not opened instead/i)).toBeInTheDocument()
     second.unmount()
 
     mocks.datasetRevisions.mockRejectedValueOnce(new KernelError(503, 'provider offline'))
       .mockResolvedValueOnce({ items: [], nextCursor: null, hasMore: false })
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
-    expect(await screen.findByText('No retained revisions are available.')).toBeInTheDocument()
+    expect(await screen.findByText('No saved versions are available.')).toBeInTheDocument()
   })
 
   it('uses the opaque cursor and keeps already loaded revisions on a load-more failure', async () => {
@@ -134,12 +135,12 @@ describe('DatasetRevisionHistory', () => {
       .mockRejectedValueOnce(new KernelError(503, 'page failed'))
       .mockResolvedValueOnce({ items: [revision('rev-1')], nextCursor: null, hasMore: false })
     render(<DatasetRevisionHistory table={TABLE} />)
-    expect(await screen.findByText('rev-2')).toBeInTheDocument()
+    expect(await screen.findByTestId('revision-open-rev-2')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('revision-history-load-more'))
     expect(await screen.findByText(/Couldn't load more history: page failed/i)).toBeInTheDocument()
-    expect(screen.getByText('rev-2')).toBeInTheDocument()
+    expect(screen.getByTestId('revision-open-rev-2')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('revision-history-load-more'))
-    expect(await screen.findByText('rev-1')).toBeInTheDocument()
+    expect(await screen.findByTestId('revision-open-rev-1')).toBeInTheDocument()
     expect(mocks.datasetRevisions).toHaveBeenLastCalledWith(TABLE.id, { limit: 20, cursor: 'opaque cursor' })
   })
 
@@ -152,12 +153,12 @@ describe('DatasetRevisionHistory', () => {
     const link = await screen.findByTestId('revision-open-rev-2')
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable',
+      '#/workspace/dataset%3Atable-1?revision=rev-2&revisionDataset=dataset-stable',
     )
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
-  it('keeps readable version context primary and opaque history evidence collapsed', async () => {
+  it('keeps readable version context primary and removes opaque history evidence', async () => {
     mocks.datasetRevisions.mockResolvedValue({
       items: [revision('rev-current')], nextCursor: null, hasMore: false,
     })
@@ -165,17 +166,13 @@ describe('DatasetRevisionHistory', () => {
 
     const open = await screen.findByTestId('revision-open-rev-current')
     expect(open).toHaveTextContent('Version from Jul 16, 2026, 12:00:00 PM UTC')
-    expect(open).toHaveTextContent('Latest retained version')
+    expect(open).toHaveTextContent('Current version')
     expect(open).toHaveTextContent('Current')
     expect(open).toHaveTextContent('Open data')
     expect(open).not.toHaveTextContent('rev-current')
 
-    const technical = screen.getByTestId('revision-technical-details-rev-current')
-    expect(technical).not.toHaveAttribute('open')
-    expect(technical).toHaveTextContent('Datasetdataset-stable')
-    expect(technical).toHaveTextContent('Revisionrev-current')
-    expect(technical).toHaveTextContent('Retentionprovider')
-    expect(technical).toHaveTextContent('Committed2026-07-16T12:00:00Z')
+    expect(screen.queryByText('rev-current')).not.toBeInTheDocument()
+    expect(screen.queryByText('dataset-stable')).not.toBeInTheDocument()
   })
 
   it('does not duplicate the exact row preview owned by the full-page dataset viewer', async () => {
@@ -186,10 +183,29 @@ describe('DatasetRevisionHistory', () => {
       initialRevisionId="rev-2" initialRevisionDatasetId="dataset-stable"
       viewerDetail={detail('rev-2')} />)
 
-    expect(await screen.findByText('Current exact version')).toBeInTheDocument()
+    expect(await screen.findByText('Current version')).toBeInTheDocument()
     expect(screen.getByText('Rows')).toBeInTheDocument()
     expect(screen.queryByText('Exact revision preview')).not.toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('keeps unchanged schema evidence and storage internals out of the version summary', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-2')], nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-1'))
+    render(<DatasetRevisionHistory table={TABLE} detailsInViewer
+      initialRevisionId="rev-2" initialRevisionDatasetId="dataset-stable"
+      viewerDetail={detail('rev-2', { parentRevisionId: 'rev-1' })} />)
+
+    expect(await screen.findByText('Rows')).toBeInTheDocument()
+    expect(screen.getByText('Size')).toBeInTheDocument()
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-stable', 'rev-1'))
+    expect(screen.queryByText('Schema compatibility with parent')).not.toBeInTheDocument()
+    expect(screen.queryByText(/nullability is not proven/)).not.toBeInTheDocument()
+    expect(screen.queryByText('comparison unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText('Data files')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fragments')).not.toBeInTheDocument()
   })
 
   it('preserves Canvas return context when the full-page viewer switches revisions', async () => {
@@ -206,7 +222,7 @@ describe('DatasetRevisionHistory', () => {
 
     expect(await screen.findByTestId('revision-open-rev-2')).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnCanvas=canvas-1&returnNode=source',
+      '#/workspace/dataset%3Atable-1?revision=rev-2&revisionDataset=dataset-stable&returnCanvas=canvas-1&returnNode=source',
     )
   })
 
@@ -224,7 +240,7 @@ describe('DatasetRevisionHistory', () => {
 
     expect(await screen.findByTestId('revision-open-rev-2')).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable&returnView=jobs&returnQuery=status%3Dfailed%26run%3Drun-1',
+      '#/workspace/dataset%3Atable-1?revision=rev-2&revisionDataset=dataset-stable&returnView=jobs&returnQuery=status%3Dfailed%26run%3Drun-1',
     )
   })
 
@@ -243,15 +259,15 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} />)
 
     fireEvent.click(await screen.findByTestId('revision-history-load-more'))
-    expect(await screen.findByText('rev-1')).toBeInTheDocument()
+    expect(await screen.findByTestId('revision-open-rev-1')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('revision-open-rev-2'))
-    expect(await screen.findByText('Current exact version')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Save view' })).toBeNull()
+    expect(await screen.findByText('Current version')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Create filtered view' })).toBeNull()
 
     capability.resolve({
       selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null, datasetViewSave: true,
     })
-    expect(await screen.findByRole('button', { name: 'Save view' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Create filtered view' })).toBeInTheDocument()
   })
 
   it('opens the selected identity exactly and compares its retained parent honestly', async () => {
@@ -269,27 +285,22 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByTestId('revision-open-rev-2'))
 
-    expect(await screen.findByText('Current exact version')).toBeInTheDocument()
+    expect(await screen.findByText('Current version')).toBeInTheDocument()
     expect(screen.getByText('4 rows · 1 schema field')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Open data' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-stable?scope=datasets&revision=rev-2&revisionDataset=dataset-stable',
+      '#/workspace/dataset%3Atable-1?revision=rev-2&revisionDataset=dataset-stable',
     )
-    const technical = screen.getByTestId('revision-technical-details')
-    expect(technical).not.toHaveAttribute('open')
-    expect(technical).toHaveTextContent('Dataset IDdataset-stable')
-    expect(technical).toHaveTextContent('Revision IDrev-2')
-    expect(technical).toHaveTextContent('Parent revisionrev-1')
-    expect(technical).toHaveTextContent('Retention ownerprovider')
-    expect(technical).toHaveTextContent('Producerappend')
-    expect(screen.getByText('breaking')).toBeInTheDocument()
+    expect(screen.queryByText('rev-2')).not.toBeInTheDocument()
+    expect(screen.queryByText('dataset-stable')).not.toBeInTheDocument()
+    expect(screen.getByText('Breaking')).toBeInTheDocument()
     expect(screen.getByText(/logical type narrows from bigint to int/i)).toBeInTheDocument()
-    expect(screen.getByText(/Preview truncated at 100 rows.*exact revision/i)).toBeInTheDocument()
+    expect(screen.getByText(/Preview limited to 100 rows.*comes from this version/i)).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(1, 'dataset-stable', 'rev-2')
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-stable', 'rev-1')
   })
 
-  it('keeps field evidence inspectable when an exact revision has zero rows', async () => {
+  it('keeps useful field details inspectable when an exact revision has zero rows', async () => {
     mocks.datasetRevisions.mockResolvedValue({
       items: [revision('rev-empty')], nextCursor: null, hasMore: false,
     })
@@ -319,10 +330,11 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(await screen.findByTestId('revision-open-rev-empty'))
 
     expect(await screen.findByText('0 rows · 1 schema field')).toBeInTheDocument()
-    expect(screen.getByText(/retained schema remains inspectable above/i)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for amount' }))
-    expect(await screen.findByTestId('field-evidence-amount'))
-      .toHaveTextContent('retained empty-revision schema')
+    expect(screen.getByText(/saved schema remains available above/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'View details for amount' }))
+    const field = await screen.findByTestId('field-evidence-amount')
+    expect(field).toHaveTextContent('Typebigint')
+    expect(field).not.toHaveTextContent('retained empty-revision schema')
   })
 
   it('keeps unsupported binary media truthful without a row-identity recovery action', async () => {
@@ -343,11 +355,11 @@ describe('DatasetRevisionHistory', () => {
     mocks.datasetRevision.mockRejectedValue(new KernelError(410, 'compacted'))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByTestId('revision-open-rev-old'))
-    expect(await screen.findByText(/no longer retained.*did not substitute latest/i)).toBeInTheDocument()
+    expect(await screen.findByText(/no longer available.*newer version was not opened/i)).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
   })
 
-  it('hides Save view when the server does not advertise local exact DatasetView support', async () => {
+  it('hides Create filtered view when the server does not advertise local exact DatasetView support', async () => {
     mocks.datasetRevisionCapabilities.mockResolvedValue({
       selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null, datasetViewSave: false,
     })
@@ -356,8 +368,8 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} />)
 
     fireEvent.click(await screen.findByTestId('revision-open-rev-2'))
-    expect(await screen.findByText('Current exact version')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Save view' })).toBeNull()
+    expect(await screen.findByText('Current version')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Create filtered view' })).toBeNull()
   })
 
   it('keeps an in-flight exact save visible and reuses its submission identity on retry', async () => {
@@ -369,22 +381,22 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} />)
 
     fireEvent.click(await screen.findByTestId('revision-open-rev-2'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Save view' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Save exact revision as view' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Create filtered view' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Create a filtered view' })
     fireEvent.click(within(dialog).getByRole('radio', { name: /Deterministic reservoir/ }))
     fireEvent.change(within(dialog).getByLabelText('Reservoir seed'), { target: { value: '2147483647' } })
-    expect(dialog).toHaveTextContent('Each preview replays that full scan; the rows are not materialized.')
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+    expect(dialog).toHaveTextContent('The view stores this setup, not another copy of the rows.')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create filtered view' }))
 
     await waitFor(() => expect(mocks.createDatasetView).toHaveBeenCalledTimes(1))
     const firstRequest = mocks.createDatasetView.mock.calls[0][0]
-    expect(within(dialog).getByRole('button', { name: 'Close save view dialog' })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: 'Close filtered view dialog' })).toBeDisabled()
     fireEvent.click(dialog.parentElement!)
-    expect(screen.getByRole('dialog', { name: 'Save exact revision as view' })).toBeVisible()
+    expect(screen.getByRole('dialog', { name: 'Create a filtered view' })).toBeVisible()
 
     rejectFirst(new Error('connection reset'))
-    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't save this view: connection reset")
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't create this view: connection reset")
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create filtered view' }))
     await waitFor(() => expect(mocks.createDatasetView).toHaveBeenCalledTimes(2))
     expect(mocks.createDatasetView.mock.calls[1][0].submissionId).toBe(firstRequest.submissionId)
     expect(firstRequest).toMatchObject({
@@ -405,7 +417,7 @@ describe('DatasetRevisionHistory', () => {
     )
     expect(parseHash()).toEqual({ view: 'workspace', workspaceResourceId: 'dataset_view:view-1' })
     expect(window.location.hash).not.toContain('scope=datasets')
-    expect(store.pushToast).toHaveBeenCalledWith('Saved “orders view” beside its source in Workspace', 'success')
+    expect(store.pushToast).toHaveBeenCalledWith('Created “orders view” beside its source in Workspace', 'success')
   })
 
   const coreDetail = (revisionId: string) => detail(revisionId, { retentionOwner: 'core' })
@@ -417,7 +429,7 @@ describe('DatasetRevisionHistory', () => {
       Promise.resolve(coreDetail(revisionId)))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByTestId(`revision-open-${opened}`))
-    await screen.findByText(opened === 'rev-head' ? 'Current exact version' : 'Historical exact version')
+    await screen.findByText(opened === 'rev-head' ? 'Current version' : 'Previous version')
   }
 
   it('publishes an old core revision as a new head and reopens the exact result', async () => {
@@ -427,7 +439,7 @@ describe('DatasetRevisionHistory', () => {
       expectedHeadRevisionId: 'rev-head', childRevisionId: 'rev-new', receipt: null,
     })
     fireEvent.click(screen.getByTestId('restore-revision'))
-    const dialog = await screen.findByRole('dialog', { name: 'Restore revision as new head' })
+    const dialog = await screen.findByRole('dialog', { name: 'Restore saved version' })
     fireEvent.click(within(dialog).getByTestId('restore-revision-confirm'))
 
     await waitFor(() => expect(mocks.restoreRevision).toHaveBeenCalledTimes(1))
@@ -436,7 +448,7 @@ describe('DatasetRevisionHistory', () => {
     expect(body.expectedHeadRevisionId).toBe('rev-head')
     expect(typeof body.submissionId).toBe('string')
     await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith(
-      'Published revision rev-new from the restored source', 'success'))
+      'Restored as the current version', 'success'))
     await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-stable', 'rev-new'))
   })
 
@@ -447,9 +459,9 @@ describe('DatasetRevisionHistory', () => {
       expectedHeadRevisionId: 'rev-head', childRevisionId: null, diagnosticCode: 'stale_expected_head',
     })
     fireEvent.click(screen.getByTestId('restore-revision'))
-    const dialog = await screen.findByRole('dialog', { name: 'Restore revision as new head' })
+    const dialog = await screen.findByRole('dialog', { name: 'Restore saved version' })
     fireEvent.click(within(dialog).getByTestId('restore-revision-confirm'))
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/current head changed/i)
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/current version changed/i)
     expect(store.pushToast).not.toHaveBeenCalled()
   })
 
@@ -462,10 +474,10 @@ describe('DatasetRevisionHistory', () => {
         : detail('rev-old', { retentionOwner: 'provider' })))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByTestId('revision-open-rev-head'))
-    await screen.findByText('Current exact version')
+    await screen.findByText('Current version')
     expect(screen.queryByTestId('restore-revision')).toBeNull()  // the current head has nothing to restore
     fireEvent.click(screen.getByTestId('revision-open-rev-old'))
-    await screen.findByText('Historical exact version')
+    await screen.findByText('Previous version')
     expect(screen.queryByTestId('restore-revision')).toBeNull()  // provider-owned history is not core-restorable
   })
 
@@ -475,11 +487,11 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} />)
 
     fireEvent.click(await screen.findByTestId('revision-open-rev-2'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Save view' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Save exact revision as view' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Create filtered view' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Create a filtered view' })
     fireEvent.click(within(dialog).getByRole('radio', { name: /Deterministic reservoir/ }))
     fireEvent.change(within(dialog).getByLabelText('Reservoir seed'), { target: { value: '2147483648' } })
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create filtered view' }))
 
     expect(await within(dialog).findByRole('alert')).toHaveTextContent(
       'seed must be between 0 and 2,147,483,647',

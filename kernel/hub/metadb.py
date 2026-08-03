@@ -30,11 +30,11 @@ from urllib.parse import unquote, urlsplit
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
     Integer, LargeBinary, String, Text, UniqueConstraint, and_, case, cast, create_engine, delete, exists,
-    func, literal, or_, select, text, tuple_, update,
+    func, literal, or_, select, text, tuple_, union_all, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column, sessionmaker
 
 from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
 from hub.settings import settings
@@ -426,6 +426,9 @@ class RunRecord(Base):
     # HTTP/WebSocket request id that started the run (OPS-01). Nullable for non-HTTP starts and
     # backends that do not propagate a request id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # The submitting principal for attempts rejected before a logical run id exists. Ordinary runs
+    # still derive their owner from RunInputAdmission / RunState; this is their truthful fallback.
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     target_port_id: Mapped[str | None] = mapped_column(String, nullable=True)
     job_type: Mapped[str] = mapped_column(String, nullable=False, default="run", server_default="run")
@@ -447,6 +450,49 @@ class RunRecord(Base):
     __table_args__ = (
         UniqueConstraint("canvas_id", "run_id", name="uq_run_record_canvas_run"),
         CheckConstraint("job_type IN ('run', 'profile')", name="ck_run_record_job_type"),
+    )
+
+
+class CanvasResultLatest(Base):
+    """Latest terminal attempt plus the latest successful full result for one Canvas target.
+
+    RunState and RunRecord are deliberately bounded operational/history surfaces. This projection is
+    the Canvas-lifetime owner that makes reopen truthful without keeping every historical artifact.
+    Terminal and successful identities are separate so a failed rerun remains visible while the last
+    successful result can still be inspected when its execution plan is unchanged.
+    """
+    __tablename__ = "canvas_result_latest"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    canvas_id: Mapped[str] = mapped_column(
+        String, ForeignKey("canvases.id"), nullable=False, index=True)
+    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    terminal_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    terminal_status: Mapped[str] = mapped_column(String, nullable=False)
+    terminal_execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
+    terminal_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    terminal_submitted_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    terminal_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    result_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    result_execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
+    result_outputs: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]")
+    result_input_manifest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_submitted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    result_updated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    __table_args__ = (
+        UniqueConstraint(
+            "canvas_id", "target_node_id", name="uq_canvas_result_latest_target"),
+        CheckConstraint(
+            "terminal_status IN ('done','failed','cancelled')",
+            name="ck_canvas_result_latest_terminal_status"),
     )
 
 
@@ -3196,7 +3242,7 @@ def _workspace_external_overlay_anchor_for_container(
 
 
 def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceContainer:
-    """Lock a destination and reject writes anywhere below a detached Catalog tombstone."""
+    """Lock a destination and reject writes below any terminally detached source."""
     destination = _workspace_container_locked(s, container_id)
     current: WorkspaceContainer | None = destination
     visited: set[str] = set()
@@ -3206,6 +3252,14 @@ def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceCon
         visited.add(current.id)
         if current.catalog_folder_state == "detached":
             raise ValueError("a deleted Catalog folder subtree is a read-only Workspace tombstone")
+        anchor = s.scalar(select(WorkspaceExternalOverlayAnchor).where(
+            WorkspaceExternalOverlayAnchor.container_id == current.id).with_for_update())
+        if anchor is not None:
+            binding = s.get(WorkspaceProviderBinding, anchor.binding_id, with_for_update=True)
+            if binding is None:  # pragma: no cover - foreign key protected invariant
+                raise RuntimeError("external Workspace overlay anchor binding is missing")
+            if binding.state == "detached":
+                raise ValueError("a detached provider location cannot accept local Canvas changes")
         current = (s.get(WorkspaceContainer, current.parent_id, with_for_update=True)
                    if current.parent_id is not None else None)
     return destination
@@ -3524,16 +3578,15 @@ def _workspace_sync_dataset_folder_in_session(
     placement.container_id = container_id
 
 
-def _workspace_ensure_root_placement_in_session(
-        s, *, target_kind: str, target_id: str, name: str) -> None:
-    """Give a local resource its canonical root placement without moving an existing one."""
+def _workspace_ensure_placement_in_session(
+        s, *, container_id: str, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource one canonical placement without moving an existing one."""
     if target_kind not in {"canvas", "dataset"}:
         raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
-    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
-    if root is None or not root.is_root:
-        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    if s.get(WorkspaceContainer, container_id) is None:
+        raise RuntimeError("Workspace placement destination is missing")
     values = {
-        "id": _uid(), "container_id": LOCAL_WORKSPACE_ROOT_ID,
+        "id": _uid(), "container_id": container_id,
         "target_kind": target_kind, "target_id": target_id,
         "name": _workspace_name(name), "ordinal": 0, "version": 1,
     }
@@ -3546,6 +3599,21 @@ def _workspace_ensure_root_placement_in_session(
         raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
     s.execute(dialect_insert(WorkspacePlacement).values(**values).on_conflict_do_nothing(
         index_elements=[WorkspacePlacement.target_kind, WorkspacePlacement.target_id]))
+
+
+def _workspace_ensure_root_placement_in_session(
+        s, *, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource its canonical root placement without moving an existing one."""
+    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
+    if root is None or not root.is_root:
+        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    _workspace_ensure_placement_in_session(
+        s,
+        container_id=LOCAL_WORKSPACE_ROOT_ID,
+        target_kind=target_kind,
+        target_id=target_id,
+        name=name,
+    )
 
 
 def import_native_canvas(
@@ -4593,6 +4661,108 @@ def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_versio
         }
 
 
+def workspace_batch_action(*, uid: str, action: str, items: list[dict],
+                           container_id: str | None = None,
+                           expected_container_version: int | None = None) -> dict:
+    """Validate and apply one bounded Workspace mutation as a single database transaction.
+
+    The current writable placement model deliberately exposes only Canvas moves. Dataset
+    placements are Catalog-owned and immutable DatasetView placements own their lifecycle.
+    Every placement and permission is checked before the first write; any later failure still
+    rolls the surrounding transaction back.
+    """
+    if action not in {"delete_canvases", "move"}:
+        raise ValueError("unsupported Workspace batch action")
+    if not items or len(items) > 50:
+        raise ValueError("Workspace batch must contain between 1 and 50 items")
+    normalized: list[tuple[str, int, int | None]] = []
+    seen: set[str] = set()
+    for item in items:
+        placement_id = str(item.get("placementId", "")).strip()
+        expected_version = item.get("expectedVersion")
+        expected_canvas_version = item.get("expectedCanvasVersion")
+        if not placement_id or placement_id in seen:
+            raise ValueError("Workspace batch contains an invalid or duplicate placement")
+        if (isinstance(expected_version, bool) or not isinstance(expected_version, int)
+                or expected_version < 1):
+            raise ValueError("Workspace batch expected version must be a positive integer")
+        if action == "delete_canvases" and (
+                isinstance(expected_canvas_version, bool)
+                or not isinstance(expected_canvas_version, int)
+                or expected_canvas_version < 1):
+            raise ValueError(
+                "Workspace batch delete expected Canvas version must be a positive integer")
+        seen.add(placement_id)
+        normalized.append((placement_id, expected_version, expected_canvas_version))
+
+    with _workspace_write_session() as s:
+        destination: WorkspaceContainer | None = None
+        if action == "move":
+            if not container_id or expected_container_version is None:
+                raise ValueError("Workspace batch move requires a versioned destination")
+            destination = _workspace_container_at_version(
+                s, container_id, expected_container_version)
+        elif container_id is not None or expected_container_version is not None:
+            raise ValueError("Workspace batch delete does not accept a destination")
+
+        validated: list[tuple[WorkspacePlacement, Canvas]] = []
+        for placement_id, expected_version, expected_canvas_version in sorted(
+                normalized, key=lambda item: item[0]):
+            placement = _workspace_placement_locked(s, placement_id)
+            if placement.target_kind != "canvas":
+                raise ValueError("only Canvas placements can be changed by this Workspace batch")
+            if placement.version != expected_version:
+                _workspace_version_conflict("placement", placement_id, expected_version)
+            canvas = s.get(Canvas, placement.target_id, with_for_update=True)
+            if canvas is None:
+                raise KeyError(f"canvas '{placement.target_id}' not found")
+            if (action == "delete_canvases"
+                    and canvas.version != expected_canvas_version):
+                _workspace_version_conflict(
+                    "canvas", canvas.id, int(expected_canvas_version))
+            role = _workspace_canvas_role_in_session(s, canvas, uid)
+            allowed = role == "owner" if action == "delete_canvases" else role in ("owner", "editor")
+            if not allowed:
+                verb = "delete" if action == "delete_canvases" else "move"
+                raise PermissionError(f"you don't have permission to {verb} this canvas")
+            if destination is not None and placement.container_id == destination.id:
+                raise ValueError(f"canvas '{canvas.id}' is already in that Workspace container")
+            validated.append((placement, canvas))
+
+        # Lock in a deterministic order, but keep the response aligned with the caller's bounded
+        # selection. A client must never need to infer which result belongs to which request item.
+        validated_by_placement = {
+            placement.id: (placement, canvas) for placement, canvas in validated
+        }
+        validated = [validated_by_placement[placement_id]
+                     for placement_id, _version, _canvas_version in normalized]
+
+        if action == "delete_canvases":
+            deleted_ids = [canvas.id for _placement, canvas in validated]
+            for canvas_id in deleted_ids:
+                delete_canvas_cascade(canvas_id, db_session=s)
+            return {"ok": True, "action": action, "deletedCanvasIds": deleted_ids, "items": []}
+
+        assert destination is not None
+        moved: list[dict] = []
+        for placement, _canvas in validated:
+            changed = s.execute(update(WorkspacePlacement).where(
+                WorkspacePlacement.id == placement.id,
+                WorkspacePlacement.version == placement.version,
+            ).values(
+                container_id=destination.id,
+                version=WorkspacePlacement.version + 1,
+            ).execution_options(synchronize_session=False))
+            if changed.rowcount != 1:
+                _workspace_version_conflict("placement", placement.id, placement.version)
+            s.refresh(placement)
+            moved.append(_workspace_public_placement_resource(s, placement, detached=False))
+        return {
+            "ok": True, "action": action, "items": moved,
+            "container": _workspace_public_container_resource(s, destination),
+        }
+
+
 def workspace_delete_placement(placement_id: str, *, expected_version: int) -> None:
     """CAS-delete a canvas placement without deleting or rewriting its target."""
     with _workspace_write_session() as s:
@@ -4610,6 +4780,28 @@ def workspace_delete_placement(placement_id: str, *, expected_version: int) -> N
         ).execution_options(synchronize_session=False))
         if removed.rowcount != 1:
             _workspace_version_conflict("placement", placement_id, expected_version)
+
+
+def workspace_delete_detached_dataset_placement(
+        placement_id: str, *, expected_version: int) -> dict:
+    """Remove one stale local Dataset shortcut, never a live Catalog-backed Dataset."""
+    with _workspace_write_session() as s:
+        row = _workspace_placement_locked(s, placement_id)
+        if row.version != expected_version:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        if row.target_kind != "dataset":
+            raise ValueError("only an unavailable dataset can be removed with this action")
+        live = s.scalar(select(CatalogEntry.registration_id).where(
+            CatalogEntry.registration_id == row.target_id))
+        if live is not None:
+            raise ValueError("this dataset is still available; remove it from the Catalog instead")
+        removed = s.execute(delete(WorkspacePlacement).where(
+            WorkspacePlacement.id == placement_id,
+            WorkspacePlacement.version == expected_version,
+        ).execution_options(synchronize_session=False))
+        if removed.rowcount != 1:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        return {"ok": True, "placementId": placement_id}
 
 
 def _dataset_view_row_doc(row: DatasetView) -> dict:
@@ -5503,7 +5695,7 @@ def release_unclaimed_merge_sparse_output(sparse_id: str) -> bool:
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
 _WORKSPACE_ANCESTOR_LIMIT = 32
-_WORKSPACE_SEARCH_CURSOR_VERSION = 1
+_WORKSPACE_SEARCH_CURSOR_VERSION = 2
 
 
 def _workspace_ref(kind: str, identity: str) -> str:
@@ -5537,9 +5729,15 @@ def _workspace_name_order(column):
     return column.collate("BINARY" if _is_sqlite_database() else "C")
 
 
-def _workspace_search_cursor_encode(query: str, name: str, rank: int, identity: str) -> str:
+def _workspace_search_cursor_encode(query: str, *, name: str, rank: int, identity: str,
+                                    updated_at: datetime.datetime | None) -> str:
     raw = json.dumps(
-        [_WORKSPACE_SEARCH_CURSOR_VERSION, query, name, rank, identity],
+        [
+            _WORKSPACE_SEARCH_CURSOR_VERSION, query,
+            1 if updated_at is None else 0,
+            updated_at.isoformat() if updated_at is not None else None,
+            name, rank, identity,
+        ],
         separators=(",", ":"),
     ).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -5547,36 +5745,33 @@ def _workspace_search_cursor_encode(query: str, name: str, rank: int, identity: 
 
 def _workspace_search_cursor_decode(
     cursor: str | None, *, query: str,
-) -> tuple[str, int, str] | None:
+) -> _WorkspaceQueryCursor | None:
     if cursor is None:
         return None
     if len(cursor) > 4096:
         raise ValueError("invalid Workspace search cursor")
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        version, bound_query, name, rank, identity = json.loads(raw)
+        version, bound_query, null_rank, raw_updated_at, name, rank, identity = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace search cursor") from exc
     if (version != _WORKSPACE_SEARCH_CURSOR_VERSION or bound_query != query
+            or isinstance(null_rank, bool) or not isinstance(null_rank, int)
+            or null_rank not in (0, 1)
+            or (null_rank == 0 and not isinstance(raw_updated_at, str))
+            or (null_rank == 1 and raw_updated_at is not None)
             or not isinstance(name, str)
             or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2, 3)
             or not isinstance(identity, str) or not identity):
         raise ValueError("invalid Workspace search cursor")
-    return name, rank, identity
-
-
-def _workspace_search_after(name_column, id_column, rank: int, cursor):
-    if cursor is None:
-        return None
-    name, cursor_rank, identity = cursor
-    ordered_name = _workspace_name_order(func.lower(name_column))
-    return or_(
-        ordered_name > name,
-        and_(ordered_name == name, or_(
-            rank > cursor_rank,
-            and_(rank == cursor_rank, id_column > identity),
-        )),
-    )
+    try:
+        updated_at = (datetime.datetime.fromisoformat(raw_updated_at)
+                      if isinstance(raw_updated_at, str) else None)
+    except ValueError as exc:
+        raise ValueError("invalid Workspace search cursor") from exc
+    return _WorkspaceQueryCursor(
+        name=name, kind_rank=rank, row_id=identity,
+        null_rank=null_rank, updated_at=updated_at)
 
 
 def _workspace_search_matches(name_column, tokens: list[str]):
@@ -5693,11 +5888,17 @@ def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
     }
 
 
-def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) -> dict:
+def _workspace_placement_resource(
+        row: WorkspacePlacement, *, detached: bool,
+        canvas_version: int | None = None,
+        updated_at: datetime.datetime | None = None) -> dict:
     return {
         "id": _workspace_ref(row.target_kind, row.target_id), "kind": row.target_kind,
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
+        **({"updatedAt": _core_utc_iso(updated_at)} if updated_at is not None else {}),
+        **({"canvasVersion": canvas_version}
+           if row.target_kind == "canvas" and canvas_version is not None else {}),
     }
 
 
@@ -5762,7 +5963,12 @@ def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
 
 def _workspace_public_placement_resource(
         s, row: WorkspacePlacement, *, detached: bool) -> dict:
-    resource = _workspace_placement_resource(row, detached=detached)
+    canvas_version = (
+        s.scalar(select(Canvas.version).where(Canvas.id == row.target_id))
+        if row.target_kind == "canvas" else None
+    )
+    resource = _workspace_placement_resource(
+        row, detached=detached, canvas_version=canvas_version)
     container = s.get(WorkspaceContainer, row.container_id)
     if container is None:  # pragma: no cover - foreign key protected invariant
         raise RuntimeError("Workspace placement parent is missing")
@@ -6311,6 +6517,33 @@ def workspace_provider_mark_dataset(
         return _workspace_provider_dataset_doc(row)
 
 
+def workspace_provider_mark_dataset_deleted(
+    *, mount_id: str, provider_dataset_id: str,
+) -> dict:
+    """Retire a provider dataset and every cached occurrence after an explicit source delete."""
+    with session() as s:
+        row = s.get(
+            WorkspaceProviderDataset,
+            (mount_id, provider_dataset_id),
+            with_for_update=True,
+        )
+        if row is None:
+            raise KeyError("Workspace provider dataset not found")
+        row.state = "detached"
+        row.last_error = _workspace_provider_safe_error("detached")
+        row.last_resolved_at = _now()
+        occurrences = list(s.scalars(select(WorkspaceProviderBinding).where(
+            WorkspaceProviderBinding.mount_id == mount_id,
+            WorkspaceProviderBinding.provider_dataset_id == provider_dataset_id,
+            WorkspaceProviderBinding.active.is_(True),
+        ).order_by(WorkspaceProviderBinding.id).with_for_update()))
+        for occurrence in occurrences:
+            occurrence.state = "detached"
+            occurrence.last_error = _workspace_provider_safe_error("detached")
+            occurrence.last_resolved_at = _now()
+        return _workspace_provider_dataset_doc(row)
+
+
 def workspace_provider_dataset(
         *, mount_id: str, provider_dataset_id: str) -> dict | None:
     with session() as s:
@@ -6522,10 +6755,6 @@ def _workspace_canvas_visible_clause(uid: str):
     ))
 
 
-def _workspace_canvas_exists_clause():
-    return exists(select(Canvas.id).where(Canvas.id == WorkspacePlacement.target_id))
-
-
 def _workspace_local_placement_visible_clause():
     """Keep hidden external anchors and all of their placements out of ordinary local navigation."""
     return ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
@@ -6540,10 +6769,346 @@ def _workspace_dataset_view_visible_clause(uid: str):
     ))
 
 
+_WORKSPACE_QUERY_CURSOR_VERSION = 3
+_WORKSPACE_BROWSE_KINDS = frozenset({"container", "canvas", "dataset", "dataset_view"})
+
+
+@dataclass(frozen=True)
+class _WorkspaceQueryCursor:
+    name: str
+    kind_rank: int
+    row_id: str
+    null_rank: int | None = None
+    updated_at: datetime.datetime | None = None
+
+
+def _workspace_query_cursor_encode(*, container_id: str, sort: str, order: str,
+                                   kinds: frozenset[str],
+                                   name: str, kind_rank: int, row_id: str,
+                                   updated_at: datetime.datetime | None) -> str:
+    payload: list[object] = [
+        _WORKSPACE_QUERY_CURSOR_VERSION, container_id, sort, order, sorted(kinds),
+    ]
+    if sort == "name":
+        payload.extend((name, kind_rank, row_id))
+    else:
+        null_rank = 1 if updated_at is None else 0
+        payload.extend((
+            null_rank,
+            updated_at.isoformat() if updated_at is not None else None,
+            name,
+            kind_rank,
+            row_id,
+        ))
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_query_cursor_decode(cursor: str | None, *, container_id: str,
+                                   sort: str, order: str,
+                                   kinds: frozenset[str]) -> _WorkspaceQueryCursor | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Workspace query cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+    except (binascii.Error, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid Workspace query cursor") from exc
+    if not isinstance(payload, list) or len(payload) < 5:
+        raise ValueError("invalid Workspace query cursor")
+    version, cursor_container_id, cursor_sort, cursor_order, cursor_kinds = payload[:5]
+    if (version != _WORKSPACE_QUERY_CURSOR_VERSION
+            or cursor_container_id != container_id
+            or cursor_sort != sort or cursor_order != order
+            or cursor_kinds != sorted(kinds)):
+        raise ValueError("Workspace query cursor does not match this folder, sort, and filter")
+    values = payload[5:]
+    if sort == "name":
+        if len(values) != 3:
+            raise ValueError("invalid Workspace query cursor")
+        name, kind_rank, row_id = values
+        null_rank = None
+        updated_at = None
+    else:
+        if len(values) != 5:
+            raise ValueError("invalid Workspace query cursor")
+        null_rank, raw_updated_at, name, kind_rank, row_id = values
+        if (isinstance(null_rank, bool) or not isinstance(null_rank, int)
+                or null_rank not in (0, 1)
+                or (null_rank == 0 and not isinstance(raw_updated_at, str))
+                or (null_rank == 1 and raw_updated_at is not None)):
+            raise ValueError("invalid Workspace query cursor")
+        try:
+            updated_at = (
+                datetime.datetime.fromisoformat(raw_updated_at)
+                if isinstance(raw_updated_at, str) else None
+            )
+        except ValueError as exc:
+            raise ValueError("invalid Workspace query cursor") from exc
+    if (not isinstance(name, str)
+            or isinstance(kind_rank, bool) or not isinstance(kind_rank, int)
+            or kind_rank not in (0, 1, 2, 3)
+            or not isinstance(row_id, str) or not row_id):
+        raise ValueError("invalid Workspace query cursor")
+    return _WorkspaceQueryCursor(
+        name=name,
+        kind_rank=kind_rank,
+        row_id=row_id,
+        null_rank=null_rank,
+        updated_at=updated_at,
+    )
+
+
+def _workspace_query_name_after(name_column, kind_column, id_column,
+                                cursor: _WorkspaceQueryCursor, *, descending: bool):
+    name_after = name_column < cursor.name if descending else name_column > cursor.name
+    return or_(
+        name_after,
+        and_(name_column == cursor.name, or_(
+            kind_column > cursor.kind_rank,
+            and_(kind_column == cursor.kind_rank, id_column > cursor.row_id),
+        )),
+    )
+
+
+def _workspace_query_updated_after(updated_column, null_column, name_column,
+                                   kind_column, id_column,
+                                   cursor: _WorkspaceQueryCursor, *, descending: bool):
+    name_after = _workspace_query_name_after(
+        name_column, kind_column, id_column, cursor, descending=False)
+    if cursor.null_rank == 1:
+        return and_(null_column == 1, name_after)
+    if cursor.updated_at is None:  # pragma: no cover - cursor validation guarantees this
+        raise ValueError("invalid Workspace query cursor")
+    updated_after = (
+        updated_column < cursor.updated_at
+        if descending else updated_column > cursor.updated_at
+    )
+    return or_(
+        null_column > 0,
+        and_(null_column == 0, or_(
+            updated_after,
+            and_(updated_column == cursor.updated_at, name_after),
+        )),
+    )
+
+
+def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
+                               container_id: str | None = None,
+                               tokens: list[str] | None = None) -> list:
+    """Per-kind local listing selects carrying the authoritative target timestamp.
+
+    ``container_id`` restricts to one Folder's direct children; ``tokens`` restricts to name
+    matches. Folders and detached Dataset placements have no timestamp and carry NULL.
+    """
+    missing_timestamp = cast(literal(None), DateTime(timezone=True))
+    missing_canvas_version = cast(literal(None), Integer)
+    container_where = [
+        *([WorkspaceContainer.parent_id == container_id] if container_id is not None else []),
+        *([_workspace_search_matches(WorkspaceContainer.name, tokens)] if tokens else []),
+        ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+            WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
+    ]
+    placement_where = [
+        *([WorkspacePlacement.container_id == container_id] if container_id is not None else []),
+        *([_workspace_search_matches(WorkspacePlacement.name, tokens)] if tokens else []),
+        _workspace_local_placement_visible_clause(),
+    ]
+    streams = []
+    if "container" in kinds:
+        streams.append(select(
+            WorkspaceContainer.id.label("row_id"),
+            literal("container").label("kind"),
+            literal(0).label("kind_rank"),
+            WorkspaceContainer.name.label("name"),
+            missing_timestamp.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).where(*container_where))
+    if "canvas" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("canvas").label("kind"),
+            literal(1).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            Canvas.updated_at.label("updated_at"),
+            Canvas.version.label("canvas_version"),
+        ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).where(
+            WorkspacePlacement.target_kind == "canvas",
+            or_(
+                Canvas.owner_id == uid,
+                Canvas.visibility.in_(("workspace", "workspace_view")),
+                exists(select(CanvasShare.id).where(
+                    CanvasShare.canvas_id == Canvas.id,
+                    CanvasShare.user_id == uid,
+                ).correlate(Canvas)),
+            ),
+            *placement_where,
+        ))
+    if "dataset" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("dataset").label("kind"),
+            literal(2).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            CatalogEntry.updated_at.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).outerjoin(
+            CatalogEntry,
+            CatalogEntry.registration_id == WorkspacePlacement.target_id,
+        ).where(
+            WorkspacePlacement.target_kind == "dataset",
+            *placement_where,
+        ))
+    if "dataset_view" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("dataset_view").label("kind"),
+            literal(3).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            DatasetView.created_at.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).where(
+            WorkspacePlacement.target_kind == "dataset_view",
+            DatasetView.owner_id == uid,
+            DatasetView.deleted_at.is_(None),
+            *placement_where,
+        ))
+    return streams
+
+
+def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
+                            cursor: str | None, sort: str, order: str,
+                            kinds: frozenset[str]) -> dict:
+    """Run one filtered and globally ordered local Workspace page in the metadata database.
+
+    ``updated`` uses the authoritative target timestamp where the current model has one: Canvas
+    ``updated_at``, Catalog entry ``updated_at``, and immutable DatasetView ``created_at``. Local
+    Folder rows and detached Dataset placements have no timestamp column and therefore sort as
+    unknown after timestamped resources, with a deterministic name/kind/id tie-break.
+    """
+    if sort not in {"name", "updated"}:
+        raise ValueError("Workspace sort must be 'name' or 'updated'")
+    if order not in {"asc", "desc"}:
+        raise ValueError("Workspace order must be 'asc' or 'desc'")
+    if not kinds or not kinds <= _WORKSPACE_BROWSE_KINDS:
+        raise ValueError("Workspace type filter is invalid")
+    decoded = _workspace_query_cursor_decode(
+        cursor, container_id=container_id, sort=sort, order=order, kinds=kinds)
+    with session() as s:
+        container = s.get(WorkspaceContainer, container_id)
+        if container is None:
+            raise KeyError(f"workspace container '{container_id}' not found")
+        if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
+            raise KeyError(f"workspace container '{container_id}' not found")
+
+        streams = _workspace_listing_streams(
+            uid=uid, kinds=kinds, container_id=container_id)
+
+        listing = union_all(*streams).subquery()
+        name_order = _workspace_name_order(func.lower(listing.c.name))
+        null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
+        if sort == "name":
+            primary = name_order.asc() if order == "asc" else name_order.desc()
+            ordering = [primary, listing.c.kind_rank.asc(), listing.c.row_id.asc()]
+            after = (
+                _workspace_query_name_after(
+                    name_order, listing.c.kind_rank, listing.c.row_id, decoded,
+                    descending=order == "desc",
+                )
+                if decoded is not None else None
+            )
+        else:
+            primary = (listing.c.updated_at.asc() if order == "asc"
+                       else listing.c.updated_at.desc())
+            ordering = [
+                null_order.asc(),
+                primary, name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
+            ]
+            after = (
+                _workspace_query_updated_after(
+                    listing.c.updated_at, null_order, name_order,
+                    listing.c.kind_rank, listing.c.row_id, decoded,
+                    descending=order == "desc",
+                )
+                if decoded is not None else None
+            )
+        query = select(
+            listing.c.row_id,
+            listing.c.kind,
+            listing.c.kind_rank,
+            name_order.label("sort_name"),
+            listing.c.updated_at,
+            listing.c.canvas_version,
+        ).order_by(*ordering).limit(limit + 1)
+        if after is not None:
+            query = query.where(after)
+        rows = list(s.execute(query).all())
+        page_rows = rows[:limit]
+        container_ids = [row.row_id for row in page_rows if row.kind == "container"]
+        placement_ids = [row.row_id for row in page_rows if row.kind != "container"]
+        containers = {
+            row.id: row for row in s.scalars(select(WorkspaceContainer).where(
+                WorkspaceContainer.id.in_(container_ids)))
+        } if container_ids else {}
+        placements = {
+            row.id: row for row in s.scalars(select(WorkspacePlacement).where(
+                WorkspacePlacement.id.in_(placement_ids)))
+        } if placement_ids else {}
+        dataset_ids = [
+            row.target_id for row in placements.values() if row.target_kind == "dataset"]
+        live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
+            CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
+        items: list[dict] = []
+        for row in page_rows:
+            if row.kind == "container":
+                resource = containers.get(row.row_id)
+                if resource is not None:
+                    items.append(_workspace_container_resource(s, resource))
+                continue
+            placement = placements.get(row.row_id)
+            if placement is not None:
+                items.append(_workspace_placement_resource(
+                    placement,
+                    detached=(placement.target_kind == "dataset"
+                              and placement.target_id not in live_datasets),
+                    canvas_version=row.canvas_version,
+                    updated_at=row.updated_at,
+                ))
+        has_more = len(rows) > limit
+        last_row = page_rows[-1] if page_rows else None
+        next_cursor = (
+            _workspace_query_cursor_encode(
+                container_id=container_id,
+                sort=sort,
+                order=order,
+                kinds=kinds,
+                name=last_row.sort_name,
+                kind_rank=last_row.kind_rank,
+                row_id=last_row.row_id,
+                updated_at=last_row.updated_at,
+            )
+            if has_more and last_row is not None else None
+        )
+        return {
+            "container": _workspace_container_resource(s, container),
+            "items": items, "nextCursor": next_cursor, "hasMore": has_more,
+            "completeness": "page" if has_more else "complete",
+        }
+
+
 def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
-                     cursor: str | None = None) -> dict:
+                     cursor: str | None = None, sort: str | None = None,
+                     order: str = "asc", kinds: set[str] | frozenset[str] | None = None) -> dict:
     """Read one bounded mixed local Workspace page without calling a catalog provider."""
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    if sort is not None or kinds is not None:
+        return _workspace_browse_query(
+            container_id, uid=uid, limit=limit, cursor=cursor,
+            sort=sort or "name", order=order,
+            kinds=frozenset(kinds or _WORKSPACE_BROWSE_KINDS),
+        )
     decoded = _workspace_cursor_decode(cursor)
     with session() as s:
         container = s.get(WorkspaceContainer, container_id)
@@ -6564,8 +7129,6 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspaceContainer.id,
         )
           .limit(limit + 1)))
-        visible_or_missing_canvas = or_(
-            ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
         canvas_after = _workspace_after(
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
         dataset_after = _workspace_after(
@@ -6574,7 +7137,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 3, decoded)
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
-            WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            WorkspacePlacement.target_kind == "canvas", _workspace_canvas_visible_clause(uid),
             _workspace_local_placement_visible_clause(),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
@@ -6606,19 +7169,41 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         placements = [*canvas_placements, *dataset_placements, *view_placements]
         dataset_ids = [row.target_id for row in placements if row.target_kind == "dataset"]
         canvas_ids = [row.target_id for row in placements if row.target_kind == "canvas"]
-        live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
-            CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
-        live_canvases = set(s.scalars(select(Canvas.id).where(Canvas.id.in_(canvas_ids)))) if canvas_ids else set()
+        view_ids = [row.target_id for row in placements if row.target_kind == "dataset_view"]
+        dataset_rows = list(s.execute(select(
+            CatalogEntry.registration_id, CatalogEntry.updated_at,
+        ).where(CatalogEntry.registration_id.in_(dataset_ids))).all()) if dataset_ids else []
+        canvas_rows = list(s.execute(select(
+            Canvas.id, Canvas.version, Canvas.updated_at,
+        ).where(Canvas.id.in_(canvas_ids))).all()) if canvas_ids else []
+        view_rows = list(s.execute(select(
+            DatasetView.id, DatasetView.created_at,
+        ).where(DatasetView.id.in_(view_ids))).all()) if view_ids else []
+        live_datasets = {dataset_id for dataset_id, _updated_at in dataset_rows}
+        dataset_updated_at = dict(dataset_rows)
+        canvas_versions = {canvas_id: version for canvas_id, version, _updated_at in canvas_rows}
+        canvas_updated_at = {
+            canvas_id: updated_at for canvas_id, _version, updated_at in canvas_rows
+        }
+        view_updated_at = dict(view_rows)
 
         rows: list[tuple[tuple, dict]] = []
         for row in containers:
             rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(s, row)))
         for row in placements:
             rank = {"canvas": 1, "dataset": 2, "dataset_view": 3}[row.target_kind]
-            live = (row.target_id in live_canvases if row.target_kind == "canvas" else
+            live = (row.target_id in canvas_versions if row.target_kind == "canvas" else
                     row.target_id in live_datasets if row.target_kind == "dataset" else True)
+            updated_at = (
+                canvas_updated_at.get(row.target_id) if row.target_kind == "canvas" else
+                dataset_updated_at.get(row.target_id) if row.target_kind == "dataset" else
+                view_updated_at.get(row.target_id)
+            )
             rows.append(((row.ordinal, rank, row.name, row.id),
-                         _workspace_placement_resource(row, detached=not live)))
+                         _workspace_placement_resource(
+                             row, detached=not live,
+                             canvas_version=canvas_versions.get(row.target_id),
+                             updated_at=updated_at)))
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
         has_more = len(rows) > limit
@@ -6648,13 +7233,11 @@ def workspace_provider_overlay_browse(
         container = s.get(WorkspaceContainer, anchor.container_id)
         if container is None or s.get(WorkspaceProviderBinding, binding_id) is None:  # pragma: no cover - FK-protected invariant
             raise RuntimeError("Workspace provider overlay binding is incomplete")
-        visible_or_missing_canvas = or_(
-            ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
         after = _workspace_after(
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
         placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container.id,
-            WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            WorkspacePlacement.target_kind == "canvas", _workspace_canvas_visible_clause(uid),
             *([after] if after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -6696,7 +7279,7 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
         ))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
-        if s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
+        if s.get(Canvas, identity) is None or canvas_role(identity, uid) is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         anchor = s.scalar(select(WorkspaceExternalOverlayAnchor).where(
             WorkspaceExternalOverlayAnchor.container_id == placement.container_id))
@@ -6715,7 +7298,11 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
 
 def workspace_search(query: str, *, uid: str, limit: int = 25,
                      cursor: str | None = None) -> dict:
-    """Search current local Workspace metadata without materializing the complete catalog."""
+    """Search current local Workspace metadata, most recently updated first.
+
+    Results carry the same ``updatedAt`` as browse. Folders and detached Dataset placements have
+    no timestamp and sort last by name, matching the browse ``updated`` sort.
+    """
     normalized = " ".join(query.split()).lower()
     if not normalized:
         raise ValueError("Workspace search query must not be blank")
@@ -6725,86 +7312,67 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
     tokens = normalized.split()
     decoded = _workspace_search_cursor_decode(cursor, query=normalized)
     with session() as s:
-        container_after = _workspace_search_after(
-            WorkspaceContainer.name, WorkspaceContainer.id, 0, decoded)
-        containers = list(s.scalars(select(WorkspaceContainer).where(
-            _workspace_search_matches(WorkspaceContainer.name, tokens),
-            ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
-                WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
-            *([container_after] if container_after is not None else []),
+        listing = union_all(*_workspace_listing_streams(
+            uid=uid, kinds=_WORKSPACE_BROWSE_KINDS, tokens=tokens)).subquery()
+        name_order = _workspace_name_order(func.lower(listing.c.name))
+        null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
+        page_query = select(
+            listing.c.row_id,
+            listing.c.kind,
+            listing.c.kind_rank,
+            name_order.label("sort_name"),
+            listing.c.updated_at,
+            listing.c.canvas_version,
         ).order_by(
-            _workspace_name_order(func.lower(WorkspaceContainer.name)),
-            WorkspaceContainer.id,
-        ).limit(limit + 1)))
-
-        canvas_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 1, decoded)
-        dataset_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 2, decoded)
-        view_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 3, decoded)
-        canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "canvas",
-            _workspace_canvas_visible_clause(uid),
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([canvas_after] if canvas_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-        dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "dataset",
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([dataset_after] if dataset_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-        view_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "dataset_view",
-            _workspace_dataset_view_visible_clause(uid),
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([view_after] if view_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-
-        dataset_ids = [row.target_id for row in dataset_placements]
+            null_order.asc(), listing.c.updated_at.desc(),
+            name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
+        ).limit(limit + 1)
+        if decoded is not None:
+            page_query = page_query.where(_workspace_query_updated_after(
+                listing.c.updated_at, null_order, name_order,
+                listing.c.kind_rank, listing.c.row_id, decoded, descending=True))
+        rows = list(s.execute(page_query).all())
+        page_rows = rows[:limit]
+        container_ids = [row.row_id for row in page_rows if row.kind == "container"]
+        placement_ids = [row.row_id for row in page_rows if row.kind != "container"]
+        containers = {
+            row.id: row for row in s.scalars(select(WorkspaceContainer).where(
+                WorkspaceContainer.id.in_(container_ids)))
+        } if container_ids else {}
+        placements = {
+            row.id: row for row in s.scalars(select(WorkspacePlacement).where(
+                WorkspacePlacement.id.in_(placement_ids)))
+        } if placement_ids else {}
+        dataset_ids = [
+            row.target_id for row in placements.values() if row.target_kind == "dataset"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
-        rows: list[tuple[tuple[str, int, str], dict]] = []
-        rows.extend(
-            ((row.name.lower(), 0, row.id), _workspace_container_resource(s, row))
-            for row in containers
-        )
-        rows.extend(
-            ((row.name.lower(), 1, row.target_id),
-             _workspace_placement_resource(row, detached=False))
-            for row in canvas_placements
-        )
-        rows.extend(
-            ((row.name.lower(), 2, row.target_id),
-             _workspace_placement_resource(row, detached=row.target_id not in live_datasets))
-            for row in dataset_placements
-        )
-        rows.extend(
-            ((row.name.lower(), 3, row.target_id),
-             _workspace_placement_resource(row, detached=False))
-            for row in view_placements
-        )
-        rows.sort(key=lambda row: row[0])
-        page = rows[:limit]
+        items: list[dict] = []
+        for row in page_rows:
+            if row.kind == "container":
+                resource = containers.get(row.row_id)
+                if resource is not None:
+                    items.append(_workspace_container_resource(s, resource))
+                continue
+            placement = placements.get(row.row_id)
+            if placement is not None:
+                items.append(_workspace_placement_resource(
+                    placement,
+                    detached=(placement.target_kind == "dataset"
+                              and placement.target_id not in live_datasets),
+                    canvas_version=row.canvas_version,
+                    updated_at=row.updated_at,
+                ))
         has_more = len(rows) > limit
+        last_row = page_rows[-1] if page_rows else None
         next_cursor = (
-            _workspace_search_cursor_encode(normalized, *page[-1][0])
-            if has_more and page else None
+            _workspace_search_cursor_encode(
+                normalized, name=last_row.sort_name, rank=last_row.kind_rank,
+                identity=last_row.row_id, updated_at=last_row.updated_at)
+            if has_more and last_row is not None else None
         )
         return {
-            "items": [item for _key, item in page],
+            "items": items,
             "nextCursor": next_cursor,
             "hasMore": has_more,
         }
@@ -6842,10 +7410,30 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         placement = s.scalar(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity,
             _workspace_local_placement_visible_clause()))
+        if placement is None and kind == "dataset":
+            # Managed writes expose their stable logical dataset identity in receipts and revision
+            # links, while Workspace placements follow the current physical catalog registration.
+            # Resolve that intentional alias at the Workspace boundary so a receipt deep link keeps
+            # working across head replacements without teaching the browser about catalog internals.
+            current_registration_id = s.scalar(select(CatalogEntry.registration_id).join(
+                CatalogLogicalDataset,
+                CatalogLogicalDataset.logical_id == CatalogEntry.logical_id,
+            ).where(
+                CatalogEntry.logical_id == identity,
+                CatalogLogicalDataset.state == "active",
+                CatalogLogicalDataset.current_uri == CatalogEntry.uri,
+            ).limit(1))
+            if current_registration_id is not None:
+                placement = s.scalar(select(WorkspacePlacement).where(
+                    WorkspacePlacement.target_kind == "dataset",
+                    WorkspacePlacement.target_id == current_registration_id,
+                    _workspace_local_placement_visible_clause(),
+                ))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
-        if kind == "canvas" and s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
-            raise KeyError(f"Workspace resource '{resource_id}' not found")
+        if kind == "canvas":
+            if s.get(Canvas, identity) is None or canvas_role(identity, uid) is None:
+                raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "dataset_view":
             view = s.get(DatasetView, identity)
             if view is None or view.owner_id != uid or view.deleted_at is not None:
@@ -6854,8 +7442,9 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         else:
             live = (s.get(Canvas, identity) is not None if kind == "canvas" else
                     s.scalar(select(CatalogEntry.uri).where(
-                        CatalogEntry.registration_id == identity)) is not None)
-        return {"resource": _workspace_placement_resource(placement, detached=not live),
+                        CatalogEntry.registration_id == placement.target_id)) is not None)
+        return {"resource": _workspace_public_placement_resource(
+                    s, placement, detached=not live),
                 "ancestors": _workspace_ancestors(s, placement.container_id)}
 
 
@@ -10279,6 +10868,10 @@ def _execution_manifest_sha256_for_run_in_session(
             RunState.run_id == str(run_id)),
         select(RunRecord.execution_manifest_sha256).where(
             RunRecord.run_id == str(run_id)),
+        select(CanvasResultLatest.terminal_execution_manifest_sha256).where(
+            CanvasResultLatest.terminal_run_id == str(run_id)),
+        select(CanvasResultLatest.result_execution_manifest_sha256).where(
+            CanvasResultLatest.result_run_id == str(run_id)),
         select(CatalogLineageFact.execution_manifest_sha256).where(
             CatalogLineageFact.run_id == str(run_id)),
         select(ManagedLocalFileRevision.execution_manifest_sha256).where(
@@ -10333,6 +10926,8 @@ def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> 
             RunInputAdmission.execution_manifest_sha256,
             RunState.execution_manifest_sha256,
             RunRecord.execution_manifest_sha256,
+            CanvasResultLatest.terminal_execution_manifest_sha256,
+            CanvasResultLatest.result_execution_manifest_sha256,
             CatalogLineageFact.execution_manifest_sha256,
             ManagedLocalFileRevision.execution_manifest_sha256,
             ManagedLocalLanceWriteReceipt.execution_manifest_sha256,
@@ -10566,6 +11161,35 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
     return failed_status.model_dump()
 
 
+def _canvas_result_history_mode(s, canvas: Canvas) -> str:
+    """Resolve the Canvas override over the validated workspace default."""
+    try:
+        canvas_doc = json.loads(canvas.doc)
+    except (TypeError, ValueError):
+        canvas_doc = {}
+    override = (
+        canvas_doc.get("resultRetention", {}).get("history")
+        if isinstance(canvas_doc, dict)
+        and isinstance(canvas_doc.get("resultRetention"), dict)
+        else None
+    )
+    if override in ("latest", "recent"):
+        return str(override)
+    setting = s.scalar(select(Setting.value).where(
+        Setting.scope == "global",
+        Setting.scope_id == "",
+        Setting.key == "canvasResultRetention",
+    ).limit(1))
+    if setting is not None:
+        try:
+            value = json.loads(setting)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, dict) and value.get("history") in ("latest", "recent"):
+            return str(value["history"])
+    return "latest"
+
+
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        target_port_id: str | None,
                        job_type: str, status: str,
@@ -10574,6 +11198,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        profile: dict | None = None,
                        run_id: str | None = None,
                        request_id: str | None = None,
+                       created_by: str | None = None,
                        execution_manifest_sha256: str | None = None,
                        execution_manifest_doc: str | None = None,
                        input_manifest: (
@@ -10610,8 +11235,10 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     if len(output_payload.encode("utf-8")) > _RUN_RECORD_OUTPUTS_MAX_BYTES:
         raise ValueError(
             f"run history outputs exceed {_RUN_RECORD_OUTPUTS_MAX_BYTES} encoded bytes")
-    if s.get(Canvas, canvas_id, with_for_update=True) is None:
+    canvas = s.get(Canvas, canvas_id, with_for_update=True)
+    if canvas is None:
         return False
+    retain_history_artifacts = _canvas_result_history_mode(s, canvas) == "recent"
     rec = (s.scalar(select(RunRecord).where(
         RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
     ).limit(1).with_for_update())
@@ -10622,6 +11249,8 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     rid = rec.id
     if request_id and not rec.request_id:
         rec.request_id = request_id
+    if created_by and not rec.created_by:
+        rec.created_by = str(created_by)
     rec.target_node_id, rec.target_port_id, rec.job_type, rec.status = (
         history.target_node_id, history.target_port_id,
         history.job_type, history.status)
@@ -10669,8 +11298,9 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         RunRecord.canvas_id == canvas_id, RunRecord.id != rid
     ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
       .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
+    history_artifact_doc = {"outputs": output_docs if retain_history_artifacts else []}
     _replace_attempt_refs(
-        s, "run_record", rid, _result_doc_refs({"outputs": output_docs}))
+        s, "run_record", rid, _result_doc_refs(history_artifact_doc))
     stale_execution_manifests = {
         obj.execution_manifest_sha256 for obj in stale
     }
@@ -10687,7 +11317,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     if stale:
         _lock_local_result_registry(s)
     sync_local_result_owner(
-        s, "run_record", rid, {"outputs": output_docs}, rec.input_manifest, rec.profile)
+        s, "run_record", rid, history_artifact_doc, rec.input_manifest, rec.profile)
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
         if obj.run_id:
@@ -10702,6 +11332,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
                profile: dict | None = None,
                run_id: str | None = None,
                request_id: str | None = None,
+               created_by: str | None = None,
                execution_manifest_sha256: str | None = None,
                execution_manifest_doc: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
@@ -10718,15 +11349,20 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
             job_type=job_type, status=status,
             rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node, profile=profile,
             run_id=run_id, request_id=request_id,
+            created_by=created_by,
             execution_manifest_sha256=execution_manifest_sha256,
             execution_manifest_doc=execution_manifest_doc,
         )
 
 
-def delete_canvas_cascade(canvas_id: str) -> None:
-    """Delete a canvas and its children (shares, run history) — FKs don't cascade (SQLite FK off,
-    Postgres would error), so clean them explicitly."""
-    with session() as s:
+def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
+    """Delete a canvas, its Workspace placement, and its children.
+
+    FKs don't cascade (SQLite FK off, Postgres would error), so clean them explicitly.
+    A Canvas placement has no independent recovery value after its target is permanently
+    deleted; retaining it only leaves an unusable row in Workspace.
+    """
+    with (session() if db_session is None else contextlib.nullcontext(db_session)) as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
             return
@@ -10780,6 +11416,9 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         runs = list(s.scalars(select(RunRecord).where(
             RunRecord.canvas_id == canvas_id
         ).order_by(RunRecord.id).with_for_update()))
+        canvas_results = list(s.scalars(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == canvas_id
+        ).order_by(CanvasResultLatest.id).with_for_update()))
         admissions = list(s.scalars(select(RunInputAdmission).where(
             RunInputAdmission.canvas_id == canvas_id
         ).order_by(RunInputAdmission.run_id).with_for_update()))
@@ -10820,12 +11459,24 @@ def delete_canvas_cascade(canvas_id: str) -> None:
                 *durable_tasks, *durable_attempts, *durable_inbox,
             ]
         }
+        execution_manifest_identities.update(
+            identity
+            for row in canvas_results
+            for identity in (
+                row.terminal_execution_manifest_sha256,
+                row.result_execution_manifest_sha256,
+            )
+        )
         profile_retention = s.get(ProfileJobRetention, canvas_id, with_for_update=True)
         profile_latest = list(s.scalars(select(ProfileJobLatest).where(
             ProfileJobLatest.canvas_id == canvas_id
         ).order_by(
             ProfileJobLatest.target_node_id, ProfileJobLatest.plan_digest,
         ).with_for_update()))
+        workspace_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "canvas",
+            WorkspacePlacement.target_id == canvas_id,
+        ).order_by(WorkspacePlacement.id).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         local_owners.extend(("durable_task", task.id) for task in durable_tasks)
         for sh in shares:
@@ -10868,6 +11519,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             _replace_attempt_ref(s, "run_record", r.id, None)
             local_owners.append(("run_record", r.id))
             s.delete(r)
+        for result in canvas_results:
+            _replace_attempt_ref(s, "canvas_result", result.id, None)
+            local_owners.append(("canvas_result", result.id))
+            s.delete(result)
         for v in versions:
             local_owners.append(("canvas_version", v.id))
             _drop_promoted_transform_refs(s, "canvas_version", v.id)
@@ -10877,6 +11532,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(latest)
         if profile_retention is not None:
             s.delete(profile_retention)
+        for placement in workspace_placements:
+            s.delete(placement)
         # also drop this canvas's run_states — else auth_canvas_id/canvas_id dangle into a reusable id
         # namespace and a later canvas re-created under the same id could re-grant its old runs (P0-AUTH-02)
         for rs in run_states:
@@ -11010,7 +11667,9 @@ def _workspace_progress(value) -> float | None:
 def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
                        backend: str | None, backend_attempt: str | None,
                        state_updated_at: datetime.datetime | None,
-                       source: str) -> tuple[tuple[datetime.datetime, str], dict]:
+                       source: str, created_by_id: str | None,
+                       created_by_name: str | None,
+                       viewer_id: str) -> tuple[tuple[datetime.datetime, str], dict]:
     """Normalize terminal history and live state without inventing another lifecycle."""
     if source == "history":
         outputs = json.loads(row.outputs)
@@ -11072,6 +11731,9 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
         "canvasId": row.canvas_id, "canvasName": canvas_name,
         "nodeLabel": node_label, "backend": effective_backend,
         "placement": placement, "attempt": attempt,
+        "createdById": created_by_id,
+        "createdByName": created_by_name,
+        "isMine": created_by_id == str(viewer_id),
     })
     return (created_at, identity), doc
 
@@ -11482,8 +12144,8 @@ def list_workspace_runs(
         backend: str | None = None,
         recorded_after: datetime.datetime | None = None,
         recorded_before: datetime.datetime | None = None,
-        text: str | None = None) -> dict:
-    """Return one bounded keyset page across every canvas the caller can currently read."""
+        text: str | None = None, owned_only: bool = True) -> dict:
+    """Return one bounded keyset page of visible jobs, owner-scoped by default."""
     if limit < 1 or limit > 100:
         raise ValueError("Jobs limit must be between 1 and 100")
     decoded = _workspace_run_cursor_decode(cursor)
@@ -11512,6 +12174,9 @@ def list_workspace_runs(
         effective_backend = func.coalesce(
             RunBackendJob.backend, state_backend_ref, state_placement, literal("unknown"))
         history_identity = literal("h:") + RunRecord.id
+        history_creator_id = func.coalesce(
+            RunInputAdmission.creator_id, RunState.created_by, RunRecord.created_by)
+        history_creator = aliased(User)
         history_predicates = [
             visible_canvas,
             # A managed-local durable write mirrors its receipt into Run history, but Jobs already
@@ -11521,6 +12186,8 @@ def list_workspace_runs(
                 DurableTask.canvas_id == RunRecord.canvas_id,
             )),
         ]
+        if owned_only:
+            history_predicates.append(history_creator_id == str(uid))
         if canvas_id:
             history_predicates.append(RunRecord.canvas_id == canvas_id)
         if run_id:
@@ -11555,24 +12222,34 @@ def list_workspace_runs(
             select(
                 RunRecord, Canvas.name, RunState.doc, RunState.updated_at,
                 RunBackendJob.backend, RunBackendJob.attempt_id,
+                history_creator_id, history_creator.name,
             )
             .join(Canvas, Canvas.id == RunRecord.canvas_id)
             .outerjoin(RunState, and_(
                 RunState.run_id == RunRecord.run_id,
                 RunState.canvas_id == RunRecord.canvas_id,
             ))
+            .outerjoin(
+                RunInputAdmission,
+                RunInputAdmission.run_id == RunRecord.run_id,
+            )
+            .outerjoin(history_creator, history_creator.id == history_creator_id)
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunRecord.run_id)
             .where(*history_predicates)
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, raw_state, state_updated_at, backend_name, backend_attempt in history_rows:
+        for (row, name, raw_state, state_updated_at, backend_name, backend_attempt,
+             creator_id, creator_name) in history_rows:
             state_doc = json.loads(raw_state) if raw_state else None
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
                 backend=backend_name, backend_attempt=backend_attempt,
-                state_updated_at=state_updated_at, source="history"))
+                state_updated_at=state_updated_at, source="history",
+                created_by_id=creator_id, created_by_name=creator_name,
+                viewer_id=uid))
 
         state_identity = literal("s:") + RunState.run_id
+        state_creator = aliased(User)
         state_predicates = [
             visible_canvas,
             ~exists().where(and_(
@@ -11580,6 +12257,8 @@ def list_workspace_runs(
                 RunRecord.run_id == RunState.run_id,
             )),
         ]
+        if owned_only:
+            state_predicates.append(RunState.created_by == str(uid))
         if canvas_id:
             state_predicates.append(RunState.canvas_id == canvas_id)
         if run_id:
@@ -11613,13 +12292,15 @@ def list_workspace_runs(
             select(
                 RunState, Canvas.name,
                 RunBackendJob.backend, RunBackendJob.attempt_id,
+                state_creator.name,
             )
             .join(Canvas, Canvas.id == RunState.canvas_id)
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
+            .outerjoin(state_creator, state_creator.id == RunState.created_by)
             .where(*state_predicates)
             .order_by(RunState.created_at.desc(), RunState.run_id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, backend_name, backend_attempt in state_rows:
+        for row, name, backend_name, backend_attempt, creator_name in state_rows:
             try:
                 state_doc = json.loads(row.doc)
             except (TypeError, ValueError) as exc:
@@ -11627,13 +12308,18 @@ def list_workspace_runs(
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
                 backend=backend_name, backend_attempt=backend_attempt,
-                state_updated_at=row.updated_at, source="state"))
+                state_updated_at=row.updated_at, source="state",
+                created_by_id=row.created_by, created_by_name=creator_name,
+                viewer_id=uid))
 
         task_identity = literal("t:") + DurableTask.id
+        task_creator = aliased(User)
         task_predicates = [
             visible_canvas,
             DurableTask.task_kind.notin_(_JOBS_HIDDEN_TASK_KINDS),
         ]
+        if owned_only:
+            task_predicates.append(DurableTask.owner_id == str(uid))
         if canvas_id:
             task_predicates.append(DurableTask.canvas_id == canvas_id)
         if run_id:
@@ -11664,9 +12350,12 @@ def list_workspace_runs(
                 DurableTask.created_at < stamp,
                 and_(DurableTask.created_at == stamp, task_identity < identity),
             ))
-        task_rows = s.execute(select(DurableTask, Canvas.name, Canvas.owner_id, Canvas.visibility).join(
+        task_rows = s.execute(select(
+            DurableTask, Canvas.name, Canvas.owner_id, Canvas.visibility, task_creator.name,
+        ).join(
             Canvas, Canvas.id == DurableTask.canvas_id,
-        ).where(*task_predicates).order_by(
+        ).outerjoin(task_creator, task_creator.id == DurableTask.owner_id).where(
+            *task_predicates).order_by(
             DurableTask.created_at.desc(), DurableTask.id.desc()).limit(fetch_limit)).all()
         share_roles = {
             row.canvas_id: row.role
@@ -11675,7 +12364,7 @@ def list_workspace_runs(
                 CanvasShare.canvas_id.in_([task.canvas_id for task, *_rest in task_rows] or ["__none__"]),
             )).all()
         } if task_rows else {}
-        for task, name, canvas_owner_id, canvas_visibility in task_rows:
+        for task, name, canvas_owner_id, canvas_visibility, creator_name in task_rows:
             task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
             status_doc = task_doc["status_doc"]
             created_at = task.created_at or _now()
@@ -11695,7 +12384,7 @@ def list_workspace_runs(
             role = _effective_canvas_role(
                 SimpleNamespace(owner_id=canvas_owner_id, visibility=canvas_visibility),
                 str(uid), share_roles.get(task.canvas_id))
-            can_mutate = role in ("owner", "editor")
+            can_mutate = role in ("owner", "editor") and task.owner_id == str(uid)
             if task.task_kind == "merge_columns_write":
                 # Keep Jobs action affordances identical to the merge action routes.  Other
                 # durable task kinds retain their established Canvas-role semantics.
@@ -11751,6 +12440,8 @@ def list_workspace_runs(
                 "updatedAt": _core_utc_iso(task.updated_at),
                 "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
                 "backend": "local", "placement": "local", "attempt": latest["id"],
+                "createdById": task.owner_id, "createdByName": creator_name,
+                "isMine": task.owner_id == str(uid),
                 "taskId": task.id,
                 "taskAttempts": [{
                     "id": item["id"], "attemptNumber": item["attempt_number"],
@@ -12048,6 +12739,34 @@ def retained_run_output_candidates(
     unrelated recent Jobs from hiding a still-retained editor input.
     """
     with session() as s:
+        latest = s.scalar(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == str(canvas_id),
+            CanvasResultLatest.target_node_id == str(target_node_id),
+        ).limit(1))
+        if latest is not None:
+            try:
+                latest_outputs = json.loads(latest.result_outputs)
+            except (TypeError, ValueError):
+                latest_outputs = []
+            if not isinstance(latest_outputs, list):
+                latest_outputs = []
+            output = next((
+                item for item in latest_outputs
+                if isinstance(item, dict)
+                and item.get("node_id", item.get("nodeId")) == target_node_id
+                and item.get("port_id", item.get("portId")) == port_id
+                and item.get("outcome") == "committed"
+                and item.get("publication_kind", item.get("publicationKind"))
+                in ("result", "catalog")
+                and item.get("uri")
+            ), None)
+            # Once a target has an authoritative projection, bounded history must never resurrect an
+            # older generation after this result is missing, replaced, or intentionally unretained.
+            return ([{
+                "run_id": str(latest.result_run_id),
+                "execution_manifest_sha256": latest.result_execution_manifest_sha256,
+                "output": dict(output),
+            }] if output is not None and latest.result_run_id is not None else [])
         rows = s.execute(
             select(
                 RunRecord.run_id,
@@ -12120,7 +12839,7 @@ def retained_run_output_candidates(
             and item.get("node_id") == target_node_id
             and item.get("port_id") == port_id
             and item.get("outcome") == "committed"
-            and item.get("publication_kind") == "result"
+            and item.get("publication_kind") in ("result", "catalog")
             and item.get("uri")
         ), None)
         if output is not None:
@@ -12154,7 +12873,7 @@ def retained_run_output_candidates(
             and item.get("node_id") == target_node_id
             and item.get("port_id") == port_id
             and item.get("outcome") == "committed"
-            and item.get("publication_kind") == "result"
+            and item.get("publication_kind") in ("result", "catalog")
             and item.get("uri")
         ), None)
         if output is not None:
@@ -12182,6 +12901,105 @@ def retained_run_output_candidates(
         return []
     candidates.sort(key=lambda item: item["_terminal_at"], reverse=True)
     return public(candidates)
+
+
+def canvas_result_latest(canvas_id: str) -> list[dict]:
+    """Return the bounded current-result projections for one Canvas.
+
+    Managed local writes predate ``CanvasResultLatest`` and complete through the durable-task
+    transaction rather than ``RunState`` publication.  Until a later terminal attempt creates the
+    dedicated projection, rebuild the same bounded view from that Canvas's retained run history.
+    The router still revalidates the exact execution manifest, catalog head, and readable artifact;
+    this fallback is only candidate discovery, never proof that an old result is current.
+    """
+    with session() as s:
+        def json_list(value: str | None) -> list:
+            try:
+                parsed = json.loads(value or "[]")
+            except (TypeError, ValueError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+
+        rows = list(s.scalars(select(CanvasResultLatest).where(
+            CanvasResultLatest.canvas_id == str(canvas_id),
+        ).order_by(CanvasResultLatest.target_node_id)))
+        result: list[dict] = []
+        for row in rows:
+            try:
+                terminal_doc = json.loads(row.terminal_doc)
+                outputs = json.loads(row.result_outputs)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(terminal_doc, dict) or not isinstance(outputs, list):
+                continue
+            result.append({
+                "target_node_id": row.target_node_id,
+                "terminal_run_id": row.terminal_run_id,
+                "terminal_status": row.terminal_status,
+                "terminal_execution_manifest_sha256": (
+                    row.terminal_execution_manifest_sha256),
+                "terminal_doc": terminal_doc,
+                "result_run_id": row.result_run_id,
+                "result_execution_manifest_sha256": (
+                    row.result_execution_manifest_sha256),
+                "result_outputs": outputs,
+            })
+        projected_targets = {item["target_node_id"] for item in result}
+        history = list(s.scalars(select(RunRecord).where(
+            RunRecord.canvas_id == str(canvas_id),
+            RunRecord.job_type == "run",
+            RunRecord.target_node_id.is_not(None),
+            RunRecord.status.in_(_TERMINAL_RUN),
+        ).order_by(
+            RunRecord.target_node_id,
+            RunRecord.created_at.desc(),
+            RunRecord.id.desc(),
+        )))
+        by_target: dict[str, list[RunRecord]] = {}
+        for row in history:
+            target = str(row.target_node_id)
+            if target not in projected_targets:
+                by_target.setdefault(target, []).append(row)
+        for target, attempts in by_target.items():
+            terminal = attempts[0]
+            terminal_outputs = json_list(terminal.outputs)
+            terminal_per_node = json_list(terminal.per_node)
+            terminal_doc = {
+                "run_id": terminal.run_id,
+                "status": terminal.status,
+                "job_type": terminal.job_type,
+                "target_node_id": terminal.target_node_id,
+                "target_port_id": terminal.target_port_id,
+                "total_rows": terminal.rows,
+                "ms": terminal.ms,
+                "error": terminal.error,
+                "outputs": terminal_outputs,
+                "per_node": terminal_per_node or None,
+            }
+            successful = next((attempt for attempt in attempts if (
+                attempt.status == "done" and any(
+                    isinstance(output, dict)
+                    and output.get("outcome") == "committed"
+                    and output.get("publication_kind", output.get("publicationKind"))
+                    in ("result", "catalog")
+                    and output.get("uri")
+                    for output in json_list(attempt.outputs)
+                )
+            )), None)
+            result.append({
+                "target_node_id": target,
+                "terminal_run_id": terminal.run_id,
+                "terminal_status": terminal.status,
+                "terminal_execution_manifest_sha256": (
+                    terminal.execution_manifest_sha256),
+                "terminal_doc": terminal_doc,
+                "result_run_id": successful.run_id if successful is not None else None,
+                "result_execution_manifest_sha256": (
+                    successful.execution_manifest_sha256 if successful is not None else None),
+                "result_outputs": (
+                    json_list(successful.outputs) if successful is not None else []),
+            })
+        return sorted(result, key=lambda item: item["target_node_id"])
 
 
 def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:
@@ -12331,6 +13149,124 @@ def _upsert_profile_latest(
             _drop_local_result_owner_locked(s, "profile_job", retired_run_id)
 
 
+def _projection_attempt_is_newer(
+        *, run_id: str, submitted_at: datetime.datetime,
+        current_run_id: str | None, current_submitted_at: datetime.datetime | None) -> bool:
+    """Deterministic latest-submission comparison for one Canvas target.
+
+    Admission timestamps are minted by the metadata database before dispatch. The run id is only a
+    stable tie breaker for the extremely narrow equal-timestamp case; repeated publication of the same
+    run remains idempotent.
+    """
+    if current_run_id is None or current_submitted_at is None:
+        return True
+    if str(run_id) == str(current_run_id):
+        return True
+    return (submitted_at, str(run_id)) > (current_submitted_at, str(current_run_id))
+
+
+def _upsert_canvas_result_latest(
+        s, *, canvas_id: str | None, run_id: str, target_node_id: str | None,
+        terminal_status: str, status_doc: dict,
+        execution_manifest_sha256: str | None) -> CanvasResultLatest | None:
+    """Advance one Canvas target's terminal/result projection and its object-result owner.
+
+    The caller must already hold the Canvas row and must not have acquired the local-result registry
+    lock. Local ownership is synchronized after every object-attempt owner in the publication
+    transaction has settled.
+    """
+    if (canvas_id is None or target_node_id is None
+            or terminal_status not in _TERMINAL_RUN
+            or str(status_doc.get("job_type", status_doc.get("jobType", "run"))) != "run"):
+        return None
+    admission = s.get(RunInputAdmission, str(run_id))
+    state = s.get(RunState, str(run_id))
+    now = _db_now(s)
+    submitted_at = (
+        admission.created_at if admission is not None and admission.created_at is not None
+        else state.created_at if state is not None and state.created_at is not None
+        else now
+    )
+    row = s.scalar(select(CanvasResultLatest).where(
+        CanvasResultLatest.canvas_id == str(canvas_id),
+        CanvasResultLatest.target_node_id == str(target_node_id),
+    ).limit(1).with_for_update())
+    if row is None:
+        row = CanvasResultLatest(
+            canvas_id=str(canvas_id),
+            target_node_id=str(target_node_id),
+            terminal_run_id=str(run_id),
+            terminal_status=str(terminal_status),
+            terminal_execution_manifest_sha256=execution_manifest_sha256,
+            terminal_doc=json.dumps(status_doc, separators=(",", ":"), default=str),
+            terminal_submitted_at=submitted_at,
+            terminal_at=now,
+            updated_at=now,
+        )
+        s.add(row)
+        terminal_wins = True
+    else:
+        terminal_wins = _projection_attempt_is_newer(
+            run_id=str(run_id), submitted_at=submitted_at,
+            current_run_id=row.terminal_run_id,
+            current_submitted_at=row.terminal_submitted_at,
+        )
+
+    old_manifest_identities = {
+        row.terminal_execution_manifest_sha256,
+        row.result_execution_manifest_sha256,
+    }
+    if terminal_wins:
+        row.terminal_run_id = str(run_id)
+        row.terminal_status = str(terminal_status)
+        row.terminal_execution_manifest_sha256 = execution_manifest_sha256
+        row.terminal_doc = json.dumps(
+            status_doc, separators=(",", ":"), default=str)
+        row.terminal_submitted_at = submitted_at
+        row.terminal_at = now
+        row.updated_at = now
+
+    result_outputs = [
+        dict(output) for output in (status_doc.get("outputs") or [])
+        if isinstance(output, dict)
+        and output.get("outcome") == "committed"
+        and output.get("publication_kind", output.get("publicationKind")) == "result"
+        and output.get("uri")
+    ] if terminal_status == "done" else []
+    result_wins = bool(result_outputs) and _projection_attempt_is_newer(
+        run_id=str(run_id), submitted_at=submitted_at,
+        current_run_id=row.result_run_id,
+        current_submitted_at=row.result_submitted_at,
+    )
+    if result_wins:
+        row.result_run_id = str(run_id)
+        row.result_execution_manifest_sha256 = execution_manifest_sha256
+        row.result_outputs = json.dumps(
+            result_outputs, separators=(",", ":"), default=str)
+        row.result_input_manifest = admission.manifest if admission is not None else None
+        row.result_submitted_at = submitted_at
+        row.result_updated_at = now
+    s.flush()
+    if result_wins:
+        _replace_attempt_refs(
+            s, "canvas_result", row.id,
+            _result_doc_refs({"outputs": result_outputs}),
+        )
+    _delete_unreferenced_execution_manifests(s, old_manifest_identities)
+    return row
+
+
+def _sync_canvas_result_latest_local_owner(s, row: CanvasResultLatest | None) -> None:
+    if row is None:
+        return
+    try:
+        outputs = json.loads(row.result_outputs)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Canvas current-result output metadata is invalid") from exc
+    sync_local_result_owner(
+        s, "canvas_result", row.id, {"outputs": outputs}, row.result_input_manifest)
+
+
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                    kernel_id: str | None = None, *, publish_region: bool = False,
                    execution_manifest_sha256: str | None = None,
@@ -12370,6 +13306,11 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
     with session() as s:
         if (execution_manifest_sha256 is None) != (execution_manifest_doc is None):
             raise ValueError("execution manifest identity and document must be supplied together")
+        projection_canvas = (
+            s.get(Canvas, str(canvas_id), with_for_update=True)
+            if st in _TERMINAL_RUN and job_type == "run" and canvas_id is not None
+            else None
+        )
         stale_candidate_ids: list[str] = []
         locked: dict[str, RunState] = {}
         if st not in _TERMINAL_RUN:
@@ -12534,6 +13475,16 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             s, "run_state", run_id, output_refs,
             publish=bool(publish_region and st in ("done", "failed")),
             publish_kind="region")
+        canvas_result_latest = _upsert_canvas_result_latest(
+            s,
+            canvas_id=(str(canvas_id) if projection_canvas is not None else None),
+            run_id=str(run_id),
+            target_node_id=(target_node_id or r.target_node_id),
+            terminal_status=st,
+            status_doc=status,
+            execution_manifest_sha256=(
+                execution_manifest_sha256 or r.execution_manifest_sha256),
+        )
         if st in _TERMINAL_RUN:
             stale_execution_manifests = {
                 obj.execution_manifest_sha256 for obj in stale
@@ -12553,6 +13504,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if st in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
+        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
         if st in _TERMINAL_RUN:
             for obj in stale:
                 _drop_local_result_owner_locked(s, "run_state", obj.run_id)
@@ -13965,6 +14917,20 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         pruned = [*stale, *([state] if prune_current else [])]
         _replace_attempt_refs(
             s, "run_state", run_id, _result_doc_refs(published))
+        canvas_result_latest = _upsert_canvas_result_latest(
+            s,
+            canvas_id=(
+                str(state.canvas_id)
+                if state.canvas_id is not None
+                and locked_canvases.get(str(state.canvas_id)) is not None
+                else None
+            ),
+            run_id=str(run_id),
+            target_node_id=(published.get("target_node_id") or state.target_node_id),
+            terminal_status=terminal,
+            status_doc=published,
+            execution_manifest_sha256=state.execution_manifest_sha256,
+        )
         _release_backend_publication_effect_refs(s, job, effects)
         for obj in pruned:
             stale_job = s.get(RunBackendJob, obj.run_id)
@@ -13996,6 +14962,7 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         elif terminal in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=True)
+        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
         for obj in pruned:
             _drop_local_result_owner_locked(s, "run_state", obj.run_id)
         return True
@@ -14366,7 +15333,7 @@ _INSTALLATION_ID = 1
 _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
-    "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
+    "canvas", "canvas_result", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
     "dataset_view", "distribution_report", "durable_task", "profile_job",
     "run_input_admission", "run_record", "run_state", "sparse_output",
 }
@@ -14432,7 +15399,7 @@ def _canvas_local_result_candidates(value) -> set[str]:
 def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     """Owner-aware exact extraction avoids scanning arbitrary caller-controlled JSON strings."""
     candidates: set[str] = set()
-    if owner_kind in ("run_state", "run_record", "result_cache"):
+    if owner_kind in ("canvas_result", "run_state", "run_record", "result_cache"):
         for value in values:
             for uri in _result_doc_uris(value):
                 candidate = _local_result_candidate(uri)
@@ -14623,7 +15590,8 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
             if parsed is not None:
                 identities.update(parsed[1])
             identities.update(_manifest_revision_identities(value))
-    elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
+    elif owner_kind in (
+            "canvas_result", "profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))
     return sorted(identities)
@@ -14632,7 +15600,7 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
 def _local_result_input_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if owner_kind in (
-            "durable_task", "profile_job", "run_input_admission", "run_record", "run_state"):
+            "canvas_result", "durable_task", "profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_local_file_input_identities(value))
     return sorted(identities)
@@ -16129,6 +17097,17 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             for cache in list(s.scalars(select(ResultCache).with_for_update())):
                 if any(uri in inherited_uris for uri in _result_doc_uris(cache.doc)):
                     s.delete(cache)
+            for latest in list(s.scalars(select(CanvasResultLatest).with_for_update())):
+                if any(uri in inherited_uris for uri in _result_doc_uris({
+                        "outputs": json.loads(latest.result_outputs)})):
+                    execution_manifest_candidates.add(
+                        latest.result_execution_manifest_sha256)
+                    latest.result_run_id = None
+                    latest.result_execution_manifest_sha256 = None
+                    latest.result_outputs = "[]"
+                    latest.result_input_manifest = None
+                    latest.result_submitted_at = None
+                    latest.result_updated_at = None
             for ref in list(s.scalars(select(ObjectAttemptRef).where(
                     ObjectAttemptRef.attempt_uri.in_(inherited_uris)).with_for_update())):
                 s.delete(ref)
@@ -20757,6 +21736,20 @@ def catalog_get(token: str) -> dict | None:
         return _row_to_doc(r, [t.tag for t in s.scalars(select(CatalogTag).where(CatalogTag.uri == r.uri))])
 
 
+def catalog_entry_storage(registration_id: str) -> dict | None:
+    """Return exact storage ownership for one current registration, without alias rebinding."""
+    with session() as s:
+        row = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.registration_id == str(registration_id)).limit(1)).first()
+        if row is None:
+            return None
+        return {
+            "registrationId": row.registration_id,
+            "uri": row.uri,
+            "managed": row.logical_id is not None,
+        }
+
+
 def catalog_resolve_example_sources(refs: list[str]) -> list[dict]:
     """Resolve example Source refs against current local registrations with bounded DB reads.
 
@@ -21220,10 +22213,13 @@ def _catalog_current_logical_ownership(
 
 def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = None,
                          expected_metadata_revision: str | None = None,
-                         report_result: bool = False) -> bool | None:
+                         report_result: bool = False,
+                         remove_workspace_placement: bool = False) -> bool | None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
     declared key/relationships). ``report_result`` lets the versioned HTTP mutation distinguish a
-    committed removal from a concurrent miss without changing the legacy fire-and-forget contract."""
+    committed removal from a concurrent miss without changing the legacy fire-and-forget contract.
+    Explicit user-facing unregister also removes the file-browser placement in this transaction;
+    internal source loss keeps it so deep-link recovery can still explain the missing source."""
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         token = str(uri).rstrip("/")
@@ -21294,6 +22290,11 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
             if catalog_metadata_revision(current_doc, declared_key) != expected_metadata_revision:
                 raise CatalogMetadataConflict(
                     "catalog metadata changed; reload before removing this dataset")
+        if remove_workspace_placement:
+            s.execute(delete(WorkspacePlacement).where(
+                WorkspacePlacement.target_kind == "dataset",
+                WorkspacePlacement.target_id == entry.registration_id,
+            ))
         execution_manifest_candidates.update(
             _delete_catalog_governance(s, catalog_key))
         if current_uri:

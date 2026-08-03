@@ -27,7 +27,15 @@ describe('Preview presentation', () => {
     expect(details).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
     expect(screen.getByText(/Requested 50 rows.*scanned unknown.*returned 1.*total unknown/i)).toBeInTheDocument()
-    expect(screen.getByText('Input dataset://events · revision revision-1.')).toBeInTheDocument()
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('dataset://events')
+    expect(screen.getByTestId('preview-details')).not.toHaveTextContent('revision-1')
+  })
+
+  it('shows an ambiguous date-order disclosure even when nothing else is on the strip', () => {
+    const notice = 'Dates in order_date were read day-first (%d/%m/%Y), so 01/02/2026 became 2026-02-01.'
+    render(<PreviewSummary data={preview({ parseNotices: [notice] })} showRange={false} />)
+
+    expect(screen.getByText(notice)).toBeVisible()
   })
 
   it('labels a reservoir sample and keeps one actionable bounded-input warning', () => {

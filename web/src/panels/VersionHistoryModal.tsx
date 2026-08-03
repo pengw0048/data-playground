@@ -35,6 +35,12 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
     }
   }
 
+  const restoreLabel = (v: CanvasVersionDto) => {
+    const recorded = v.createdAt ? ` from ${new Date(v.createdAt).toLocaleString()}` : ''
+    const action = busy === v.id ? 'Restoring' : 'Restore'
+    return `${action} snapshot v${v.version}${recorded}`
+  }
+
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
       <DialogContent className="dp-modal-overlay flex max-h-[76vh] w-[560px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
@@ -56,6 +62,7 @@ export function VersionHistoryModal({ onClose }: { onClose: () => void }) {
               </span>
               <span className="text-[11px] text-muted-foreground">{v.createdAt ? new Date(v.createdAt).toLocaleString() : ''}</span>
               <Button type="button" variant="outline" size="sm" onClick={() => restore(v)} disabled={!!busy || !canEdit}
+                aria-label={restoreLabel(v)}
                 title={canEdit ? 'Restore this version' : 'View-only canvas'}
                 className={cn('text-[11.5px]', busy === v.id && 'disabled:opacity-100')}>
                 {busy === v.id ? 'Restoring…' : 'Restore'}

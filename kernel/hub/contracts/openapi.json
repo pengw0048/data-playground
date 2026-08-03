@@ -401,6 +401,85 @@
         "title": "CanvasCopyValidationResponse",
         "type": "object"
       },
+      "CanvasResultRecovery": {
+        "properties": {
+          "failedNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Failednodeids",
+            "type": "array"
+          },
+          "latestNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Latestnodeids",
+            "type": "array"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/RetainedResultIdentity"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "staleNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Stalenodeids",
+            "type": "array"
+          },
+          "unknownNodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unknownnodeids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "latestNodeIds",
+          "failedNodeIds",
+          "staleNodeIds",
+          "unknownNodeIds",
+          "results"
+        ],
+        "title": "CanvasResultRecovery",
+        "type": "object"
+      },
+      "CanvasResultRecoveryRequest": {
+        "additionalProperties": false,
+        "description": "One bounded reopen check for the Canvas's retained full results.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          }
+        },
+        "required": [
+          "graph"
+        ],
+        "title": "CanvasResultRecoveryRequest",
+        "type": "object"
+      },
+      "CanvasResultRetention": {
+        "description": "Canvas override for physical full-result history.\n\n``latest`` always remains owned by the Canvas. ``recent`` additionally lets bounded Jobs history\nretain its result artifacts. The managed store itself is deployment-owned and runner-independent.",
+        "properties": {
+          "history": {
+            "default": "inherit",
+            "enum": [
+              "inherit",
+              "latest",
+              "recent"
+            ],
+            "title": "History",
+            "type": "string"
+          }
+        },
+        "title": "CanvasResultRetention",
+        "type": "object"
+      },
       "CanvasTransformReference": {
         "properties": {
           "availability": {
@@ -866,6 +945,11 @@
             ],
             "title": "Rowcount"
           },
+          "sourceDeleteAllowed": {
+            "default": false,
+            "title": "Sourcedeleteallowed",
+            "type": "boolean"
+          },
           "tags": {
             "default": [],
             "items": {
@@ -948,6 +1032,9 @@
           },
           "mean": {
             "anyOf": [
+              {
+                "type": "string"
+              },
               {
                 "type": "number"
               },
@@ -5091,6 +5178,50 @@
         "title": "ExecutionManifestDetail",
         "type": "object"
       },
+      "ExecutionTargetInfo": {
+        "description": "One configured whole-Canvas execution choice exposed to the editor.\n\n``name`` remains the stable runner identity persisted in a Canvas. The other fields are bounded\npresentation metadata so the web client never has to turn implementation class names into UX.\nOnly registered runners are returned; unavailable integrations must not look selectable.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "interactive",
+              "job"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "substrate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Substrate"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "kind",
+          "description"
+        ],
+        "title": "ExecutionTargetInfo",
+        "type": "object"
+      },
       "FacetValue": {
         "properties": {
           "count": {
@@ -5396,6 +5527,20 @@
             "title": "Edges",
             "type": "array"
           },
+          "executionBackend": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionbackend"
+          },
           "id": {
             "default": "canvas",
             "maxLength": 512,
@@ -5428,6 +5573,9 @@
             },
             "title": "Requirements",
             "type": "array"
+          },
+          "resultRetention": {
+            "$ref": "#/components/schemas/CanvasResultRetention"
           },
           "version": {
             "default": 1,
@@ -6029,6 +6177,14 @@
             "title": "Capabilityviews",
             "type": "array"
           },
+          "executionTargets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExecutionTargetInfo"
+            },
+            "title": "Executiontargets",
+            "type": "array"
+          },
           "mode": {
             "default": "local",
             "enum": [
@@ -6045,6 +6201,14 @@
             },
             "title": "Processors",
             "type": "array"
+          },
+          "resultStorage": {
+            "$ref": "#/components/schemas/ResultStorageInfo",
+            "default": {
+              "id": "workspace-managed",
+              "kind": "local",
+              "label": "Workspace managed storage"
+            }
           },
           "runners": {
             "default": [],
@@ -6106,11 +6270,60 @@
         "title": "KeyInfo",
         "type": "object"
       },
+      "LineageCardinality": {
+        "description": "A provider-backed relationship count, never a graph-layout inference.",
+        "properties": {
+          "evidence": {
+            "enum": [
+              "declared",
+              "measured"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "value": {
+            "enum": [
+              "1:1",
+              "1:N",
+              "N:1",
+              "N:M"
+            ],
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "evidence"
+        ],
+        "title": "LineageCardinality",
+        "type": "object"
+      },
       "LineageEdge": {
         "properties": {
+          "cardinality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LineageCardinality"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "child": {
             "title": "Child",
             "type": "string"
+          },
+          "columns": {
+            "items": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Columns",
+            "type": "array"
           },
           "factCount": {
             "minimum": 1.0,
@@ -6120,6 +6333,16 @@
           "parent": {
             "title": "Parent",
             "type": "string"
+          },
+          "pipelineNames": {
+            "items": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Pipelinenames",
+            "type": "array"
           }
         },
         "required": [
@@ -9417,6 +9640,34 @@
         "title": "RestoreRevisionTaskV1",
         "type": "object"
       },
+      "ResultStorageInfo": {
+        "description": "The one lifecycle-managed result store available to Canvas runs.\n\nExport destinations are deliberately absent: they do not own result references, manifests, or\ngarbage collection and therefore cannot truthfully be selected as a Canvas result store.",
+        "properties": {
+          "id": {
+            "const": "workspace-managed",
+            "default": "workspace-managed",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "local",
+            "enum": [
+              "local",
+              "object",
+              "plugin"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "default": "Workspace managed storage",
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "title": "ResultStorageInfo",
+        "type": "object"
+      },
       "RetainedEditorPreviewRequest": {
         "additionalProperties": false,
         "description": "Editor-only preview request; the server selects the retained run and artifact.",
@@ -10773,6 +11024,14 @@
             "default": false,
             "title": "Notpreviewable",
             "type": "boolean"
+          },
+          "parseNotices": {
+            "description": "Text-parsing choices the reader made that a different, equally valid choice would have decided differently — for example the day/month order of an ambiguous CSV date.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Parsenotices",
+            "type": "array"
           },
           "previewRef": {
             "anyOf": [
@@ -12241,6 +12500,93 @@
         "title": "WorkspaceAddTransformBody",
         "type": "object"
       },
+      "WorkspaceBatchBody": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "delete_canvases",
+              "move"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "containerId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Containerid"
+          },
+          "expectedContainerVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expectedcontainerversion"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceBatchItem"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "items"
+        ],
+        "title": "WorkspaceBatchBody",
+        "type": "object"
+      },
+      "WorkspaceBatchItem": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedCanvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expectedcanvasversion"
+          },
+          "expectedVersion": {
+            "minimum": 1.0,
+            "title": "Expectedversion",
+            "type": "integer"
+          },
+          "placementId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Placementid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "placementId",
+          "expectedVersion"
+        ],
+        "title": "WorkspaceBatchItem",
+        "type": "object"
+      },
       "WorkspaceBrowsePage": {
         "properties": {
           "completeness": {
@@ -12252,6 +12598,14 @@
             ],
             "title": "Completeness",
             "type": "string"
+          },
+          "connectedSources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceResource"
+            },
+            "title": "Connectedsources",
+            "type": "array"
           },
           "container": {
             "anyOf": [
@@ -12286,6 +12640,13 @@
               }
             ],
             "title": "Nextcursor"
+          },
+          "queryCapabilities": {
+            "$ref": "#/components/schemas/WorkspaceQueryCapabilities",
+            "default": {
+              "kindFilter": false,
+              "sort": []
+            }
           },
           "sources": {
             "default": [],
@@ -12346,7 +12707,8 @@
           "readMode": {
             "enum": [
               "exact",
-              "current"
+              "current",
+              "lineage"
             ],
             "title": "Readmode",
             "type": "string"
@@ -12368,6 +12730,12 @@
             "pattern": "^[0-9a-f]{32}$",
             "title": "Sourcebindingid",
             "type": "string"
+          },
+          "sourceUri": {
+            "maxLength": 1024,
+            "pattern": "^workspace-provider://[A-Za-z0-9_-]+$",
+            "title": "Sourceuri",
+            "type": "string"
           }
         },
         "required": [
@@ -12375,6 +12743,7 @@
           "sourceBindingId",
           "providerDatasetId",
           "datasetIdentity",
+          "sourceUri",
           "readMode"
         ],
         "title": "WorkspaceCanonicalDatasetContext",
@@ -12529,6 +12898,21 @@
         "title": "WorkspaceDeleteFolderBody",
         "type": "object"
       },
+      "WorkspaceDeletePlacementBody": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedVersion": {
+            "minimum": 1.0,
+            "title": "Expectedversion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedVersion"
+        ],
+        "title": "WorkspaceDeletePlacementBody",
+        "type": "object"
+      },
       "WorkspaceLocalPlacementCapability": {
         "description": "A local-only mutation destination paired with a provider resource read reference.",
         "properties": {
@@ -12675,6 +13059,42 @@
         "title": "WorkspaceProviderSource",
         "type": "object"
       },
+      "WorkspaceQueryCapabilities": {
+        "description": "Queries that are truthful for every item returned by this browse lens.",
+        "properties": {
+          "kindFilter": {
+            "default": false,
+            "title": "Kindfilter",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "sort": {
+            "default": [],
+            "items": {
+              "enum": [
+                "name",
+                "updated"
+              ],
+              "type": "string"
+            },
+            "title": "Sort",
+            "type": "array"
+          }
+        },
+        "title": "WorkspaceQueryCapabilities",
+        "type": "object"
+      },
       "WorkspaceRenameFolderBody": {
         "additionalProperties": false,
         "properties": {
@@ -12743,6 +13163,18 @@
               }
             ],
             "title": "Canonicalreferencestate"
+          },
+          "canvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvasversion"
           },
           "catalogFolderId": {
             "anyOf": [
@@ -12969,6 +13401,18 @@
             ],
             "title": "Unavailablereason"
           },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          },
           "version": {
             "anyOf": [
               {
@@ -13145,6 +13589,30 @@
             ],
             "title": "Createdat"
           },
+          "createdById": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdbyid"
+          },
+          "createdByName": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdbyname"
+          },
           "datasetContext": {
             "anyOf": [
               {
@@ -13249,6 +13717,11 @@
               }
             ],
             "title": "Inputmanifest"
+          },
+          "isMine": {
+            "default": true,
+            "title": "Ismine",
+            "type": "boolean"
           },
           "jobType": {
             "enum": [
@@ -14769,6 +15242,24 @@
       "post": {
         "operationId": "create_canvas_api_canvas_post",
         "parameters": [
+          {
+            "in": "query",
+            "name": "besideCanvasId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Besidecanvasid"
+            }
+          },
           {
             "in": "header",
             "name": "x-dp-user",
@@ -19381,6 +19872,16 @@
             }
           },
           {
+            "in": "query",
+            "name": "delete_source",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Delete Source",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "x-dp-user",
             "required": false,
@@ -22775,6 +23276,20 @@
           },
           {
             "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "mine",
+              "enum": [
+                "mine",
+                "all"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "status",
             "required": false,
             "schema": {
@@ -25030,6 +25545,89 @@
           }
         },
         "summary": "Run"
+      }
+    },
+    "/api/run/current-results": {
+      "post": {
+        "description": "Rebuild current node badges from exact plans and readable Canvas-owned results.",
+        "operationId": "recover_canvas_results_api_run_current_results_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CanvasResultRecoveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasResultRecovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Recover Canvas Results"
       }
     },
     "/api/run/editor-preview": {
@@ -27662,6 +28260,91 @@
         "summary": "Version"
       }
     },
+    "/api/workspace/batch": {
+      "post": {
+        "description": "Atomically validate and apply one bounded Canvas delete or move selection.",
+        "operationId": "mutate_workspace_batch_api_workspace_batch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBatchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mutate Workspace Batch Api Workspace Batch Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Mutate Workspace Batch"
+      }
+    },
     "/api/workspace/canvases": {
       "post": {
         "description": "Create at one exact local destination; an optional dataset is resolved by stable identity.",
@@ -27935,7 +28618,7 @@
     },
     "/api/workspace/containers/{container_id}": {
       "get": {
-        "description": "One bounded mixed Workspace page across local and configured read-only provider sources.",
+        "description": "One bounded local, connected-source, or legacy mixed Workspace page.",
         "operationId": "browse_workspace_container_api_workspace_containers__container_id__get",
         "parameters": [
           {
@@ -27953,6 +28636,8 @@
             "required": false,
             "schema": {
               "default": 50,
+              "maximum": 100,
+              "minimum": 1,
               "title": "Limit",
               "type": "integer"
             }
@@ -27964,6 +28649,7 @@
             "schema": {
               "anyOf": [
                 {
+                  "maxLength": 4096,
                   "type": "string"
                 },
                 {
@@ -27971,6 +28657,79 @@
                 }
               ],
               "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "local",
+                    "provider"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "name",
+                    "updated"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sort"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "enum": [
+                  "container",
+                  "canvas",
+                  "dataset",
+                  "dataset_view"
+                ],
+                "type": "string"
+              },
+              "title": "Kind",
+              "type": "array"
             }
           },
           {
@@ -28312,6 +29071,109 @@
         "summary": "Rename Workspace Folder"
       }
     },
+    "/api/workspace/lineage/resolve": {
+      "get": {
+        "description": "Open one clicked provider-lineage node as an ordinary Workspace dataset.",
+        "operationId": "resolve_workspace_lineage_resource_api_workspace_lineage_resolve_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "rootUri",
+            "required": true,
+            "schema": {
+              "maxLength": 1024,
+              "title": "Rooturi",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "nodeUri",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "title": "Nodeuri",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Resolve Workspace Lineage Resource"
+      }
+    },
     "/api/workspace/placements/{placement_id}/canvas": {
       "put": {
         "description": "Move only local canvas placement with placement and destination CAS preconditions.",
@@ -28404,6 +29266,100 @@
           }
         },
         "summary": "Move Workspace Canvas"
+      }
+    },
+    "/api/workspace/placements/{placement_id}/detached-dataset": {
+      "delete": {
+        "description": "Remove only a stale local Dataset shortcut after its Catalog registration is gone.",
+        "operationId": "delete_detached_workspace_dataset_api_workspace_placements__placement_id__detached_dataset_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "placement_id",
+            "required": true,
+            "schema": {
+              "title": "Placement Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceDeletePlacementBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Detached Workspace Dataset Api Workspace Placements  Placement Id  Detached Dataset Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Delete Detached Workspace Dataset"
       }
     },
     "/api/workspace/resources/{resource_id}": {
@@ -28568,6 +29524,90 @@
           }
         },
         "summary": "Canonical Workspace Provider Dataset"
+      }
+    },
+    "/api/workspace/resources/{resource_id}/provider-dataset": {
+      "delete": {
+        "description": "Remove one exact connected-source dataset when that provider declares write support.",
+        "operationId": "remove_workspace_provider_dataset_api_workspace_resources__resource_id__provider_dataset_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "title": "Resource Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Workspace Provider Dataset Api Workspace Resources  Resource Id  Provider Dataset Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Remove Workspace Provider Dataset"
       }
     },
     "/api/workspace/resources/{resource_id}/relink": {

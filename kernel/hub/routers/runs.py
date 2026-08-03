@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -47,6 +48,7 @@ from hub.execution_manifest import (
     execution_manifest_admission,
     execution_manifest_parameter_intent_matches,
 )
+from hub.local_run_inputs import LOCAL_FILE_INPUT_PROVIDER
 from hub.plugins.adapters import (
     RevisionPermissionLost,
     RevisionProviderOffline,
@@ -296,12 +298,13 @@ def _external_wait_request(deps, graph, target_node_id: str | None):
     if (len(graph.nodes) != 2 or len(external) != 1 or target is None or target.type != "write"
             or edge is None or edge.source != external[0].id or edge.target != target.id
             or edge.source_handle not in (None, "out") or edge.target_handle not in (None, "in")):
-        raise HTTPException(409, "external-wait tasks require exactly one fixture-to-Write edge")
+        raise HTTPException(
+            409, "An external wait run needs exactly one external step connected to one Write step.")
     cfg = external[0].data.get("config", {}) if isinstance(external[0].data, dict) else {}
     if (not isinstance(cfg, dict)
             or set(cfg) - {"operation", "documentJson", "outputSchema"}
             or not isinstance(cfg.get("outputSchema"), list) or not cfg["outputSchema"]):
-        raise HTTPException(409, "external-wait node configuration is not supported")
+        raise HTTPException(409, "This external step's settings are not supported.")
     from hub.external_wait import ExternalWaitSubmitRequest
     try:
         return ExternalWaitSubmitRequest(
@@ -309,7 +312,7 @@ def _external_wait_request(deps, graph, target_node_id: str | None):
             idempotency_key="admission", operation=cfg.get("operation", "conformance.success"),
             document_json=cfg.get("documentJson", "{}"))
     except ValueError as exc:
-        raise HTTPException(409, "external-wait node configuration is invalid") from exc
+        raise HTTPException(409, "This external step's settings are invalid.") from exc
 
 
 def _node_config(node) -> dict:
@@ -339,50 +342,50 @@ def _bounded_fanout_write_shape(graph, target_node_id: str | None):
     write = by_id.get(target_node_id)
     if (write is None or write.type != "write" or len(checkpoint_nodes) != 1):
         raise HTTPException(
-            409,
-            "bounded fan-out tasks require exactly "
-            "Source -> Select(checkpoint) -> Select(*) -> Write")
+            409, "This run needs exactly Source → Select (checkpointed) → Select → Write.")
     checkpoint_select = checkpoint_nodes[0]
     if checkpoint_select.type != "select":
-        raise HTTPException(409, "bounded fan-out requires checkpoint:true on a Select node")
+        raise HTTPException(409, "Only a Select step can be checkpointed.")
     ck_cfg = _node_config(checkpoint_select)
     if ck_cfg != {"select": "*", "checkpoint": True}:
         raise HTTPException(
-            409, "bounded fan-out checkpoint Select requires exact "
-            "{\"select\":\"*\",\"checkpoint\":true}")
+            409, "The checkpointed Select step must select every column, with no other settings.")
     edges = list(graph.edges)
     write_in = next((edge for edge in edges if edge.target == write.id), None)
     if write_in is None:
-        raise HTTPException(409, "bounded fan-out Write requires one inbound edge")
+        raise HTTPException(409, "The Write step needs exactly one incoming connection.")
     identity_select = by_id.get(write_in.source)
     if identity_select is None or identity_select.type != "select":
-        raise HTTPException(409, "bounded fan-out requires identity Select before Write")
+        raise HTTPException(409, "The Write step must be fed by a Select step.")
     from hub.identity_projection import validate_identity_select_config
     try:
         validate_identity_select_config(_node_config(identity_select))
     except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(
+            409, "The Select step before Write must select every column, with no other settings.",
+        ) from exc
     identity_in = next((edge for edge in edges if edge.target == identity_select.id), None)
     if identity_in is None or identity_in.source != checkpoint_select.id:
         raise HTTPException(
-            409, "bounded fan-out requires checkpoint Select feeding identity Select")
+            409, "The checkpointed Select step must feed the Select step before Write.")
     checkpoint_in = next((edge for edge in edges if edge.target == checkpoint_select.id), None)
     if checkpoint_in is None:
-        raise HTTPException(409, "bounded fan-out checkpoint Select requires one inbound edge")
+        raise HTTPException(
+            409, "The checkpointed Select step needs exactly one incoming connection.")
     source = by_id.get(checkpoint_in.source)
     if source is None or source.type != "source":
-        raise HTTPException(409, "bounded fan-out tasks require exactly one built-in Source")
+        raise HTTPException(409, "This run needs exactly one Source step.")
     for edge in (checkpoint_in, identity_in, write_in):
         if (edge.source_handle not in (None, "out")
                 or edge.target_handle not in (None, "in")):
             raise HTTPException(
-                409, "bounded fan-out edges must be source:out -> target:in")
+                409, "Every connection must join a step's output to the next step's input.")
     expected = {source.id, checkpoint_select.id, identity_select.id, write.id}
     if {node.id for node in graph.nodes} != expected:
-        raise HTTPException(409, "bounded fan-out tasks reject extra nodes")
+        raise HTTPException(409, "This run cannot include extra steps.")
     if any(_node_bypassed_or_disabled(node)
            for node in (source, checkpoint_select, identity_select, write)):
-        raise HTTPException(409, "bounded fan-out tasks reject disabled or bypassed nodes")
+        raise HTTPException(409, "This run cannot include disabled or bypassed steps.")
     return source, checkpoint_select, identity_select, write
 
 
@@ -400,10 +403,10 @@ def _linear_checkpoint_shape(graph, target_node_id: str | None):
     if (len(graph.nodes) != 3 or len(graph.edges) != 2 or write is None or write.type != "write"
             or len(checkpoint_nodes) != 1):
         raise HTTPException(
-            409, "linear checkpoint tasks require exactly Source -> Select(checkpoint) -> Write")
+            409, "This run needs exactly Source → Select (checkpointed) → Write.")
     select = checkpoint_nodes[0]
     if select.type != "select":
-        raise HTTPException(409, "linear checkpoint requires checkpoint:true on the Select node")
+        raise HTTPException(409, "Only the Select step can be checkpointed.")
     edges = list(graph.edges)
     select_in = next((edge for edge in edges if edge.target == select.id), None)
     write_in = next((edge for edge in edges if edge.target == write.id), None)
@@ -413,15 +416,16 @@ def _linear_checkpoint_shape(graph, target_node_id: str | None):
             or write_in.source_handle not in (None, "out")
             or write_in.target_handle not in (None, "in")):
         raise HTTPException(
-            409, "linear checkpoint tasks require source:out -> select:in and select:out -> write:in")
+            409, "Source must connect to Select and Select must connect to Write, "
+            "using the default ports.")
     source = by_id.get(select_in.source)
     if source is None or source.type != "source":
-        raise HTTPException(409, "linear checkpoint tasks require exactly one built-in Source")
+        raise HTTPException(409, "This run needs exactly one Source step.")
     other_ids = {node.id for node in graph.nodes} - {source.id, select.id, write.id}
     if other_ids:
-        raise HTTPException(409, "linear checkpoint tasks reject extra nodes")
+        raise HTTPException(409, "This run cannot include extra steps.")
     if any(_node_bypassed_or_disabled(node) for node in (source, select, write)):
-        raise HTTPException(409, "linear checkpoint tasks reject disabled or bypassed nodes")
+        raise HTTPException(409, "This run cannot include disabled or bypassed steps.")
     # Reject unsupported Write modes and Select extras early via later admission; keep shape only here.
     return source, select, write
 
@@ -490,27 +494,27 @@ def _resolve_local_run_manifest(
             adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
         except PermissionError as exc:
             raise APIError(
-                403, "permission to read the provider dataset was lost",
+                403, "You no longer have permission to read this data source.",
                 code=APIErrorCode.PERMISSION_DENIED, retryable=False,
             ) from exc
         except workspace_providers.ProviderDatasetGone as exc:
             raise APIError(
-                410, "local_run_input_revision_unavailable",
+                410, "The pinned version of an input dataset is no longer available.",
                 code=APIErrorCode.RESOURCE_GONE, retryable=False,
             ) from exc
         except workspace_providers.ProviderDatasetOffline as exc:
             raise APIError(
-                503, "provider dataset is offline",
+                503, "This data source is offline. Try again once it is reachable.",
                 code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
             ) from exc
         except workspace_providers.ProviderDatasetUnavailable as exc:
             raise APIError(
-                409, ("provider dataset binding is unavailable; install or restore a compatible "
-                      "provider and dataset adapter"),
+                409, ("This data source is unavailable because its plugin is missing. Install or "
+                      "restore the plugin, then try again."),
                 code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
             ) from exc
         if binding is None and provider_dataset_id is None:
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         dataset_ref = cfg.get("datasetRef")
         try:
@@ -520,13 +524,11 @@ def _resolve_local_run_manifest(
             if not exact:
                 if provider_dataset_id is not None:
                     raise ManifestInputError(
-                        "provider dataset is mutable-only and cannot enter an immutable run manifest")
+                        "This data source cannot pin an exact version, so it cannot be used in "
+                        "this run.")
                 if isinstance(dataset_ref, dict) or not materialize_local_files:
                     raise RuntimeError("source has no provider-native exact revision")
-                from hub.local_run_inputs import (
-                    LOCAL_FILE_INPUT_PROVIDER,
-                    snapshot_local_file_input,
-                )
+                from hub.local_run_inputs import snapshot_local_file_input
                 revision_id, candidate = snapshot_local_file_input(
                     uri=uri,
                     config=cfg if isinstance(cfg, dict) else {},
@@ -557,7 +559,7 @@ def _resolve_local_run_manifest(
                         preview_revision = getattr(adapter, "preview_revision", None)
                         if not callable(preview_revision):
                             raise ManifestInputError(
-                                "exact input revision has no bounded preview capability")
+                                "This data source cannot preview a pinned version.")
                         preview_revision(uri, revision_id, limit=preview_limit)
                 provider = str(getattr(adapter, "name", "") or "")
             else:
@@ -571,19 +573,20 @@ def _resolve_local_run_manifest(
             ) from exc
         except (PermissionError, RevisionPermissionLost) as exc:
             raise APIError(
-                403, "permission to read an exact input revision was lost",
+                403, "You no longer have permission to read the pinned version of an input dataset.",
                 code=APIErrorCode.PERMISSION_DENIED, retryable=False,
             ) from exc
         except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError) as exc:
             raise APIError(
-                503, "exact input revision provider is offline",
+                503, ("The data source for a pinned input version is offline. Try again once "
+                      "it is reachable."),
                 code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
             ) from exc
         except Exception as exc:  # missing pins and provider errors never permit a fallback to head
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
         if not revision_id or not provider:
-            raise APIError(410, "local_run_input_revision_unavailable",
+            raise APIError(410, "The pinned version of an input dataset is no longer available.",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         manifest.append({
             "node_id": str(node.id),
@@ -607,37 +610,39 @@ def _bind_local_run_manifest(
             node_builders=getattr(deps, "node_builders", None))
     except (PermissionError, RevisionPermissionLost) as exc:
         raise APIError(
-            403, "permission to read an exact input revision was lost",
+            403, "You no longer have permission to read the pinned version of an input dataset.",
             code=APIErrorCode.PERMISSION_DENIED, retryable=False,
         ) from exc
     except workspace_providers.ProviderDatasetGone as exc:
         raise APIError(
-            410, "local_run_input_revision_unavailable",
+            410, "The pinned version of an input dataset is no longer available.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError,
             workspace_providers.ProviderDatasetOffline) as exc:
         raise APIError(
-            503, "exact input revision provider is offline",
+            503, ("The data source for a pinned input version is offline. Try again once it "
+                  "is reachable."),
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
         ) from exc
     except workspace_providers.ProviderDatasetUnavailable as exc:
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
     except LocalRunInputError as exc:
         if "mutable-only" in str(exc):
             raise APIError(
-                409, "provider dataset is mutable-only and cannot enter an immutable run manifest",
+                409, ("This data source cannot pin an exact version, so it cannot be used in "
+                      "this run."),
                 code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
             ) from exc
         unavailable = "unavailable" in str(exc)
         raise APIError(
             410 if unavailable else 409,
-            "local_run_input_revision_unavailable" if unavailable
-            else "local_run_input_manifest_does_not_match_graph",
+            "The pinned version of an input dataset is no longer available." if unavailable
+            else "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.",
             code=APIErrorCode.RESOURCE_GONE if unavailable else APIErrorCode.INVALID_REQUEST,
             retryable=False,
         ) from exc
@@ -835,8 +840,8 @@ def _exact_run_readiness(
             ready=False,
             reason="registration_required",
             source_node_ids=unregistered,
-            message=("Register this local input through the Source data picker before exact execution. "
-                     "Preview, schema, and estimate do not create its immutable run binding."),
+            message=("Register this local input through the Source data picker before running. "
+                     "Preview, schema, and estimate do not create the saved input version required by a full run."),
         )
     return ExactRunReadiness(ready=True, reason="ready")
 
@@ -877,8 +882,17 @@ def _write_admission_for_graph(
             getattr(deps, "node_ir", {}))
         # #391's typed publisher is the in-process local consumer. Other bundled/plugin transports
         # retain their provider-neutral sink contract and must not be labelled create/replace.
-        runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
+        runner = _route_by_capability(
+            deps, _pick_runner(deps, plan, uid, graph), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
+        if not managed:
+            published = metadb.catalog_managed_local_write_head(logical_uri)
+            if (published is not None and published.get("state") == "active"
+                    and published.get("revision_id")):
+                raise HTTPException(
+                    409,
+                    f"'{spec.name}' publishes dataset versions, and the selected execution target "
+                    "cannot publish datasets. Choose another target for this Canvas, then run again.")
         execution_resolve = getattr(runner, "resolve_adapter", None)
         if managed and runner is getattr(deps, "runner", None) and callable(execution_resolve):
             try:
@@ -930,8 +944,8 @@ def _write_admission_for_graph(
     if not managed:
         if supplied is not None:
             raise HTTPException(
-                409, "the selected destination uses provider-neutral sink semantics; "
-                "discard the managed-local admission and retry")
+                409, "This Write can no longer publish a dataset version to the selected "
+                "destination. Check its destination and execution target, then run again.")
         return WriteAdmission(
             node_id=node_id,
             managed=False,
@@ -1180,7 +1194,7 @@ def _write_admission_for_graph(
         except RuntimeError as exc:
             if supplied is not None:
                 raise HTTPException(
-                    409, "write admission cannot reopen the exact destination schema metadata"
+                    409, "the destination schema could not be loaded for this write"
                 ) from exc
             return response(
                 node_id=node_id,
@@ -1191,7 +1205,7 @@ def _write_admission_for_graph(
                 expected_schema=normalized_schema,
                 partitions=partitions,
                 expected_head=expected_head,
-                blocker="the exact destination head has no valid retained schema metadata",
+                blocker="the destination's saved schema is unavailable",
             )
         schema_drift = _managed_file_schema_drift(
             expected_head, previous_schema, normalized_schema)
@@ -1266,7 +1280,7 @@ def _provider_inspection_graph(graph, target_node_id: str | None, deps):
         ) from exc
     except workspace_providers.ProviderDatasetGone as exc:
         raise APIError(
-            410, "provider dataset was deleted; relink it explicitly",
+            410, "This data source was deleted. Link it again to keep using it.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     except workspace_providers.ProviderDatasetOffline as exc:
@@ -1276,8 +1290,8 @@ def _provider_inspection_graph(graph, target_node_id: str | None, deps):
         ) from exc
     except workspace_providers.ProviderDatasetUnavailable as exc:
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
 
@@ -1373,7 +1387,7 @@ def _input_drift(
             graph, target_node_id, preview_manifest, require_bound_revisions=False)
     except LocalRunInputError as exc:
         raise APIError(
-            409, "local_run_input_manifest_does_not_match_graph",
+            409, "This run's inputs no longer match the Canvas. Reopen the Canvas and run again.",
             code=APIErrorCode.INVALID_REQUEST, retryable=False,
         ) from exc
     try:
@@ -1493,6 +1507,24 @@ class RetainedResultIdentity(BaseModel):
     output: RunOutput
 
 
+class CanvasResultRecoveryRequest(BaseModel):
+    """One bounded reopen check for the Canvas's retained full results."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+
+
+class CanvasResultRecovery(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    latest_node_ids: list[str]
+    failed_node_ids: list[str]
+    stale_node_ids: list[str]
+    unknown_node_ids: list[str]
+    results: list[RetainedResultIdentity]
+
+
 class ExampleRowsEditorPreviewRequest(BaseModel):
     """Editor-only Transform preview over one bounded, non-persisted JSON fixture."""
 
@@ -1604,6 +1636,11 @@ def _invalid_graph(
         graph, deps, target_node_id: str | None = None, *,
         enforce_join_condition: bool = True) -> tuple[str, bool] | None:
     """Compatibility wrapper around the shared graph-ingress validator."""
+    # A target run is allowed to coexist with unfinished work elsewhere on the Canvas. Validate
+    # exactly the executable dependency cone that compile/run will consume; whole-Canvas analysis
+    # endpoints still pass no target and therefore remain strict about every node and edge.
+    if target_node_id is not None:
+        graph = _target_execution_graph(graph, target_node_id)
     return graph_mod.validation_error(
         graph, getattr(deps, "node_specs", {}), getattr(deps, "node_builders", {}), target_node_id,
         enforce_join_condition=enforce_join_condition)
@@ -1798,7 +1835,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     _reject_invalid(preview_graph, deps, req.node_id)
     port_id = _inspection_port(preview_graph, req.node_id, req.port_id, deps)
     k = req.k if req.k is not None else settings.preview_k
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, preview_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         try:
             result = SampleResult(**kb.preview(
                 preview_graph, req.node_id, k, max(0, req.offset), port_id))
@@ -1856,7 +1893,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     )
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         try:
             result = ProfileResult(**kb.profile(
                 graph, req.node_id, full=False, port_id=port_id))
@@ -2435,7 +2472,7 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
         plan = compiler.compile_plan(
             graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
         runner = _route_by_capability(
-            deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
+            deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
         warning = _destination_credential_preflight(deps, runner, plan, graph)
         if warning is not None and regions:
             region = regions[-1]
@@ -2679,6 +2716,13 @@ def _metadata_only_cone_size(
     return (None if unbounded_population else max(rows) if rows else None), None, sizes
 
 
+def _pick_runner(deps, plan, uid: str, graph):
+    try:
+        return deps.pick_runner(plan, uid, graph.execution_backend)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None):
     """Route a declared requirement to region placement or explicit whole-graph admission.
 
@@ -2698,6 +2742,15 @@ def _route_by_capability(deps, chosen, graph, target_node_id: str | None = None)
         accepts = getattr(r, "accepts_whole_graph", None)
         return callable(accepts) and bool(accepts(req))
 
+    if graph.execution_backend is not None:
+        hard_requirement = bool(req.gpu or req.gpu_type or req.labels)
+        if not hard_requirement or _can_place(chosen) or _accepts_whole_graph(chosen):
+            return chosen
+        raise HTTPException(
+            409,
+            f"Canvas execution target '{graph.execution_backend}' cannot satisfy this graph's "
+            "GPU or placement requirement",
+        )
     if _can_place(chosen) or _accepts_whole_graph(chosen):
         return chosen
     return next(
@@ -2767,7 +2820,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     _require_satisfiable_hard_requirements(deps, graph, req.target_node_id)
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
-        deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
+        deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
     multi_output = False
     if output_target is not None:
         multi_output = _require_backend_run_output_support(
@@ -3224,7 +3277,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                     "schema drift confirmation requires the displayed write admission")
             if admission.managed and admission.intent is not None:
                 effective_write_intent = admission.intent
-                bound_unsubmitted_write = True
+                readiness = admission.exact_run_readiness
+                if (unadmitted_write_target == target_node_id
+                        and operational_canvas is not None
+                        and readiness is not None and readiness.ready):
+                    # A caller with no submission identity adopts the minted one and publishes
+                    # through the same durable owner a browser Run uses.
+                    write_admission = admission
+                    submission_id = unsubmitted_write_admission_id
+                else:
+                    bound_unsubmitted_write = True
                 _inject_write_intent(graph, unadmitted_write_target, admission.intent)
                 _inject_write_intent(durable_graph, unadmitted_write_target, admission.intent)
             _preflight_write_target_destination(
@@ -3237,7 +3299,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     _require_satisfiable_hard_requirements(deps, graph, target_node_id)
     output_target = _run_output_preflight(plan, target_node_id)
     runner = _route_by_capability(
-        deps, deps.pick_runner(plan, uid), graph, target_node_id
+        deps, _pick_runner(deps, plan, uid, graph), graph, target_node_id
     )  # honor requirements only in the target's executable cone
     if ((write_admission is not None and write_admission.managed
             or bound_unsubmitted_write)
@@ -3625,8 +3687,23 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             code=APIErrorCode.RUN_CONFIRMATION_REQUIRED,
             retryable=False,
         )
-    except metadb.DurableTaskSubmissionConflict as exc:
-        raise HTTPException(409, str(exc)) from exc
+    except (HTTPException, metadb.DurableTaskSubmissionConflict) as exc:
+        from hub.observability import get_request_id
+
+        # Only explicit admission refusals belong in Jobs without a run id. Backend/internal
+        # failures may already own a real run and must not create a second, fabricated attempt.
+        # Recording history must never mask the rejection it is recording.
+        with contextlib.suppress(Exception):
+            canvas_id = str(getattr(req.graph, "id", "") or "")
+            # Only a caller who may run this canvas may add a rejected submission to its history.
+            if not auth.auth_enabled() or metadb.canvas_role(canvas_id, uid) in _RUN_MUTATE_ROLES:
+                metadb.record_run(
+                    canvas_id, req.target_node_id, "run", "failed",
+                    error=str(getattr(exc, "detail", None) or exc), request_id=get_request_id(),
+                    created_by=uid)
+        if isinstance(exc, metadb.DurableTaskSubmissionConflict):
+            raise HTTPException(409, str(exc)) from exc
+        raise
     return status
 
 
@@ -4013,6 +4090,7 @@ def _example_rows_editor_graph(graph: Graph, transform_id: str, fixture_uri: str
     return Graph.model_validate({
         "id": graph.id,
         "version": graph.version,
+        "executionBackend": graph.execution_backend,
         "requirements": graph.requirements,
         "parameters": [
             parameter.model_dump(by_alias=True, mode="json")
@@ -4119,7 +4197,9 @@ def _merge_retained_parameter_bindings(
 
 
 def _retained_current_output(
-        candidate: dict, target, current_cone: Graph, deps) -> RunOutput:
+        candidate: dict, target, current_cone: Graph, deps, *,
+        allow_local_snapshot_registration: bool = False,
+        ) -> RunOutput:
     """Prove one server-selected retained candidate matches the current target cone."""
     try:
         output = RunOutput.model_validate(candidate["output"])
@@ -4127,6 +4207,27 @@ def _retained_current_output(
         raise _retained_editor_error(
             409, "retained upstream output metadata is invalid",
             APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE) from exc
+    if output.publication_kind == "catalog":
+        receipt = output.write_receipt
+        expected_version = output.version or (
+            receipt.publication.backend_version if receipt is not None else None)
+        try:
+            current_table = (
+                deps.catalog.get_table(receipt.dataset_id) if receipt is not None else None)
+        except Exception as exc:
+            raise _retained_editor_error(
+                409, "the published dataset is no longer available",
+                APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+        if (
+            receipt is None
+            or current_table is None
+            or not expected_version
+            or str(current_table.uri).rstrip("/") != str(output.uri).rstrip("/")
+            or current_table.version != expected_version
+        ):
+            raise _retained_editor_error(
+                409, "the published dataset has changed",
+                APIErrorCode.RETAINED_UPSTREAM_STALE)
     manifest_sha256 = candidate["execution_manifest_sha256"]
     retained = (
         metadb.execution_manifest(str(manifest_sha256))
@@ -4218,6 +4319,18 @@ def _retained_current_output(
         except Exception:
             revision_adapter = None
         retained_ref = retained_config.get("datasetRef")
+        if (
+            binding
+            and binding["dataset_id"] == admitted["dataset_id"]
+            and isinstance(retained_ref, dict)
+            and retained_ref.get("datasetId") == admitted["dataset_id"]
+            and retained_ref.get("revisionId") == admitted["revision_id"]
+            and admitted.get("provider") == LOCAL_FILE_INPUT_PROVIDER
+            and allow_local_snapshot_registration
+        ):
+            return metadb.local_file_input_revision_artifact(
+                admitted["dataset_id"], admitted["revision_id"]
+            ) is not None
         return bool(
             binding
             and isinstance(revision_adapter, DatasetRevisionAdapter)
@@ -4249,13 +4362,32 @@ def _retained_current_output(
     # without treating a moved latest head as an edit to this result.
     current_for_digest = current_cone.model_copy(deep=True)
     current_for_digest._parameter_bindings = copy.deepcopy(retained_canonical)
+    retained_write_intent = (
+        WriteIntent.model_validate(admission["write_intent"])
+        if admission.get("write_intent") is not None else None
+    )
+    if retained_write_intent is not None:
+        # Admission restores this private dispatch value onto its graph, but the original manifest
+        # carries the same intent in the dedicated ``writeIntent`` field.  Remove the duplicate
+        # before rebuilding both sides so a reopened editor graph and its retained manifest use the
+        # same semantic identity.
+        for digest_graph in (retained_graph, retained_cone, current_for_digest):
+            digest_target = next(
+                (node for node in digest_graph.nodes if node.id == target.id), None)
+            if digest_target is None:
+                raise _retained_editor_error(
+                    409, "current upstream execution plan cannot be verified",
+                    APIErrorCode.RETAINED_UPSTREAM_STALE)
+            digest_config = dict(digest_target.data.get("config") or {})
+            digest_config.pop("_admittedWriteIntent", None)
+            digest_target.data["config"] = digest_config
     try:
         rebuilt_retained_digest, _ = build_execution_manifest(
             retained_graph,
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
         current_digest, _ = build_execution_manifest(
@@ -4263,7 +4395,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
         retained_digest, _ = build_execution_manifest(
@@ -4271,7 +4403,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=None,
+            write_intent=retained_write_intent,
             deps=deps,
         )
     except ExecutionManifestError as exc:
@@ -4292,6 +4424,7 @@ def _current_retained_result(
         graph: Graph, canvas_id: str, node_id: str, port_id: str,
         uid: str, deps, *,
         requested_bindings: list[ParameterBinding] | None = None,
+        allow_local_snapshot_registration: bool = False,
         ) -> RetainedResultIdentity:
     """Select the newest retained result current under its own persisted bindings.
 
@@ -4341,7 +4474,8 @@ def _current_retained_result(
                     409, "current result targets a different output",
                     APIErrorCode.RETAINED_UPSTREAM_STALE)
             output = _retained_current_output(
-                candidate, target, current_cone, deps)
+                candidate, target, current_cone, deps,
+                allow_local_snapshot_registration=allow_local_snapshot_registration)
         except (APIError, ExecutionManifestError, ValueError):
             continue
         if requested_bindings is not None:
@@ -4351,7 +4485,9 @@ def _current_retained_result(
             graph_mod.resolve_source_refs(requested_cone, deps.catalog.resolve_ref)
             _reject_invalid(requested_cone, deps, node_id)
             try:
-                _retained_current_output(candidate, target, requested_cone, deps)
+                _retained_current_output(
+                    candidate, target, requested_cone, deps,
+                    allow_local_snapshot_registration=allow_local_snapshot_registration)
             except (APIError, ExecutionManifestError, ValueError):
                 raise _retained_editor_error(
                     409, "current result parameter bindings changed",
@@ -4461,6 +4597,7 @@ def _retained_editor_graph(
     return Graph.model_validate({
         "id": graph.id,
         "version": graph.version,
+        "executionBackend": graph.execution_backend,
         "requirements": graph.requirements,
         "nodes": [
             source.model_dump(by_alias=True, mode="json"),
@@ -4491,7 +4628,7 @@ def preview_transform_with_example_rows(
         graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+    if deps.chosen_backend(uid, graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         result = SampleResult(**kb.preview(
             graph,
             req.node_id,
@@ -4566,7 +4703,7 @@ def preview_transform_with_retained_upstream(
                 editor_graph = _retained_editor_graph(
                     graph, req.node_id, upstream, edge, target_uri)
                 _reject_invalid(editor_graph, deps, req.node_id)
-                if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+                if deps.chosen_backend(uid, editor_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
                     result = SampleResult(**kb.preview(
                         editor_graph, req.node_id, req.k, req.offset, port_id))
                 else:
@@ -4625,6 +4762,118 @@ def retained_canvas_result(
         requested_bindings=(
             req.parameter_bindings
             if "parameter_bindings" in req.model_fields_set else None),
+    )
+
+
+def _retained_result_readability(
+        identity: RetainedResultIdentity, deps) -> Literal["readable", "missing", "unknown"]:
+    """Distinguish a missing artifact from a result whose availability cannot be proved now."""
+    uri = identity.output.uri or ""
+    if not uri:
+        return "missing"
+    try:
+        with source_read_scope(
+                deps.storage, [uri],
+                owner=f"canvas-reopen:{identity.run_id}:{uuid.uuid4().hex}"):
+            member = _object_attempt_member(uri)
+            target_uri = member[0] if member is not None else uri
+            if (member is not None and identity.output.rows is not None
+                    and member[2] != identity.output.rows):
+                return "missing"
+            # Schema is a bounded provider read that proves the committed member/file can actually be
+            # reopened. Metadata identity alone is insufficient after credential loss or external GC.
+            deps.resolve_adapter(target_uri).schema(target_uri)
+        return "readable"
+    except (FileNotFoundError, ValueError):
+        return "missing"
+    except Exception:  # noqa: BLE001 - a transient check failure must not falsify result state
+        return "unknown"
+
+
+@router.post("/run/current-results", response_model=CanvasResultRecovery)
+def recover_canvas_results(
+        req: CanvasResultRecoveryRequest,
+        uid: str = Depends(current_user)) -> CanvasResultRecovery:
+    """Rebuild current node badges from exact plans and readable Canvas-owned results."""
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
+        raise _retained_editor_error(
+            404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    deps = get_deps()
+    node_map = graph_mod.node_map(req.graph)
+    latest: set[str] = set()
+    failed: set[str] = set()
+    stale: set[str] = set()
+    unknown: set[str] = set()
+    results: list[RetainedResultIdentity] = []
+    for projection in metadb.canvas_result_latest(canvas_id):
+        target_id = str(projection["target_node_id"])
+        if target_id not in node_map:
+            continue
+        output_docs = projection.get("result_outputs") or []
+        identities: list[RetainedResultIdentity] = []
+        valid = bool(output_docs)
+        availability_unknown = False
+        for output_doc in output_docs:
+            if not isinstance(output_doc, dict):
+                valid = False
+                break
+            port_id = output_doc.get("port_id", output_doc.get("portId"))
+            if not isinstance(port_id, str) or not port_id:
+                valid = False
+                break
+            try:
+                identity = _current_retained_result(
+                    req.graph, canvas_id, target_id, port_id, uid, deps,
+                    allow_local_snapshot_registration=True)
+            except APIError:
+                valid = False
+                break
+            if identity.run_id != projection.get("result_run_id"):
+                valid = False
+                break
+            readability = _retained_result_readability(identity, deps)
+            if readability != "readable":
+                valid = False
+                availability_unknown = readability == "unknown"
+                break
+            identities.append(identity)
+        if not valid:
+            affected = {node.id for node in graph_mod.upstream_chain(req.graph, target_id)}
+            (unknown if availability_unknown else stale).update(affected)
+            continue
+        terminal_is_result = (
+            projection.get("terminal_status") == "done"
+            and projection.get("terminal_run_id") == projection.get("result_run_id")
+        )
+        terminal_matches_result_plan = (
+            projection.get("terminal_execution_manifest_sha256") is not None
+            and projection.get("terminal_execution_manifest_sha256")
+            == projection.get("result_execution_manifest_sha256")
+        )
+        if terminal_is_result or not terminal_matches_result_plan:
+            # A later attempt for another plan does not invalidate the exact result that was just
+            # proved current for this graph (for example, the user reverted an unsuccessful edit).
+            latest.update(node.id for node in graph_mod.upstream_chain(req.graph, target_id))
+            results.extend(identities)
+        elif projection.get("terminal_status") == "failed":
+            # Same execution manifest means the failed attempt targeted the exact plan whose prior
+            # result remains retained. Keep failure visible without discarding that successful data.
+            failed.add(target_id)
+            latest.update(
+                node.id for node in graph_mod.upstream_chain(req.graph, target_id)
+                if node.id != target_id
+            )
+            results.extend(identities)
+        else:
+            stale.add(target_id)
+    return CanvasResultRecovery(
+        latest_node_ids=sorted(latest - failed),
+        failed_node_ids=sorted(failed),
+        stale_node_ids=sorted(stale - latest - failed),
+        unknown_node_ids=sorted(unknown - latest - failed - stale),
+        results=results,
     )
 
 

@@ -1,7 +1,8 @@
 import { useEffect } from 'react'
 import { hasConfiguredManagedSidecarMerge, roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
-import { color, status as statusTok } from '../theme/tokens'
+import { color, status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
+import { ProgressBar } from '../ui/controls'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
@@ -9,13 +10,16 @@ import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
-import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import type { CanvasDoc, CanvasParameterDeclaration } from '../types/graph'
 import type { DatasetViewerCanvasReturn } from '../router'
+import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
+import { presentRunError } from '../lib/runErrors'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
   const graphSize = useStore((s) => s.sizes[nodeId])
   const estimate = useStore((s) => s.estimate)
+  const requestRun = useStore((s) => s.requestRun)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
   const refreshPreviewInputs = useStore((s) => s.refreshPreviewInputs)
@@ -48,7 +52,6 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
   const st = run?.status
-  const pinnedInputs = pinnedSourceInputs(doc, nodeId)
   const writeAdmission = run?.writeAdmission
     ?? (run?.phase === 'done' ? run.writeOutcomeAdmission : undefined)
   const writeSubmissionUnresolved = Boolean(
@@ -82,33 +85,33 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       : null
   )
   const confirmationActionLabel = isManagedWrite
-    ? 'Publish a new version'
+    ? 'Publish output'
     : visibleRows == null ? 'Run with unknown row count' : `Run ${visibleRows.toLocaleString()} rows`
   const primaryActionLabel = isManagedWrite
-    ? exactRunReady ? 'Publish revision' : 'Exact input registration required'
-    : exactRunReady ? 'Run' : 'Exact input registration required'
+    ? exactRunReady ? 'Publish output' : 'Register inputs to publish'
+    : exactRunReady ? 'Run' : 'Register inputs to run'
   const previewActionLabel = isManagedWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
   if (isConfiguredManagedSidecarMerge) return (
     <div className="p-3.5">
-      <Label>MANAGED SIDECAR MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges an already-published exact sidecar into a selected current base head. The server certifies every coverage and publication fact.</div>
+      <Label>SAVED DATASET COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges columns from a saved dataset into the selected destination. The server verifies row coverage before publishing.</div>
       <ManagedSidecarMergeControl nodeId={nodeId} />
     </div>
   )
 
   if (isConfiguredMerge) return (
     <div className="p-3.5">
-      <Label>CERTIFIED COLUMN MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware column merge rather than an ordinary overwrite run.</div>
+      <Label>COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges columns into the existing dataset.</div>
       <MergeColumnsControl nodeId={nodeId} />
     </div>
   )
 
   if (isConfiguredUpsert) return (
     <div className="p-3.5">
-      <Label>CERTIFIED KEYED UPSERT</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware keyed upsert rather than an ordinary overwrite run.</div>
+      <Label>KEYED UPSERT</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write updates matching rows in the existing dataset.</div>
       <UpsertControl nodeId={nodeId} />
     </div>
   )
@@ -145,10 +148,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
               {confirmationCopy(est, writeAdmission, visibleRows)}
             </div>
-            <ConfirmationTechnicalDetails estimate={est} pinnedInputs={pinnedInputs}
-              isWrite={isWrite} outputName={outputName} destination={destination}
+            {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
               admission={writeAdmission} receipt={receipt ?? undefined}
-              returnToCanvas={returnToCanvas} />
+              returnToCanvas={returnToCanvas} />}
           </> : <>
             <Label>ESTIMATE</Label>
             <div className="mt-0.5 flex items-baseline gap-2">
@@ -161,8 +163,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               admission={writeAdmission} receipt={receipt} returnToCanvas={returnToCanvas} />}
           </>}
           {!isWrite && exactRunReadiness?.ready === false && (
-            <div aria-label="Exact run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
-              <strong>Not exact-run-ready:</strong> {exactRunReadiness.message}
+            <div aria-label="Run readiness" role="alert" className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-[10.5px] text-destructive">
+              <strong>Not ready to run:</strong> {exactRunReadiness.message}
             </div>
           )}
           {phase === 'confirm' ? (
@@ -184,12 +186,12 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <Label>PREVIEW INPUTS MOVED</Label>
           <div className="mt-1 text-[11px] text-muted-foreground">
-            Latest changed after this preview. The full run will keep the preview's exact inputs unless you explicitly refresh.
+            The inputs changed after this preview. The full run will keep the versions shown here unless you refresh.
           </div>
           <InputDriftNotice drift={run.inputDrift} doc={doc} />
           <div className="mt-3 flex gap-2">
             <Button size="sm" onClick={() => doRun(nodeId, !!est?.needsConfirm, true)} disabled={!canEdit}
-              title={canEdit ? `${previewActionLabel} at their exact revisions` : 'View-only canvas'} className="flex-1">
+              title={canEdit ? `${previewActionLabel} using their selected versions` : 'View-only canvas'} className="flex-1">
               {previewActionLabel}
             </Button>
             <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)} disabled={!canEdit}
@@ -204,11 +206,12 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <div className="mb-2.5 flex items-center gap-2">
             <span className="dp-running-glyph text-primary">●</span>
-            <span className="text-[13px] font-semibold">{isManagedWrite ? 'publishing managed revision' : 'running'}</span>
+            <span className="text-[13px] font-semibold">{isManagedWrite ? 'publishing dataset' : 'running'}</span>
             {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
           {/* step-progress (deterministic) when we have it, else the row-based fallback */}
-          <ProgressBar value={st.progress ?? (st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3)} />
+          <ProgressBar value={st.progress ?? (st.totalRows ? st.rowsProcessed / Math.max(1, st.totalRows) : 0.3)}
+            label={isManagedWrite ? 'Publishing dataset' : 'Run progress'} />
           <div className="my-2 text-[11.5px] text-muted-foreground">
             {st.rowsProcessed.toLocaleString()}{st.totalRows ? ` / ${st.totalRows.toLocaleString()}` : ''} rows
           </div>
@@ -231,7 +234,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 
       {phase === 'done' && st && (
         isManagedWrite ? <>
-          <Label>MANAGED REVISION PUBLISHED</Label>
+          <Label>DATASET PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
             outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed
             returnToCanvas={returnToCanvas} />
@@ -259,15 +262,16 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <span className="text-destructive">✕</span>
             <span className="text-[13px] font-semibold text-destructive">run failed</span>
           </div>
-          <div className="dp-mono mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 p-2.5 text-[11px] text-muted-foreground">
-            {run?.error ?? st?.error ?? 'unknown error'}
-          </div>
-          {st && <RunOutputs outputs={st.outputs} />}
+          <ReadableRunError raw={run?.error ?? st?.error} nodeTitle={target?.data.title}
+            config={target?.data.config} details />
+          {st?.status === 'failed' && <RunOutputs outputs={st.outputs} showErrors={false} />}
           <div className="mt-3 flex gap-2">
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved
                 ? doRun(nodeId, !!est?.needsConfirm)
-                : estimate(nodeId)}
+                : requestRun(nodeId)}
+              disabled={!canEdit}
+              title={canEdit ? 'Retry this run' : 'View-only canvas'}
               className="flex-1">Retry</Button>
             {(run?.inputDrift || hasRetainedPreviewBinding) && <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)}
               disabled={!canEdit} className="flex-1">Refresh to latest</Button>}
@@ -298,7 +302,7 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
   if (!isBound) return declaration.default == null ? 'A binding is required because this parameter has no default.' : null
   if (declaration.type === 'string') {
     if (typeof value !== 'string') return 'Enter a string value.'
-    if (isBuiltInSecretRef(value)) return 'Secret references are not public run parameters.'
+    if (isBuiltInSecretRef(value)) return 'Secrets can’t be used as run parameters.'
     if (declaration.constraints?.minLength != null && value.length < declaration.constraints.minLength) return `Minimum length is ${declaration.constraints.minLength}.`
     if (declaration.constraints?.maxLength != null && value.length > declaration.constraints.maxLength) return `Maximum length is ${declaration.constraints.maxLength}.`
   } else if (declaration.type === 'integer') {
@@ -318,7 +322,7 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
     if (!value || typeof value !== 'object' || !['exact', 'latest'].includes(String(ref.kind))
         || typeof ref.datasetId !== 'string' || !ref.datasetId
         || isBuiltInSecretRef(ref.datasetId)
-        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose latest or exact and provide the dataset identity and revision.'
+        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose Follow latest or Selected version, then provide the dataset and version IDs.'
   }
   if ((declaration.type === 'integer' || declaration.type === 'float') && typeof value === 'number') {
     if (declaration.constraints?.minimum != null && value < declaration.constraints.minimum) return `Minimum is ${declaration.constraints.minimum}.`
@@ -350,11 +354,11 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
     control = <div className="grid grid-cols-[92px_1fr] gap-1.5">
       <select aria-label={`${label} selection`} value={kind} onChange={(event) => setValue({
         kind: event.target.value, datasetId: ref.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}),
-      })} disabled={usingDefault} className={common}><option value="exact">Exact</option><option value="latest">Follow latest</option></select>
+      })} disabled={usingDefault} className={common}><option value="exact">Selected version</option><option value="latest">Follow latest</option></select>
       <input aria-label={`${label} dataset`} value={ref.datasetId ?? ''} placeholder="Dataset identity" onChange={(event) => {
         event.target.value ? setValue({ kind, datasetId: event.target.value, ...(kind === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}) }) : clear()
       }} disabled={usingDefault} className={common} />
-      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Exact revision" onChange={(event) => {
+      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Version ID" onChange={(event) => {
         event.target.value ? setValue({ kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: event.target.value }) : clear()
       }} disabled={usingDefault} className={`col-start-2 ${common}`} />}
       {usingDefault && <div className="col-span-2 flex items-center justify-between gap-2 text-muted-foreground">
@@ -395,7 +399,7 @@ function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc })
   return <div aria-label="Preview input drift" className="mt-2 flex flex-col gap-1.5">
     {drift.sources.map((source) => {
       const compatibility = source.compatibility
-      const notable = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
+      const notable = compatibility?.fields.filter(isMeaningfulSchemaChange) ?? []
       return <div key={`${source.nodeId}:${source.previewRevisionId}`} className="rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px]">
         <div className="font-semibold text-foreground">{titles.get(source.nodeId) ?? source.nodeId}</div>
         <div className="dp-mono mt-0.5 break-all text-muted-foreground">
@@ -412,31 +416,6 @@ function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc })
       </div>
     })}
   </div>
-}
-
-function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: string; title: string; ref: DatasetRef }[] {
-  const byId = new Map(doc.nodes.map((node) => [node.id, node]))
-  const incoming = new Map<string, string[]>()
-  const children = new Map<string, string[]>()
-  for (const edge of doc.edges) incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source])
-  for (const node of doc.nodes) {
-    if (node.parentId) children.set(node.parentId, [...(children.get(node.parentId) ?? []), node.id])
-  }
-  const selected = new Set<string>()
-  const pending = byId.has(targetNodeId) ? [targetNodeId] : []
-  while (pending.length) {
-    const current = pending.pop()!
-    if (selected.has(current)) continue
-    selected.add(current)
-    pending.push(...(incoming.get(current) ?? []))
-    if (byId.get(current)?.type === 'section') pending.push(...(children.get(current) ?? []))
-  }
-  return doc.nodes.flatMap((node) => {
-    const ref = node.data.config.datasetRef
-    return selected.has(node.id) && node.type === 'source' && ref && !isParameterRef(ref)
-      ? [{ nodeId: node.id, title: node.data.title, ref }]
-      : []
-  })
 }
 
 type ConfirmationReason = NonNullable<RunEstimate['confirmationReasons']>[number]
@@ -471,37 +450,6 @@ function confirmationCopy(
   return `${cost} ${risk}`
 }
 
-function ConfirmationTechnicalDetails({
-  estimate, pinnedInputs, isWrite, outputName, destination, admission, receipt, returnToCanvas,
-}: {
-  estimate: RunEstimate
-  pinnedInputs: { nodeId: string; title: string; ref: DatasetRef }[]
-  isWrite: boolean
-  outputName: string
-  destination: string
-  admission?: WriteAdmission
-  receipt?: WriteReceipt
-  returnToCanvas: DatasetViewerCanvasReturn
-}) {
-  const reasons = confirmationReasons(estimate, admission)
-  return <details className="mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-    <summary className="cursor-pointer font-semibold text-foreground">Technical details</summary>
-    <div className="mt-2 grid gap-1 break-all">
-      {estimate.breakdown && <div>{estimate.breakdown}</div>}
-      {reasons.length > 0 && <div>Confirmation reason{reasons.length === 1 ? '' : 's'}: {reasons.join(', ').replaceAll('_', ' ')}</div>}
-      {pinnedInputs.map((input) => {
-        const exact = datasetRefIdentity(input.ref)
-        return <div key={input.nodeId}>
-          {input.title} · dataset {exact.datasetId} · revision {exact.revisionId}
-          {input.ref.kind === 'as_of' ? ` · as of ${new Date(input.ref.asOf).toLocaleString()}` : ''}
-        </div>
-      })}
-      {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination}
-        admission={admission} receipt={receipt} returnToCanvas={returnToCanvas} />}
-    </div>
-  </details>
-}
-
 function formatByteEstimate(value: number): string {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
   const unit = value > 0
@@ -511,7 +459,7 @@ function formatByteEstimate(value: number): string {
   return `${amount} ${units[unit]}`
 }
 
-function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
+function RunOutputs({ outputs, showErrors = true }: { outputs: RunOutput[]; showErrors?: boolean }) {
   if (outputs.length === 0) return null
   return (
     <div aria-label="Run outputs" className="mt-2.5 flex flex-col gap-1.5">
@@ -531,17 +479,7 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
                     : 'bg-muted text-muted-foreground',
               )}>{output.outcome}</span>
             </div>
-            {output.uri && <div className="dp-mono mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground" title={output.uri}>→ {output.uri}</div>}
-            {output.writeReceipt && (
-              <div aria-label="Durable write receipt" className="mt-1 text-muted-foreground">
-                <span className="font-semibold text-foreground">revision {output.writeReceipt.revisionId}</span>
-                {' · '}dataset {output.writeReceipt.datasetId}
-                {' · '}{output.writeReceipt.bytes.toLocaleString()} bytes
-                {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
-                {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
-              </div>
-            )}
-            {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
+            {showErrors && output.error && <ReadableRunError raw={output.error} />}
           </div>
         )
       })}
@@ -558,13 +496,13 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
         return (
           <div key={p.nodeId} className="flex flex-col gap-0.5">
             <div className="flex items-center gap-2 text-[11px]">
-              <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: s.color }}>{s.glyph}</span>
+              <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: statusText[p.status as keyof typeof statusText] ?? statusText.queued }}>{s.glyph}</span>
               <span className={cn(p.status === 'failed' ? 'font-semibold text-destructive' : 'text-muted-foreground')}>{p.label ?? p.nodeId}</span>
               <span className="flex-1" />
               {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
             </div>
             {p.status === 'failed' && p.error && (
-              <div className="dp-mono ml-[18px] whitespace-pre-wrap rounded bg-destructive/10 px-2 py-1 text-[10.5px] text-muted-foreground">{p.error}</div>
+              <div className="ml-[18px]"><ReadableRunError raw={p.error} /></div>
             )}
           </div>
         )
@@ -573,10 +511,22 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
   )
 }
 
-function ProgressBar({ value }: { value: number }) {
+function ReadableRunError({ raw, nodeTitle, config, details = false }: {
+  raw?: string | null
+  nodeTitle?: string
+  config?: Record<string, unknown>
+  details?: boolean
+}) {
+  const error = presentRunError(raw, { nodeTitle, config })
   return (
-    <div className="h-1.5 overflow-hidden rounded bg-muted">
-      <div className="h-full rounded bg-primary transition-[width] duration-300" style={{ width: `${Math.min(100, Math.max(6, value * 100))}%` }} />
+    <div className="mt-2 rounded-lg bg-destructive/10 p-2.5 text-[11px] text-destructive">
+      <div className="leading-relaxed">{error.summary}</div>
+      {details && error.details && error.details !== error.summary && (
+        <details className="mt-2 text-muted-foreground">
+          <summary className="cursor-pointer select-none font-semibold text-foreground">Details</summary>
+          <pre className="dp-mono mt-1.5 max-h-44 overflow-auto whitespace-pre-wrap text-[10px] leading-relaxed">{error.details}</pre>
+        </details>
+      )}
     </div>
   )
 }

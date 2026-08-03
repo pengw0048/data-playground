@@ -16,17 +16,18 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.goto('/#/workspace')
     await page.getByRole('button', { name: 'New folder' }).click()
     await page.getByLabel('Folder name').fill(parent)
-    await page.getByRole('button', { name: 'Create' }).click()
+    await page.getByRole('button', { name: 'Create', exact: true }).click()
     await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(parent)
 
     await page.getByRole('button', { name: 'New folder' }).click()
     await page.getByLabel('Folder name').fill(child)
-    await page.getByRole('button', { name: 'Create' }).click()
+    await page.getByRole('button', { name: 'Create', exact: true }).click()
     await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(child)
 
-    await page.getByRole('button', { name: 'New canvas here' }).click()
-    await page.getByLabel('Canvas name').fill(canvas)
     await page.getByRole('button', { name: 'Create canvas' }).click()
+    const createCanvas = page.getByRole('dialog', { name: 'Create canvas' })
+    await createCanvas.getByLabel('Canvas name').fill(canvas)
+    await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     await page.getByTestId('app-menu').click()
@@ -63,11 +64,12 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.goto('/#/workspace')
     await page.getByRole('button', { name: 'New folder' }).click()
     await page.getByLabel('Folder name').fill(destination)
-    await page.getByRole('button', { name: 'Create' }).click()
+    await page.getByRole('button', { name: 'Create', exact: true }).click()
     await page.getByRole('navigation', { name: 'Workspace path' }).getByRole('button', { name: 'Workspace', exact: true }).click()
-    await page.getByRole('button', { name: 'New canvas here' }).click()
-    await page.getByLabel('Canvas name').fill(canvas)
     await page.getByRole('button', { name: 'Create canvas' }).click()
+    const createCanvas = page.getByRole('dialog', { name: 'Create canvas' })
+    await createCanvas.getByLabel('Canvas name').fill(canvas)
+    await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
@@ -77,10 +79,55 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.getByRole('button', { name: destination, exact: true }).click()
     await expect(page.getByText(/Destination:/)).toContainText(`Workspace / ${destination}`)
     await page.getByRole('button', { name: `Move to ${destination}` }).click()
-    const status = page.getByRole('status')
+    const status = page.getByRole('status').filter({ hasText: `Moved “${canvas}” to Workspace / ${destination}.` })
     await expect(status).toContainText(`Moved “${canvas}” to Workspace / ${destination}.`)
     await page.getByRole('button', { name: 'Undo move' }).click()
     await expect(status).toHaveCount(0)
     await expect(page.getByRole('button', { name: `Open canvas ${canvas}` })).toBeVisible()
+  })
+
+  test('opens product menus from the right-clicked Workspace and Canvas location', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    const suffix = Date.now()
+    const folder = `Context menu folder ${suffix}`
+    const canvas = `Context menu Canvas ${suffix}`
+
+    await page.goto('/#/workspace')
+    await page.getByRole('button', { name: 'New folder' }).click()
+    await page.getByLabel('Folder name').fill(folder)
+    await page.getByRole('button', { name: 'Create', exact: true }).click()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText(folder)
+    await page.getByTestId('workspace-scroll-surface').click({
+      button: 'right', position: { x: 520, y: 320 },
+    })
+    const folderMenu = page.getByRole('menu', { name: 'Folder actions' })
+    await expect(folderMenu).toBeVisible()
+    for (const name of ['Add data…', 'New folder', 'Create canvas', 'Reload']) {
+      await expect(folderMenu.getByRole('menuitem', { name })).toBeVisible()
+    }
+    await folderMenu.getByRole('menuitem', { name: 'Create canvas' }).click()
+    const createCanvas = page.getByRole('dialog', { name: 'Create canvas' })
+    await createCanvas.getByLabel('Canvas name').fill(canvas)
+    await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
+    await expect(page).toHaveURL(/#\/canvas\//)
+
+    const pane = page.locator('.react-flow__pane')
+    await pane.click({ button: 'right', position: { x: 220, y: 220 } })
+    const canvasMenu = page.getByRole('menu', { name: 'Canvas actions' })
+    await expect(canvasMenu).toBeVisible()
+    for (const name of ['Paste', 'Select all', 'Fit canvas']) {
+      await expect(canvasMenu.getByRole('menuitem', { name: new RegExp(name) })).toBeVisible()
+    }
+    await canvasMenu.getByRole('menuitem', { name: 'Add Sources & sinks' }).hover()
+    await page.getByRole('menuitem', { name: 'source', exact: true }).click()
+
+    const node = page.locator('.react-flow__node').filter({ hasText: 'source' })
+    await expect(node).toHaveCount(1)
+    await node.click({ button: 'right' })
+    const nodeMenu = page.getByRole('menu', { name: 'Node actions' })
+    await expect(nodeMenu).toBeVisible()
+    for (const name of ['Rename', 'Duplicate', 'Disable', 'Delete']) {
+      await expect(nodeMenu.getByRole('menuitem', { name: new RegExp(name) })).toBeVisible()
+    }
   })
 })

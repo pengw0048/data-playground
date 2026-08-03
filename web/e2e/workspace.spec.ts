@@ -18,7 +18,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
     try {
       await page.goto('/#/workspace')
-      await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+      await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
       await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
       await expect(await workspaceResource(page, 'dataset', dataset.name)).toBeVisible()
 
@@ -55,7 +55,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     }
   })
 
-  test('makes an All Workspace query explicit and clears old rows after a submitted no-match search', async ({ page }) => {
+  test('makes an All query explicit and clears old rows after a submitted no-match search', async ({ page }) => {
     const canvasId = `workspace-search-${Date.now()}`
     const canvasName = 'Workspace search candidate'
     const created = await page.request.post('/api/canvas', {
@@ -69,12 +69,12 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       const submit = page.getByRole('button', { name: 'Search Workspace' })
 
       await search.fill(canvasName)
-      await expect(page.getByRole('status')).toHaveText(`Select Search to look for “${canvasName}”.`)
+      await expect(page.getByRole('status').filter({ hasText: `Select Search to look for “${canvasName}”.` })).toHaveCount(1)
       await submit.click()
       await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
 
       await search.fill('zzzz-no-match')
-      await expect(page.getByRole('status')).toHaveText(`Results are still for “${canvasName}”. Select Search to update.`)
+      await expect(page.getByRole('status').filter({ hasText: `Results are still for “${canvasName}”. Select Search to update.` })).toHaveCount(1)
       await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
       await submit.click()
 
@@ -83,6 +83,31 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toHaveCount(0)
     } finally {
       await page.request.delete(`/api/canvas/${canvasId}`)
+    }
+  })
+
+  test('reload makes an agent-created Canvas actionable without a browser refresh', async ({ page }) => {
+    const suffix = Date.now()
+    const canvasId = `workspace-agent-created-${suffix}`
+    const canvasName = `Agent-created Canvas ${suffix}`
+    await page.goto('/#/workspace')
+
+    const created = await page.request.post('/api/canvas', {
+      data: { id: canvasId, name: canvasName, version: 1, requirements: [], nodes: [], edges: [] },
+    })
+    expect(created.ok()).toBe(true)
+
+    try {
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toHaveCount(0)
+      await page.getByRole('button', { name: 'Reload' }).click()
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
+
+      await page.getByRole('checkbox', { name: `Select ${canvasName}` }).check()
+      for (const action of ['Rename', 'Duplicate', 'Move', 'Delete']) {
+        await expect(page.getByRole('button', { name: action, exact: true })).toBeVisible()
+      }
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }
   })
 
@@ -98,9 +123,10 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
     try {
       await page.goto('/#/workspace')
-      await page.getByRole('button', { name: 'New canvas here' }).click()
-      await page.getByLabel('Canvas name').fill(emptyName)
       await page.getByRole('button', { name: 'Create canvas' }).click()
+      const createCanvas = page.getByRole('dialog', { name: 'Create canvas' })
+      await createCanvas.getByLabel('Canvas name').fill(emptyName)
+      await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
       await expect(page).toHaveURL(/#\/canvas\//)
       emptyCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
 
@@ -240,9 +266,15 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
 test('browses and opens one exact retained dataset revision without drifting to latest', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 })
-  const catalog = await page.request.get('/api/catalog/tables?limit=1')
+  // Other specs intentionally register and unregister short-lived datasets against the shared
+  // local kernel. Select a seeded fixture by stable name instead of treating mutable list order as
+  // identity; otherwise this acceptance can click a dataset that another worker just retired.
+  const catalog = await page.request.get('/api/catalog/search', {
+    params: { q: 'events', mode: 'lexical', limit: 10 },
+  })
   expect(catalog.ok()).toBe(true)
-  const dataset = (await catalog.json()).items[0] as { id: string; name: string }
+  const dataset = (await catalog.json() as Array<{ id: string; name: string }>)
+    .find((item) => item.name === 'events')
   expect(dataset).toBeTruthy()
   await page.route('**/api/catalog/tables/stable-dataset?registration=true', (route) =>
     route.fulfill({ json: dataset }))
@@ -298,32 +330,20 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await page.goto('/#/workspace')
   await (await workspaceResource(page, 'dataset', dataset.name)).click()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
-  const currentTechnicalDetails = page.getByTestId('revision-technical-details-rev-2')
-  await expect(currentTechnicalDetails.getByText('rev-2', { exact: true })).toBeHidden()
-  await currentTechnicalDetails.locator('summary').click()
-  await expect(currentTechnicalDetails.getByText('rev-2', { exact: true })).toBeVisible()
+  await expect(page.getByText('Technical details', { exact: true })).toHaveCount(0)
+  await expect(page.getByTestId('dataset-revision-history')).not.toContainText('rev-2')
   await page.getByTestId('revision-history-load-more').click()
-  const historicalTechnicalDetails = page.getByTestId('revision-technical-details-rev-1')
-  await expect(historicalTechnicalDetails.getByText('rev-1', { exact: true })).toBeHidden()
-  await historicalTechnicalDetails.locator('summary').click()
-  await expect(historicalTechnicalDetails.getByText('rev-1', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('revision-open-rev-1')).toBeVisible()
+  await expect(page.getByTestId('dataset-revision-history')).not.toContainText('rev-1')
 
   await page.getByTestId('revision-open-rev-2').click()
-  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this exact revision')
-  await expect(page.getByTestId('dataset-version-context')).toHaveText('Current exact version')
-  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Current exact version · view-only')
-  const datasetDetails = page.getByTestId('detail-dataset-details')
-  await datasetDetails.locator('summary').click()
-  await expect(datasetDetails.getByTestId('dataset-version-identity')).toContainText(
-    'stable-dataset@rev-2',
-  )
-  const technicalRevision = page.getByTestId('revision-detail')
-  const revisionTechnicalDetails = technicalRevision.getByTestId('revision-technical-details')
-  await revisionTechnicalDetails.locator('summary').click()
-  await expect(revisionTechnicalDetails.getByText('Parent revision', { exact: true })).toBeVisible()
-  await expect(revisionTechnicalDetails.getByText('rev-1', { exact: true })).toBeVisible()
-  await expect(technicalRevision.getByText('breaking')).toBeVisible()
-  await expect(technicalRevision.getByText('Exact revision preview', { exact: true })).toHaveCount(0)
+  await expect(page.getByLabel('Dataset preview scope')).toContainText('from this selected version')
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Current version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Current version · view-only')
+  await expect(page.getByTestId('dataset-viewer')).not.toContainText('stable-dataset@rev-2')
+  const versionSummary = page.getByTestId('revision-detail')
+  await expect(versionSummary.getByText('Breaking')).toBeVisible()
+  await expect(versionSummary.getByText('Version preview', { exact: true })).toHaveCount(0)
   const dataPreview = page.getByRole('region', { name: 'Data preview' })
   await expect(dataPreview.getByLabel('Dataset preview scope')).toContainText('preview capped at 100 rows')
   await expect(dataPreview.getByText('Binary media preview is unavailable.', { exact: true })).toBeVisible()
@@ -334,11 +354,12 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByRole('button', { name: /certify/i })).toHaveCount(0)
   await expect(page.getByText(/row identity/i)).toHaveCount(0)
 
-  await page.getByTestId('revision-history-load-more').click()
-  await page.getByTestId('revision-open-rev-1').click()
-  await expect(page.getByTestId('dataset-version-context')).toHaveText('Historical exact version')
-  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Historical exact version · view-only')
-  await expect(page.getByRole('region', { name: 'Data preview' })).toContainText('Historical exact version')
+  const previousVersion = page.getByTestId('revision-open-rev-1')
+  if (!(await previousVersion.isVisible())) await page.getByTestId('revision-history-load-more').click()
+  await previousVersion.click()
+  await expect(page.getByTestId('dataset-version-context')).toHaveText('Previous version')
+  await expect(page.getByTestId('detail-use-unavailable')).toHaveText('Previous version · view-only')
+  await expect(page.getByRole('region', { name: 'Data preview' })).toContainText('Previous version')
   await expect(dataPreview.getByRole('cell', { name: '1', exact: true })).toBeVisible()
   await expect(dataPreview.getByRole('cell', { name: '2', exact: true })).toHaveCount(0)
   expect(historyRequests).toBeGreaterThanOrEqual(2)
@@ -390,10 +411,10 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     await page.goto(`/#/canvas/${canvasId}`)
     const node = page.locator('.react-flow__node', { hasText: 'Pinned source' })
     await expect(node).toBeVisible()
-    await page.getByRole('button', { name: 'Pin exact revision' }).click()
-    const revisionPicker = page.getByText('Select one retained version. This Source will not switch to latest automatically.').locator('..')
+    await page.getByRole('button', { name: 'Pin a version' }).click()
+    const revisionPicker = page.getByText('Select one saved version. This Source will not switch to latest automatically.').locator('..')
     await revisionPicker.getByText('1', { exact: true }).click()
-    await expect(node).toContainText('Local catalog · Version 1 · 1 row · 1 column')
+    await expect(node).toContainText('Datasets · Saved version · 1 row · 1 column')
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${canvasId}`)
       return (await response.json()).nodes[0].data.config.datasetRef
@@ -406,7 +427,7 @@ test('pins a managed-local Parquet Source revision, persists it across reload, a
     const control = page.getByRole('button', { name: 'Change selected version' })
     await expect(control).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: 'Pinned source' })).toContainText(
-      'Local catalog · Version 1 · 1 row · 1 column')
+      'Datasets · Saved version · 1 row · 1 column')
     const box = await control.boundingBox()
     expect(box).not.toBeNull()
     expect(box!.x).toBeGreaterThanOrEqual(0)
@@ -472,13 +493,13 @@ test('keeps an exact Source binding through provider outage and retries at the s
   try {
     await page.goto(`/#/canvas/${canvasId}`)
     await expect(page.getByText(
-      /provider is offline.*selected version could not be verified.*latest was not substituted/i,
+      /provider is offline.*selected version could not be verified.*Your selection is unchanged/i,
     )).toBeVisible()
 
     providerAvailable = true
     await page.getByRole('button', { name: 'Retry provider' }).click()
     await expect(page.locator('.react-flow__node', { hasText: 'Recoverable source' })).toContainText(
-      'Local catalog · Version 1 · 1 row · 1 column')
+      'Datasets · Saved version · 1 row · 1 column')
     const response = await page.request.get(`/api/canvas/${canvasId}`)
     expect((await response.json()).nodes[0].data.config.datasetRef).toEqual(selected)
   } finally {

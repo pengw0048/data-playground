@@ -1286,6 +1286,43 @@ def test_kernel_default_admits_and_publishes_managed_create(tmp_path, monkeypatc
     assert _managed_revision_count(logical_uri) == 1
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
+    projection = metadb.canvas_result_latest(str(graph.id))
+    assert len(projection) == 1
+    assert projection[0]["terminal_run_id"] == task["id"]
+    assert projection[0]["result_run_id"] == task["id"]
+    assert projection[0]["result_outputs"][0]["publication_kind"] == "catalog"
+    monkeypatch.setattr(runs, "get_deps", lambda: deps)
+    recovered = runs.recover_canvas_results(
+        runs.CanvasResultRecoveryRequest(graph=graph), uid)
+    assert recovered.latest_node_ids == ["source", "write"]
+    assert recovered.failed_node_ids == []
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_kernel_default_publishes_a_managed_write_without_a_submission_id(
+        tmp_path, monkeypatch):
+    # MCP and direct-API callers send no submissionId; the server mints one so they publish
+    # through the durable owner.
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+
+    status, owner = runs.start_run(deps, graph, "write", uid, confirmed=True)
+    assert owner is None
+    task = metadb.durable_task(status.run_id)
+    assert task is not None and task["task_kind"] == "managed_local_write"
+
+    observed = _await_durable_task(task["id"])
+    assert observed["status"] == "done", observed
+    receipt = observed["output_receipt"]
+    assert receipt["revisionId"] and receipt["parentHead"] is None
+    logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == receipt["revisionId"]
+    assert _managed_revision_count(logical_uri) == 1
+    jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
+    assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
 
     metadb.delete_canvas_cascade(str(graph.id))
     deps.storage.close()
@@ -1386,8 +1423,9 @@ def test_injected_pre_dispatch_failure_terminalizes_the_kernel_claim(tmp_path, m
 
     monkeypatch.setattr(KernelBackend, "run", boom)
 
+    # a managed Write is owned by the durable Task, so target the Source to reach the kernel claim
     with pytest.raises(RuntimeError, match="injected pre-dispatch failure"):
-        runs.start_run(deps, graph, "write", uid, confirmed=True)
+        runs.start_run(deps, graph, "source", uid, confirmed=True)
 
     with metadb.session() as session:
         rows = session.scalars(select(metadb.RunState)).all()

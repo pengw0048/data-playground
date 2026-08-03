@@ -78,13 +78,41 @@ function yToDoc(base: CanvasDoc): CanvasDoc {
   })
   const es: CanvasEdge[] = []
   edges().forEach((e) => es.push(e))
-  return { ...base, name: (meta().get('name') as string) ?? base.name, nodes: ns, edges: es }
+  const hasExecutionBackend = meta().has('executionBackend')
+  const executionBackend = meta().get('executionBackend')
+  const hasResultRetention = meta().has('resultRetention')
+  const resultRetention = meta().get('resultRetention')
+  return {
+    ...base,
+    name: (meta().get('name') as string) ?? base.name,
+    // A missing key is a pre-execution-target replica, so keep the authoritative DB value. New
+    // replicas write null explicitly for Automatic; that makes a collaborative clear distinguishable
+    // from legacy Y state that never knew about this field.
+    executionBackend: !hasExecutionBackend
+      ? base.executionBackend
+      : typeof executionBackend === 'string' ? executionBackend : undefined,
+    resultRetention: !hasResultRetention
+      ? base.resultRetention
+      : typeof resultRetention === 'string'
+        ? JSON.parse(resultRetention) as CanvasDoc['resultRetention']
+        : undefined,
+    nodes: ns,
+    edges: es,
+  }
 }
 
 // -- CanvasDoc → Y (diff the store doc into the shared state) ----------------- //
 function pushDocToY(doc: CanvasDoc): void {
   replica.doc.transact(() => {
     if (meta().get('name') !== doc.name) meta().set('name', doc.name)
+    const executionBackend = doc.executionBackend ?? null
+    if (!meta().has('executionBackend') || meta().get('executionBackend') !== executionBackend) {
+      meta().set('executionBackend', executionBackend)
+    }
+    const resultRetention = JSON.stringify(doc.resultRetention ?? { history: 'inherit' })
+    if (meta().get('resultRetention') !== resultRetention) {
+      meta().set('resultRetention', resultRetention)
+    }
     const nmap = nodes()
     const ids = new Set(doc.nodes.map((n) => n.id))
     nmap.forEach((_v, id) => { if (!ids.has(id)) nmap.delete(id) })

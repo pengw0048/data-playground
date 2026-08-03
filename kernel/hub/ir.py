@@ -29,6 +29,10 @@ from dataclasses import dataclass, field
 from hub import graph as g
 from hub.models import CompilePlan, Graph, GraphNode
 
+# Source CSV parse overrides carried on the wire, and the closed value sets that gate them.
+SOURCE_OPTION_KEYS = ("delimiter", "header", "dateOrder")
+SOURCE_OPTION_VALUES = {"header": ("yes", "no"), "dateOrder": ("day-first", "month-first")}
+
 # transform modes a per-row / per-batch engine runs faithfully (the reduce-y `aggregate` and
 # escape-hatch `callable` modes need a full custom pass, so they are NOT clean).
 CLEAN_TRANSFORM_MODES = {"map", "map_batches", "filter", "flat_map", "flat_map_generator"}
@@ -168,9 +172,10 @@ def resolve_config(node: GraphNode) -> dict:
             c["enforceSchema"] = True
         return c
     if t == "source":
-        opts = {k: str(cfg[k]).strip().lower() if k == "header" else str(cfg[k]).strip()
-                for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
-        opts = {k: v for k, v in opts.items() if k != "header" or v in ("yes", "no")}  # header must be yes/no
+        opts = {k: str(cfg[k]).strip().lower() if k in SOURCE_OPTION_VALUES else str(cfg[k]).strip()
+                for k in SOURCE_OPTION_KEYS if str(cfg.get(k, "")).strip()}
+        opts = {k: v for k, v in opts.items()
+                if k not in SOURCE_OPTION_VALUES or v in SOURCE_OPTION_VALUES[k]}
         c = {"uri": cfg.get("uri")}
         dataset_ref = cfg.get("datasetRef")
         if isinstance(dataset_ref, dict):
@@ -196,7 +201,8 @@ def resolve_config(node: GraphNode) -> dict:
     if t == "filter":
         return {"predicate": cfg.get("predicate", "")}
     if t == "assert":  # a data-quality gate: rows where `predicate` is not TRUE = violations
-        return {"predicate": cfg.get("predicate", ""), "severity": cfg.get("severity", "warn")}
+        # A visible check must be a gate unless the author explicitly changes it to a warning.
+        return {"predicate": cfg.get("predicate", ""), "severity": cfg.get("severity", "error")}
     if t == "select":
         return {"expr": cfg.get("select") or cfg.get("expr") or ""}
     if t == "sql":

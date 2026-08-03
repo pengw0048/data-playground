@@ -216,6 +216,26 @@ def test_current_copy_preserves_current_source_filter_write_document():
     }
 
 
+def test_current_copy_preserves_an_incomplete_filter_draft():
+    owner = _user("copy-filter-draft-owner")
+    source_id = _canvas(owner, "Filter draft")
+    with metadb.session() as session:
+        source = session.get(metadb.Canvas, source_id)
+        document = json.loads(source.doc)
+        document["nodes"] = [{
+            "id": "filter", "type": "filter", "position": {"x": 40, "y": 60},
+            "data": {"title": "filter", "status": "draft", "config": {"predicate": ""}},
+        }]
+        source.doc = json.dumps(document)
+    payload = _payload(source_id, name="Filter draft copy")
+
+    checked = _validate(payload, owner)
+    assert checked.status_code == 200, checked.text
+    validation = checked.json()
+    assert validation["canImport"] is True
+    assert _create(payload, validation, owner, confirm_warnings=False).status_code == 200
+
+
 def test_current_copy_keeps_a_confirmed_missing_registered_source_fail_closed(tmp_path):
     owner = _user("copy-missing-owner")
     source_id = _canvas(owner, "Missing registered source")

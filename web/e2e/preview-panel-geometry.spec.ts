@@ -135,9 +135,8 @@ test('docks a rightmost Transform preview above the toolbar at 1280x720', async 
     expect(panelBox!.x).toBeLessThan(transformBox!.x)
     expect(panelBox!.y).toBeGreaterThanOrEqual(chromeBottom)
     expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(toolbarBox!.y + 0.5)
-    const badge = page.getByTestId('kernel-badge')
-    await badge.click()
-    await expect(page.getByText('Execution kernel', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: /Execution target:/ }).click()
+    await expect(page.getByText('Run this Canvas on', { exact: true })).toBeVisible()
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: 'Fit view', exact: true }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
@@ -153,8 +152,21 @@ test('keeps an anchored data preview and restores it after maximize at 1440x900'
     await expect(panel).toHaveAttribute('data-presentation', 'anchored')
     await panel.getByRole('button', { name: 'Maximize' }).click()
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'maximized')
+
+    const body = page.getByTestId('panel-data').getByTestId('full-result-body')
+    await expect(body).toBeVisible()
+    const rows = await body.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      bottom: element.getBoundingClientRect().bottom,
+    }))
+    const cardBottom = await page.getByTestId('panel-data')
+      .evaluate((element) => (element.firstElementChild as HTMLElement).getBoundingClientRect().bottom)
+    expect(rows.clientHeight, 'a maximized preview must use the height, not stop at the docked cap').toBeGreaterThan(500)
+    expect(Math.abs(rows.bottom - cardBottom)).toBeLessThanOrEqual(1)
+
     await page.getByTestId('panel-data').getByRole('button', { name: 'Restore' }).click()
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'anchored')
+    expect(await body.evaluate((element) => element.clientHeight)).toBeLessThanOrEqual(440)
   } finally {
     await removeCanvas(page, canvasId)
   }

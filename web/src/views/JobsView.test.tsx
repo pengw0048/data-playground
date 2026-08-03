@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -19,9 +19,6 @@ const job = (overrides = {}) => ({
   attempt: 'run-1', rows: 12, ms: 240, error: 'destination unavailable',
   outputs: [], createdAt: '2026-07-16T12:00:00Z', ...overrides,
 })
-
-const openAdvancedFilters = () => fireEvent.click(screen.getByText('Advanced filters'))
-const openTechnicalEvidence = () => fireEvent.click(screen.getByText('Technical evidence'))
 
 describe('JobsView', () => {
   beforeEach(() => {
@@ -45,7 +42,7 @@ describe('JobsView', () => {
     render(<JobsView />)
     expect(screen.getByText('Loading Jobs…')).toBeVisible()
     await act(async () => { finish?.({ items: [], hasMore: false, nextCursor: null }) })
-    expect(screen.getByText('No Jobs match these filters.')).toBeVisible()
+    expect(screen.getByText('No jobs match these filters.')).toBeVisible()
   })
 
   it('shows normalized workspace history and stable canvas/node links', async () => {
@@ -56,14 +53,43 @@ describe('JobsView', () => {
     expect(screen.getByText('Open for failure details')).toBeVisible()
     expect(screen.queryByText('destination unavailable')).toBeNull()
     expect(screen.getByText(new Date('2026-07-16T12:00:00Z').toLocaleString())).toHaveClass('whitespace-nowrap')
-    fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByTestId('job-row-run-1'))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.getAllByText('destination unavailable')).toHaveLength(1)
-    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
-    expect(screen.getByText('Last durable update:').closest('div')).toHaveTextContent('Last durable update: Unavailable')
-    expect(screen.getByRole('link', { name: 'Open canvas' })).toHaveAttribute('href', '#/canvas/canvas-1')
-    expect(screen.getByRole('link', { name: 'Open node' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
+    expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
+    expect(screen.queryByRole('link', { name: 'Open canvas' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('Last durable update:')).not.toBeInTheDocument()
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
+  })
+
+  it('names a row after what the row shows instead of its run id', async () => {
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ isMine: false, createdById: 'peer', createdByName: 'Ada' })],
+      hasMore: false, nextCursor: null,
+    })
+    useStore.setState({ jobsQuery: 'scope=all' } as never)
+    render(<JobsView />)
+
+    const recorded = new Date('2026-07-16T12:00:00Z').toLocaleString()
+    expect(await screen.findByTestId('job-row-run-1')).toHaveAccessibleName(
+      `Open job, Alpha research, Publish observations · Ada, Failed, ${recorded}`,
+    )
+    expect(screen.queryByRole('button', { name: /run-1/ })).not.toBeInTheDocument()
+  })
+
+  it('turns a known engine exception into an actionable failure message', async () => {
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ error: 'LocalRunInputError: local run input revision is unavailable' })],
+      hasMore: false,
+      nextCursor: null,
+    })
+
+    render(<JobsView />)
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
+
+    expect(screen.getByRole('alert')).toHaveTextContent('An input dataset version used by this run is no longer available.')
+    expect(screen.queryByText(/LocalRunInputError/)).not.toBeInTheDocument()
   })
 
   it('keeps the differentiating suffix and full tooltip for long shared-prefix canvas names', async () => {
@@ -119,21 +145,21 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run history-1 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-history-1'))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(useStore.getState().jobsQuery).toContain('run=history-1')
   })
 
-  it('keeps filters in the route and passes them to the bounded API', async () => {
+  it('keeps common filters visible and passes them to the bounded API', async () => {
+    useStore.setState({ files: [{ id: 'canvas-1', name: 'Research', version: 1 }] } as never)
     render(<JobsView />)
     await screen.findByText('Alpha research')
-    openAdvancedFilters()
-    fireEvent.change(screen.getByLabelText('Filter jobs by status'), { target: { value: 'running' } })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=running'))
+    expect(screen.getByRole('region', { name: 'Job filters' })).toBeVisible()
+    expect(screen.queryByText('Advanced filters')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
-      limit: 50, status: 'running',
+      limit: 50, canvasId: 'canvas-1',
     })))
   })
 
@@ -147,6 +173,10 @@ describe('JobsView', () => {
       await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=queued'))
       expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'queued' }))
 
+      fireEvent.click(screen.getByRole('button', { name: 'Completed' }))
+      await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=done'))
+      expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'done' }))
+
       fireEvent.click(screen.getByRole('button', { name: 'Recent' }))
       await waitFor(() => expect(useStore.getState().jobsQuery).toBe('after=2026-07-14T12%3A00%3A00.000Z'))
       expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ after: '2026-07-14T12:00:00.000Z', status: undefined }))
@@ -158,18 +188,40 @@ describe('JobsView', () => {
     }
   })
 
-  it('keeps exact evidence closed until a researcher asks for it', async () => {
+  it('defaults to my jobs and can include visible jobs from all users', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ isMine: true })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({
+        items: [
+          job({ isMine: true }),
+          job({ id: 'history-2', runId: 'run-2', isMine: false, createdById: 'peer', createdByName: 'Ada' }),
+        ],
+        hasMore: false,
+        nextCursor: null,
+      })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+
+    await screen.findByText('Alpha research')
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(1, expect.not.objectContaining({ scope: 'all' }))
+    expect(screen.getByTestId('jobs-scope-mine')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('jobs-scope-all')).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(screen.getByTestId('jobs-scope-all'))
+
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('scope=all'))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ scope: 'all' })))
+    expect(screen.getByTestId('jobs-scope-mine')).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByTestId('jobs-scope-all')).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByText(/Ada/)).toBeVisible()
+  })
+
+  it('keeps internal run evidence out of the user-facing Job detail', async () => {
+    render(<JobsView />)
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
 
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
-    const evidence = screen.getByText('Technical evidence').closest('details')!
-    expect(evidence).not.toHaveAttribute('open')
-    expect(screen.getByText('Current attempt:')).not.toBeVisible()
-
-    openTechnicalEvidence()
-    expect(screen.getByText('Current attempt:')).toBeVisible()
-    expect(screen.getByText('Run:').closest('div')).toHaveTextContent('run-1')
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('Current attempt:')).not.toBeInTheDocument()
+    expect(screen.queryByText('Run:')).not.toBeInTheDocument()
   })
 
   it('rechecks the same unavailable deep link after returning to Jobs', async () => {
@@ -185,10 +237,72 @@ describe('JobsView', () => {
 
     useStore.setState({ jobsQuery: deepLink } as never)
     expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(2, { limit: 1, runId: 'missing-run' })
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(3)
   })
 
-  it('uses authorized canvas names and current-page node/backend context while retaining canonical IDs', async () => {
+  it('does not turn a temporary direct-link lookup failure into an unavailable Job', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [], hasMore: false, nextCursor: null })
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce({
+        items: [job({ id: 'direct-history', runId: 'direct-run', status: 'running', error: null })],
+        hasMore: false,
+        nextCursor: null,
+      })
+    useStore.setState({ jobsQuery: 'status=failed&canvas=canvas-1&run=direct-run' } as never)
+    render(<JobsView />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Couldn’t open the linked Job: network unavailable')
+    expect(screen.queryByText('This Job is unavailable or you no longer have access.')).toBeNull()
+    expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(2, { limit: 1, runId: 'direct-run' })
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByTestId('job-row-direct-run')).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('removes a direct-link-only Job after returning to the filtered list', async () => {
+    const filtered = job({ id: 'failed-history', runId: 'failed-run', status: 'failed' })
+    const linked = job({ id: 'running-history', runId: 'running-run', status: 'running', error: null })
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [filtered], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
+    render(<JobsView />)
+
+    const linkedRow = await screen.findByTestId('job-row-running-run')
+    expect(screen.getByTestId('job-row-failed-run')).toBeVisible()
+
+    fireEvent.click(linkedRow)
+
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
+    expect(screen.queryByTestId('job-row-running-run')).not.toBeInTheDocument()
+    expect(screen.getByTestId('job-row-failed-run')).toBeVisible()
+  })
+
+  it('keeps a linked Job after a later ordinary page includes it', async () => {
+    const first = job({ id: 'first-history', runId: 'first-run', status: 'failed' })
+    const linked = job({ id: 'running-history', runId: 'running-run', status: 'running', error: null })
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [first], hasMore: true, nextCursor: 'second-page' })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [linked], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
+    render(<JobsView />)
+
+    const linkedRow = await screen.findByTestId('job-row-running-run')
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      cursor: 'second-page', status: 'failed',
+    })))
+
+    fireEvent.click(linkedRow)
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
+    expect(screen.getByTestId('job-row-running-run')).toBeVisible()
+  })
+
+  it('uses authorized canvas names and accepts direct server-side node or execution filters', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [
       job({ canvasId: 'canvas-1', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish' }),
       job({ id: 'history-2', runId: 'run-2', canvasId: 'canvas-2', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish', backend: 'ray' }),
@@ -201,19 +315,10 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     await screen.findAllByText('Research')
-    openAdvancedFilters()
     expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Publish · Research (canvas-1) · publish' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Node unlabelled · Research (canvas-2) · unlabelled' })).toBeVisible()
-
-    fireEvent.change(screen.getByLabelText('Filter jobs by node'), {
-      target: { value: JSON.stringify(['canvas-2', 'publish']) },
-    })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-2&node=publish'))
-    expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
-      canvasId: 'canvas-2', nodeId: 'publish', limit: 50,
-    }))
+    expect(screen.getByLabelText('Filter jobs by step')).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by compute target')).toBeVisible()
 
     fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
@@ -221,38 +326,32 @@ describe('JobsView', () => {
       canvasId: 'canvas-1', nodeId: undefined, limit: 50,
     })))
 
-    fireEvent.change(screen.getByLabelText('Filter jobs by backend'), { target: { value: 'ray' } })
-    await waitFor(() => expect(useStore.getState().jobsQuery).toContain('backend=ray'))
   })
 
-  it('keeps a deep-linked exact ID filter editable without inventing an inaccessible canvas name', async () => {
+  it('keeps deep-linked server-side filters visible and editable', async () => {
     useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
     render(<JobsView />)
 
-    openAdvancedFilters()
-    expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
-    expect(screen.getByRole('option', { name: 'Exact node ID: exact-node' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
-    expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
-    expect(screen.queryByLabelText(/Filter jobs by canvas id \(exact\)/i)).not.toBeInTheDocument()
-    expect(screen.queryByLabelText(/Filter jobs by node id \(exact\)/i)).not.toBeInTheDocument()
-    expect(screen.queryByLabelText(/Filter jobs by backend id \(exact\)/i)).not.toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Canvas from link (not in this list)' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by step')).toHaveValue('exact-node')
+    expect(screen.getByLabelText('Filter jobs by compute target')).toHaveValue('exact-backend')
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: 'not-accessible', nodeId: 'exact-node', backend: 'exact-backend', limit: 50,
+    })))
   })
 
-  it('keeps a standalone exact node filter visible and clearable', async () => {
+  it('keeps a standalone node filter visible and clearable', async () => {
     useStore.setState({ jobsQuery: 'node=orphan-node' } as never)
     render(<JobsView />)
 
-    openAdvancedFilters()
-    expect(await screen.findByRole('option', { name: 'Exact node ID: orphan-node' })).toBeVisible()
-    expect(screen.getByLabelText('Filter jobs by node'))
-      .toHaveValue(JSON.stringify([null, 'orphan-node']))
+    const nodeFilter = await screen.findByLabelText('Filter jobs by step')
+    expect(nodeFilter).toHaveValue('orphan-node')
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       canvasId: undefined, nodeId: 'orphan-node', limit: 50,
     })))
 
-    fireEvent.change(screen.getByLabelText('Filter jobs by node'), { target: { value: '' } })
+    fireEvent.change(nodeFilter, { target: { value: '' } })
+    fireEvent.blur(nodeFilter)
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe(''))
   })
 
@@ -302,7 +401,7 @@ describe('JobsView', () => {
       render(<JobsView />)
       await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
-      expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
+      expect(screen.getByTestId('job-row-direct-run')).toBeVisible()
       expect(screen.getByText(/No active jobs · Updated/)).toBeVisible()
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
@@ -318,7 +417,7 @@ describe('JobsView', () => {
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
 
-    expect(await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).toBeVisible()
+    expect(await screen.findByTestId('job-row-run-2')).toBeVisible()
     expect(screen.getByText(/Loaded job history · Auto-refresh paused · Updated/)).toBeVisible()
   })
 
@@ -329,11 +428,11 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ id: 'history-3', runId: 'run-3', status: 'running', error: null })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
-    await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })
+    await screen.findByTestId('job-row-run-2')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    expect(await screen.findByRole('button', { name: 'Open run run-3 in Alpha research', expanded: false })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).not.toBeInTheDocument()
+    expect(await screen.findByTestId('job-row-run-3')).toBeVisible()
+    expect(screen.queryByTestId('job-row-run-2')).not.toBeInTheDocument()
     expect(screen.getByText(/Active jobs refresh automatically · Updated/)).toBeVisible()
     expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: undefined, limit: 50 }))
   })
@@ -346,12 +445,12 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ id: 'direct-run', runId: 'direct-run', error: null })], hasMore: false, nextCursor: null })
     useStore.setState({ jobsQuery: 'run=direct-run' } as never)
     render(<JobsView />)
-    await screen.findByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })
+    await screen.findByTestId('job-row-direct-run')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenCalledTimes(4))
-    expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Open run refreshed-page in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByTestId('job-row-direct-run')).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByTestId('job-row-refreshed-page')).toBeVisible()
   })
 
   it('keeps the last successful first page visible after refresh failure', async () => {
@@ -359,11 +458,11 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: false, nextCursor: null })
       .mockRejectedValueOnce(new Error('network unavailable'))
     render(<JobsView />)
-    await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })
+    await screen.findByTestId('job-row-run-1')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t refresh Jobs: network unavailable')
-    expect(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByTestId('job-row-run-1')).toBeVisible()
     expect(screen.getByText(/Refresh failed · Updated/)).toBeVisible()
   })
 
@@ -373,15 +472,15 @@ describe('JobsView', () => {
       publicationKind: 'result', outcome: 'committed', uri: 'file:///result.parquet', rows: 12,
     }] })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
     fireEvent.click(screen.getByRole('button', { name: 'Open result' }))
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('output=write-1%3Aout'))
     expect(screen.getByTestId('full-result')).toBeVisible()
-    expect(screen.getByRole('complementary', { name: 'Retained result' })).toBeVisible()
+    expect(screen.getByRole('complementary', { name: 'Saved result' })).toBeVisible()
   })
 
-  it('keeps a completed row concise and moves multiple port identities into technical evidence', async () => {
+  it('keeps a completed row concise and exposes multiple results as direct actions', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       status: 'done', progress: 1, error: null, rows: 1,
       outputs: [
@@ -397,9 +496,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run run-1 in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-run-1')
     expect(row).toHaveTextContent('done')
     expect(row).not.toHaveTextContent('100%')
     expect(row).toHaveTextContent('2 outputs available')
@@ -410,10 +507,8 @@ describe('JobsView', () => {
     expect(screen.queryByText('Rows:', { exact: true })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Open result 1' })).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open result 2' })).toBeVisible()
-    openTechnicalEvidence()
-    expect(screen.getByText('Retained results:', { exact: true }).closest('div')).toHaveTextContent(
-      'Result 1 · transform-1:clean, Result 2 · transform-1:rejected',
-    )
+    expect(screen.queryByText('transform-1:clean')).not.toBeInTheDocument()
+    expect(screen.queryByText('transform-1:rejected')).not.toBeInTheDocument()
   })
 
   it('keeps progress visible for active work without adding a second status signal', async () => {
@@ -423,9 +518,7 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run run-1 in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-run-1')
     expect(row).toHaveTextContent('running')
     expect(row).toHaveTextContent('50%')
     expect(row.textContent?.match(/running/g)).toHaveLength(1)
@@ -456,16 +549,12 @@ describe('JobsView', () => {
     ], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const transform = (await screen.findByRole('button', {
-      name: 'Open run transform-run in Alpha research', expanded: false,
-    })).closest('article')
+    const transform = (await screen.findByTestId('job-row-transform-run')).closest('article')
     expect(transform).toHaveTextContent('1 output available')
     expect(transform).toHaveTextContent('12 rows')
     expect(transform).not.toHaveTextContent('published')
 
-    const profile = screen.getByRole('button', {
-      name: 'Open run profile-run in Alpha research', expanded: false,
-    }).closest('article')
+    const profile = screen.getByTestId('job-row-profile-run').closest('article')
     expect(profile).toHaveTextContent('1 output available')
     expect(profile).toHaveTextContent('987 rows')
     expect(profile).not.toHaveTextContent('published')
@@ -496,26 +585,21 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run write-run in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-write-run')
     expect(row.closest('article')).toHaveTextContent('Dataset revision published')
     expect(row.closest('article')).toHaveTextContent('12 rows')
     expect(row.closest('article')).not.toHaveTextContent('output retained')
     fireEvent.click(row)
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=revision-7&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dwrite-run',
+      '#/workspace/dataset%3Adataset-1?revision=revision-7&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dwrite-run',
     )
     expect(screen.queryByRole('button', { name: 'Open result' })).not.toBeInTheDocument()
-    openTechnicalEvidence()
-    expect(screen.getByText('Receipt:', { exact: true }).closest('div')).toHaveTextContent(
-      'dataset dataset-1 · revision revision-7 · 12 rows',
-    )
+    expect(screen.queryByText('Receipt:')).not.toBeInTheDocument()
     expect(screen.getAllByRole('link', { name: 'Open dataset' })).toHaveLength(1)
   })
 
-  it('shows exact durable task state and requests cancellation from Jobs', async () => {
+  it('shows useful durable task progress and requests cancellation from Jobs', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'task-1', taskId: 'task-1', status: 'running', error: null,
       progress: 0.5, updatedAt: '2026-07-16T12:00:30Z',
@@ -525,16 +609,11 @@ describe('JobsView', () => {
       writeIntent: { mode: 'replace', destination: { name: 'durable', logicalUri: 'managed://durable', provider: 'managed-local-file' }, expectedHead: { revisionId: 'head-6' } },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-1 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-task-1'))
 
-    openTechnicalEvidence()
-    expect(screen.getByText(/dataset-1@revision-7/)).toBeVisible()
-    expect(screen.getByText(/#1 running/).closest('li')).toHaveTextContent('Progress 50%')
-    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: 50%')
-    expect(screen.getByText('Last durable update:').closest('div')).not.toHaveTextContent('Unavailable')
-    expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
+    expect(screen.getByTestId('job-row-task-1')).toHaveTextContent('50%')
+    expect(screen.queryByText(/dataset-1@revision-7/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/expected head head-6/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
   })
@@ -545,9 +624,8 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'sparse-output', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
-    openTechnicalEvidence()
-    expect(screen.getByText('Column merge:', { exact: true })).toBeVisible()
+    fireEvent.click(await screen.findByTestId('job-row-merge-1'))
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Merging columns')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelMergeColumnsTask).toHaveBeenCalledWith('merge-1'))
     expect(mocks.cancelRun).not.toHaveBeenCalledWith('merge-1')
@@ -559,7 +637,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'managed-sidecar', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-sidecar-1'))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-1'))
     expect(mocks.cancelMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-1')
@@ -571,7 +649,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'managed-sidecar', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: true, canCancel: false },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-retry in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-sidecar-retry'))
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
     await waitFor(() => expect(mocks.retryManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-retry', expect.any(String)))
     expect(mocks.retryMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-retry')
@@ -584,10 +662,10 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'sparse-output', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: false, canRetry: false, canCancel: false, diagnosticCode: 'stale_expected_head' },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-stale in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-merge-stale'))
 
-    expect(screen.getByRole('link', { name: 'Re-admit in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
-    expect(screen.queryByRole('link', { name: 'Open node' })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
+    expect(screen.getAllByRole('link', { name: 'Open in Canvas' })).toHaveLength(1)
   })
 
   it('routes an exact merge receipt to the immutable shared dataset viewer', async () => {
@@ -596,16 +674,15 @@ describe('JobsView', () => {
       outputReceipt: { datasetId: 'dataset-1', revisionId: 'rev-gone', rows: 2, bytes: 12, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-gone', retentionOwner: 'core' }, schema: [], partitions: [], publication: { provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'redacted', publishSequence: 1, idempotencyKey: 'merge-done' } },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
-    openTechnicalEvidence()
+    fireEvent.click(await screen.findByTestId('job-row-merge-done'))
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Adataset-1?scope=datasets&revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
+      '#/workspace/dataset%3Adataset-1?revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
     )
     expect(mocks.workspaceJobs).toHaveBeenCalledTimes(1)
   })
 
-  it('loads the selected durable task manifest through its current Canvas subject', async () => {
+  it('offers a direct Duplicate Canvas recovery action without exposing the saved manifest', async () => {
     const digest = 'b'.repeat(64)
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       id: 't:task-manifest', runId: 'task-manifest', taskId: 'task-manifest', error: null,
@@ -624,17 +701,11 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-manifest in Alpha research', expanded: false,
-    }))
-    openTechnicalEvidence()
+    fireEvent.click(await screen.findByTestId('job-row-task-manifest'))
     expect(mocks.executionManifest).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: /Execution manifest/ }))
-
-    expect(await screen.findByText('Submitted graph')).toBeVisible()
-    expect(screen.getByText(/"threshold"/)).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
-    expect(mocks.executionManifest).toHaveBeenCalledWith('canvas-1', 't:task-manifest')
+    expect(screen.getByRole('button', { name: 'Duplicate Canvas' })).toBeVisible()
+    expect(screen.queryByText('Submitted graph')).not.toBeInTheDocument()
+    expect(screen.queryByText(digest)).not.toBeInTheDocument()
   })
 
   it('reuses one retry action id after an ambiguous request failure', async () => {
@@ -647,11 +718,9 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     mocks.retryRun.mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce(undefined)
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-2 in Alpha research', expanded: false,
-    }))
-    expect(screen.getByText(/#1 fenced/).closest('li')).toHaveTextContent('Progress Unavailable')
-    expect(screen.getByText(/#2 failed/).closest('li')).toHaveTextContent('Progress Unavailable')
+    fireEvent.click(await screen.findByTestId('job-row-task-2'))
+    expect(screen.queryByText('attempt-1')).not.toBeInTheDocument()
+    expect(screen.queryByText('attempt-2')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
     expect(await screen.findByText(/Job action failed: response lost/)).toBeVisible()
     const actionId = mocks.retryRun.mock.calls[0][1]
@@ -660,7 +729,7 @@ describe('JobsView', () => {
     expect(mocks.retryRun.mock.calls[1]).toEqual(['task-2', actionId])
   })
 
-  it('renders parent-only bounded fan-out stage and partition progress', async () => {
+  it('renders bounded partition progress in plain language', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'fan-1', taskId: 'fan-1', status: 'running', error: null,
       boundedFanout: {
@@ -675,16 +744,15 @@ describe('JobsView', () => {
       canCancel: true,
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run fan-1 in Alpha research', expanded: false,
-    }))
-    const fanout = screen.getByText('Fan-out:').closest('div')
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Fan-out · running partitions')
-    expect(fanout).toHaveTextContent('Fan-out: 2/4 partitions · checkpoint reused · gather pending')
+    fireEvent.click(await screen.findByTestId('job-row-fan-1'))
+    const progress = screen.getByRole('status', { name: 'Job progress' })
+    expect(progress).toHaveTextContent('Current step · Processing partitions')
+    expect(progress).toHaveTextContent('2 of 4 partitions complete')
+    expect(progress).not.toHaveTextContent('checkpoint reused')
     expect(screen.queryByText(/unitId|planDigest|range/i)).not.toBeInTheDocument()
   })
 
-  it('renders existing external-wait and checkpoint phases without inventing a generic phase', async () => {
+  it('renders external and reusable-result work in plain language', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [
       job({
         id: 'external-history', runId: 'external-1', taskId: 'external-1', status: 'running',
@@ -699,13 +767,13 @@ describe('JobsView', () => {
     ], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run external-1 in Alpha research', expanded: false }))
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: External wait · downloading')
-    expect(screen.getByText('External provider:').closest('div')).toHaveTextContent('fixture-local · provider attempt #2')
+    fireEvent.click(await screen.findByTestId('job-row-external-1'))
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Downloading data')
+    expect(screen.queryByText('fixture-local')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open run checkpoint-1 in Alpha research', expanded: false }))
-    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Checkpoint · materializing')
-    expect(screen.getByText('Checkpoint:').closest('div')).toHaveTextContent('checkpoint:out')
+    fireEvent.click(screen.getByTestId('job-row-checkpoint-1'))
+    expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Saving result for reuse')
+    expect(screen.queryByText('materializing')).not.toBeInTheDocument()
   })
 
   it('renders a canvas-less dataset task with an exact dataset-viewer deep-link', async () => {
@@ -717,11 +785,11 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     expect(await screen.findByText('Dataset restore · Climate observations')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
+    fireEvent.click(screen.getByTestId('job-row-restore-1'))
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Ads-logical-9?scope=datasets&revision=rev-9&revisionDataset=ds-logical-9&returnView=jobs&returnQuery=run%3Drestore-1',
+      '#/workspace/dataset%3Ads-logical-9?revision=rev-9&revisionDataset=ds-logical-9&returnView=jobs&returnQuery=run%3Drestore-1',
     )
   })
 

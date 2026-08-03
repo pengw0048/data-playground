@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -18,9 +19,10 @@ from hub import catalog_provider_conformance
 from hub.catalog_provider import (
     _PROVIDER_READ_CONCURRENCY, CatalogDatasetDetail, CatalogMount, CatalogResource,
     ProviderAncestors, ProviderCapabilities, ProviderCapabilitiesResult,
-    ProviderDatasetDetailResult, ProviderPage, ProviderResourceResult, ProviderSearchPage,
+    ProviderDatasetDetailResult, ProviderLineageResult, ProviderPage,
+    ProviderResourceResult, ProviderSearchPage,
     bounded_ancestors, bounded_capabilities, bounded_dataset_detail, bounded_list_children,
-    bounded_resolve, bounded_search,
+    bounded_lineage, bounded_resolve, bounded_search, lineage_resource_key,
 )
 
 
@@ -172,6 +174,33 @@ def test_file_provider_distinguishes_placements_from_canonical_dataset_identity(
     assert [item.placement_id for item in cyclic.items] == ["container-b"]
 
 
+def test_file_provider_exact_revision_keeps_preview_rows(tmp_path, monkeypatch):
+    repo = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(repo / "examples" / "plugins"))
+    from dp_file_catalog_provider import FileCatalogDatasetAdapter, provider
+
+    root = tmp_path / "catalog"
+    root.mkdir()
+    (root / "observations.csv").write_text("id,value\n1,alpha\n2,beta\n")
+    (root / "catalog.json").write_text(json.dumps({"resources": [{
+        "placementId": "observations", "kind": "dataset",
+        "datasetId": "canonical-observations", "name": "observations",
+        "uri": "observations.csv", "revisionId": "revision-v1",
+        "columns": [{"name": "id", "type": "int"},
+                    {"name": "value", "type": "string"}],
+    }]}))
+    mount = CatalogMount(id="mount", provider="dp-file-catalog", config={"root": str(root)})
+    item = provider().list_children(mount, None, limit=10).items[0]
+
+    detail = FileCatalogDatasetAdapter().revision_detail(
+        item.uri or "", "revision-v1", preview_limit=100)
+
+    assert detail["row_count"] == 2
+    assert detail["preview_table"].to_pylist() == [
+        {"id": 1, "value": "alpha"}, {"id": 2, "value": "beta"},
+    ]
+
+
 def test_occurrence_contract_rejects_legacy_ids_and_conflicting_facts():
     with pytest.raises(ValueError, match="placementId"):
         CatalogResource.model_validate({
@@ -277,6 +306,189 @@ def test_bounded_helpers_enforce_requested_provider_identity():
     assert resolved.state == "unavailable" and resolved.failure == "provider_error"
     detailed = bounded_dataset_detail(MismatchedProvider(), mount, "requested-dataset")
     assert detailed.state == "unavailable" and detailed.failure == "provider_error"
+
+
+def test_provider_lineage_is_bounded_and_hides_physical_uris(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from hub import metadb, workspace_providers
+    from hub.main import app
+    from hub.models import LineageCardinality, LineageEdge, LineageNode, LineageResult
+
+    suffix = uuid.uuid4().hex
+    mount_id = f"lineage-mount-{suffix}"
+    source_binding_id = uuid.uuid4().hex
+    provider_dataset_id = f"dataset-{suffix}"
+    physical_root = f"s3://secret-bucket/{suffix}/raw_video_v2.lance"
+    physical_parent = f"s3://secret-bucket/{suffix}/raw_video_v1.lance"
+
+    class Provider:
+        def capabilities(self, _mount):
+            return ProviderCapabilities(search=True, lineage=True)
+
+        def search(self, _mount, query, *, limit, cursor=None):
+            assert query == "raw_video_v1" and limit == 100 and cursor is None
+            return ProviderSearchPage(items=[CatalogResource(
+                placement_id=f"placement-{suffix}",
+                kind="dataset",
+                name="raw_video_v1",
+                dataset_id=f"parent-{suffix}",
+                uri="fixture://opaque/provider-binding",
+                lineage_key=lineage_resource_key(mount_id, physical_parent),
+            )])
+
+        def lineage_resource(self, _mount, root_dataset_id, node_key, name):
+            assert root_dataset_id == provider_dataset_id
+            assert node_key == lineage_resource_key(mount_id, physical_parent)
+            assert name == "raw_video_v1"
+            return ProviderResourceResult(item=CatalogResource(
+                placement_id=f"lineage-{node_key}",
+                kind="dataset",
+                name=name,
+                dataset_id=f"lineage-{node_key}",
+                uri="fixture://opaque/provider-lineage-binding",
+                lineage_key=node_key,
+            ))
+
+        def list_children(self, *_args, **_kwargs):
+            return ProviderPage()
+
+        def resolve(self, *_args, **_kwargs):
+            return ProviderResourceResult(state="unavailable", failure="not_found")
+
+        def ancestors(self, *_args, **_kwargs):
+            return ProviderAncestors()
+
+        def dataset_detail(self, *_args, **_kwargs):
+            return ProviderDatasetDetailResult(state="unavailable", failure="not_found")
+
+        def lineage(self, _mount, dataset_id, *, depth, max_nodes):
+            assert dataset_id == provider_dataset_id
+            assert depth == 2 and max_nodes == 10
+            return LineageResult(
+                root_uri=physical_root,
+                nodes=[
+                    LineageNode(id=physical_parent, name="raw_video_v1", uri=physical_parent),
+                    LineageNode(id=physical_root, name="raw_video_v2", uri=physical_root),
+                ],
+                edges=[LineageEdge(
+                    parent=physical_parent,
+                    child=physical_root,
+                    fact_count=2,
+                    cardinality=LineageCardinality(value="1:N", evidence="measured"),
+                )],
+            )
+
+    provider = Provider()
+    bounded = bounded_lineage(
+        provider, CatalogMount(id=mount_id, provider="fixture"), provider_dataset_id,
+        depth=2, max_nodes=10,
+    )
+    assert bounded == ProviderLineageResult(item=provider.lineage(
+        CatalogMount(id=mount_id, provider="fixture"), provider_dataset_id,
+        depth=2, max_nodes=10,
+    ))
+
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id,
+        "provider": "fixture",
+        "config": {},
+    }]))
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    with metadb.session() as session:
+        session.add(metadb.WorkspaceProviderDataset(
+            mount_id=mount_id,
+            provider_dataset_id=provider_dataset_id,
+            provider="fixture",
+            source_binding_id=source_binding_id,
+            uri="fixture://hidden/provider-binding",
+            columns_doc="[]",
+            state="current",
+        ))
+    source_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    graph = workspace_providers.provider_dataset_lineage(
+        source_uri, depth=2, max_nodes=10)
+    serialized = graph.model_dump_json()
+    assert graph.root_uri == source_uri
+    assert graph.nodes[1].name == "raw_video_v2"
+    assert graph.edges[0].child == source_uri
+    assert graph.edges[0].cardinality == LineageCardinality(
+        value="1:N", evidence="measured")
+    assert "secret-bucket" not in serialized and suffix not in graph.nodes[0].uri
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/catalog/lineage",
+            params={"uri": source_uri, "depth": 2, "maxNodes": 10},
+        )
+    assert response.status_code == 200, response.text
+    routed = response.json()
+    assert routed["rootUri"] == source_uri
+    assert {node["name"] for node in routed["nodes"]} >= {
+        "raw_video_v1", "raw_video_v2",
+    }
+    assert routed["edges"][0]["cardinality"] == {
+        "value": "1:N", "evidence": "measured",
+    }
+    assert "secret-bucket" not in response.text
+
+    resolved = workspace_providers.resolve_provider_lineage_resource(
+        source_uri, graph.nodes[0].uri, "raw_video_v1", uid="local")
+    assert resolved["kind"] == "dataset" and resolved["name"] == "raw_video_v1"
+    assert "secret-bucket" not in json.dumps(resolved, default=str)
+
+    with TestClient(app) as client:
+        opened = client.get("/api/workspace/lineage/resolve", params={
+            "rootUri": source_uri,
+            "nodeUri": graph.nodes[0].uri,
+            "name": "raw_video_v1",
+        })
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["name"] == "raw_video_v1"
+    assert "secret-bucket" not in opened.text
+
+
+def test_lineage_merge_preserves_only_consistent_reported_cardinality():
+    from hub.models import LineageCardinality, LineageEdge, LineageNode, LineageResult
+    from hub.routers.catalog import _merge_lineage_graphs
+
+    root = "mem://root"
+    agreed = "mem://agreed"
+    conflicted = "mem://conflicted"
+    unknown = "mem://unknown"
+    nodes = [
+        LineageNode(id=uri, name=uri.removeprefix("mem://"), uri=uri)
+        for uri in (root, agreed, conflicted, unknown)
+    ]
+    declared = LineageResult(root_uri=root, nodes=nodes, edges=[
+        LineageEdge(
+            parent=root, child=agreed, fact_count=1,
+            cardinality=LineageCardinality(value="1:N", evidence="declared"),
+        ),
+        LineageEdge(
+            parent=root, child=conflicted, fact_count=1,
+            cardinality=LineageCardinality(value="1:1", evidence="declared"),
+        ),
+        LineageEdge(parent=root, child=unknown, fact_count=1),
+    ])
+    measured = LineageResult(root_uri=root, nodes=nodes, edges=[
+        LineageEdge(
+            parent=root, child=agreed, fact_count=2,
+            cardinality=LineageCardinality(value="1:N", evidence="measured"),
+        ),
+        LineageEdge(
+            parent=root, child=conflicted, fact_count=1,
+            cardinality=LineageCardinality(value="N:1", evidence="measured"),
+        ),
+    ])
+
+    merged = _merge_lineage_graphs(root, [declared, measured], max_nodes=10)
+    by_child = {edge.child: edge for edge in merged.edges}
+    assert by_child[agreed].fact_count == 3
+    assert by_child[agreed].cardinality == LineageCardinality(
+        value="1:N", evidence="measured")
+    assert by_child[conflicted].cardinality is None
+    assert by_child[unknown].cardinality is None
 
 
 def test_bounded_pages_reject_overlimit_and_nonadvancing_cursors():
@@ -700,6 +912,7 @@ with TestClient(app) as client:
     assert canonical_context["sourceBindingId"] == source_binding["sourceBindingId"]
     assert canonical_context["providerDatasetId"] == "dataset-a"
     assert canonical_context["datasetIdentity"].startswith("workspace-provider:")
+    assert canonical_context["sourceUri"].startswith("workspace-provider://")
     assert canonical_context["readMode"] == "exact"
     assert canonical_context["revisionId"] == "provider-dataset-a-v1"
     assert isinstance(canonical_context["committedAt"], str)
@@ -913,7 +1126,7 @@ with TestClient(app) as client:
         "graph": mutable_graph, "targetNodeId": mutable_source["id"], "confirmed": True,
     })
     assert rejected.status_code == 409, rejected.text
-    assert "mutable-only" in rejected.json()["detail"]
+    assert "cannot pin an exact version" in rejected.json()["detail"]
     assert os.environ["DP_CATALOG_MOUNTS"] not in json.dumps(graph)
     Path(os.environ["ACCEPTANCE_STATE"]).write_text(json.dumps({
         "canvas_id": canvas_id, "run_id": run_id, "source_id": source["id"],

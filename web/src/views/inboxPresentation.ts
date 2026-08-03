@@ -12,23 +12,24 @@ export function inboxOutcomeSummary(item: InboxItemDto): string {
   if (item.completedWrite) {
     return `“${item.completedWrite.outputName}” written · ${item.completedWrite.rowCount} rows`
   }
-  if (item.outcome === 'failed' && item.diagnosticCode) return item.diagnosticCode.replace(/_/g, ' ')
-  if (item.outcome === 'failed') return 'Work failed'
+  if (item.outcome === 'failed' && item.diagnosticCode === 'external_wait_deadline') return 'Timed out before completion'
+  if (item.outcome === 'failed' && item.diagnosticCode === 'stale_expected_head') return 'Dataset changed before this job finished'
+  if (item.outcome === 'failed') return 'Job failed'
   return item.outcome === 'cancelled' ? 'Cancelled before completion' : 'Finished successfully'
 }
 
 const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
-  managed_local_write: 'Managed local write',
-  external_wait: 'External wait',
-  linear_checkpoint_write: 'Checkpointed write',
-  bounded_fanout_write: 'Bounded fan-out write',
-  merge_columns_write: 'Merge columns write',
-  restore_revision_write: 'Dataset restore',
-  keyed_upsert_write: 'Keyed upsert',
+  managed_local_write: 'Write dataset',
+  external_wait: 'Wait',
+  linear_checkpoint_write: 'Checkpoint',
+  bounded_fanout_write: 'Batch write',
+  merge_columns_write: 'Merge columns',
+  restore_revision_write: 'Restore dataset',
+  keyed_upsert_write: 'Update dataset',
 }
 
 export function inboxKindLabel(kind: InboxItemDto['taskKind'] | string): string {
-  return TASK_KIND_LABELS[kind as InboxTaskKind] ?? `Unknown task type: ${kind}`
+  return TASK_KIND_LABELS[kind as InboxTaskKind] ?? 'Other job'
 }
 
 export function inboxRelativeTime(iso: string): string {

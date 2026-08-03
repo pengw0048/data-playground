@@ -1319,7 +1319,8 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
     canvas_id = f"canvas-{uuid.uuid4().hex}"
     with metadb.session() as session:
         session.add(metadb.Canvas(
-            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="refs", version=1, doc="{}"))
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="refs", version=1,
+            doc='{"resultRetention":{"history":"recent"}}'))
     monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 1)
     monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 1)
     run_id = f"run-{uuid.uuid4().hex}"
@@ -1439,7 +1440,8 @@ def test_failed_named_output_run_owns_committed_prefix_in_state_and_history():
     with metadb.session() as session:
         session.add(metadb.Canvas(
             id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
-            name="failed named output", version=1, doc="{}"))
+            name="failed named output", version=1,
+            doc='{"resultRetention":{"history":"recent"}}'))
     pending = RunStatus(
         run_id=run_id, status="running", target_node_id="section",
         outputs=[
@@ -2551,7 +2553,7 @@ def test_commit_crash_publish_lease_expires_and_secondary_pointers_fail_closed()
     with metadb.session() as session:
         session.add(metadb.Canvas(
             id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="commit crash",
-            version=1, doc="{}"))
+            version=1, doc='{"resultRetention":{"history":"recent"}}'))
     with pytest.raises(RuntimeError, match="only a published"):
         metadb.record_run(
             canvas_id, "n", "run", "done", rows=1,

@@ -41,7 +41,7 @@ function newSubmissionId(): string {
 
 function cleanError(caught: unknown): string {
   const message = caught instanceof Error ? caught.message : String(caught)
-  return message || 'Keyed upsert could not be admitted.'
+  return message || 'Keyed upsert could not be started.'
 }
 
 function submissionDefinitelyRejected(caught: unknown): boolean {
@@ -68,19 +68,24 @@ function requestFrom(intent: ResolvedIntent, submissionId: string): UpsertReques
   }
 }
 
-function EvidenceSummary({ evidence, base, expectedHead, keys, schema, eligible }: {
-  evidence: UpsertPreflight['evidence']; base: string; expectedHead: string; keys: string[]
+function EvidenceSummary({ evidence, keys, schema, eligible }: {
+  evidence: UpsertPreflight['evidence']; keys: string[]
   schema?: UpsertPreflight['outputSchema']; eligible?: boolean
 }) {
-  return <div aria-label="Upsert projection" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-    {eligible !== undefined && <div className="font-semibold text-foreground">{eligible ? 'Eligible keyed upsert' : 'Not eligible'}</div>}
-    <div className="mt-0.5 break-all font-mono">base {base}</div>
-    <div>Keys: <span className="font-mono">{keys.join(', ') || 'none'}</span></div>
+  return <div aria-label="Upsert check" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
+    {eligible !== undefined && <div className="font-semibold text-foreground">{eligible ? 'Ready to update' : 'Not ready to update'}</div>}
+    <div>Match rows by: <span className="font-mono">{keys.join(', ') || 'none'}</span></div>
     <div>{countLabel(evidence.matched)} matched · {countLabel(evidence.inserted)} inserted · {countLabel(evidence.unchanged)} unchanged</div>
     <div>{countLabel(evidence.rejected)} rejected · {countLabel(evidence.duplicate)} duplicate · {countLabel(evidence.conflict)} conflict</div>
-    <div>Expected head: <span className="font-mono">{expectedHead}</span></div>
-    {schema && <div>Output schema: {schema.length ? schema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'no fields'}</div>}
+    {schema && <div>Result columns: {schema.length ? schema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'no fields'}</div>}
   </div>
+}
+
+function taskStatus(status: UpsertTask['status']): string {
+  if (status === 'done') return 'Update complete'
+  if (status === 'failed') return 'Update failed'
+  if (status === 'cancelled') return 'Update cancelled'
+  return 'Update in progress'
 }
 
 /**
@@ -186,7 +191,7 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
     if (!intent) return
     const key = semanticKey(intent)
     if (!preflight?.eligible || preflightKey !== key) {
-      setError('Check the current exact upsert before running it.')
+      setError('Check the current upsert setup before running it.')
       return
     }
     const next = withSubmission()
@@ -278,21 +283,21 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
   const trackedTaskPending = !!config.taskId && !task
   const intentLocked = (busy !== null && busy !== 'preflight') || responseUnknown || trackedTaskPending || (!!task && !taskTerminal)
 
-  return <div aria-label="Certified keyed upsert" className="mt-3 rounded-md border border-border bg-muted/30 p-2">
-    <div className="font-semibold text-[11px] text-foreground">Keyed upsert</div>
+  return <div aria-label="Keyed upsert setup" className="mt-3 rounded-md border border-border bg-muted/30 p-2">
+    <div className="font-semibold text-[11px] text-foreground">Update dataset</div>
     {!intent
-      ? <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Available for one exact managed-local Source feeding a managed-local-file destination that already has a head.</div>
-      : <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Update rows matched by the keys and insert new keys. Preflight proves key validity and the current head.</div>}
+      ? <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Connect one saved dataset to a destination that already has data.</div>
+      : null}
     {intent && <label className="mt-2 block text-[10.5px] text-muted-foreground">Key columns
       <input aria-label="Upsert key columns" value={(config.keys ?? []).join(', ')} disabled={!canEdit || intentLocked}
         onChange={(event) => changeKeys(event.target.value)} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
     </label>}
 
-    {preflight && <EvidenceSummary evidence={preflight.evidence} base={`${preflight.base.datasetId}@${preflight.base.revisionId}`}
-      expectedHead={preflight.expectedHead.revisionId} keys={preflight.keys} schema={preflight.outputSchema} eligible={preflight.eligible} />}
+    {preflight && <EvidenceSummary evidence={preflight.evidence} keys={preflight.keys}
+      schema={preflight.outputSchema} eligible={preflight.eligible} />}
 
     {task && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-      <div className="font-semibold text-foreground">{task.status}{task.diagnosticCode ? ` · ${task.diagnosticCode.replaceAll('_', ' ')}` : ''}</div>
+      <div className="font-semibold text-foreground">{taskStatus(task.status)}{task.diagnosticCode === 'stale_expected_head' ? ' · dataset changed' : ''}</div>
       {task.evidence && <div className="mt-0.5">{countLabel(task.evidence.matched)} matched · {countLabel(task.evidence.inserted)} inserted · {countLabel(task.evidence.unchanged)} unchanged</div>}
       {(task.canCancel || task.canRetry) && <div className="mt-1 flex gap-1">
         {task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}
@@ -305,21 +310,21 @@ export function UpsertControl({ nodeId }: { nodeId: string }) {
     </div>}
 
     {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
-      <div className="font-semibold text-foreground">Tracked durable Task</div>
-      <div className="mt-0.5">Its current state is loading or temporarily unavailable. This is not treated as a new admission.</div>
+      <div className="font-semibold text-foreground">Submitted job</div>
+      <div className="mt-0.5">Its current state is loading or temporarily unavailable. This does not start a new setup.</div>
     </div>}
     {responseUnknown && !recoveryAvailable && <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">Previous submission outcome is unresolved</div>
-      <div className="mt-0.5">The intent changed after submission. A second admission is blocked; undo those edits to recover the same submission, or start a new admission.</div>
+      <div className="mt-0.5">The setup changed after submission. A second run is blocked; undo those edits to recover the same submission, or start a new setup.</div>
     </div>}
-    {staleHead && <div className="mt-2 text-[10px] text-muted-foreground">The destination moved. Nothing was rebased and this never retries automatically; start a new admission against the current head.</div>}
+    {staleHead && <div className="mt-2 text-[10px] text-muted-foreground">The destination has a newer version. Nothing changed automatically; start a new setup using the current version.</div>}
     {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error}</div>}
 
     <div className="mt-2 flex gap-1">
-      {intent && !task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null || !config.keys?.length}>{busy === 'preflight' ? 'Checking…' : 'Check eligibility'}</Button>}
-      {intent && !task && !config.taskId && !responseUnknown && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentSemanticKey}>{busy === 'submit' ? 'Submitting…' : 'Run keyed upsert'}</Button>}
+      {intent && !task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null || !config.keys?.length}>{busy === 'preflight' ? 'Checking…' : 'Check setup'}</Button>}
+      {intent && !task && !config.taskId && !responseUnknown && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentSemanticKey}>{busy === 'submit' ? 'Updating…' : 'Update dataset'}</Button>}
       {recoveryAvailable && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void recover()} disabled={!canEdit || busy !== null}>{busy === 'submit' ? 'Recovering…' : 'Recover previous submission'}</Button>}
-      {(taskTerminal || staleHead) && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Start new admission</Button>}
+      {(taskTerminal || staleHead) && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Start new setup</Button>}
     </div>
   </div>
 }

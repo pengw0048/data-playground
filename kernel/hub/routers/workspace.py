@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-from typing import Any, Callable, Hashable, Literal, TypeVar
+from typing import Annotated, Any, Callable, Hashable, Literal, TypeVar
 from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Path, Query, Request, Response
@@ -41,6 +41,7 @@ from hub.models import (
     WorkspaceBrowsePage,
     WorkspaceCanonicalDatasetContext,
     WorkspaceProviderSource,
+    WorkspaceResource,
     WorkspaceResourceResolution,
     WorkspaceProviderRelinkRequest,
     WorkspaceProviderRelinkResult,
@@ -368,6 +369,8 @@ def _require_admin(uid: str) -> None:
 
 def _create_user_work(body: UserBody, uid: str) -> dict:
     _require_admin(uid)
+    if auth.auth_enabled() and body.password is None:
+        raise HTTPException(400, "password is required when authentication is enabled")
     if body.password is not None and len(body.password) < 6:
         raise HTTPException(400, "password must be at least 6 characters")
     password_hash = auth.hash_password(body.password) if body.password is not None else None
@@ -444,6 +447,36 @@ class WorkspaceMoveCanvasBody(_StrictAuthBody):
     expected_version: int = Field(ge=1)
 
 
+class WorkspaceBatchItem(_StrictAuthBody):
+    placement_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
+    expected_canvas_version: int | None = Field(default=None, ge=1)
+
+
+class WorkspaceBatchBody(_StrictAuthBody):
+    action: Literal["delete_canvases", "move"]
+    items: list[WorkspaceBatchItem] = Field(min_length=1, max_length=50)
+    container_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_container_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _destination_matches_action(self) -> "WorkspaceBatchBody":
+        destination_supplied = (
+            self.container_id is not None or self.expected_container_version is not None)
+        if self.action == "move" and (
+                self.container_id is None or self.expected_container_version is None):
+            raise ValueError("Workspace batch move requires a versioned destination")
+        if self.action == "delete_canvases" and destination_supplied:
+            raise ValueError("Workspace batch delete does not accept a destination")
+        if self.action == "delete_canvases" and any(
+                item.expected_canvas_version is None for item in self.items):
+            raise ValueError("Workspace batch delete requires each Canvas document version")
+        placement_ids = [item.placement_id for item in self.items]
+        if len(placement_ids) != len(set(placement_ids)):
+            raise ValueError("Workspace batch contains a duplicate placement")
+        return self
+
+
 class WorkspaceCreateFolderBody(_StrictAuthBody):
     parent_id: str = Field(min_length=1, max_length=128)
     expected_parent_version: int = Field(ge=1)
@@ -457,6 +490,10 @@ class WorkspaceRenameFolderBody(_StrictAuthBody):
 
 
 class WorkspaceDeleteFolderBody(_StrictAuthBody):
+    expected_version: int = Field(ge=1)
+
+
+class WorkspaceDeletePlacementBody(_StrictAuthBody):
     expected_version: int = Field(ge=1)
 
 
@@ -692,18 +729,18 @@ def _provider_dataset_sources(refs: list[str], uid: str) -> list[dict]:
 def _provider_dataset_action_error(exc: Exception) -> None:
     if isinstance(exc, workspace_providers.ProviderDatasetGone):
         raise APIError(
-            410, "provider dataset was deleted; relink it explicitly",
+            410, "This data source was deleted. Link it again to keep using it.",
             code=APIErrorCode.RESOURCE_GONE, retryable=False,
         ) from exc
     if isinstance(exc, workspace_providers.ProviderDatasetOffline):
         raise APIError(
-            503, "provider dataset is offline",
+            503, "This data source is offline. Try again once it is reachable.",
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
         ) from exc
     if isinstance(exc, workspace_providers.ProviderDatasetUnavailable):
         raise APIError(
-            409, ("provider dataset binding is unavailable; install or restore a compatible "
-                  "provider and dataset adapter"),
+            409, ("This data source is unavailable because its plugin is missing. Install or "
+                  "restore the plugin, then try again."),
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
     _workspace_action_error(exc)
@@ -718,10 +755,54 @@ def _exact_transform_descriptor(processor_id: str, version: str) -> dict:
 
 
 @router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
-def browse_workspace_container(container_id: str, limit: int = 50, cursor: str | None = None,
-                               uid: str = Depends(current_user)) -> dict:
-    """One bounded mixed Workspace page across local and configured read-only provider sources."""
+def browse_workspace_container(
+        container_id: str,
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=4096),
+        source: Literal["local", "provider"] | None = Query(default=None),
+        sort: Literal["name", "updated"] | None = Query(default=None),
+        order: Literal["asc", "desc"] = Query(default="asc"),
+        kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
+        = Query(default=[]),
+        uid: str = Depends(current_user),
+) -> dict:
+    """One bounded local, connected-source, or legacy mixed Workspace page."""
     try:
+        query_requested = sort is not None or order != "asc" or bool(kind)
+        connected_source = workspace_providers.is_connected_source_container(container_id)
+        if source == "local":
+            if connected_source:
+                raise ValueError("A connected source cannot be browsed as local Workspace data.")
+            return workspace_providers.browse_local_source(
+                container_id,
+                uid=uid,
+                limit=limit,
+                cursor=cursor,
+                sort=sort,
+                order=order,
+                kinds=set(kind) or None,
+            )
+        if source == "provider":
+            if not connected_source:
+                raise ValueError(
+                    "Choose a connected source before browsing provider data.")
+            if query_requested:
+                raise ValueError(
+                    "This connected source controls its own order. "
+                    "Workspace sort and type filters are unavailable.")
+            return workspace_providers.browse_connected_source(
+                container_id, uid=uid, limit=limit, cursor=cursor)
+        if query_requested:
+            if (container_id.startswith("external.") or connected_source
+                    or workspace_providers.is_configured_mount_container(container_id)):
+                raise ValueError(
+                    "This folder includes a mounted data source that controls its own order. "
+                    "Sort and type filters are available in local folders.")
+            return workspace_providers.browse_local_source(
+                container_id, uid=uid, limit=limit, cursor=cursor,
+                sort=sort or "name", order=order, kinds=set(kind) or None,
+                bind_cursor=False,
+            )
         return workspace_providers.browse(
             container_id, uid=uid, limit=limit, cursor=cursor)
     except KeyError as exc:
@@ -768,6 +849,28 @@ def canonical_workspace_provider_dataset(
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
 
 
+@router.get("/workspace/lineage/resolve", response_model=WorkspaceResource)
+def resolve_workspace_lineage_resource(
+        root_uri: str = Query(..., alias="rootUri", max_length=1024),
+        node_uri: str = Query(..., alias="nodeUri", max_length=128),
+        name: str = Query(..., max_length=512),
+        uid: str = Depends(current_user)) -> dict:
+    """Open one clicked provider-lineage node as an ordinary Workspace dataset."""
+    try:
+        return workspace_providers.resolve_provider_lineage_resource(
+            root_uri, node_uri, name, uid=uid)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except workspace_providers.ProviderDatasetLineageUnsupported as exc:
+        raise HTTPException(501, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 @router.get(
     "/workspace/resources/{resource_id}/source",
     response_model=WorkspaceProviderSource,
@@ -796,6 +899,57 @@ def workspace_provider_source(
     except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
         _provider_dataset_action_error(exc)
         raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
+
+
+@router.delete("/workspace/resources/{resource_id}/provider-dataset")
+def remove_workspace_provider_dataset(
+    resource_id: str,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Remove one exact connected-source dataset when that provider declares write support."""
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
+
+    try:
+        result = workspace_providers.delete_provider_dataset(
+            resource_id, uid=uid, actor=uid)
+    except PermissionError as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.DENIED,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(403, str(exc)) from exc
+    except workspace_providers.ProviderDatasetMutationUnsupported as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.DENIED,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(501, str(exc)) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(404, str(exc)) from exc
+    except workspace_providers.ProviderDatasetOffline as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(503, str(exc)) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        emit_audit(
+            AuditAction.DATASET_MUTATION, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_dataset",
+        )
+        raise HTTPException(409, str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    emit_audit(
+        AuditAction.DATASET_MUTATION, AuditOutcome.SUCCESS,
+        principal_id=uid, resource_type="workspace_provider_dataset",
+        attrs={"operation": "provider_remove"},
+    )
+    return result
 
 
 @router.post(
@@ -1002,6 +1156,37 @@ def move_workspace_canvas(placement_id: str, body: WorkspaceMoveCanvasBody,
         _workspace_action_error(exc)
 
 
+@router.delete("/workspace/placements/{placement_id}/detached-dataset")
+def delete_detached_workspace_dataset(
+        placement_id: str, body: WorkspaceDeletePlacementBody,
+        uid: str = Depends(current_user)) -> dict:
+    """Remove only a stale local Dataset shortcut after its Catalog registration is gone."""
+    del uid  # Local placement authority is installation-local; authentication is the guard.
+    try:
+        return metadb.workspace_delete_detached_dataset_placement(
+            placement_id, expected_version=body.expected_version)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.post("/workspace/batch")
+def mutate_workspace_batch(body: WorkspaceBatchBody,
+                           uid: str = Depends(current_user)) -> dict:
+    """Atomically validate and apply one bounded Canvas delete or move selection."""
+    try:
+        return metadb.workspace_batch_action(
+            uid=uid,
+            action=body.action,
+            items=[item.model_dump(by_alias=True) for item in body.items],
+            container_id=body.container_id,
+            expected_container_version=body.expected_container_version,
+        )
+    except metadb.ActiveBackendJobsError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
 @router.post("/workspace/folders")
 def create_workspace_folder(body: WorkspaceCreateFolderBody,
                             uid: str = Depends(current_user)) -> dict:
@@ -1189,7 +1374,14 @@ def _validate_canvas_execution_contract(doc: dict) -> None:
 
 
 @router.post("/canvas")
-def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
+def create_canvas(
+        doc: dict,
+        beside_canvas_id: Annotated[
+            str | None,
+            Query(alias="besideCanvasId", min_length=1, max_length=256),
+        ] = None,
+        uid: str = Depends(current_user),
+) -> dict:
     # The route owns persisted identity. Raw clients may omit these fields or submit stale values;
     # neither should leak into the document later returned to every other Canvas consumer.
     cid = doc.get("id") or metadb._uid()
@@ -1199,45 +1391,81 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
         metadb.require_promoted_transform_use(uid, persisted_doc)
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
-    with metadb.session() as s:
-        # honor the client's id so the canvas exists under it immediately (no orphan row, and
-        # sharing/opening works without waiting for the first autosave to PUT it).
-        values = {
-            "id": cid,
-            "owner_id": uid,
-            "name": persisted_doc.get("name") or "untitled",
-            "version": 1,
-            "doc": json.dumps(persisted_doc),
-        }
-        dialect = s.get_bind().dialect.name
-        if dialect == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert as dialect_insert
-        elif dialect == "sqlite":
-            from sqlalchemy.dialects.sqlite import insert as dialect_insert
-        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
-            raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
-        # The insert itself is the ownership decision. A prior read plus INSERT would race another
-        # creator, while RETURNING proves this transaction inserted the row. Clients may only clean up
-        # a cancelled import after receiving this positive evidence; an existing ID is never theirs.
-        inserted_id = s.scalar(dialect_insert(metadb.Canvas).values(**values)
-                               .on_conflict_do_nothing(index_elements=[metadb.Canvas.id])
-                               .returning(metadb.Canvas.id))
-        created = inserted_id is not None
-        if created:
-            # Materialize the durable owner row before the local-result registry lock.  Autoflush is
-            # deliberately disabled inside that lock so every ownership path has one global order.
-            s.flush()
-            metadb.sync_local_result_owner(s, "canvas", cid, persisted_doc)
-            metadb._replace_promoted_transform_refs(s, "canvas", cid, persisted_doc)
-        metadb._workspace_ensure_root_placement_in_session(
-            s, target_kind="canvas", target_id=cid, name=values["name"])
-        canvas = s.get(metadb.Canvas, cid)
-        return {
-            "ok": True,
-            "id": cid,
-            "version": canvas.version if canvas is not None else 1,
-            "created": created,
-        }
+    try:
+        # A sibling-selected destination is a Workspace write, so share the same hierarchy lock and
+        # tombstone validation as create/move. A rejected destination rolls back the whole create.
+        with metadb._workspace_write_session() as s:
+            # honor the client's id so the canvas exists under it immediately (no orphan row, and
+            # sharing/opening works without waiting for the first autosave to PUT it).
+            values = {
+                "id": cid,
+                "owner_id": uid,
+                "name": persisted_doc.get("name") or "untitled",
+                "version": 1,
+                "doc": json.dumps(persisted_doc),
+            }
+            dialect = s.get_bind().dialect.name
+            if dialect == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as dialect_insert
+            elif dialect == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as dialect_insert
+            else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+                raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+            # The insert itself is the ownership decision. A prior read plus INSERT would race another
+            # creator, while RETURNING proves this transaction inserted the row. Clients may only clean up
+            # a cancelled import after receiving this positive evidence; an existing ID is never theirs.
+            inserted_id = s.scalar(dialect_insert(metadb.Canvas).values(**values)
+                                   .on_conflict_do_nothing(index_elements=[metadb.Canvas.id])
+                                   .returning(metadb.Canvas.id))
+            created = inserted_id is not None
+            if created:
+                placement_container_id = metadb.LOCAL_WORKSPACE_ROOT_ID
+                if beside_canvas_id is not None:
+                    source_canvas = s.get(
+                        metadb.Canvas, beside_canvas_id, with_for_update=True)
+                    if (source_canvas is None
+                            or metadb._workspace_canvas_role_in_session(
+                                s, source_canvas, uid) is None):
+                        raise APIError(
+                            404,
+                            f"canvas '{beside_canvas_id}' not found",
+                            code=APIErrorCode.CANVAS_NOT_FOUND,
+                            retryable=False,
+                        )
+                    source_placement = s.scalar(_sa_select(metadb.WorkspacePlacement).where(
+                        metadb.WorkspacePlacement.target_kind == "canvas",
+                        metadb.WorkspacePlacement.target_id == beside_canvas_id,
+                    ).limit(1).with_for_update())
+                    if source_placement is not None:
+                        placement_container_id = source_placement.container_id
+                metadb._workspace_writable_destination_locked(s, placement_container_id)
+                # Materialize the durable owner row before the local-result registry lock.  Autoflush is
+                # deliberately disabled inside that lock so every ownership path has one global order.
+                s.flush()
+                metadb.sync_local_result_owner(s, "canvas", cid, persisted_doc)
+                metadb._replace_promoted_transform_refs(s, "canvas", cid, persisted_doc)
+            if created:
+                metadb._workspace_ensure_placement_in_session(
+                    s,
+                    container_id=placement_container_id,
+                    target_kind="canvas",
+                    target_id=cid,
+                    name=values["name"],
+                )
+            else:
+                # A collision is not evidence that this request owns the existing Canvas. Preserve the
+                # old repair-only behavior without using a caller-selected sibling to move an orphan.
+                metadb._workspace_ensure_root_placement_in_session(
+                    s, target_kind="canvas", target_id=cid, name=values["name"])
+            canvas = s.get(metadb.Canvas, cid)
+            return {
+                "ok": True,
+                "id": cid,
+                "version": canvas.version if canvas is not None else 1,
+                "created": created,
+            }
+    except (KeyError, ValueError) as exc:
+        _workspace_action_error(exc)
 
 
 @router.get("/canvas/{canvas_id}")
@@ -1472,11 +1700,18 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
 
 @router.delete("/canvas/{canvas_id}")
 def delete_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
-    if metadb.canvas_role(canvas_id, uid) == "owner":  # only the owner can delete
-        try:
-            metadb.delete_canvas_cascade(canvas_id)  # also drop shares + run history + versions (no FK cascade)
-        except metadb.ActiveBackendJobsError as e:
-            raise HTTPException(409, str(e))
+    try:
+        # Share one transaction and the Workspace root-first lock order with batch delete/move.
+        # Otherwise a concurrent placement mutation can deadlock against Canvas-first cascade locks,
+        # and a role checked in an earlier session can become stale before deletion.
+        with metadb._workspace_write_session() as s:
+            canvas = s.get(metadb.Canvas, canvas_id, with_for_update=True)
+            if (canvas is not None
+                    and metadb._workspace_canvas_role_in_session(s, canvas, uid) == "owner"):
+                # Also drops shares, run history, versions, and the Workspace placement.
+                metadb.delete_canvas_cascade(canvas_id, db_session=s)
+    except metadb.ActiveBackendJobsError as e:
+        raise HTTPException(409, str(e)) from e
     return {"ok": True}
 
 
@@ -1554,6 +1789,7 @@ def execution_manifest_detail(
 def workspace_jobs(
         limit: int = Query(default=50, ge=1, le=100),
         cursor: str | None = Query(default=None, max_length=4096),
+        scope: Literal["mine", "all"] = Query(default="mine"),
         status: Literal["queued", "running", "done", "failed", "cancelled"] | None = None,
         canvas_id: str | None = Query(default=None, max_length=512),
         node_id: str | None = Query(default=None, max_length=256),
@@ -1575,6 +1811,7 @@ def workspace_jobs(
             uid, limit=limit, cursor=cursor, status=status,
             canvas_id=canvas_id, node_id=node_id, run_id=run_id, backend=backend,
             recorded_after=after, recorded_before=before, text=q,
+            owned_only=(scope == "mine"),
         )
         return WorkspaceRunPage.model_validate(page)
     except ValueError as exc:
@@ -1738,6 +1975,16 @@ def _prepare_setting_changes(
         if change.key in _REMOVED_CREDENTIAL_SETTINGS:
             raise HTTPException(400, _REMOVED_CREDENTIAL_SETTINGS[change.key])
         value = change.value
+        if change.key == "canvasResultRetention":
+            if change.scope != "global":
+                raise HTTPException(400, "canvasResultRetention is a workspace setting")
+            if (not isinstance(value, dict)
+                    or set(value) != {"history"}
+                    or value.get("history") not in ("latest", "recent")):
+                raise HTTPException(
+                    400,
+                    "canvasResultRetention.history must be 'latest' or 'recent'",
+                )
         is_secret = change.scope == "global" and change.key in plugin_secrets
         if is_secret:
             try:

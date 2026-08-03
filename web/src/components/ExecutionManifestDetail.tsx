@@ -21,10 +21,10 @@ const availabilityLabel: Record<ExecutionManifestAvailability, string> = {
 }
 
 const availabilityMessage: Record<Exclude<ExecutionManifestAvailability, 'available'>, string> = {
-  pruned: 'The retained manifest document was pruned. Live Canvas state was not substituted.',
+  pruned: 'The saved run record is no longer available. Live Canvas state was not substituted.',
   not_recorded: 'This legacy or summary-only item did not record an execution manifest.',
   unavailable: 'The manifest subject or its schema is unavailable. Live Canvas and current plugin state were not substituted.',
-  corrupt: 'The retained manifest failed integrity or secret-safety validation and was not returned.',
+  corrupt: 'The saved run record could not be safely opened and was not returned.',
 }
 
 export function ExecutionManifestDetail({
@@ -70,19 +70,19 @@ export function ExecutionManifestDetail({
   const digest = detail?.sha256 ?? summary.executionManifestSha256
   const schemaVersion = detail?.schemaVersion ?? summary.executionManifestSchemaVersion
 
-  return <section aria-label={`Execution manifest for ${subjectId}`} className="border-t border-border bg-muted/20">
+  return <section aria-label={`Saved run setup for ${subjectId}`} className="border-t border-border bg-muted/20">
     <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
       className="flex w-full items-center gap-2 px-4 py-2 text-left text-[11px] hover:bg-muted/40">
       <span className="text-muted-foreground">{open ? '▾' : '▸'}</span>
-      <span className="font-semibold text-foreground">Execution manifest</span>
+      <span className="font-semibold text-foreground">Saved run setup</span>
       {schemaVersion != null && <Badge variant="outline" className="h-5 px-1.5 text-[9px]">v{schemaVersion}</Badge>}
       <Badge variant="secondary" className="h-5 px-1.5 text-[9px]">{availabilityLabel[activeAvailability]}</Badge>
     </button>
     {open && <div className="grid gap-3 border-t border-border/60 px-4 py-3 text-[10.5px]">
       {digest && <div><strong>Digest:</strong> <span className="dp-mono break-all">{digest}</span></div>}
-      {!detail && !error && <div role="status" className="text-muted-foreground">Loading the retained manifest…</div>}
+      {!detail && !error && <div role="status" className="text-muted-foreground">Loading the saved run record…</div>}
       {error && <div role="alert" className="text-destructive">
-        Couldn’t inspect the retained manifest: {error}{' '}
+        Couldn’t inspect the saved run record: {error}{' '}
         <button type="button" className="font-semibold underline" onClick={() => setGeneration((value) => value + 1)}>Retry</button>
       </div>}
       {detail && detail.availability !== 'available' && (

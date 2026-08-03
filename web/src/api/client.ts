@@ -3,10 +3,10 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogExampleSourceResolveResponse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, InstalledProcessorSource, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
-  CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasCopyValidation, CanvasResultRecovery, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
-  WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResource, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
@@ -117,6 +117,8 @@ function toGraph(doc: CanvasDoc) {
   return {
     id: doc.id,
     version: doc.version,
+    executionBackend: doc.executionBackend ?? null,
+    resultRetention: doc.resultRetention ?? { history: 'inherit' },
     requirements: doc.requirements ?? [],  // the canvas's declared pip deps → the kernel installs them
     parameters: doc.parameters ?? [],
     nodes: dataNodes.map((n) => ({
@@ -284,16 +286,31 @@ export const api = {
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`, {
       signal: options?.signal,
     }),
-  workspaceBrowse: (containerId: string, params?: { cursor?: string; limit?: number }) => {
+  workspaceBrowse: (containerId: string, params?: {
+    cursor?: string
+    limit?: number
+    source?: 'local' | 'provider'
+    sort?: 'name' | 'updated'
+    order?: 'asc' | 'desc'
+    kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
+  }) => {
     const query = new URLSearchParams()
     if (params?.cursor) query.set('cursor', params.cursor)
     if (params?.limit) query.set('limit', String(params.limit))
+    if (params?.source) query.set('source', params.source)
+    if (params?.sort) query.set('sort', params.sort)
+    if (params?.order) query.set('order', params.order)
+    for (const kind of params?.kinds ?? []) query.append('kind', kind)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
   workspaceResource: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`, {
       signal: options?.signal,
     }),
+  workspaceLineageResource: (params: { rootUri: string; nodeUri: string; name: string }) => {
+    const query = new URLSearchParams(params)
+    return req<WorkspaceResource>(`/workspace/lineage/resolve?${query}`)
+  },
   workspaceCanonicalDataset: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceCanonicalDatasetContext>(
       `/workspace/resources/${encodeURIComponent(resourceId)}/canonical-dataset`,
@@ -332,6 +349,23 @@ export const api = {
     req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+  workspaceRemoveDetachedDataset: (placementId: string, body: { expectedVersion: number }) =>
+    req<{ ok: boolean; placementId: string }>(
+      `/workspace/placements/${encodeURIComponent(placementId)}/detached-dataset`, {
+        method: 'DELETE', body: JSON.stringify(body),
+      }),
+  workspaceBatch: (body: {
+    action: 'delete_canvases' | 'move'
+    items: Array<{ placementId: string; expectedVersion: number; expectedCanvasVersion?: number }>
+    containerId?: string
+    expectedContainerVersion?: number
+  }) => req<{
+    ok: boolean
+    action: 'delete_canvases' | 'move'
+    items: WorkspaceResource[]
+    deletedCanvasIds?: string[]
+    container?: WorkspaceResource
+  }>('/workspace/batch', { method: 'POST', body: JSON.stringify(body) }),
   workspaceCreateFolder: (body: { parentId: string; expectedParentVersion: number; name: string; requestId: string }) =>
     req<WorkspaceFolderActionResult>('/workspace/folders', { method: 'POST', body: JSON.stringify(body) }),
   workspaceRenameFolder: (containerId: string, body: { expectedVersion: number; name: string }) =>
@@ -422,8 +456,18 @@ export const api = {
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/edit`, { method: 'PUT', body: JSON.stringify(edit) }),
-  unregisterTable: (id: string, expectedRegistrationId: string, expectedRevision: string) => req<{ ok: boolean }>(
-    `/catalog/tables/${encodeURIComponent(id)}?${new URLSearchParams({ expected_registration_id: expectedRegistrationId, expected_revision: expectedRevision })}`,
+  unregisterTable: (id: string, expectedRegistrationId: string, expectedRevision: string, deleteSource = false) => req<{
+    ok: boolean; sourceDeleted?: boolean; sourceMissing?: boolean; warning?: string | null
+  }>(
+    `/catalog/tables/${encodeURIComponent(id)}?${new URLSearchParams({
+      expected_registration_id: expectedRegistrationId,
+      expected_revision: expectedRevision,
+      ...(deleteSource ? { delete_source: 'true' } : {}),
+    })}`,
+    { method: 'DELETE' },
+  ),
+  removeProviderDataset: (resourceId: string) => req<{ ok: boolean; removedFrom: string }>(
+    `/workspace/resources/${encodeURIComponent(resourceId)}/provider-dataset`,
     { method: 'DELETE' },
   ),
   unregisterTables: (targets: { id: string; expectedRegistrationId: string; expectedRevision: string }[]) =>
@@ -445,6 +489,9 @@ export const api = {
     body: JSON.stringify({
       graph: toGraph(doc), nodeId, portId, parameterBindings,
     }),
+  }),
+  currentResults: (doc: CanvasDoc) => req<CanvasResultRecovery>('/run/current-results', {
+    method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }),
   }),
   retainedEditorPreview: (
     doc: CanvasDoc, nodeId: string, k = 50, offset = 0,
@@ -718,10 +765,12 @@ export const api = {
   // per-user canvases (multi-file)
   listCanvases: () => req<CanvasFile[]>('/canvas'),
   getCanvas: (id: string) => req<CanvasDoc>(`/canvas/${id}`),
-  createCanvas: (doc: CanvasDoc) =>
-    req<{ ok: boolean; id: string; created: boolean }>('/canvas', {
+  createCanvas: (doc: CanvasDoc, options?: { besideCanvasId?: string }) =>
+    req<{ ok: boolean; id: string; created: boolean }>(
+      `/canvas${options?.besideCanvasId ? `?besideCanvasId=${encodeURIComponent(options.besideCanvasId)}` : ''}`, {
       method: 'POST', body: JSON.stringify(doc),
-    }),
+      },
+    ),
   saveCanvas: (doc: CanvasDoc, keepalive = false, expectedVersion?: number) => {  // keepalive: let the PUT survive a tab-close flush
     const query = expectedVersion == null ? '' : `?expectedVersion=${encodeURIComponent(expectedVersion)}`
     return req<{ ok: boolean; id: string; version: number }>(`/canvas/${doc.id}${query}`, {
@@ -751,6 +800,7 @@ export const api = {
     const query = new URLSearchParams()
     if (params.limit != null) query.set('limit', String(params.limit))
     if (params.cursor) query.set('cursor', params.cursor)
+    if (params.scope && params.scope !== 'mine') query.set('scope', params.scope)
     if (params.status) query.set('status', params.status)
     if (params.canvasId) query.set('canvas_id', params.canvasId)
     if (params.nodeId) query.set('node_id', params.nodeId)
@@ -845,9 +895,9 @@ export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
 export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write'
 export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; revisionId?: string | null; name?: string | null; deepLink?: string | null }
-export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
+export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; createdById?: string | null; createdByName?: string | null; isMine?: boolean; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
-export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
+export interface WorkspaceJobsQuery { limit?: number; cursor?: string; scope?: 'mine' | 'all'; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {
   id: string
   taskId: string

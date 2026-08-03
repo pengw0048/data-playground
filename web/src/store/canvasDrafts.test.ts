@@ -56,6 +56,19 @@ describe('principal-scoped Canvas draft storage', () => {
     expect(readCanvasDrafts('alice').drafts).toMatchObject([{ draftId: 'a', name: 'renamed' }])
   })
 
+  it('round-trips an optional placement hint while keeping older records readable', () => {
+    const legacy = draft('alice', 'legacy', 1)
+    const placed = { ...draft('alice', 'placed', 2), besideCanvasId: 'folder-neighbor' }
+    expect(writeCanvasDraft(legacy).ok).toBe(true)
+    expect(writeCanvasDraft(placed).ok).toBe(true)
+
+    const recovered = readCanvasDrafts('alice').drafts
+    expect(recovered.find((item) => item.draftId === 'placed')).toMatchObject({
+      besideCanvasId: 'folder-neighbor',
+    })
+    expect(recovered.find((item) => item.draftId === 'legacy')).not.toHaveProperty('besideCanvasId')
+  })
+
   it('enforces a visible bound without evicting an existing draft', () => {
     for (let index = 0; index < MAX_LOCAL_CANVAS_DRAFTS; index += 1) {
       expect(writeCanvasDraft(draft('alice', `draft-${index}`, index)).ok).toBe(true)
@@ -79,7 +92,7 @@ describe('principal-scoped Canvas draft storage', () => {
     expect(result.errors[0]).toContain('corrupt')
   })
 
-  it('skips malformed index identities while retaining unrelated drafts', () => {
+  it('skips malformed draft references while retaining unrelated drafts', () => {
     writeCanvasDraft(draft('alice', 'good', 1))
     const indexKey = Array.from(values.keys()).find((key) => key.includes('dp-canvas-drafts-v1'))!
     values.set(indexKey, JSON.stringify({ version: 1, ids: ['good', '', 7] }))
@@ -88,7 +101,7 @@ describe('principal-scoped Canvas draft storage', () => {
 
     expect(result.drafts.map((item) => item.draftId)).toEqual(['good'])
     expect(result.errors).toHaveLength(2)
-    expect(result.errors.every((error) => error.includes('identity'))).toBe(true)
+    expect(result.errors.every((error) => error.includes('saved Canvas draft') && error.includes('reference'))).toBe(true)
   })
 
   it('reports quota failure and does not add an unreachable index entry', () => {

@@ -8,7 +8,7 @@ import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
 import type { ProcessorMode } from '../types/graph'
 import type { InstalledProcessorSource, ProcessorDescriptor } from '../types/api'
-import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
+import { configuredProcessorRef, exactProcessor, processorModeLabel } from '../nodes/processorIdentity'
 import { api } from '../api/client'
 import {
   EDITOR_EXAMPLE_MAX_BYTES,
@@ -378,7 +378,7 @@ export function CodeFullscreen() {
           <span className="text-[12.5px] text-muted-foreground">
             {isLibrary ? '· Library processor' : `· ${fs.param} · ${language}`}
           </span>
-          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${libraryDescriptor ? `${libraryDescriptor.title} ${libraryDescriptor.version}` : `${configuredRef ?? 'unconfigured library transform'} (exact reference)`}` : ''}</span>}
+          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${libraryDescriptor ? `${libraryDescriptor.title} ${libraryDescriptor.version}` : `${configuredRef ?? 'unconfigured library transform'} (selected version)`}` : ''}</span>}
           <span className="flex-1" />
           <button onClick={close} aria-label="Close" title="Close (Esc)"
             className="grid h-[26px] w-7 place-items-center rounded-md border-0 bg-transparent text-muted-foreground hover:text-foreground">
@@ -671,14 +671,14 @@ function LibraryProcessorDefinition({
 }) {
   const parameters = descriptor ? processorParameterEntries(descriptor.paramsSchema) : []
   const status = loading
-    ? 'Loading the exact processor definition before enabling a bounded test.'
+    ? 'Loading the processor version before enabling a bounded test.'
     : error || !descriptor
-      ? 'The exact processor definition is unavailable, so bounded testing cannot be enabled safely.'
+      ? 'The selected processor version is unavailable, so bounded testing cannot be enabled safely.'
       : descriptor.previewable === false
         ? 'This processor does not support bounded preview tests. Run it from the Canvas to produce a result.'
         : !runnable
       ? 'Connect one dataset input before testing this processor.'
-      : 'Use Test transform to run this exact processor against a bounded upstream result.'
+      : 'Use Test transform to run this version against a bounded upstream result.'
 
   return (
     <section aria-label="Library processor definition"
@@ -688,10 +688,10 @@ function LibraryProcessorDefinition({
           Library processor
         </div>
         <h2 className="mt-1 text-xl font-semibold text-foreground">
-          {descriptor?.title ?? 'Exact Library processor'}
+          {descriptor?.title ?? 'Library transform'}
         </h2>
         <div className="mt-1 text-[11.5px] text-muted-foreground">
-          Immutable version {descriptor?.version
+          Version {descriptor?.version
             ?? (configuredRef?.includes('@')
               ? configuredRef.slice(configuredRef.lastIndexOf('@') + 1)
               : 'not available')}
@@ -699,7 +699,7 @@ function LibraryProcessorDefinition({
 
         {loading && (
           <div role="status" className="mt-5 rounded-md border border-border bg-card px-4 py-3 text-xs text-muted-foreground">
-            Loading the exact registry definition…
+            Loading the selected version…
           </div>
         )}
         {error && (
@@ -716,7 +716,7 @@ function LibraryProcessorDefinition({
 
             <dl className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
               <DefinitionFact label="Registry source" value={descriptor.provenance === 'plugin' ? 'Plugin' : 'Promoted'} />
-              <DefinitionFact label="Mode" value={descriptor.mode} />
+              <DefinitionFact label="Mode" value={processorModeLabel(descriptor.mode)} />
               <DefinitionFact label="Category" value={descriptor.category} />
               <DefinitionFact label="Bounded test" value={descriptor.previewable ? 'Supported' : 'Unavailable'} />
             </dl>
@@ -787,15 +787,6 @@ function LibraryProcessorDefinition({
           </>
         )}
 
-        <details className="mt-6 rounded-md border border-border bg-card px-3 py-2 text-[11px] text-muted-foreground">
-          <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
-          <div className="mt-2">
-            <div>Processor reference</div>
-            <div className="break-all font-mono text-foreground">
-              {configuredRef ?? 'No exact processor selected'}
-            </div>
-          </div>
-        </details>
         <InstalledSourcePanel
           source={installedSource}
           loading={installedSourceLoading}
@@ -824,23 +815,12 @@ function InstalledSourcePanel({
 }) {
   if (source) {
     return (
-      <section aria-label="Installed processor source"
+      <section aria-label="Implementation source"
         className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
-        <div className="font-semibold text-foreground">Installed processor source</div>
-        <div className="mt-1">
-          This is the exact local implementation installed for this Canvas processor. It does not
-          indicate remote or distributed dispatch.
-        </div>
+        <div className="font-semibold text-foreground">Implementation source</div>
         <pre className="mt-3 max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-[11px] leading-relaxed text-foreground">
           <code>{source.source}</code>
         </pre>
-        <details className="mt-2">
-          <summary className="cursor-pointer font-medium text-foreground">Source integrity</summary>
-          <div className="mt-1">
-            <span className="mr-2 uppercase">{source.language}</span>
-            <span className="break-all font-mono">SHA-256 {source.sha256}</span>
-          </div>
-        </details>
       </section>
     )
   }
@@ -856,7 +836,7 @@ function InstalledSourcePanel({
     return (
       <div role="alert"
         className="mt-6 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-[11.5px] text-destructive">
-        <div className="font-semibold">Installed processor source could not be loaded</div>
+        <div className="font-semibold">Implementation source could not be loaded</div>
         <div className="mt-1">{error}</div>
       </div>
     )
@@ -865,8 +845,8 @@ function InstalledSourcePanel({
     <div className="mt-6 rounded-md border border-border bg-card px-4 py-3 text-[11.5px] leading-relaxed text-muted-foreground">
       <div className="font-semibold text-foreground">Implementation source unavailable</div>
       <div className="mt-1">
-        This registry entry does not publish executable source. Canvas execution uses the exact
-        registered processor shown above.
+        This registry entry does not publish executable source. Canvas execution uses the selected
+        processor version shown above.
       </div>
     </div>
   )
@@ -971,7 +951,7 @@ function PromotionDescriptionDialog({
         </h2>
         <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
           Describe what the processor does and what a researcher should expect. This description is
-          stored with the immutable Library version.
+          stored with the Library version.
         </p>
         <label htmlFor="promotion-description"
           className="mt-4 block text-[11px] font-semibold text-foreground">
@@ -1064,7 +1044,7 @@ function EditorUpstreamRunStatus({
   if (phase === 'done' && selectionFailed) return (
     <section aria-label="Upstream result unavailable" role="alert" className="border-b border-destructive/30 bg-destructive/10 px-3 py-2.5 text-[11px]">
       <div className="font-semibold text-destructive">Fresh upstream result unavailable</div>
-      <p className="mt-1 text-muted-foreground">The run finished, but its retained result could not be selected for this editor. Retry the input or run {upstreamLabel} again.</p>
+      <p className="mt-1 text-muted-foreground">The run finished, but its saved result could not be opened in this editor. Retry the input or run {upstreamLabel} again.</p>
     </section>
   )
 

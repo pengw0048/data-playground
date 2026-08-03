@@ -1,12 +1,11 @@
 import { useEffect, useState } from 'react'
 import { api, type PerNodeStat, type RunRecordDto } from '../api/client'
 import { useStore } from '../store/graph'
-import { status as statusTok } from '../theme/tokens'
+import { status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
 import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
@@ -56,7 +55,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     onClick={() => hasNodes && setOpen(isOpen ? null : r.id)}
                   >
                     <span className="w-3 text-center text-muted-foreground">{hasNodes ? (isOpen ? '▾' : '▸') : ''}</span>
-                    <span className="w-3 text-center" style={{ color: st.color }}>{st.glyph}</span>
+                    <span className="w-3 text-center" style={{ color: statusText[r.status as keyof typeof statusText] ?? statusText.draft }}>{st.glyph}</span>
                     <Badge variant="secondary" className="w-[70px] justify-center">{r.status}</Badge>
                     <Badge variant="outline" className="w-[54px] justify-center capitalize">{r.jobType}</Badge>
                     <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
@@ -77,10 +76,17 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                       }}>
                       View in Jobs
                     </Button>}
+                    {(r.executionManifestAvailability === 'available' || r.executionManifestSha256) && (
+                      <Button size="sm" variant="ghost" className="h-7 shrink-0 px-2 text-[10.5px]"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setCopySource({ canvasId, subjectId: r.id, name: useStore.getState().doc.name ?? 'Untitled canvas' })
+                        }}>
+                        Create Canvas from run
+                      </Button>
+                    )}
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
-                  <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r}
-                    onClone={() => setCopySource({ canvasId, subjectId: r.id, name: useStore.getState().doc.name ?? 'Untitled canvas' })} />
                   {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
@@ -119,10 +125,10 @@ function unavailableEvidence(error: unknown, table: CatalogTable | null): Manife
   const status = errorStatus(error)
   const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
     ? (error as { code: string }).code : undefined
-  if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this exact revision was lost.' }
-  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This exact revision or its registration is missing or compacted. Latest was not substituted.' }
+  if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this saved version was lost.' }
+  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This saved version is no longer available. A newer version was not opened instead.' }
   if (code === 'service_unavailable' || status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
-  return { table, detail: null, availability: 'error', message: `Couldn't verify this exact revision: ${errorText(error)}` }
+  return { table, detail: null, availability: 'error', message: `Couldn't verify this saved version: ${errorText(error)}` }
 }
 
 function RunInputManifest({ historyId, manifest }: {
@@ -144,7 +150,7 @@ function RunInputManifest({ historyId, manifest }: {
       let next: ManifestEvidence
       try {
         const detail = await api.datasetRevision(item.dataset_id, item.revision_id)
-        next = { table, detail, availability: 'available', message: 'Exact revision is available.' }
+        next = { table, detail, availability: 'available', message: 'Saved version is available.' }
       } catch (error) { next = unavailableEvidence(error, table) }
       if (live) setEvidence((current) => current.map((value, position) => position === index ? next : value))
     }))
@@ -153,19 +159,19 @@ function RunInputManifest({ historyId, manifest }: {
 
   if (manifest == null) {
     return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-      No admitted input manifest was recorded for this legacy run.
+      Input data details were not saved for this older run.
     </div>
   }
   if (manifest.length === 0) {
     return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-      This run admitted no Source inputs.
+      This run did not use any dataset inputs.
     </div>
   }
-  return <div aria-label={`Admitted Sources for run ${historyId}`} className="border-t border-border bg-muted/20">
+  return <div aria-label={`Input data for run ${historyId}`} className="border-t border-border bg-muted/20">
     <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
       className="flex w-full items-center gap-2 px-4 py-2 text-left text-[11px] hover:bg-muted/40">
       <span className="text-muted-foreground">{open ? '▾' : '▸'}</span>
-      <span className="font-semibold text-foreground">Admitted Sources</span>
+      <span className="font-semibold text-foreground">Input data</span>
       <Badge variant="outline" className="h-5 px-1.5 text-[9px]">{manifest.length}</Badge>
       <span className="text-muted-foreground">used for this run</span>
     </button>
@@ -179,19 +185,14 @@ function RunInputManifest({ historyId, manifest }: {
               <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-muted text-[9px] font-semibold text-muted-foreground">{index + 1}</span>
               <div className="min-w-0 flex-1">
                 <div className="font-semibold text-foreground">Source {source?.data.title || item.node_id}</div>
-                {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all text-[9.5px] text-muted-foreground">node {item.node_id}</div>}
                 <div className="mt-1 break-all text-muted-foreground">
-                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.dataset_id}</span>
-                  {current?.table?.name && <span className="dp-mono"> · {item.dataset_id}</span>}
+                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? 'Dataset from this run'}</span>
                 </div>
-                <div className="dp-mono break-all text-muted-foreground">Exact revision {item.revision_id}</div>
-                <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
-                <div className="text-muted-foreground">Reference intent was not stored; this row reports only admitted resolution evidence.</div>
               </div>
               <AvailabilityBadge availability={current?.availability ?? 'checking'} />
             </div>
             <div className={`mt-1.5 ${current?.availability === 'error' || current?.availability === 'permission' ? 'text-destructive' : 'text-muted-foreground'}`}>
-              {current?.message ?? 'Checking the exact revision without opening latest…'}
+              {current?.message ?? 'Checking the saved version without opening a newer one…'}
             </div>
             {current?.availability === 'error' || current?.availability === 'offline' ? <button type="button"
               onClick={() => setGeneration((value) => value + 1)} className="mt-1 font-semibold text-primary underline">Retry availability check</button> : null}
@@ -217,14 +218,12 @@ function ExactRevisionFacts({ detail }: { detail: DatasetRevisionDetail }) {
   const [open, setOpen] = useState(false)
   return <div className="mt-2 border-t border-border/60 pt-1.5">
     <button type="button" onClick={() => setOpen((value) => !value)} className="font-semibold text-primary underline">
-      {open ? 'Hide Catalog revision detail' : 'Open Catalog revision detail'}
+      {open ? 'Hide saved version details' : 'Show saved version details'}
     </button>
     {open && <div data-testid="run-input-revision-detail" className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 rounded bg-muted/40 p-2 text-muted-foreground">
       <span>Committed</span><span>{detail.committedAt ? formatManifestTime(detail.committedAt) : 'not provided'}</span>
-      <span>Retention</span><span>{detail.retentionOwner}</span>
-      <span>Parent</span><span className="dp-mono break-all">{detail.parentRevisionId ?? 'not evidenced'}</span>
       <span>Rows</span><span>{detail.summary.rowCount == null ? 'unknown' : detail.summary.rowCount.toLocaleString()}</span>
-      <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} exact row{detail.preview.rows.length === 1 ? '' : 's'}{detail.preview.hasMore ? ' (truncated)' : ''}</span>
+      <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} row{detail.preview.rows.length === 1 ? '' : 's'} from this saved version{detail.preview.hasMore ? ' (truncated)' : ''}</span>
     </div>}
   </div>
 }
@@ -280,17 +279,6 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
-            {output.writeReceipt && (
-              <details aria-label={`Write receipt for run ${historyId}`} className="mx-4 mb-2 text-[10.5px] text-muted-foreground">
-                <summary className="w-fit cursor-pointer font-semibold text-foreground">Technical receipt</summary>
-                <div className="dp-mono mt-1 break-all">
-                  durable revision {output.writeReceipt.revisionId}
-                  {' · '}dataset {output.writeReceipt.datasetId}
-                  {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
-                  {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
-                </div>
-              </details>
-            )}
             {output.sampleProvenance && <div className="px-4 pb-2"><SampleProvenanceSummary provenance={output.sampleProvenance} /></div>}
             {openKey === key && readable && (
               <div className="border-t border-border">
@@ -318,19 +306,28 @@ export function fmtMs(ms: number): string {
 // A compact bar-per-run duration trend (oldest → newest), colored by status. Native SVG.
 export function DurationTrend({ runs }: { runs: RunRecordDto[] }) {
   const chron = [...runs].reverse()  // list is newest-first; chart reads left→right in time
-  const max = Math.max(1, ...chron.map((r) => r.ms ?? 0))
+  const timed = chron.map((r) => r.ms ?? 0).filter((ms) => ms > 0)
+  const max = Math.max(1, ...timed)
+  const min = timed.length ? Math.min(...timed) : 0
+  // One slow run otherwise flattens every other bar onto the 2px floor, where they read as equal.
+  const logScale = min > 0 && max / min >= 20
   const W = 6, GAP = 2, H = 44
   const width = chron.length * (W + GAP)
+  const barHeight = (ms: number) => {
+    if (ms <= 0) return 1
+    const share = logScale ? Math.log(ms / min + 1) / Math.log(max / min + 1) : ms / max
+    return Math.max(2, Math.round(share * (H - 2)))
+  }
   return (
     <div className="border-b border-border px-4 py-3">
       <div className="mb-1.5 flex items-baseline justify-between text-[11px] text-muted-foreground">
-        <span>Run duration · last {chron.length}</span>
+        <span>Run duration · last {chron.length}{logScale ? ' · log scale' : ''}</span>
         <span>max {fmtMs(max)}</span>
       </div>
       <svg width="100%" height={H} viewBox={`0 0 ${Math.max(width, 1)} ${H}`} preserveAspectRatio="none" role="img" aria-label="run duration trend">
         {chron.map((r, i) => {
           const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
-          const h = Math.max(2, Math.round(((r.ms ?? 0) / max) * (H - 2)))
+          const h = barHeight(r.ms ?? 0)
           return (
             <rect key={r.id} x={i * (W + GAP)} y={H - h} width={W} height={h} rx={1} fill={st.color} opacity={0.85}>
               <title>{`${r.status} · ${fmtMs(r.ms ?? 0)}${r.rows != null ? ` · ${r.rows.toLocaleString()} rows` : ''}${r.createdAt ? `\n${new Date(r.createdAt).toLocaleString()}` : ''}`}</title>
@@ -348,10 +345,10 @@ export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
   return (
     <div className="bg-muted/30 px-3 py-2.5">
       {/* honest label (DATA-05): this is the time to BUILD each node's lazy plan step, not to
-          materialize it — the out-of-core engine defers the heavy work to the target's single pass,
+          execute it — the out-of-core engine defers the heavy work to the target's single pass,
           so don't read these as each node's share of the run. */}
       <div className="mb-1.5 text-[11px] text-muted-foreground"
-           title="Time to build each node's lazy plan step — not its materialization time (the engine defers the heavy work to the target's single pass).">
+           title="Time to build each node's plan step, not the time spent processing its data.">
         Plan build time per node
       </div>
       <div className="flex flex-col gap-1">

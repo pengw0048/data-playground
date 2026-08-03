@@ -2,12 +2,18 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
 
-const viewport = vi.hoisted(() => ({ zoomIn: vi.fn(), zoomOut: vi.fn(), fitView: vi.fn(), zoom: 1 }))
+const viewport = vi.hoisted(() => ({
+  zoomIn: vi.fn(), zoomOut: vi.fn(), fitView: vi.fn(), zoom: 1,
+  screenToFlowPosition: vi.fn(({ x, y }: { x: number; y: number }) => ({ x, y })),
+}))
 const toolbarState = vi.hoisted(() => ({
-  doc: { nodes: [{ id: 'source-1', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', config: {} } }], edges: [] },
+  doc: { id: 'canvas-1', nodes: [{ id: 'source-1', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'draft', config: {} } }], edges: [] },
+  selectedId: null as string | null,
   selectedIds: [],
-  specs: [] as Array<{ kind: string; title: string; category: string; inputs: []; outputs: []; canBypass: boolean; blurb: string }>,
+  specs: [] as Array<{ kind: string; title: string; category: string; inputs: Array<{ id: string; wire: string }>; outputs: Array<{ id: string; wire: string }>; canBypass: boolean; blurb: string }>,
   addNode: vi.fn(),
+  addConnectedNode: vi.fn(),
+  requestNodeReveal: vi.fn(),
   select: vi.fn(),
   setAgentOpen: vi.fn(),
   agentOpen: false,
@@ -15,7 +21,10 @@ const toolbarState = vi.hoisted(() => ({
 }))
 
 vi.mock('@xyflow/react', () => ({
-  useReactFlow: () => ({ zoomIn: viewport.zoomIn, zoomOut: viewport.zoomOut, fitView: viewport.fitView }),
+  useReactFlow: () => ({
+    zoomIn: viewport.zoomIn, zoomOut: viewport.zoomOut, fitView: viewport.fitView,
+    screenToFlowPosition: viewport.screenToFlowPosition,
+  }),
   useViewport: () => ({ zoom: viewport.zoom }),
 }))
 
@@ -28,7 +37,16 @@ vi.mock('../store/graph', () => ({
 }))
 
 vi.mock('../nodes', () => ({ allSpecs: () => toolbarState.specs }))
-vi.mock('../theme/tokens', () => ({ categoryOrder: [], color: {}, kindAccent: {} }))
+vi.mock('../nodes/registry', () => ({
+  nodeOutputs: (node: { type: string }) => toolbarState.specs.find((spec) => spec.kind === node.type)?.outputs
+    ?? (node.type === 'source' ? [{ id: 'out', wire: 'dataset' }] : []),
+  firstCompatibleInput: (kind: string, wire: string) => toolbarState.specs
+    .find((spec) => spec.kind === kind)?.inputs.find((input) => input.wire === wire),
+}))
+vi.mock('../theme/tokens', () => ({
+  categoryOrder: ['io', 'shape', 'compute', 'query', 'inspect', 'control'],
+  color: {}, kindAccent: {},
+}))
 import { CanvasViewportControls, Toolbar, toolbarDensityForWidth } from './Toolbar'
 
 describe('toolbarDensityForWidth', () => {
@@ -46,8 +64,12 @@ describe('Canvas controls', () => {
     viewport.zoomOut.mockReset()
     viewport.fitView.mockReset()
     toolbarState.canvasRole = 'viewer'
+    toolbarState.selectedId = null
     toolbarState.selectedIds = []
     toolbarState.specs = []
+    toolbarState.addNode.mockReset()
+    toolbarState.addConnectedNode.mockReset()
+    toolbarState.requestNodeReveal.mockReset()
   })
 
   it('keeps viewport operations accessible while rendering icons only', () => {
@@ -107,7 +129,7 @@ describe('Canvas controls', () => {
     expect(screen.getByRole('button', { name: 'Fit view' })).toBeEnabled()
   })
 
-  it('does not add a second global operation picker when selection changes', () => {
+  it('keeps category tools and node search without a redundant global add button', () => {
     toolbarState.canvasRole = 'owner'
     toolbarState.selectedIds = ['source-1']
     toolbarState.specs = [{
@@ -131,5 +153,33 @@ describe('Canvas controls', () => {
       </TooltipProvider>,
     )
     expect(screen.queryByRole('button', { name: 'Add operation' })).not.toBeInTheDocument()
+  })
+
+  it('connects a toolbar operation to the sole selected compatible node', () => {
+    toolbarState.canvasRole = 'owner'
+    toolbarState.selectedId = 'source-1'
+    toolbarState.selectedIds = ['source-1']
+    toolbarState.specs = [{
+      kind: 'transform', title: 'Transform', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: true, blurb: 'Transform rows',
+    }]
+    toolbarState.addConnectedNode.mockReturnValue({ id: 'transform-1' })
+
+    render(
+      <TooltipProvider delayDuration={0}>
+        <Toolbar />
+      </TooltipProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Compute' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Transform' }))
+
+    expect(toolbarState.addConnectedNode).toHaveBeenCalledWith(
+      'transform',
+      expect.any(Object),
+      { source: 'source-1', sourceHandle: 'out', targetHandle: 'in', wire: 'dataset' },
+    )
+    expect(toolbarState.addNode).not.toHaveBeenCalled()
+    expect(toolbarState.requestNodeReveal).toHaveBeenCalledWith('canvas-1', 'transform-1')
   })
 })

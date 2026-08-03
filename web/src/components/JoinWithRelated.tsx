@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
 import type { DatasetRevisionPage, RelatedDatasetCandidate, RelatedDatasetPage } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../types/graph'
@@ -56,11 +56,11 @@ function relationshipSummary(candidate: RelatedDatasetCandidate): string {
 }
 
 function revisionLabel(index: number, committedAt?: string | null) {
-  return `Retained version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
+  return `Saved version ${index + 1}${committedAt ? ` · ${new Date(committedAt).toLocaleString()}` : ''}`
 }
 
-function friendlyRevisionError(error: string) {
-  if (error.includes('related_dataset_revision_history_unavailable')) {
+function friendlyRevisionError(error: unknown) {
+  if (error instanceof KernelError && error.code === 'not_implemented') {
     return 'Version history is unavailable for this dataset.'
   }
   return 'Version history could not be loaded. You can still join the current version.'
@@ -139,7 +139,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const [loadingRevisions, setLoadingRevisions] = useState(false)
   const [loadingMoreRevisions, setLoadingMoreRevisions] = useState(false)
   const [revising, setRevising] = useState(false)
-  const [revisionError, setRevisionError] = useState('')
+  const [revisionError, setRevisionError] = useState<unknown>(null)
   const [how, setHow] = useState<'inner' | 'left' | 'right' | 'outer'>('inner')
   const [loading, setLoading] = useState(false)
   const [confirming, setConfirming] = useState(false)
@@ -202,18 +202,16 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   useEffect(() => {
     if (!candidateBase) {
       setRevisions(null)
-      setRevisionError('')
+      setRevisionError(null)
       setRequestedRevisionId('')
       return
     }
     let active = true
     setLoadingRevisions(true)
-    setRevisionError('')
+    setRevisionError(null)
     api.relatedDatasetRevisions(candidateBase.identity, { limit: 20 }).then(
       (next) => { if (active) setRevisions(next) },
-      (reason) => {
-        if (active) setRevisionError(reason instanceof Error ? reason.message : String(reason))
-      },
+      (reason) => { if (active) setRevisionError(reason) },
     ).finally(() => { if (active) setLoadingRevisions(false) })
     return () => { active = false }
   }, [candidateBase])
@@ -295,11 +293,11 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     setRequestedRevisionId(revisionId)
     if (!revisionId) {
       setCandidate(candidateBase)
-      setRevisionError('')
+      setRevisionError(null)
       return
     }
     setRevising(true)
-    setRevisionError('')
+    setRevisionError(null)
     try {
       const reviewed = await api.reviewRelatedDatasetRevision(page.source, candidateBase, revisionId, {
         q: q.trim() || undefined,
@@ -307,7 +305,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
       })
       setCandidate(reviewed)
     } catch (reason) {
-      setRevisionError(reason instanceof Error ? reason.message : String(reason))
+      setRevisionError(reason)
     } finally {
       setRevising(false)
     }
@@ -316,7 +314,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
   const loadMoreRevisions = async () => {
     if (!candidateBase || !revisions?.nextCursor) return
     setLoadingMoreRevisions(true)
-    setRevisionError('')
+    setRevisionError(null)
     try {
       const next = await api.relatedDatasetRevisions(candidateBase.identity, {
         limit: 20, cursor: revisions.nextCursor,
@@ -330,7 +328,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
         }
       })
     } catch (reason) {
-      setRevisionError(reason instanceof Error ? reason.message : String(reason))
+      setRevisionError(reason)
     } finally {
       setLoadingMoreRevisions(false)
     }
@@ -354,15 +352,6 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
     || error.toLowerCase().includes('evidence')
     || error.toLowerCase().includes('revision')
   )
-  const sourceFallback = page
-    ? `${page.source.registrationId ?? page.source.sourceBindingId}@${page.source.revisionMode}`
-    : sourceIdentity.kind === 'local' ? sourceIdentity.registrationId
-      : `${sourceIdentity.mountId}/${sourceIdentity.sourceBindingId}`
-  const candidateIdentity = candidate
-    ? candidate.exactRef
-      ? `${candidate.exactRef.datasetId}@${candidate.exactRef.revisionId}`
-      : `${candidate.identity.registrationId ?? candidate.identity.sourceBindingId}@${candidate.identity.revisionMode}`
-    : ''
   const reviewedRevisionId = candidate?.identity.revisionMode === 'exact'
     ? candidate.identity.revisionId ?? '' : ''
   const exactRevisionPending = Boolean(requestedRevisionId && requestedRevisionId !== reviewedRevisionId)
@@ -408,7 +397,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
             <div>
               <div className="text-sm font-semibold text-foreground">Find join candidates</div>
               <div className="mt-0.5 text-[11px] text-muted-foreground">
-                Review the evidence before adding this Join to the Canvas.
+                Check the datasets, matching columns, and expected row matches before adding this Join.
               </div>
             </div>
             <button type="button" aria-label="Cancel finding data to join" disabled={confirming}
@@ -470,7 +459,7 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                   className="mt-1 rounded border border-border p-2"><strong>{item.name}</strong> — {item.reason}</div>)}
               </details>}
               {!loading && page?.refinementRequired && <div className="mt-3 rounded border border-amber-300/50 bg-amber-50 p-2 text-[10.5px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                {page.scopeNote ?? 'Results are truncated to a bounded working set. Refine search or folder to inspect omitted datasets.'}
+                {page.scopeNote ?? 'Showing the first matches only. Refine the search or folder to see the rest.'}
               </div>}
             </> : <>
               <button type="button" className="mb-3 text-[11px] font-semibold text-primary"
@@ -510,14 +499,14 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                         {revisionLabel(index, revision.committedAt)}
                       </option>)}
                     </select>
-                    {loadingRevisions && <span className="ml-2 text-muted-foreground">Loading retained versions…</span>}
+                    {loadingRevisions && <span className="ml-2 text-muted-foreground">Loading saved versions…</span>}
                     {revising && <span className="ml-2 text-muted-foreground">Reviewing selected version…</span>}
                     {revisions?.hasMore && <Button type="button" size="sm" variant="outline"
                       className="ml-2 h-7" disabled={loadingMoreRevisions || revising}
                       onClick={() => void loadMoreRevisions()}>
                       {loadingMoreRevisions ? 'Loading…' : 'Load more versions'}
                     </Button>}
-                    {revisionError && <span role="status" className="ml-2 text-muted-foreground">
+                    {!!revisionError && <span role="status" className="ml-2 text-muted-foreground">
                       {friendlyRevisionError(revisionError)}
                       {requestedRevisionId && <Button type="button" size="sm" variant="outline"
                         className="ml-2 h-7" disabled={revising}
@@ -531,16 +520,6 @@ export function JoinWithRelated({ nodeId, surface = 'inspector' }: {
                     {['inner', 'left', 'right', 'outer'].map((item) => <option key={item}>{item}</option>)}
                   </select>
                 </div>
-                <details className="text-[10px] text-muted-foreground">
-                  <summary>Details</summary>
-                  <div className="mt-1">Evidence detail: {candidate.reason}</div>
-                  <div className="mt-1 break-all font-mono">
-                    Selected binding: {sourceFallback}<br />
-                    Related binding: {candidateIdentity}
-                  </div>
-                  {revisionError && <div className="mt-1 break-all font-mono">Diagnostic: {revisionError}</div>}
-                  {error && <div className="mt-1 break-all font-mono">Diagnostic: {error}</div>}
-                </details>
               </div>
               {error && <div role="alert" className="mt-3 rounded border border-destructive/30 p-2 text-[11px] text-destructive">
                 {friendlyActionError(error)}

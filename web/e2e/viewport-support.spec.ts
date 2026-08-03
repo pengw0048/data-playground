@@ -134,7 +134,7 @@ test.describe('minimum viewport support', () => {
     const transformFilterControls = [
       page.getByLabel('Search Transforms'),
       page.getByLabel('Transform source'),
-      page.getByLabel('Transform mode'),
+      page.getByLabel('Transform behavior'),
       page.getByLabel('Transform category'),
     ]
     const transformFilterBoxes = await Promise.all(transformFilterControls.map(async (control, index) => {
@@ -151,7 +151,7 @@ test.describe('minimum viewport support', () => {
       'Transform filter toolbar should not consume multiple rows at the desktop viewport',
     ).toBeLessThanOrEqual(48)
     await page.getByTestId('rail-workspace').click()
-    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
 
     // Settings from the rail.
     await page.getByTestId('rail-settings').click()
@@ -167,21 +167,13 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Back to Workspace' }), 'dataset detail back')
-    const datasetDetails = detail.getByTestId('detail-dataset-details')
-    await expect(datasetDetails).not.toHaveAttribute('open', '')
-    await expect(datasetDetails).toContainText('Dataset details')
-    await datasetDetails.locator('summary').click()
-    await expect(datasetDetails).toHaveAttribute('open', '')
-    await expect(datasetDetails.getByRole('button', { name: 'Copy dataset location' })).toBeVisible()
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
     await expect(detail.getByRole('heading', { name: 'Data preview' })).toBeVisible()
     await expect(detail.getByRole('status').filter({
       hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
     })).toBeVisible({ timeout: 15_000 })
     await expect(detail.getByTestId('detail-relationships')).toBeVisible()
-    const maintenance = detail.getByText('Edit catalog details', { exact: true })
-    await expect(maintenance.locator('..')).not.toHaveAttribute('open', '')
-    await maintenance.click()
+    await expect(detail.getByRole('heading', { name: 'Dataset details' })).toBeVisible()
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
     await keyAction.scrollIntoViewIfNeeded()
     await expectFullyInViewport(page, keyAction, 'column key action')
@@ -209,14 +201,15 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
     // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
-    await expect(node).toContainText(/Local catalog · Current version · \d[\d,]* rows? · \d+ columns?/)
-    await expect(node.getByText(/Field evidence/i)).toHaveCount(0)
-    const connectionDetails = page.getByTestId('inspector').getByText('Connection details', { exact: true })
+    await expect(node).toContainText(/Datasets · Current version · \d[\d,]* rows? · \d+ columns?/)
+    await expect(node.getByText(/^Fields/i)).toHaveCount(0)
+    const connectionDetails = page.getByTestId('inspector').getByText('Data details', { exact: true })
     await expectFullyInViewport(page, connectionDetails, 'source connection details')
     await connectionDetails.click()
     await expect(page.getByLabel('Source connection details')).toBeVisible()
-    await expect(page.getByLabel('Source connection details').getByText('Catalog registration')).toBeVisible()
-    await expect(page.getByLabel('Source connection details').getByText(/Field evidence/i)).toBeVisible()
+    await expect(page.getByLabel('Source connection details').getByText('Dataset', { exact: true })).toBeVisible()
+    await expect(page.getByLabel('Source connection details').getByText('Catalog registration')).toHaveCount(0)
+    await expect(page.getByLabel('Source connection details').getByText(/^Fields/i)).toBeVisible()
     await connectionDetails.click()
     await expect(page.getByLabel('Source connection details')).not.toBeVisible()
     // Inspector run control stays reachable at the minimum viewport (sources label it Count rows).
@@ -364,17 +357,15 @@ test.describe('minimum viewport support', () => {
     await expect(columnSummary).toContainText('120 data columns')
     await expect(columnSummary).toContainText('1 system column')
     await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
-    await expect(detail.getByText('114 more data columns', { exact: true })).toBeVisible()
+    await expect(detail.getByText('provider_column_119', { exact: true })).toBeVisible()
     await expect(detail.getByText('System row ID').first()).toHaveAttribute(
-      'title', /not a canonical data column/,
+      'title', /not a data column/,
     )
     await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
     await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })
-    const datasetDetails = detail.getByText('Dataset details', { exact: true })
-    await expect(datasetDetails.locator('..')).not.toHaveAttribute('open', '')
-    await datasetDetails.click()
-    await expect(detail.getByText('Source dataset identity', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Diagnostics', { exact: true })).toHaveCount(0)
+    await expect(detail.getByText('Dataset ID', { exact: true })).toHaveCount(0)
     await expect(page.getByTestId('workspace-scroll-surface')).toHaveCount(0)
 
     const contentSize = await content.evaluate((element) => ({
@@ -410,13 +401,13 @@ test.describe('minimum viewport support', () => {
   test('panel choices persist and the canvas tracks the real remaining viewport', async ({ page }) => {
     await goToWorkspaceShell(page)
     const rail = page.getByTestId('workspace-rail')
-    expect((await boxOf(rail)).width).toBeCloseTo(232, 0)
+    expect((await boxOf(rail)).width).toBeCloseTo(220, 0)
     await page.getByTestId('rail-collapse').click()
     await expect(page.getByRole('button', { name: 'Expand navigation' })).toBeVisible()
-    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+    expect((await boxOf(rail)).width).toBeCloseTo(56, 0)
     await page.reload()
     await expect(page.getByRole('button', { name: 'Expand navigation' })).toBeVisible()
-    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+    expect((await boxOf(rail)).width).toBeCloseTo(56, 0)
 
     await openCanvasWithSource(page)
     const inspector = page.getByTestId('inspector')
@@ -464,7 +455,7 @@ test.describe('minimum viewport support', () => {
     await goToWorkspaceShell(page)
 
     const rail = page.getByTestId('workspace-rail')
-    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+    expect((await boxOf(rail)).width).toBeCloseTo(56, 0)
     const main = page.getByRole('main')
     expect((await boxOf(main)).width).toBeGreaterThan(900)
     for (const id of ['rail-workspace', 'rail-transforms', 'rail-settings'] as const) {
@@ -500,14 +491,12 @@ test.describe('minimum viewport support', () => {
     await page.getByTestId('app-menu').click()
     const appMenu = page.getByRole('menu', { name: 'Data Playground menu' })
     await expectFullyInViewport(page, appMenu, '1024px Canvas app menu')
-    await expect(appMenu.getByText('runs and background tasks', { exact: true })).toBeVisible()
+    await expect(appMenu.getByRole('menuitem', { name: 'Back to Workspace', exact: true })).toBeVisible()
+    await expect(appMenu.getByRole('menuitem', { name: 'Run history', exact: true })).toBeVisible()
+    await expect(appMenu.getByRole('menuitem', { name: 'Jobs', exact: true })).toHaveCount(0)
     await expect(appMenu.getByRole('menuitem', { name: 'Inbox', exact: true })).toHaveCount(0)
     await page.keyboard.press('Escape')
     await expect(appMenu).toBeHidden()
-    await page.getByTestId('app-menu').click()
-    await expectFullyInViewport(page, appMenu, '1024px Canvas menu')
-    await expect(appMenu.getByRole('menuitem', { name: 'Run history' })).toBeVisible()
-    await page.keyboard.press('Escape')
     // Escape closes the menu and clears the Canvas selection. The selection-owned Inspector only
     // returns for one real node, so restore that explicit precondition before exercising expansion.
     const source = page.locator('.react-flow__node').first()

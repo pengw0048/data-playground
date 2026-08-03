@@ -91,7 +91,7 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     expect(screen.getByTestId('agent-disclosure-provider')).toHaveTextContent('anthropic')
     expect(screen.getByTestId('agent-disclosure-model')).toHaveTextContent('anthropic/claude-opus-4-8')
     expect(screen.getByTestId('agent-disclosure-values')).toHaveTextContent(
-      /Sample row values will not leave this deployment/,
+      /Sample row values stay in this deployment/,
     )
     expect(screen.getByTestId('agent-disclosure-values')).not.toHaveTextContent(
       /Sample row values may leave/,
@@ -115,7 +115,7 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     })
     render(<AgentDock />)
     expect(await screen.findByTestId('agent-disclosure-values')).toHaveTextContent(
-      /Sample row values may leave this deployment/,
+      /Sample row values may be sent to the model/,
     )
   })
 
@@ -123,7 +123,7 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
     mocks.state.agentLog = [{ role: 'user', text: 'build a filter' }]
     render(<AgentDock />)
     expect(await screen.findByTestId('agent-egress-disclosure')).toBeInTheDocument()
-    expect(screen.getByText(/Earlier requests and results shown here are display-only/)).toBeInTheDocument()
+    expect(screen.getByText(/Each request is sent on its own/)).toBeInTheDocument()
     expect(screen.getByTestId('agent-completed-request')).toHaveTextContent('build a filter')
   })
 

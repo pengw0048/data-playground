@@ -26,7 +26,15 @@ from hub.backends import (
     PreparedNodeBuilder,
     _PreparedNodeRegistration,
 )
-from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
+from hub.models import (
+    BackendInfo,
+    CapabilityView,
+    ExecutionTargetInfo,
+    KernelInfo,
+    ResultStorageInfo,
+    ResourceSpec,
+    WorkerInfo,
+)
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
 from hub.plugins.capabilities import BUILTIN_CAPABILITIES
@@ -645,6 +653,11 @@ class Deps:
         # re-register previously written outputs so committed tables survive a kernel restart
         # (they live in storage, separate from the seeded data_dir).
         for uri in self.storage.list_outputs():
+            try:
+                self.catalog.get_table(uri)
+                continue  # preserve the user-facing name, folder, tags, and description already stored
+            except KeyError:
+                pass  # an orphaned physical output still needs to be recovered into the catalog
             name = os.path.splitext(os.path.basename(uri.rstrip("/")))[0]
             self.catalog.register_output(name=name, uri=uri, parents=[], pipeline="canvas")  # content-addressed version
         self.runner = LocalRunner(self.resolve_adapter, self.registry, self.catalog, workspace,
@@ -841,12 +854,15 @@ class Deps:
                         f"Runner activation failed ({type(e).__name__}); check plugin configuration and server logs.",
                     )
 
-    def chosen_backend(self, uid: str | None = None) -> str:
+    def chosen_backend(self, uid: str | None = None, requested: str | None = None) -> str:
         """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >
         the default (the per-canvas KERNEL). Kernel-only: with no explicit choice, execution runs on the
         canvas's kernel — process isolation (a runaway transform only wedges that canvas, restartably) +
-        durability (survives a hub restart) + warm reuse. Also drives preview/profile routing."""
+        durability (survives a hub restart) + warm reuse. A Canvas-level request wins over every default.
+        Also drives preview/profile routing."""
         from hub import metadb
+        if requested:
+            return requested
         chosen = (metadb.get_setting("backend", "user", uid, default="") if uid else "") or ""
         if not chosen:
             chosen = metadb.get_setting("backend", "global", default="") or ""
@@ -979,17 +995,25 @@ class Deps:
         from hub.kernel_backend import KernelBackend
         return next((r for r in self.runners if isinstance(r, KernelBackend)), None)
 
-    def pick_runner(self, plan, uid: str | None = None):
-        # honor the chosen backend (Settings → Execution) when it's registered and can run this plan;
-        # otherwise the first runner that can, else the default.
-        chosen = self.chosen_backend(uid)
-        if chosen and chosen not in {getattr(r, "name", None) for r in self.runners}:
+    def pick_runner(self, plan, uid: str | None = None, requested: str | None = None):
+        # An explicit Canvas target is a user-visible execution contract: reject an unavailable or
+        # incompatible target instead of silently dispatching the job somewhere else. Defaults retain
+        # the old stale-setting recovery and first-capable fallback for compatibility.
+        chosen = self.chosen_backend(uid, requested)
+        registered = {getattr(r, "name", None) for r in self.runners}
+        if requested and chosen not in registered:
+            raise ValueError(f"Canvas execution target '{chosen}' is not configured")
+        if chosen and chosen not in registered:
             chosen = "kernel"  # a stale / uninstalled-plugin selection → the kernel DEFAULT, not the
             #                    generic first-capable runner (which silently was local-out-of-core)
         if chosen:
             for r in self.runners:
-                if getattr(r, "name", None) == chosen and r.can_run(plan):
+                if getattr(r, "name", None) != chosen:
+                    continue
+                if r.can_run(plan):
                     return r
+                if requested:
+                    raise ValueError(f"Canvas execution target '{chosen}' cannot run this graph")
         for r in self.runners:
             if r.can_run(plan):
                 return r
@@ -1208,13 +1232,93 @@ class Deps:
                                    else [WorkerInfo(id=f"{r.name}:local", capacity=cap)]))
         return out
 
+    def _execution_targets(self) -> list[ExecutionTargetInfo]:
+        """Human presentation for the runners that are actually registered in this process."""
+        from hub.kernel_backend import KernelBackend
+
+        out: list[ExecutionTargetInfo] = []
+        for runner in self.runners:
+            name = str(getattr(runner, "name", "") or "")
+            if not name:
+                continue
+            custom = getattr(runner, "execution_target_info", None)
+            if callable(custom):
+                try:
+                    info = ExecutionTargetInfo.model_validate(custom())
+                    if info.name == name:
+                        out.append(info)
+                        continue
+                except Exception:  # noqa: BLE001 — a bad optional label must not hide a working runner
+                    pass
+            if isinstance(runner, KernelBackend):
+                substrate = str(getattr(getattr(runner, "spawner", None), "name", "configured"))
+                if substrate == "pod":
+                    description = "Reusable worker for this Canvas in a configured Kubernetes pod."
+                elif substrate == "local-process":
+                    description = "Reusable worker for this Canvas on this machine."
+                else:
+                    description = "Reusable worker for this Canvas on the configured compute substrate."
+                out.append(ExecutionTargetInfo(
+                    name=name, label="Canvas worker", kind="interactive",
+                    description=description, substrate=substrate,
+                ))
+            elif name == "local-out-of-core":
+                out.append(ExecutionTargetInfo(
+                    name=name, label="This machine", kind="job",
+                    description="Run here with streaming and disk spill for data larger than memory.",
+                    substrate="local",
+                ))
+            elif name == "local-subprocess":
+                out.append(ExecutionTargetInfo(
+                    name=name, label="Isolated process", kind="job",
+                    description="Run once in a separate local process that can be cancelled independently.",
+                    substrate="local",
+                ))
+            elif name == "local-pool":
+                out.append(ExecutionTargetInfo(
+                    name=name, label="Local worker pool", kind="job",
+                    description="Run on one of the configured local worker slots.", substrate="local-pool",
+                ))
+            elif name == "ray-data":
+                remote = bool(str(getattr(runner, "jobs_address", "") or "").strip())
+                out.append(ExecutionTargetInfo(
+                    name=name,
+                    label="Ray Jobs" if remote else "Ray Data on this machine",
+                    kind="job",
+                    description=(
+                        "Submit a durable whole-graph job to the configured Ray cluster."
+                        if remote else
+                        "Use Ray Data locally; no remote Ray Jobs endpoint is configured."
+                    ),
+                    substrate="ray-jobs" if remote else "local-ray",
+                ))
+            else:
+                label = name.replace("_", " ").replace("-", " ").strip().title()
+                out.append(ExecutionTargetInfo(
+                    name=name, label=label or "Configured runner", kind="job",
+                    description="Run through a compute provider configured for this workspace.",
+                    substrate="plugin",
+                ))
+        return out
+
     def info(self) -> KernelInfo:
         from hub.plugins.catalog import InMemoryCatalog
+        from hub.storage import LocalStorage, ObjectStorage
 
         # These mutations are implemented by the bundled metadata store, not by the generic catalog
         # SPI. A subclass may reuse read behavior for an external provider, but must not inherit a
         # capability that would route deletes or atomic edits into the local metadata database.
         built_in_catalog = type(self.catalog) is InMemoryCatalog
+        result_storage_kind = (
+            "local" if isinstance(self.storage, LocalStorage)
+            else "object" if isinstance(self.storage, ObjectStorage)
+            else "plugin"
+        )
+        result_storage_label = {
+            "local": "Local workspace",
+            "object": "Shared object storage",
+            "plugin": "Plugin-managed storage",
+        }[result_storage_kind]
         return KernelInfo(
             mode="local", backend="duckdb+polars+arrow", warm=True,
             adapters=[a.name for a in self.adapters],
@@ -1227,6 +1331,9 @@ class Deps:
             capability_views=[CapabilityView(id=c.id, label=getattr(c, "label", c.id), viewer=getattr(c, "viewer"))
                               for c in self.capabilities if isinstance(getattr(c, "viewer", None), dict)],
             backends=self._backends(),
+            execution_targets=self._execution_targets(),
+            result_storage=ResultStorageInfo(
+                label=result_storage_label, kind=result_storage_kind),
         )
 
 

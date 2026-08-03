@@ -113,6 +113,10 @@ class ExactRowRestrictionUnsupported(RuntimeError):
 class ExecutionBackend(Protocol):
     """Run ownership contract.
 
+    When ``graph.execution_backend`` names this backend, it is an explicit Canvas-level choice. The
+    backend must fail with a visible unsupported status/error when it cannot execute the graph; it must
+    not delegate to a different backend or silently run on another substrate.
+
     A backend whose terminal ``cancelled`` means its worker is genuinely unable to publish may expose
     ``cancel_acknowledges_stop = True`` or ``cancel_acknowledged(run_id)``. Without that optional seam,
     cancellation is treated as unacknowledged even if a legacy backend eagerly relabels its status.

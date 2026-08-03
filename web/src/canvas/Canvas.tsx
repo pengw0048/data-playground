@@ -15,20 +15,33 @@ import {
 } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
-import { kindAccent, color } from '../theme/tokens'
-import type { WireType } from '../theme/tokens'
+import { categoryOrder, kindAccent, color } from '../theme/tokens'
+import type { Category, WireType } from '../theme/tokens'
 import type { CanvasNode } from '../types/graph'
 import { NodeFinder, type ScreenRect } from './NodeFinder'
+import { NodeTypeIcon } from './NodeTypeIcon'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
+import { Icon } from '../ui/Icon'
 import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 import { canvasFitOptions } from './viewportFit'
+import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
+import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
+  ContextMenuSeparator, ContextMenuShortcut, ContextMenuSub, ContextMenuSubContent,
+  ContextMenuSubTrigger, ContextMenuTrigger,
+} from '@/components/ui/context-menu'
 
 const edgeTypes = { wire: WireEdge }
+
+const CONTEXT_CATEGORY_LABEL: Record<Category, string> = {
+  io: 'Sources & sinks', shape: 'Shape', compute: 'Compute', query: 'Query',
+  inspect: 'Inspect', control: 'Control flow',
+}
 
 function viewportNodeGeometryIdentity(nodes: readonly Node[]): string {
   return JSON.stringify(nodes.map((node) => [
@@ -109,9 +122,10 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
     if (!canEdit) return
     api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false))
   }, [canEdit])
-  const add = () => {
+  const add = (action: SourceEntryAction) => {
     const c = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
-    addNode('source', { x: c.x - 116, y: c.y - 40 })
+    const node = addNode('source', { x: c.x - 116, y: c.y - 40 })
+    if (node) requestSourceEntryAction(node.id, action)
   }
   return (
     <div className="pointer-events-none absolute inset-0 grid place-items-center">
@@ -121,10 +135,17 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
           {canEdit ? 'Add a dataset source to begin — or open a runnable example.' : 'You have view-only access to this canvas.'}
         </div>
         {canEdit && (
-          <div className="mt-3.5 flex justify-center gap-2">
-            <Button variant="outline" onClick={add} className="rounded-lg text-[12.5px] text-muted-foreground">+ Add a source</Button>
-            {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
-          </div>
+          <>
+            <div className="mt-3.5 flex flex-wrap justify-center gap-2">
+              <Button variant="outline" onClick={() => add('select')} className="rounded-lg text-[12.5px] text-muted-foreground">Choose dataset</Button>
+              <Button variant="outline" onClick={() => add('upload')} className="rounded-lg text-[12.5px] text-muted-foreground">Upload file</Button>
+              <Button variant="outline" onClick={() => add('browse')} className="rounded-lg text-[12.5px] text-muted-foreground">Register path or URL</Button>
+              {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
+            </div>
+            <div className="mt-2 text-[10.5px] text-muted-foreground/80">
+              Or drop a Parquet, CSV, JSON, or Arrow file here.
+            </div>
+          </>
         )}
         {/* runnable starters on the seeded data — a first-timer never opens the file menu to find them */}
         {canEdit && <div className="mx-auto mt-6 grid max-w-[460px] gap-2">
@@ -143,16 +164,35 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
   )
 }
 
+// The minimap plus the viewport controls under it need this much room. Below it — a small window, or
+// a supported one at 200% browser zoom — it covers canvas content and swallows clicks meant for nodes.
+const MINIMAP_ROOM = '(min-width: 900px) and (min-height: 560px)'
+
+function useMinimapRoom() {
+  const [fits, setFits] = useState(() => window.matchMedia(MINIMAP_ROOM).matches)
+  useEffect(() => {
+    const query = window.matchMedia(MINIMAP_ROOM)
+    const update = () => setFits(query.matches)
+    query.addEventListener('change', update)
+    update()
+    return () => query.removeEventListener('change', update)
+  }, [])
+  return fits
+}
+
 export function Canvas() {
   const specsVersion = useStore((s) => s.specsVersion)
   const nodeTypes = useMemo(() => buildNodeTypes(), [specsVersion])
   const doc = useStore((s) => s.doc)
+  const minimapFits = useMinimapRoom()
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const schemas = useStore((s) => s.schemas)
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
+  const canUndo = useStore((s) => s.past.length > 0)
+  const canRedo = useStore((s) => s.future.length > 0)
   const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
   const acknowledgeNodeReveal = useStore((s) => s.acknowledgeNodeReveal)
   const viewportFitRequest = useStore((s) => s.viewportFitRequest)
@@ -194,6 +234,7 @@ export function Canvas() {
     wire: WireType
     source: { nodeId: string; handleId: string | null }
   } | null>(null)
+  const [contextPosition, setContextPosition] = useState({ x: 0, y: 0 })
 
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
@@ -215,7 +256,7 @@ export function Canvas() {
     setDropActive(false)
     const base = screenToFlowPosition({ x: e.clientX, y: e.clientY })
     const s = useStore.getState()
-    if (!s.kernelUp) { s.pushToast('Kernel offline — cannot upload a file', 'error'); return }
+    if (!s.kernelUp) { s.pushToast('Offline — cannot upload a file', 'error'); return }
     for (const file of files) {
       const t = await s.uploadDataset(file)  // uploads + refreshes the catalog; toasts on failure
       if (!t) continue
@@ -353,15 +394,23 @@ export function Canvas() {
   const warnedIds = useMemo(() => new Set(warnedKey ? warnedKey.split(',') : []), [warnedKey])
 
   const rfEdges: Edge[] = useMemo(
-    () => doc.edges.map((e) => ({
-      id: e.id, source: e.source, target: e.target,
-      sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
-      // Match node selection: React Flow receives a controlled edge list, so selection must be
-      // reflected from the store or an edge click is lost on the next render.
-      selected: selectedIds.includes(e.id),
-      type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
-    })),
-    [doc.edges, selectedIds, warnedIds],
+    () => {
+      // Large canvases can have as many edges as nodes. Resolve display names once rather than
+      // rescanning every node for every edge while building React Flow's controlled edge list.
+      const titles = new Map(doc.nodes.map((node) => [node.id, node.data.title || node.id]))
+      const title = (id: string) => titles.get(id) || id
+      return doc.edges.map((e) => ({
+        id: e.id, source: e.source, target: e.target,
+        sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
+        // React Flow would otherwise name the edge with internal node ids
+        ariaLabel: `Edge from ${title(e.source)} to ${title(e.target)}`,
+        // Match node selection: React Flow receives a controlled edge list, so selection must be
+        // reflected from the store or an edge click is lost on the next render.
+        selected: selectedIds.includes(e.id),
+        type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
+      }))
+    },
+    [doc.edges, doc.nodes, selectedIds, warnedIds],
   )
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
@@ -561,10 +610,25 @@ export function Canvas() {
     return () => window.removeEventListener('keydown', onKey)
   }, [removeSelected, bypass, disable])
 
+  const addNodeAtContext = (kind: string) => {
+    if (!canEdit) return
+    const base = { x: contextPosition.x - 116, y: contextPosition.y - 40 }
+    const position = freePosition(useStore.getState().doc.nodes, base)
+    useStore.getState().addNode(kind, position, undefined, undefined, { autoPlaced: false })
+  }
+  const contextSpecs = allSpecs()
+
   return (
+    <ContextMenu>
+    <ContextMenuTrigger asChild>
     <div ref={canvasRef}
       data-node-reveal-pending={nodeRevealRequest?.canvasId === doc.id ? 'true' : 'false'}
       style={{ position: 'absolute', inset: 0 }}
+      onContextMenu={(event) => {
+        setContextPosition(screenToFlowPosition({ x: event.clientX, y: event.clientY }))
+        select(null)
+        setFinder(null)
+      }}
       onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
       onDragOver={onDragOverFiles} onDragLeave={onDragLeaveFiles} onDrop={onDropFiles}>
       <ArrowDefs />
@@ -604,7 +668,8 @@ export function Canvas() {
         panOnScroll
         connectOnClick={false}
         selectionOnDrag
-        panOnDrag={[1, 2]}
+        // Keep right-click available for the product menu; middle-drag still pans the Canvas.
+        panOnDrag={[1]}
         selectionKeyCode={null}
         multiSelectionKeyCode={['Meta', 'Shift']}
         deleteKeyCode={null}
@@ -612,7 +677,7 @@ export function Canvas() {
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
         {/* Keep the minimap only once there's something to navigate — on an empty canvas it would
             just be a stray box over the first-run prompt. */}
-        {doc.nodes.length > 0 && (
+        {doc.nodes.length > 0 && minimapFits && (
           <>
             {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
                 fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}
@@ -678,5 +743,44 @@ export function Canvas() {
         />
       )}
     </div>
+    </ContextMenuTrigger>
+    <ContextMenuContent aria-label="Canvas actions" className="w-[220px]">
+      <ContextMenuLabel>Canvas</ContextMenuLabel>
+      {canEdit && <>
+        <ContextMenuItem disabled={!canUndo} onSelect={() => useStore.getState().undo()}>
+          <Icon name="undo" /> Undo <ContextMenuShortcut>⌘Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuItem disabled={!canRedo} onSelect={() => useStore.getState().redo()}>
+          <Icon name="redo" /> Redo <ContextMenuShortcut>⇧⌘Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        {categoryOrder.map((category) => {
+          const specs = contextSpecs.filter((spec) => spec.category === category)
+          if (!specs.length) return null
+          return <ContextMenuSub key={category}>
+            <ContextMenuSubTrigger>Add {CONTEXT_CATEGORY_LABEL[category]}</ContextMenuSubTrigger>
+            <ContextMenuSubContent className="max-h-80 w-56 overflow-y-auto">
+              {specs.map((spec) => <ContextMenuItem key={spec.kind} onSelect={() => addNodeAtContext(spec.kind)}>
+                <span aria-hidden="true" className="grid h-5 w-5 shrink-0 place-items-center rounded border border-border bg-card text-muted-foreground">
+                  <NodeTypeIcon spec={spec} size={12} />
+                </span>
+                <span className="min-w-0 truncate">{spec.title}</span>
+              </ContextMenuItem>)}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+        })}
+        <ContextMenuItem onSelect={() => useStore.getState().paste()}>
+          <Icon name="duplicate" /> Paste <ContextMenuShortcut>⌘V</ContextMenuShortcut>
+        </ContextMenuItem>
+      </>}
+      <ContextMenuItem disabled={!doc.nodes.length} onSelect={() => useStore.getState().selectAll()}>
+        <Icon name="check" /> Select all <ContextMenuShortcut>⌘A</ContextMenuShortcut>
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem disabled={!doc.nodes.length} onSelect={() => { void fitView(canvasFitOptions(doc.nodes.length)) }}>
+        <Icon name="maximize" /> Fit canvas
+      </ContextMenuItem>
+    </ContextMenuContent>
+    </ContextMenu>
   )
 }

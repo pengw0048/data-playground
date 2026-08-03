@@ -843,7 +843,8 @@ def test_owner_and_editor_can_cancel_and_idempotently_retry_their_own_merge_task
             metadb.DurableTaskAttempt.task_id == editor_task.task_id)) == 2
 
 
-def test_merge_task_observation_is_shared_but_actions_remain_with_original_owner(tmp_path, monkeypatch):
+def test_merge_task_observation_is_shared_but_jobs_and_actions_remain_with_original_owner(
+        tmp_path, monkeypatch):
     request = _request(tmp_path, monkeypatch)
     with metadb.session() as session:
         session.add_all((
@@ -869,14 +870,15 @@ def test_merge_task_observation_is_shared_but_actions_remain_with_original_owner
     assert owner_view.merge_columns.can_cancel is False
     assert viewer_view.merge_columns.can_cancel is False
 
-    for uid, expected in (("editor", True), ("owner", False), ("viewer", False)):
-        job = next(item for item in metadb.list_workspace_runs(uid, run_id=task.task_id)["items"]
-                   if item["taskId"] == task.task_id)
-        assert job["targetNodeId"] == "write"
-        assert job["canCancel"] is expected and job["canRetry"] is False
-        assert job["mergeColumns"]["producerKind"] == "sparse-output"
-        assert job["mergeColumns"]["canCancel"] is expected
-        assert job["mergeColumns"]["canRetry"] is False
+    job = next(item for item in metadb.list_workspace_runs(
+        "editor", run_id=task.task_id)["items"] if item["taskId"] == task.task_id)
+    assert job["targetNodeId"] == "write"
+    assert job["canCancel"] is True and job["canRetry"] is False
+    assert job["mergeColumns"]["producerKind"] == "sparse-output"
+    assert job["mergeColumns"]["canCancel"] is True
+    assert job["mergeColumns"]["canRetry"] is False
+    for uid in ("owner", "viewer"):
+        assert not metadb.list_workspace_runs(uid, run_id=task.task_id)["items"]
 
     for uid in ("owner", "viewer", "stranger"):
         with pytest.raises(APIError) as cancel_error:

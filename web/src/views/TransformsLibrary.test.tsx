@@ -121,10 +121,13 @@ describe('TransformsLibrary', () => {
 
     render(<TransformsLibrary />)
 
-    await screen.findByText("row['score'] = 1", { exact: false })
+    const sourceCode = await screen.findByText("row['score'] = 1", { exact: false })
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent("row['score'] = 1")
-    expect(source).toHaveTextContent(`SHA-256 ${'b'.repeat(64)}`)
+    expect(source).not.toHaveTextContent('SHA-256')
+    expect(sourceCode).not.toBeVisible()
+    fireEvent.click(screen.getByText('Implementation source'))
+    expect(sourceCode).toBeVisible()
     expect(mocks.installedProcessorSource).toHaveBeenCalledWith('tr_exact', 'v1')
   })
 
@@ -154,7 +157,7 @@ describe('TransformsLibrary', () => {
     await screen.findByText('def processor_factory(params)', { exact: false })
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent('def processor_factory(params)')
-    expect(source).toHaveTextContent(`SHA-256 ${'a'.repeat(64)}`)
+    expect(source).not.toHaveTextContent('SHA-256')
     expect(mocks.installedProcessorSource).toHaveBeenCalledWith(luma.id, luma.version)
   })
 
@@ -171,7 +174,7 @@ describe('TransformsLibrary', () => {
     await screen.findByText('Implementation source unavailable.')
     const source = screen.getByRole('region', { name: 'Implementation source' })
     expect(source).toHaveTextContent('Implementation source unavailable.')
-    expect(source).toHaveTextContent('This plugin does not publish implementation source for this exact version.')
+    expect(source).toHaveTextContent('This plugin does not publish implementation source for this version.')
     expect(source).not.toHaveTextContent('not found')
   })
 
@@ -193,18 +196,21 @@ describe('TransformsLibrary', () => {
         : new Promise((resolve) => { resolveV2 = resolve })
     ))
     const { rerender } = render(<TransformsLibrary />)
-    expect(await screen.findByText('SOURCE_FROM_V1')).toBeVisible()
+    const sourceV1 = await screen.findByText('SOURCE_FROM_V1')
+    expect(sourceV1).not.toBeVisible()
+    fireEvent.click(screen.getByText('Implementation source'))
+    expect(sourceV1).toBeVisible()
 
     store.transformVersion = 'v2'
     rerender(<TransformsLibrary />)
 
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
-    expect(await screen.findByText('Loading exact implementation source…')).toBeVisible()
+    expect(await screen.findByText('Loading implementation source…')).not.toBeVisible()
     resolveV2?.({
       processorId: 'tr_exact', version: 'v2', language: 'python',
       source: 'SOURCE_FROM_V2', sha256: '2'.repeat(64),
     })
-    expect(await screen.findByText('SOURCE_FROM_V2')).toBeVisible()
+    expect(await screen.findByText('SOURCE_FROM_V2')).not.toBeVisible()
     expect(screen.queryByText('SOURCE_FROM_V1')).not.toBeInTheDocument()
   })
 
@@ -282,8 +288,21 @@ describe('TransformsLibrary', () => {
 
     const toolbar = screen.getByRole('group', { name: 'Transform filters' })
     expect(toolbar).toHaveClass('xl:grid-cols-[minmax(220px,1fr)_130px_105px_120px]')
-    expect(within(toolbar).getAllByRole('textbox')).toHaveLength(3)
+    expect(within(toolbar).getAllByRole('textbox')).toHaveLength(2)
     expect(within(toolbar).getByRole('combobox', { name: 'Transform source' })).toBeVisible()
+    expect(within(toolbar).getByRole('combobox', { name: 'Transform behavior' })).toBeVisible()
+  })
+
+  it('uses one actionable empty state when the library has no Transforms', async () => {
+    store.transformResourceId = null as never
+    store.transformVersion = null as never
+    mocks.transformLibrary.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByText('No transforms yet.')).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Open Workspace' })).toHaveAttribute('href', '#/workspace')
+    expect(screen.queryByRole('region', { name: 'Transform detail' })).not.toBeInTheDocument()
   })
 
   it('configures an explicit blank Transform in place without opening the generic chooser', async () => {
@@ -308,7 +327,7 @@ describe('TransformsLibrary', () => {
     })
     render(<TransformsLibrary />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
 
     await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {
       transformId: 'tr_exact', transformVersion: 'v1', expectedCanvasVersion: 9,
@@ -329,20 +348,19 @@ describe('TransformsLibrary', () => {
     render(<TransformsLibrary />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(message)
-    expect(screen.queryByRole('button', { name: 'Use exact v1' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Use v1' })).not.toBeInTheDocument()
     expect(mocks.workspaceAddTransform).not.toHaveBeenCalled()
   })
 
   it('uses only an explicitly selected editable Canvas and focuses after server confirmation', async () => {
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
     fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
     expect(screen.getByLabelText('Target Canvas')).toHaveValue('target')
     expect(screen.getByRole('option', { name: 'Exact target' })).toBeVisible()
     expect(screen.queryByRole('option', { name: /target/ })).toHaveAccessibleName('Exact target')
-    expect(screen.getByText('Canvas ID: target')).not.toBeVisible()
-    fireEvent.click(screen.getByText('Technical details'))
-    expect(screen.getByText('Canvas ID: target')).toBeVisible()
+    expect(screen.queryByText('Canvas ID: target')).not.toBeInTheDocument()
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {
@@ -355,7 +373,7 @@ describe('TransformsLibrary', () => {
   it('keeps a stale target failure in the chooser and never opens a Canvas', async () => {
     mocks.workspaceAddTransform.mockRejectedValue(new KernelError(409, 'canvas changed'))
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
     fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('no other Canvas was changed')
@@ -370,7 +388,11 @@ describe('TransformsLibrary', () => {
       .mockResolvedValueOnce({ container: { id: 'container:workspace-local-root', name: 'Workspace', kind: 'container', version: 1 }, items: [], hasMore: false })
       .mockResolvedValueOnce({ container: { id: 'container:workspace-local-root', name: 'Workspace', kind: 'container', version: 2 }, items: [], hasMore: false })
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', {
+      limit: 1,
+      source: 'local',
+    })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Create and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('no other Canvas was changed')
@@ -385,7 +407,7 @@ describe('TransformsLibrary', () => {
     let resolveMutation: ((value: { ok: boolean; id: string; version: number; nodeId: string; doc: object }) => void) | undefined
     mocks.workspaceAddTransform.mockImplementation(() => new Promise((resolve) => { resolveMutation = resolve }))
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
     fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
 
@@ -405,7 +427,7 @@ describe('TransformsLibrary', () => {
   it('closes after a committed mutation even when the target cannot be opened locally', async () => {
     store.openFile.mockResolvedValue(false)
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
     fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
@@ -415,7 +437,7 @@ describe('TransformsLibrary', () => {
   it('does not replay a committed new-Canvas mutation when its target cannot be opened locally', async () => {
     store.openFile.mockResolvedValue(false)
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Use exact v1' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Create and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
@@ -426,9 +448,9 @@ describe('TransformsLibrary', () => {
   it('does not offer an upgrade from hidden Canvas state without explicit context', async () => {
     store.transformVersion = 'v2'
     render(<TransformsLibrary />)
-    expect(await screen.findByRole('button', { name: 'Use exact v2' })).toBeVisible()
-    expect(screen.queryByText('Explicit upgrade target')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Confirm exact upgrade/ })).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Use v2' })).toBeVisible()
+    expect(screen.queryByText('Upgrade target')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Confirm upgrade/ })).not.toBeInTheDocument()
   })
 
   it('reloads a deep-linked explicit target and admits only a compatible exact upgrade', async () => {
@@ -451,7 +473,7 @@ describe('TransformsLibrary', () => {
     expect(await screen.findByText(/Exact target/)).toBeVisible()
     expect(screen.getByText('+ confidence')).toBeVisible()
     expect(screen.getByText('nullable field was added')).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm exact upgrade to v2' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm upgrade to v2' }))
     await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {
       transformId: 'tr_exact', transformVersion: 'v2', expectedCanvasVersion: 9, replaceNodeId: 'node-1',
     }))
@@ -477,7 +499,7 @@ describe('TransformsLibrary', () => {
     expect(screen.getAllByText('No field changes.')).toHaveLength(1)
   })
 
-  it('renders same-name nullability changes and unknown nullability evidence', async () => {
+  it('renders actual nullability changes without no-change evidence', async () => {
     store.transformVersion = 'v2'
     store.transformUpgradeCanvasId = 'target'
     store.transformUpgradeNodeId = 'node-1'
@@ -497,11 +519,11 @@ describe('TransformsLibrary', () => {
 
     render(<TransformsLibrary />)
 
-    expect(await screen.findByText(/nullability is not proven on both versions/)).toBeVisible()
-    expect(screen.getByText(/field became non-nullable/)).toBeVisible()
-    expect(screen.getByText('changed · unknown')).toBeVisible()
+    expect(await screen.findByText(/field became non-nullable/)).toBeVisible()
+    expect(screen.queryByText(/nullability is not proven on both versions/)).not.toBeInTheDocument()
+    expect(screen.queryByText('changed · unknown')).not.toBeInTheDocument()
     expect(screen.getByText('changed · breaking')).toBeVisible()
-    expect(screen.queryByText('No field changes.')).not.toBeInTheDocument()
+    expect(screen.getByText('No field changes.')).toBeVisible()
   })
 
   it('keeps a committed upgrade non-retryable when its Canvas cannot be opened', async () => {
@@ -513,11 +535,11 @@ describe('TransformsLibrary', () => {
       .mockResolvedValueOnce(targetDoc('v2', 10))
     store.openFile.mockResolvedValue(false)
     render(<TransformsLibrary />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Confirm exact upgrade to v2' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm upgrade to v2' }))
     await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith(
       expect.stringContaining('could not be opened'), 'info'))
     await waitFor(() => expect(screen.queryByRole('button', {
-      name: 'Confirm exact upgrade to v2',
+      name: 'Confirm upgrade to v2',
     })).not.toBeInTheDocument())
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(mocks.workspaceAddTransform).toHaveBeenCalledTimes(1)
@@ -532,12 +554,12 @@ describe('TransformsLibrary', () => {
       .mockResolvedValueOnce({ items: [entry('v1', 'deleted')], hasMore: false, nextCursor: null })
     render(<TransformsLibrary />)
     fireEvent.click(await screen.findByText('Delete unreferenced version…'))
-    fireEvent.click(screen.getByRole('button', { name: 'Delete exact version' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete version' }))
     await waitFor(() => expect(mocks.deleteTransformVersion).toHaveBeenCalledWith('tr_exact', 'v1'))
     await waitFor(() => expect(mocks.transformLibraryDetail.mock.calls.length).toBeGreaterThan(1))
     expect(mocks.transformLibrary.mock.calls.length).toBeGreaterThan(1)
     expect(await screen.findByText('v1 · deleted')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Use exact v1' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Use v1' })).toBeDisabled()
   })
 
   it('continues a large library only from the server cursor', async () => {

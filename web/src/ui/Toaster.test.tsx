@@ -39,4 +39,23 @@ describe('Toaster', () => {
     expect(recover).toHaveBeenCalledOnce()
     expect(state.dismissToast).toHaveBeenCalledWith('conflict')
   })
+
+  it('announces notifications from a live region that exists before the first one arrives', () => {
+    const { container, rerender } = render(<Toaster />)
+    const stack = container.querySelector('[aria-live="polite"][aria-atomic="false"]')
+    expect(stack).not.toBeNull()
+
+    state.toasts = [{ id: 'run', kind: 'error', msg: 'Run failed: column not found' }]
+    rerender(<Toaster />)
+
+    expect(stack).toContainElement(screen.getByTestId('toast'))
+  })
+
+  it('announces the offline banner', () => {
+    state.kernelUp = false
+    render(<Toaster />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Data Playground is offline')
+    state.kernelUp = true
+  })
 })

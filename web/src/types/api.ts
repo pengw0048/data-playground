@@ -11,6 +11,13 @@ export interface ResourceSpec {
 }
 export interface WorkerInfo { id: string; capacity: ResourceSpec; state: 'idle' | 'busy' | 'down' }
 export interface BackendInfo { name: string; workers: WorkerInfo[] }
+export interface ExecutionTargetInfo {
+  name: string
+  label: string
+  kind: 'interactive' | 'job'
+  description: string
+  substrate?: string | null
+}
 
 export interface CapabilityView { id: string; label: string; viewer: { kind: string } }
 export interface KernelInfo {
@@ -24,6 +31,12 @@ export interface KernelInfo {
   capabilities: string[]
   capabilityViews?: CapabilityView[]  // plugin capabilities that declare a viewer tab (rendered generically)
   backends: BackendInfo[]
+  executionTargets?: ExecutionTargetInfo[]
+  resultStorage?: {
+    id: 'workspace-managed'
+    label: string
+    kind: 'local' | 'object' | 'plugin'
+  }
 }
 
 export interface NativeCanvasDiagnostic {
@@ -94,6 +107,8 @@ export interface CatalogTable {
   description?: string | null
   usage?: number
   metadataRevision?: string | null
+  /** Server-owned capability for atomically deleting one unmanaged local source file. */
+  sourceDeleteAllowed?: boolean
 }
 
 export interface DatasetRevision {
@@ -360,6 +375,10 @@ export interface WorkspaceResource {
   parentId?: string | null
   placementId?: string | null
   version?: number | null
+  /** Canvas document CAS token. Workspace placement mutations continue to use `version`. */
+  canvasVersion?: number | null
+  /** Authoritative modification time when the backing resource exposes one. */
+  updatedAt?: string | null
   /** Stable built-in Catalog folder binding when this local container is a folder projection. */
   catalogFolderId?: string | null
   catalogFolderState?: 'current' | 'detached' | null
@@ -401,9 +420,17 @@ export interface WorkspaceSourceStatus {
   error?: string | null
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
 }
+export interface WorkspaceQueryCapabilities {
+  sort: Array<'name' | 'updated'>
+  kindFilter: boolean
+  reason?: string | null
+}
 export interface WorkspaceBrowsePage {
   container: WorkspaceResource | null
   items: WorkspaceResource[]
+  /** Configured provider roots are explicit source folders, not sortable local children. */
+  connectedSources?: WorkspaceResource[]
+  queryCapabilities?: WorkspaceQueryCapabilities
   nextCursor?: string | null
   hasMore: boolean
   completeness: 'complete' | 'page' | 'partial'
@@ -422,7 +449,9 @@ export interface WorkspaceCanonicalDatasetContext {
   providerDatasetId: string
   /** Placement-independent identity used by the eventual Source admission. */
   datasetIdentity: string
-  readMode: 'exact' | 'current'
+  /** Stable non-sensitive Source URI used for core lineage recorded by Data Playground runs. */
+  sourceUri: string
+  readMode: 'exact' | 'current' | 'lineage'
   revisionId?: string | null
   committedAt?: string | null
   columns: ColumnSchema[]
@@ -570,7 +599,16 @@ export interface Relationship {
 }
 
 export interface LineageNode { id: string; name: string; uri: string; kind: string }
-export interface LineageEdge { parent: string; child: string; factCount: number }
+export interface LineageEdge {
+  parent: string
+  child: string
+  factCount: number
+  /** Provider-reported mapped columns. Empty means the graph has no column-level evidence. */
+  columns?: string[]
+  pipelineNames?: string[]
+  /** Proven by the source. Missing means the relationship count is unknown. */
+  cardinality?: { value: Exclude<Cardinality, 'unknown'>; evidence: 'declared' | 'measured' } | null
+}
 export interface LineageResult { rootUri: string; nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
 
 export interface LineageFieldMapping {
@@ -616,6 +654,7 @@ export interface SampleResult {
   limitReason?: 'preview-scan' | 'interactive-row-budget' | null
   limitScope?: 'each-source' | 'result-window' | null
   sampleProvenance?: SampleProvenance | null
+  parseNotices?: string[]
   previewRef?: string | null
   editorTestInput?: {
     runId: string
@@ -669,7 +708,8 @@ export interface ColumnProfile {
   distinctIsApproximate: boolean
   min?: string | null
   max?: string | null
-  mean?: number | null
+  /** A non-finite mean arrives as the token 'NaN' | 'Infinity' | '-Infinity'. */
+  mean?: number | string | null
 }
 
 export interface ProfileResult {
@@ -814,6 +854,14 @@ export interface RetainedResultIdentity {
   executionManifestSha256: string
   parameterBindings: CanvasParameterBinding[]
   output: RunOutput
+}
+
+export interface CanvasResultRecovery {
+  latestNodeIds: string[]
+  failedNodeIds: string[]
+  staleNodeIds: string[]
+  unknownNodeIds: string[]
+  results: RetainedResultIdentity[]
 }
 
 export interface WriteIntent {

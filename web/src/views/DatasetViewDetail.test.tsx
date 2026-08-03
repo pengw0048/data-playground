@@ -58,8 +58,10 @@ describe('DatasetViewDetail', () => {
     render(<DatasetViewDetail definition={DEFINITION} onClose={onClose} onDeleted={onDeleted} />)
 
     expect(await screen.findByText('grasp')).toBeInTheDocument()
-    expect(screen.getByRole('dialog', { name: 'robot interactions' })).toHaveTextContent('Pinned to the saved revision')
+    expect(screen.getByRole('dialog', { name: 'robot interactions' })).toHaveTextContent('keeps using the saved version')
+    expect(screen.getByRole('dialog', { name: 'robot interactions' })).toHaveTextContent('Reproducible sample · 1,000 rows')
     fireEvent.click(screen.getByRole('button', { name: 'Delete view' }))
+    expect(screen.getByText('Delete this saved view? The underlying dataset and its saved versions are not deleted.')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
     await waitFor(() => expect(mocks.deleteDatasetView).toHaveBeenCalledWith('view-1'))
 
@@ -73,7 +75,7 @@ describe('DatasetViewDetail', () => {
     await waitFor(() => expect(onDeleted).toHaveBeenCalledOnce())
   })
 
-  it('keeps complete dataset and view identities behind closed technical details', async () => {
+  it('keeps the saved version understandable without exposing internal identities', async () => {
     const legacyCoreDefinition = {
       ...DEFINITION,
       datasetRef: { ...DEFINITION.datasetRef, lastKnown: { committedAt: '2026-07-17T12:00:00' } },
@@ -81,19 +83,12 @@ describe('DatasetViewDetail', () => {
     render(<DatasetViewDetail definition={legacyCoreDefinition} onClose={vi.fn()} onDeleted={vi.fn()} />)
 
     expect(await screen.findByText('grasp')).toBeInTheDocument()
-    expect(screen.getByText('Exact dataset revision')).toBeVisible()
+    expect(screen.getByText('Saved dataset version')).toBeVisible()
     expect(screen.getByText(`Committed ${new Date('2026-07-17T12:00:00Z').toLocaleString()}`)).toBeVisible()
-    const details = screen.getByTestId('dataset-view-technical-details')
-    expect(details).not.toHaveAttribute('open')
-    expect(within(details).getByText('dataset-stable')).not.toBeVisible()
-    expect(within(details).getByText('rev-7')).not.toBeVisible()
-
-    fireEvent.click(within(details).getByText('Technical details'))
-    expect(details).toHaveAttribute('open')
-    expect(within(details).getByText('dataset-stable')).toBeVisible()
-    expect(within(details).getByText('rev-7')).toBeVisible()
-    expect(within(details).getByText('a'.repeat(64))).toBeVisible()
-    expect(within(details).getByText('b'.repeat(64))).toBeVisible()
+    expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
+    expect(screen.queryByText('dataset-stable')).not.toBeInTheDocument()
+    expect(screen.queryByText('rev-7')).not.toBeInTheDocument()
+    expect(screen.queryByText('a'.repeat(64))).not.toBeInTheDocument()
   })
 
   it('reports an unavailable exact revision without substituting the current head', async () => {
@@ -101,7 +96,7 @@ describe('DatasetViewDetail', () => {
     render(<DatasetViewDetail definition={DEFINITION} onClose={vi.fn()} onDeleted={vi.fn()} />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This exact revision is no longer available. The view did not substitute the current head.',
+      'This saved version is no longer available. The view did not open a newer version instead.',
     )
     expect(mocks.previewDatasetView).toHaveBeenCalledTimes(1)
   })

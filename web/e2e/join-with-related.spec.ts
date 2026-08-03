@@ -671,7 +671,7 @@ test.describe('Related data and possible key matches', () => {
       registered.push(await focusedResponse.json() as Table & { metadataRevision?: string })
       await seedSourceCanvas(page, canvasId, source)
       await (await sourceRelatedAction(page)).click()
-      const truncation = page.getByText('Results are truncated to a bounded working set. Refine search or folder to inspect omitted datasets.')
+      const truncation = page.getByText('Showing the first matches only. Refine the search or folder to see the rest.')
       await expect(truncation).toBeVisible()
 
       const search = page.getByPlaceholder('Dataset, column, tag…')

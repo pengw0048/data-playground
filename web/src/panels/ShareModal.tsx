@@ -17,8 +17,8 @@ const nativeSelect =
 
 const VISIBILITIES: { value: CanvasVisibility; label: string }[] = [
   { value: 'private', label: 'Private' },
-  { value: 'workspace', label: 'Everyone in workspace' },
-  { value: 'workspace_view', label: 'Everyone in workspace (view-only)' },
+  { value: 'workspace', label: 'Workspace can edit' },
+  { value: 'workspace_view', label: 'Workspace can view' },
 ]
 
 // Share a canvas: workspace visibility + explicit collaborators. Everyone with access can inspect
@@ -28,6 +28,7 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const canvasRole = useStore((s) => s.canvasRole)
   const users = useStore((s) => s.users)
   const currentUser = useStore((s) => s.currentUser)
+  const authEnabled = useStore((s) => s.authEnabled)
   const pushToast = useStore((s) => s.pushToast)
   const isOwner = canvasRole === 'owner'
   const sharing = useCanvasSharing(canvasId, isOwner)
@@ -63,18 +64,18 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
       <DialogContent className="dp-modal-overlay flex w-[460px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <span className="text-muted-foreground"><Icon name="link" size={15} /></span>
-          <DialogTitle className="text-sm font-semibold text-foreground">Share this canvas</DialogTitle>
+          <DialogTitle className="text-sm font-semibold text-foreground">{authEnabled ? 'Share this canvas' : 'Copy Canvas link'}</DialogTitle>
           <span className="flex-1" />
           <button onClick={onClose} aria-label="Close" className="cursor-pointer border-0 bg-transparent p-0 text-muted-foreground hover:text-foreground"><Icon name="close" size={16} /></button>
         </div>
         <div className="flex flex-col gap-3.5 p-4">
-          {sharing.error && (
+          {authEnabled && sharing.error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-[11.5px] text-destructive">
               <span className="min-w-0 flex-1">{sharing.error}</span>
               {sharing.retryable && <Button type="button" variant="outline" size="sm" onClick={sharing.retry} disabled={busy} className="h-6 px-2 text-[10.5px]">Retry</Button>}
             </div>
           )}
-          {sharing.pending && sharing.pending !== 'load' && (
+          {authEnabled && sharing.pending && sharing.pending !== 'load' && (
             <div role="status" className="text-[10.5px] text-muted-foreground">Saving sharing changes…</div>
           )}
           <div>
@@ -90,9 +91,11 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
                   )
                 }}>Copy</Button>
             </div>
-            <div className="mt-1.5 text-[10.5px] text-muted-foreground">Opens this canvas directly. People need workspace access or an explicit invite below.</div>
+            <div className="mt-1.5 text-[10.5px] text-muted-foreground">
+              {authEnabled ? 'Opens this Canvas directly for people who already have access.' : 'Opens this Canvas directly in this Data Playground.'}
+            </div>
           </div>
-          <div>
+          {authEnabled && <div>
             <div className={sectionLabel}>Visibility</div>
             {sharing.visibility === null && sharing.pending === 'load' ? (
               <div className="text-[11.5px] text-muted-foreground">Loading visibility…</div>
@@ -109,8 +112,8 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
               </div>
             )}
             {!isOwner && <div className="mt-1.5 text-[10.5px] text-muted-foreground">Only the canvas owner can change visibility and collaborators.</div>}
-          </div>
-          <div>
+          </div>}
+          {authEnabled && <div>
             <div className={sectionLabel}>Collaborators</div>
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center gap-2 text-[12.5px] text-muted-foreground">
@@ -150,7 +153,7 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
                 </Button>
               </div>
             )}
-          </div>
+          </div>}
         </div>
       </DialogContent>
     </Dialog>

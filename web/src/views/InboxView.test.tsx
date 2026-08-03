@@ -46,17 +46,18 @@ describe('InboxView', () => {
     useStore.setState({ view: 'inbox', inboxQuery: '', jobsQuery: '', toasts: [] } as never)
   })
 
-  it('describes Inbox scope without internal task terminology', () => {
+  it('keeps the Inbox header concise', () => {
     render(<InboxView />)
-    expect(screen.queryByText('Completed background tasks assigned to you')).toBeNull()
-    expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Inbox' })).toBeVisible()
+    expect(screen.queryByText(/background work you started/)).toBeNull()
+    expect(screen.queryByText(/other people/)).toBeNull()
     expect(screen.queryByText(/durable/i)).toBeNull()
   })
 
   it('keeps the empty-state promise limited to background tasks', async () => {
     mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
     render(<InboxView />)
-    expect(await screen.findByText('No completed background tasks yet.')).toBeInTheDocument()
+    expect(await screen.findByText('No notifications yet.')).toBeInTheDocument()
     expect(screen.queryByText(/finished runs/i)).toBeNull()
   })
 
@@ -94,10 +95,12 @@ describe('InboxView', () => {
       nextCursor: null,
     })
     render(<InboxView />)
-    await screen.findByText('external wait deadline')
+    await screen.findByText('Timed out before completion')
     expect(screen.queryByText(/secret|traceback|boom/i)).toBeNull()
     expect(screen.getByRole('button', { name: 'Open job' })).toBeDisabled()
-    expect(screen.getByText('Canvas unavailable')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Open job' })).toHaveAttribute('title', 'The linked Job is no longer available')
+    expect(screen.getByText('Original Canvas unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/Deleted or no longer shared with you/)).toBeVisible()
   })
 
   it('never describes a failed item without a diagnostic as successful', async () => {
@@ -107,17 +110,17 @@ describe('InboxView', () => {
       nextCursor: null,
     })
     render(<InboxView />)
-    expect(await screen.findByText('Work failed')).toBeInTheDocument()
+    expect(await screen.findByText('Job failed')).toBeInTheDocument()
     expect(screen.queryByText('Finished successfully')).toBeNull()
   })
 
-  it('labels every declared task kind for each terminal outcome and diagnoses unknown runtime kinds', async () => {
+  it('labels every declared task kind without exposing unknown runtime kinds', async () => {
     const kinds = [
-      ['managed_local_write', 'Managed local write'],
-      ['external_wait', 'External wait'],
-      ['linear_checkpoint_write', 'Checkpointed write'],
-      ['bounded_fanout_write', 'Bounded fan-out write'],
-      ['merge_columns_write', 'Merge columns write'],
+      ['managed_local_write', 'Write dataset'],
+      ['external_wait', 'Wait'],
+      ['linear_checkpoint_write', 'Checkpoint'],
+      ['bounded_fanout_write', 'Batch write'],
+      ['merge_columns_write', 'Merge columns'],
     ] as const
     const outcomes = ['completed', 'failed', 'cancelled'] as const
     const rows = kinds.flatMap(([taskKind, label]) => outcomes.map((outcome) => item({
@@ -144,7 +147,7 @@ describe('InboxView', () => {
           ? 'Failed' : 'Cancelled')).toBeInTheDocument()
       }
     }
-    expect(within(screen.getByTestId('inbox-item-future-kind')).getByText('Unknown task type: future_task_kind')).toBeInTheDocument()
+    expect(within(screen.getByTestId('inbox-item-future-kind')).getByText('Other job')).toBeInTheDocument()
   })
 
   it('keeps a locally read item read when a stale list response arrives', async () => {
@@ -291,14 +294,14 @@ describe('InboxView', () => {
     })], hasMore: false, nextCursor: null })
     render(<InboxView />)
     await screen.findByText('Sensor upserts')
-    expect(screen.getByText('Keyed upsert')).toBeInTheDocument()
+    expect(screen.getByText('Update dataset')).toBeInTheDocument()
     expect(screen.getByText('Revision upserted')).toBeInTheDocument()
     expect(screen.queryByText('Dataset ds-logical-7')).toBeNull()
     expect(screen.queryByText(/authorization revoked/i)).toBeNull()
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',
-      '#/workspace/dataset%3Ads-logical-7?scope=datasets&revision=rev-7&revisionDataset=ds-logical-7&returnView=inbox&returnQuery=filter%3Dunread',
+      '#/workspace/dataset%3Ads-logical-7?revision=rev-7&revisionDataset=ds-logical-7&returnView=inbox&returnQuery=filter%3Dunread',
     )
   })
 

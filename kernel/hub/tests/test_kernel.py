@@ -215,6 +215,11 @@ def test_kernel_info():
     assert "duckdb" in info["adapters"] and "lance" in info["adapters"]
     assert info["runners"] == ["local-out-of-core", "local-subprocess", "kernel"]
     assert {"media", "vector"} <= set(info["capabilities"])
+    assert info["resultStorage"] == {
+        "id": "workspace-managed",
+        "label": "Local workspace",
+        "kind": "local",
+    }
 
 
 def test_nodes_endpoint():
@@ -1686,6 +1691,37 @@ def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tm
 # --------------------------------------------------------------------------- #
 # Regression tests for adversarial-acceptance findings
 # --------------------------------------------------------------------------- #
+def test_naive_timestamps_bind_to_utc_not_the_host_timezone(tmp_path):
+    """One file, one answer: a naive timestamp is UTC everywhere, and the tz label says UTC."""
+    import json
+    import subprocess
+    import sys
+
+    from hub import db
+    csv = tmp_path / "timestamps.csv"
+    csv.write_text("id,t\n1,2026-01-02T03:04:05\n2,2026-06-15T22:30:00+09:00\n")
+    g = {"id": "tz", "version": 1, "nodes": [N("s", "source", {"uri": str(csv)})], "edges": []}
+    expected = ["2026-01-02T03:04:05+00:00", "2026-06-15T13:30:00+00:00"]
+
+    body = client.post("/api/run/preview", json={"graph": g, "nodeId": "s", "k": 10}).json()
+    assert [r["t"] for r in body["rows"]] == expected
+    assert [c["physicalType"] for c in body["columns"] if c["name"] == "t"] == ["timestamp[us, tz=UTC]"]
+    with db.run_scope():  # a cursor does not inherit the base connection's timezone
+        assert db.conn().execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+
+    script = (
+        "import json\n"
+        "from fastapi.testclient import TestClient\n"
+        "from hub.main import app\n"
+        f"body = TestClient(app).post('/api/run/preview', json={{'graph': {g!r}, 'nodeId': 's', 'k': 10}}).json()\n"
+        "print(json.dumps([r['t'] for r in body['rows']]))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, timeout=120,
+                         env={**os.environ, "TZ": "Asia/Tokyo"})
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == expected
+
+
 def test_aggregate_keeps_group_key():
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
@@ -1966,6 +2002,114 @@ def test_high_precision_decimal_previews_exactly():
     row = _table_to_rows(tbl)[0]
     assert row["big"] == "12345678901234567.123456789"        # exact string, not a rounded float
     assert isinstance(row["price"], float) and row["price"] == 9.99  # small decimal stays numeric
+
+
+def test_out_of_range_integers_serialize_as_exact_digits():
+    # JSON.parse rounds any integer past 2^53, so an int64/uint64 outside that range must reach the
+    # browser as its exact digits; everything the browser can hold exactly stays a JSON number.
+    import pyarrow as pa
+    from hub.executors.engine import _table_to_rows
+    tbl = pa.table({
+        "i64": pa.array([9223372036854775807, 9223372036854775806, -9223372036854775808,
+                         9007199254740991, -9007199254740991, 42, None], type=pa.int64()),
+        "u64": pa.array([18446744073709551615, 18446744073709551614, 9007199254740992,
+                         9007199254740991, 0, 7, None], type=pa.uint64()),
+    })
+    rows = _table_to_rows(tbl)
+    assert [r["i64"] for r in rows] == [
+        "9223372036854775807", "9223372036854775806", "-9223372036854775808",
+        9007199254740991, -9007199254740991, 42, None,
+    ]
+    assert [r["u64"] for r in rows] == [
+        "18446744073709551615", "18446744073709551614", "9007199254740992",
+        9007199254740991, 0, 7, None,
+    ]
+    assert rows[0]["i64"] != rows[1]["i64"]  # neighbouring int64s stay distinguishable
+    assert _table_to_rows(pa.table({"b": pa.array([True, False])})) == [{"b": True}, {"b": False}]
+
+
+def test_large_integer_preview_matches_the_stats_tab(tmp_path):
+    # Stats and the Rows grid must show the same digits for one column, and it stays typed as an int.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = str(tmp_path / "bigints.parquet")
+    pq.write_table(pa.table({"id": pa.array(
+        [9223372036854775807, 9223372036854775806, 42, 42], type=pa.int64())}), path)
+    graph = {"id": "bigints", "version": 1, "nodes": [
+        N("src", "source", {"uri": path}),
+        N("dedup", "dedup", {"on": ""}),
+    ], "edges": [E("src", "dedup")]}
+
+    preview = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "dedup", "k": 50}).json()
+    assert preview["columns"][0]["type"] == "int"        # still an integer → the grid right-aligns it
+    ids = {row["id"] for row in preview["rows"]}
+    assert ids == {"9223372036854775807", "9223372036854775806", 42}, preview["rows"]
+
+    profile = client.post("/api/run/profile", json={"graph": graph, "nodeId": "src"}).json()
+    stats = profile["columns"][0]
+    assert (stats["min"], stats["max"], stats["distinct"]) == ("42", "9223372036854775807", 3)
+    assert stats["max"] in ids
+
+
+NON_FINITE_CSV = b"id,ratio\n1,1.5\n2,Infinity\n3,-Infinity\n4,NaN\n"
+
+
+def test_non_finite_floats_preview_as_tokens_not_nulls():
+    # JSON has no number form for +/-Infinity and NaN. Serializing them as null told the user the file
+    # had missing data it does not have, so "drop the nulls" silently discarded blown-up values.
+    import pyarrow as pa
+    from hub.executors.engine import _table_to_rows
+    row = _table_to_rows(pa.table({
+        "ratio": pa.array([float("inf")], type=pa.float64()),
+        "drop": pa.array([float("-inf")], type=pa.float64()),
+        "mean": pa.array([float("nan")], type=pa.float64()),
+        "embedding": pa.array([[1.0, float("nan")]], type=pa.list_(pa.float64())),
+    }))[0]
+    assert row == {"ratio": "Infinity", "drop": "-Infinity", "mean": "NaN",
+                   "embedding": [1.0, "NaN"]}
+
+    t = _upload("nonfinite.csv", NON_FINITE_CSV).json()
+    sampled = client.post("/api/data/sample", json={"uri": t["uri"], "k": 10}).json()
+    assert [r["ratio"] for r in sampled["rows"]] == [1.5, "Infinity", "-Infinity", "NaN"]
+
+
+def test_canvas_preview_of_non_finite_floats_is_not_a_kernel_error():
+    # The kernel's /preview returns a plain dict, which FastAPI encodes with allow_nan=False — one NaN
+    # cell failed the whole response and the canvas blamed the (healthy) kernel for a data condition.
+    from fastapi import FastAPI
+
+    from hub.executors.preview import preview_node
+    from hub.models import Graph
+
+    t = _upload("nonfinite-canvas.csv", NON_FINITE_CSV).json()
+    g = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": t["uri"]})], "edges": []}
+    deps = get_deps()
+    kernel = FastAPI()
+
+    @kernel.post("/preview")
+    def _kernel_preview():
+        return preview_node(Graph(**g), "src", 10, deps.resolve_adapter, deps.registry,
+                            deps.node_builders, deps.node_specs, storage=deps.storage).model_dump()
+
+    kernel_reply = TestClient(kernel, raise_server_exceptions=False).post("/preview")
+    assert kernel_reply.status_code == 200, "kernel /preview must encode non-finite floats"
+    assert [r["ratio"] for r in kernel_reply.json()["rows"]] == [1.5, "Infinity", "-Infinity", "NaN"]
+
+    hub_reply = client.post("/api/run/preview", json={"graph": g, "nodeId": "src", "k": 10})
+    assert hub_reply.status_code == 200, hub_reply.text
+    assert not hub_reply.json()["error"] and not hub_reply.json()["notPreviewable"]
+
+
+def test_profile_reports_non_finite_stats():
+    t = _upload("nonfinite-stats.csv", NON_FINITE_CSV).json()
+    g = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": t["uri"]})], "edges": []}
+    r = client.post("/api/run/profile", json={"graph": g, "nodeId": "src"})
+    assert r.status_code == 200, r.text
+    ratio = next(c for c in r.json()["columns"] if c["name"] == "ratio")
+    assert (ratio["min"], ratio["max"], ratio["mean"]) == ("-Infinity", "Infinity", "NaN")
+    assert ratio["nulls"] == 0
 
 
 def test_plugin_run_applies_lowering(tmp_path):
@@ -2397,6 +2541,37 @@ def test_default_execution_is_the_per_canvas_kernel(tmp_path, monkeypatch):
         assert d.pick_runner(plan).name == "local-out-of-core"       # explicit choice wins over the default
     finally:
         metadb.set_setting("backend", "", scope="global")
+
+
+def test_canvas_execution_target_overrides_defaults_and_fails_closed(tmp_path):
+    import types
+
+    from hub import metadb
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    plan = types.SimpleNamespace(acyclic=True)
+    metadb.set_setting("backend", "local-out-of-core", scope="global")
+    try:
+        assert d.pick_runner(plan, "alice", "local-subprocess").name == "local-subprocess"
+        with pytest.raises(ValueError, match="not configured"):
+            d.pick_runner(plan, "alice", "missing-runner")
+        with pytest.raises(ValueError, match="cannot run this graph"):
+            d.pick_runner(types.SimpleNamespace(acyclic=False), "alice", "local-subprocess")
+    finally:
+        metadb.set_setting("backend", "", scope="global")
+
+
+def test_kernel_info_describes_only_registered_canvas_execution_targets(tmp_path):
+    from hub.deps import Deps
+
+    d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+    targets = {target.name: target for target in d.info().execution_targets}
+    assert set(targets) == {runner.name for runner in d.runners}
+    assert targets["kernel"].label == "Canvas worker"
+    assert targets["kernel"].kind == "interactive"
+    assert targets["kernel"].substrate == "local-process"
+    assert targets["local-subprocess"].kind == "job"
 
 
 def test_sandbox_blocks_dunder_escape():
@@ -3093,6 +3268,23 @@ def test_output_version_is_content_addressed_and_flags_schema_drift(tmp_path, ca
     assert any("schema changed" in r.getMessage() for r in caplog.records), "schema drift must be surfaced"
 
 
+def test_restart_recovery_preserves_an_existing_output_display_name(tmp_path):
+    import duckdb
+    from hub.deps import Deps
+
+    workspace = str(tmp_path / "ws")
+    data_dir = str(tmp_path / "data")
+    first = Deps(workspace, data_dir)
+    uri = first.storage.output_uri("support-tickets-a1b2c3", ".parquet")
+    duckdb.connect().execute(f"COPY (SELECT 1 AS id) TO '{uri}' (FORMAT PARQUET)")
+    first.catalog.register_output(
+        name="support_tickets", uri=uri, parents=[], pipeline="upload")
+
+    restarted = Deps(workspace, data_dir)
+
+    assert restarted.catalog.get_table(uri).name == "support_tickets"
+
+
 def test_catalog_output_receipt_attests_exact_unmanaged_version(tmp_path):
     from hub import metadb
 
@@ -3476,6 +3668,93 @@ def test_source_csv_parse_options(tmp_path):
         assert auto.columns == ["a", "b"] and auto.aggregate("count(*)").fetchone()[0] == 2
         opt = a.scan(p, options={"delimiter": ";", "header": "no"})  # explicit: no header → 3 data rows
         assert opt.columns == ["column0", "column1"] and opt.aggregate("count(*)").fetchone()[0] == 3
+
+
+def test_ambiguous_csv_date_order_is_disclosed_and_overridable(tmp_path):
+    # 01/02/2026 has two equally valid readings. DuckDB's sniffer silently picks day-first, so the
+    # preview must say which order it used and the Source must be able to choose the other one.
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter, csv_date_order_notices
+    p = str(tmp_path / "orders.csv")
+    with open(p, "w") as f:
+        f.write("id,order_date\n1,01/02/2026\n2,03/04/2026\n3,05/06/2026\n")
+    a = DuckDBAdapter()
+    with db.lock():
+        assert [str(row[1]) for row in a.scan(p).fetchall()] == ["2026-02-01", "2026-04-03", "2026-06-05"]
+        notice = csv_date_order_notices(p)
+        assert len(notice) == 1, notice
+        assert "order_date" in notice[0] and "day-first" in notice[0] and "%d/%m/%Y" in notice[0]
+        assert "01/02/2026 became 2026-02-01" in notice[0] and "month-first" in notice[0]
+
+        us = a.scan(p, options={"dateOrder": "month-first"})
+        assert [str(row[1]) for row in us.fetchall()] == ["2026-01-02", "2026-03-04", "2026-05-06"]
+        assert csv_date_order_notices(p, {"dateOrder": "month-first"}) == []
+
+
+def test_csv_date_order_notice_probe_obeys_the_shared_local_root(tmp_path, monkeypatch):
+    from hub import paths
+    from hub.plugins.adapters import csv_date_order_notices
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "inside.csv"
+    outside = tmp_path / "outside.csv"
+    body = "id,order_date\n1,01/02/2026\n2,03/04/2026\n"
+    inside.write_text(body)
+    outside.write_text(body)
+    monkeypatch.setattr(paths.auth, "auth_enabled", lambda: True)
+    monkeypatch.setattr(paths, "allowed_roots", lambda: [str(allowed.resolve())])
+
+    assert csv_date_order_notices(str(inside))
+    with pytest.raises(PermissionError, match="outside the allowed roots"):
+        csv_date_order_notices(str(outside))
+
+
+def test_unambiguous_csv_dates_read_unchanged_and_silently(tmp_path):
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter, csv_date_order_notices
+    files = {
+        "iso.csv": "id,dt\n1,2026-01-02\n2,2026-03-04\n",
+        "dmy.csv": "id,dt\n1,13/04/2026\n2,25/06/2026\n",
+        "mdy.csv": "id,dt\n1,04/13/2026\n2,06/25/2026\n",
+        "text.csv": "id,dt\nhello,world\n",
+    }
+    a = DuckDBAdapter()
+    with db.lock():
+        for name, body in files.items():
+            p = str(tmp_path / name)
+            with open(p, "w") as f:
+                f.write(body)
+            assert csv_date_order_notices(p) == [], name
+        dmy = str(tmp_path / "dmy.csv")
+        assert [str(row[1]) for row in a.scan(dmy).fetchall()] == ["2026-04-13", "2026-06-25"]
+        # Forcing the reading the file contradicts refuses instead of degrading the column to text.
+        with pytest.raises(ValueError, match="month-first"):
+            a.scan(dmy, options={"dateOrder": "month-first"})
+
+
+def test_preview_discloses_the_guessed_csv_date_order(tmp_path):
+    p = str(tmp_path / "orders.csv")
+    with open(p, "w") as f:
+        f.write("id,order_date\n1,01/02/2026\n2,03/04/2026\n")
+    graph = {
+        "id": f"date-order-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [{"id": "s", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"uri": p}}}],
+        "edges": [],
+    }
+    response = client.post("/api/run/preview", json={"graph": graph, "nodeId": "s"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [row["order_date"] for row in body["rows"]] == ["2026-02-01", "2026-04-03"]
+    assert len(body["parseNotices"]) == 1, body["parseNotices"]
+    assert "day-first (%d/%m/%Y)" in body["parseNotices"][0]
+
+    graph["nodes"][0]["data"]["config"]["dateOrder"] = "month-first"
+    corrected = client.post("/api/run/preview", json={"graph": graph, "nodeId": "s"})
+    assert corrected.status_code == 200, corrected.text
+    assert [row["order_date"] for row in corrected.json()["rows"]] == ["2026-01-02", "2026-03-04"]
+    assert corrected.json()["parseNotices"] == []
 
 
 def test_overwrite_is_atomic_and_preserves_old_data_on_failure(tmp_path):
@@ -4084,7 +4363,10 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
 
 
 def test_canvas_crud_is_per_user():
-    doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
+    doc = {
+        "id": "cv1", "name": "My Canvas", "version": 3,
+        "executionBackend": "local-subprocess", "nodes": [], "edges": [],
+    }
     r = client.put("/api/canvas/cv1", json=doc).json()
     assert r == {"ok": True, "id": "cv1", "version": 1}
     listing = client.get("/api/canvas").json()
@@ -11759,7 +12041,7 @@ def test_catalog_missing_flag_and_unregister(tmp_path):
 
 def test_chart_node_produces_series():
     # F37 (charting): the chart node builds an (x, y) series — grouped agg(y) by x (bar/line), or
-    # raw x,y points (scatter). Grouped charts require a durable full run; raw points stay bounded-previewable.
+    # raw x,y points (scatter). Charts always use a durable full run so the visible shape is complete.
     ev = _uri("events")
 
     def chart_graph(cfg):
@@ -11776,9 +12058,25 @@ def test_chart_node_produces_series():
     _, grouped = _full_result(chart_graph({"chartType": "bar", "x": "event", "agg": "count"}), "ch", 50)
     assert {c["name"] for c in grouped["columns"]} == {"x", "y"}
     assert {r["x"] for r in grouped["rows"]} == {"view", "click", "purchase", "signup"}
-    scatter = chart({"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"})
+    _, automatic = _full_result(chart_graph({"chartType": "bar", "agg": "count"}), "ch", 50)
+    assert {r["x"] for r in automatic["rows"]} == {"view", "click", "purchase", "signup"}
+    assert all(isinstance(r["y"], (int, float)) for r in automatic["rows"])
+    scatter_cfg = {"chartType": "scatter", "x": "user_id", "y": "amount", "agg": "none"}
+    assert chart(scatter_cfg).get("notPreviewable")
+    _, scatter = _full_result(chart_graph(scatter_cfg), "ch", 50)
     assert {c["name"] for c in scatter["columns"]} == {"x", "y"} and scatter["rows"]
-    assert chart({"chartType": "bar", "agg": "count"}).get("notPreviewable")       # no X → honest refusal
+    expression_cfg = {
+        "chartType": "scatter", "agg": "none",
+        "xMode": "expression", "x": "user_id + 1",
+        "yMode": "expression", "y": "amount * 2",
+    }
+    assert chart(expression_cfg).get("notPreviewable")
+    _, expression = _full_result(chart_graph(expression_cfg), "ch", 50)
+    assert expression["rows"][:2] == [{"x": 1, "y": 0.0}, {"x": 2, "y": 3.0}]
+    assert chart({
+        "chartType": "scatter", "agg": "none",
+        "xMode": "expression", "x": "user_id FROM secret", "y": "amount",
+    }).get("notPreviewable")
     assert chart({"chartType": "bar", "x": "event", "agg": "sum"}).get("notPreviewable")  # sum needs a Y (not silent count)
     minmax = chart({"chartType": "bar", "x": "event", "y": "event", "agg": "max"})  # max of a TEXT column
     assert minmax.get("notPreviewable")
@@ -11786,6 +12084,26 @@ def test_chart_node_produces_series():
         chart_graph({"chartType": "bar", "x": "event", "y": "event", "agg": "max"}), "ch", 50,
     )
     assert not minmax_result.get("error")  # TRY_CAST → NULL y, not a raw ConversionException
+
+
+def test_chart_counts_all_rows_when_only_binary_and_identifier_fields_exist(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "provider-images.parquet"
+    pq.write_table(pa.table({
+        "image_res_2048": [b"first", b"second"],
+        "source_rowid": [10, 11],
+        "_rowid": [20, 21],
+    }), source)
+    graph = {"id": "chart-provider-images", "version": 1, "nodes": [
+        N("source", "source", {"uri": str(source)}),
+        N("chart", "chart", {"chartType": "bar", "agg": "count"}),
+    ], "edges": [E("source", "chart")]}
+
+    _, result = _full_result(graph, "chart", 50)
+
+    assert result["rows"] == [{"x": "All rows", "y": 2.0}]
 
 
 def test_grouped_chart_keeps_all_groups_while_interactive_view_is_capped(tmp_path, monkeypatch):

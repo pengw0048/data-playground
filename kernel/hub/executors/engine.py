@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
@@ -43,6 +44,7 @@ from hub.sqlpolicy import (
     validate_identifier_alias,
     validate_identifier_schema,
     validate_query,
+    validate_value_expression,
 )
 from hub.sdk import ExactSourceRowRestriction, NodePreparation, UnsupportedUpstreamError, ctx
 
@@ -1580,29 +1582,47 @@ class BuildEngine:
             )
 
         if t == "chart":
-            x, y, agg = cfg.get("x"), cfg.get("y"), cfg.get("agg", "count")  # default matches nodespec/UI
-            if not x:
-                raise NotPreviewable(node, "pick an X column to chart")
-            if agg == "none" and not y:
-                raise NotPreviewable(node, "pick a Y column (or an aggregation) to chart")
-            if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
-                raise NotPreviewable(node, f"pick a Y column to {agg}")
-            if agg != "none" and not self.full:
+            base = parent
+            agg = str(cfg.get("agg", "count"))  # default matches nodespec/UI
+            x_mode = str(cfg.get("xMode", "column"))
+            y_mode = str(cfg.get("yMode", "column"))
+            x = str(cfg.get("x") or "").strip()
+            y = str(cfg.get("y") or "").strip()
+            if x_mode == "column" and not x:
+                x = _default_chart_dimension(base)
+            if agg != "count" and y_mode == "column" and not y:
+                y = _default_chart_measure(base, exclude=x)
+            # A chart is a complete-result view, not a sample of a visualization. Sampling can change
+            # category counts, line shape, and extrema, so every chart uses the durable run lifecycle.
+            if not self.full:
                 raise NotPreviewable(
                     node,
-                    "This grouped chart needs all input rows. Run this step to compute its series.",
+                    "Charts use all input rows. Run this step to calculate the chart.",
                     suggested_action="run",
                 )
-            base = parent
-            x = identifier(x, base.columns, label="chart X column")
-            if y:
-                y = identifier(y, base.columns, label="chart Y column")
-            v, xq = self._view(base, "ch"), quote_identifier(x)
+            ungrouped_count = agg == "count" and x_mode == "column" and not x
+            if not x and not ungrouped_count:
+                raise NotPreviewable(node, "Connect data with a chartable column, or enter an X SQL expression.")
+            if agg == "none" and not y:
+                raise NotPreviewable(node, "Choose a numeric Y column, or enter a Y SQL expression.")
+            if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
+                raise NotPreviewable(node, f"Choose a numeric Y value to {agg}.")
+            try:
+                xq = _chart_axis_expression(base, x, x_mode, label="X") if x else None
+                yq = _chart_axis_expression(base, y, y_mode, label="Y") if y else None
+            except (SQLPolicyError, duckdb.Error, ValueError) as exc:
+                axis = "SQL expression" if "expression" in (x_mode, y_mode) else "field selection"
+                raise NotPreviewable(node, f"Fix the chart {axis} before running it.") from exc
+            v = self._view(base, "ch")
+            if ungrouped_count:
+                return db.conn().sql(
+                    f"SELECT 'All rows' AS x, count(*)::DOUBLE AS y FROM {quote_identifier(v)}"
+                )
             if agg == "none":  # raw points (scatter/line) — the chart series is x,y as-is
                 return db.conn().sql(
-                    f"SELECT {xq} AS x, {quote_identifier(y)} AS y FROM {quote_identifier(v)}"
+                    f"SELECT {xq} AS x, {yq} AS y FROM {quote_identifier(v)}"
                 )
-            yexpr = "count(*)" if agg == "count" or not y else f"{_agg_name(agg)}({quote_identifier(y)})"
+            yexpr = "count(*)" if agg == "count" or not yq else f"{_agg_name(agg)}({yq})"
             # Grouped series is a real dataset output, so the durable artifact must retain every group.
             # The interactive chart renderer owns its explicit 2,000-point display budget; imposing the
             # cap here would silently make both downstream nodes and full-result exports incomplete.
@@ -1994,6 +2014,28 @@ def _conform(tbl: "pa.Table", schema: "pa.Schema", node) -> "pa.Table":
                              f"safely reconciled ({detail or e}); a transform must emit one schema") from e
 
 
+_JS_SAFE_INT = 2**53 - 1  # Number.MAX_SAFE_INTEGER
+
+
+def json_float(value: float) -> float | str:
+    """A float on the wire: JSON has no number form for the non-finite ones, so ship the exact token
+    (`Infinity` / `-Infinity` / `NaN`) rather than a null that reads as missing data."""
+    if math.isfinite(value):
+        return value
+    return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+
+
+def _json_floats(value):
+    """json_float over every float in a cell, including inside a list/struct column."""
+    if isinstance(value, float):
+        return json_float(value)
+    if isinstance(value, list):
+        return [_json_floats(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_floats(v) for k, v in value.items()}
+    return value
+
+
 def _table_to_rows(table_or_rows) -> list[dict]:
     import decimal
     rows = table_or_rows if isinstance(table_or_rows, list) else table_or_rows.to_pylist()
@@ -2005,10 +2047,16 @@ def _table_to_rows(table_or_rows) -> list[dict]:
                 # disagrees with the exact value the run writes to parquet (faithful preview).
                 fv = float(v)
                 r[k] = fv if decimal.Decimal(repr(fv)) == v else str(v)
+            elif isinstance(v, int) and not -_JS_SAFE_INT <= v <= _JS_SAFE_INT:
+                # same rule for integers: a number while the browser can hold it exactly, else the
+                # exact digits as a string — JSON.parse rounds anything past 2^53 to a double.
+                r[k] = str(v)
             elif isinstance(v, (bytes, bytearray)):
                 r[k] = f"<{len(v)} bytes>"
             elif hasattr(v, "isoformat"):
                 r[k] = v.isoformat()
+            elif isinstance(v, (float, list, dict)):
+                r[k] = _json_floats(v)
     return rows
 
 
@@ -2024,6 +2072,66 @@ def _agg_name(agg: str) -> str:
     if a not in _AGG_ALLOWED:
         raise ValueError(f"unsupported aggregate '{agg}' (allowed: {', '.join(sorted(_AGG_ALLOWED))})")
     return {"mean": "avg"}.get(a, a)
+
+
+_CHART_NESTED_OR_BINARY = re.compile(r"(?:LIST|ARRAY|STRUCT|MAP|UNION|BLOB|BIT)", re.I)
+_CHART_NUMERIC = re.compile(
+    r"(?:U?INT(?:8|16|32|64|128)?|TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC)",
+    re.I,
+)
+_CHART_TEMPORAL = re.compile(r"(?:DATE|TIME|TIMESTAMP|INTERVAL)", re.I)
+_CHART_CATEGORICAL = re.compile(r"(?:VARCHAR|CHAR|TEXT|ENUM|BOOL)", re.I)
+_CHART_ID_LIKE = re.compile(r"(?:^id$|_id$|^uuid$|row_?id|index$)", re.I)
+_CHART_MEASURE_LIKE = re.compile(
+    r"(?:amount|value|score|total|price|revenue|cost|duration|latency|size|width|height|rate|count)",
+    re.I,
+)
+
+
+def _chart_fields(relation: Relation) -> list[tuple[str, str]]:
+    return [
+        (str(name), str(field_type))
+        for name, field_type in zip(relation.columns, relation.types)
+        if not _CHART_NESTED_OR_BINARY.search(str(field_type))
+    ]
+
+
+def _default_chart_dimension(relation: Relation) -> str:
+    fields = _chart_fields(relation)
+    return next((name for name, field_type in fields
+                 if _CHART_CATEGORICAL.search(field_type) and not _CHART_ID_LIKE.search(name)), None) \
+        or next((name for name, field_type in fields if _CHART_TEMPORAL.search(field_type)), None) \
+        or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
+        or ""
+
+
+def _default_chart_measure(relation: Relation, *, exclude: str = "") -> str:
+    fields = [(name, field_type) for name, field_type in _chart_fields(relation)
+              if name != exclude and _CHART_NUMERIC.search(field_type)]
+    return next((name for name, _field_type in fields
+                 if _CHART_MEASURE_LIKE.search(name) and not _CHART_ID_LIKE.search(name)), None) \
+        or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
+        or ""
+
+
+def _chart_axis_expression(relation: Relation, value: str, mode: str, *, label: str) -> str:
+    if mode not in {"column", "expression"}:
+        raise ValueError(f"unsupported chart {label} mode")
+    if mode == "column":
+        column = identifier(value, relation.columns, label=f"chart {label} column")
+        field_type = str(relation.types[relation.columns.index(column)])
+        if _CHART_NESTED_OR_BINARY.search(field_type):
+            raise SQLPolicyError(f"chart {label} column must contain scalar values")
+        return quote_identifier(column)
+    if not value:
+        raise SQLPolicyError(f"chart {label} expression is empty")
+    validated = validate_value_expression(value, con=db.conn())
+    # Bind against the real input schema without reading rows. This catches unknown columns,
+    # aggregates/window expressions in a per-row slot, and expressions that return nested values.
+    probe = relation.project(f"({validated.sql}) AS {quote_identifier('__dp_chart_axis')}")
+    if len(probe.columns) != 1 or _CHART_NESTED_OR_BINARY.search(str(probe.types[0])):
+        raise SQLPolicyError(f"chart {label} expression must return one scalar value")
+    return f"({validated.sql})"
 
 
 def _ident(col: str) -> str:

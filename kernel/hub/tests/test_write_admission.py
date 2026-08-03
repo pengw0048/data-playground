@@ -117,7 +117,7 @@ def lance_contract(tmp_path):
         registry=ProcessorRegistry(), node_builders={},
         node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
         node_ir={}, runners=[], runner=runner_capability,
-        pick_runner=lambda _plan, _uid: runner_capability,
+        pick_runner=lambda _plan, _uid, _requested=None: runner_capability,
     )
     try:
         yield lance, deps, graph, table
@@ -516,6 +516,83 @@ def test_direct_run_returns_the_same_name_error_before_run_allocation(
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
+def test_rejected_submission_is_kept_in_run_history_and_jobs(contract, monkeypatch):
+    deps, graph, _admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [{"name": "replacement", "type": "int", "nullable": True}],
+    )
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    response = TestClient(app).post(
+        "/api/run",
+        headers={"X-DP-User": "researcher"},
+        json={
+            "graph": graph.model_dump(by_alias=True, mode="json"),
+            "targetNodeId": "write",
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    history = metadb.list_runs(str(graph.id))
+    assert [(row["status"], row["runId"], row["targetNodeId"], row["outputs"]) for row in history] \
+        == [("failed", None, "write", [])]
+    assert history[0]["error"] == response.json()["detail"]
+    assert [item["id"] for item in metadb.list_workspace_runs("researcher")["items"]] \
+        == [history[0]["id"]]
+
+
+def test_confirmation_gate_is_not_recorded_as_a_failed_run(contract, monkeypatch):
+    _deps, graph = contract
+
+    def needs_confirm(*_args, **_kwargs):
+        raise run_routes.RunNeedsConfirm(
+            RunEstimate(rows=10_000_000, placement="local", needs_confirm=True))
+
+    monkeypatch.setattr(run_routes, "start_run", needs_confirm)
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+    })
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == APIErrorCode.RUN_CONFIRMATION_REQUIRED
+    assert metadb.list_runs(str(graph.id)) == []
+
+
+def test_internal_submission_failure_does_not_fabricate_a_run_record(contract, monkeypatch):
+    _deps, graph = contract
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes, "start_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("backend receipt lost")),
+    )
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    with pytest.raises(RuntimeError, match="backend receipt lost"):
+        run_routes.run(run_routes.RunRequest(
+            graph=graph.model_dump(by_alias=True, mode="json"),
+            targetNodeId="write",
+        ), uid="researcher")
+
+    assert metadb.list_runs(str(graph.id)) == []
+
+
 @pytest.mark.parametrize("failed_probe", ["runner_adapter", "controller_ownership"])
 def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers(
         contract, monkeypatch, failed_probe):
@@ -564,7 +641,7 @@ def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers
     deps.runner = runner
     deps.runners = []
     deps.node_ir = {}
-    deps.pick_runner = lambda _plan, _uid: runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: runner
     deps.controller = controller
     monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
     before_head = metadb.catalog_managed_local_write_head(create.destination)
@@ -832,7 +909,7 @@ def test_replace_fails_closed_when_exact_head_schema_metadata_is_corrupt(
     assert admission.intent is None
     assert admission.expected_head is not None
     assert admission.blocker == \
-        "the exact destination head has no valid retained schema metadata"
+        "the destination's saved schema is unavailable"
 
 
 def test_structural_drift_requires_the_displayed_admission_before_allocation(
@@ -959,7 +1036,7 @@ def test_unsubmitted_replace_consumes_the_probed_head_and_loses_a_dispatch_race(
     deps.runner = runner
     deps.runners = []
     deps.node_ir = {}
-    deps.pick_runner = lambda _plan, _uid: runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: runner
     deps.controller = Controller()
     deps.run_index = {}
     deps.run_owner = {}
@@ -1459,7 +1536,7 @@ def test_unknown_destination_admission_api_returns_the_typed_envelope(contract, 
 def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):
     deps, graph = contract
     deps.runner = SimpleNamespace(supports_managed_local_write_intents=lambda: True)
-    deps.pick_runner = lambda _plan, _uid: object()
+    deps.pick_runner = lambda _plan, _uid, _requested=None: object()
     deps.runners = []
     deps.node_ir = {}
 
@@ -1474,7 +1551,7 @@ def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):
 def test_runner_without_typed_write_capability_is_not_mislabeled_managed(contract):
     deps, graph = contract
     deps.runner = object()
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     deps.runners = []
     deps.node_ir = {}
 
@@ -1568,12 +1645,13 @@ def test_write_admission_requires_a_registered_exact_input_and_recovers_after_re
     with pytest.raises(run_routes.APIError) as excinfo:
         run_routes._resolve_local_run_manifest(graph, "write", deps)
     assert excinfo.value.status_code == 410
-    assert excinfo.value.detail == "local_run_input_revision_unavailable"
+    assert excinfo.value.detail == (
+        "The pinned version of an input dataset is no longer available.")
 
     deps.node_ir = {}
     deps.runner = SimpleNamespace(estimate=lambda *_args: RunEstimate(
         rows=2, bytes=10, placement="local", needs_confirm=False))
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     estimate = TestClient(app).post("/api/run/estimate", json={
         "graph": payload, "targetNodeId": "source",
     })
@@ -1594,7 +1672,7 @@ def test_write_admission_requires_a_registered_exact_input_and_recovers_after_re
     assert admission.exact_run_readiness is not None
     assert admission.exact_run_readiness.ready is True
     assert admission.intent is not None
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     ready_estimate = TestClient(app).post("/api/run/estimate", json={
         "graph": payload, "targetNodeId": "source",
     })
@@ -2385,14 +2463,14 @@ def test_lance_append_admission_rejects_stale_head_and_one_of_two_admissions(
 def test_lance_append_requires_registration_and_in_process_runner(lance_contract):
     _lance, deps, graph, _table = lance_contract
     unsupported = object()
-    deps.pick_runner = lambda _plan, _uid: unsupported
+    deps.pick_runner = lambda _plan, _uid, _requested=None: unsupported
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", "85555555-5555-4555-8555-555555555555")
     assert admission.managed is False
     assert admission.mode == "append"
     assert admission.intent is None
 
-    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.pick_runner = lambda _plan, _uid, _requested=None: deps.runner
     write = next(node for node in graph.nodes if node.id == "write")
     write.data["config"]["filename"] = "missing.lance"
     missing = _write_admission_for_graph(
@@ -2510,3 +2588,26 @@ def test_local_runner_consumes_lance_append_intent_and_recovers_exact_receipt(
     lance.write_dataset(pa.table({"value": [99]}), table.uri, mode="append")
     assert LanceAdapter().open_revision(table.uri, receipt.revision_id).fetchall() == [
         (1,), (2,), (3,)]
+
+
+def _routed(deps, runner):
+    return SimpleNamespace(**{**vars(deps), "runner": runner,
+                              "pick_runner": lambda _plan, _uid, *_rest: runner})
+
+
+def test_a_target_that_cannot_publish_is_refused_for_a_published_dataset(contract):
+    deps, graph = contract
+    receipt = _publish(deps, _write_admission_for_graph(
+        deps, graph, "write", "researcher", "44444444-4444-4444-8444-444444444444"), [1, 2])
+    published = _managed_publication_counts()
+
+    with pytest.raises(HTTPException) as refusal:
+        _write_admission_for_graph(
+            _routed(deps, SimpleNamespace(name="plugin-backend")), graph, "write", "researcher",
+            "55555555-5555-4555-8555-555555555555")
+
+    assert refusal.value.status_code == 409
+    assert "cannot publish datasets" in refusal.value.detail
+    assert _managed_publication_counts() == published
+    assert metadb.catalog_managed_local_write_head(
+        deps.storage.output_uri("output", ".parquet"))["revision_id"] == receipt.revision_id

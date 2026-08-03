@@ -25,7 +25,9 @@ from hub.version import current_version
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
 # (a metric or a node value driving another node's param). All must be representable on an edge.
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
-NodeStatus = Literal["draft", "latest", "stale", "queued", "running", "failed"]
+NodeStatus = Literal[
+    "draft", "checking", "latest", "stale", "unknown", "queued", "running", "failed",
+]
 Placement = Literal["local", "distributed"]
 DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
@@ -441,6 +443,9 @@ class CatalogTable(Wire):
     # Fixed-length CAS token for the staged built-in catalog editor. It changes whenever the editable
     # metadata or declared primary key changes, but deliberately does not expose storage internals.
     metadata_revision: str | None = None
+    # True only when the built-in Catalog owns an unmanaged registration for one ordinary local
+    # file. The UI must not guess this from the URI: managed outputs can also use local paths.
+    source_delete_allowed: bool = False
 
 
 CatalogExampleSourceRef = Annotated[str, Field(min_length=1, max_length=8192)]
@@ -735,10 +740,23 @@ class LineageNode(Wire):
     kind: str = "dataset"
 
 
+LineageEdgeLabel = Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class LineageCardinality(Wire):
+    """A provider-backed relationship count, never a graph-layout inference."""
+
+    value: Literal["1:1", "1:N", "N:1", "N:M"]
+    evidence: Literal["declared", "measured"]
+
+
 class LineageEdge(Wire):
     parent: str
     child: str
     fact_count: int = Field(ge=1)
+    columns: list[LineageEdgeLabel] = Field(default_factory=list, max_length=64)
+    pipeline_names: list[LineageEdgeLabel] = Field(default_factory=list, max_length=16)
+    cardinality: LineageCardinality | None = None
 
 
 class LineageFieldMapping(Wire):
@@ -1264,6 +1282,8 @@ class WorkspaceResource(Wire):
     parent_id: str | None = None
     placement_id: str | None = None
     version: int | None = None
+    canvas_version: int | None = Field(default=None, ge=1)
+    updated_at: datetime.datetime | None = None
     catalog_folder_id: str | None = None
     catalog_folder_state: Literal["current", "detached"] | None = None
     catalog_folder_path: str | None = None
@@ -1314,9 +1334,18 @@ class WorkspaceSourceStatus(Wire):
     ] | None = None
 
 
+class WorkspaceQueryCapabilities(Wire):
+    """Queries that are truthful for every item returned by this browse lens."""
+    sort: list[Literal["name", "updated"]] = []
+    kind_filter: bool = False
+    reason: str | None = Field(default=None, max_length=256)
+
+
 class WorkspaceBrowsePage(Wire):
     container: WorkspaceResource | None
     items: list[WorkspaceResource] = []
+    connected_sources: list[WorkspaceResource] = []
+    query_capabilities: WorkspaceQueryCapabilities = WorkspaceQueryCapabilities()
     next_cursor: str | None = None
     has_more: bool = False
     completeness: Literal["complete", "page", "partial"] = "complete"
@@ -1344,7 +1373,8 @@ class WorkspaceCanonicalDatasetContext(Wire):
     source_binding_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     provider_dataset_id: str = Field(min_length=1, max_length=512)
     dataset_identity: str = Field(min_length=1, max_length=512)
-    read_mode: Literal["exact", "current"]
+    source_uri: str = Field(pattern=r"^workspace-provider://[A-Za-z0-9_-]+$", max_length=1024)
+    read_mode: Literal["exact", "current", "lineage"]
     revision_id: str | None = Field(default=None, min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
     columns: list[ColumnSchema] = Field(default_factory=list, max_length=2048)
@@ -1353,9 +1383,9 @@ class WorkspaceCanonicalDatasetContext(Wire):
     def validate_read_mode(self) -> "WorkspaceCanonicalDatasetContext":
         if self.read_mode == "exact" and self.revision_id is None:
             raise ValueError("exact canonical dataset context requires a revision")
-        if self.read_mode == "current" and (
+        if self.read_mode in {"current", "lineage"} and (
                 self.revision_id is not None or self.committed_at is not None):
-            raise ValueError("current canonical dataset context cannot imply an exact revision")
+            raise ValueError("non-exact canonical dataset context cannot imply an exact revision")
         return self
 
 
@@ -1725,6 +1755,13 @@ class SampleResult(Wire):
         ),
     )
     sample_provenance: SampleProvenance | None = None
+    parse_notices: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Text-parsing choices the reader made that a different, equally valid choice would "
+            "have decided differently — for example the day/month order of an ambiguous CSV date."
+        ),
+    )
     preview_ref: str | None = None
     # Present only for the fullscreen Transform editor's retained-upstream endpoint. The storage URI
     # stays server-side; this is user-facing evidence, not an input accepted by any later Canvas run.
@@ -1791,6 +1828,8 @@ class SampleResult(Wire):
                 raise ValueError("an unavailable sample cannot carry an active row limit")
             if not self.reason or not self.reason.strip():
                 raise ValueError("an unavailable sample requires a non-empty reason")
+            if self.parse_notices:
+                raise ValueError("an unavailable sample cannot carry parse notices")
             return self
         if self.limit_reason == "preview-scan" and self.limit_scope != "each-source":
             raise ValueError("preview-scan limits must use limitScope=each-source")
@@ -1844,7 +1883,8 @@ class ColumnProfile(Wire):
     )
     min: str | None = None         # stringified (numeric / temporal / text); None if not applicable
     max: str | None = None
-    mean: float | None = None      # numeric columns only
+    # numeric columns only; a non-finite mean is the token string "NaN"/"Infinity"/"-Infinity"
+    mean: str | float | None = None
 
     @model_validator(mode="after")
     def _distinct_shape(self) -> "ColumnProfile":
@@ -2494,6 +2534,9 @@ class WorkspaceRunRecord(Wire):
     canvas_id: str | None = None
     canvas_name: str | None = None
     node_label: str | None = None
+    created_by_id: str | None = Field(default=None, max_length=512)
+    created_by_name: str | None = Field(default=None, max_length=512)
+    is_mine: bool = True
     backend: str
     placement: Placement
     attempt: str
@@ -2605,6 +2648,31 @@ class BackendInfo(Wire):
     workers: list[WorkerInfo] = []
 
 
+class ExecutionTargetInfo(Wire):
+    """One configured whole-Canvas execution choice exposed to the editor.
+
+    ``name`` remains the stable runner identity persisted in a Canvas. The other fields are bounded
+    presentation metadata so the web client never has to turn implementation class names into UX.
+    Only registered runners are returned; unavailable integrations must not look selectable.
+    """
+    name: str
+    label: str
+    kind: Literal["interactive", "job"]
+    description: str
+    substrate: str | None = None
+
+
+class ResultStorageInfo(Wire):
+    """The one lifecycle-managed result store available to Canvas runs.
+
+    Export destinations are deliberately absent: they do not own result references, manifests, or
+    garbage collection and therefore cannot truthfully be selected as a Canvas result store.
+    """
+    id: Literal["workspace-managed"] = "workspace-managed"
+    label: str = "Workspace managed storage"
+    kind: Literal["local", "object", "plugin"] = "local"
+
+
 class CapabilityView(Wire):
     """A plugin capability that contributes a VIEWER TAB, declaratively. `viewer.kind` names a generic
     renderer the SPA ships (e.g. 'grid' = media/image grid, 'json' = pretty-printed cell) — so a plugin
@@ -2626,6 +2694,8 @@ class KernelInfo(Wire):
     capabilities: list[str] = []
     capability_views: list[CapabilityView] = []  # plugin capabilities that declare a viewer tab (additive)
     backends: list[BackendInfo] = []  # real backend/worker topology + capacities (additive; runners kept)
+    execution_targets: list[ExecutionTargetInfo] = []
+    result_storage: ResultStorageInfo = ResultStorageInfo()
 
 
 class ProcessorDescriptor(Wire):
@@ -2872,9 +2942,25 @@ class ParameterBinding(Wire):
     value: Any
 
 
+class CanvasResultRetention(Wire):
+    """Canvas override for physical full-result history.
+
+    ``latest`` always remains owned by the Canvas. ``recent`` additionally lets bounded Jobs history
+    retain its result artifacts. The managed store itself is deployment-owned and runner-independent.
+    """
+    history: Literal["inherit", "latest", "recent"] = "inherit"
+
+
 class Graph(Wire):
     id: str = Field(default="canvas", min_length=1, max_length=512)
     version: int = Field(default=1, ge=0, le=MAX_SAFE_INTEGER)
+    execution_backend: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    result_retention: CanvasResultRetention = Field(default_factory=CanvasResultRetention)
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them

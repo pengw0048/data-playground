@@ -27,6 +27,7 @@ from hub.sqlpolicy import (
     quote_identifier,
     validate_fragment,
     validate_query,
+    validate_value_expression,
 )
 
 
@@ -237,6 +238,17 @@ def test_function_policy_rejects_existing_mixed_case_shadow_without_mutating_cat
 )
 def test_fragment_policy_allows_expected_shapes(kind, fragment):
     assert validate_fragment(kind, fragment).sql == fragment
+
+
+def test_value_expression_policy_accepts_one_expression_without_alias():
+    assert validate_value_expression("date_trunc('day', created_at)").sql == "date_trunc('day', created_at)"
+    assert validate_value_expression("amount * exchange_rate").sql == "amount * exchange_rate"
+
+
+@pytest.mark.parametrize("expression", ["x, y", "x AS renamed", "*", "x FROM secret"])
+def test_value_expression_policy_rejects_projection_lists_aliases_and_query_escape(expression):
+    with pytest.raises(SQLPolicyError):
+        validate_value_expression(expression)
 
 
 def test_join_key_extraction_uses_validated_ast_for_quoted_identifiers():
