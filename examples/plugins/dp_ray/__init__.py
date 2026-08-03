@@ -275,6 +275,7 @@ def _secure_duckdb_connection():
     con.execute("SET autoload_known_extensions = false")
     con.execute("SET python_enable_replacements = false")
     con.execute("SET search_path = 'main'")
+    con.execute("SET TimeZone = 'UTC'")  # a routed worker must bind naive timestamps like the hub
     con.execute("BEGIN TRANSACTION")
     return con
 
