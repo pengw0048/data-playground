@@ -38,12 +38,12 @@ async function createCanvas(page: Page, name: string, suffix: string) {
   return canvasId
 }
 
-async function openCanvas(page: Page, canvasId: string) {
+async function openCanvas(page: Page, canvasId: string, expectedName: string) {
   await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
   await expect(page.getByTestId('inspector')).toHaveCount(0)
-  await expect(page.getByTestId('canvas-title')).toBeVisible()
-  await expect(page.getByRole('button', { name: /Execution target:/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Rerun all' })).toBeVisible()
+  await expect(page.getByTestId('canvas-title')).toHaveText(expectedName)
+  await expect(page.getByRole('button', { name: /Execution target:/ })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Rerun all' })).toBeEnabled()
   await expect(page.getByTestId('share-btn')).toBeVisible()
   await page.evaluate(() => document.fonts.ready)
 }
@@ -73,7 +73,7 @@ test('keeps long Canvas titles clear of independently operable run controls at d
     await page.setViewportSize(viewport)
     const canvasId = await createCanvas(page, LONG_CANVAS_NAME, `${viewport.width}`)
     try {
-      await openCanvas(page, canvasId)
+      await openCanvas(page, canvasId, LONG_CANVAS_NAME)
       const title = page.getByTestId('canvas-title')
       const runControls = page.getByTestId('canvas-run-controls')
       const titleBox = await boxOf(title)
@@ -98,7 +98,7 @@ test('preserves the compact short-title layout', async ({ page }) => {
   const shortName = 'Short canvas'
   const canvasId = await createCanvas(page, shortName, 'short')
   try {
-    await openCanvas(page, canvasId)
+    await openCanvas(page, canvasId, shortName)
     const title = page.getByTestId('canvas-title')
     const titleMetrics = await title.evaluate((element) => ({
       clientWidth: element.clientWidth,
@@ -113,13 +113,14 @@ test('preserves the compact short-title layout', async ({ page }) => {
 })
 
 test('browser Back cannot carry a title rollback into another Canvas', async ({ page }) => {
+  test.setTimeout(45_000)
   const canvasAName = 'Canvas A original'
   const canvasBName = 'Canvas B original'
   const canvasA = await createCanvas(page, canvasAName, 'history-a')
   const canvasB = await createCanvas(page, canvasBName, 'history-b')
   try {
-    await openCanvas(page, canvasB)
-    await openCanvas(page, canvasA)
+    await openCanvas(page, canvasB, canvasBName)
+    await openCanvas(page, canvasA, canvasAName)
     await page.getByTestId('canvas-title').click()
     await page.getByRole('textbox', { name: 'Canvas name' }).fill('Canvas A in progress')
 

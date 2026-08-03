@@ -55,7 +55,7 @@ describe('Toaster', () => {
     state.kernelUp = false
     render(<Toaster />)
 
-    expect(screen.getByRole('status')).toHaveTextContent('Kernel offline')
+    expect(screen.getByRole('status')).toHaveTextContent('Data Playground is offline')
     state.kernelUp = true
   })
 })

@@ -123,7 +123,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
               rows={3}
               className="dp-mono w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-[11.5px] text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-70"
             />
-            <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed on this canvas's kernel, then importable in <code>transform</code> cells. Travels with the canvas.</div>
+            <div className="mt-1 text-[10.5px] text-muted-foreground">One pip spec per line — installed for this Canvas and available to <code>transform</code> cells. Travels with the Canvas.</div>
           </div>
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Results</Label>
@@ -146,7 +146,6 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
               <div className="text-[11.5px] font-medium text-foreground">Location</div>
               <div className="text-right text-[11px] text-muted-foreground">
                 {resultStorage?.label ?? 'Workspace managed storage'}
-                {resultStorage?.kind ? ` · ${resultStorage.kind}` : ''}
               </div>
             </div>
           </div>

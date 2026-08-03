@@ -24,6 +24,7 @@ const store = vi.hoisted(() => ({
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
   firstRunChoice: false,
+  newFile: vi.fn(), newFromExample: vi.fn(),
   localDrafts: [] as never[],
   draftStorageErrors: [] as string[],
   doc: { id: '', version: 0 },
@@ -141,6 +142,8 @@ describe('WorkspaceExplorer', () => {
     store.workspaceScope = 'all'
     store.workspaceDatasetQuery = ''
     store.firstRunChoice = false
+    store.newFile.mockResolvedValue({ ok: true, canvasId: 'blank', persistence: 'remote' })
+    store.newFromExample.mockResolvedValue({ ok: true, canvasId: 'example', persistence: 'remote' })
     store.localDrafts = []
     store.draftStorageErrors = []
     store.doc = { id: 'canvas-1', version: 3 }
@@ -202,6 +205,29 @@ describe('WorkspaceExplorer', () => {
     const dialog = screen.getByRole('dialog', { name: 'Add data' })
     expect(dialog).toHaveTextContent('Upload a local file')
     expect(dialog).toHaveTextContent('Register an accessible path or URI')
+  })
+
+  it('keeps a first-run example in the folder currently shown in Workspace', async () => {
+    store.firstRunChoice = true
+    store.workspaceResourceId = FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: FOLDER, ancestors: [ROOT],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: FOLDER, items: [], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'folder-example', created: true })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open example Purchases per user' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
+      containerId: 'folder-1', expectedContainerVersion: 1, name: 'untitled',
+    }))
+    await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('folder-example'))
+    expect(store.newFromExample).toHaveBeenCalledWith('purchases', 'replace-pristine')
   })
 
   it('resolves a stable DatasetView URL beside its Catalog source and replays its exact revision', async () => {
@@ -462,6 +488,24 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.workspaceCreateFolder).toHaveBeenCalledWith(expect.objectContaining({
       parentId: 'folder-1', expectedParentVersion: 1, name: 'Child', requestId: expect.any(String),
     })))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New folder' })).not.toBeInTheDocument())
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research/Child')
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('container:child')
+  })
+
+  it('switches the action context before a folder route finishes resolving', async () => {
+    const localFolder = { ...FOLDER, canCreateFolder: true }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [localFolder], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open folder Research' }))
+
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(FOLDER.id)
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
+    expect(screen.getByRole('button', { name: 'New folder' })).toBeDisabled()
   })
 
   it('opens item and folder actions from the right-click location', async () => {
@@ -485,6 +529,20 @@ describe('WorkspaceExplorer', () => {
     for (const name of ['Add data…', 'New folder', 'Create canvas', 'Reload']) {
       expect(within(folderMenu).getByRole('menuitem', { name })).toBeVisible()
     }
+  })
+
+  it('refreshes Canvas roles when the Workspace is reloaded', async () => {
+    store.files = []
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Reload' }))
+
+    await waitFor(() => expect(store.refreshFiles).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledTimes(2))
   })
 
   it('removes a local dataset from its right-click menu without claiming to delete the source file', async () => {

@@ -1619,7 +1619,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc).toBe(doc)
     expect(useStore.getState().toasts).toMatchObject([{
       kind: 'error',
-      msg: 'Hub offline — reconnect before starting or controlling execution.',
+      msg: 'Data Playground is offline — reconnect before starting or controlling a run.',
       dedupeKey: 'hub-offline-execution',
     }])
   })
@@ -2506,7 +2506,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).not.toHaveBeenCalled()
     expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
     expect(useStore.getState().openPanels).toEqual({ write: 'run' })
-    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Review the sidecar merge setup before running.')).toBe(true)
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Review the saved-dataset column merge before running.')).toBe(true)
   })
 
   it('fails closed to the managed-sidecar panel when an imported draft is malformed', async () => {

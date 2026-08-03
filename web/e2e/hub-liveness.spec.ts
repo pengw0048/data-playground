@@ -67,12 +67,12 @@ test('reports a stopped hub within 5s and recovers the local draft after restart
 
     await killHub()
 
-    await expect(page.getByText('Kernel offline — your work is cached locally.')).toBeVisible({ timeout: 5_000 })
+    await expect(page.getByText('Data Playground is offline — your work is cached in this browser.')).toBeVisible({ timeout: 5_000 })
     await expect(target).toBeDisabled()
     await expect(page.getByTestId('autosave')).toContainText(/offline/i)
     await expect(page.getByTestId('autosave')).not.toContainText(/saved/i)
     await expect(page.getByRole('button', { name: 'Rerun all' })).toBeDisabled()
-    await expect(page.getByTestId('inspector').getByRole('button', { name: 'Hub offline — run unavailable' }))
+    await expect(page.getByTestId('inspector').getByRole('button', { name: 'Offline — run unavailable' }))
       .toHaveAttribute('aria-disabled', 'true')
 
     const recoveredName = `Issue 844 recovered ${Date.now()}`

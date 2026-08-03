@@ -26,7 +26,7 @@ export function Toaster() {
         {!kernelUp && (
           <div className="fixed left-0 right-0 top-0 z-[70] flex items-center justify-center gap-3 bg-foreground px-3 py-[7px] text-xs text-background">
             <span className="h-2 w-2 rounded-full bg-destructive" />
-            Kernel offline — your work is cached locally.
+            Data Playground is offline — your work is cached in this browser.
             <Button variant="outline" size="sm" className="h-6 px-2.5 text-foreground" onClick={() => bootstrap()}>Retry</Button>
           </div>
         )}

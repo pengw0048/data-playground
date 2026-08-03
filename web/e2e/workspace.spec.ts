@@ -86,6 +86,31 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     }
   })
 
+  test('reload makes an agent-created Canvas actionable without a browser refresh', async ({ page }) => {
+    const suffix = Date.now()
+    const canvasId = `workspace-agent-created-${suffix}`
+    const canvasName = `Agent-created Canvas ${suffix}`
+    await page.goto('/#/workspace')
+
+    const created = await page.request.post('/api/canvas', {
+      data: { id: canvasId, name: canvasName, version: 1, requirements: [], nodes: [], edges: [] },
+    })
+    expect(created.ok()).toBe(true)
+
+    try {
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toHaveCount(0)
+      await page.getByRole('button', { name: 'Reload' }).click()
+      await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
+
+      await page.getByRole('checkbox', { name: `Select ${canvasName}` }).check()
+      for (const action of ['Rename', 'Duplicate', 'Move', 'Delete']) {
+        await expect(page.getByRole('button', { name: action, exact: true })).toBeVisible()
+      }
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
   test('creates, explores, and adds by exact local targets across reload', async ({ page }) => {
     const catalog = await page.request.get('/api/catalog/tables?limit=1')
     expect(catalog.ok()).toBe(true)
@@ -241,9 +266,15 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
 test('browses and opens one exact retained dataset revision without drifting to latest', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 })
-  const catalog = await page.request.get('/api/catalog/tables?limit=1')
+  // Other specs intentionally register and unregister short-lived datasets against the shared
+  // local kernel. Select a seeded fixture by stable name instead of treating mutable list order as
+  // identity; otherwise this acceptance can click a dataset that another worker just retired.
+  const catalog = await page.request.get('/api/catalog/search', {
+    params: { q: 'events', mode: 'lexical', limit: 10 },
+  })
   expect(catalog.ok()).toBe(true)
-  const dataset = (await catalog.json()).items[0] as { id: string; name: string }
+  const dataset = (await catalog.json() as Array<{ id: string; name: string }>)
+    .find((item) => item.name === 'events')
   expect(dataset).toBeTruthy()
   await page.route('**/api/catalog/tables/stable-dataset?registration=true', (route) =>
     route.fulfill({ json: dataset }))

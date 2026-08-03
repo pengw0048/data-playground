@@ -134,8 +134,19 @@ function ERViewportControls({ fitKey, container, lineage, overview, onZoomChange
   // whenever the pane resizes.
   useEffect(() => {
     if (size.width === 0 || size.height === 0) return
-    const frame = requestAnimationFrame(() => { void fitSafely() })
-    return () => cancelAnimationFrame(frame)
+    let cancelled = false
+    let frame = 0
+    // A query replacement, React Flow's measurements, and semantic card collapse happen in
+    // separate frames. Settle the same bounded fit across all three; the first pass can still see
+    // the previous query, while the final pass sees the compact cards produced by the new zoom.
+    const settle = async (remaining: number) => {
+      if (cancelled) return
+      await fitSafely()
+      if (cancelled || remaining <= 1) return
+      frame = requestAnimationFrame(() => { void settle(remaining - 1) })
+    }
+    frame = requestAnimationFrame(() => { void settle(3) })
+    return () => { cancelled = true; cancelAnimationFrame(frame) }
   }, [fitKey, fitSafely, size])
 
   useEffect(() => {
@@ -807,7 +818,7 @@ export function ERDiagram() {
           <div className="flex flex-col gap-2" data-testid="er-focus-bar">
             <div className="flex items-center gap-1.5">
               <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-primary">Focused: {focusName ?? (focusResolving ? 'loading…' : 'dataset')}</span>
-              <button onClick={() => { setFocus(null); setRelationshipsFocus(null) }} className="text-[10.5px] underline hover:text-foreground" data-testid="er-clear-focus">show all</button>
+              <button onClick={() => { setExpandedEntities(false); setFocus(null); setRelationshipsFocus(null) }} className="text-[10.5px] underline hover:text-foreground" data-testid="er-clear-focus">show all</button>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10.5px]">Hops</span>

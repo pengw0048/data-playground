@@ -92,7 +92,7 @@ describe('principal-scoped Canvas draft storage', () => {
     expect(result.errors[0]).toContain('corrupt')
   })
 
-  it('skips malformed index identities while retaining unrelated drafts', () => {
+  it('skips malformed draft references while retaining unrelated drafts', () => {
     writeCanvasDraft(draft('alice', 'good', 1))
     const indexKey = Array.from(values.keys()).find((key) => key.includes('dp-canvas-drafts-v1'))!
     values.set(indexKey, JSON.stringify({ version: 1, ids: ['good', '', 7] }))
@@ -101,7 +101,7 @@ describe('principal-scoped Canvas draft storage', () => {
 
     expect(result.drafts.map((item) => item.draftId)).toEqual(['good'])
     expect(result.errors).toHaveLength(2)
-    expect(result.errors.every((error) => error.includes('identity'))).toBe(true)
+    expect(result.errors.every((error) => error.includes('saved Canvas draft') && error.includes('reference'))).toBe(true)
   })
 
   it('reports quota failure and does not add an unreachable index entry', () => {

@@ -3,6 +3,15 @@ import { useEffect, useRef } from 'react'
 import { columnStore } from '../monaco-setup' // side-effect: wires Monaco offline (this chunk is lazy-loaded)
 import { useResolvedTheme } from '../theme/mode'
 
+type MonacoEditor = Parameters<OnMount>[0]
+
+function focusEditorLine(editor: MonacoEditor, lineNumber: number) {
+  editor.setPosition({ lineNumber, column: 1 })
+  editor.revealLineInCenter(lineNumber)
+  editor.getDomNode()?.setAttribute('data-cursor-line-number', String(lineNumber))
+  editor.focus()
+}
+
 // Monaco-backed code cell: syntax highlighting + autocomplete for SQL / Python. This module (and
 // all of Monaco) is code-split — CodePanel lazy-imports it, so the editor loads only when opened.
 export function CodeEditor({ value, onChange, language, readOnly, height = 200, completions, errorLine }: {
@@ -16,16 +25,34 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
 }) {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
   const cursorListenerRef = useRef<{ dispose: () => void } | null>(null)
-  useEffect(() => () => cursorListenerRef.current?.dispose(), [])
+  const contentListenerRef = useRef<{ dispose: () => void } | null>(null)
+  const errorFocusFrameRef = useRef<number | null>(null)
+  const errorLineRef = useRef(errorLine)
+  errorLineRef.current = errorLine
+  const deferErrorFocus = (editor: MonacoEditor, lineNumber: number) => {
+    if (errorFocusFrameRef.current !== null) cancelAnimationFrame(errorFocusFrameRef.current)
+    errorFocusFrameRef.current = requestAnimationFrame(() => {
+      errorFocusFrameRef.current = null
+      if (editorRef.current === editor) focusEditorLine(editor, lineNumber)
+    })
+  }
+  useEffect(() => () => {
+    cursorListenerRef.current?.dispose()
+    contentListenerRef.current?.dispose()
+    if (errorFocusFrameRef.current !== null) cancelAnimationFrame(errorFocusFrameRef.current)
+    editorRef.current = null
+  }, [])
   useEffect(() => {
     if (!errorLine || !editorRef.current) return
-    editorRef.current.setPosition({ lineNumber: errorLine, column: 1 })
-    editorRef.current.revealLineInCenter(errorLine)
-    editorRef.current.focus()
+    focusEditorLine(editorRef.current, errorLine)
+    // Monaco restores model/view state asynchronously during a busy first layout. Re-apply the
+    // server-selected syntax line after that frame so the visible error and editable cursor agree.
+    deferErrorFocus(editorRef.current, errorLine)
   }, [errorLine])
   const onMount: OnMount = (editor) => {
     editorRef.current = editor
     cursorListenerRef.current?.dispose()
+    contentListenerRef.current?.dispose()
     const editorNode = editor.getDomNode()
     const reflectCursorLine = (lineNumber: number) => {
       editorNode?.setAttribute('data-cursor-line-number', String(lineNumber))
@@ -35,10 +62,16 @@ export function CodeEditor({ value, onChange, language, readOnly, height = 200, 
     cursorListenerRef.current = editor.onDidChangeCursorPosition((event) => {
       reflectCursorLine(event.position.lineNumber)
     })
+    // @monaco-editor/react can install the controlled value after onMount. Monaco resets the
+    // selection to line 1 as part of that model update, so an onMount-only focus is racy on a busy
+    // first load. Re-apply a still-current server syntax location after model content settles.
+    contentListenerRef.current = editor.onDidChangeModelContent(() => {
+      const currentErrorLine = errorLineRef.current
+      if (currentErrorLine) deferErrorFocus(editor, currentErrorLine)
+    })
     if (errorLine) {
-      editor.setPosition({ lineNumber: errorLine, column: 1 })
-      editor.revealLineInCenter(errorLine)
-      editor.focus()
+      focusEditorLine(editor, errorLine)
+      deferErrorFocus(editor, errorLine)
     }
   }
   columnStore.columns = completions ?? []

@@ -153,7 +153,7 @@ export function TopBar() {
           <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <CanvasTitle />
-          <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Hub offline — server save state is unknown. Local edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
+          <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Offline — server save state is unknown. Edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
             <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
             <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
@@ -163,9 +163,9 @@ export function TopBar() {
           <PeerAvatars />
           <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
           <span className="relative">
-            <Button onClick={() => graphRun ? void cancelGraphRun() : rerunAll}
+            <Button onClick={() => graphRun ? void cancelGraphRun() : rerunAll()}
               disabled={!canEdit || !kernelUp || (!!graphRun && !graphRun.runId)}
-              title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running'
+              title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Offline — reconnect before running'
                 : graphRun?.runId ? 'Stop the whole-graph run'
                   : graphRun ? 'Starting the whole-graph run' : 'Re-run the whole graph'}
               size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
@@ -234,7 +234,7 @@ function ExecutionTargetMenu({ kernelUp, kernelInfo, canEdit }: {
     <DropdownMenuTrigger asChild>
       <button type="button" disabled={!kernelUp || !canEdit}
         aria-label={`Execution target: ${label}`}
-        title={!canEdit ? 'View-only Canvas' : !kernelUp ? 'Hub offline' : 'Choose where full Canvas runs execute'}
+        title={!canEdit ? 'View-only Canvas' : !kernelUp ? 'Offline' : 'Choose where full Canvas runs execute'}
         className="inline-flex h-8 max-w-[210px] items-center gap-1.5 rounded-full border border-border bg-card px-2.5 text-[11px] font-semibold text-foreground shadow-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60">
         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${kernelUp && !unavailable ? 'bg-green-500' : 'bg-amber-500'}`} />
         <Icon name="server" size={13} />

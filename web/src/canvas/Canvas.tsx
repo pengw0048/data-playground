@@ -256,7 +256,7 @@ export function Canvas() {
     setDropActive(false)
     const base = screenToFlowPosition({ x: e.clientX, y: e.clientY })
     const s = useStore.getState()
-    if (!s.kernelUp) { s.pushToast('Kernel offline — cannot upload a file', 'error'); return }
+    if (!s.kernelUp) { s.pushToast('Offline — cannot upload a file', 'error'); return }
     for (const file of files) {
       const t = await s.uploadDataset(file)  // uploads + refreshes the catalog; toasts on failure
       if (!t) continue

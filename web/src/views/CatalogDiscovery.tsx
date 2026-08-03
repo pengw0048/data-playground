@@ -418,7 +418,7 @@ export function CatalogDiscovery({
         <h1 className="text-[20px] font-bold text-foreground">{title}</h1>
         <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} {total === 1 ? 'dataset' : 'datasets'}</span>
         <span className="flex-1" />
-        <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset the kernel can access by path or URI"
+        <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset from a path or URI the server can read"
           className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background">
           <Icon name="plus" size={13} /> Register path or URI
         </button>
@@ -1762,7 +1762,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
   const submit = async () => {
     const u = uri.trim()
     if (busy) return
-    if (!u) { setFormError('Enter a path or URI the kernel can access.'); return }
+    if (!u) { setFormError('Enter a path or URI that Data Playground can access.'); return }
     if (u.includes('\u0000')) { setFormError('The path or URI cannot contain a null character.'); return }
     setBusy(true)
     setFormError(null)
@@ -1778,7 +1778,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
       onRegistered(t)
     } catch (e) {
       const detail = errorMessage(e)
-      setFormError(`The kernel could not register “${u}”. Confirm it exists and is readable from the kernel host, then try again. ${detail}`)
+      setFormError(`Data Playground could not register “${u}”. Confirm that the server can read it, then try again. ${detail}`)
       pushToast(`Registration failed: ${detail}`, 'error')
     }
     finally { setBusy(false) }
@@ -1806,7 +1806,7 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
           <button onClick={() => void submit()} disabled={busy || !uri.trim()} data-testid="register-submit"
             className="rounded-md bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background disabled:opacity-50">{busy ? 'Registering…' : 'Register'}</button>
         </div>
-      {browseOpen && <FileDialog mode="open" title="Browse kernel-visible storage" onClose={() => setBrowseOpen(false)}
+      {browseOpen && <FileDialog mode="open" title="Browse accessible storage" onClose={() => setBrowseOpen(false)}
         onPick={({ uri: pickedUri }) => { setUri(pickedUri); setFormError(null); setBrowseOpen(false) }} />}
     </Modal>
   )

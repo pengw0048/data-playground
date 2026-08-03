@@ -105,7 +105,7 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
   it('shows the managed result location and saves a Canvas history override', async () => {
     render(<CanvasSettingsModal onClose={vi.fn()} />)
 
-    expect(screen.getByText('Local workspace · local')).toBeInTheDocument()
+    expect(screen.getByText('Local workspace')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Result history'), { target: { value: 'recent' } })
     expect(mocks.state.setResultRetention).toHaveBeenCalledWith('recent')
   })

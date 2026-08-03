@@ -258,7 +258,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     useStore.setState({ kernelUp: false, catalog: [] } as any)
     render1({ title: 'source', status: 'draft', config: {} })
     fireEvent.click(screen.getByText(/select dataset/i))
-    expect(await screen.findByText(/Kernel offline/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Offline — datasets unavailable/i)).toBeInTheDocument()
     await waitFor(() => expect(mocks.tablesPage).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByText(/Failed to fetch/i)).toBeNull()

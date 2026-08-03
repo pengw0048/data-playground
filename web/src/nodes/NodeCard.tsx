@@ -248,7 +248,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
             name="eye" label={openPanel === 'data'
               ? 'Hide data'
               : !kernelUp
-                ? `Hub offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
+                ? `Offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
                 : invalid ?? (runnable
                     ? kind === 'chart' ? 'View chart result' : 'View data'
                     : blocked ?? `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`)}
@@ -263,7 +263,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={!kernelUp ? 'Hub offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? blocked ?? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
+              label={!kernelUp ? 'Offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? blocked ?? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review saved-dataset column merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
               disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}

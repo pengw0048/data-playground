@@ -78,6 +78,57 @@ the source in Back/breadcrumb navigation, and unsupported sort/filter controls m
 a reason before the user tries them. Locators must not encode the product path as a substitute for
 the independent cold review.
 
+## Failure-finding pass
+
+The golden workflow proves one useful path; it does not prove that the product remains coherent when
+the same object is reached from another page or when the researcher returns later. Before release
+sign-off, run a separate failure-finding pass that inventories every top-level page and every action
+surface (primary button, overflow menu, context menu, keyboard, drag/drop, multi-select, and direct
+reopen link). Compare the same Canvas, dataset, run, result, and user across Workspace, Canvas, Jobs,
+Inbox, dataset detail, lineage, and Settings.
+
+The reviewer deliberately looks through these lenses:
+
+| Lens | Failure to seek |
+| --- | --- |
+| Product language | Internal storage, scheduler, identity, version, or transport terms shown where they do not help a decision; one concept given several labels. |
+| Cross-surface consistency | Different state, owner, destination, count, or available action for the same object on different pages. |
+| Discoverability and defaults | A visible control that silently does nothing, a useful action hidden behind an unrelated panel, or a default path that needs configuration before producing anything useful. |
+| Data and execution truth | Frontend formatting or serialization that changes values, hides scope, invents freshness, or reports a smaller sample as complete. |
+| Guard parity | UI, keyboard, agent/MCP, retry, and whole-graph paths applying different validation, confirmation, ownership, or cancellation rules. |
+| Lifecycle continuity | Folder, selection, viewport, result, job ownership, or recovery context lost after navigation, reload, restart, upstream mutation, cancellation, or partial failure. |
+| Scale and presentation | Controls overlap or disappear at supported viewports, zoom, long names, empty state, 50+ items, dense graphs, dark mode, forced colours, or reduced motion. |
+
+Freeze the black-box evidence before reading implementation details. For every finding record the
+starting state, visible clue, action, expected result, actual result, screenshot or trace, severity,
+and smallest product correction. A path that eventually succeeds after guessing still fails the
+comprehension gate. After the black-box pass, inspect API responses, persisted state, and logs to
+distinguish a presentation defect from incorrect backend truth; then add an observable regression
+test at the boundary that failed.
+
+Use this prompt for an autonomous failure-finding and correction loop:
+
+> Act as a skeptical first-time researcher, then as the same researcher returning on day 20. Do not
+> inspect source code, test IDs, network traffic, or APIs during the first pass. Inventory every
+> top-level page and every visible way to act on a Canvas, dataset, run, result, folder, member, and
+> setting. Complete a real create → inspect → transform → run → publish → leave → reopen workflow.
+> Repeat it from a nested folder and a connected source, with more than 50 resources and a dense
+> graph. Use mouse, keyboard, right-click, multi-select, drag/drop, zoom, and durable links. Compare
+> the same object and action across Workspace, Canvas, Jobs, Inbox, dataset detail, lineage, and
+> Settings. Restart the application, mutate an upstream dataset, cancel and retry work, and inject a
+> slow, unavailable, permission-denied, partial, and stale response. Test 1280×720 and 1440×900,
+> 200% browser zoom, long names, light/dark themes, forced colours, and reduced motion. Build data
+> containing integers beyond JavaScript's safe range, non-finite floats, whitespace-only strings,
+> timezone-sensitive timestamps, ambiguous dates, and malformed rows; verify displayed values and
+> exported artifacts against persisted backend truth. Treat unexplained vocabulary, inconsistent
+> labels or state, silent clicks, hidden default-path requirements, lost context, and validation that
+> differs between UI, whole-graph, retry, keyboard, or agent/MCP paths as defects even if the task can
+> eventually be completed. Stop each path after 30 seconds or two guesses without a visible clue.
+> Record evidence and the smallest correction for every finding. Only then inspect code, APIs, and
+> logs, implement the corrections, add regression coverage at the failed boundary, and rerun the
+> complete continuous workflow. Do not weaken known truthfulness, scope, confirmation, recovery, or
+> exact-value behavior to make a test pass.
+
 ## Deterministic fixtures
 
 Build fixtures with the product environment so they use the same starter-data formats as a real local

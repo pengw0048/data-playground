@@ -1506,7 +1506,7 @@ interface Store {
 function hubExecutionAvailable(get: () => Store): boolean {
   if (get().kernelUp) return true
   get().pushToast(
-    'Hub offline — reconnect before starting or controlling execution.',
+    'Data Playground is offline — reconnect before starting or controlling a run.',
     'error',
     { dedupeKey: 'hub-offline-execution' },
   )
@@ -3027,7 +3027,7 @@ export const useStore = create<Store>((set, get) => ({
     if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Review the sidecar merge setup before running.', 'info')
+      get().pushToast('Review the saved-dataset column merge before running.', 'info')
       return
     }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
@@ -3301,7 +3301,7 @@ export const useStore = create<Store>((set, get) => ({
     if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
-      get().pushToast('Review the sidecar merge setup before running.', 'info')
+      get().pushToast('Review the saved-dataset column merge before running.', 'info')
       return
     }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
@@ -4648,7 +4648,7 @@ export const useStore = create<Store>((set, get) => ({
         const created = original.besideCanvasId
           ? await api.createCanvas(original.doc, { besideCanvasId: original.besideCanvasId })
           : await api.createCanvas(original.doc)
-        if (!created.ok || created.id !== original.canvasId) throw new Error('The hub returned an incompatible create result.')
+        if (!created.ok || created.id !== original.canvasId) throw new Error('The server returned an incompatible create result.')
         if (created.created) {
           await finish(original.doc.version)
           return
@@ -4692,7 +4692,7 @@ export const useStore = create<Store>((set, get) => ({
         ? 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
         : denied
           ? 'Current access does not permit syncing this draft.'
-          : `Sync failed: ${error instanceof Error ? error.message : 'the hub is unreachable'}`
+          : `Sync failed: ${error instanceof Error ? error.message : 'Data Playground is unreachable'}`
       const failed: LocalCanvasDraft = {
         ...latest,
         syncState: conflict ? 'conflict' : denied ? 'error' : 'dirty',
@@ -4861,7 +4861,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   uploadDataset: async (file) => {
-    if (!get().kernelUp) { get().pushToast('Kernel offline — cannot upload a file', 'error'); return null }
+    if (!get().kernelUp) { get().pushToast('Offline — cannot upload a file', 'error'); return null }
     try {
       const t = await api.uploadFile(file)
       mergeIntoCatalog(set, [t])  // so the new dataset appears in pickers / the open canvas immediately
@@ -5868,7 +5868,7 @@ function pollGraphRun(
       if (++fails <= 6) { setTimeout(tick, 800); return }
       set({ graphRun: null })
       settleAnimatingNodes(set)
-      get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
+      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
       stop()
       return
     }
@@ -5932,7 +5932,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'idle' as const }), phase: 'idle' } } }))
       get().updateData(nodeId, { status: 'stale' })
       settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
-      get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
+      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
       stopPolling()
       return
     }

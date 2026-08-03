@@ -297,7 +297,7 @@ function Source({ id, data }: NodeComponentProps) {
           // distinguish a healthy-but-empty result from a down kernel (UX-14) — don't cry "offline" on
           // a fresh install with zero datasets
           <div className="p-2 text-[11.5px] text-muted-foreground">
-            {!kernelUp ? 'Kernel offline — no catalog'
+            {!kernelUp ? 'Offline — datasets unavailable'
               : resultsError ? 'Catalog results unavailable'
               : q.trim() ? (results === null ? 'Searching…' : 'No matches')
               : results === null ? 'Loading…'
@@ -645,7 +645,7 @@ function RevisionControl({ nodeId, table, selected, exactDetailState: detailStat
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           Selected version is missing or compacted. Selection preserved; latest was not substituted.
           {staleLastKnown}{' '}
-          {registrationReplaced && 'The current catalog registration has a different dataset identity. '}
+          {registrationReplaced && 'The current catalog entry now points to a different dataset. '}
           {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another saved version</button>}
           {controlAvailable && ' or '}
           {table ? <><button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow current latest explicitly</button>.</>

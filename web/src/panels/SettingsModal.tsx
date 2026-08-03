@@ -616,12 +616,12 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
     try {
       const result = await api.restartKernel(canvasId)
       const message = result.restarted
-        ? 'Kernel restart requested. This applied immediately; staged Settings are unchanged.'
-        : 'No live kernel to restart. The next run starts fresh; staged Settings are unchanged.'
+        ? 'Canvas worker restart requested. This applied immediately; staged Settings are unchanged.'
+        : 'No active Canvas worker. The next run starts fresh; staged Settings are unchanged.'
       setKernelNotice({ kind: 'success', message })
-      pushToast(result.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+      pushToast(result.restarted ? 'Canvas worker restarting…' : 'The next run starts a fresh Canvas worker.', 'success')
     } catch (e) {
-      const message = `Could not restart kernel: ${errorMessage(e)}`
+      const message = `Could not restart the Canvas worker: ${errorMessage(e)}`
       setKernelNotice({ kind: 'error', message })
       pushToast(message, 'error')
     } finally { setKernelRestarting(false) }
@@ -929,15 +929,15 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                   {!canGlobal && <div className="mb-3 rounded-md border border-border bg-muted/40 p-2.5 text-[10.5px] text-muted-foreground">Workspace-wide defaults are managed by an administrator. Choose a target for the current Canvas from its top bar.</div>}
                   {selectedRunner === 'kernel' && (
                     <div className="mt-2 flex items-center gap-2">
-                      <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
-                      <span className="text-[10.5px] text-muted-foreground">Applies immediately; it does not save staged Settings. Clears this canvas's warm kernel; the next run starts fresh.</span>
+                      <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart Canvas worker'}</Button>
+                      <span className="text-[10.5px] text-muted-foreground">Applies immediately; it does not save staged Settings. Clears warm state for this Canvas; the next run starts fresh.</span>
                     </div>
                   )}
                   {kernelNotice && <div role={kernelNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', kernelNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
                     {kernelNotice.message}
                   </div>}
 
-                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Default compute target</div>
+                  <div className="mb-1.5 text-[11.5px] font-semibold text-foreground">Your default compute target</div>
                   <p className="mb-2 text-[10.5px] leading-relaxed text-muted-foreground">
                     Change a specific Canvas from its top bar.
                   </p>
@@ -958,7 +958,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                           ? <Badge variant="secondary" className="ml-auto rounded px-1.5 py-0 text-[10px] font-normal">Recommended</Badge>
                           : <span className="ml-auto text-[10.5px] font-medium text-muted-foreground">Use</span>}
                       </div>
-                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the workspace default.</div>
+                      <div className="mt-1 text-[10.5px] leading-snug text-muted-foreground">Uses the target chosen for this workspace.</div>
                     </button>
                     {runners.map((runner) => (
                       <button
@@ -1004,7 +1004,6 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                       <div className="text-[11.5px] font-medium text-foreground">Location</div>
                       <div className="text-right text-[11px] text-muted-foreground">
                         {kernelInfo?.resultStorage?.label ?? 'Workspace managed storage'}
-                        {kernelInfo?.resultStorage?.kind ? ` · ${kernelInfo.resultStorage.kind}` : ''}
                       </div>
                     </div>
                   </div>
@@ -1060,7 +1059,7 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         </SelectContent>
                       </Select>
                       <div className="mt-1 text-[10.5px] text-muted-foreground">The object-store credential used to browse and write here. Manage credentials in the Credentials pane.</div>
-                      <div className="mt-1 text-[10.5px] text-amber-700 dark:text-amber-300">In an authenticated workspace that started with no object store, external file access is fixed when the Data Playground server starts. Restart the Data Playground server after adding this destination; restarting only the canvas kernel is not enough.</div>
+                      <div className="mt-1 text-[10.5px] text-amber-700 dark:text-amber-300">In an authenticated workspace that started with no object store, external file access is fixed when the Data Playground server starts. Restart the Data Playground server after adding this destination; restarting only the Canvas worker is not enough.</div>
                     </div>
                   )}
                 </Section>}

@@ -631,7 +631,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
 
-    expect(screen.getByText('Default compute target')).toBeVisible()
+    expect(screen.getByText('Your default compute target')).toBeVisible()
     expect(screen.getByText('Local streaming')).toBeVisible()
     expect(screen.getByText('Isolated local process')).toBeVisible()
     expect(screen.getByText('Canvas worker')).toBeVisible()
@@ -650,7 +650,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
     expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByText('Change a specific Canvas from its top bar.')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the workspace default.')
+    expect(screen.getByRole('button', { name: 'Use Automatic execution' })).toHaveTextContent('Uses the target chosen for this workspace.')
     expect(screen.queryByText(/Uses the mode chosen for this Workspace/)).toBeNull()
     expect(screen.queryByText('Workspace default (deployment default)')).toBeNull()
   })
@@ -676,7 +676,7 @@ describe('SettingsModal — plugin config form', () => {
     ))
   })
 
-  it('does not expose Restart kernel when Settings has no explicit runner selection', async () => {
+  it('does not expose Restart Canvas worker when Settings has no explicit runner selection', async () => {
     state.kernelInfo = {
       runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
       backends: [],
@@ -684,10 +684,10 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
-    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restart Canvas worker' })).toBeNull()
   })
 
-  it('offers Restart kernel for an explicit user runner selection', async () => {
+  it('offers Restart Canvas worker for an explicit user runner selection', async () => {
     state.kernelInfo = {
       runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
       backends: [],
@@ -698,12 +698,12 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart Canvas worker' }))
 
     await waitFor(() => expect(restartKernel).toHaveBeenCalledWith('canvas'))
   })
 
-  it('does not expose Restart kernel for an explicit non-kernel runner', async () => {
+  it('does not expose Restart Canvas worker for an explicit non-worker runner', async () => {
     state.kernelInfo = {
       runners: ['local-out-of-core', 'local-subprocess', 'kernel'],
       backends: [],
@@ -714,7 +714,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Compute defaults' }))
-    expect(screen.queryByRole('button', { name: 'Restart kernel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restart Canvas worker' })).toBeNull()
   })
 
   it('keeps every edit when the atomic save fails and retries without claiming success', async () => {
@@ -911,13 +911,13 @@ describe('SettingsModal — plugin config form', () => {
     const model = await screen.findByPlaceholderText('anthropic/claude-opus-4-8')
     fireEvent.change(model, { target: { value: 'staged-model' } })
     fireEvent.click(screen.getByRole('button', { name: 'Compute defaults' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Restart kernel' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restart Canvas worker' }))
 
     expect(screen.getByRole('button', { name: 'Restarting…' })).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Restarting…' }))
     expect(restartKernel).toHaveBeenCalledOnce()
     rejectRestart?.(new Error('kernel is unavailable'))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not restart kernel: kernel is unavailable')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not restart the Canvas worker: kernel is unavailable')
     fireEvent.click(screen.getByRole('button', { name: 'Agent' }))
     expect(screen.getByPlaceholderText('anthropic/claude-opus-4-8')).toHaveValue('staged-model')
     expect(putSettingsBatch).not.toHaveBeenCalled()
@@ -982,7 +982,7 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('option', { name: 's3' }))
     expect(await screen.findByLabelText('Destination credential')).toBeVisible()
     expect(screen.getByText(/Restart the Data Playground server after adding this destination/i)).toBeVisible()
-    expect(screen.getByText(/restarting only the canvas kernel is not enough/i)).toBeVisible()
+    expect(screen.getByText(/restarting only the Canvas worker is not enough/i)).toBeVisible()
   })
 
   it('saves the workspace result-history policy and shows the actual managed store', async () => {
@@ -996,7 +996,7 @@ describe('SettingsModal — plugin config form', () => {
     render(<SettingsModal onClose={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
 
-    expect(await screen.findByText('Shared object storage · object')).toBeVisible()
+    expect(await screen.findByText('Shared object storage')).toBeVisible()
     fireEvent.click(screen.getByLabelText('Canvas result history'))
     fireEvent.click(await screen.findByRole('option', { name: 'Latest result' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))

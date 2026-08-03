@@ -423,6 +423,42 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('first-run examples keep the selected folder and the primary run control responds @first-run', async ({ page, request }) => {
+    await useFreshFirstRunUser(page, request, 'First-run folder example')
+    const suffix = Date.now()
+    const parent = `First-run Research ${suffix}`
+    const child = `Experiment ${suffix}`
+    let exampleId = ''
+    try {
+      await page.goto('/#/workspace')
+      for (const folder of [parent, child]) {
+        await page.getByRole('button', { name: 'New folder' }).click()
+        await page.getByLabel('Folder name').fill(folder)
+        await page.getByRole('button', { name: 'Create', exact: true }).click()
+        await expect(page.getByRole('dialog', { name: 'New folder' })).toHaveCount(0)
+      }
+      await expect(page.getByRole('navigation', { name: 'Workspace path' }))
+        .toContainText(`${parent}/${child}`)
+
+      await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
+      await expect(page.locator('.react-flow__node')).toHaveCount(5)
+      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+      await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' }))
+        .toContainText(`Workspace/${parent}/${child}`)
+
+      await page.getByRole('button', { name: 'Rerun all' }).click()
+      await expect(page.getByRole('button', { name: 'Confirm run…' })).toBeVisible()
+
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Back to Workspace', { exact: true }).click()
+      await expect(page.getByRole('navigation', { name: 'Workspace path' }))
+        .toContainText(`${parent}/${child}`)
+      await expect(page.getByRole('button', { name: 'Open canvas Purchases per user' })).toBeVisible()
+    } finally {
+      if (exampleId) await page.request.delete(`/api/canvas/${encodeURIComponent(exampleId)}`)
+    }
+  })
+
   test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page, request }) => {
     await useFreshFirstRunUser(page, request, 'First-run replacement safety')
     await page.goto('/')
@@ -1744,7 +1780,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('rail-settings').click()
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.getByRole('button', { name: 'Compute defaults' }).click()
-    await expect(page.getByText('Default compute target', { exact: true })).toBeVisible()
+    await expect(page.getByText('Your default compute target', { exact: true })).toBeVisible()
     const automatic = page.getByRole('button', { name: 'Use Automatic execution' })
     await automatic.click()
     await expect(automatic).toHaveAttribute('aria-pressed', 'true')

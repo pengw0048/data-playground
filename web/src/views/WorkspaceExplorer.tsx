@@ -417,6 +417,61 @@ export function WorkspaceExplorer() {
 function FirstRunCanvasChoice() {
   const newFile = useStore((state) => state.newFile)
   const newFromExample = useStore((state) => state.newFromExample)
+  const requestedResourceId = useStore((state) => state.workspaceResourceId)
+  const openFile = useStore((state) => state.openFile)
+  const refreshFiles = useStore((state) => state.refreshFiles)
+  const pushToast = useStore((state) => state.pushToast)
+  const [creating, setCreating] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const replay = useRef<{ intent: string; requestId: string } | null>(null)
+
+  const create = async (exampleKey?: string) => {
+    if (creating) return
+    setCreating(exampleKey ?? 'blank')
+    setError(null)
+    try {
+      // At the Workspace root, the ordinary store path already has the exact placement semantics.
+      // A selected folder needs an explicit destination: the previously-open Canvas is not evidence
+      // of the folder currently visible in Workspace.
+      if (!requestedResourceId) {
+        if (exampleKey) await newFromExample(exampleKey)
+        else await newFile()
+        return
+      }
+      const resolved = await api.workspaceResource(requestedResourceId)
+      const target = resolved.resource?.kind === 'container'
+        ? resolved.resource
+        : resolved.ancestors[resolved.ancestors.length - 1]
+      const destination = canvasDestination(target ?? null, 'create')
+      if (!target || !destination) throw new Error(canvasDestinationTitle(target ?? null, 'create'))
+      const intent = JSON.stringify({
+        containerId: destination.containerId,
+        expectedContainerVersion: destination.expectedContainerVersion,
+        name: 'untitled',
+      })
+      if (destination.externalOverlay && replay.current?.intent !== intent) {
+        replay.current = { intent, requestId: newRequestId() }
+      }
+      const created = await api.workspaceCreateCanvas({
+        containerId: destination.containerId,
+        expectedContainerVersion: destination.expectedContainerVersion,
+        name: 'untitled',
+        ...(destination.externalOverlay ? { requestId: replay.current!.requestId } : {}),
+      })
+      await refreshFiles()
+      if (!await openFile(created.id)) throw new Error('The Canvas was created but could not be opened.')
+      if (exampleKey) {
+        const applied = await newFromExample(exampleKey, 'replace-pristine')
+        if (!applied.ok) throw new Error('The Canvas was created, but the example could not be loaded.')
+      }
+    } catch (caught) {
+      const message = errorMessage(caught)
+      setError(message)
+      pushToast(message, 'error')
+    } finally {
+      setCreating(null)
+    }
+  }
   return (
     <section data-testid="first-run-canvas-choice" aria-labelledby="first-run-canvas-title"
       className="border-b border-border bg-card px-7 py-3">
@@ -426,17 +481,21 @@ function FirstRunCanvasChoice() {
           Start with an empty graph, or open a runnable example using the seeded sample data.
         </p>
         <div className="mt-2 flex flex-wrap gap-2">
-          <button type="button" onClick={() => { void newFile() }}
-            className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background">Start a blank Canvas</button>
+          <button type="button" onClick={() => { void create() }} disabled={creating !== null}
+            className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-60">
+            {creating === 'blank' ? 'Creating…' : 'Start a blank Canvas'}
+          </button>
         </div>
         <div className="mt-2 grid max-w-4xl gap-2 sm:grid-cols-3" role="group" aria-label="Runnable examples">
           {examples.map((example) => <button key={example.key} type="button"
-            onClick={() => { void newFromExample(example.key) }} aria-label={`Open example ${example.name}`}
-            className="rounded-md border border-border bg-background px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent">
+            onClick={() => { void create(example.key) }} disabled={creating !== null}
+            aria-label={`Open example ${example.name}`}
+            className="rounded-md border border-border bg-background px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent disabled:opacity-60">
             <span className="block text-[12px] font-semibold text-foreground">{example.name}</span>
             <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{example.blurb}</span>
           </button>)}
         </div>
+        {error && <div role="alert" className="mt-2 text-[11.5px] text-destructive">{error}</div>}
       </div>
     </section>
   )
@@ -722,9 +781,43 @@ function WorkspaceMixedExplorer() {
     return () => { cancelled = true; request.current += 1 }
   }, [requestedResourceId, searchQuery, load, revision, providerPlacementObservations])
 
+  const enterContainer = (resource: WorkspaceResource, path?: WorkspaceResource[]) => {
+    // Folder navigation changes the target of every create/move action. Make that context switch
+    // synchronously, then let route resolution refresh the authoritative contents. Otherwise a
+    // quick follow-up action can run against the folder we just left.
+    const alreadySelected = identity(resource) === containerId
+      && (requestedResourceId === resource.id
+        || (identity(resource) === LOCAL_ROOT_ID && requestedResourceId === null))
+    if (alreadySelected && !searchQuery) return
+    request.current += 1
+    loadedContainer.current = identity(resource)
+    selectionContainer.current = resource
+    setContainerId(identity(resource))
+    setContainer(resource)
+    if (path) setCrumbs(path)
+    setItems([])
+    setConnectedSources([])
+    setSources([])
+    setCompleteness('complete')
+    setSelectedResourceIds(new Set())
+    setPageIndex(0)
+    setPageCursors([null])
+    setCursor(null)
+    setHasMore(false)
+    setError(null)
+    setLoadMoreError(null)
+    setResolutionError(null)
+    setLoading(true)
+    setWorkspaceResource(identity(resource) === LOCAL_ROOT_ID ? null : resource.id)
+  }
+
   const open = (resource: WorkspaceResource) => {
     if (itemAvailability(resource) && !hasDetachedDatasetRecovery(resource)) return
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
+    if (resource.kind === 'container') {
+      enterContainer(resource, searchQuery ? undefined : [...crumbs, resource])
+      return
+    }
     if (resource.kind === 'dataset'
         && (providerViewerRoute.exactRevision || providerViewerRoute.viewerReturn)) {
       setWorkspaceDatasetQuery('')
@@ -758,7 +851,7 @@ function WorkspaceMixedExplorer() {
   }
   const useTable = (table: CatalogTable) => {
     if (!selectedDataset) {
-      pushToast('Could not resolve the stable Workspace dataset identity', 'error')
+      pushToast('The selected dataset could not be resolved. Reload Workspace and try again.', 'error')
       return
     }
     rememberTables([table])
@@ -779,7 +872,12 @@ function WorkspaceMixedExplorer() {
   }
   // Re-resolve the stable resource before reloading. This keeps rename/move refreshes truthful and
   // retries the same deep link rather than silently falling back to a different container.
-  const reload = () => setRevision((current) => current + 1)
+  const reload = () => {
+    // Workspace resources and Canvas roles are separate projections of the same objects. Refresh
+    // both so an agent-created Canvas becomes actionable without requiring a full browser reload.
+    void refreshFiles()
+    setRevision((current) => current + 1)
+  }
   const searchActionRequest = useRef(0)
   useEffect(() => () => { searchActionRequest.current += 1 }, [searchQuery])
   const startSearchAction = async (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas' | 'remove-dataset') => {
@@ -981,7 +1079,7 @@ function WorkspaceMixedExplorer() {
         ? 'This dataset is not currently available in Workspace.' : undefined}
       onOpenTable={setSelectedTable} onFolder={() => {
         if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
-          setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
+          enterContainer(container, crumbs)
         } else pushToast('This dataset is not currently available in Workspace.', 'error')
       }}
       onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />
@@ -992,8 +1090,8 @@ function WorkspaceMixedExplorer() {
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[60px] flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-7 py-2.5">
         <nav aria-label="Workspace path" className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground">
-          <button onClick={() => setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
-          {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
+          <button onClick={() => crumbs[0] ? enterContainer(crumbs[0], [crumbs[0]]) : setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
+          {crumbs.slice(1).map((crumb, index) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => enterContainer(crumb, crumbs.slice(0, index + 2))} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
         </nav>
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
@@ -1240,7 +1338,8 @@ function WorkspaceMixedExplorer() {
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
       {folderCreateParent && <FolderCreateDialog parent={folderCreateParent.resource} path={folderCreateParent.path}
         onClose={() => setFolderCreateParent(null)} onCreated={(resource) => {
-          setFolderCreateParent(null); reload(); setWorkspaceResource(resource.id)
+          setFolderCreateParent(null)
+          enterContainer(resource, [...folderCreateParent.path, resource])
         }} />}
       {folderRenameResource && <FolderRenameDialog resource={folderRenameResource.resource} path={folderRenameResource.path}
         onClose={() => setFolderRenameResource(null)} onRenamed={(resource) => {
@@ -1251,14 +1350,17 @@ function WorkspaceMixedExplorer() {
       {folderDeleteResource && <FolderDeleteDialog resource={folderDeleteResource.resource} path={folderDeleteResource.path}
         onClose={() => setFolderDeleteResource(null)} onDeleted={() => {
           setFolderDeleteResource(null); reload()
-        }} onOpenFolder={() => { setFolderDeleteResource(null); setWorkspaceResource(folderDeleteResource.resource.id) }} />}
+        }} onOpenFolder={() => {
+          enterContainer(folderDeleteResource.resource, folderDeleteResource.path)
+          setFolderDeleteResource(null)
+        }} />}
       {canvasRenameResource && <CanvasRenameDialog resource={canvasRenameResource} onClose={() => setCanvasRenameResource(null)}
-        onRenamed={() => { setCanvasRenameResource(null); void refreshFiles(); reload() }} />}
+        onRenamed={() => { setCanvasRenameResource(null); reload() }} />}
       {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
-        onDeleted={() => { setCanvasDeleteResource(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload() }} />}
+        onDeleted={() => { setCanvasDeleteResource(null); setSelectedResourceIds(new Set()); reload() }} />}
       {canvasBatchDeleteResources && <CanvasBatchDeleteDialog resources={canvasBatchDeleteResources}
         onClose={() => setCanvasBatchDeleteResources(null)} onCompleted={(deleted) => {
-          setCanvasBatchDeleteResources(null); setSelectedResourceIds(new Set()); void refreshFiles(); reload()
+          setCanvasBatchDeleteResources(null); setSelectedResourceIds(new Set()); reload()
           pushToast(`Deleted ${deleted} Canvases.`, 'success')
         }} />}
       {datasetRemoveResource && (isExternal(datasetRemoveResource)
@@ -1874,7 +1976,7 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
     setBusy(true); setError(null); setConflict(false)
     try {
       if (datasetIds.length !== action.tables.length || !datasetIds.length) {
-        setError('Reload the selection before using it; a stable dataset identity is missing')
+        setError('The selected datasets changed while this dialog was open. Close it, reload Workspace, and try again.')
         return
       }
       if (mode === 'explore') {

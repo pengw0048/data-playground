@@ -216,7 +216,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     const sequence = ++admissionGeneration.current
     const next = ensureSubmission()
     const request = requestFor(next, sidecar)
-    if (!request) { setError('Choose one direct saved sidecar Source version and one destination first.'); return }
+    if (!request) { setError('Connect one saved dataset version and choose a destination first.'); return }
     const key = requestKey(request)
     setBusy('preflight'); setError(''); setPreflight(null); setPreflightKey(null)
     try {
@@ -370,7 +370,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     const sourceNames = new Set<string>()
     const targetNames = new Set<string>()
     for (const rule of rules) {
-      if (!rule.source.trim() || !rule.target.trim()) return 'Every mapping needs both a sidecar and destination column.'
+      if (!rule.source.trim() || !rule.target.trim()) return 'Every mapping needs both an input and destination column.'
       const sourceKey = asciiFold(rule.source)
       const targetKey = asciiFold(rule.target)
       if (identityNames.has(sourceKey)) return 'A matching column cannot also be added or replaced.'
@@ -380,7 +380,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
       if (suggestedFields) {
         const source = sidecarFields.get(rule.source)
         const target = baseFields.get(rule.target)
-        if (!source) return `Sidecar payload “${rule.source}” is not present in the saved sidecar schema.`
+        if (!source) return `Input column “${rule.source}” is not present in the saved dataset.`
         if (rule.mode === 'add' && target) return `“${rule.target}” already exists in the destination draft; use replace or choose a new column.`
         if (rule.mode === 'replace' && !target) return `“${rule.target}” is not in the destination draft; use add or choose an existing column.`
         if (target && source.type !== target.type) return `Mapping “${rule.source}” → “${rule.target}” has incompatible draft types (${source.type} → ${target.type}).`
@@ -389,7 +389,7 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     if (suggestedFields) {
       const payload = suggestedFields.sidecar.filter((field) => !identityNames.has(asciiFold(field.name)))
       const unused = payload.filter((field) => !sourceNames.has(asciiFold(field.name)))
-      if (unused.length) return `Add explicit mappings for sidecar payload: ${unused.map((field) => field.name).join(', ')}.`
+      if (unused.length) return `Add explicit mappings for input columns: ${unused.map((field) => field.name).join(', ')}.`
     }
     return null
   }, [config.identityColumns, config.rules, suggestedFields])
@@ -416,11 +416,11 @@ export function ManagedSidecarMergeControl({ nodeId, compact = false }: { nodeId
     </label>}
     {selectedBase && <div className="mt-2 rounded border border-border bg-background p-2 text-[10px] text-muted-foreground"><strong className="text-foreground">Target dataset</strong><div className="mt-0.5 truncate">{selectedBaseName}</div></div>}
     {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Matching columns
-      <input aria-label="Managed sidecar identity columns" disabled={!canEdit || intentLocked} value={(config.identityColumns ?? []).join(', ')} onChange={(event) => change({ ...config, identityColumns: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
+      <input aria-label="Saved dataset matching columns" disabled={!canEdit || intentLocked} value={(config.identityColumns ?? []).join(', ')} onChange={(event) => change({ ...config, identityColumns: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
     </label>}
     {identityCandidates.length > 0 && !compact && <div className="mt-1 flex flex-wrap items-center gap-1"><span className="text-[10px] text-muted-foreground">Suggested:</span>{identityCandidates.map((candidate) => <Button key={candidate.join('\u0000')} size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => useSuggestion(candidate)} disabled={!canEdit || intentLocked}>Use {candidate.join(', ')}</Button>)}</div>}
     {!compact && <div className="mt-2 space-y-1"><div className="text-[10.5px] text-muted-foreground">Input column → target column</div>
-      {(config.rules ?? []).map((rule, index) => <div key={index} className="grid grid-cols-[1fr_74px_1fr_24px] gap-1"><input aria-label={`Managed sidecar source column ${index + 1}`} value={rule.source} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, source: event.target.value }; change({ ...config, rules }) }} placeholder="sidecar field" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><select aria-label={`Managed sidecar mode ${index + 1}`} value={rule.mode} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, mode: event.target.value as MergeColumnRule['mode'] }; change({ ...config, rules }) }} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select><input aria-label={`Managed sidecar target column ${index + 1}`} value={rule.target} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, target: event.target.value }; change({ ...config, rules }) }} placeholder="base field" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><button aria-label={`Remove managed sidecar rule ${index + 1}`} disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })} className="text-muted-foreground hover:text-destructive">×</button></div>)}
+      {(config.rules ?? []).map((rule, index) => <div key={index} className="grid grid-cols-[1fr_74px_1fr_24px] gap-1"><input aria-label={`Saved dataset source column ${index + 1}`} value={rule.source} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, source: event.target.value }; change({ ...config, rules }) }} placeholder="input column" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><select aria-label={`Saved dataset merge mode ${index + 1}`} value={rule.mode} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, mode: event.target.value as MergeColumnRule['mode'] }; change({ ...config, rules }) }} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select><input aria-label={`Destination column ${index + 1}`} value={rule.target} disabled={!canEdit || intentLocked} onChange={(event) => { const rules = [...(config.rules ?? [])]; rules[index] = { ...rules[index]!, target: event.target.value }; change({ ...config, rules }) }} placeholder="destination column" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" /><button aria-label={`Remove column mapping ${index + 1}`} disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })} className="text-muted-foreground hover:text-destructive">×</button></div>)}
       <div className="flex gap-1"><Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" disabled={!canEdit || intentLocked} onClick={() => change({ ...config, rules: [...(config.rules ?? []), { source: '', target: '', mode: 'add' }] })}>Add mapping</Button>{suggestedFields && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" disabled={!canEdit || intentLocked} onClick={addSuggestedRules}>Add suggested rules</Button>}</div>
     </div>}
     {preflight && <div aria-label="Column merge check" className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground"><div className="font-semibold text-foreground">{preflight.eligible ? 'Ready to merge' : 'Not ready to merge'}</div><div>Matching columns: <span className="font-mono">{preflight.identityColumns.join(', ') || 'none'}</span></div><div>Changes: {preflight.rules.map((rule) => `${rule.source} → ${rule.target} (${rule.mode})`).join('; ') || 'none'}</div><div>Coverage: {coverageLine(preflight.coverage)}</div><div>Target: {preflight.coverage.base.rows.toLocaleString()} rows · {preflight.coverage.base.uniqueIdentities.toLocaleString()} unique keys · {preflight.coverage.base.nullRows.toLocaleString()} missing keys · {preflight.coverage.base.duplicateGroups.toLocaleString()} duplicate groups</div><div>Input: {preflight.coverage.candidate.rows.toLocaleString()} rows · {preflight.coverage.candidate.uniqueIdentities.toLocaleString()} unique keys · {preflight.coverage.candidate.nullRows.toLocaleString()} missing keys · {preflight.coverage.candidate.duplicateGroups.toLocaleString()} duplicate groups</div><div>Result columns: {preflight.outputSchema.map((field) => `${field.name}: ${field.type}`).join(', ') || 'no fields'}</div></div>}

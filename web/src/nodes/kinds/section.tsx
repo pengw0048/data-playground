@@ -67,7 +67,7 @@ function Section({ id, data, selected }: NodeComponentProps) {
           )}
           <span className={editing ? 'flex-1' : undefined} />
           <span className="rounded bg-muted px-1.5 py-0.5 text-[8.5px] font-semibold tracking-[0.6px] text-muted-foreground">SECTION</span>
-          <Tooltip label={!kernelUp ? 'Hub offline — run unavailable' : runnable ? 'Run up to here' : blocked ?? 'Connect a source to run'}>
+          <Tooltip label={!kernelUp ? 'Offline — run unavailable' : runnable ? 'Run up to here' : blocked ?? 'Connect a source to run'}>
             <button aria-label="Run section" aria-disabled={!canEdit || !kernelUp || !runnable} onClick={(e) => { e.stopPropagation(); if (canEdit && kernelUp && runnable) requestRun(id) }}
               className={cn('grid h-[22px] w-6 place-items-center rounded-md', canEdit && kernelUp && runnable ? 'cursor-pointer text-muted-foreground' : 'cursor-not-allowed text-muted-foreground/40')}>
               <Icon name="play" size={13} />

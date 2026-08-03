@@ -918,7 +918,7 @@ function ProfileTable({ res, toggle, fillAvailableHeight = false }: {
               ? 'All rows were scanned; approximate distinct counts are marked ≈.'
               : previewSample
                 ? 'All metrics describe this preview sample only; approximate counts are marked ≈.'
-                : 'The kernel did not report whether these statistics cover a sample or the whole dataset.'}
+                : 'Data Playground did not report whether these statistics cover a sample or the whole dataset.'}
           </div>
           {res.sampleProvenance && <SampleProvenanceSummary provenance={res.sampleProvenance} />}
         </div>
@@ -1462,7 +1462,7 @@ export function FullResult({
   </div>
   if (data.error) return (
     <FullResultMessage title={`Couldn’t read ${viewLabel.toLowerCase()}`}
-      reason={data.reason ?? 'The kernel reported an error while reading this run output.'}
+      reason={data.reason ?? 'Data Playground reported an error while reading this run output.'}
       chrome={modeChrome} action={exportAction}
       onRetry={() => setRetry((n) => n + 1)} />
   )

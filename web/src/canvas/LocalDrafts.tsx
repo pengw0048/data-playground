@@ -25,14 +25,14 @@ function DraftActions({ draft, close }: { draft: LocalCanvasDraft; close?: () =>
   const actionClass = 'rounded px-1.5 py-0.5 text-[10.5px] font-semibold hover:bg-accent disabled:opacity-50'
   return <><div className="flex shrink-0 items-center gap-0.5">
     {draft.syncState === 'conflict' && draft.baseCanvasId && !serverCopyKnownUnavailable && (
-      <button aria-label={`Open server copy for ${draft.name}`} title={!kernelUp ? 'Hub offline — reconnect before opening the server copy' : undefined}
+      <button aria-label={`Open server copy for ${draft.name}`} title={!kernelUp ? 'Offline — reconnect before opening the server copy' : undefined}
         className={actionClass} disabled={!kernelUp} onClick={() => { void openFile(draft.baseCanvasId!, { serverCopy: true }); close?.() }}>Open server</button>
     )}
     {draft.syncState === 'conflict' && (
       <button aria-label={`Keep local draft ${draft.name} as new Canvas`} className={actionClass} onClick={() => { void fork(draft.draftId); close?.() }}>Keep as new</button>
     )}
     {draft.syncState !== 'conflict' && (
-      <button aria-label={`Retry local draft ${draft.name}`} title={!kernelUp ? 'Hub offline — reconnect before syncing' : undefined}
+      <button aria-label={`Retry local draft ${draft.name}`} title={!kernelUp ? 'Offline — reconnect before syncing' : undefined}
         className={actionClass} disabled={!kernelUp || draft.syncState === 'syncing'} onClick={() => void retry(draft.draftId)}>Retry</button>
     )}
     <button aria-label={`Export local draft ${draft.name}`} className={actionClass} onClick={() => exportDraft(draft.draftId)}>Export</button>

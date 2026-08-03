@@ -94,8 +94,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 
   if (isConfiguredManagedSidecarMerge) return (
     <div className="p-3.5">
-      <Label>SIDECAR COLUMN MERGE</Label>
-      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges an already-published sidecar version into the selected current base. The server verifies coverage before publishing.</div>
+      <Label>SAVED DATASET COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges columns from a saved dataset into the selected destination. The server verifies row coverage before publishing.</div>
       <ManagedSidecarMergeControl nodeId={nodeId} />
     </div>
   )

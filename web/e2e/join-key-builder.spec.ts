@@ -78,9 +78,9 @@ test.describe('Join key builder', () => {
     }
   })
 
-  test('uses the real a/b schemas for same, different, multi-key, advanced, and rewired joins', async ({ page }) => {
+  test('uses the real a/b schemas for same, different, multi-key, advanced, and rewired joins', async ({ page }, testInfo) => {
     test.setTimeout(45_000)
-    const token = `join-key-builder-${Date.now()}`
+    const token = `join-key-builder-${Date.now()}-${testInfo.workerIndex}-${testInfo.repeatEachIndex}`
     const dataRoot = resolve(process.cwd(), '.e2e-workspace', 'data')
     const leftPath = resolve(dataRoot, `${token}-left.csv`)
     const rightPath = resolve(dataRoot, `${token}-right.csv`)
@@ -145,6 +145,7 @@ test.describe('Join key builder', () => {
       await expect.poll(async () => (await saved(page, canvasId)).nodes.find((node: any) => node.id === 'join').data.config)
         .toMatchObject({ how: 'left', on: '', condition: 'a._rowid = b.original_row_id AND a.left_region = b.right_region' })
 
+      await expect(page.getByTestId('autosave')).toContainText('saved')
       const advanced = await saved(page, canvasId)
       advanced.nodes.find((node: any) => node.id === 'join').data.config = {
         how: 'left', on: '', condition: 'a._rowid = b.original_row_id OR a.left_region = b.right_region',
@@ -154,6 +155,7 @@ test.describe('Join key builder', () => {
       await page.reload()
       await expect(page.getByLabel('advanced ON condition')).toHaveValue('a._rowid = b.original_row_id OR a.left_region = b.right_region')
 
+      await expect(page.getByTestId('autosave')).toContainText('saved')
       const rewired = await saved(page, canvasId)
       rewired.nodes.find((node: any) => node.id === 'join').data.config = { how: 'left', on: '', condition: 'a.replacement_id = b.original_row_id' }
       rewired.edges.find((edge: any) => edge.id === 'left-a').source = 'replacement'

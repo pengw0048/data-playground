@@ -38,7 +38,7 @@ export function AgentDock() {
       provider: s.provider,
       reason: s.reason,
       disclosure: s.disclosure ?? s.policy,
-    })).catch(() => setLlm({ available: false, reason: 'kernel offline' }))
+    })).catch(() => setLlm({ available: false, reason: 'Data Playground is offline.' }))
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }  // Esc closes the dock
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)

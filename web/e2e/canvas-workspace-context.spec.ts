@@ -1,8 +1,8 @@
 import { expect, test } from '@playwright/test'
 
 test.describe('Canvas Workspace placement context @ux-smoke', () => {
-  test('creates an immediately chosen example beside a blank Canvas in the same nested folder', async ({ page }) => {
-    const suffix = Date.now()
+  test('creates an immediately chosen example beside a blank Canvas in the same nested folder', async ({ page }, testInfo) => {
+    const suffix = `${Date.now()}-${testInfo.workerIndex}-${testInfo.repeatEachIndex}`
     const parent = `Example parent ${suffix}`
     const child = `Example child ${suffix}`
     const blankName = 'untitled'
@@ -76,10 +76,10 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     }
   })
 
-  test('retains a nested local location through reload, folder rename, and Canvas move at 1280px', async ({ page }) => {
+  test('retains a nested local location through reload, folder rename, and Canvas move at 1280px', async ({ page }, testInfo) => {
     test.setTimeout(60_000)
     await page.setViewportSize({ width: 1280, height: 720 })
-    const suffix = Date.now()
+    const suffix = `${Date.now()}-${testInfo.workerIndex}-${testInfo.repeatEachIndex}`
     const destination = `Canvas destination ${suffix}`
     const parent = `Canvas parent ${suffix}`
     const renamedParent = `Canvas renamed parent ${suffix}`

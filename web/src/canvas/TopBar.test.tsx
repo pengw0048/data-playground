@@ -19,6 +19,8 @@ const state = vi.hoisted(() => ({
   localDrafts: [] as Array<{ draftId: string; syncState: string }>,
   canvasRole: 'owner',
   rerunAll: vi.fn(),
+  cancelGraphRun: vi.fn(),
+  graphRun: null,
   past: [] as unknown[],
   future: [] as unknown[],
   peers: {} as Record<string, { name: string; color: string }>,
@@ -252,6 +254,14 @@ describe('TopBar Settings handoff', () => {
 })
 
 describe('Canvas execution target', () => {
+  it('starts the whole graph from the primary run control', async () => {
+    render(<TopBar />)
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Rerun all' }))
+
+    expect(state.rerunAll).toHaveBeenCalledTimes(1)
+  })
+
   it('selects a configured runner from the Canvas top bar', async () => {
     state.kernelInfo.executionTargets = [
       { name: 'kernel', label: 'Canvas worker', kind: 'interactive', description: 'Reusable worker.', substrate: 'pod' },

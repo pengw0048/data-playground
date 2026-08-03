@@ -160,7 +160,7 @@ describe('Catalog discovery request and mutation truth', () => {
     fireEvent.change(screen.getByTestId('register-uri'), { target: { value: '/mounted/missing.parquet' } })
     fireEvent.click(screen.getByTestId('register-submit'))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Confirm it exists and is readable from the kernel host')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Confirm that the server can read it')
     expect(mocks.registerDataset).toHaveBeenCalledWith(expect.objectContaining({ uri: '/mounted/missing.parquet' }))
   })
 

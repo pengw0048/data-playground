@@ -98,7 +98,7 @@ describe('ManagedSidecarMergeControl', () => {
     let resolve: (value: any) => void = () => undefined
     mocks.preflight.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
     fireEvent.click(screen.getByRole('button', { name: 'Check setup' }))
-    fireEvent.change(screen.getByLabelText('Managed sidecar identity columns'), { target: { value: 'id, frame' } })
+    fireEvent.change(screen.getByLabelText('Saved dataset matching columns'), { target: { value: 'id, frame' } })
     resolve({ base: { kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r4' }, sidecar: { kind: 'exact', datasetId: 'sidecar-dataset', revisionId: 'sidecar-r1' }, expectedHead: { kind: 'exact', datasetId: 'base-dataset', revisionId: 'base-r4' }, identityColumns: ['id'], rules: [], baseSchema: [], sidecarSchema: [], outputSchema: [], coverage: { base: { rows: 1, uniqueIdentities: 1, nullRows: 0, duplicateGroups: 0, duplicateRows: 0 }, candidate: { rows: 1, uniqueIdentities: 1, nullRows: 0, duplicateGroups: 0, duplicateRows: 0 }, matchedIdentities: 1, missingIdentities: 0, extraIdentities: 0, status: 'complete' }, eligible: true })
     await waitFor(() => expect(screen.queryByText('Ready to merge')).not.toBeInTheDocument())
   })
