@@ -256,7 +256,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     // 5. Jobs evidence: the durable task and its output receipt are visible in the shipped Jobs surface.
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    const jobRow = page.getByRole('button', { name: `Open run ${runId} in Issue 635 default journey` })
+    const jobRow = page.getByTestId(`job-row-${runId}`)
     await expect(jobRow).toBeVisible({ timeout: 15_000 })
     await expect(jobRow).toContainText(localJobsTime)
     await shoot(page, 'light', 'jobs')
@@ -564,7 +564,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
       await page.setViewportSize(VIEWPORT)
       await page.goto(`${base}/#/jobs?run=${encodeURIComponent(started.runId)}`)
       await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-      await expect(page.getByRole('button', { name: `Open run ${started.runId} in Issue 635 restart recovery` })).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByTestId(`job-row-${started.runId}`)).toBeVisible({ timeout: 15_000 })
     } finally {
       await killHub()
       await rm(workspace, { recursive: true, force: true })

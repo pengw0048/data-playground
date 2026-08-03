@@ -313,7 +313,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await page.keyboard.press('Escape')
 
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
-    const job = page.getByRole('button', { name: new RegExp(`Open run ${runId}`) })
+    const job = page.getByTestId(`job-row-${runId}`)
     await expect(job).toHaveAttribute('aria-expanded', 'true')
     await page.getByRole('button', { name: 'Open result' }).click()
     const jobsResult = page.getByRole('complementary', { name: 'Saved result' })

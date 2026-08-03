@@ -53,7 +53,7 @@ describe('JobsView', () => {
     expect(screen.getByText('Open for failure details')).toBeVisible()
     expect(screen.queryByText('destination unavailable')).toBeNull()
     expect(screen.getByText(new Date('2026-07-16T12:00:00Z').toLocaleString())).toHaveClass('whitespace-nowrap')
-    fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByTestId('job-row-run-1'))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.getAllByText('destination unavailable')).toHaveLength(1)
     expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
@@ -61,6 +61,21 @@ describe('JobsView', () => {
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
     expect(screen.queryByText('Last durable update:')).not.toBeInTheDocument()
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
+  })
+
+  it('names a row after what the row shows instead of its run id', async () => {
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ isMine: false, createdById: 'peer', createdByName: 'Ada' })],
+      hasMore: false, nextCursor: null,
+    })
+    useStore.setState({ jobsQuery: 'scope=all' } as never)
+    render(<JobsView />)
+
+    const recorded = new Date('2026-07-16T12:00:00Z').toLocaleString()
+    expect(await screen.findByTestId('job-row-run-1')).toHaveAccessibleName(
+      `Open job, Alpha research, Publish observations · Ada, Failed, ${recorded}`,
+    )
+    expect(screen.queryByRole('button', { name: /run-1/ })).not.toBeInTheDocument()
   })
 
   it('turns a known engine exception into an actionable failure message', async () => {
@@ -71,7 +86,7 @@ describe('JobsView', () => {
     })
 
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
 
     expect(screen.getByRole('alert')).toHaveTextContent('An input dataset version used by this run is no longer available.')
     expect(screen.queryByText(/LocalRunInputError/)).not.toBeInTheDocument()
@@ -130,9 +145,7 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run history-1 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-history-1'))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(useStore.getState().jobsQuery).toContain('run=history-1')
   })
@@ -203,7 +216,7 @@ describe('JobsView', () => {
 
   it('keeps internal run evidence out of the user-facing Job detail', async () => {
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
 
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.queryByText('Diagnostics')).not.toBeInTheDocument()
@@ -246,9 +259,7 @@ describe('JobsView', () => {
     expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(2, { limit: 1, runId: 'direct-run' })
 
     fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
-    expect(await screen.findByRole('button', {
-      name: 'Open run direct-run in Alpha research', expanded: true,
-    })).toBeVisible()
+    expect(await screen.findByTestId('job-row-direct-run')).toHaveAttribute('aria-expanded', 'true')
   })
 
   it('removes a direct-link-only Job after returning to the filtered list', async () => {
@@ -260,22 +271,14 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
     render(<JobsView />)
 
-    const linkedRow = await screen.findByRole('button', {
-      name: 'Open run running-run in Alpha research', expanded: true,
-    })
-    expect(screen.getByRole('button', {
-      name: 'Open run failed-run in Alpha research', expanded: false,
-    })).toBeVisible()
+    const linkedRow = await screen.findByTestId('job-row-running-run')
+    expect(screen.getByTestId('job-row-failed-run')).toBeVisible()
 
     fireEvent.click(linkedRow)
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
-    expect(screen.queryByRole('button', {
-      name: 'Open run running-run in Alpha research', expanded: false,
-    })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', {
-      name: 'Open run failed-run in Alpha research', expanded: false,
-    })).toBeVisible()
+    expect(screen.queryByTestId('job-row-running-run')).not.toBeInTheDocument()
+    expect(screen.getByTestId('job-row-failed-run')).toBeVisible()
   })
 
   it('keeps a linked Job after a later ordinary page includes it', async () => {
@@ -288,9 +291,7 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'status=failed&run=running-run' } as never)
     render(<JobsView />)
 
-    const linkedRow = await screen.findByRole('button', {
-      name: 'Open run running-run in Alpha research', expanded: true,
-    })
+    const linkedRow = await screen.findByTestId('job-row-running-run')
     fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenNthCalledWith(3, expect.objectContaining({
       cursor: 'second-page', status: 'failed',
@@ -298,9 +299,7 @@ describe('JobsView', () => {
 
     fireEvent.click(linkedRow)
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=failed'))
-    expect(screen.getByRole('button', {
-      name: 'Open run running-run in Alpha research', expanded: false,
-    })).toBeVisible()
+    expect(screen.getByTestId('job-row-running-run')).toBeVisible()
   })
 
   it('uses authorized canvas names and accepts direct server-side node or execution filters', async () => {
@@ -402,7 +401,7 @@ describe('JobsView', () => {
       render(<JobsView />)
       await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
-      expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
+      expect(screen.getByTestId('job-row-direct-run')).toBeVisible()
       expect(screen.getByText(/No active jobs · Updated/)).toBeVisible()
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
@@ -418,7 +417,7 @@ describe('JobsView', () => {
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
 
-    expect(await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).toBeVisible()
+    expect(await screen.findByTestId('job-row-run-2')).toBeVisible()
     expect(screen.getByText(/Loaded job history · Auto-refresh paused · Updated/)).toBeVisible()
   })
 
@@ -429,11 +428,11 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ id: 'history-3', runId: 'run-3', status: 'running', error: null })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
-    await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })
+    await screen.findByTestId('job-row-run-2')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    expect(await screen.findByRole('button', { name: 'Open run run-3 in Alpha research', expanded: false })).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).not.toBeInTheDocument()
+    expect(await screen.findByTestId('job-row-run-3')).toBeVisible()
+    expect(screen.queryByTestId('job-row-run-2')).not.toBeInTheDocument()
     expect(screen.getByText(/Active jobs refresh automatically · Updated/)).toBeVisible()
     expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: undefined, limit: 50 }))
   })
@@ -446,12 +445,12 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ id: 'direct-run', runId: 'direct-run', error: null })], hasMore: false, nextCursor: null })
     useStore.setState({ jobsQuery: 'run=direct-run' } as never)
     render(<JobsView />)
-    await screen.findByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })
+    await screen.findByTestId('job-row-direct-run')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenCalledTimes(4))
-    expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Open run refreshed-page in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByTestId('job-row-direct-run')).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByTestId('job-row-refreshed-page')).toBeVisible()
   })
 
   it('keeps the last successful first page visible after refresh failure', async () => {
@@ -459,11 +458,11 @@ describe('JobsView', () => {
       .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: false, nextCursor: null })
       .mockRejectedValueOnce(new Error('network unavailable'))
     render(<JobsView />)
-    await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })
+    await screen.findByTestId('job-row-run-1')
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t refresh Jobs: network unavailable')
-    expect(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByTestId('job-row-run-1')).toBeVisible()
     expect(screen.getByText(/Refresh failed · Updated/)).toBeVisible()
   })
 
@@ -473,7 +472,7 @@ describe('JobsView', () => {
       publicationKind: 'result', outcome: 'committed', uri: 'file:///result.parquet', rows: 12,
     }] })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
     fireEvent.click(screen.getByRole('button', { name: 'Open result' }))
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('output=write-1%3Aout'))
@@ -497,9 +496,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run run-1 in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-run-1')
     expect(row).toHaveTextContent('done')
     expect(row).not.toHaveTextContent('100%')
     expect(row).toHaveTextContent('2 outputs available')
@@ -521,9 +518,7 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run run-1 in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-run-1')
     expect(row).toHaveTextContent('running')
     expect(row).toHaveTextContent('50%')
     expect(row.textContent?.match(/running/g)).toHaveLength(1)
@@ -554,16 +549,12 @@ describe('JobsView', () => {
     ], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const transform = (await screen.findByRole('button', {
-      name: 'Open run transform-run in Alpha research', expanded: false,
-    })).closest('article')
+    const transform = (await screen.findByTestId('job-row-transform-run')).closest('article')
     expect(transform).toHaveTextContent('1 output available')
     expect(transform).toHaveTextContent('12 rows')
     expect(transform).not.toHaveTextContent('published')
 
-    const profile = screen.getByRole('button', {
-      name: 'Open run profile-run in Alpha research', expanded: false,
-    }).closest('article')
+    const profile = screen.getByTestId('job-row-profile-run').closest('article')
     expect(profile).toHaveTextContent('1 output available')
     expect(profile).toHaveTextContent('987 rows')
     expect(profile).not.toHaveTextContent('published')
@@ -594,9 +585,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    const row = await screen.findByRole('button', {
-      name: 'Open run write-run in Alpha research', expanded: false,
-    })
+    const row = await screen.findByTestId('job-row-write-run')
     expect(row.closest('article')).toHaveTextContent('Dataset revision published')
     expect(row.closest('article')).toHaveTextContent('12 rows')
     expect(row.closest('article')).not.toHaveTextContent('output retained')
@@ -620,11 +609,9 @@ describe('JobsView', () => {
       writeIntent: { mode: 'replace', destination: { name: 'durable', logicalUri: 'managed://durable', provider: 'managed-local-file' }, expectedHead: { revisionId: 'head-6' } },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-1 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-task-1'))
 
-    expect(screen.getByRole('button', { name: 'Open run task-1 in Alpha research' })).toHaveTextContent('50%')
+    expect(screen.getByTestId('job-row-task-1')).toHaveTextContent('50%')
     expect(screen.queryByText(/dataset-1@revision-7/)).not.toBeInTheDocument()
     expect(screen.queryByText(/expected head head-6/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
@@ -637,7 +624,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'sparse-output', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-merge-1'))
     expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Merging columns')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelMergeColumnsTask).toHaveBeenCalledWith('merge-1'))
@@ -650,7 +637,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'managed-sidecar', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-sidecar-1'))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-1'))
     expect(mocks.cancelMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-1')
@@ -662,7 +649,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'managed-sidecar', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: true, canCancel: false },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-retry in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-sidecar-retry'))
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
     await waitFor(() => expect(mocks.retryManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-retry', expect.any(String)))
     expect(mocks.retryMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-retry')
@@ -675,7 +662,7 @@ describe('JobsView', () => {
       mergeColumns: { producerKind: 'sparse-output', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: false, canRetry: false, canCancel: false, diagnosticCode: 'stale_expected_head' },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-stale in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-merge-stale'))
 
     expect(screen.getByRole('link', { name: 'Open in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
     expect(screen.getAllByRole('link', { name: 'Open in Canvas' })).toHaveLength(1)
@@ -687,7 +674,7 @@ describe('JobsView', () => {
       outputReceipt: { datasetId: 'dataset-1', revisionId: 'rev-gone', rows: 2, bytes: 12, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-gone', retentionOwner: 'core' }, schema: [], partitions: [], publication: { provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'redacted', publishSequence: 1, idempotencyKey: 'merge-done' } },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-merge-done'))
     expect(screen.getByRole('link', { name: 'Open dataset' })).toHaveAttribute(
       'href',
       '#/workspace/dataset%3Adataset-1?revision=rev-gone&revisionDataset=dataset-1&returnView=jobs&returnQuery=run%3Dmerge-done',
@@ -714,9 +701,7 @@ describe('JobsView', () => {
     })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-manifest in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-task-manifest'))
     expect(mocks.executionManifest).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Duplicate Canvas' })).toBeVisible()
     expect(screen.queryByText('Submitted graph')).not.toBeInTheDocument()
@@ -733,9 +718,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     mocks.retryRun.mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce(undefined)
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run task-2 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-task-2'))
     expect(screen.queryByText('attempt-1')).not.toBeInTheDocument()
     expect(screen.queryByText('attempt-2')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
@@ -761,9 +744,7 @@ describe('JobsView', () => {
       canCancel: true,
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
-    fireEvent.click(await screen.findByRole('button', {
-      name: 'Open run fan-1 in Alpha research', expanded: false,
-    }))
+    fireEvent.click(await screen.findByTestId('job-row-fan-1'))
     const progress = screen.getByRole('status', { name: 'Job progress' })
     expect(progress).toHaveTextContent('Current step · Processing partitions')
     expect(progress).toHaveTextContent('2 of 4 partitions complete')
@@ -786,11 +767,11 @@ describe('JobsView', () => {
     ], hasMore: false, nextCursor: null })
     render(<JobsView />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Open run external-1 in Alpha research', expanded: false }))
+    fireEvent.click(await screen.findByTestId('job-row-external-1'))
     expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Downloading data')
     expect(screen.queryByText('fixture-local')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open run checkpoint-1 in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByTestId('job-row-checkpoint-1'))
     expect(screen.getByRole('status', { name: 'Job progress' })).toHaveTextContent('Current step · Saving result for reuse')
     expect(screen.queryByText('materializing')).not.toBeInTheDocument()
   })
@@ -804,7 +785,7 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     expect(await screen.findByText('Dataset restore · Climate observations')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
+    fireEvent.click(screen.getByTestId('job-row-restore-1'))
     const link = screen.getByRole('link', { name: 'Open dataset' })
     expect(link).toHaveAttribute(
       'href',

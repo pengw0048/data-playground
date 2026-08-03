@@ -101,7 +101,7 @@ test('uses the installed sidecar fixture through the Write inspector and reopens
     await expect(page.getByText(/saved$/)).toBeVisible()
     await inspector.getByRole('button', { name: 'Open in Jobs' }).click()
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    await expect(page.getByRole('button', { name: new RegExp(`Open run ${task.taskId} in Column merge`) })).toBeVisible()
+    await expect(page.getByTestId(`job-row-${task.taskId}`)).toBeVisible()
     const jobs = await json<{ items: Array<{ outputReceipt?: { datasetId: string; revisionId: string } }> }>(
       await page.request.get(`/api/jobs?run_id=${encodeURIComponent(task.taskId)}&limit=1`), 'read managed merge receipt',
     )

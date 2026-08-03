@@ -515,10 +515,14 @@ function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput
                     : 'In progress'
   const outcomeDetail = item.error ? 'Open for failure details' : !report && rows != null ? rowLabel(rows) : null
   const duration = item.ms != null ? fmtMs(item.ms) : active ? 'In progress' : 'Unavailable'
+  const author = showAuthor
+    ? ` · ${item.isMine === false ? item.createdByName || item.createdById || 'Another user' : 'You'}`
+    : ''
+  const recorded = item.createdAt ? new Date(item.createdAt).toLocaleString() : null
   const step = jobStep(item)
   return <article className="border-b border-border last:border-b-0">
-    <button type="button" onClick={onSelect} aria-expanded={expanded}
-      aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
+    <button type="button" onClick={onSelect} aria-expanded={expanded} data-testid={`job-row-${jobKey(item)}`}
+      aria-label={`Open job, ${subject}, ${context}${author}, ${outcome}, ${recorded ?? duration}`}
       className="grid w-full grid-cols-[88px_minmax(0,1fr)_minmax(110px,1fr)] gap-2 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35 md:grid-cols-[96px_minmax(150px,1.3fr)_minmax(130px,1fr)_100px_140px] md:gap-3 xl:grid-cols-[108px_minmax(190px,1.3fr)_minmax(150px,1fr)_120px_100px_150px]">
       <span className="flex flex-wrap items-center gap-1.5">
         <Badge variant="secondary" className="capitalize" style={{ color: token.color }}>{item.status}</Badge>
@@ -528,12 +532,12 @@ function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput
         {!report && !dataset
           ? <JobSubject name={subject} />
           : <span className="block truncate font-semibold text-foreground">{subject}</span>}
-        <span className="block truncate text-muted-foreground">{context}{showAuthor ? ` · ${item.isMine === false ? item.createdByName || item.createdById || 'Another user' : 'You'}` : ''}</span>
+        <span className="block truncate text-muted-foreground">{context}{author}</span>
       </span>
       <span className="min-w-0"><span className={`block truncate font-medium ${item.status === 'failed' ? 'text-destructive' : 'text-foreground'}`}>{outcome}</span>{outcomeDetail && <span className="block truncate text-muted-foreground">{outcomeDetail}</span>}</span>
       <span className="hidden text-muted-foreground md:block">{duration}</span>
       <span className="hidden truncate text-muted-foreground xl:block" title={item.backend}>{item.backend}</span>
-      <span className="hidden whitespace-nowrap text-[10.5px] text-muted-foreground md:block">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
+      <span className="hidden whitespace-nowrap text-[10.5px] text-muted-foreground md:block">{recorded ?? '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
       {step && <div role="status" aria-label="Job progress" className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground sm:col-span-2">

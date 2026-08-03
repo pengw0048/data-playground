@@ -165,7 +165,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await control.getByRole('button', { name: 'Open in Jobs' }).click()
 
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    const job = page.getByRole('button', { name: `Open run ${task.taskId} in Issue 585 exact merge canvas` })
+    const job = page.getByTestId(`job-row-${task.taskId}`)
     await expect(job).toBeVisible()
     await expect(page.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     const exactDataset = page.getByRole('link', { name: 'Open dataset' })

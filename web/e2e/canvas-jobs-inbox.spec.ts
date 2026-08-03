@@ -103,7 +103,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     await expect(page.getByTestId('panel-run').getByRole('button', { name: 'View in Jobs' })).toBeVisible()
     await page.getByTestId('panel-run').getByRole('button', { name: 'View in Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${runId}$`))
-    const jobRow = page.getByRole('button', { name: `Open run ${runId} in Canvas Jobs and Inbox` })
+    const jobRow = page.getByTestId(`job-row-${runId}`)
     await expect(jobRow).toHaveAttribute('aria-expanded', 'true')
     const openInCanvas = page.getByRole('link', { name: 'Open in Canvas' })
     await expect(openInCanvas).toHaveAttribute('href', `#/canvas/${canvasId}?node=write`)
