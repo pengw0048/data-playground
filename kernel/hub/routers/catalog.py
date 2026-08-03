@@ -37,8 +37,8 @@ from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
     BoundedPreviewUnsupported, RevisionPermissionLost, RevisionProviderOffline,
-    RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
-    revision_adapter_for_uri,
+    RevisionResolutionAmbiguous, RevisionUnavailable, csv_date_order_notices, is_object_uri, path_of,
+    relation_columns, revision_adapter_for_uri,
 )
 from hub.plugins.capabilities import tag_columns
 from hub.plugins.importer import ImporterNotConfigured
@@ -1441,6 +1441,7 @@ def data_sample(req: SampleRequest) -> SampleResult:
         paths.ensure_local_uri_allowed(req.uri)  # multi-user: don't sample an arbitrary local file
     except PermissionError as e:
         raise HTTPException(403, str(e))
+    parse_notices: list[str] = []
     try:
         with source_read_scope(
                 deps.storage, [req.uri], owner=f"sample:{uuid.uuid4().hex}"):
@@ -1468,6 +1469,8 @@ def data_sample(req: SampleRequest) -> SampleResult:
                 except BoundedPreviewUnsupported as exc:
                     return SampleResult(not_previewable=True, reason=str(exc))
                 cols = relation_columns(rel)          # schema is metadata — no second scan needed
+                with contextlib.suppress(Exception):  # a disclosure must never fail the preview
+                    parse_notices = csv_date_order_notices(req.uri)
                 page = _table_to_rows(rel.limit(req.k + 1, req.offset).to_arrow_table())
                 rows = page[:req.k]
                 metadata_count = getattr(adapter, "metadata_count", None)
@@ -1516,6 +1519,7 @@ def data_sample(req: SampleRequest) -> SampleResult:
                                   limit_reason=("interactive-row-budget"
                                                 if budget_capped else None),
                                   limit_scope=("result-window" if budget_capped else None),
+                                  parse_notices=parse_notices,
                                   sample_provenance=provenance_for_dataset(
                                       req.uri, adapter, requested_rows=req.k,
                                       scanned_rows=None, returned_rows=len(rows), total_rows=exact_total,

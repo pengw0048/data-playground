@@ -3531,6 +3531,74 @@ def test_source_csv_parse_options(tmp_path):
         assert opt.columns == ["column0", "column1"] and opt.aggregate("count(*)").fetchone()[0] == 3
 
 
+def test_ambiguous_csv_date_order_is_disclosed_and_overridable(tmp_path):
+    # 01/02/2026 has two equally valid readings. DuckDB's sniffer silently picks day-first, so the
+    # preview must say which order it used and the Source must be able to choose the other one.
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter, csv_date_order_notices
+    p = str(tmp_path / "orders.csv")
+    with open(p, "w") as f:
+        f.write("id,order_date\n1,01/02/2026\n2,03/04/2026\n3,05/06/2026\n")
+    a = DuckDBAdapter()
+    with db.lock():
+        assert [str(row[1]) for row in a.scan(p).fetchall()] == ["2026-02-01", "2026-04-03", "2026-06-05"]
+        notice = csv_date_order_notices(p)
+        assert len(notice) == 1, notice
+        assert "order_date" in notice[0] and "day-first" in notice[0] and "%d/%m/%Y" in notice[0]
+        assert "01/02/2026 became 2026-02-01" in notice[0] and "month-first" in notice[0]
+
+        us = a.scan(p, options={"dateOrder": "month-first"})
+        assert [str(row[1]) for row in us.fetchall()] == ["2026-01-02", "2026-03-04", "2026-05-06"]
+        assert csv_date_order_notices(p, {"dateOrder": "month-first"}) == []
+
+
+def test_unambiguous_csv_dates_read_unchanged_and_silently(tmp_path):
+    from hub import db
+    from hub.plugins.adapters import DuckDBAdapter, csv_date_order_notices
+    files = {
+        "iso.csv": "id,dt\n1,2026-01-02\n2,2026-03-04\n",
+        "dmy.csv": "id,dt\n1,13/04/2026\n2,25/06/2026\n",
+        "mdy.csv": "id,dt\n1,04/13/2026\n2,06/25/2026\n",
+        "text.csv": "id,dt\nhello,world\n",
+    }
+    a = DuckDBAdapter()
+    with db.lock():
+        for name, body in files.items():
+            p = str(tmp_path / name)
+            with open(p, "w") as f:
+                f.write(body)
+            assert csv_date_order_notices(p) == [], name
+        dmy = str(tmp_path / "dmy.csv")
+        assert [str(row[1]) for row in a.scan(dmy).fetchall()] == ["2026-04-13", "2026-06-25"]
+        # Forcing the reading the file contradicts refuses instead of degrading the column to text.
+        with pytest.raises(ValueError, match="month-first"):
+            a.scan(dmy, options={"dateOrder": "month-first"})
+
+
+def test_preview_discloses_the_guessed_csv_date_order(tmp_path):
+    p = str(tmp_path / "orders.csv")
+    with open(p, "w") as f:
+        f.write("id,order_date\n1,01/02/2026\n2,03/04/2026\n")
+    graph = {
+        "id": f"date-order-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [{"id": "s", "type": "source", "position": {"x": 0, "y": 0},
+                   "data": {"config": {"uri": p}}}],
+        "edges": [],
+    }
+    response = client.post("/api/run/preview", json={"graph": graph, "nodeId": "s"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [row["order_date"] for row in body["rows"]] == ["2026-02-01", "2026-04-03"]
+    assert len(body["parseNotices"]) == 1, body["parseNotices"]
+    assert "day-first (%d/%m/%Y)" in body["parseNotices"][0]
+
+    graph["nodes"][0]["data"]["config"]["dateOrder"] = "month-first"
+    corrected = client.post("/api/run/preview", json={"graph": graph, "nodeId": "s"})
+    assert corrected.status_code == 200, corrected.text
+    assert [row["order_date"] for row in corrected.json()["rows"]] == ["2026-01-02", "2026-03-04"]
+    assert corrected.json()["parseNotices"] == []
+
+
 def test_overwrite_is_atomic_and_preserves_old_data_on_failure(tmp_path):
     # a failed/cancelled overwrite must NOT truncate the existing dataset: we write to a temp sibling
     # and os.replace only on success (review finding — silent data loss on re-run failure).

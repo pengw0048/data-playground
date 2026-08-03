@@ -1747,6 +1747,13 @@ class SampleResult(Wire):
         ),
     )
     sample_provenance: SampleProvenance | None = None
+    parse_notices: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Text-parsing choices the reader made that a different, equally valid choice would "
+            "have decided differently — for example the day/month order of an ambiguous CSV date."
+        ),
+    )
     preview_ref: str | None = None
     # Present only for the fullscreen Transform editor's retained-upstream endpoint. The storage URI
     # stays server-side; this is user-facing evidence, not an input accepted by any later Canvas run.
@@ -1813,6 +1820,8 @@ class SampleResult(Wire):
                 raise ValueError("an unavailable sample cannot carry an active row limit")
             if not self.reason or not self.reason.strip():
                 raise ValueError("an unavailable sample requires a non-empty reason")
+            if self.parse_notices:
+                raise ValueError("an unavailable sample cannot carry parse notices")
             return self
         if self.limit_reason == "preview-scan" and self.limit_scope != "each-source":
             raise ValueError("preview-scan limits must use limitScope=each-source")

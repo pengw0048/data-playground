@@ -247,7 +247,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
     : kind === 'transform'
       ? (libraryTransform ? ['source', 'mode', 'batchFormat'] : ['source', 'mode'])
       : kind === 'source' && !manualDelimitedSource
-        ? ['delimiter', 'header']
+        ? ['delimiter', 'header', 'dateOrder']
         : []
   // Chart configuration is edited directly on the card, where the controls can use the
   // connected input schema. The generic Inspector would turn the same axes back into raw
@@ -1036,6 +1036,14 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
                 onChange={(event) => updateConfig(nodeId, { header: event.target.value })}
                 className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
                 <option value="auto">auto</option><option value="yes">yes</option><option value="no">no</option>
+              </select>
+              <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-date-order-${nodeId}`}>CSV date order</Label>
+              <select id={`source-date-order-${nodeId}`} aria-label="CSV date order" value={String(config.dateOrder ?? 'auto')}
+                onChange={(event) => updateConfig(nodeId, { dateOrder: event.target.value })}
+                className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
+                <option value="auto">auto</option>
+                <option value="day-first">day-first (01/02/2026 = 1 Feb)</option>
+                <option value="month-first">month-first (01/02/2026 = 2 Jan)</option>
               </select>
             </>}
           </div>
