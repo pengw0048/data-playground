@@ -1522,13 +1522,26 @@ function friendlyJoinInputRefusal(message: string): string | null {
 // says so on the canvas.
 export function nodeGraphRefusals(error: unknown): Record<string, string> {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return {}
-  const refusals: Record<string, string> = {}
+  const clausesByNode = new Map<string, string[]>()
   for (const clause of error.message.replace(/^invalid graph: /, '').split('; ')) {
     for (const [, nodeId] of clause.matchAll(/node '([^']+)'/g)) {
-      if (!refusals[nodeId]) refusals[nodeId] = clause
+      clausesByNode.set(nodeId, [...(clausesByNode.get(nodeId) ?? []), clause])
     }
   }
-  return refusals
+  return Object.fromEntries([...clausesByNode].map(([nodeId, clauses]) => {
+    const joinInputs = new Set(clauses.flatMap((clause) => {
+      const match = /requires exactly one incoming edge on input '([ab])'/.exec(clause)
+      return match ? [match[1]] : []
+    }))
+    if (joinInputs.has('a') && joinInputs.has('b')) return [nodeId, 'Connect left and right datasets']
+    if (joinInputs.has('a')) return [nodeId, 'Connect a left dataset']
+    if (joinInputs.has('b')) return [nodeId, 'Connect a right dataset']
+    if (clauses.some((clause) => /needs at least one left and right column/.test(clause))) {
+      return [nodeId, 'Choose the left and right columns to match']
+    }
+    if (clauses.some((clause) => /has no input port/.test(clause))) return [nodeId, 'Connect an input']
+    return [nodeId, 'This step is not ready to run']
+  }))
 }
 
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
@@ -4902,7 +4915,7 @@ export const useStore = create<Store>((set, get) => ({
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
         previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {},
-        schemas: {}, sizes: {},
+        schemas: {}, sizes: {}, graphRefusals: {},
         numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })

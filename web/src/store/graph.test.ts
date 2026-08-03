@@ -1764,12 +1764,22 @@ describe('graph store — core authority ops', () => {
 
     expect(useStore.getState().toasts).toEqual([])
     expect(useStore.getState().graphRefusals).toEqual({
-      'join-1': "Join node 'join-1' requires exactly one incoming edge on input 'a'",
-      'write-2': "target node 'write-2' has no input port",
+      'join-1': 'Connect a left dataset',
+      'write-2': 'Connect an input',
     })
 
     apiMocks.schema.mockResolvedValue({})
     await useStore.getState().refreshSchemas()
+    expect(useStore.getState().graphRefusals).toEqual({})
+  })
+
+  it('does not carry a graph refusal into another canvas', () => {
+    useStore.setState({ graphRefusals: { source: 'Connect an input' } })
+
+    useStore.getState().loadDoc({
+      id: 'other', version: 1, name: 'other', requirements: [], nodes: [], edges: [],
+    }, 'owner', { recoverServerState: false })
+
     expect(useStore.getState().graphRefusals).toEqual({})
   })
 
