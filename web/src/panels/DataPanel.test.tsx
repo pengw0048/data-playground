@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { RowsTable } from './DataPanel'
 import type { ColumnSchema } from '../types/graph'
+import { RowDetail, RowsTable } from './DataPanel'
 
 const col = (name: string, type: string): ColumnSchema => ({
   name, type, capabilities: [], provenance: 'inferred',
@@ -9,7 +9,6 @@ const col = (name: string, type: string): ColumnSchema => ({
 
 describe('Rows grid', () => {
   it('renders integers beyond 2^53 as the exact digits the kernel sent', () => {
-    // the kernel ships out-of-safe-range integers as exact strings; the grid prints them verbatim
     render(<RowsTable
       columns={[col('id', 'int'), col('u', 'int'), col('n', 'int')]}
       rows={[
@@ -33,5 +32,30 @@ describe('Rows grid', () => {
 
     const cell = screen.getByText('9223372036854775807').closest('td')
     expect(cell).toHaveClass('text-right', 'tabular-nums')
+  })
+})
+
+const whitespaceColumns: ColumnSchema[] = [{ name: 'val', type: 'string', capabilities: [] }]
+const whitespaceValues = ['trail  ', '  lead', '  ', '\t', 'a\nb', 'plain text', '', null]
+const whitespaceRows = whitespaceValues.map((val) => ({ val }))
+
+describe('whitespace in string cells', () => {
+  it('shows hidden whitespace in the grid and keeps NULL, empty and clean values apart', () => {
+    render(<RowsTable columns={whitespaceColumns} rows={whitespaceRows} onRowClick={() => {}} />)
+    expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual([
+      'trail␣␣', '␣␣lead', '␣␣', '⇥', 'a↵\nb', 'plain text', '', '·',
+    ])
+  })
+
+  it('names the whitespace it marks', () => {
+    render(<RowsTable columns={whitespaceColumns} rows={whitespaceRows} onRowClick={() => {}} />)
+    expect(screen.getAllByTitle('2 spaces')).toHaveLength(3)
+    expect(screen.getByTitle('1 tab')).toBeTruthy()
+    expect(screen.getByTitle('1 newline')).toBeTruthy()
+  })
+
+  it('shows hidden whitespace in the row detail', () => {
+    const { container } = render(<RowDetail columns={whitespaceColumns} row={{ val: 'trail  ' }} />)
+    expect(container.textContent).toContain('trail␣␣')
   })
 })

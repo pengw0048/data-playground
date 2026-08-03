@@ -16,6 +16,7 @@ import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCell
 import {
   editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
 } from '../components/PreviewPresentation'
+import { WhitespaceText } from '../components/WhitespaceText'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
   ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
@@ -959,7 +960,7 @@ export function SampleProvenanceSummary({ provenance }: { provenance: SampleProv
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
-function RowDetail({ columns, row, fillAvailableHeight = false }: {
+export function RowDetail({ columns, row, fillAvailableHeight = false }: {
   columns: ColumnSchema[]; row: Record<string, unknown>; fillAvailableHeight?: boolean
 }) {
   return (
@@ -976,7 +977,9 @@ function RowDetail({ columns, row, fillAvailableHeight = false }: {
                 mediaKind={c.mediaKind} viewport="detail" /></div>
             )}
             <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
-              {row[c.name] == null ? '·' : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
+              {row[c.name] == null ? '·'
+                : typeof row[c.name] === 'string' ? <WhitespaceText value={row[c.name] as string} />
+                : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
             </div>
           </div>
         </div>
@@ -1136,6 +1139,7 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>
   if (typeof value === 'object') return <span className="dp-mono">{JSON.stringify(value)}</span>  // struct/map — not [object Object]
+  if (typeof value === 'string') return <WhitespaceText value={value} />
   return <span>{String(value)}</span>
 }
 
