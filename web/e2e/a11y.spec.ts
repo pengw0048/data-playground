@@ -177,6 +177,18 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('the Share visibility control stays on one row', async ({ page }) => {
+    await fresh(page)
+    await page.getByTestId('share-btn').click()
+    const options = page.getByRole('dialog').getByRole('button', { name: /^(Private|Workspace can)/ })
+    await expect(options).toHaveCount(3)
+
+    const tops = await options.evaluateAll((elements) => (
+      [...new Set(elements.map((element) => Math.round(element.getBoundingClientRect().top)))]
+    ))
+    expect(tops, 'the three visibility options wrapped onto more than one row').toHaveLength(1)
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')

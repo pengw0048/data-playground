@@ -17,8 +17,8 @@ const nativeSelect =
 
 const VISIBILITIES: { value: CanvasVisibility; label: string }[] = [
   { value: 'private', label: 'Private' },
-  { value: 'workspace', label: 'Everyone in workspace' },
-  { value: 'workspace_view', label: 'Everyone in workspace (view-only)' },
+  { value: 'workspace', label: 'Workspace can edit' },
+  { value: 'workspace_view', label: 'Workspace can view' },
 ]
 
 // Share a canvas: workspace visibility + explicit collaborators. Everyone with access can inspect
