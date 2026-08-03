@@ -177,6 +177,24 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
+  test('zoom: the minimap never covers the canvas at 200%', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const node = page.locator('.react-flow__node').first()
+    await expect(node).toBeVisible()
+    await expect(page.locator('.react-flow__minimap')).toBeVisible()
+
+    // 200% browser zoom halves the CSS viewport; the minimap kept its fixed size and sat on the graph.
+    await page.setViewportSize({ width: 720, height: 450 })
+    await expect(page.locator('.react-flow__minimap')).toHaveCount(0)
+    await node.click()
+    await expect(page.getByTestId('inspector')).toBeVisible()
+
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await expect(page.locator('.react-flow__minimap')).toBeVisible()
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
