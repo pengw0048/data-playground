@@ -267,3 +267,14 @@ describe('Canvas execution target', () => {
     expect(state.setExecutionBackend).toHaveBeenCalledWith('ray-data')
   })
 })
+
+describe('Canvas top chrome', () => {
+  it('does not capture pointer events outside its controls', () => {
+    const { container } = render(<TopBar />)
+    const band = container.querySelector<HTMLElement>('[data-layout-region="canvas-top-chrome"]')!
+
+    expect(band.style.pointerEvents).toBe('none')
+    expect(screen.getByTestId('canvas-run-controls').style.pointerEvents).toBe('auto')
+    expect(screen.getByTestId('app-menu').closest<HTMLElement>('[style*="pointer-events"]')!.style.pointerEvents).toBe('auto')
+  })
+})
