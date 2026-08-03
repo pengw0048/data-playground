@@ -3689,9 +3689,11 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             code=APIErrorCode.RUN_CONFIRMATION_REQUIRED,
             retryable=False,
         )
-    except Exception as exc:
+    except (HTTPException, metadb.DurableTaskSubmissionConflict) as exc:
         from hub.observability import get_request_id
 
+        # Only explicit admission refusals belong in Jobs without a run id. Backend/internal
+        # failures may already own a real run and must not create a second, fabricated attempt.
         # Recording history must never mask the rejection it is recording.
         with contextlib.suppress(Exception):
             canvas_id = str(getattr(req.graph, "id", "") or "")
@@ -3699,7 +3701,8 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             if not auth.auth_enabled() or metadb.canvas_role(canvas_id, uid) in _RUN_MUTATE_ROLES:
                 metadb.record_run(
                     canvas_id, req.target_node_id, "run", "failed",
-                    error=str(getattr(exc, "detail", None) or exc), request_id=get_request_id())
+                    error=str(getattr(exc, "detail", None) or exc), request_id=get_request_id(),
+                    created_by=uid)
         if isinstance(exc, metadb.DurableTaskSubmissionConflict):
             raise HTTPException(409, str(exc)) from exc
         raise

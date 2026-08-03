@@ -426,6 +426,9 @@ class RunRecord(Base):
     # HTTP/WebSocket request id that started the run (OPS-01). Nullable for non-HTTP starts and
     # backends that do not propagate a request id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # The submitting principal for attempts rejected before a logical run id exists. Ordinary runs
+    # still derive their owner from RunInputAdmission / RunState; this is their truthful fallback.
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     target_port_id: Mapped[str | None] = mapped_column(String, nullable=True)
     job_type: Mapped[str] = mapped_column(String, nullable=False, default="run", server_default="run")
@@ -11195,6 +11198,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        profile: dict | None = None,
                        run_id: str | None = None,
                        request_id: str | None = None,
+                       created_by: str | None = None,
                        execution_manifest_sha256: str | None = None,
                        execution_manifest_doc: str | None = None,
                        input_manifest: (
@@ -11245,6 +11249,8 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     rid = rec.id
     if request_id and not rec.request_id:
         rec.request_id = request_id
+    if created_by and not rec.created_by:
+        rec.created_by = str(created_by)
     rec.target_node_id, rec.target_port_id, rec.job_type, rec.status = (
         history.target_node_id, history.target_port_id,
         history.job_type, history.status)
@@ -11326,6 +11332,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
                profile: dict | None = None,
                run_id: str | None = None,
                request_id: str | None = None,
+               created_by: str | None = None,
                execution_manifest_sha256: str | None = None,
                execution_manifest_doc: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
@@ -11342,6 +11349,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
             job_type=job_type, status=status,
             rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node, profile=profile,
             run_id=run_id, request_id=request_id,
+            created_by=created_by,
             execution_manifest_sha256=execution_manifest_sha256,
             execution_manifest_doc=execution_manifest_doc,
         )
@@ -12167,7 +12175,7 @@ def list_workspace_runs(
             RunBackendJob.backend, state_backend_ref, state_placement, literal("unknown"))
         history_identity = literal("h:") + RunRecord.id
         history_creator_id = func.coalesce(
-            RunInputAdmission.creator_id, RunState.created_by)
+            RunInputAdmission.creator_id, RunState.created_by, RunRecord.created_by)
         history_creator = aliased(User)
         history_predicates = [
             visible_canvas,

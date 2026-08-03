@@ -530,11 +530,15 @@ def test_rejected_submission_is_kept_in_run_history_and_jobs(contract, monkeypat
         session.add(metadb.Canvas(
             id=str(graph.id), owner_id="researcher", name="Purchases per user"))
 
-    response = TestClient(app).post("/api/run", json={
-        "graph": graph.model_dump(by_alias=True, mode="json"),
-        "targetNodeId": "write",
-        "confirmed": True,
-    })
+    response = TestClient(app).post(
+        "/api/run",
+        headers={"X-DP-User": "researcher"},
+        json={
+            "graph": graph.model_dump(by_alias=True, mode="json"),
+            "targetNodeId": "write",
+            "confirmed": True,
+        },
+    )
 
     assert response.status_code == 409, response.text
     history = metadb.list_runs(str(graph.id))
@@ -565,6 +569,27 @@ def test_confirmation_gate_is_not_recorded_as_a_failed_run(contract, monkeypatch
 
     assert response.status_code == 409, response.text
     assert response.json()["code"] == APIErrorCode.RUN_CONFIRMATION_REQUIRED
+    assert metadb.list_runs(str(graph.id)) == []
+
+
+def test_internal_submission_failure_does_not_fabricate_a_run_record(contract, monkeypatch):
+    _deps, graph = contract
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes, "start_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("backend receipt lost")),
+    )
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    with pytest.raises(RuntimeError, match="backend receipt lost"):
+        run_routes.run(run_routes.RunRequest(
+            graph=graph.model_dump(by_alias=True, mode="json"),
+            targetNodeId="write",
+        ), uid="researcher")
+
     assert metadb.list_runs(str(graph.id)) == []
 
 
@@ -2567,7 +2592,7 @@ def test_local_runner_consumes_lance_append_intent_and_recovers_exact_receipt(
 
 def _routed(deps, runner):
     return SimpleNamespace(**{**vars(deps), "runner": runner,
-                              "pick_runner": lambda _plan, _uid: runner})
+                              "pick_runner": lambda _plan, _uid, *_rest: runner})
 
 
 def test_a_target_that_cannot_publish_is_refused_for_a_published_dataset(contract):
