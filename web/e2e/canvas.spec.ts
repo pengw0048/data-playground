@@ -1941,6 +1941,10 @@ test.describe('Data Playground canvas', () => {
     const editor = page.locator('.monaco-editor').first()
     await expect(editor).toBeVisible({ timeout: 15_000 })
     await expect(editor).toContainText('SELECT') // the node's default SQL, editable full-screen
+    await editor.click()
+    await page.keyboard.press('ControlOrMeta+a')
+    await page.keyboard.type('SELECT user_id FROM input')
+    await expect(editor).toContainText('SELECT user_id FROM input')
     await page.keyboard.press('Escape')
     await expect(page.locator('.monaco-editor')).toHaveCount(0) // Esc closes it
   })
