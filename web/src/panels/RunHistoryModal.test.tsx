@@ -114,6 +114,22 @@ describe('DurationTrend — a native SVG bar per run', () => {
     expect(screen.getByText('max 200 ms')).toBeInTheDocument()
     expect(screen.getByText('Run duration · last 2')).toBeInTheDocument()
   })
+
+  it('keeps short runs readable when one slow run sets the maximum', () => {
+    const spread: RunRecordDto[] = [
+      { id: 'r5', status: 'done', ms: 371, outputs: [] },
+      { id: 'r4', status: 'done', ms: 30, outputs: [] },
+      { id: 'r3', status: 'done', ms: 11, outputs: [] },
+      { id: 'r2', status: 'done', ms: 11, outputs: [] },
+      { id: 'r1', status: 'done', ms: 11, outputs: [] },
+    ]
+    const { container } = render(<DurationTrend runs={spread} />)
+    const heights = [...container.querySelectorAll('rect')].map((rect) => Number(rect.getAttribute('height')))
+
+    expect(screen.getByText('Run duration · last 5 · log scale')).toBeInTheDocument()
+    expect(heights.filter((height) => height <= 2)).toHaveLength(0)
+    expect(new Set(heights).size).toBe(3)
+  })
 })
 
 describe('PerNodeBreakdown — per-node horizontal bars', () => {

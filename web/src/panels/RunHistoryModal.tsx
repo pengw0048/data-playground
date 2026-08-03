@@ -306,19 +306,28 @@ export function fmtMs(ms: number): string {
 // A compact bar-per-run duration trend (oldest → newest), colored by status. Native SVG.
 export function DurationTrend({ runs }: { runs: RunRecordDto[] }) {
   const chron = [...runs].reverse()  // list is newest-first; chart reads left→right in time
-  const max = Math.max(1, ...chron.map((r) => r.ms ?? 0))
+  const timed = chron.map((r) => r.ms ?? 0).filter((ms) => ms > 0)
+  const max = Math.max(1, ...timed)
+  const min = timed.length ? Math.min(...timed) : 0
+  // One slow run otherwise flattens every other bar onto the 2px floor, where they read as equal.
+  const logScale = min > 0 && max / min >= 20
   const W = 6, GAP = 2, H = 44
   const width = chron.length * (W + GAP)
+  const barHeight = (ms: number) => {
+    if (ms <= 0) return 1
+    const share = logScale ? Math.log(ms / min + 1) / Math.log(max / min + 1) : ms / max
+    return Math.max(2, Math.round(share * (H - 2)))
+  }
   return (
     <div className="border-b border-border px-4 py-3">
       <div className="mb-1.5 flex items-baseline justify-between text-[11px] text-muted-foreground">
-        <span>Run duration · last {chron.length}</span>
+        <span>Run duration · last {chron.length}{logScale ? ' · log scale' : ''}</span>
         <span>max {fmtMs(max)}</span>
       </div>
       <svg width="100%" height={H} viewBox={`0 0 ${Math.max(width, 1)} ${H}`} preserveAspectRatio="none" role="img" aria-label="run duration trend">
         {chron.map((r, i) => {
           const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
-          const h = Math.max(2, Math.round(((r.ms ?? 0) / max) * (H - 2)))
+          const h = barHeight(r.ms ?? 0)
           return (
             <rect key={r.id} x={i * (W + GAP)} y={H - h} width={W} height={h} rx={1} fill={st.color} opacity={0.85}>
               <title>{`${r.status} · ${fmtMs(r.ms ?? 0)}${r.rows != null ? ` · ${r.rows.toLocaleString()} rows` : ''}${r.createdAt ? `\n${new Date(r.createdAt).toLocaleString()}` : ''}`}</title>
