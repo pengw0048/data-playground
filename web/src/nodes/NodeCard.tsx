@@ -120,6 +120,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
       <div
         // flat card: thin token border, soft shadow. Selection reads as a primary ring (no heavy
         // border); a bypassed node keeps its dashed accent outline (dynamic color → inline).
+        data-dp-card data-selected={selected || undefined}
         className={cn(
           'overflow-hidden rounded-lg border bg-card shadow-sm transition-[box-shadow,border-color] duration-100',
           !bypassed && (selected ? 'border-primary' : 'border-border'),

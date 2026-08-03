@@ -201,3 +201,34 @@ input, textarea, select { font-family: inherit; }
 
 /* connect-from-port menu + floating chrome sit above the canvas */
 .dp-float { position: absolute; z-index: 20; }
+
+/* ---- forced colours (Windows High Contrast) ----
+   box-shadow is not painted in this mode, so every focus ring and the node selection ring built on
+   `ring-*` vanishes. Repaint them as outlines, which are. */
+@media (forced-colors: active) {
+  /* React Flow's own `.react-flow__node.selectable:focus-visible { outline: none }` outranks a
+     single-class selector, so match its specificity. */
+  .react-flow__node:focus-visible,
+  .react-flow__node.selectable:focus-visible,
+  .dp-input:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+    box-shadow: none;
+  }
+  [data-dp-card][data-selected] {
+    outline: 3px solid Highlight;
+    outline-offset: 1px;
+  }
+}
+
+/* ---- reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* the running glyph is a status indicator, so end it on the visible keyframe rather than mid-fade */
+  .dp-running-glyph { animation: none; opacity: 1; }
+}
