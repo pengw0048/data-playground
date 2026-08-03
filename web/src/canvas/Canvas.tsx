@@ -164,10 +164,27 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
   )
 }
 
+// The minimap plus the viewport controls under it need this much room. Below it — a small window, or
+// a supported one at 200% browser zoom — it covers canvas content and swallows clicks meant for nodes.
+const MINIMAP_ROOM = '(min-width: 900px) and (min-height: 560px)'
+
+function useMinimapRoom() {
+  const [fits, setFits] = useState(() => window.matchMedia(MINIMAP_ROOM).matches)
+  useEffect(() => {
+    const query = window.matchMedia(MINIMAP_ROOM)
+    const update = () => setFits(query.matches)
+    query.addEventListener('change', update)
+    update()
+    return () => query.removeEventListener('change', update)
+  }, [])
+  return fits
+}
+
 export function Canvas() {
   const specsVersion = useStore((s) => s.specsVersion)
   const nodeTypes = useMemo(() => buildNodeTypes(), [specsVersion])
   const doc = useStore((s) => s.doc)
+  const minimapFits = useMinimapRoom()
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const schemas = useStore((s) => s.schemas)
@@ -652,7 +669,7 @@ export function Canvas() {
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
         {/* Keep the minimap only once there's something to navigate — on an empty canvas it would
             just be a stray box over the first-run prompt. */}
-        {doc.nodes.length > 0 && (
+        {doc.nodes.length > 0 && minimapFits && (
           <>
             {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
                 fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}

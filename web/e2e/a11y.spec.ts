@@ -183,7 +183,6 @@ test.describe('accessibility gate @ux-smoke', () => {
     await addNode(page, 'Shape', 'filter')
     const node = page.locator('.react-flow__node').first()
     await expect(node).toBeVisible()
-
     // Focus first: clicking the node would select it and add the shelf controls to the tab order.
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
     expect(await tabUntil(page, node, 80)).toBe(true)
@@ -290,6 +289,24 @@ test.describe('accessibility gate @ux-smoke', () => {
     const indicated = (ring.boxShadow !== 'none' && ring.boxShadow.includes('rgb'))
       || ring.outlineStyle !== 'none' || ring.ownOutline !== 'none'
     expect(indicated, `focused search box needs an indicator; got ${JSON.stringify(ring)}`).toBe(true)
+  })
+
+  test('zoom: the minimap never covers the canvas at 200%', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+    const node = page.locator('.react-flow__node').first()
+    await expect(node).toBeVisible()
+    await expect(page.locator('.react-flow__minimap')).toBeVisible()
+
+    // 200% browser zoom halves the CSS viewport; the minimap kept its fixed size and sat on the graph.
+    await page.setViewportSize({ width: 720, height: 450 })
+    await expect(page.locator('.react-flow__minimap')).toHaveCount(0)
+    await node.click()
+    await expect(page.getByTestId('inspector')).toBeVisible()
+
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await expect(page.locator('.react-flow__minimap')).toBeVisible()
   })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
