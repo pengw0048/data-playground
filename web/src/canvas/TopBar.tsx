@@ -153,7 +153,11 @@ export function TopBar() {
           <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <CanvasTitle />
-          <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Offline — server save state is unknown. Edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
+          {canEdit && currentDraft?.syncState === 'conflict'
+            ? <button data-testid="autosave" type="button" aria-label="Sync conflict — choose how to continue"
+                title={currentDraft.lastError} onClick={() => useStore.getState().notifyLocalDraftConflict(currentDraft.draftId)}
+                className="ml-0.5 shrink-0 rounded px-1 text-[11px] font-semibold text-destructive underline decoration-dotted underline-offset-2 hover:bg-accent">· {saveLabel}</button>
+            : <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp ? 'Offline — server save state is unknown. Edits remain cached in this browser.' : undefined)} className={cn('ml-0.5 shrink-0 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' || !kernelUp ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>}
           <span className="ml-1.5 inline-flex shrink-0 gap-0.5">
             <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
             <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />

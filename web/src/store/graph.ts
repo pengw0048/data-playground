@@ -1255,7 +1255,7 @@ export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[
 export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string; nodeIds?: string[] }
 export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
 export interface ToastAction { label: string; onClick: () => void | Promise<unknown> }
-export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string }
+export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string; sticky?: boolean }
 
 // Fit identity is deliberately geometry-only: transient run badges may settle while React Flow is
 // measuring, but a different node set or position must never consume an example's viewport request.
@@ -1472,7 +1472,7 @@ interface Store {
   openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
   closeCodeFullscreen: () => void
   // transient notifications surfaced as toasts (errors/info) — so failures aren't silent
-  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string; actions?: ToastAction[]; dedupeKey?: string }[]
+  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string; actions?: ToastAction[]; dedupeKey?: string; sticky?: boolean }[]
   pushToast: (msg: string, kind?: 'error' | 'info' | 'success', options?: ToastOptions) => void
   dismissToast: (id: string) => void
   // realtime collaboration presence: other people currently on this canvas (live cursors + avatars)
@@ -1501,6 +1501,7 @@ interface Store {
   refreshLocalDrafts: () => void
   openLocalDraft: (draftId: string, options?: CanvasNavigationOptions) => boolean
   retryLocalDraft: (draftId: string, options?: { notify?: boolean }) => Promise<void>
+  notifyLocalDraftConflict: (draftId: string) => void
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
   exportLocalDraft: (draftId: string) => void
@@ -1600,6 +1601,9 @@ function replaceDraft(drafts: LocalCanvasDraft[], draft: LocalCanvasDraft): Loca
   return [draft, ...drafts.filter((candidate) => candidate.draftId !== draft.draftId)]
     .sort((a, b) => b.lastLocalEditAt.localeCompare(a.lastLocalEditAt))
 }
+
+const DRAFT_SYNC_CONFLICT_MESSAGE = 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+const draftSyncConflictKey = (draftId: string) => `canvas-sync-conflict:${draftId}`
 
 function draftAfterStorageWrite(
   draft: LocalCanvasDraft, result: { ok: boolean; error?: string },
@@ -2199,7 +2203,7 @@ export const useStore = create<Store>((set, get) => ({
     if (options?.dedupeKey && get().toasts.some((toast) => toast.dedupeKey === options.dedupeKey)) return
     const id = `t_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 6)}`
     set((s) => ({ toasts: [...s.toasts, { id, kind, msg, ...options }] }))
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
+    if (!options?.sticky) setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   authEnabled: false,
@@ -4692,7 +4696,7 @@ export const useStore = create<Store>((set, get) => ({
       const conflict = error instanceof KernelError && (error.status === 404 || error.status === 409)
       const denied = error instanceof KernelError && (error.status === 401 || error.status === 403)
       const message = conflict
-        ? 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+        ? DRAFT_SYNC_CONFLICT_MESSAGE
         : denied
           ? 'Current access does not permit syncing this draft.'
           : `Sync failed: ${error instanceof Error ? error.message : 'Data Playground is unreachable'}`
@@ -4715,21 +4719,31 @@ export const useStore = create<Store>((set, get) => ({
         set({ accessDenied: true, canvasRole: null, agentOpen: false })
         void get().refreshFiles()
       }
-      get().pushToast(stored.ok ? message : stored.error!, 'error', conflict && stored.ok ? {
-        dedupeKey: `canvas-sync-conflict:${failed.draftId}`,
-        actions: [
-          ...(failed.baseCanvasId ? [{
-            label: 'Open server copy',
-            onClick: () => get().openFile(failed.baseCanvasId!, { serverCopy: true }),
-          }] : []),
-          {
-            label: 'Keep local draft as new Canvas',
-            onClick: () => get().forkLocalDraft(failed.draftId),
-          },
-        ],
-      } : undefined)
+      if (conflict && stored.ok) get().notifyLocalDraftConflict(failed.draftId)
+      else get().pushToast(stored.ok ? message : stored.error!, 'error')
       _draftSyncInFlight.delete(syncKey)
     }
+  },
+
+  notifyLocalDraftConflict: (draftId) => {
+    const draft = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === get().currentUser?.id
+    ))
+    if (draft?.syncState !== 'conflict') return
+    get().pushToast(DRAFT_SYNC_CONFLICT_MESSAGE, 'error', {
+      dedupeKey: draftSyncConflictKey(draft.draftId),
+      sticky: true,
+      actions: [
+        ...(draft.baseCanvasId ? [{
+          label: 'Open server copy',
+          onClick: () => get().openFile(draft.baseCanvasId!, { serverCopy: true }),
+        }] : []),
+        {
+          label: 'Keep local draft as new Canvas',
+          onClick: () => get().forkLocalDraft(draft.draftId),
+        },
+      ],
+    })
   },
 
   forkLocalDraft: async (draftId) => {
@@ -4762,6 +4776,7 @@ export const useStore = create<Store>((set, get) => ({
       localDrafts: replaceDraft(
         state.localDrafts.filter((draft) => draft.draftId !== original.draftId), fork,
       ),
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(original.draftId)),
     }))
     get().openLocalDraft(fork.draftId)
     await get().retryLocalDraft(fork.draftId)
@@ -4789,6 +4804,7 @@ export const useStore = create<Store>((set, get) => ({
       localDrafts: state.localDrafts.filter((candidate) => candidate.draftId !== draftId),
       currentDraftId: wasOpen ? null : state.currentDraftId,
       canvasRole: inspectingServer ? cachedRole(principalId, draft.canvasId) : state.canvasRole,
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(draftId)),
     }))
     if (!wasOpen || navigationToken === null) return
     const stillOwnsDiscardNavigation = () => (
