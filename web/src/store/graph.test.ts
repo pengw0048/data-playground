@@ -5114,10 +5114,17 @@ describe('graph store — core authority ops', () => {
     expect(conflicts).toHaveLength(1)
     const conflict = conflicts[0]
     expect(conflict.msg).toContain('local draft is preserved')
+    expect(conflict.sticky).toBe(true)
     expect(conflict.actions?.map((action) => action.label)).toEqual([
       'Open server copy',
       'Keep local draft as new Canvas',
     ])
+
+    useStore.getState().dismissToast(conflict.id)
+    useStore.getState().notifyLocalDraftConflict(doc.id)
+    expect(useStore.getState().toasts.filter((toast) => (
+      toast.dedupeKey === `canvas-sync-conflict:${doc.id}`
+    ))).toMatchObject([{ sticky: true, msg: conflict.msg }])
 
     const serverCopy = { ...doc, name: 'server edit', version: 2 }
     apiMocks.getCanvas.mockResolvedValueOnce(serverCopy)
