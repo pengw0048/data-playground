@@ -10986,6 +10986,14 @@
             "title": "Notpreviewable",
             "type": "boolean"
           },
+          "parseNotices": {
+            "description": "Text-parsing choices the reader made that a different, equally valid choice would have decided differently — for example the day/month order of an ambiguous CSV date.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Parsenotices",
+            "type": "array"
+          },
           "previewRef": {
             "anyOf": [
               {

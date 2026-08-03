@@ -652,6 +652,7 @@ export interface SampleResult {
   limitReason?: 'preview-scan' | 'interactive-row-budget' | null
   limitScope?: 'each-source' | 'result-window' | null
   sampleProvenance?: SampleProvenance | null
+  parseNotices?: string[]
   previewRef?: string | null
   editorTestInput?: {
     runId: string

@@ -60,7 +60,8 @@ export function PreviewSummary({
 }) {
   const summary = data.sampleProvenance ? samplingSummary(data.sampleProvenance) : null
   const warning = showWarning ? previewWarning(data, unit, surface, suppressSourceCapWarning) : null
-  if (!showRange && !summary && !warning) return null
+  const notices = data.parseNotices ?? []
+  if (!showRange && !summary && !warning && notices.length === 0) return null
   return (
     <div role="status" className="border-b border-border bg-muted/30 px-[11px] py-1.5 text-[10.5px] text-muted-foreground">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -68,6 +69,9 @@ export function PreviewSummary({
         {summary && <span>{summary}</span>}
       </div>
       {warning && <div className="mt-1 font-medium text-amber-700 dark:text-amber-300">{warning}</div>}
+      {notices.map((notice) => (
+        <div key={notice} className="mt-1 font-medium text-amber-700 dark:text-amber-300">{notice}</div>
+      ))}
     </div>
   )
 }

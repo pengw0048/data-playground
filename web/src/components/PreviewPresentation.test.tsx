@@ -31,6 +31,13 @@ describe('Preview presentation', () => {
     expect(screen.getByTestId('preview-details')).not.toHaveTextContent('revision-1')
   })
 
+  it('shows an ambiguous date-order disclosure even when nothing else is on the strip', () => {
+    const notice = 'Dates in order_date were read day-first (%d/%m/%Y), so 01/02/2026 became 2026-02-01.'
+    render(<PreviewSummary data={preview({ parseNotices: [notice] })} showRange={false} />)
+
+    expect(screen.getByText(notice)).toBeVisible()
+  })
+
   it('labels a reservoir sample and keeps one actionable bounded-input warning', () => {
     const data = preview({
       limitScope: 'each-source', limitReason: 'preview-scan', rowLimit: 2_000,

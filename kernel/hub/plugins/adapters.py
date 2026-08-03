@@ -325,6 +325,141 @@ def _csv_kwargs(options: dict | None) -> dict:
     return kw
 
 
+DATE_ORDERS = ("day-first", "month-first")
+_DATE_PROBE_ROWS = 2048
+_NAMED_COLUMNS = 4
+
+
+def _date_order(fmt: str | None) -> str | None:
+    """The day/month order of a strptime format that leads with them, else None (year-led is unambiguous)."""
+    if not fmt or "%d" not in fmt or "%m" not in fmt:
+        return None
+    day, month = fmt.index("%d"), fmt.index("%m")
+    if max(fmt.find("%Y"), fmt.find("%y")) < max(day, month):
+        return None
+    return "day-first" if day < month else "month-first"
+
+
+def _swapped_date_order(fmt: str) -> str:
+    return fmt.replace("%d", "\x00").replace("%m", "%d").replace("\x00", "%m")
+
+
+def _sniff_csv(con: duckdb.DuckDBPyConnection, target: str, kw: dict) -> tuple[str | None, str | None, list]:
+    """DuckDB's own auto-detected (dateformat, timestampformat, columns) under the caller's overrides."""
+    args, params = ["?"], [target]
+    if "delimiter" in kw:
+        args.append("delim=?")
+        params.append(kw["delimiter"])
+    if "header" in kw:
+        args.append("header=?")
+        params.append(kw["header"])
+    sql = f"SELECT DateFormat, TimestampFormat, Columns FROM sniff_csv({', '.join(args)})"
+    row = con.execute(sql, params).fetchone()
+    return (row[0], row[1], list(row[2] or [])) if row else (None, None, [])
+
+
+def _temporal_columns(sniffed: list, prefix: str) -> list[str]:
+    return [str(c["name"]) for c in sniffed if str(c.get("type", "")).startswith(prefix)]
+
+
+def _read_csv(con: duckdb.DuckDBPyConnection, target: str, options: dict | None) -> Relation:
+    kw = _csv_kwargs(options)
+    order = str((options or {}).get("dateOrder") or "").strip().lower()
+    if order not in DATE_ORDERS:
+        return con.read_csv(target, **kw)
+    date_fmt, ts_fmt, sniffed = _sniff_csv(con, target, kw)
+    for kwarg, fmt in (("date_format", date_fmt), ("timestamp_format", ts_fmt)):
+        if fmt and _date_order(fmt) not in (None, order):
+            kw[kwarg] = _swapped_date_order(fmt)
+    rel = con.read_csv(target, **kw)
+    actual = {name: str(t) for name, t in zip(rel.columns, rel.types)}
+    lost = [c for c in _temporal_columns(sniffed, "DATE") + _temporal_columns(sniffed, "TIMESTAMP")
+            if not actual.get(c, "").startswith(("DATE", "TIMESTAMP"))]
+    if lost:
+        raise ValueError(
+            f"CSV date order '{order}' cannot read {', '.join(sorted(lost))} as dates; "
+            "those values only parse the other way round"
+        )
+    return rel
+
+
+def csv_date_order_notices(uri: str, options: dict | None = None) -> list[str]:
+    """Disclose the day/month order a CSV read guessed, for columns whose text also reads the other way.
+
+    Empty when the order was configured, is the only possible reading, or the source is not a plain CSV.
+    """
+    if str((options or {}).get("dateOrder") or "").strip().lower() in DATE_ORDERS:
+        return []
+    target = _read_uri(uri)
+    if not target.lower().endswith((".csv", ".tsv")) or glob.has_magic(target):
+        return []
+    if is_object_uri(target):
+        db.ensure_object_store()
+    else:
+        local = paths.checked_local_path(target)
+        # ``checked_local_path`` canonicalizes and confines the caller-controlled URI before this
+        # probe. Keep the probe on that returned spelling rather than the original target.
+        # codeql[py/path-injection]
+        if local is None or not os.path.isfile(local):
+            return []
+        target = local
+    con = db.conn()
+    kw = _csv_kwargs(options)
+    date_fmt, ts_fmt, sniffed = _sniff_csv(con, target, kw)
+    notices = []
+    for fmt, prefix in ((date_fmt, "DATE"), (ts_fmt, "TIMESTAMP")):
+        order = _date_order(fmt)
+        if order is None or not fmt:
+            continue
+        swapped = _swapped_date_order(fmt)
+        ambiguous = _also_reads_as(con, target, kw, _temporal_columns(sniffed, prefix), fmt, swapped, prefix)
+        if ambiguous:
+            other = "month-first" if order == "day-first" else "day-first"
+            raw, parsed = ambiguous[0][1], ambiguous[0][2]
+            named = [name for name, _, _ in ambiguous[:_NAMED_COLUMNS]]
+            if len(ambiguous) > _NAMED_COLUMNS:
+                named.append(f"{len(ambiguous) - _NAMED_COLUMNS} more column(s)")
+            notices.append(
+                f"Dates in {', '.join(named)} were read {order} ({fmt}), "
+                f"so {raw} became {parsed}. The same values also read {other} ({swapped}). "
+                "Set the source's CSV date order if that is what the file means."
+            )
+    return notices
+
+
+def _also_reads_as(con: duckdb.DuckDBPyConnection, target: str, kw: dict, columns: list[str],
+                   fmt: str, swapped: str, prefix: str) -> list[tuple[str, str, str]]:
+    """(column, raw, parsed) for each column whose sampled text is equally valid under `swapped`."""
+    if not columns:
+        return []
+    rel = con.read_csv(target, **dict(kw, all_varchar=True)).limit(_DATE_PROBE_ROWS)
+    cast = "::DATE" if prefix == "DATE" else ""
+    lit_fmt, lit_swapped = _sql_text(fmt), _sql_text(swapped)
+    exprs = []
+    for name in columns:
+        col = quote_identifier(identifier(name, rel.columns, label="CSV column"))
+        present = f"{col} IS NOT NULL"
+        exprs += [
+            f"count(*) FILTER ({present})",
+            f"count(*) FILTER ({present} AND try_strptime({col}, {lit_swapped}) IS NULL)",
+            f"first({col}) FILTER ({present})",
+            f"first(try_strptime({col}, {lit_fmt}){cast}::VARCHAR) FILTER ({present})",
+        ]
+    row = rel.aggregate(", ".join(exprs)).fetchone()
+    if row is None:
+        return []
+    out = []
+    for index, name in enumerate(columns):
+        seen, unreadable, raw, parsed = (row[index * 4 + offset] for offset in range(4))
+        if seen and not unreadable and raw is not None and parsed is not None:
+            out.append((name, str(raw), str(parsed)))
+    return out
+
+
+def _sql_text(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def relation_columns(rel: Relation) -> list[ColumnSchema]:
     # A local relation exposes logical and physical DuckDB types, but not durable
     # field identities, nullability, or defaults. Keep those facts explicitly unknown.
@@ -482,7 +617,7 @@ class DuckDBAdapter:
         if low.endswith((".parquet", ".pq")):
             return con.read_parquet(snapshot_path)
         if low.endswith((".csv", ".tsv")):
-            return con.read_csv(snapshot_path, **_csv_kwargs(options))
+            return _read_csv(con, snapshot_path, options)
         if low.endswith((".json", ".ndjson")):
             return con.read_json(snapshot_path)
         if low.endswith((".arrow", ".feather", ".ipc")):
@@ -529,14 +664,13 @@ class DuckDBAdapter:
 
     def _read(self, con: duckdb.DuckDBPyConnection, uri: str, options: dict | None = None) -> Relation:
         uri = _read_uri(uri)
-        csv = _csv_kwargs(options)  # explicit CSV parse overrides (delimiter / header); else auto-detect
         if uri.startswith("mem://"):
             return con.table(uri[len("mem://"):])
         if is_object_uri(uri):
             db.ensure_object_store()  # load httpfs + credentials
             low = uri.lower()
             if low.endswith((".csv", ".tsv")):
-                return con.read_csv(uri, **csv)
+                return _read_csv(con, uri, options)
             if low.endswith((".json", ".ndjson")):
                 return con.read_json(uri)
             if low.endswith((".arrow", ".feather", ".ipc")):
@@ -567,7 +701,7 @@ class DuckDBAdapter:
         if os.path.isdir(p):
             return self._read_dir(con, p)
         if low.endswith((".csv", ".tsv")):
-            return con.read_csv(p, **csv)
+            return _read_csv(con, p, options)
         if low.endswith((".json", ".ndjson")):
             return con.read_json(p)
         if low.endswith((".arrow", ".feather", ".ipc")):
