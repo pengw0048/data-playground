@@ -5692,7 +5692,7 @@ def release_unclaimed_merge_sparse_output(sparse_id: str) -> bool:
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
 _WORKSPACE_ANCESTOR_LIMIT = 32
-_WORKSPACE_SEARCH_CURSOR_VERSION = 1
+_WORKSPACE_SEARCH_CURSOR_VERSION = 2
 
 
 def _workspace_ref(kind: str, identity: str) -> str:
@@ -5726,9 +5726,15 @@ def _workspace_name_order(column):
     return column.collate("BINARY" if _is_sqlite_database() else "C")
 
 
-def _workspace_search_cursor_encode(query: str, name: str, rank: int, identity: str) -> str:
+def _workspace_search_cursor_encode(query: str, *, name: str, rank: int, identity: str,
+                                    updated_at: datetime.datetime | None) -> str:
     raw = json.dumps(
-        [_WORKSPACE_SEARCH_CURSOR_VERSION, query, name, rank, identity],
+        [
+            _WORKSPACE_SEARCH_CURSOR_VERSION, query,
+            1 if updated_at is None else 0,
+            updated_at.isoformat() if updated_at is not None else None,
+            name, rank, identity,
+        ],
         separators=(",", ":"),
     ).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -5736,36 +5742,33 @@ def _workspace_search_cursor_encode(query: str, name: str, rank: int, identity: 
 
 def _workspace_search_cursor_decode(
     cursor: str | None, *, query: str,
-) -> tuple[str, int, str] | None:
+) -> _WorkspaceQueryCursor | None:
     if cursor is None:
         return None
     if len(cursor) > 4096:
         raise ValueError("invalid Workspace search cursor")
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        version, bound_query, name, rank, identity = json.loads(raw)
+        version, bound_query, null_rank, raw_updated_at, name, rank, identity = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace search cursor") from exc
     if (version != _WORKSPACE_SEARCH_CURSOR_VERSION or bound_query != query
+            or isinstance(null_rank, bool) or not isinstance(null_rank, int)
+            or null_rank not in (0, 1)
+            or (null_rank == 0 and not isinstance(raw_updated_at, str))
+            or (null_rank == 1 and raw_updated_at is not None)
             or not isinstance(name, str)
             or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2, 3)
             or not isinstance(identity, str) or not identity):
         raise ValueError("invalid Workspace search cursor")
-    return name, rank, identity
-
-
-def _workspace_search_after(name_column, id_column, rank: int, cursor):
-    if cursor is None:
-        return None
-    name, cursor_rank, identity = cursor
-    ordered_name = _workspace_name_order(func.lower(name_column))
-    return or_(
-        ordered_name > name,
-        and_(ordered_name == name, or_(
-            rank > cursor_rank,
-            and_(rank == cursor_rank, id_column > identity),
-        )),
-    )
+    try:
+        updated_at = (datetime.datetime.fromisoformat(raw_updated_at)
+                      if isinstance(raw_updated_at, str) else None)
+    except ValueError as exc:
+        raise ValueError("invalid Workspace search cursor") from exc
+    return _WorkspaceQueryCursor(
+        name=name, kind_rank=rank, row_id=identity,
+        null_rank=null_rank, updated_at=updated_at)
 
 
 def _workspace_search_matches(name_column, tokens: list[str]):
@@ -6889,6 +6892,89 @@ def _workspace_query_updated_after(updated_column, null_column, name_column,
     )
 
 
+def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
+                               container_id: str | None = None,
+                               tokens: list[str] | None = None) -> list:
+    """Per-kind local listing selects carrying the authoritative target timestamp.
+
+    ``container_id`` restricts to one Folder's direct children; ``tokens`` restricts to name
+    matches. Folders and detached Dataset placements have no timestamp and carry NULL.
+    """
+    missing_timestamp = cast(literal(None), DateTime(timezone=True))
+    missing_canvas_version = cast(literal(None), Integer)
+    container_where = [
+        *([WorkspaceContainer.parent_id == container_id] if container_id is not None else []),
+        *([_workspace_search_matches(WorkspaceContainer.name, tokens)] if tokens else []),
+        ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+            WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
+    ]
+    placement_where = [
+        *([WorkspacePlacement.container_id == container_id] if container_id is not None else []),
+        *([_workspace_search_matches(WorkspacePlacement.name, tokens)] if tokens else []),
+        _workspace_local_placement_visible_clause(),
+    ]
+    streams = []
+    if "container" in kinds:
+        streams.append(select(
+            WorkspaceContainer.id.label("row_id"),
+            literal("container").label("kind"),
+            literal(0).label("kind_rank"),
+            WorkspaceContainer.name.label("name"),
+            missing_timestamp.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).where(*container_where))
+    if "canvas" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("canvas").label("kind"),
+            literal(1).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            Canvas.updated_at.label("updated_at"),
+            Canvas.version.label("canvas_version"),
+        ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).where(
+            WorkspacePlacement.target_kind == "canvas",
+            or_(
+                Canvas.owner_id == uid,
+                Canvas.visibility.in_(("workspace", "workspace_view")),
+                exists(select(CanvasShare.id).where(
+                    CanvasShare.canvas_id == Canvas.id,
+                    CanvasShare.user_id == uid,
+                ).correlate(Canvas)),
+            ),
+            *placement_where,
+        ))
+    if "dataset" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("dataset").label("kind"),
+            literal(2).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            CatalogEntry.updated_at.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).outerjoin(
+            CatalogEntry,
+            CatalogEntry.registration_id == WorkspacePlacement.target_id,
+        ).where(
+            WorkspacePlacement.target_kind == "dataset",
+            *placement_where,
+        ))
+    if "dataset_view" in kinds:
+        streams.append(select(
+            WorkspacePlacement.id.label("row_id"),
+            literal("dataset_view").label("kind"),
+            literal(3).label("kind_rank"),
+            WorkspacePlacement.name.label("name"),
+            DatasetView.created_at.label("updated_at"),
+            missing_canvas_version.label("canvas_version"),
+        ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).where(
+            WorkspacePlacement.target_kind == "dataset_view",
+            DatasetView.owner_id == uid,
+            DatasetView.deleted_at.is_(None),
+            *placement_where,
+        ))
+    return streams
+
+
 def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                             cursor: str | None, sort: str, order: str,
                             kinds: frozenset[str]) -> dict:
@@ -6914,74 +7000,8 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
         if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
             raise KeyError(f"workspace container '{container_id}' not found")
 
-        streams = []
-        missing_timestamp = cast(literal(None), DateTime(timezone=True))
-        missing_canvas_version = cast(literal(None), Integer)
-        if "container" in kinds:
-            streams.append(select(
-                WorkspaceContainer.id.label("row_id"),
-                literal("container").label("kind"),
-                literal(0).label("kind_rank"),
-                WorkspaceContainer.name.label("name"),
-                missing_timestamp.label("updated_at"),
-                missing_canvas_version.label("canvas_version"),
-            ).where(
-                WorkspaceContainer.parent_id == container_id,
-                ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
-                    WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
-            ))
-        if "canvas" in kinds:
-            streams.append(select(
-                WorkspacePlacement.id.label("row_id"),
-                literal("canvas").label("kind"),
-                literal(1).label("kind_rank"),
-                WorkspacePlacement.name.label("name"),
-                Canvas.updated_at.label("updated_at"),
-                Canvas.version.label("canvas_version"),
-            ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).where(
-                WorkspacePlacement.container_id == container_id,
-                WorkspacePlacement.target_kind == "canvas",
-                or_(
-                    Canvas.owner_id == uid,
-                    Canvas.visibility.in_(("workspace", "workspace_view")),
-                    exists(select(CanvasShare.id).where(
-                        CanvasShare.canvas_id == Canvas.id,
-                        CanvasShare.user_id == uid,
-                    ).correlate(Canvas)),
-                ),
-                _workspace_local_placement_visible_clause(),
-            ))
-        if "dataset" in kinds:
-            streams.append(select(
-                WorkspacePlacement.id.label("row_id"),
-                literal("dataset").label("kind"),
-                literal(2).label("kind_rank"),
-                WorkspacePlacement.name.label("name"),
-                CatalogEntry.updated_at.label("updated_at"),
-                missing_canvas_version.label("canvas_version"),
-            ).outerjoin(
-                CatalogEntry,
-                CatalogEntry.registration_id == WorkspacePlacement.target_id,
-            ).where(
-                WorkspacePlacement.container_id == container_id,
-                WorkspacePlacement.target_kind == "dataset",
-                _workspace_local_placement_visible_clause(),
-            ))
-        if "dataset_view" in kinds:
-            streams.append(select(
-                WorkspacePlacement.id.label("row_id"),
-                literal("dataset_view").label("kind"),
-                literal(3).label("kind_rank"),
-                WorkspacePlacement.name.label("name"),
-                DatasetView.created_at.label("updated_at"),
-                missing_canvas_version.label("canvas_version"),
-            ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).where(
-                WorkspacePlacement.container_id == container_id,
-                WorkspacePlacement.target_kind == "dataset_view",
-                DatasetView.owner_id == uid,
-                DatasetView.deleted_at.is_(None),
-                _workspace_local_placement_visible_clause(),
-            ))
+        streams = _workspace_listing_streams(
+            uid=uid, kinds=kinds, container_id=container_id)
 
         listing = union_all(*streams).subquery()
         name_order = _workspace_name_order(func.lower(listing.c.name))
@@ -7275,7 +7295,11 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
 
 def workspace_search(query: str, *, uid: str, limit: int = 25,
                      cursor: str | None = None) -> dict:
-    """Search current local Workspace metadata without materializing the complete catalog."""
+    """Search current local Workspace metadata, most recently updated first.
+
+    Results carry the same ``updatedAt`` as browse. Folders and detached Dataset placements have
+    no timestamp and sort last by name, matching the browse ``updated`` sort.
+    """
     normalized = " ".join(query.split()).lower()
     if not normalized:
         raise ValueError("Workspace search query must not be blank")
@@ -7285,91 +7309,67 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
     tokens = normalized.split()
     decoded = _workspace_search_cursor_decode(cursor, query=normalized)
     with session() as s:
-        container_after = _workspace_search_after(
-            WorkspaceContainer.name, WorkspaceContainer.id, 0, decoded)
-        containers = list(s.scalars(select(WorkspaceContainer).where(
-            _workspace_search_matches(WorkspaceContainer.name, tokens),
-            ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
-                WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
-            *([container_after] if container_after is not None else []),
+        listing = union_all(*_workspace_listing_streams(
+            uid=uid, kinds=_WORKSPACE_BROWSE_KINDS, tokens=tokens)).subquery()
+        name_order = _workspace_name_order(func.lower(listing.c.name))
+        null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
+        page_query = select(
+            listing.c.row_id,
+            listing.c.kind,
+            listing.c.kind_rank,
+            name_order.label("sort_name"),
+            listing.c.updated_at,
+            listing.c.canvas_version,
         ).order_by(
-            _workspace_name_order(func.lower(WorkspaceContainer.name)),
-            WorkspaceContainer.id,
-        ).limit(limit + 1)))
-
-        canvas_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 1, decoded)
-        dataset_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 2, decoded)
-        view_after = _workspace_search_after(
-            WorkspacePlacement.name, WorkspacePlacement.target_id, 3, decoded)
-        canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "canvas",
-            _workspace_canvas_visible_clause(uid),
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([canvas_after] if canvas_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-        dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "dataset",
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([dataset_after] if dataset_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-        view_placements = list(s.scalars(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == "dataset_view",
-            _workspace_dataset_view_visible_clause(uid),
-            _workspace_local_placement_visible_clause(),
-            _workspace_search_matches(WorkspacePlacement.name, tokens),
-            *([view_after] if view_after is not None else []),
-        ).order_by(
-            _workspace_name_order(func.lower(WorkspacePlacement.name)),
-            WorkspacePlacement.target_id,
-        ).limit(limit + 1)))
-
-        canvas_ids = [row.target_id for row in canvas_placements]
-        canvas_versions = dict(s.execute(select(Canvas.id, Canvas.version).where(
-            Canvas.id.in_(canvas_ids))).all()) if canvas_ids else {}
-        dataset_ids = [row.target_id for row in dataset_placements]
+            null_order.asc(), listing.c.updated_at.desc(),
+            name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
+        ).limit(limit + 1)
+        if decoded is not None:
+            page_query = page_query.where(_workspace_query_updated_after(
+                listing.c.updated_at, null_order, name_order,
+                listing.c.kind_rank, listing.c.row_id, decoded, descending=True))
+        rows = list(s.execute(page_query).all())
+        page_rows = rows[:limit]
+        container_ids = [row.row_id for row in page_rows if row.kind == "container"]
+        placement_ids = [row.row_id for row in page_rows if row.kind != "container"]
+        containers = {
+            row.id: row for row in s.scalars(select(WorkspaceContainer).where(
+                WorkspaceContainer.id.in_(container_ids)))
+        } if container_ids else {}
+        placements = {
+            row.id: row for row in s.scalars(select(WorkspacePlacement).where(
+                WorkspacePlacement.id.in_(placement_ids)))
+        } if placement_ids else {}
+        dataset_ids = [
+            row.target_id for row in placements.values() if row.target_kind == "dataset"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
-        rows: list[tuple[tuple[str, int, str], dict]] = []
-        rows.extend(
-            ((row.name.lower(), 0, row.id), _workspace_container_resource(s, row))
-            for row in containers
-        )
-        rows.extend(
-            ((row.name.lower(), 1, row.target_id),
-             _workspace_placement_resource(
-                 row, detached=False,
-                 canvas_version=canvas_versions.get(row.target_id)))
-            for row in canvas_placements
-        )
-        rows.extend(
-            ((row.name.lower(), 2, row.target_id),
-             _workspace_placement_resource(row, detached=row.target_id not in live_datasets))
-            for row in dataset_placements
-        )
-        rows.extend(
-            ((row.name.lower(), 3, row.target_id),
-             _workspace_placement_resource(row, detached=False))
-            for row in view_placements
-        )
-        rows.sort(key=lambda row: row[0])
-        page = rows[:limit]
+        items: list[dict] = []
+        for row in page_rows:
+            if row.kind == "container":
+                resource = containers.get(row.row_id)
+                if resource is not None:
+                    items.append(_workspace_container_resource(s, resource))
+                continue
+            placement = placements.get(row.row_id)
+            if placement is not None:
+                items.append(_workspace_placement_resource(
+                    placement,
+                    detached=(placement.target_kind == "dataset"
+                              and placement.target_id not in live_datasets),
+                    canvas_version=row.canvas_version,
+                    updated_at=row.updated_at,
+                ))
         has_more = len(rows) > limit
+        last_row = page_rows[-1] if page_rows else None
         next_cursor = (
-            _workspace_search_cursor_encode(normalized, *page[-1][0])
-            if has_more and page else None
+            _workspace_search_cursor_encode(
+                normalized, name=last_row.sort_name, rank=last_row.kind_rank,
+                identity=last_row.row_id, updated_at=last_row.updated_at)
+            if has_more and last_row is not None else None
         )
         return {
-            "items": [item for _key, item in page],
+            "items": items,
             "nextCursor": next_cursor,
             "hasMore": has_more,
         }

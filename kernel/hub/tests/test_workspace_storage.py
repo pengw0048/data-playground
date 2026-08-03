@@ -3993,17 +3993,120 @@ def test_workspace_search_finds_local_kinds_with_stable_identity_and_bounded_pag
             page = first.json()
             assert page["completeness"] == "page"
             assert [group["source"]["id"] for group in page["groups"]] == ["local"]
-            assert page["groups"][0]["items"][0]["id"] == f"container:{container['id']}"
+            assert page["groups"][0]["items"][0]["id"] == (
+                f"canvas:{workspace_scope['canvas_id']}")
             second = client.get("/api/workspace/search", params={
                 "q": name, "limit": 1, "cursor": page["nextCursor"],
             })
             assert second.status_code == 200, second.text
             assert second.json()["completeness"] == "complete"
-            assert second.json()["groups"][0]["items"][0]["id"] == (
-                f"canvas:{workspace_scope['canvas_id']}")
+            assert second.json()["groups"][0]["items"][0]["id"] == f"container:{container['id']}"
     finally:
         metadb.workspace_delete_placement(placement["id"], expected_version=placement["version"])
         metadb.workspace_delete_container(container["id"], expected_version=container["version"])
+
+
+def test_workspace_search_reports_browse_timestamps_and_orders_by_recency(workspace_scope):
+    """Near-duplicate names are only separable when search carries the dates browse already shows."""
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    prefix = f"recency-{token}"
+    root = metadb.local_workspace_root()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    canvas_at = now - datetime.timedelta(days=1)
+    view_at = now - datetime.timedelta(days=2)
+    dataset_at = now - datetime.timedelta(days=3)
+
+    uri = f"file:///{prefix}.parquet"
+    metadb.catalog_upsert_entry(uri, f"{prefix} dataset", {
+        "id": f"tbl_{prefix}", "name": f"{prefix} dataset", "uri": uri, "version": "v1"})
+    dataset_id = metadb.workspace_builtin_dataset_identity(uri)
+    canvas_placement = metadb.workspace_create_placement(
+        root["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
+        name=f"{prefix} canvas")
+    container = metadb.workspace_create_container(root["id"], f"{prefix} folder")
+    view_id = uuid.uuid4().hex
+    with metadb.session() as session:
+        session.add(metadb.DatasetView(
+            id=view_id, owner_id=metadb.DEFAULT_USER_ID, submission_id=view_id,
+            request_sha256="0" * 64, definition_sha256="1" * 64,
+            definition_doc="{}", created_at=view_at))
+        session.add(metadb.WorkspacePlacement(
+            container_id=root["id"], target_kind="dataset_view", target_id=view_id,
+            name=f"{prefix} view"))
+        session.execute(update(metadb.Canvas).where(
+            metadb.Canvas.id == workspace_scope["canvas_id"]).values(updated_at=canvas_at))
+        session.execute(update(metadb.CatalogEntry).where(
+            metadb.CatalogEntry.registration_id == dataset_id).values(updated_at=dataset_at))
+    try:
+        found = metadb.workspace_search(prefix, uid=metadb.DEFAULT_USER_ID, limit=25)["items"]
+        assert [item["name"] for item in found] == [
+            f"{prefix} canvas", f"{prefix} view", f"{prefix} dataset", f"{prefix} folder"]
+
+        browsed: dict[str, dict] = {}
+        cursor = None
+        for _page in range(20):
+            page = metadb.workspace_browse(
+                root["id"], uid=metadb.DEFAULT_USER_ID, limit=50, cursor=cursor,
+                sort="updated", order="desc")
+            browsed.update({item["id"]: item for item in page["items"]})
+            cursor = page["nextCursor"]
+            if cursor is None:
+                break
+        assert browsed[f"container:{container['id']}"].get("updatedAt") is None
+        for item in found:
+            assert item.get("updatedAt") == browsed[item["id"]].get("updatedAt")
+        assert [datetime.datetime.fromisoformat(item["updatedAt"]) for item in found[:3]] == [
+            canvas_at, view_at, dataset_at]
+        assert found[3].get("updatedAt") is None
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id.in_([view_id, dataset_id])))
+            session.execute(delete(metadb.DatasetView).where(metadb.DatasetView.id == view_id))
+        metadb.workspace_delete_placement(
+            canvas_placement["id"], expected_version=canvas_placement["version"])
+        metadb.workspace_delete_container(
+            container["id"], expected_version=container["version"])
+        metadb.catalog_delete_entry(uri)
+
+
+def test_workspace_search_recency_pages_stay_ordered_and_complete(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    prefix = f"paging-{token}"
+    root = metadb.local_workspace_root()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    canvas_ids = [f"{prefix}-{index}" for index in range(4)]
+    with metadb.session() as session:
+        for index, canvas_id in enumerate(canvas_ids):
+            session.add(metadb.Canvas(
+                id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name=f"{prefix} {index}", version=1,
+                doc=json.dumps({"id": canvas_id, "name": f"{prefix} {index}", "version": 1,
+                                "nodes": [], "edges": []}),
+                updated_at=now - datetime.timedelta(days=4 - index)))
+            session.add(metadb.WorkspacePlacement(
+                container_id=root["id"], target_kind="canvas", target_id=canvas_id,
+                name=f"{prefix} {index}"))
+    try:
+        # Newest last by name, so a page that stayed alphabetical would invert this.
+        expected = [f"{prefix} {index}" for index in reversed(range(4))]
+        assert [item["name"] for item in metadb.workspace_search(
+            prefix, uid=metadb.DEFAULT_USER_ID, limit=25)["items"]] == expected
+
+        walked: list[str] = []
+        cursor = None
+        for _page in range(10):
+            page = metadb.workspace_search(
+                prefix, uid=metadb.DEFAULT_USER_ID, limit=1, cursor=cursor)
+            walked.extend(item["name"] for item in page["items"])
+            cursor = page["nextCursor"]
+            if cursor is None:
+                break
+        assert walked == expected
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id.in_(canvas_ids)))
+            session.execute(delete(metadb.Canvas).where(metadb.Canvas.id.in_(canvas_ids)))
 
 
 def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_names(workspace_scope):
