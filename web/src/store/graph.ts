@@ -2,11 +2,12 @@ import { create } from 'zustand'
 import type { WireType } from '../theme/tokens'
 import type {
   CanvasDoc, CanvasEdge, CanvasNode, CanvasParameterBinding, CanvasParameterDeclaration,
-  NodeConfig, NodeData, NodeStatus, NodeVersion,
+  LastRun, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
-  CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
-  RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteReceipt,
+  CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, Placement, ProcessorDescriptor,
+  ProfileResult, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
+  WriteAdmission, WriteReceipt,
 } from '../types/api'
 import { canConnect, getSpec, nodeOutputs, portWire } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
@@ -645,6 +646,12 @@ interface RunState {
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
 }
 
+export interface GraphRunState {
+  canvasId: string
+  runId?: string
+  status?: RunStatus
+}
+
 function managedWriteReceiptOutput(
   outputs: RunOutput[],
   nodeId: string,
@@ -1257,6 +1264,8 @@ interface Store {
   editorPreviews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
   runs: Record<string, RunState>
+  // The single whole-graph pass behind "Rerun all"; null when no such pass is in flight.
+  graphRun: GraphRunState | null
   profileJobs: Record<string, ProfileJobState>
   past: CanvasDoc[]
   future: CanvasDoc[]
@@ -2162,6 +2171,7 @@ export const useStore = create<Store>((set, get) => ({
   editorPreviews: {},
   previewBindings: {},
   runs: {},
+  graphRun: null,
   profileJobs: {},
   past: [],
   future: [],
@@ -3394,11 +3404,14 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  // Re-run the whole graph: kick every runnable sink (a node with no outgoing edge); each pulls
-  // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
+  // Re-run the whole graph as ONE targetless run: the hub executes every node in topological order
+  // and reports per-node progress. Notes/unconnected nodes aren't runnable → skipped. A Write
+  // publication, a canvas parameter, an invalid node, or a size confirmation each own a decision the
+  // targetless pass cannot make, so those fall back to a run per runnable sink.
   rerunAll: () => {
     if (!roleCanEdit(get().canvasRole)) return
     if (!hubExecutionAvailable(get)) return
+    if (get().graphRun) return
     const { doc, numericParamDrafts } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
@@ -3417,8 +3430,10 @@ export const useStore = create<Store>((set, get) => ({
       node, invalidReason: invalidUpstreamReason(doc, node.id, numericParamDrafts),
     }))
     const valid = candidates.filter(({ invalidReason }) => !invalidReason)
-    valid.forEach(({ node }) => get().requestRun(node.id))
     const invalidSkipped = sinks.length - valid.length
+    const perSink = () => { valid.forEach(({ node }) => get().requestRun(node.id)) }
+    if (!invalidSkipped && !requiresTargetedDispatch(doc, sinks)) startGraphRun(get, set, perSink)
+    else perSink()
     if (invalidSkipped) {
       get().pushToast(
         candidates.find(({ invalidReason }) => invalidReason)?.invalidReason
@@ -4885,7 +4900,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {},
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, graphRun: null, profileJobs: {},
         schemas: {}, sizes: {},
         numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
@@ -5474,6 +5489,12 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         continue
       }
       const nodeId = st.targetNodeId
+      if (current() && !nodeId && !get().graphRun) {  // the targetless "Rerun all" pass owns no node
+        set({ graphRun: { canvasId, runId: st.runId, status: st } })
+        applyPerNodeStatus(set, st.perNode)
+        pollGraphRun(get, set, canvasId, st.runId)
+        continue
+      }
       if (!current() || !nodeId || !get().doc.nodes.some((node) => node.id === nodeId)) continue
       set((s: Store) => {
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
@@ -5712,6 +5733,106 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
 }
 
 const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>()
+
+/** Decisions a single targetless run cannot own: a Write needs its own destination admission and
+ * confirmation, a canvas parameter needs its binding panel, and named multi-output publication is
+ * declared against one target. */
+function requiresTargetedDispatch(doc: CanvasDoc, sinks: CanvasNode[]): boolean {
+  return (doc.parameters?.length ?? 0) > 0
+    || doc.nodes.some((node) => node.type === 'write' && !isDisabled(doc, node.id))
+    || sinks.some((node) => nodeOutputs(node).length > 1)
+}
+
+function startGraphRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  fallbackToSinks: () => void,
+) {
+  const doc = get().doc
+  set({ graphRun: { canvasId: doc.id } })
+  void api.run(doc, undefined, false, globalThis.crypto.randomUUID()).then((status) => {
+    if (get().graphRun?.canvasId !== doc.id) return
+    set({ graphRun: { canvasId: doc.id, runId: status.runId, status } })
+    applyPerNodeStatus(set, status.perNode)
+    pollGraphRun(get, set, doc.id, status.runId)
+  }).catch((e: unknown) => {
+    set({ graphRun: null })
+    // The size gate is a per-target decision with a per-target card; hand the click back to it.
+    if (e instanceof KernelError && e.code === 'run_confirmation_required') { fallbackToSinks(); return }
+    const message = (e as Error).message || 'Could not start the run'
+    if (!surfaceInvalidGraphRefusal(get(), e)) get().pushToast(presentRunError(message).summary, 'error')
+  })
+}
+
+/** A completed targetless pass measures every step, so each executed node carries its own readout. */
+function applyPerNodeResults(
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  perNode: RunStatus['perNode'],
+  placement: Placement,
+) {
+  const results = new Map<string, LastRun>()
+  for (const step of perNode ?? []) {
+    if (step.status !== 'done') continue
+    results.set(step.nodeId, {
+      ...(step.rows != null ? { rows: step.rows } : {}), ms: step.ms ?? 0, placement,
+    })
+  }
+  if (!results.size) return
+  set((s) => ({ doc: { ...s.doc, nodes: s.doc.nodes.map((node) => {
+    const lastRun = results.get(node.id)
+    return lastRun ? { ...node, data: { ...node.data, lastRun } } : node
+  }) } }))
+}
+
+function pollGraphRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  canvasId: string, runId: string,
+) {
+  const token = Symbol(runId)
+  _polling.set(runId, { token })
+  const owns = () => _polling.get(runId)?.token === token && get().graphRun?.runId === runId
+  const stop = () => { if (_polling.get(runId)?.token === token) _polling.delete(runId) }
+  let fails = 0
+  const tick = async () => {
+    if (!owns() || get().doc.id !== canvasId) { stop(); return }
+    let status: RunStatus
+    try {
+      status = await api.runStatus(runId)
+      fails = 0
+    } catch {
+      if (++fails <= 6) { setTimeout(tick, 800); return }
+      set({ graphRun: null })
+      settleAnimatingNodes(set)
+      get().pushToast('Lost track of the run — the kernel became unreachable', 'error')
+      stop()
+      return
+    }
+    if (!owns()) return
+    set((s) => ({ graphRun: { ...s.graphRun!, status } }))
+    applyPerNodeStatus(set, status.perNode)
+    if (status.status !== 'done' && status.status !== 'failed' && status.status !== 'cancelled') {
+      setTimeout(tick, 300)
+      return
+    }
+    set({ graphRun: null })
+    stop()
+    if (status.status === 'done') {
+      applyPerNodeResults(set, status.perNode, status.placement)
+      void get().refreshSchemas()
+      void get().refreshCatalog()
+    }
+    settleAnimatingNodes(set)
+    if (status.status === 'failed') {
+      const failed = status.perNode?.find((step) => step.status === 'failed')
+      const node = get().doc.nodes.find((item) => item.id === failed?.nodeId)
+      get().pushToast(presentRunError(status.error, {
+        nodeTitle: node?.data.title, config: node?.data.config,
+      }).summary, 'error')
+    }
+  }
+  setTimeout(tick, 200)
+}
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
                  nodeId: string, runId: string, reattachGeneration?: number,
