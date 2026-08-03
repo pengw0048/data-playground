@@ -522,6 +522,7 @@ export function ERDiagram() {
   const visibleFocus = mode === 'lineage' && lineageFocus?.requested === focus
     ? lineageFocus.canonical : focus
   const focusName = tables.find((t) => t.uri === visibleFocus)?.name
+    ?? (focusedTable?.uri === visibleFocus ? focusedTable.name : undefined)
     ?? (mode === 'lineage' ? 'Current dataset' : visibleFocus?.split('/').slice(-1)[0])
   useEffect(() => {
     if (focusResolving || focusResolutionError) {
@@ -565,7 +566,14 @@ export function ERDiagram() {
             const uris = joinNeighbourhood(focus, rels, hops)
             const page = await api.tablesPage({ uris, limit: ER_CAP })
             if (s !== dataReq.current) return
-            setTables(page.items); setTotal(page.items.length); setLinEdges([]); setLineageFocus(null)
+            // A connected-source dataset can have a stable relationship focus without being
+            // registered in the local Catalog. Preserve the already-resolved dataset card and its
+            // human name instead of replacing the graph with an opaque provider identity.
+            const relationshipTables = focusedTable?.uri === focus
+              && !page.items.some((table) => table.uri === focus)
+              ? [focusedTable, ...page.items]
+              : page.items
+            setTables(relationshipTables); setTotal(relationshipTables.length); setLinEdges([]); setLineageFocus(null)
           }
         } else {
           const page = await api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })

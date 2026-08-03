@@ -6,7 +6,8 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), relationships: vi.fn(), facets: vi.fn(), joinSuggestions: vi.fn(),
   declareKey: vi.fn(), deleteRelationship: vi.fn(), addRelationship: vi.fn(), lineage: vi.fn(),
-  tableByRegistration: vi.fn(), workspaceLineageResource: vi.fn(), fitView: vi.fn(),
+  tableByRegistration: vi.fn(), workspaceResource: vi.fn(), workspaceCanonicalDataset: vi.fn(),
+  workspaceLineageResource: vi.fn(), fitView: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
@@ -92,6 +93,12 @@ describe('ERDiagram request truth', () => {
     mocks.deleteRelationship.mockResolvedValue([])
     mocks.addRelationship.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: ORDERS.uri, nodes: [], edges: [] })
+    mocks.workspaceResource.mockResolvedValue({
+      resource: { id: 'dataset:resolved', kind: 'dataset', name: 'resolved' },
+      ancestors: [],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({ sourceUri: ORDERS.uri, columns: ORDERS.columns })
     mocks.workspaceLineageResource.mockResolvedValue({ id: 'dataset:resolved', kind: 'dataset', name: 'resolved', source: 'provider', detached: false })
     mocks.fitView.mockReset()
   })
@@ -238,6 +245,36 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveAttribute('data-focused', 'true')
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
+  })
+
+  it('keeps a connected-source focus human-readable when switching to ER', async () => {
+    const providerDatasetId = 'dataset:external.raw-video'
+    const providerUri = `workspace-provider:${'a'.repeat(64)}`
+    store.erFocusDatasetId = providerDatasetId
+    store.erMode = 'lineage'
+    mocks.workspaceResource.mockResolvedValue({
+      resource: { id: providerDatasetId, kind: 'dataset', name: 'raw_video_v2' },
+      ancestors: [],
+      source: { id: 'luma-staging', kind: 'provider', completeness: 'complete' },
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({
+      sourceUri: providerUri,
+      columns: [{ name: 'id', type: 'binary', capabilities: [] }],
+    })
+    mocks.lineage.mockResolvedValue({
+      rootUri: providerUri,
+      nodes: [{ id: 'provider-root', name: 'raw_video_v2', uri: providerUri, kind: 'table' }],
+      edges: [],
+    })
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
+    render(<ERDiagram />)
+
+    expect(await within(screen.getByTestId('er-focus-bar')).findByText('raw_video_v2')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('er-mode-joins'))
+
+    expect(await within(screen.getByTestId('er-focus-bar')).findByText('Focused: raw_video_v2')).toBeInTheDocument()
+    expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveTextContent('raw_video_v2')
+    expect(screen.queryByText(providerUri)).toBeNull()
   })
 
   it('opens a clicked provider-lineage neighbour as a Workspace dataset', async () => {

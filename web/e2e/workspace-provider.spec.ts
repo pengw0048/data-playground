@@ -318,6 +318,18 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(detail.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     await expect(detail.getByText('Version ID', { exact: true })).toHaveCount(0)
     await expect(detail.getByText('browser-provider-revision-v1', { exact: true })).toHaveCount(0)
+
+    // The same connected-source dataset must keep its user-facing name when moving between the
+    // lineage and relationship graphs, even though it has no local Catalog registration.
+    await detail.getByRole('button', { name: 'Lineage' }).click()
+    await expect(page.getByTestId('er-focus-bar')).toContainText(datasetNameA)
+    await page.getByTestId('er-mode-joins').click()
+    await expect(page.getByTestId('er-focus-bar')).toContainText(`Focused: ${datasetNameA}`)
+    await expect(page.getByRole('button', { name: `Focus graph on ${datasetNameA}` })).toBeVisible()
+    await expect(page.getByTestId('er-focus-bar')).not.toContainText('workspace-provider:')
+    await page.getByTestId('er-back-to-dataset').click()
+    await expect(detail).toBeVisible()
+
     await detail.getByRole('button', { name: 'Use in Canvas' }).click()
 
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetNameA}` })
