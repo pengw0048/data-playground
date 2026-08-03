@@ -47,6 +47,30 @@ describe('Join card — join types come from the backend spec (UX-05)', () => {
     }
   })
 
+  // `full` and `outer` are one join to the engine, `cross` is one it runs but does not offer, and
+  // anything else runs as `inner`.
+  it.each([
+    [undefined, 'inner'], ['', 'inner'], ['inner', 'inner'], ['left', 'left'], ['right', 'right'],
+    ['outer', 'outer'], ['full', 'outer'], ['FULL', 'outer'], ['cross', 'cross'], ['nonsense', 'inner'],
+  ])('shows the join the engine runs for a stored how of %s', (stored, shown) => {
+    useStore.getState().updateConfig('j', { how: stored })
+    const Join = getComponent('join')!
+    render(<ReactFlowProvider><Join id="j" data={useStore.getState().doc.nodes[0].data} /></ReactFlowProvider>)
+    expect(screen.getByLabelText('Join type')).toHaveValue(shown)
+    expect(screen.getByTestId('node-meta')).toHaveTextContent(`${shown} · on id`)
+  })
+
+  it('stores exactly the join type the control displays', () => {
+    const Join = getComponent('join')!
+    for (const option of ['left', 'right', 'outer', 'inner']) {
+      const { unmount } = render(<ReactFlowProvider><Join id="j" data={useStore.getState().doc.nodes[0].data} /></ReactFlowProvider>)
+      fireEvent.change(screen.getByLabelText('Join type'), { target: { value: option } })
+      expect(useStore.getState().doc.nodes[0].data.config.how).toBe(option)
+      expect(screen.getByLabelText('Join type')).toHaveValue(option)
+      unmount()
+    }
+  })
+
   it('describes bare and one-sided drafts with dataset roles instead of internal port IDs', () => {
     const Join = getComponent('join')!
     useStore.setState((state) => ({

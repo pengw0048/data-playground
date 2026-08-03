@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { Segmented } from './controls'
+import { MiniSelect, Segmented } from './controls'
 
 const options = [
   { value: 'adhoc', label: 'Ad-hoc' },
@@ -40,5 +40,17 @@ describe('Segmented', () => {
     expect(onChange).toHaveBeenCalledOnce()
     expect(onChange).toHaveBeenCalledWith('library')
     expect(onParentClick).not.toHaveBeenCalled()
+  })
+})
+
+describe('MiniSelect', () => {
+  it('shows a configured value no option carries instead of the first option', () => {
+    render(<MiniSelect value="arrow" options={[{ value: 'rows', label: 'rows' }]} onChange={vi.fn()} />)
+    expect(screen.getByRole('combobox')).toHaveValue('arrow')
+  })
+
+  it('leaves an unset value on the first option', () => {
+    render(<MiniSelect value="" options={[{ value: 'all', label: 'all' }, { value: 'distinct', label: 'distinct' }]} onChange={vi.fn()} />)
+    expect(screen.getByRole('combobox')).toHaveValue('all')
   })
 })

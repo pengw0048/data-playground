@@ -5,6 +5,7 @@ import { useStore } from '../../store/graph'
 import { Field, MiniInput, miniSelectClass } from '../../ui/controls'
 import { useInputColumnsForPort } from '../fields'
 import { parseJoinKeys, serializeJoinCondition, serializeJoinKeys, type JoinKeyPair } from '../joinKeys'
+import { JOIN_HOW_OPTIONS, joinHowOption } from '../joinHow'
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import type { NodeConfig } from '../../types/graph'
@@ -17,12 +18,11 @@ function Join({ id, data }: NodeComponentProps) {
   const config = doc.nodes.find((node) => node.id === id)?.data.config ?? data.config
   const on = String(config.on ?? '')
   const condition = String(config.condition ?? '')
-  const how = (config.how as NodeConfig['how']) ?? 'inner'
   // derive the join types from the backend NodeSpec (source of truth: inner/left/right/outer) instead of
   // a hardcoded subset, so the card can't silently drift from what the engine supports (UX-05). The
   // fallback covers the brief pre-bootstrap window before backendSpecs is populated.
-  const howOptions = ((getBackendSpec('join')?.params.find((p) => p.name === 'how')?.options
-    ?? ['inner', 'left', 'right', 'outer']) as NonNullable<NodeConfig['how']>[])
+  const howOptions = getBackendSpec('join')?.params.find((p) => p.name === 'how')?.options ?? JOIN_HOW_OPTIONS
+  const how = joinHowOption(config.how, howOptions)
   const leftColumns = useInputColumnsForPort(id, 'a')
   const rightColumns = useInputColumnsForPort(id, 'b')
   const connectedInput = incoming.length === 1 ? incoming[0].targetHandle : null
@@ -80,6 +80,7 @@ function Join({ id, data }: NodeComponentProps) {
       <Field label="join type">
         <select aria-label="Join type" value={how} onClick={(event) => event.stopPropagation()}
           onChange={(event) => updateConfig(id, { how: event.target.value as NodeConfig['how'] })} className={cn('nodrag', miniSelectClass)}>
+          {!howOptions.includes(how) && <option value={how}>{how}</option>}
           {howOptions.map((option) => <option key={option} value={option}>{option}</option>)}
         </select>
       </Field>
