@@ -125,8 +125,8 @@ export function TopBar() {
   return (
     <>
       <div data-layout-region="canvas-top-chrome"
-        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12 }}>
-        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+        style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, right: 20, zIndex: 15, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 12, pointerEvents: 'none' }}>
+        <div style={{ pointerEvents: 'auto' }} className="flex w-fit min-w-0 max-w-full items-center gap-2 overflow-hidden">
           <AppMenu
             onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)}
             onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)}
@@ -148,7 +148,7 @@ export function TopBar() {
             <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
           </span>
         </div>
-        <div data-testid="canvas-run-controls" className="flex items-center gap-2.5">
+        <div data-testid="canvas-run-controls" style={{ pointerEvents: 'auto' }} className="flex items-center gap-2.5">
           <PeerAvatars />
           <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
           <Button onClick={rerunAll} disabled={!canEdit || !kernelUp} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
