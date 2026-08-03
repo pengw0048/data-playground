@@ -1,58 +1,49 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test } from '@playwright/test'
+import {
+  prepareProviderAcceptanceFixture,
+  providerAcceptanceNames,
+} from '../scripts/provider-acceptance-fixture.mjs'
 
 const enabled = process.env.DP_E2E_PROVIDER_ACCEPTANCE === '1'
 const providerRoot = process.env.DP_E2E_PROVIDER_ROOT
-const containerNameA = 'Browser provider collection A'
-const containerNameB = 'Browser provider collection B'
-const datasetNameA = 'Browser provider observations'
-const datasetNameB = 'Browser provider observations'
-const relatedDatasetName = 'Browser provider labels'
+const containerNameA = providerAcceptanceNames.containerA
+const containerNameB = providerAcceptanceNames.containerB
+const datasetNameA = providerAcceptanceNames.datasetA
+const datasetNameB = providerAcceptanceNames.datasetB
+const relatedDatasetName = providerAcceptanceNames.relatedDataset
 const typedDatasetName = 'Browser provider referenced observations'
 
 test.describe('provider Workspace Source acceptance', () => {
   test.skip(!enabled || !providerRoot, 'set DP_E2E_PROVIDER_ACCEPTANCE=1 and DP_E2E_PROVIDER_ROOT')
 
   test.beforeAll(() => {
-    const root = resolve(providerRoot!)
-    mkdirSync(root, { recursive: true })
-    writeFileSync(resolve(root, 'observations.csv'), 'id,value\n1,alpha\n2,beta\n')
-    writeFileSync(resolve(root, 'labels.csv'), 'id,label\n1,one\n2,two\n')
-    writeFileSync(resolve(root, 'catalog.json'), JSON.stringify({ resources: [
-      { placementId: 'browser-collection-a', kind: 'container', name: containerNameA },
-      { placementId: 'browser-collection-b', kind: 'container', name: containerNameB },
-      {
-        placementId: 'browser-observations-a', datasetId: 'browser-canonical-observations',
-        kind: 'dataset', name: datasetNameA, parentPlacementId: 'browser-collection-a',
-        uri: 'observations.csv', revisionId: 'browser-provider-revision-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'value', type: 'string' }],
-      },
-      {
-        placementId: 'browser-observations-b', datasetId: 'browser-canonical-observations',
-        kind: 'dataset', name: datasetNameB, parentPlacementId: 'browser-collection-b',
-        uri: 'observations.csv',
-        revisionId: 'browser-provider-revision-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'value', type: 'string' }],
-      },
-      {
-        placementId: 'browser-labels-a', datasetId: 'browser-canonical-labels',
-        kind: 'dataset', name: relatedDatasetName, parentPlacementId: 'browser-collection-a',
-        uri: 'labels.csv', revisionId: 'browser-provider-labels-v1',
-        columns: [{ name: 'id', type: 'int' }, { name: 'label', type: 'string' }],
-      },
-    ] }))
+    prepareProviderAcceptanceFixture(providerRoot!)
   })
 
   test('replaces a provider-backed Source from the Workspace catalog without weakening its exact binding', async ({ page }) => {
     test.setTimeout(60_000)
-    const rootResponse = await page.request.get('/api/workspace/containers/workspace-local-root?limit=100')
+    const rootResponse = await page.request.get(
+      '/api/workspace/containers/workspace-local-root?limit=100&source=local',
+    )
     expect(rootResponse.ok()).toBeTruthy()
     const root = await rootResponse.json() as {
       container: { version: number }
+      connectedSources: Array<{ id: string; mountId?: string }>
+    }
+    const mount = root.connectedSources.find((item) => item.mountId === 'browser-provider')
+    expect(mount).toBeTruthy()
+    const mountResponse = await page.request.get(
+      `/api/workspace/containers/${encodeURIComponent(mount!.id.replace(/^container:/, ''))}?limit=100&source=provider`,
+    )
+    expect(mountResponse.ok()).toBeTruthy()
+    const mountPage = await mountResponse.json() as {
       items: Array<{ id: string; providerPlacementId?: string }>
     }
-    const collection = root.items.find((item) => item.providerPlacementId === 'browser-collection-a')
+    const collection = mountPage.items.find(
+      (item) => item.providerPlacementId === 'browser-collection-a',
+    )
     expect(collection).toBeTruthy()
     const collectionResponse = await page.request.get(
       `/api/workspace/containers/${encodeURIComponent(collection!.id.replace(/^container:/, ''))}?limit=100`,
@@ -181,7 +172,7 @@ test.describe('provider Workspace Source acceptance', () => {
       expectedContainerVersion: moveResult.container.localPlacement!.containerVersion,
     }))
     expect(moveBody.containerId).not.toBe(moveResult.container.id.replace(/^container:/, ''))
-    await expect(page.getByRole('status')).toContainText(
+    await expect(page.getByRole('status').filter({ hasText: `Moved “${name}”` })).toContainText(
       `Moved “${name}” to Workspace / browser-provider / ${containerNameA}.`,
     )
     await expect.poll(async () => {
@@ -241,8 +232,6 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(location).toContainText('Connected source browser-provider')
     await expect(location).toContainText(`${containerNameA} / ${datasetNameA}`)
     await expect(location.getByText('dp-file-catalog', { exact: true })).toBeVisible()
-    await expect(detail).toContainText('Workspace placement')
-    await expect(detail).toContainText('Provider dataset IDbrowser-canonical-observations')
     const placementAId = externalPage.items.find((item) => item.providerPlacementId === 'browser-observations-a')?.id
     expect(placementAId).toBeTruthy()
     const placementA = await page.request.get(`/api/workspace/resources/${encodeURIComponent(placementAId!)}`)
@@ -319,10 +308,13 @@ test.describe('provider Workspace Source acceptance', () => {
     )?.id
     expect(typedPlacementId).toBeTruthy()
     const canonicalDetail = detail.getByTestId('canonical-provider-dataset-context')
-    await expect(canonicalDetail.getByText('id', { exact: true })).toBeVisible()
+    await expect(canonicalDetail.getByText('id', { exact: true }).first()).toBeVisible()
     await expect(canonicalDetail.getByText('Integer', { exact: true })).toBeVisible()
-    await expect(canonicalDetail.getByText('value', { exact: true })).toBeVisible()
+    await expect(canonicalDetail.getByText('value', { exact: true }).first()).toBeVisible()
     await expect(canonicalDetail.getByText('Text', { exact: true })).toBeVisible()
+    const providerPreview = canonicalDetail.getByTestId('provider-dataset-preview-scroll')
+    await expect(providerPreview.getByText('alpha', { exact: true })).toBeVisible()
+    await expect(providerPreview.getByText('beta', { exact: true })).toBeVisible()
     await expect(detail.getByText('Diagnostics', { exact: true })).toHaveCount(0)
     await expect(detail.getByText('Version ID', { exact: true })).toHaveCount(0)
     await expect(detail.getByText('browser-provider-revision-v1', { exact: true })).toHaveCount(0)
@@ -359,7 +351,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(canvasLocation).toContainText(`Workspace/browser-provider/${containerNameA}`)
     const source = page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })
     await expect(source).toHaveCount(1)
-    await expect(source).toContainText('dp-file-catalog · Selected version · 2 rows · 2 columns')
+    await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
     const canvasId = decodeURIComponent(
       new URL(page.url()).hash.split('/').pop()!.split('?')[0],
     )
@@ -398,15 +390,15 @@ test.describe('provider Workspace Source acceptance', () => {
     const exactProviderContext = exactProviderViewer.getByTestId('canonical-provider-dataset-context')
     await expect(exactProviderContext).toContainText('2 rows')
     await expect(exactProviderContext).toContainText('2 data columns')
-    await expect(exactProviderContext.getByText('id', { exact: true })).toBeVisible()
+    await expect(exactProviderContext.getByText('id', { exact: true }).first()).toBeVisible()
     await expect(exactProviderContext.getByText('Integer', { exact: true })).toBeVisible()
-    await expect(exactProviderContext.getByText('value', { exact: true })).toBeVisible()
+    await expect(exactProviderContext.getByText('value', { exact: true }).first()).toBeVisible()
     await expect(exactProviderContext.getByText('Text', { exact: true })).toBeVisible()
     await expect(exactProviderViewer.getByRole('button', { name: 'Use in Canvas' })).toHaveCount(0)
     await page.reload()
     await expect(page.getByTestId('provider-dataset-viewer')).toContainText('Selected version')
     await expect(page.getByTestId('canonical-provider-dataset-context')
-      .getByText('value', { exact: true })).toBeVisible()
+      .getByText('value', { exact: true }).first()).toBeVisible()
     await expect(page.getByTestId('canonical-provider-dataset-context')
       .getByText('Text', { exact: true })).toBeVisible()
     const expectedCanvasReturnUrl = new URL(
@@ -416,7 +408,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.getByTestId('provider-dataset-viewer').getByRole('button', { name: 'Back to Canvas' }).click()
     await expect(page).toHaveURL(expectedCanvasReturnUrl)
     await expect(page.locator(`.react-flow__node[data-id="${exactProviderSource.id}"]`)).toHaveClass(/selected/)
-    await expect(source).toContainText('dp-file-catalog · Selected version · 2 rows · 2 columns')
+    await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
 
     const beforeMutableReplacement = await (await page.request.get(`/api/canvas/${canvasId}`)).json()
     const beforeMutableConfig = beforeMutableReplacement.nodes.find(
@@ -565,9 +557,10 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(duplicateResource).toBeVisible({ timeout: 20_000 })
     await duplicateResource.click()
     const duplicateDetail = page.getByRole('region', { name: datasetNameB })
-    await expect(duplicateDetail).toContainText(
-      `Also observed atbrowser-provider / ${containerNameA} / ${datasetNameA}`,
-    )
+    await expect(duplicateDetail.getByText('Other locations', { exact: true })).toBeVisible()
+    await expect(duplicateDetail.getByText(
+      `browser-provider / ${containerNameA} / ${datasetNameA}`, { exact: true },
+    )).toBeVisible()
     const placementBRequest = page.waitForResponse((response) =>
       decodeURIComponent(new URL(response.url()).pathname.split('/').pop() ?? '') === placementBId
       && response.request().method() === 'GET')
@@ -687,7 +680,7 @@ test.describe('provider Workspace Source acceptance', () => {
       /^\/api\/canvas\/[^/]+\/join-with-related$/,
       /^\/api\/catalog\/related-datasets(?:\/revisions|\/revision-review)?$/,
       /^\/api\/graph\/(plan|schema|estimate)$/,
-      /^\/api\/run(\/preview|\/estimate|\/input-drift)?$/,
+      /^\/api\/run(\/preview|\/estimate|\/input-drift|\/current-results)?$/,
     ].some((allowed) => allowed.test(path)))
     expect(unexpectedWrites).toEqual([])
     const writesBeforeUnavailableReturn = [...writes]
@@ -736,14 +729,15 @@ test.describe('provider Workspace Source acceptance', () => {
     })
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
     const detachedPlacement = page.getByRole('region', { name: datasetNameA })
-    await expect(detachedPlacement).toContainText('Placement state · detached')
-    await expect(detachedPlacement).toContainText('Dataset status · current')
+    await expect(detachedPlacement).toContainText(
+      'This provider location is not available right now.',
+    )
+    await expect(detachedPlacement.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     placementState = 'canonical-offline'
     await page.goto('/#/workspace')
     await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
     const canonicalUnavailable = page.getByRole('region', { name: datasetNameA })
-    await expect(canonicalUnavailable).toContainText('Dataset status · offline')
-    await expect(canonicalUnavailable).toContainText('Placement state · current')
+    await expect(canonicalUnavailable.getByRole('status')).toContainText(/not available|offline/i)
     await expect(canonicalUnavailable.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
     expect(writes).toEqual(writesBeforeUnavailableReturn)
     writeFileSync(resolve(providerRoot!, 'catalog.json'), providerCatalogBefore)

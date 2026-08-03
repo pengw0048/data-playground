@@ -3,6 +3,7 @@ import { existsSync, readdirSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { appendTimingEvent } from './e2e-timing-lib.mjs'
+import { prepareProviderAcceptanceFixture } from './provider-acceptance-fixture.mjs'
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = resolve(webRoot, '..')
@@ -14,7 +15,8 @@ const timingFile = process.env.DP_E2E_TIMINGS_FILE
 const profile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
 const port = process.env.DP_E2E_PORT ?? '8899'
 const databaseUrl = process.env.DP_E2E_DATABASE_URL ?? 'sqlite:///e2e-test.db'
-const providerAcceptance = Boolean(process.env.DP_E2E_PROVIDER_ACCEPTANCE)
+const providerAcceptance = process.env.DP_E2E_PROVIDER_ACCEPTANCE === '1'
+const providerRoot = process.env.DP_E2E_PROVIDER_ROOT
 const kernelPackage = databaseUrl.startsWith('postgres') ? '.[postgres]' : '.'
 const wheelExtras = databaseUrl.startsWith('postgres') ? '[lance,postgres]' : '[lance]'
 
@@ -72,6 +74,16 @@ async function waitForServer(child) {
 
 async function main() {
   await timedPhase('e2e-workspace-cleanup', async () => rmSync(workspace, { recursive: true, force: true }))
+  if (providerAcceptance) {
+    if (!providerRoot) {
+      throw new Error('DP_E2E_PROVIDER_ROOT is required when DP_E2E_PROVIDER_ACCEPTANCE=1')
+    }
+    await timedPhase(
+      'provider-acceptance-fixture',
+      async () => prepareProviderAcceptanceFixture(providerRoot),
+      'Creates the provider catalog before the server discovers configured mounts.',
+    )
+  }
   await timedPhase(
     'candidate-spa-build',
     () => run('npm', ['run', 'build'], { cwd: webRoot }),
@@ -98,12 +110,32 @@ async function main() {
   if (!wheel) throw new Error(`candidate wheel missing from ${wheelDir}`)
   const wheelPath = join(wheelDir, wheel)
   if (!existsSync(wheelPath)) throw new Error(`candidate wheel missing: ${wheelPath}`)
+  let providerWheelPath
+  if (providerAcceptance) {
+    const providerWheelDir = join(workspace, 'provider-wheel')
+    await timedPhase(
+      'provider-fixture-wheel-build',
+      () => run('uv', [
+        'build', '--wheel', '--clear', '--no-create-gitignore',
+        '--out-dir', providerWheelDir,
+        join(repoRoot, 'examples/plugins/dp_file_catalog_provider'),
+      ], { cwd: kernelRoot }),
+      'Builds the exact provider fixture source instead of reusing a stale local-package cache.',
+    )
+    const providerWheel = readdirSync(providerWheelDir).find(
+      (entry) => /^dp_file_catalog_provider-.*\.whl$/.test(entry),
+    )
+    if (!providerWheel) throw new Error(`provider fixture wheel missing from ${providerWheelDir}`)
+    providerWheelPath = join(providerWheelDir, providerWheel)
+  }
   const withDependencies = [
     '--with', `${wheelPath}${wheelExtras}`,
     '--with', join(repoRoot, 'examples/plugins/dp_descriptor_contract'),
     '--with', join(repoRoot, 'examples/plugins/dp_sidecar_fixture'),
   ]
-  if (providerAcceptance) withDependencies.push('--with', join(repoRoot, 'examples/plugins/dp_file_catalog_provider'))
+  if (providerAcceptance) {
+    withDependencies.push('--with', providerWheelPath)
+  }
 
   await timedPhase(
     'candidate-wheel-install',

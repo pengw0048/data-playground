@@ -124,10 +124,13 @@ Use this prompt for an autonomous failure-finding and correction loop:
 > labels or state, silent clicks, hidden default-path requirements, lost context, and validation that
 > differs between UI, whole-graph, retry, keyboard, or agent/MCP paths as defects even if the task can
 > eventually be completed. Stop each path after 30 seconds or two guesses without a visible clue.
-> Record evidence and the smallest correction for every finding. Only then inspect code, APIs, and
-> logs, implement the corrections, add regression coverage at the failed boundary, and rerun the
-> complete continuous workflow. Do not weaken known truthfulness, scope, confirmation, recovery, or
-> exact-value behavior to make a test pass.
+> Prove that the running service loaded the exact candidate artifacts, including optional plugins,
+> and that external fixtures existed before startup discovery. Do not accept matching metadata alone:
+> reconcile summary counts and schema with visible rows, pages, exports, and persisted data. Record
+> evidence and the smallest correction for every finding. Only then inspect code, APIs, and logs,
+> implement the corrections, add regression coverage at the failed boundary, and rerun the complete
+> continuous workflow. Do not weaken known truthfulness, scope, confirmation, recovery, or exact-value
+> behavior to make a test pass.
 
 ## Deterministic fixtures
 
@@ -146,6 +149,12 @@ relationship-dense datasets. The generated
 unavailable, permission-denied, stale-reference, partial-failure, and recovery scenarios. These fixtures
 need neither external credentials nor a private service.
 
+Fixture setup and candidate installation are part of the acceptance boundary. Create configured
+catalogs before the application starts so startup discovery sees the same state as a real deployment.
+Build and install exact wheels for the kernel and every local plugin rather than relying on a package
+manager's path-dependency cache. Record the candidate commit and artifact paths in the run evidence.
+A green test against a cached package is not evidence for the candidate under review.
+
 ## Invariants
 
 - A result is never presented as current after its graph or canvas scope changed.
@@ -155,6 +164,8 @@ need neither external credentials nor a private service.
 - Full work exposes estimate, progress, cancellation, terminal state, and recovery evidence.
 - A reproducible view has durable navigation state, and all core actions have a keyboard path.
 - Supported desktop viewports preserve access to essential controls without silently hiding them.
+- Summary counts, schema, visible rows, paging, exports, and persisted data agree for the same scope.
+- Connected sources remain discoverable even when the local folder fills one or more result pages.
 
 ## Result scope and export contract
 

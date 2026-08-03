@@ -68,6 +68,12 @@ function isProviderBrowseIdentity(identity: string): boolean {
   return identity.startsWith('external.') || identity.startsWith('mount.')
 }
 
+function workspaceBrowseSource(identity: string): 'local' | 'provider' | undefined {
+  if (identity.startsWith('mount.')) return 'provider'
+  if (!isProviderBrowseIdentity(identity)) return 'local'
+  return undefined
+}
+
 function isConnectedSourceRoot(resource: WorkspaceResource): boolean {
   return resource.id.startsWith('container:mount.')
 }
@@ -634,6 +640,8 @@ function WorkspaceMixedExplorer() {
         limit: PAGE_SIZE,
         cursor: pageCursor ?? undefined,
       }
+      const source = workspaceBrowseSource(targetId)
+      if (source) params.source = source
       if (localSource && sort && order) {
         params.sort = sort
         params.order = order
@@ -2065,7 +2073,8 @@ function MoveCanvasDialog({ resources, sourceContainer, sourcePath, onClose, onM
       const params: Parameters<typeof api.workspaceBrowse>[1] = {
         limit: PAGE_SIZE, cursor: nextCursor ?? undefined,
       }
-      if (!isProviderBrowseIdentity(targetId)) params.source = 'local'
+      const source = workspaceBrowseSource(targetId)
+      if (source) params.source = source
       const page = await api.workspaceBrowse(targetId, params)
       if (request !== loadRequest.current) return
       if (!page.container) throw new Error(page.sources.map(statusMessage).find(Boolean) ?? 'Workspace destination is unavailable')

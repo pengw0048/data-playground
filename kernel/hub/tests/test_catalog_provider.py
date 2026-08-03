@@ -174,6 +174,33 @@ def test_file_provider_distinguishes_placements_from_canonical_dataset_identity(
     assert [item.placement_id for item in cyclic.items] == ["container-b"]
 
 
+def test_file_provider_exact_revision_keeps_preview_rows(tmp_path, monkeypatch):
+    repo = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(repo / "examples" / "plugins"))
+    from dp_file_catalog_provider import FileCatalogDatasetAdapter, provider
+
+    root = tmp_path / "catalog"
+    root.mkdir()
+    (root / "observations.csv").write_text("id,value\n1,alpha\n2,beta\n")
+    (root / "catalog.json").write_text(json.dumps({"resources": [{
+        "placementId": "observations", "kind": "dataset",
+        "datasetId": "canonical-observations", "name": "observations",
+        "uri": "observations.csv", "revisionId": "revision-v1",
+        "columns": [{"name": "id", "type": "int"},
+                    {"name": "value", "type": "string"}],
+    }]}))
+    mount = CatalogMount(id="mount", provider="dp-file-catalog", config={"root": str(root)})
+    item = provider().list_children(mount, None, limit=10).items[0]
+
+    detail = FileCatalogDatasetAdapter().revision_detail(
+        item.uri or "", "revision-v1", preview_limit=100)
+
+    assert detail["row_count"] == 2
+    assert detail["preview_table"].to_pylist() == [
+        {"id": 1, "value": "alpha"}, {"id": 2, "value": "beta"},
+    ]
+
+
 def test_occurrence_contract_rejects_legacy_ids_and_conflicting_facts():
     with pytest.raises(ValueError, match="placementId"):
         CatalogResource.model_validate({

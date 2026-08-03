@@ -195,7 +195,9 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('button', { name: 'Open dataset observations' })).not.toBeInTheDocument()
     expect(screen.queryByTestId('first-run-canvas-choice')).not.toBeInTheDocument()
     expect(screen.queryByText('local draft warning')).not.toBeInTheDocument()
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'folder-1', { limit: 50, cursor: undefined, source: 'local' },
+    )
   })
 
   it('exposes both add-data choices directly from All Workspace', async () => {
@@ -345,7 +347,9 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByTestId('workspace-next-page'))
-    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2' }))
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith(
+      'workspace-local-root', { limit: 50, cursor: 'cursor-2', source: 'local' },
+    ))
     expect(await screen.findByText('observations')).toBeInTheDocument()
     expect(screen.queryByText('Research')).not.toBeInTheDocument()
   })
@@ -361,7 +365,7 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByText('observations')).toBeVisible()
     expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', {
-      limit: 50, cursor: 'sparse-page-2',
+      limit: 50, cursor: 'sparse-page-2', source: 'local',
     })
   })
 
@@ -757,7 +761,7 @@ describe('WorkspaceExplorer', () => {
     fireEvent.change(sort, { target: { value: 'name-desc' } })
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
-      { limit: 50, cursor: undefined, sort: 'name', order: 'desc' },
+      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc' },
     ))
 
     fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
@@ -765,7 +769,7 @@ describe('WorkspaceExplorer', () => {
     })
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
-      { limit: 50, cursor: undefined, sort: 'name', order: 'desc', kinds: ['canvas'] },
+      { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc', kinds: ['canvas'] },
     ))
   })
 
@@ -802,7 +806,28 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
     expect(screen.queryByText("Sorting and type filters aren't available for this source.")).not.toBeInTheDocument()
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
-      'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined },
+      'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined, source: 'provider' },
+    )
+  })
+
+  it('keeps connected sources visible while the local folder still has another page', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT,
+      items: [CANVAS],
+      connectedSources: [CONNECTED_SOURCE],
+      nextCursor: 'local-page-2',
+      hasMore: true,
+      completeness: 'page',
+      sources: [{ id: 'local', kind: 'local', completeness: 'page' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const connectedSources = await screen.findByRole('region', { name: 'Connected sources' })
+    expect(within(connectedSources).getByRole('button', {
+      name: 'Open folder warehouse from Connected source warehouse · fixture',
+    })).toBeVisible()
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root', { limit: 50, cursor: undefined, source: 'local' },
     )
   })
 
@@ -1403,7 +1428,9 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
     const dialog = await screen.findByRole('dialog', { name: 'Move Analysis' })
     fireEvent.click(await within(dialog).findByRole('button', { name: /warehouse.*connected source/ }))
-    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('mount.d2FyZWhvdXNl', { limit: 50, cursor: undefined })
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'mount.d2FyZWhvdXNl', { limit: 50, cursor: undefined, source: 'provider' },
+    )
     fireEvent.click(await within(dialog).findByRole('button', { name: /Remote.*Canvas folder/ }))
     const move = await within(dialog).findByRole('button', { name: 'Move to Remote' })
     expect(screen.getByText(/Destination:/)).toHaveTextContent('Canvases stay in this Workspace')
@@ -2584,7 +2611,9 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText(/ancestor read interrupted/)).toBeVisible()
     expect(screen.getByRole('region', { name: 'observations' })).toBeVisible()
     expect(screen.queryByRole('navigation', { name: 'Workspace path' })).not.toBeInTheDocument()
-    expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('external.mount-folder', { limit: 50, cursor: undefined })
+    expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith(
+      'external.mount-folder', { limit: 50, cursor: undefined },
+    )
   })
 
   it('allows an initially unavailable external deep link to retry instead of loading forever', async () => {

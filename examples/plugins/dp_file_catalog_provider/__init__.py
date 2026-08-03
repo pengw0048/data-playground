@@ -147,14 +147,19 @@ class FileCatalogDatasetAdapter(_FileCatalogReadAdapter):
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         relation = self.open_revision(uri, revision_id)
         bounded = max(1, min(int(preview_limit), 100))
-        preview = relation.limit(bounded + 1).arrow()
+        columns = relation_columns(relation)
+        row_count = self.count(uri)
+        # Materialize only after every other DuckDB query. A live RecordBatchReader is invalidated
+        # when the shared connection executes the schema or count query, yielding a truthful row
+        # count beside an empty preview.
+        preview = relation.limit(bounded + 1).to_arrow_table()
         return {
             "revision_id": revision_id,
             "committed_at": self.resolve_revision(uri)["committed_at"],
             "parent_revision_id": None,
             "producer_operation": "external",
-            "columns": relation_columns(relation),
-            "row_count": self.count(uri),
+            "columns": columns,
+            "row_count": row_count,
             "data_file_count": 1,
             "total_bytes": _dataset_binding(uri)[0].stat().st_size,
             "fragment_count": None,
