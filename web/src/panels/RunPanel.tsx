@@ -264,7 +264,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </div>
           <ReadableRunError raw={run?.error ?? st?.error} nodeTitle={target?.data.title}
             config={target?.data.config} details />
-          {st && <RunOutputs outputs={st.outputs} showErrors={false} />}
+          {st?.status === 'failed' && <RunOutputs outputs={st.outputs} showErrors={false} />}
           <div className="mt-3 flex gap-2">
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved

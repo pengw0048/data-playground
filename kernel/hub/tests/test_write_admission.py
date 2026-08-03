@@ -516,6 +516,58 @@ def test_direct_run_returns_the_same_name_error_before_run_allocation(
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
+def test_rejected_submission_is_kept_in_run_history_and_jobs(contract, monkeypatch):
+    deps, graph, _admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [{"name": "replacement", "type": "int", "nullable": True}],
+    )
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+        "confirmed": True,
+    })
+
+    assert response.status_code == 409, response.text
+    history = metadb.list_runs(str(graph.id))
+    assert [(row["status"], row["runId"], row["targetNodeId"], row["outputs"]) for row in history] \
+        == [("failed", None, "write", [])]
+    assert history[0]["error"] == response.json()["detail"]
+    assert [item["id"] for item in metadb.list_workspace_runs("researcher")["items"]] \
+        == [history[0]["id"]]
+
+
+def test_confirmation_gate_is_not_recorded_as_a_failed_run(contract, monkeypatch):
+    _deps, graph = contract
+
+    def needs_confirm(*_args, **_kwargs):
+        raise run_routes.RunNeedsConfirm(
+            RunEstimate(rows=10_000_000, placement="local", needs_confirm=True))
+
+    monkeypatch.setattr(run_routes, "start_run", needs_confirm)
+    with metadb.session() as session:
+        session.add(metadb.User(id="researcher", name="Researcher"))
+        session.add(metadb.Canvas(
+            id=str(graph.id), owner_id="researcher", name="Purchases per user"))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+    })
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == APIErrorCode.RUN_CONFIRMATION_REQUIRED
+    assert metadb.list_runs(str(graph.id)) == []
+
+
 @pytest.mark.parametrize("failed_probe", ["runner_adapter", "controller_ownership"])
 def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers(
         contract, monkeypatch, failed_probe):

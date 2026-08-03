@@ -529,6 +529,27 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.setJobsQuery).toHaveBeenCalledWith(`run=job-${phase}`)
   })
 
+  it('shows failed-state outputs only for the attempt that failed', () => {
+    const outputs = [{
+      nodeId: 'target', portId: 'out', portLabel: 'out', wire: 'dataset' as const,
+      publicationKind: 'result' as const, outcome: 'committed' as const, table: 'top_users', rows: 50,
+    }]
+    mocks.state.runs.target = {
+      phase: 'failed', error: 'The destination changed while the run was starting.',
+      status: { runId: 'previous-job', status: 'done', jobType: 'run', targetNodeId: 'target', rowsProcessed: 50, ms: 10, placement: 'local', perNode: [], outputs },
+    }
+    const { rerender } = render(<RunPanel nodeId="target" />)
+    expect(screen.getByText('The destination changed while the run was starting.')).toBeVisible()
+    expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
+
+    mocks.state.runs.target = {
+      phase: 'failed', error: 'aggregate failed',
+      status: { runId: 'failed-job', status: 'failed', jobType: 'run', targetNodeId: 'target', rowsProcessed: 50, ms: 10, placement: 'local', perNode: [], outputs },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByLabelText('Run outputs')).toHaveTextContent('top_users')
+  })
+
   it('omits View in Jobs without a known Job identity or after an unrelated estimate failure', () => {
     mocks.state.runs.target = {
       phase: 'failed',
