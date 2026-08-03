@@ -272,6 +272,9 @@ def _local_run_intent_sha256(
         write_intent: WriteIntent | None = None) -> str:
     """Hash caller intent before source resolution so a retry cannot be retargeted by a moved head."""
     doc = graph.model_dump(mode="json")
+    # Result ownership changes storage lifecycle only. It must not fork execution identity or make a
+    # response-loss retry look like a different computation.
+    doc.pop("result_retention", None)
     if write_intent is not None:
         # Canvas run status is operational UI evidence, not write intent. A response-loss retry changes
         # it from running to failed before replaying the same frozen write submission.

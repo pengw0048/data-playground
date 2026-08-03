@@ -37,6 +37,17 @@ const CATS: { id: string; label: string; icon: IconName }[] = [
 const INHERIT = '__default__'
 // Radix Select forbids an empty value — sentinels for "no credential" pickers (mapped to '' on save).
 const NO_CRED = '__none__'
+type ResultRetentionSetting = { history: string; maxVersions: number; maxAgeDays: number }
+const resultRetentionSetting = (value: unknown): ResultRetentionSetting => {
+  const policy = value && typeof value === 'object'
+    ? value as { history?: unknown; maxVersions?: unknown; maxAgeDays?: unknown }
+    : {}
+  return {
+    history: policy.history === 'recent' ? 'recent' : 'latest',
+    maxVersions: Number.isInteger(policy.maxVersions) ? Number(policy.maxVersions) : 10,
+    maxAgeDays: Number.isInteger(policy.maxAgeDays) ? Number(policy.maxAgeDays) : 30,
+  }
+}
 const BUILTIN_RUNNER_PRESENTATION: Record<string, { label: string; guidance: string }> = {
   'local-out-of-core': {
     label: 'This machine',
@@ -209,8 +220,8 @@ function stagedSettings(
       ['defaultObjectStoreCredId', global.defaultObjectStoreCredId === NO_CRED ? '' : String(global.defaultObjectStoreCredId ?? ''), String(baseline.global.defaultObjectStoreCredId ?? '')],
       [
         'canvasResultRetention',
-        { history: String((global.canvasResultRetention as { history?: string } | undefined)?.history || 'latest') },
-        { history: String((baseline.global.canvasResultRetention as { history?: string } | undefined)?.history || 'latest') },
+        resultRetentionSetting(global.canvasResultRetention),
+        resultRetentionSetting(baseline.global.canvasResultRetention),
       ],
       [
         'agentDataPolicy',
@@ -260,9 +271,7 @@ function editableGlobal(snapshot: SettingsSnapshot): Record<string, unknown> {
   global.agentDataPolicyLevel = policy?.level || 'metadata-only'
   global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
   const retention = global.canvasResultRetention
-  global.canvasResultRetention = retention && typeof retention === 'object'
-    ? { history: (retention as { history?: string }).history || 'latest' }
-    : { history: 'latest' }
+  global.canvasResultRetention = resultRetentionSetting(retention)
   return global
 }
 
@@ -395,8 +404,8 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
   const val = (k: string) => (g[k] == null ? '' : String(g[k]))
   const set = (k: string, v: string) => setG((prev) => ({ ...prev, [k]: v }))
   const dests = (Array.isArray(g.destinations) ? g.destinations : []) as DestinationPreset[]
-  const canvasResultHistory = String(
-    (g.canvasResultRetention as { history?: string } | undefined)?.history || 'latest')
+  const canvasResultPolicy = resultRetentionSetting(g.canvasResultRetention)
+  const canvasResultHistory = canvasResultPolicy.history
   const savedDestinations = (Array.isArray(baseline?.global.destinations)
     ? baseline.global.destinations : []) as DestinationPreset[]
   const isSavedDestination = (destination: DestinationPreset) => savedDestinations.some(
@@ -1000,14 +1009,44 @@ export function SettingsModal({ onClose, initialCategory }: { onClose: () => voi
                         <div className="text-[11.5px] font-medium text-foreground">Stored results</div>
                       </div>
                       <Select value={canvasResultHistory} onValueChange={(history) => setG((prev) => ({
-                        ...prev, canvasResultRetention: { history },
+                        ...prev, canvasResultRetention: {
+                          ...resultRetentionSetting(prev.canvasResultRetention), history,
+                        },
                       }))}>
                         <SelectTrigger className="w-[140px]" aria-label="Canvas result history"><SelectValue /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value="latest">Latest result</SelectItem>
-                          <SelectItem value="recent">Recent run results</SelectItem>
+                          <SelectItem value="recent">Recent results</SelectItem>
                         </SelectContent>
                       </Select>
+                      {canvasResultHistory === 'recent' && <>
+                        <Label htmlFor="workspace-retention-versions" className="text-[11px] font-normal text-muted-foreground">Versions per step</Label>
+                        <Input id="workspace-retention-versions" aria-label="Workspace versions per step" type="number" min={1} max={500}
+                          value={canvasResultPolicy.maxVersions}
+                          onChange={(event) => {
+                            const value = Number(event.target.value)
+                            if (Number.isInteger(value) && value >= 1 && value <= 500) setG((prev) => ({
+                              ...prev,
+                              canvasResultRetention: {
+                                ...resultRetentionSetting(prev.canvasResultRetention), maxVersions: value,
+                              },
+                            }))
+                          }}
+                          className="h-8 w-20 text-right text-[11.5px]" />
+                        <Label htmlFor="workspace-retention-days" className="text-[11px] font-normal text-muted-foreground">Days to keep</Label>
+                        <Input id="workspace-retention-days" aria-label="Workspace days to keep" type="number" min={1} max={3650}
+                          value={canvasResultPolicy.maxAgeDays}
+                          onChange={(event) => {
+                            const value = Number(event.target.value)
+                            if (Number.isInteger(value) && value >= 1 && value <= 3650) setG((prev) => ({
+                              ...prev,
+                              canvasResultRetention: {
+                                ...resultRetentionSetting(prev.canvasResultRetention), maxAgeDays: value,
+                              },
+                            }))
+                          }}
+                          className="h-8 w-20 text-right text-[11.5px]" />
+                      </>}
                       <div className="text-[11.5px] font-medium text-foreground">Location</div>
                       <div className="text-right text-[11px] text-muted-foreground">
                         {kernelInfo?.resultStorage?.label ?? 'Workspace managed storage'}

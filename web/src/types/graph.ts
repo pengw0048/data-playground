@@ -160,6 +160,12 @@ export interface CanvasParameterDeclaration {
 }
 export interface CanvasParameterBinding { name: string; value: unknown }
 
+export interface CanvasResultRetention {
+  history: 'inherit' | 'latest' | 'recent'
+  maxVersions?: number
+  maxAgeDays?: number
+}
+
 export interface CanvasDoc {
   id: string
   name?: string
@@ -167,7 +173,7 @@ export interface CanvasDoc {
   /** Explicit whole-Canvas runner. Missing means automatic placement/workspace default. */
   executionBackend?: string
   /** Full-result history override. The newest successful result always follows Canvas lifetime. */
-  resultRetention?: { history: 'inherit' | 'latest' | 'recent' }
+  resultRetention?: CanvasResultRetention
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   requirements?: string[]  // pip specs this canvas needs; its kernel installs them (travels with the canvas)

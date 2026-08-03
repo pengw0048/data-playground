@@ -1488,6 +1488,67 @@ def test_failed_named_output_run_owns_committed_prefix_in_state_and_history():
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
+def test_canvas_result_history_expansion_adopts_published_object_results():
+    canvas_id = f"canvas-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
+            name="object result retention", version=1,
+            doc='{"resultRetention":{"history":"latest"}}'))
+
+    run_ids: list[str] = []
+    handles: list[dict] = []
+    for _index in range(2):
+        run_id = f"object-history-{uuid.uuid4().hex}"
+        handle = _handle(run_id=run_id)
+        _commit(handle)
+        metadb.save_run_state(
+            run_id, _pending_run_state_document(
+                run_id, node_id="section"), canvas_id=canvas_id)
+        status = RunStatus(
+            run_id=run_id, status="done", target_node_id="section", total_rows=1,
+            outputs=[_run_output(
+                handle["uri"], rows=1, node_id="section")],
+        )
+        metadb.save_run_state(
+            run_id, status.model_dump(), canvas_id=canvas_id, publish_region=True)
+        metadb.record_run(
+            canvas_id, "section", "run", "done", rows=1,
+            outputs=[output.model_dump() for output in status.outputs], run_id=run_id)
+        run_ids.append(run_id)
+        handles.append(handle)
+
+    with metadb.session() as session:
+        assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "run_record",
+            metadb.ObjectAttemptRef.attempt_uri.in_([handle["uri"] for handle in handles]),
+        )))
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps({
+            "resultRetention": {
+                "history": "recent", "maxVersions": 2, "maxAgeDays": 30,
+            },
+        })
+
+    assert metadb.reconcile_canvas_result_history(canvas_id) == 0
+    with metadb.session() as session:
+        refs = list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "run_record",
+            metadb.ObjectAttemptRef.attempt_uri.in_([handle["uri"] for handle in handles]),
+        )))
+        assert {ref.attempt_uri for ref in refs} == {
+            handle["uri"] for handle in handles
+        }
+
+    for run_id in run_ids:
+        _retire_terminal_run_state(run_id)
+    metadb.delete_canvas_cascade(canvas_id)
+    assert {_state(handle["uri"]) for handle in handles} == {"superseded"}
+    for handle in handles:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
 def test_kernel_status_wiring_publishes_failed_partial_region_output():
     from hub.kernel import _persist_kernel_run_state
 

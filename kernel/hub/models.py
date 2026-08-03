@@ -45,6 +45,10 @@ RunConfirmationReason = Literal[
     "destructive_overwrite",
 ]
 MAX_SAFE_INTEGER = 2**53 - 1
+CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS = 10
+CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS = 30
+CANVAS_RESULT_RETENTION_MAX_VERSIONS = 500
+CANVAS_RESULT_RETENTION_MAX_AGE_DAYS = 3650
 ROW_IDENTITY_FIELD_NAME_MAX = 256
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
@@ -2946,9 +2950,20 @@ class CanvasResultRetention(Wire):
     """Canvas override for physical full-result history.
 
     ``latest`` always remains owned by the Canvas. ``recent`` additionally lets bounded Jobs history
-    retain its result artifacts. The managed store itself is deployment-owned and runner-independent.
+    retain at most ``max_versions`` results per target for ``max_age_days``. The managed store itself
+    is deployment-owned and runner-independent.
     """
     history: Literal["inherit", "latest", "recent"] = "inherit"
+    max_versions: int = Field(
+        default=CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS,
+        ge=1,
+        le=CANVAS_RESULT_RETENTION_MAX_VERSIONS,
+    )
+    max_age_days: int = Field(
+        default=CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS,
+        ge=1,
+        le=CANVAS_RESULT_RETENTION_MAX_AGE_DAYS,
+    )
 
 
 class Graph(Wire):

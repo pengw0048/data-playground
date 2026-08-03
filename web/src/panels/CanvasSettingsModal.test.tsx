@@ -104,12 +104,29 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  it('shows the managed result location and saves a Canvas history override', async () => {
+  it('saves a Canvas history override without offering a per-Canvas location', async () => {
     render(<CanvasSettingsModal onClose={vi.fn()} />)
 
-    expect(screen.getByText('Local workspace')).toBeInTheDocument()
+    expect(screen.queryByText('Local workspace')).toBeNull()
     fireEvent.change(screen.getByLabelText('Result history'), { target: { value: 'recent' } })
-    expect(mocks.state.setResultRetention).toHaveBeenCalledWith('recent')
+    expect(mocks.state.setResultRetention).toHaveBeenCalledWith({
+      history: 'recent', maxVersions: 10, maxAgeDays: 30,
+    })
+  })
+
+  it('edits bounded recent-result limits without changing the storage location', () => {
+    mocks.state.doc.resultRetention = {
+      history: 'recent', maxVersions: 4, maxAgeDays: 14,
+    } as any
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+
+    expect(screen.getByLabelText('Versions per step')).toHaveValue(4)
+    expect(screen.getByLabelText('Days to keep')).toHaveValue(14)
+    fireEvent.change(screen.getByLabelText('Versions per step'), { target: { value: '6' } })
+    expect(mocks.state.setResultRetention).toHaveBeenCalledWith({
+      history: 'recent', maxVersions: 6, maxAgeDays: 14,
+    })
+    expect(screen.getByText('Latest result is always kept.')).toBeVisible()
   })
 
   it('hides unenforceable visibility controls when authentication is off', () => {
