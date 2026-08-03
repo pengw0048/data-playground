@@ -25,7 +25,6 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const setRequirements = useStore((s) => s.setRequirements)
   const setResultRetention = useStore((s) => s.setResultRetention)
   const setParameters = useStore((s) => s.setParameters)
-  const resultStorage = useStore((s) => s.kernelInfo?.resultStorage)
   const authEnabled = useStore((s) => s.authEnabled)
   const canEdit = roleCanEdit(canvasRole)
   const isOwner = canvasRole === 'owner'
@@ -34,13 +33,36 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
   const [reqs, setReqs] = useState((doc.requirements ?? []).join('\n'))
   const [parameters, setParameterDrafts] = useState<CanvasParameterDeclaration[]>(doc.parameters ?? [])
   const [parameterError, setParameterError] = useState('')
+  const [retentionVersions, setRetentionVersions] = useState(String(doc.resultRetention?.maxVersions ?? 10))
+  const [retentionDays, setRetentionDays] = useState(String(doc.resultRetention?.maxAgeDays ?? 30))
 
   useEffect(() => {
     setName(doc.name ?? '')
     setReqs((doc.requirements ?? []).join('\n'))
     setParameterDrafts(doc.parameters ?? [])
     setParameterError('')
-  }, [doc.id, doc.name, doc.requirements, doc.parameters])
+    setRetentionVersions(String(doc.resultRetention?.maxVersions ?? 10))
+    setRetentionDays(String(doc.resultRetention?.maxAgeDays ?? 30))
+  }, [
+    doc.id, doc.name, doc.requirements, doc.parameters,
+    doc.resultRetention?.maxVersions, doc.resultRetention?.maxAgeDays,
+  ])
+
+  const retentionHistory = doc.resultRetention?.history ?? 'inherit'
+  const retentionPolicy = (history = retentionHistory) => ({
+    history,
+    maxVersions: Number.parseInt(retentionVersions, 10) || 10,
+    maxAgeDays: Number.parseInt(retentionDays, 10) || 30,
+  } as const)
+  const updateRetentionLimit = (
+    field: 'maxVersions' | 'maxAgeDays', rawValue: string, maximum: number,
+  ) => {
+    if (field === 'maxVersions') setRetentionVersions(rawValue)
+    else setRetentionDays(rawValue)
+    const value = Number(rawValue)
+    if (!Number.isInteger(value) || value < 1 || value > maximum) return
+    setResultRetention({ ...retentionPolicy(), [field]: value })
+  }
 
   const busy = sharing.pending !== null
   const applyParameters = (next: CanvasParameterDeclaration[]) => {
@@ -128,26 +150,38 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
           </div>
           <div>
             <Label className="mb-1 block text-[11.5px] font-normal text-muted-foreground">Results</Label>
-            <div className="grid grid-cols-[1fr_auto] items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
-              <div>
+            <div className="rounded-md border border-border bg-background">
+              <div className="grid grid-cols-[1fr_auto] items-center gap-2 px-2.5 py-2">
                 <div className="text-[11.5px] font-medium text-foreground">Stored results</div>
+                <select
+                  aria-label="Result history"
+                  value={retentionHistory}
+                  disabled={!canEdit}
+                  onChange={(event) => setResultRetention(retentionPolicy(
+                    event.target.value as 'inherit' | 'latest' | 'recent'))}
+                  className="h-8 rounded-md border border-border bg-background px-2 text-[11.5px] text-foreground outline-none focus:border-primary disabled:opacity-60"
+                >
+                  <option value="inherit">Workspace default</option>
+                  <option value="latest">Latest result</option>
+                  <option value="recent">Recent results</option>
+                </select>
+                {retentionHistory === 'recent' && <div className="col-span-2 flex items-center gap-1.5 border-t border-border pt-2 text-[11px] text-muted-foreground">
+                  <span>Keep</span>
+                  <Input id="canvas-retention-versions" aria-label="Versions per step" type="number" min={1} max={500}
+                    value={retentionVersions} disabled={!canEdit}
+                    onChange={(event) => updateRetentionLimit('maxVersions', event.target.value, 500)}
+                    onBlur={() => setRetentionVersions(String(doc.resultRetention?.maxVersions ?? 10))}
+                    className="h-7 w-14 px-1.5 text-right text-[11.5px]" />
+                  <Label htmlFor="canvas-retention-versions" className="whitespace-nowrap text-[11px] font-normal text-muted-foreground">versions per step for</Label>
+                  <Input id="canvas-retention-days" aria-label="Days to keep" type="number" min={1} max={3650}
+                    value={retentionDays} disabled={!canEdit}
+                    onChange={(event) => updateRetentionLimit('maxAgeDays', event.target.value, 3650)}
+                    onBlur={() => setRetentionDays(String(doc.resultRetention?.maxAgeDays ?? 30))}
+                    className="h-7 w-14 px-1.5 text-right text-[11.5px]" />
+                  <Label htmlFor="canvas-retention-days" className="text-[11px] font-normal text-muted-foreground">days</Label>
+                </div>}
               </div>
-              <select
-                aria-label="Result history"
-                value={doc.resultRetention?.history ?? 'inherit'}
-                disabled={!canEdit}
-                onChange={(event) => setResultRetention(
-                  event.target.value as 'inherit' | 'latest' | 'recent')}
-                className="h-8 rounded-md border border-border bg-background px-2 text-[11.5px] text-foreground outline-none focus:border-primary disabled:opacity-60"
-              >
-                <option value="inherit">Workspace default</option>
-                <option value="latest">Latest result</option>
-                <option value="recent">Recent run results</option>
-              </select>
-              <div className="text-[11.5px] font-medium text-foreground">Location</div>
-              <div className="text-right text-[11px] text-muted-foreground">
-                {resultStorage?.label ?? 'Workspace managed storage'}
-              </div>
+              {retentionHistory === 'recent' && <div className="px-2.5 pb-2 text-[10.5px] text-muted-foreground">Latest result is always kept.</div>}
             </div>
           </div>
           <div>

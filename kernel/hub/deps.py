@@ -642,7 +642,13 @@ class Deps:
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
         if maintain_storage:
+            from hub import metadb
             self.storage.recover_orphans()
+            try:
+                metadb.reconcile_canvas_result_history_batch(limit=100)
+            except Exception:  # retryable metadata failure must not block serving the workspace
+                logging.getLogger("hub").warning(
+                    "Canvas result retention failed at startup", exc_info=True)
             prune_results = getattr(self.storage, "prune_results", None)
             if callable(prune_results):
                 try:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 from typing import Annotated, Any, Callable, Hashable, Literal, TypeVar
 from uuid import UUID
 
@@ -24,6 +25,10 @@ from hub import auth, auth_admission, canvas_copy, metadb, native_canvas, worksp
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
 from hub.deps import get_deps
 from hub.models import (
+    CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS,
+    CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS,
+    CANVAS_RESULT_RETENTION_MAX_AGE_DAYS,
+    CANVAS_RESULT_RETENTION_MAX_VERSIONS,
     CanvasTransformReference,
     CredUpsert,
     DurableTaskInboxItemView,
@@ -1637,6 +1642,12 @@ def put_canvas(canvas_id: str, doc: dict,
                     code=APIErrorCode.CONFLICT,
                     retryable=False,
                 )
+        try:
+            previous_doc = json.loads(c.doc) if c is not None else {}
+        except (TypeError, ValueError):
+            previous_doc = {}
+        if not isinstance(previous_doc, dict):
+            previous_doc = {}
         current_version = c.version if c is not None else 0
         if c is None:
             c = metadb.Canvas(id=canvas_id, owner_id=uid)  # first save → the creator owns it
@@ -1648,6 +1659,8 @@ def put_canvas(canvas_id: str, doc: dict,
         c.version = version
         c.doc = doc_json
         s.flush()  # settle a newly-created owner row before the local-result registry lock
+        if previous_doc.get("resultRetention") != persisted_doc.get("resultRetention"):
+            metadb._reconcile_canvas_result_history_in_session(s, c)
         metadb.sync_local_result_owner(s, "canvas", canvas_id, persisted_doc)
         metadb._replace_promoted_transform_refs(
             s, "canvas", canvas_id, persisted_doc)
@@ -1692,6 +1705,7 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
         c.version = (c.version or 1) + 1
         restored_doc = {**json.loads(doc), "id": canvas_id, "version": c.version}
         c.doc = json.dumps(restored_doc)
+        metadb._reconcile_canvas_result_history_in_session(s, c)
         metadb.sync_local_result_owner(s, "canvas", canvas_id, restored_doc)
         metadb._replace_promoted_transform_refs(
             s, "canvas", canvas_id, restored_doc)
@@ -1978,13 +1992,36 @@ def _prepare_setting_changes(
         if change.key == "canvasResultRetention":
             if change.scope != "global":
                 raise HTTPException(400, "canvasResultRetention is a workspace setting")
+            allowed_keys = {"history", "maxVersions", "maxAgeDays"}
             if (not isinstance(value, dict)
-                    or set(value) != {"history"}
+                    or "history" not in value
+                    or not set(value).issubset(allowed_keys)
                     or value.get("history") not in ("latest", "recent")):
                 raise HTTPException(
                     400,
-                    "canvasResultRetention.history must be 'latest' or 'recent'",
+                    "canvasResultRetention must define latest or recent history and bounded limits",
                 )
+            max_versions = value.get(
+                "maxVersions", CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS)
+            max_age_days = value.get(
+                "maxAgeDays", CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS)
+            if (isinstance(max_versions, bool) or not isinstance(max_versions, int)
+                    or not 1 <= max_versions <= CANVAS_RESULT_RETENTION_MAX_VERSIONS):
+                raise HTTPException(
+                    400,
+                    "canvasResultRetention.maxVersions must be between 1 and 500",
+                )
+            if (isinstance(max_age_days, bool) or not isinstance(max_age_days, int)
+                    or not 1 <= max_age_days <= CANVAS_RESULT_RETENTION_MAX_AGE_DAYS):
+                raise HTTPException(
+                    400,
+                    "canvasResultRetention.maxAgeDays must be between 1 and 3650",
+                )
+            value = {
+                "history": value["history"],
+                "maxVersions": max_versions,
+                "maxAgeDays": max_age_days,
+            }
         is_secret = change.scope == "global" and change.key in plugin_secrets
         if is_secret:
             try:
@@ -2010,6 +2047,20 @@ def _prepare_setting_changes(
         sensitive = sensitive or is_secret
         prepared.append((change.scope, change.key, value))
     return prepared, sensitive
+
+
+def _reconcile_result_retention_after_settings(changes: list[SettingBody]) -> None:
+    if not any(
+            change.scope == "global" and change.key == "canvasResultRetention"
+            for change in changes):
+        return
+    try:
+        metadb.reconcile_canvas_result_history_batch(limit=100)
+    except Exception:  # setting commit is authoritative; the periodic worker retries reconciliation
+        logging.getLogger("hub").warning(
+            "Canvas result retention reconciliation deferred after settings update",
+            exc_info=True,
+        )
 
 
 def _settings_batch_audit(
@@ -2061,6 +2112,7 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
     _scope, _key, value = prepared[0]
     scope_id = uid if body.scope == "user" else ""
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
+    _reconcile_result_retention_after_settings([body])
     is_secret = body.key in plugin_secrets
     # attr key must avoid validate_audit_attrs' secret-name regex, else this event is rejected + dropped.
     emit_audit(AuditAction.ADMIN_SETTINGS_CHANGE, AuditOutcome.SUCCESS, principal_id=uid,
@@ -2099,6 +2151,7 @@ def put_settings_batch(
             content=conflict.model_dump(mode="json", by_alias=True, exclude_none=True),
         )
     if body.changes:
+        _reconcile_result_retention_after_settings(body.changes)
         _settings_batch_audit(
             AuditOutcome.SUCCESS, uid=uid, changes=body.changes, sensitive=sensitive)
     return SettingsBatchResult.model_validate({"ok": True, "revision": revision})

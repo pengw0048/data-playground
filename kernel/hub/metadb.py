@@ -36,7 +36,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column, sessionmaker
 
-from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
+from hub.models import (
+    CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS,
+    CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS,
+    CANVAS_RESULT_RETENTION_MAX_AGE_DAYS,
+    CANVAS_RESULT_RETENTION_MAX_VERSIONS,
+    ColumnSchema,
+    SchemaCompatibility,
+    SchemaFieldCompatibility,
+)
 from hub.settings import settings
 
 DEFAULT_USER_ID = "local"
@@ -11161,20 +11169,59 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
     return failed_status.model_dump()
 
 
-def _canvas_result_history_mode(s, canvas: Canvas) -> str:
+@dataclass(frozen=True)
+class _CanvasResultHistoryPolicy:
+    history: str
+    max_versions: int
+    max_age_days: int
+
+
+def _result_retention_limit(value: object, default: int, upper: int) -> int:
+    return (
+        int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= upper
+        else default
+    )
+
+
+def _result_retention_policy(
+        value: object, *, allow_inherit: bool) -> _CanvasResultHistoryPolicy | None:
+    if not isinstance(value, dict):
+        return None
+    allowed_history = ("inherit", "latest", "recent") if allow_inherit else ("latest", "recent")
+    history = value.get("history")
+    if history not in allowed_history:
+        return None
+    return _CanvasResultHistoryPolicy(
+        history=str(history),
+        max_versions=_result_retention_limit(
+            value.get("maxVersions"),
+            CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS,
+            CANVAS_RESULT_RETENTION_MAX_VERSIONS,
+        ),
+        max_age_days=_result_retention_limit(
+            value.get("maxAgeDays"),
+            CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS,
+            CANVAS_RESULT_RETENTION_MAX_AGE_DAYS,
+        ),
+    )
+
+
+def _canvas_result_history_policy(s, canvas: Canvas) -> _CanvasResultHistoryPolicy:
     """Resolve the Canvas override over the validated workspace default."""
     try:
         canvas_doc = json.loads(canvas.doc)
     except (TypeError, ValueError):
         canvas_doc = {}
-    override = (
-        canvas_doc.get("resultRetention", {}).get("history")
+    override_value = (
+        canvas_doc.get("resultRetention")
         if isinstance(canvas_doc, dict)
         and isinstance(canvas_doc.get("resultRetention"), dict)
         else None
     )
-    if override in ("latest", "recent"):
-        return str(override)
+    override = _result_retention_policy(override_value, allow_inherit=True)
+    if override is not None and override.history in ("latest", "recent"):
+        return override
     setting = s.scalar(select(Setting.value).where(
         Setting.scope == "global",
         Setting.scope_id == "",
@@ -11185,9 +11232,136 @@ def _canvas_result_history_mode(s, canvas: Canvas) -> str:
             value = json.loads(setting)
         except (TypeError, ValueError):
             value = None
-        if isinstance(value, dict) and value.get("history") in ("latest", "recent"):
-            return str(value["history"])
-    return "latest"
+        policy = _result_retention_policy(value, allow_inherit=False)
+        if policy is not None:
+            return policy
+    return _CanvasResultHistoryPolicy(
+        history="latest",
+        max_versions=CANVAS_RESULT_RETENTION_DEFAULT_MAX_VERSIONS,
+        max_age_days=CANVAS_RESULT_RETENTION_DEFAULT_MAX_AGE_DAYS,
+    )
+
+
+def _utc_datetime(value: datetime.datetime) -> datetime.datetime:
+    return value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None else value.astimezone(
+        datetime.timezone.utc)
+
+
+def _canvas_result_history_records(
+        s, canvas: Canvas) -> tuple[list[RunRecord], set[str]]:
+    """Lock bounded Jobs history and choose the result owners allowed by this Canvas policy."""
+    records = list(s.scalars(select(RunRecord).where(
+        RunRecord.canvas_id == canvas.id,
+    ).order_by(RunRecord.id).with_for_update()))
+    policy = _canvas_result_history_policy(s, canvas)
+    if policy.history != "recent":
+        return records, set()
+    cutoff = _utc_datetime(_db_now(s)) - datetime.timedelta(days=policy.max_age_days)
+    eligible = sorted(
+        (
+            record for record in records
+            if record.job_type == "run"
+            and record.status == "done"
+            and record.target_node_id is not None
+            and record.outputs != "[]"
+            and _utc_datetime(record.created_at) >= cutoff
+        ),
+        key=lambda record: (
+            str(record.target_node_id),
+            -_utc_datetime(record.created_at).timestamp(),
+            record.id,
+        ),
+    )
+    retained: set[str] = set()
+    per_target: dict[str, int] = {}
+    for record in eligible:
+        target = str(record.target_node_id)
+        count = per_target.get(target, 0)
+        if count >= policy.max_versions:
+            continue
+        retained.add(record.id)
+        per_target[target] = count + 1
+    return records, retained
+
+
+def _run_record_output_owner_ids(s, records: list[RunRecord]) -> set[str]:
+    if not records:
+        return set()
+    record_ids = [record.id for record in records]
+    owned = set(s.scalars(select(ObjectAttemptRef.ref_key).where(
+        ObjectAttemptRef.ref_type == "run_record",
+        ObjectAttemptRef.ref_key.in_(record_ids),
+    )))
+    local_refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.owner_kind == "run_record",
+        LocalResultReference.owner_key.in_(record_ids),
+    )))
+    output_uris: dict[str, set[str]] = {}
+    for record in records:
+        try:
+            outputs = json.loads(record.outputs)
+        except (TypeError, ValueError):
+            outputs = []
+        result_doc = {"outputs": outputs if isinstance(outputs, list) else []}
+        output_uris[record.id] = {
+            candidate for uri in _result_doc_uris(result_doc)
+            if (candidate := _local_result_candidate(uri)) is not None
+        }
+    owned.update(
+        ref.owner_key for ref in local_refs
+        if ref.uri in output_uris.get(ref.owner_key, set())
+    )
+    return owned
+
+
+def _release_run_record_result_owners(s, records: list[RunRecord]) -> int:
+    """Release only historical outputs; exact run inputs remain owned by their RunRecord."""
+    if not records:
+        return 0
+    for record in records:
+        _replace_attempt_refs(s, "run_record", record.id, {})
+    for record in records:
+        sync_local_result_owner(
+            s, "run_record", record.id,
+            {"outputs": []}, record.input_manifest, record.profile,
+        )
+    return len(records)
+
+
+def _reconcile_canvas_result_history_in_session(s, canvas: Canvas) -> int:
+    records, retained = _canvas_result_history_records(s, canvas)
+    output_owners = _run_record_output_owner_ids(s, records)
+    release = [
+        record for record in records
+        if record.id in output_owners and record.id not in retained
+    ]
+    return _release_run_record_result_owners(s, release)
+
+
+def reconcile_canvas_result_history(canvas_id: str) -> int:
+    """Apply one Canvas's version/age limits without deleting its Jobs metadata."""
+    with session() as s:
+        canvas = s.get(Canvas, str(canvas_id), with_for_update=True)
+        if canvas is None:
+            return 0
+        return _reconcile_canvas_result_history_in_session(s, canvas)
+
+
+def reconcile_canvas_result_history_batch(
+        *, after_canvas_id: str | None = None, limit: int = 25) -> dict[str, object]:
+    """Reconcile one deterministic Canvas page for the periodic retention worker."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0 or limit > 100:
+        raise ValueError("Canvas result retention batch limit must be between 1 and 100")
+    with session() as s:
+        query = select(Canvas.id)
+        if after_canvas_id:
+            query = query.where(Canvas.id > str(after_canvas_id))
+        canvas_ids = list(s.scalars(query.order_by(Canvas.id).limit(limit)))
+    released = sum(reconcile_canvas_result_history(canvas_id) for canvas_id in canvas_ids)
+    return {
+        "released": released,
+        "next_canvas_id": canvas_ids[-1] if len(canvas_ids) == limit else None,
+    }
 
 
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
@@ -11238,7 +11412,6 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     canvas = s.get(Canvas, canvas_id, with_for_update=True)
     if canvas is None:
         return False
-    retain_history_artifacts = _canvas_result_history_mode(s, canvas) == "recent"
     rec = (s.scalar(select(RunRecord).where(
         RunRecord.run_id == run_id, RunRecord.canvas_id == canvas_id
     ).limit(1).with_for_update())
@@ -11298,14 +11471,28 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         RunRecord.canvas_id == canvas_id, RunRecord.id != rid
     ).order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
       .offset(max(0, _RUN_HISTORY_MAX - 1)).with_for_update()))
-    history_artifact_doc = {"outputs": output_docs if retain_history_artifacts else []}
+    history_records, retained_record_ids = _canvas_result_history_records(s, canvas)
+    stale_ids = {record.id for record in stale}
+    output_owner_ids = _run_record_output_owner_ids(s, history_records)
+    retention_release = [
+        record for record in history_records
+        if record.id != rid
+        and record.id not in stale_ids
+        and record.id in output_owner_ids
+        and record.id not in retained_record_ids
+    ]
+    history_artifact_doc = {
+        "outputs": output_docs if rid in retained_record_ids else [],
+    }
     _replace_attempt_refs(
         s, "run_record", rid, _result_doc_refs(history_artifact_doc))
+    for obj in retention_release:
+        _replace_attempt_refs(s, "run_record", obj.id, {})
     stale_execution_manifests = {
         obj.execution_manifest_sha256 for obj in stale
     }
     for obj in stale:
-        _replace_attempt_ref(s, "run_record", obj.id, None)
+        _replace_attempt_refs(s, "run_record", obj.id, {})
         if obj.run_id:
             admission = s.get(RunInputAdmission, obj.run_id, with_for_update=True)
             if admission is not None:
@@ -11318,6 +11505,11 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         _lock_local_result_registry(s)
     sync_local_result_owner(
         s, "run_record", rid, history_artifact_doc, rec.input_manifest, rec.profile)
+    for obj in retention_release:
+        sync_local_result_owner(
+            s, "run_record", obj.id,
+            {"outputs": []}, obj.input_manifest, obj.profile,
+        )
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
         if obj.run_id:

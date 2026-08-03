@@ -984,7 +984,9 @@ describe('SettingsModal — plugin config form', () => {
 
   it('saves the workspace result-history policy and shows the actual managed store', async () => {
     getSettings.mockResolvedValue({
-      global: { canvasResultRetention: { history: 'recent' } },
+      global: {
+        canvasResultRetention: { history: 'recent', maxVersions: 8, maxAgeDays: 21 },
+      },
       user: {}, revision: { global: 2, user: 4 },
     })
     ;(state.kernelInfo as any).resultStorage = {
@@ -994,13 +996,19 @@ describe('SettingsModal — plugin config form', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Destinations' }))
 
     expect(await screen.findByText('Shared object storage')).toBeVisible()
-    fireEvent.click(screen.getByLabelText('Canvas result history'))
-    fireEvent.click(await screen.findByRole('option', { name: 'Latest result' }))
+    expect(screen.getByLabelText('Workspace versions per step')).toHaveValue(8)
+    expect(screen.getByLabelText('Workspace days to keep')).toHaveValue(21)
+    fireEvent.change(screen.getByLabelText('Workspace versions per step'), {
+      target: { value: '6' },
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(putSettingsBatch).toHaveBeenCalledWith(
       { global: 2, user: 4 },
-      [{ scope: 'global', key: 'canvasResultRetention', value: { history: 'latest' } }],
+      [{
+        scope: 'global', key: 'canvasResultRetention',
+        value: { history: 'recent', maxVersions: 6, maxAgeDays: 21 },
+      }],
     ))
   })
 

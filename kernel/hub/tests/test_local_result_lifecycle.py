@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import importlib.util
 import json
 import os
@@ -103,6 +104,36 @@ def _publish_run(storage: LocalStorage, run_id: str, uri: str) -> tuple[str, str
     metadb.save_run_state(run_id, doc, canvas_id=canvas_id)
     assert storage.release_result(uri, run_id) is True
     return user_id, canvas_id, doc
+
+
+def _publish_run_to_canvas(
+        storage: LocalStorage, user_id: str, canvas_id: str, run_id: str, uri: str) -> dict:
+    metadb.bind_run_owner(run_id, user_id, canvas_id)
+    doc = _done_doc(run_id, uri)
+    metadb.save_run_state(run_id, doc, canvas_id=canvas_id)
+    assert storage.release_result(uri, run_id) is True
+    assert metadb.record_run(
+        canvas_id=canvas_id,
+        target_node_id="target",
+        job_type="run",
+        status="done",
+        rows=1,
+        outputs=doc["outputs"],
+        run_id=run_id,
+    ) is True
+    return doc
+
+
+def _drop_run_states(run_ids: list[str]) -> None:
+    with metadb.session() as session:
+        states = list(session.scalars(select(metadb.RunState).where(
+            metadb.RunState.run_id.in_(run_ids),
+        ).order_by(metadb.RunState.run_id).with_for_update()))
+        metadb._lock_local_result_registry(session)
+        for state in states:
+            metadb._drop_local_result_owner_locked(
+                session, "run_state", state.run_id)
+            session.delete(state)
 
 
 def _artifact(uri: str):
@@ -209,6 +240,126 @@ def test_canvas_result_history_policy_controls_only_historical_artifacts(
 
     metadb.delete_canvas_cascade(canvas_id)
     storage.prune_results(limit=10)
+
+
+def test_canvas_result_history_keeps_bounded_versions_per_target(storage):
+    user_id, canvas_id = _create_canvas()
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps({
+            "resultRetention": {
+                "history": "recent", "maxVersions": 2, "maxAgeDays": 30,
+            },
+        })
+
+    run_ids: list[str] = []
+    uris: list[str] = []
+    for _index in range(3):
+        run_id = f"run-{uuid.uuid4().hex}"
+        uri = _ready_result(storage, run_id)
+        _publish_run_to_canvas(storage, user_id, canvas_id, run_id, uri)
+        run_ids.append(run_id)
+        uris.append(uri)
+
+    with metadb.session() as session:
+        records = list(session.scalars(select(metadb.RunRecord).where(
+            metadb.RunRecord.canvas_id == canvas_id,
+        ).order_by(metadb.RunRecord.created_at, metadb.RunRecord.id)))
+        assert len(records) == 3, "Jobs metadata is independent from result retention"
+        history_owner_keys = set(session.scalars(select(
+            metadb.LocalResultReference.owner_key,
+        ).where(
+            metadb.LocalResultReference.owner_kind == "run_record",
+            metadb.LocalResultReference.uri.in_(uris),
+        )))
+        assert history_owner_keys == {records[1].id, records[2].id}
+
+    _drop_run_states(run_ids)
+    storage.prune_results(limit=10)
+    assert not pathlib.Path(uris[0]).exists()
+    assert all(pathlib.Path(uri).exists() for uri in uris[1:])
+    metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_canvas_result_history_inherits_workspace_limits(storage):
+    user_id, canvas_id = _create_canvas()
+    metadb.set_setting("canvasResultRetention", {
+        "history": "recent", "maxVersions": 1, "maxAgeDays": 30,
+    }, scope="global")
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps({"resultRetention": {"history": "inherit"}})
+
+    uris: list[str] = []
+    for _index in range(2):
+        run_id = f"run-{uuid.uuid4().hex}"
+        uri = _ready_result(storage, run_id)
+        _publish_run_to_canvas(storage, user_id, canvas_id, run_id, uri)
+        uris.append(uri)
+
+    with metadb.session() as session:
+        history_uris = set(session.scalars(select(
+            metadb.LocalResultReference.uri,
+        ).where(
+            metadb.LocalResultReference.owner_kind == "run_record",
+            metadb.LocalResultReference.uri.in_(uris),
+        )))
+        assert history_uris == {uris[1]}
+
+    metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_canvas_result_history_age_reconciliation_releases_only_old_outputs(storage):
+    user_id, canvas_id = _create_canvas()
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps({
+            "resultRetention": {
+                "history": "recent", "maxVersions": 10, "maxAgeDays": 1,
+            },
+        })
+
+    run_ids: list[str] = []
+    uris: list[str] = []
+    for _index in range(2):
+        run_id = f"run-{uuid.uuid4().hex}"
+        uri = _ready_result(storage, run_id)
+        _publish_run_to_canvas(storage, user_id, canvas_id, run_id, uri)
+        run_ids.append(run_id)
+        uris.append(uri)
+
+    with metadb.session() as session:
+        oldest = session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.canvas_id == canvas_id,
+            metadb.RunRecord.run_id == run_ids[0],
+        ).with_for_update())
+        assert oldest is not None
+        oldest.created_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
+
+    assert metadb.reconcile_canvas_result_history(canvas_id) == 1
+    with metadb.session() as session:
+        assert session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.canvas_id == canvas_id,
+            metadb.RunRecord.run_id == run_ids[0],
+        )) is not None
+        old_history_ref = session.get(metadb.LocalResultReference, {
+            "uri": uris[0],
+            "owner_kind": "run_record",
+            "owner_key": session.scalar(select(metadb.RunRecord.id).where(
+                metadb.RunRecord.canvas_id == canvas_id,
+                metadb.RunRecord.run_id == run_ids[0],
+            )),
+        })
+        assert old_history_ref is None
+
+    _drop_run_states(run_ids)
+    storage.prune_results(limit=10)
+    assert not pathlib.Path(uris[0]).exists()
+    assert pathlib.Path(uris[1]).exists()
+    metadb.delete_canvas_cascade(canvas_id)
 
 
 def test_terminal_commit_then_raise_is_proved_by_exact_receipt(storage):

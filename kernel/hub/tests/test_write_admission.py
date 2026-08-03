@@ -18,7 +18,8 @@ from sqlalchemy import func, select
 from hub import db, metadb
 from hub.api_errors import APIErrorCode
 from hub.models import (
-    ColumnSchema, Graph, PerNodeStatus, RunEstimate, RunOutput, RunStatus, WriteAdmission,
+    CanvasResultRetention, ColumnSchema, Graph, PerNodeStatus, RunEstimate, RunOutput, RunStatus,
+    WriteAdmission,
 )
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
@@ -1451,7 +1452,7 @@ def test_repeated_admission_recovers_the_exact_durable_receipt(contract):
     assert recovered.recovered_receipt.publication.artifact_uri == receipt.publication.artifact_uri
 
 
-def test_write_submission_identity_ignores_only_operational_node_status(contract):
+def test_write_submission_identity_ignores_operational_state_and_result_retention(contract):
     deps, graph = contract
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", "43333333-3333-4333-8333-333333333333")
@@ -1460,6 +1461,11 @@ def test_write_submission_identity_ignores_only_operational_node_status(contract
 
     retried = graph.model_copy(deep=True)
     next(node for node in retried.nodes if node.id == "write").data["status"] = "failed"
+    assert _local_run_intent_sha256(
+        retried, "write", write_intent=admission.intent) == initial
+
+    retried.result_retention = CanvasResultRetention(
+        history="recent", max_versions=3, max_age_days=7)
     assert _local_run_intent_sha256(
         retried, "write", write_intent=admission.intent) == initial
 

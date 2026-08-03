@@ -477,7 +477,25 @@ def _local_result_reaper_loop(stop: threading.Event) -> None:
     """Run bounded exact local-result retention away from run completion latency."""
     from hub.deps import get_deps
 
+    canvas_cursor: str | None = None
+    next_canvas_pass = 0.0
     while not stop.wait(metadb.KERNEL_STALE_S):
+        now = time.monotonic()
+        if canvas_cursor is not None or now >= next_canvas_pass:
+            try:
+                result = metadb.reconcile_canvas_result_history_batch(
+                    after_canvas_id=canvas_cursor, limit=25)
+                next_canvas_id = result["next_canvas_id"]
+                canvas_cursor = str(next_canvas_id) if isinstance(next_canvas_id, str) else None
+                if canvas_cursor is None:
+                    next_canvas_pass = now + 60 * 60
+                if result["released"]:
+                    logging.getLogger("hub").info(
+                        "Canvas result retention released %s historical result owners",
+                        result["released"])
+            except Exception:  # a transient metadata failure must not stop later retention passes
+                logging.getLogger("hub").warning(
+                    "Canvas result retention cycle failed (continuing)", exc_info=True)
         try:
             raw_retention = os.environ.get(
                 "DP_MANAGED_REVISION_RETENTION_SECONDS", str(7 * 24 * 60 * 60))

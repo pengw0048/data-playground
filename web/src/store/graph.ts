@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { WireType } from '../theme/tokens'
 import type {
   CanvasDoc, CanvasEdge, CanvasNode, CanvasParameterBinding, CanvasParameterDeclaration,
+  CanvasResultRetention,
   LastRun, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
@@ -1495,7 +1496,7 @@ interface Store {
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   setExecutionBackend: (backend: string | null) => void
-  setResultRetention: (history: 'inherit' | 'latest' | 'recent') => void
+  setResultRetention: (retention: CanvasResultRetention) => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
@@ -4425,12 +4426,20 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((state) => ({ doc: { ...state.doc, executionBackend: normalized } }))
   },
-  setResultRetention: (history) => {
+  setResultRetention: (retention) => {
     if (!roleCanEdit(get().canvasRole)) return
-    if ((get().doc.resultRetention?.history ?? 'inherit') === history) return
+    const normalized = {
+      history: retention.history,
+      maxVersions: retention.maxVersions ?? 10,
+      maxAgeDays: retention.maxAgeDays ?? 30,
+    }
+    const current = get().doc.resultRetention
+    if (current?.history === normalized.history
+        && (current.maxVersions ?? 10) === normalized.maxVersions
+        && (current.maxAgeDays ?? 30) === normalized.maxAgeDays) return
     get().commit()
     set((state) => ({
-      doc: { ...state.doc, resultRetention: { history } },
+      doc: { ...state.doc, resultRetention: normalized },
     }))
   },
   setParameters: (parameters) => {

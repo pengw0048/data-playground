@@ -371,15 +371,20 @@ def test_canvas_result_retention_is_a_strict_workspace_policy():
     valid = _batch(baseline, [{
         "scope": "global",
         "key": "canvasResultRetention",
-        "value": {"history": "recent"},
+        "value": {"history": "recent", "maxVersions": 7, "maxAgeDays": 14},
     }])
     assert valid.status_code == 200, valid.text
-    assert metadb.get_setting("canvasResultRetention", "global") == {"history": "recent"}
+    assert metadb.get_setting("canvasResultRetention", "global") == {
+        "history": "recent", "maxVersions": 7, "maxAgeDays": 14,
+    }
 
     for scope, value in (
         ("user", {"history": "latest"}),
         ("global", {"history": "forever"}),
         ("global", {"history": "latest", "location": "export-destination"}),
+        ("global", {"history": "recent", "maxVersions": 0, "maxAgeDays": 30}),
+        ("global", {"history": "recent", "maxVersions": True, "maxAgeDays": 30}),
+        ("global", {"history": "recent", "maxVersions": 10, "maxAgeDays": 3651}),
     ):
         before = _snapshot()
         rejected = _batch(before, [{
