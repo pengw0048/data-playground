@@ -1514,6 +1514,7 @@ function replaceDraft(drafts: LocalCanvasDraft[], draft: LocalCanvasDraft): Loca
 }
 
 const DRAFT_SYNC_CONFLICT_MESSAGE = 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
+const draftSyncConflictKey = (draftId: string) => `canvas-sync-conflict:${draftId}`
 
 function draftAfterStorageWrite(
   draft: LocalCanvasDraft, result: { ok: boolean; error?: string },
@@ -4463,7 +4464,7 @@ export const useStore = create<Store>((set, get) => ({
     ))
     if (draft?.syncState !== 'conflict') return
     get().pushToast(DRAFT_SYNC_CONFLICT_MESSAGE, 'error', {
-      dedupeKey: `canvas-sync-conflict:${draft.draftId}`,
+      dedupeKey: draftSyncConflictKey(draft.draftId),
       sticky: true,
       actions: [
         ...(draft.baseCanvasId ? [{
@@ -4508,6 +4509,7 @@ export const useStore = create<Store>((set, get) => ({
       localDrafts: replaceDraft(
         state.localDrafts.filter((draft) => draft.draftId !== original.draftId), fork,
       ),
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(original.draftId)),
     }))
     get().openLocalDraft(fork.draftId)
     await get().retryLocalDraft(fork.draftId)
@@ -4531,6 +4533,7 @@ export const useStore = create<Store>((set, get) => ({
       localDrafts: state.localDrafts.filter((candidate) => candidate.draftId !== draftId),
       currentDraftId: wasOpen ? null : state.currentDraftId,
       canvasRole: inspectingServer ? cachedRole(principalId, draft.canvasId) : state.canvasRole,
+      toasts: state.toasts.filter((toast) => toast.dedupeKey !== draftSyncConflictKey(draftId)),
     }))
     if (!wasOpen) return
     if (draft.baseCanvasId && await get().openFile(draft.baseCanvasId)) return

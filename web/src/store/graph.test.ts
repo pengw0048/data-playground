@@ -5140,6 +5140,40 @@ describe('graph store — core authority ops', () => {
     }))
     expect(useStore.getState().doc).toMatchObject({ name: 'local edit (recovered)', nodes: doc.nodes })
     expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().toasts.filter((toast) => (
+      toast.dedupeKey === `canvas-sync-conflict:${doc.id}`
+    ))).toEqual([])
+  })
+
+  it('drops the conflict notification when the draft it points at is discarded', async () => {
+    const doc = { ...emptyTestDoc('discarded'), name: 'local edit', nodes: [NODE('local-node')] }
+    expect(writeCanvasDraft({
+      draftId: doc.id,
+      principalId: 'alice',
+      canvasId: doc.id,
+      baseCanvasId: doc.id,
+      baseVersion: 1,
+      name: doc.name,
+      doc,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-25T12:00:00.000Z',
+    }).ok).toBe(true)
+    useStore.getState().refreshLocalDrafts()
+    expect(useStore.getState().openLocalDraft(doc.id)).toBe(true)
+    apiMocks.saveCanvas.mockRejectedValue(new KernelError(409, 'another session saved first'))
+    await useStore.getState().retryLocalDraft(doc.id)
+    expect(useStore.getState().toasts.some((toast) => (
+      toast.dedupeKey === `canvas-sync-conflict:${doc.id}`
+    ))).toBe(true)
+
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+    await useStore.getState().discardLocalDraft(doc.id)
+    confirm.mockRestore()
+
+    expect(useStore.getState().toasts.filter((toast) => (
+      toast.dedupeKey === `canvas-sync-conflict:${doc.id}`
+    ))).toEqual([])
   })
 
   it('clears another principal draft list synchronously on identity change', async () => {
