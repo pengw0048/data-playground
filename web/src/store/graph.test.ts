@@ -1170,6 +1170,9 @@ describe('graph store — core authority ops', () => {
     }
     expect(writeAdmissionFingerprint(withStatusChange, 'write', bindings, manifest)).not.toBe(initial)
     expect(writeAdmissionFingerprint(
+      { ...doc, executionBackend: 'local-subprocess' }, 'write', bindings, manifest,
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
       { ...doc, edges: [{ ...doc.edges[0], id: 'replacement-id' }] },
       'write', bindings, manifest,
     )).not.toBe(initial)

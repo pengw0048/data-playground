@@ -581,6 +581,9 @@ export function writeAdmissionFingerprint(
   // target Write's lifecycle status, canvas presentation, and unrelated branches.
   return JSON.stringify({
     plan: targetExecutionPlanIdentity(doc, nodeId, undefined, true),
+    // The server resolves publication capability from the selected target, so an admission taken on
+    // one target must not be replayed on another.
+    executionBackend: doc.executionBackend ?? null,
     declarations: targetParameterDeclarations(doc, nodeId)
       .map((declaration) => canonicalIdentityValue({
         name: declaration.name,
