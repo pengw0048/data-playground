@@ -397,6 +397,9 @@ def csv_date_order_notices(uri: str, options: dict | None = None) -> list[str]:
         db.ensure_object_store()
     else:
         local = paths.checked_local_path(target)
+        # ``checked_local_path`` canonicalizes and confines the caller-controlled URI before this
+        # probe. Keep the probe on that returned spelling rather than the original target.
+        # codeql[py/path-injection]
         if local is None or not os.path.isfile(local):
             return []
         target = local
