@@ -90,6 +90,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const inputColumns = useInputColumns(id)
   const numericDrafts = useStore((s) => s.numericParamDrafts[id])
   const invalid = node ? nodeInvalidReason(node, inputColumns, numericDrafts) : null   // e.g. "order by is required"
+  const refused = useStore((s) => s.graphRefusals[id])   // the kernel refused the graph because of this node
   const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
   const sizeEst = useStore((s) => s.sizes[id])   // conservative pre-run size estimate (card hint)
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean
@@ -169,13 +170,20 @@ export function NodeCard({ id, data, children, metaOverride }: {
               {metaOverride ?? data.meta ?? ''}
             </div>
 
+            {/* the kernel refused this branch; the run button is already blocked, say why */}
+            {refused && !off && (
+              <div data-testid="node-graph-refusal" className="mt-0.5 truncate text-[10.5px] text-destructive" title={refused}>
+                ⚠ {refused}
+              </div>
+            )}
+
             {/* soft schema cue: config points at a column not in the input (never blocks a run) */}
-            {kind === 'filter' && invalid && !off && (
+            {!refused && kind === 'filter' && invalid && !off && (
               <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={invalid}>
                 ⚠ {invalid}
               </div>
             )}
-            {!invalid && warnings.length > 0 && !off && (
+            {!refused && !invalid && warnings.length > 0 && !off && (
               <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={warnings.join(' · ')}>
                 ⚠ {warnings[0]}
               </div>

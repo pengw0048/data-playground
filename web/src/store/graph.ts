@@ -1246,6 +1246,7 @@ interface Store {
   specsVersion: number
   schemas: SchemaMap               // per-node, per-output-port columns; null port entry = untyped
   sizes: Record<string, { rows: number | null; confidence: string }>  // per-node size estimate (card hint)
+  graphRefusals: Record<string, string>  // per-node reason the kernel refused the graph, if any
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
@@ -1517,6 +1518,19 @@ function friendlyJoinInputRefusal(message: string): string | null {
 
 // The kernel is authoritative for graph validity. User-requested target actions surface a product
 // explanation; passive whole-Canvas metadata refreshes deliberately stay quiet.
+// Attribute an invalid_graph refusal to the nodes its clauses name, so the branch that cannot run
+// says so on the canvas.
+export function nodeGraphRefusals(error: unknown): Record<string, string> {
+  if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return {}
+  const refusals: Record<string, string> = {}
+  for (const clause of error.message.replace(/^invalid graph: /, '').split('; ')) {
+    for (const [, nodeId] of clause.matchAll(/node '([^']+)'/g)) {
+      if (!refusals[nodeId]) refusals[nodeId] = clause
+    }
+  }
+  return refusals
+}
+
 function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
   if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
   const message = friendlyJoinInputRefusal(error.message)
@@ -2153,6 +2167,7 @@ export const useStore = create<Store>((set, get) => ({
   specsVersion: 0,
   schemas: {},
   sizes: {},
+  graphRefusals: {},
   selectedId: null,
   selectedIds: [],
   nodeRevealRequest: null,
@@ -4810,12 +4825,13 @@ export const useStore = create<Store>((set, get) => ({
       const schemas = parameterBindings === undefined
         ? await api.schema(doc)
         : await api.schema(doc, undefined, undefined, parameterBindings)
-      if (seq === _schemaSeq) set({ schemas })
+      if (seq === _schemaSeq) set({ schemas, graphRefusals: {} })
     }
-    // This is a background metadata refresh, not a user-requested whole-Canvas run. An unfinished
-    // sibling branch must not interrupt opening the Canvas; keep the last known schema until the
-    // user runs or inspects the affected branch directly.
-    catch { /* offline or an unfinished sibling branch: keep last-known */ }
+    // A background metadata refresh must not interrupt opening the Canvas with a toast, so an
+    // invalid_graph refusal lands on the nodes it names instead.
+    catch (error) {
+      if (seq === _schemaSeq) set({ graphRefusals: nodeGraphRefusals(error) })
+    }
     // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
     try {
       const sizes = parameterBindings === undefined

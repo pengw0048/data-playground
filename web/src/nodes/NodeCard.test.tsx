@@ -31,7 +31,7 @@ describe('NodeCard result summary', () => {
     apiMocks.schema.mockReset().mockResolvedValue({})
     apiMocks.graphSizes.mockReset().mockResolvedValue({})
     useStore.setState({
-      canvasRole: 'owner', kernelUp: true, selectedIds: [], openPanels: {}, runs: {}, sizes: {},
+      canvasRole: 'owner', kernelUp: true, selectedIds: [], openPanels: {}, runs: {}, sizes: {}, graphRefusals: {},
       runPreview, closePanel,
       doc: {
         id: 'c', name: 'test', version: 1, requirements: [], edges: [], nodes: [{
@@ -40,6 +40,16 @@ describe('NodeCard result summary', () => {
         }],
       },
     } as any)
+  })
+
+  it('says on the card which node the kernel refused', () => {
+    useStore.setState({ graphRefusals: { target: "Join node 'target' requires exactly one incoming edge on input 'a'" } } as any)
+    const data: NodeData = { title: 'target', status: 'draft', config: {}, history: [] }
+
+    render(<TooltipProvider><ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider></TooltipProvider>)
+
+    expect(screen.getByTestId('node-graph-refusal')).toHaveTextContent(
+      "Join node 'target' requires exactly one incoming edge on input 'a'")
   })
 
   it('shows output cardinality for a named multi-output result', () => {
