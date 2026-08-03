@@ -982,7 +982,7 @@ function WorkspaceMixedExplorer() {
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <header className="flex min-h-[60px] items-center gap-3 border-b border-border px-7 py-2.5">
+      <header className="flex min-h-[60px] flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-7 py-2.5">
         <nav aria-label="Workspace path" className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground">
           <button onClick={() => setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
           {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
