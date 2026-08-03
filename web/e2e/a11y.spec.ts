@@ -360,16 +360,20 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(clipped, 'the Workspace title is cut off by an overflow ancestor').toBe(false)
   })
 
-  test('the Share visibility control stays on one row', async ({ page }) => {
+  test('the open-mode Canvas link control stays on one row', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('share-btn').click()
-    const options = page.getByRole('dialog').getByRole('button', { name: /^(Private|Workspace can)/ })
-    await expect(options).toHaveCount(3)
+    const dialog = page.getByRole('dialog', { name: 'Copy Canvas link' })
+    const link = dialog.getByRole('textbox')
+    const copy = dialog.getByRole('button', { name: 'Copy' })
+    await expect(link).toBeVisible()
+    await expect(copy).toBeVisible()
 
-    const tops = await options.evaluateAll((elements) => (
-      [...new Set(elements.map((element) => Math.round(element.getBoundingClientRect().top)))]
-    ))
-    expect(tops, 'the three visibility options wrapped onto more than one row').toHaveLength(1)
+    const [linkTop, copyTop] = await Promise.all([
+      link.evaluate((element) => Math.round(element.getBoundingClientRect().top)),
+      copy.evaluate((element) => Math.round(element.getBoundingClientRect().top)),
+    ])
+    expect(copyTop, 'the Copy button wrapped below the Canvas link').toBe(linkTop)
   })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
