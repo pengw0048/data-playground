@@ -16,6 +16,7 @@ import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCell
 import {
   editorInputFitsPreviewCap, PreviewDetails, PreviewProvenance, PreviewSummary, previewRangeLabel,
 } from '../components/PreviewPresentation'
+import { WhitespaceText } from '../components/WhitespaceText'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
   ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
@@ -946,7 +947,7 @@ export function SampleProvenanceSummary({ provenance }: { provenance: SampleProv
 }
 
 // Full detail for one row — every column with its full value (untruncated array / url / etc.).
-function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<string, unknown> }) {
+export function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<string, unknown> }) {
   return (
     <div className="max-h-[440px] overflow-auto py-1">
       {columns.map((c) => (
@@ -961,7 +962,9 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
                 mediaKind={c.mediaKind} viewport="detail" /></div>
             )}
             <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
-              {row[c.name] == null ? '·' : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
+              {row[c.name] == null ? '·'
+                : typeof row[c.name] === 'string' ? <WhitespaceText value={row[c.name] as string} />
+                : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
             </div>
           </div>
         </div>
@@ -1062,7 +1065,7 @@ function ExportCluster({
   )
 }
 
-function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
+export function RowsTable({ columns, rows, onRowClick, fillAvailableHeight = false }: {
   columns: ColumnSchema[]; rows: Record<string, unknown>[]; onRowClick: (i: number) => void
   fillAvailableHeight?: boolean
 }) {
@@ -1118,6 +1121,7 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value === true) return <span className="text-[#2f9e5f]">true</span>
   if (value === false) return <span className="text-destructive">false</span>
   if (typeof value === 'object') return <span className="dp-mono">{JSON.stringify(value)}</span>  // struct/map — not [object Object]
+  if (typeof value === 'string') return <WhitespaceText value={value} />
   return <span>{String(value)}</span>
 }
 
