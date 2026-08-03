@@ -245,9 +245,9 @@ function Source({ id, data }: NodeComponentProps) {
                 ? `${sourceLabel} · Selected version could not be checked`
                 : `${sourceLabel} · Selected version · Loading rows and columns…`
       : table
-        ? `${sourceLabel} · Current version · ${countSummary(table.rowCount, table.columns.length)}`
+        ? `${sourceLabel} · ${countSummary(table.rowCount, table.columns.length)}`
         : providerBinding
-          ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Version not selected' : 'Current version'} · Rows and columns unknown`
+          ? `${sourceLabel} · ${data.config.providerReadMode === 'exact' ? 'Version not selected · ' : ''}Rows and columns unknown`
           : 'Choose a dataset'
 
   return (

@@ -66,6 +66,23 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.getByText(/\b0\s*rows/)).toBeInTheDocument()
   })
 
+  it('prioritizes useful dataset facts over a redundant current-version label', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ kernelUp: true, catalog: [
+      { id: 't1', name: 'events', uri: 'mem://events', rowCount: 2_000, version: 'v1', columns: [
+        { name: 'id', type: 'int', capabilities: [] },
+        { name: 'event', type: 'string', capabilities: [] },
+        { name: 'user_id', type: 'int', capabilities: [] },
+        { name: 'amount', type: 'float', capabilities: [] },
+      ] },
+    ] } as any)
+
+    render1({ title: 'events', status: 'stale', config: { tableId: 't1' } })
+
+    expect(screen.getByTestId('node-meta')).toHaveTextContent('Datasets · 2,000 rows · 4 columns')
+    expect(screen.queryByText(/Current version/i)).not.toBeInTheDocument()
+  })
+
   it('selects the Source when its dataset control receives the click', () => {
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
 
