@@ -338,6 +338,28 @@ test.describe('accessibility gate @ux-smoke', () => {
     await expect(name).toHaveValue('Quarterly revenue v2')
   })
 
+  test('zoom: the Workspace title is not clipped at 200%', async ({ page }) => {
+    await fresh(page)
+    await backToWorkspace(page)
+    const title = page.getByRole('navigation', { name: 'Workspace path' })
+      .getByRole('button', { name: 'Workspace', exact: true })
+    await expect(title).toBeVisible()
+
+    // 200% browser zoom on a supported 1440x900 display
+    await page.setViewportSize({ width: 720, height: 450 })
+    const clipped = await title.evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      let node: Element | null = element.parentElement
+      while (node) {
+        const parent = node.getBoundingClientRect()
+        if (getComputedStyle(node).overflowX !== 'visible' && box.right > parent.right + 0.5) return true
+        node = node.parentElement
+      }
+      return element.scrollWidth > element.clientWidth + 0.5
+    })
+    expect(clipped, 'the Workspace title is cut off by an overflow ancestor').toBe(false)
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
