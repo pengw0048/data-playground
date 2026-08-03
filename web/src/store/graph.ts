@@ -1353,6 +1353,7 @@ interface Store {
   prepareWrite: (id: string) => Promise<WriteAdmission | undefined>
   run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
   rerunAll: () => void
+  cancelGraphRun: () => Promise<void>
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
   prepareFullProfile: (id: string, portId?: string) => Promise<void>
@@ -3441,6 +3442,17 @@ export const useStore = create<Store>((set, get) => ({
         'error',
       )
     }
+  },
+
+  cancelGraphRun: async () => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const current = get().graphRun
+    if (!current?.runId) return
+    await api.cancelRun(current.runId).catch(() => {})
+    if (get().graphRun?.runId !== current.runId) return
+    _polling.delete(current.runId)
+    set({ graphRun: null })
+    settleAnimatingNodes(set)
   },
 
   cancelRun: async (id) => {

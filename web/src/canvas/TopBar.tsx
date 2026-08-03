@@ -54,6 +54,7 @@ export function TopBar() {
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const rerunAll = useStore((s) => s.rerunAll)
+  const cancelGraphRun = useStore((s) => s.cancelGraphRun)
   const graphRun = useStore((s) => s.graphRun)
   const graphProgress = rerunAllProgress(graphRun)
   // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
@@ -162,12 +163,19 @@ export function TopBar() {
           <PeerAvatars />
           <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
           <span className="relative">
-            <Button onClick={rerunAll} disabled={!canEdit || !kernelUp || !!graphRun} title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running' : graphRun ? 'Re-running the whole graph' : 'Re-run the whole graph'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
-              {graphRun
-                ? <><span className="dp-running-glyph">●</span> Running {graphProgress.done}/{graphProgress.total}</>
+            <Button onClick={() => graphRun ? void cancelGraphRun() : rerunAll}
+              disabled={!canEdit || !kernelUp || (!!graphRun && !graphRun.runId)}
+              title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline — reconnect before running'
+                : graphRun?.runId ? 'Stop the whole-graph run'
+                  : graphRun ? 'Starting the whole-graph run' : 'Re-run the whole graph'}
+              size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
+              {graphRun?.runId
+                ? <><Icon name="stop" size={12} /> Stop {graphProgress.done}/{graphProgress.total}</>
+                : graphRun
+                  ? <><span className="dp-running-glyph">●</span> Starting…</>
                 : <><Icon name="refresh" size={13} /> Rerun all</>}
             </Button>
-            {graphRun && (
+            {graphRun?.status && (
               <span className="absolute -bottom-2 left-1 right-1 block">
                 <ProgressBar value={graphProgress.value}
                   label={`Re-running the whole graph — ${graphProgress.done} of ${graphProgress.total} steps done`} />

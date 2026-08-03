@@ -1725,6 +1725,29 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts).toHaveLength(0)
   })
 
+  it('lets the user stop the single whole-graph run', async () => {
+    const doc = fanOutDoc(2)
+    useStore.setState({
+      doc, graphRun: {
+        canvasId: doc.id, runId: 'graph-run', status: {
+          runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+          rowsProcessed: 0, ms: 4, placement: 'local', progress: 0.5,
+          perNode: [
+            { nodeId: 'source', status: 'done' },
+            { nodeId: 'sink0', status: 'running' },
+            { nodeId: 'sink1', status: 'queued' },
+          ], outputs: [],
+        },
+      },
+    })
+
+    await useStore.getState().cancelGraphRun()
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith('graph-run')
+    expect(useStore.getState().graphRun).toBeNull()
+    expect(useStore.getState().doc.nodes.some((node) => node.data.status === 'running')).toBe(false)
+  })
+
   it('keeps rerun all on per-sink dispatch when a sink publishes a Write', async () => {
     const doc = fanOutDoc(2)
     doc.nodes.push(NODE('publish', 'write'))
