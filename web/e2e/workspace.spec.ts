@@ -69,12 +69,12 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       const submit = page.getByRole('button', { name: 'Search Workspace' })
 
       await search.fill(canvasName)
-      await expect(page.getByRole('status')).toHaveText(`Select Search to look for “${canvasName}”.`)
+      await expect(page.getByRole('status').filter({ hasText: `Select Search to look for “${canvasName}”.` })).toHaveCount(1)
       await submit.click()
       await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
 
       await search.fill('zzzz-no-match')
-      await expect(page.getByRole('status')).toHaveText(`Results are still for “${canvasName}”. Select Search to update.`)
+      await expect(page.getByRole('status').filter({ hasText: `Results are still for “${canvasName}”. Select Search to update.` })).toHaveCount(1)
       await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
       await submit.click()
 
