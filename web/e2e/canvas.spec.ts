@@ -1017,6 +1017,21 @@ test.describe('Data Playground canvas', () => {
     await expect(run).toHaveAttribute('aria-disabled', 'true')
   })
 
+  test('an auto-connected node says the source needs a dataset, not that it needs a source', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    // the toolbar connects the new node to the selected one, so this filter has an upstream source
+    await addNode(page, 'Shape', 'filter')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect.poll(async () => page.locator('.react-flow__edge').count()).toBe(1)
+
+    await expect(page.getByRole('button', { name: 'Connect a source to run' })).toHaveCount(0)
+    const run = page.getByRole('button', { name: /^Choose a dataset in / }).last()
+    await expect(run).toBeAttached()
+    await expect(run).toHaveAttribute('aria-disabled', 'true')
+  })
+
   test('there is no Save button — the canvas auto-saves', async ({ page }) => {
     await page.goto('/')
     await expect(page.getByRole('button', { name: /^save/i })).toHaveCount(0)

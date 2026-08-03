@@ -21,7 +21,7 @@ import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useInputColumns, useSchemaWarnings } from './fields'
 import {
-  useStore, nodeRunnable, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite, type PanelKind,
+  useStore, nodeRunnable, unsetSourceReason, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite, type PanelKind,
 } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -52,6 +52,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  const blocked = useStore((s) => unsetSourceReason(s.doc, id))
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, id))
   const configuredManagedSidecarMerge = useStore((s) => hasConfiguredManagedSidecarMerge(s.doc, id))
   const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, id))
@@ -250,7 +251,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
                 ? `Hub offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
                 : invalid ?? (runnable
                     ? kind === 'chart' ? 'View chart result' : 'View data'
-                    : `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`)}
+                    : blocked ?? `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`)}
             active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
             onClick={() => (openPanel === 'data'
               ? closePanel(id)
@@ -262,7 +263,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={!kernelUp ? 'Hub offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
+              label={!kernelUp ? 'Hub offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? blocked ?? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
               disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}

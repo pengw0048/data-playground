@@ -172,6 +172,29 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
   return walk(id)
 }
 
+/** Names the upstream source still missing a dataset — the usual reason a connected node cannot run. */
+export function unsetSourceReason(doc: CanvasDoc, id: string): string | null {
+  if (nodeRunnable(doc, id)) return null
+  const seen = new Set<string>()
+  const unset: string[] = []
+  const walk = (nid: string) => {
+    if (seen.has(nid)) return
+    seen.add(nid)
+    const node = doc.nodes.find((item) => item.id === nid)
+    if (!node) return
+    if (node.type === 'source') {
+      if (!node.data.config.uri) unset.push(node.data.title || 'the source')
+      return
+    }
+    for (const edge of doc.edges.filter((item) => item.target === nid)) walk(edge.source)
+  }
+  walk(id)
+  if (!unset.length) return null
+  return unset.length === 1
+    ? `Choose a dataset in “${unset[0]}”`
+    : `Choose a dataset in ${unset.length} upstream sources`
+}
+
 /**
  * Column merges have a separate certified admission protocol.  Keeping this predicate next to
  * the generic run entry points prevents alternate UI affordances (node play, inspector play, or
