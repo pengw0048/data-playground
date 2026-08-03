@@ -1033,6 +1033,9 @@
           "mean": {
             "anyOf": [
               {
+                "type": "string"
+              },
+              {
                 "type": "number"
               },
               {

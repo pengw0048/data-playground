@@ -314,6 +314,22 @@ describe('durable full results', () => {
     expect(screen.queryByRole('menuitem', { name: /current page/i })).not.toBeInTheDocument()
   })
 
+  it('renders non-finite numbers as themselves rather than as the NULL marker', async () => {
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [{ name: 'ratio', type: 'float', capabilities: [] }],
+      rows: [{ ratio: 1.5 }, { ratio: 'Infinity' }, { ratio: '-Infinity' }, { ratio: 'NaN' },
+             { ratio: null }],
+      rowCount: 5, hasMore: false, truncated: false, completeness: 'complete',
+    })
+
+    render(<FullResult uri="/outputs/nonfinite.parquet" total={5} {...fullIdentity} />)
+
+    expect(await screen.findByText('Infinity')).toBeInTheDocument()
+    expect(screen.getByText('-Infinity')).toBeInTheDocument()
+    expect(screen.getByText('NaN')).toBeInTheDocument()
+    expect(screen.getAllByText('·')).toHaveLength(1)  // only the one genuinely missing value
+  })
+
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
     apiMock.listRuns.mockResolvedValue([{
       id: 'partial-history', runId: 'partial-run', status: 'failed', targetNodeId: 'target', rows: null,

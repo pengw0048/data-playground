@@ -1866,7 +1866,8 @@ class ColumnProfile(Wire):
     )
     min: str | None = None         # stringified (numeric / temporal / text); None if not applicable
     max: str | None = None
-    mean: float | None = None      # numeric columns only
+    # numeric columns only; a non-finite mean is the token string "NaN"/"Infinity"/"-Infinity"
+    mean: str | float | None = None
 
     @model_validator(mode="after")
     def _distinct_shape(self) -> "ColumnProfile":

@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from hub import db, graph as g
-from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names
+from hub.executors.engine import BuildEngine, NotPreviewable, _dedupe_names, json_float
 from hub.executors.preview import (
     _CODE_CELL_KINDS, PREVIEW_BUDGET_S, PREVIEW_SCAN, _reservoir_preview_allowed,
 )
@@ -67,6 +67,11 @@ def _reservoir_profile_allowed(graph: Graph, node_id: str, resolve_adapter) -> b
     return True
 
 
+def _extreme_text(value) -> str:
+    """min/max as text, with non-finite floats spelled the way the wire spells them."""
+    return str(json_float(value) if isinstance(value, float) else value)
+
+
 def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
     """null/distinct/min/max/mean for one column, guarding types that don't support each op."""
     non_null = pc.count(arr).as_py()  # counts only valid (non-null) by default
@@ -82,13 +87,14 @@ def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
         try:
             mm = pc.min_max(arr)
             lo, hi = mm["min"].as_py(), mm["max"].as_py()
-            out["min"] = None if lo is None else str(lo)
-            out["max"] = None if hi is None else str(hi)
+            out["min"] = None if lo is None else _extreme_text(lo)
+            out["max"] = None if hi is None else _extreme_text(hi)
         except Exception:  # noqa: BLE001
             pass
     if numeric:
         try:
-            out["mean"] = pc.mean(arr).as_py()
+            mean = pc.mean(arr).as_py()
+            out["mean"] = None if mean is None else json_float(mean)
         except Exception:  # noqa: BLE001
             pass
     return out
@@ -133,10 +139,10 @@ def _full_stats(
             prof["distinct_is_approximate"] = True
         if has_mm:
             lo, hi = d.get(f"c{i}_mn"), d.get(f"c{i}_mx")
-            prof["min"] = None if lo is None else str(lo)
-            prof["max"] = None if hi is None else str(hi)
+            prof["min"] = None if lo is None else _extreme_text(lo)
+            prof["max"] = None if hi is None else _extreme_text(hi)
         if numeric and d.get(f"c{i}_av") is not None:
-            prof["mean"] = float(d[f"c{i}_av"])
+            prof["mean"] = json_float(float(d[f"c{i}_av"]))
         cols.append(ColumnProfile(name=name, type=display_type(str(t)), **prof))
     return ProfileResult(columns=cols, row_count=n, sampled=False, completeness="complete")
 

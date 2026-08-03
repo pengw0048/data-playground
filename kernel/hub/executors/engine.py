@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
@@ -2013,6 +2014,25 @@ def _conform(tbl: "pa.Table", schema: "pa.Schema", node) -> "pa.Table":
                              f"safely reconciled ({detail or e}); a transform must emit one schema") from e
 
 
+def json_float(value: float) -> float | str:
+    """A float on the wire: JSON has no number form for the non-finite ones, so ship the exact token
+    (`Infinity` / `-Infinity` / `NaN`) rather than a null that reads as missing data."""
+    if math.isfinite(value):
+        return value
+    return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+
+
+def _json_floats(value):
+    """json_float over every float in a cell, including inside a list/struct column."""
+    if isinstance(value, float):
+        return json_float(value)
+    if isinstance(value, list):
+        return [_json_floats(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_floats(v) for k, v in value.items()}
+    return value
+
+
 def _table_to_rows(table_or_rows) -> list[dict]:
     import decimal
     rows = table_or_rows if isinstance(table_or_rows, list) else table_or_rows.to_pylist()
@@ -2028,6 +2048,8 @@ def _table_to_rows(table_or_rows) -> list[dict]:
                 r[k] = f"<{len(v)} bytes>"
             elif hasattr(v, "isoformat"):
                 r[k] = v.isoformat()
+            elif isinstance(v, (float, list, dict)):
+                r[k] = _json_floats(v)
     return rows
 
 
