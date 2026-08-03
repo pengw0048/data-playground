@@ -3265,7 +3265,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                     "schema drift confirmation requires the displayed write admission")
             if admission.managed and admission.intent is not None:
                 effective_write_intent = admission.intent
-                bound_unsubmitted_write = True
+                readiness = admission.exact_run_readiness
+                if (unadmitted_write_target == target_node_id
+                        and operational_canvas is not None
+                        and readiness is not None and readiness.ready):
+                    # A caller with no submission identity adopts the minted one and publishes
+                    # through the same durable owner a browser Run uses.
+                    write_admission = admission
+                    submission_id = unsubmitted_write_admission_id
+                else:
+                    bound_unsubmitted_write = True
                 _inject_write_intent(graph, unadmitted_write_target, admission.intent)
                 _inject_write_intent(durable_graph, unadmitted_write_target, admission.intent)
             _preflight_write_target_destination(
