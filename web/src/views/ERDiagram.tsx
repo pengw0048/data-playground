@@ -522,8 +522,8 @@ export function ERDiagram() {
   const visibleFocus = mode === 'lineage' && lineageFocus?.requested === focus
     ? lineageFocus.canonical : focus
   const focusName = tables.find((t) => t.uri === visibleFocus)?.name
-    ?? (focusedTable?.uri === visibleFocus ? focusedTable.name : undefined)
-    ?? (mode === 'lineage' ? 'Current dataset' : visibleFocus?.split('/').slice(-1)[0])
+    ?? focusedTable?.name
+    ?? 'Current dataset'
   useEffect(() => {
     if (focusResolving || focusResolutionError) {
       setLoading(focusResolving)
@@ -560,6 +560,10 @@ export function ERDiagram() {
                 columns: [],
                 missing: true,
               } satisfies CatalogTable))
+            const lineageRootTable = lineageTables.find((table) => table.uri === lin.rootUri)
+            // Keep the provider's human label and a usable card even when optional Workspace
+            // enrichment failed or the lineage service canonicalized the root to another URI.
+            if (lineageRootTable) setFocusedTable((current) => current ?? lineageRootTable)
             setTables(lineageTables); setTotal(lineageTables.length); setLinEdges(lin.edges)
             setLineageFocus({ requested: focus, canonical: lin.rootUri })
           } else {
@@ -569,9 +573,12 @@ export function ERDiagram() {
             // A connected-source dataset can have a stable relationship focus without being
             // registered in the local Catalog. Preserve the already-resolved dataset card and its
             // human name instead of replacing the graph with an opaque provider identity.
-            const relationshipTables = focusedTable?.uri === focus
+            const relationshipFocusTable = focusedTable
+              ? { ...focusedTable, uri: focus }
+              : null
+            const relationshipTables = relationshipFocusTable
               && !page.items.some((table) => table.uri === focus)
-              ? [focusedTable, ...page.items]
+              ? [relationshipFocusTable, ...page.items]
               : page.items
             setTables(relationshipTables); setTotal(relationshipTables.length); setLinEdges([]); setLineageFocus(null)
           }

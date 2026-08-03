@@ -250,20 +250,16 @@ describe('ERDiagram request truth', () => {
   it('keeps a connected-source focus human-readable when switching to ER', async () => {
     const providerDatasetId = 'dataset:external.raw-video'
     const providerUri = `workspace-provider:${'a'.repeat(64)}`
+    const canonicalLineageUri = `workspace-provider-lineage:${'b'.repeat(64)}`
+    store.erFocusUri = providerUri
     store.erFocusDatasetId = providerDatasetId
     store.erMode = 'lineage'
-    mocks.workspaceResource.mockResolvedValue({
-      resource: { id: providerDatasetId, kind: 'dataset', name: 'raw_video_v2' },
-      ancestors: [],
-      source: { id: 'luma-staging', kind: 'provider', completeness: 'complete' },
-    })
-    mocks.workspaceCanonicalDataset.mockResolvedValue({
-      sourceUri: providerUri,
-      columns: [{ name: 'id', type: 'binary', capabilities: [] }],
-    })
+    // Real provider navigation already has a runtime URI. Optional Workspace enrichment may fail,
+    // and lineage can still canonicalize that URI to a different graph root.
+    mocks.workspaceResource.mockRejectedValue(new Error('provider details timed out'))
     mocks.lineage.mockResolvedValue({
-      rootUri: providerUri,
-      nodes: [{ id: 'provider-root', name: 'raw_video_v2', uri: providerUri, kind: 'table' }],
+      rootUri: canonicalLineageUri,
+      nodes: [{ id: 'provider-root', name: 'raw_video_v2', uri: canonicalLineageUri, kind: 'table' }],
       edges: [],
     })
     mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
@@ -273,7 +269,7 @@ describe('ERDiagram request truth', () => {
     fireEvent.click(screen.getByTestId('er-mode-joins'))
 
     expect(await within(screen.getByTestId('er-focus-bar')).findByText('Focused: raw_video_v2')).toBeInTheDocument()
-    expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveTextContent('raw_video_v2')
+    expect(screen.getByTestId(`node-lineage:${canonicalLineageUri}`)).toHaveTextContent('raw_video_v2')
     expect(screen.queryByText(providerUri)).toBeNull()
   })
 
