@@ -32,7 +32,7 @@ export const color = {
   // WireEdge) and in alpha-concatenated strings (shadow.focus), where var() does NOT resolve.
   wire: '#9b9b9b',
   wireActive: '#0099ff',
-  focus: '#0099ff',
+  focus: '#007acc',
 } as const
 
 // Muted node colors remain for the minimap and wire-scale overview only. Normal UI chrome uses
