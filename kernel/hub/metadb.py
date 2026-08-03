@@ -11247,6 +11247,28 @@ def _utc_datetime(value: datetime.datetime) -> datetime.datetime:
         datetime.timezone.utc)
 
 
+def _run_record_submission_times(s, records: list[RunRecord]) -> dict[str, datetime.datetime]:
+    """Resolve the same admission order used by the Canvas current-result projection."""
+    run_ids = sorted({str(record.run_id) for record in records if record.run_id})
+    if not run_ids:
+        return {}
+    times = {
+        str(run_id): created_at
+        for run_id, created_at in s.execute(select(
+            RunInputAdmission.run_id, RunInputAdmission.created_at,
+        ).where(RunInputAdmission.run_id.in_(run_ids)))
+    }
+    missing = [run_id for run_id in run_ids if run_id not in times]
+    if missing:
+        times.update({
+            str(run_id): created_at
+            for run_id, created_at in s.execute(select(
+                RunState.run_id, RunState.created_at,
+            ).where(RunState.run_id.in_(missing)))
+        })
+    return times
+
+
 def _canvas_result_history_records(
         s, canvas: Canvas) -> tuple[list[RunRecord], set[str]]:
     """Lock bounded Jobs history and choose the result owners allowed by this Canvas policy."""
@@ -11265,24 +11287,45 @@ def _canvas_result_history_records(
     if policy.history != "recent":
         return records, retained
     cutoff = _utc_datetime(_db_now(s)) - datetime.timedelta(days=policy.max_age_days)
-    eligible = sorted(
-        (
-            record for record in records
-            if record.job_type == "run"
-            and record.status == "done"
-            and record.target_node_id is not None
-            and record.outputs != "[]"
-            and _utc_datetime(record.created_at) >= cutoff
-        ),
-        key=lambda record: (
-            str(record.target_node_id),
-            -_utc_datetime(record.created_at).timestamp(),
-            record.id,
-        ),
-    )
+    eligible = [
+        record for record in records
+        if record.job_type == "run"
+        and record.status == "done"
+        and record.target_node_id is not None
+        and record.outputs != "[]"
+        and _utc_datetime(record.created_at) >= cutoff
+    ]
+    submission_times = _run_record_submission_times(s, eligible)
+    eligible.sort(key=lambda record: (
+        _utc_datetime(submission_times.get(
+            str(record.run_id), record.created_at)),
+        str(record.run_id or record.id),
+    ), reverse=True)
+    latest_by_target = {
+        str(target): str(run_id)
+        for target, run_id in s.execute(select(
+            CanvasResultLatest.target_node_id,
+            CanvasResultLatest.result_run_id,
+        ).where(
+            CanvasResultLatest.canvas_id == canvas.id,
+            CanvasResultLatest.result_run_id.is_not(None),
+        ))
+    }
+    eligible_by_run = {
+        str(record.run_id): record for record in eligible if record.run_id
+    }
     per_target: dict[str, int] = {}
+    # The Canvas-lifetime latest owner is one of the configured N distinct
+    # versions even when its bounded RunRecord is absent or older than the age cutoff.
+    for target, run_id in latest_by_target.items():
+        per_target[target] = 1
+        latest_record = eligible_by_run.get(run_id)
+        if latest_record is not None:
+            retained.add(latest_record.id)
     for record in eligible:
         target = str(record.target_node_id)
+        if record.id in retained:
+            continue
         count = per_target.get(target, 0)
         if count >= policy.max_versions:
             continue
@@ -11321,28 +11364,74 @@ def _run_record_output_owner_ids(s, records: list[RunRecord]) -> set[str]:
     return owned
 
 
-def _release_run_record_result_owners(s, records: list[RunRecord]) -> int:
-    """Release only historical outputs; exact run inputs remain owned by their RunRecord."""
-    if not records:
-        return 0
-    for record in records:
-        _replace_attempt_refs(s, "run_record", record.id, {})
-    for record in records:
-        sync_local_result_owner(
-            s, "run_record", record.id,
-            {"outputs": []}, record.input_manifest, record.profile,
-        )
-    return len(records)
+def _run_record_result_doc(record: RunRecord) -> dict[str, list[dict]]:
+    try:
+        outputs = json.loads(record.outputs)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("run history output metadata is invalid") from exc
+    if not isinstance(outputs, list):
+        raise RuntimeError("run history outputs must be a list")
+    return {"outputs": outputs}
+
+
+def _run_record_result_is_available(s, record: RunRecord) -> bool:
+    """Return whether a released history owner can safely adopt its exact outputs again."""
+    refs = _result_doc_refs(_run_record_result_doc(record))
+    if not refs:
+        return False
+    for uri in refs.values():
+        local_uri = _local_result_candidate(uri)
+        if local_uri is not None:
+            artifact = s.get(LocalResultArtifact, local_uri)
+            if (artifact is None or artifact.state != "ready"
+                    or artifact.writer_run_id is not None or artifact.writer_token is not None):
+                return False
+            continue
+        if object_attempt_uri_shape(uri):
+            attempt = s.get(ObjectAttempt, uri)
+            if attempt is None or attempt.state != "published":
+                return False
+            continue
+        # An unmanaged external URI has no lifecycle owner that this policy can restore.
+        return False
+    return True
 
 
 def _reconcile_canvas_result_history_in_session(s, canvas: Canvas) -> int:
     records, retained = _canvas_result_history_records(s, canvas)
     output_owners = _run_record_output_owner_ids(s, records)
+    restore = [
+        record for record in records
+        if record.id in retained
+        and record.id not in output_owners
+        and _run_record_result_is_available(s, record)
+    ]
     release = [
         record for record in records
         if record.id in output_owners and record.id not in retained
     ]
-    return _release_run_record_result_owners(s, release)
+    restore_docs = {
+        record.id: _run_record_result_doc(record) for record in restore
+    }
+    # Preserve the global object-attempt -> ref -> local-registry lock order.
+    for record in restore:
+        _replace_attempt_refs(
+            s, "run_record", record.id,
+            _result_doc_refs(restore_docs[record.id]),
+        )
+    for record in release:
+        _replace_attempt_refs(s, "run_record", record.id, {})
+    for record in restore:
+        sync_local_result_owner(
+            s, "run_record", record.id, restore_docs[record.id],
+            record.input_manifest, record.profile,
+        )
+    for record in release:
+        sync_local_result_owner(
+            s, "run_record", record.id,
+            {"outputs": []}, record.input_manifest, record.profile,
+        )
+    return len(release)
 
 
 def reconcile_canvas_result_history(canvas_id: str) -> int:
@@ -11488,11 +11577,27 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         and record.id in output_owner_ids
         and record.id not in retained_record_ids
     ]
+    retention_restore = [
+        record for record in history_records
+        if record.id != rid
+        and record.id not in stale_ids
+        and record.id in retained_record_ids
+        and record.id not in output_owner_ids
+        and _run_record_result_is_available(s, record)
+    ]
+    retention_restore_docs = {
+        record.id: _run_record_result_doc(record) for record in retention_restore
+    }
     history_artifact_doc = {
         "outputs": output_docs if rid in retained_record_ids else [],
     }
     _replace_attempt_refs(
         s, "run_record", rid, _result_doc_refs(history_artifact_doc))
+    for obj in retention_restore:
+        _replace_attempt_refs(
+            s, "run_record", obj.id,
+            _result_doc_refs(retention_restore_docs[obj.id]),
+        )
     for obj in retention_release:
         _replace_attempt_refs(s, "run_record", obj.id, {})
     stale_execution_manifests = {
@@ -11512,6 +11617,11 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         _lock_local_result_registry(s)
     sync_local_result_owner(
         s, "run_record", rid, history_artifact_doc, rec.input_manifest, rec.profile)
+    for obj in retention_restore:
+        sync_local_result_owner(
+            s, "run_record", obj.id, retention_restore_docs[obj.id],
+            obj.input_manifest, obj.profile,
+        )
     for obj in retention_release:
         sync_local_result_owner(
             s, "run_record", obj.id,
