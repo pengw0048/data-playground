@@ -1936,6 +1936,26 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().graphRefusals).toEqual({})
   })
 
+  it('clears stale graph refusals in the edited node cone', () => {
+    const source = NODE('source')
+    const target = NODE('target', 'filter')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+        edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+      },
+      graphRefusals: {
+        source: 'This step is not ready to run',
+        target: 'This step is not ready to run',
+        unrelated: 'Connect an input',
+      },
+    })
+
+    useStore.getState().updateConfig('source', { uri: '/data/events.parquet' })
+
+    expect(useStore.getState().graphRefusals).toEqual({ unrelated: 'Connect an input' })
+  })
+
   it.each([
     ['a', 'left'],
     ['b', 'right'],

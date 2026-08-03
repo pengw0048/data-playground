@@ -1979,6 +1979,9 @@ function mutateNodeConfig(
     const sizes = Object.fromEntries(
       Object.entries(s.sizes).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
     )
+    const graphRefusals = Object.fromEntries(
+      Object.entries(s.graphRefusals).filter(([nodeId]) => nodeId !== id && !stale.has(nodeId)),
+    )
     // A Source picker registration changes the durable catalog identity even when its URI stays
     // the same. Drop only a previously blocked exact-readiness estimate in the affected cone so
     // the next Run re-estimates against the new registration instead of caching the old refusal.
@@ -1994,7 +1997,7 @@ function mutateNodeConfig(
         }
       }
     }
-    return { doc: { ...s.doc, nodes, edges }, runs, sizes }
+    return { doc: { ...s.doc, nodes, edges }, runs, sizes, graphRefusals }
   })
 }
 

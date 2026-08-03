@@ -173,14 +173,14 @@ export function NodeCard({ id, data, children, metaOverride }: {
             </div>
 
             {/* the kernel refused this branch; the run button is already blocked, say why */}
-            {refused && !off && (
+            {refused && !invalid && !off && (
               <div data-testid="node-graph-refusal" className="mt-0.5 truncate text-[10.5px] text-destructive" title={refused}>
                 ⚠ {refused}
               </div>
             )}
 
             {/* soft schema cue: config points at a column not in the input (never blocks a run) */}
-            {!refused && kind === 'filter' && invalid && !off && (
+            {kind === 'filter' && invalid && !off && (
               <div className="mt-0.5 truncate text-[10.5px] text-amber-700 dark:text-amber-300" title={invalid}>
                 ⚠ {invalid}
               </div>

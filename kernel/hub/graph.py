@@ -456,6 +456,10 @@ def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
     """
     errors: list[str] = []
     for node in graph.nodes:
+        # Section children are templates. Their required parameters are supplied by run(...)
+        # inside the parent Section script, so the durable child config may intentionally be empty.
+        if node.parent_id is not None:
+            continue
         spec = node_specs.get(node.type)
         if spec is None:
             continue
@@ -465,16 +469,21 @@ def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
         for param in getattr(spec, "params", []):
             param_type = getattr(param, "type", None)
             required = getattr(param, "required", False)
+            # The acceptance guard added here is deliberately scoped to Filter. Historically the
+            # descriptor schema used ``required`` as an editor hint for several operations whose
+            # preview refusal or runtime supplies a more useful contract; enforcing every string
+            # descriptor here would change those established execution semantics.
+            required_filter_predicate = (
+                node.type == "filter" and param.name == "predicate" and required)
             if param.name not in config or config[param.name] is None:
-                if required and getattr(param, "default", None) is None:
+                if ((param_type in ("int", "float") and required
+                     and getattr(param, "default", None) is None)
+                        or required_filter_predicate):
                     errors.append(f"node '{node.id}' parameter '{param.name}' is required")
                 continue
             value = config[param.name]
-            if (required and param_type in ("string", "text", "code", "select")
+            if (required_filter_predicate
                     and (not isinstance(value, str) or not value.strip())):
-                errors.append(f"node '{node.id}' parameter '{param.name}' is required")
-                continue
-            if required and param_type == "columns" and not value:
                 errors.append(f"node '{node.id}' parameter '{param.name}' is required")
                 continue
             if param_type == "int" and (type(value) is not int or not -(2**53 - 1) <= value <= 2**53 - 1):
