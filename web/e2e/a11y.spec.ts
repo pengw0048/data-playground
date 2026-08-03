@@ -320,6 +320,24 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(name).toBe('Edge from source to filter')
   })
 
+  test('a prefilled name dialog replaces its suggestion instead of appending to it', async ({ page }) => {
+    await fresh(page)
+    await backToWorkspace(page)
+    await page.getByRole('button', { name: 'Create canvas' }).first().click()
+    const dialog = page.getByRole('dialog', { name: 'Create canvas' })
+    await expect(dialog).toBeVisible()
+
+    const name = dialog.getByRole('textbox')
+    await expect(name).toHaveValue('untitled')
+    await page.keyboard.type('Quarterly revenue')
+    await expect(name).toHaveValue('Quarterly revenue')
+
+    await dialog.getByRole('button', { name: 'Cancel' }).focus()
+    await name.focus()
+    await page.keyboard.type(' v2')
+    await expect(name).toHaveValue('Quarterly revenue v2')
+  })
+
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     // Build the target Canvas via the API so this test stays focused on Workspace keyboard behavior.
     await page.goto('/')
