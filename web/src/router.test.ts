@@ -292,7 +292,7 @@ describe('Workspace routes', () => {
     window.location.hash = routeHash(
       'canvas', 'file-key-1', undefined, undefined, undefined, 'node-1',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
-      '销售分析 Draft',
+      undefined, '销售分析 Draft',
     )
     expect(window.location.hash).toBe(
       `#/canvas/file-key-1/${encodeURIComponent('销售分析-Draft')}?node=node-1`,
@@ -312,7 +312,8 @@ describe('Workspace routes', () => {
 
   it('omits the slug for untitled canvases and keeps share links keyed by file identity', () => {
     expect(routeHash('canvas', 'id-1', undefined, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'untitled'))
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, 'untitled'))
       .toBe('#/canvas/id-1')
     expect(canvasLink('id-1', 'Purchases per user')).toBe(
       `${location.origin}${location.pathname}#/canvas/id-1/Purchases-per-user`,
