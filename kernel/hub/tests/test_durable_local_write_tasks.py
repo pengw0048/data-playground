@@ -1294,7 +1294,7 @@ def test_kernel_default_admits_and_publishes_managed_create(tmp_path, monkeypatc
     monkeypatch.setattr(runs, "get_deps", lambda: deps)
     recovered = runs.recover_canvas_results(
         runs.CanvasResultRecoveryRequest(graph=graph), uid)
-    assert recovered.latest_node_ids == ["source", "write"]
+    assert recovered.latest_node_ids == ["write"]
     assert recovered.failed_node_ids == []
 
     metadb.delete_canvas_cascade(str(graph.id))
