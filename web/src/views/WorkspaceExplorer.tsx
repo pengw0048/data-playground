@@ -697,9 +697,6 @@ function WorkspaceMixedExplorer() {
         setQueryCapabilities(page.queryCapabilities ?? {
           sort: [], kindFilter: true, reason: 'Favorites are ordered by when you starred them.',
         })
-        if (kindFilter !== 'all' && kindFilter !== 'canvas' && kindFilter !== 'dataset') {
-          setKindFilter('all')
-        }
         const shelf = page.container ?? FAVORITES_BREADCRUMB
         setContainerId(identity(shelf))
         loadedContainer.current = identity(shelf)
@@ -1307,7 +1304,11 @@ function WorkspaceMixedExplorer() {
       {!searchQuery && !loading && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
         <button type="button" aria-pressed={favoritesOnly} data-testid="workspace-favorites-filter"
           onClick={() => {
-            setFavoritesOnly((current) => !current)
+            const nextFavoritesOnly = !favoritesOnly
+            setFavoritesOnly(nextFavoritesOnly)
+            if (nextFavoritesOnly && kindFilter !== 'all' && kindFilter !== 'canvas' && kindFilter !== 'dataset') {
+              commitBrowseState({ kindFilter: 'all' })
+            }
             setSelectedResourceIds(new Set())
             setWorkspaceSearchQuery('')
             setSearchDraft('')

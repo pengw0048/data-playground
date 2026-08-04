@@ -768,8 +768,8 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
-        "0053_workspace_favorites.py": (
-            "921413722913675978560b27b47684b594cde7bc54c219e8869749920fab1e6e"
+        "0054_workspace_favorites.py": (
+            "31fa22cdc3ff04a428bdb738b7414601ffbf79755ca38b8007309142fdee87a1"
         ),
         "0052_rejected_run_owner.py": (
             "34c3fa6e540e8c6d49565d9bbdd72d8dab8e736ee9836a90e520752f4f07bd65"

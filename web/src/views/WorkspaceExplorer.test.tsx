@@ -2740,4 +2740,20 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByRole('button', { name: 'Open dataset observations' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Open canvas Analysis' })).toBeNull()
   })
+
+  it('clears a folder-only type filter when opening Favorites', async () => {
+    store.workspaceBrowseQuery = 'wq=1&sort=name&order=asc&kind=container&view=grid'
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByTestId('workspace-favorites-filter'))
+
+    await waitFor(() => expect(mocks.workspaceFavorites).toHaveBeenCalled())
+    expect(store.setWorkspaceBrowseQuery).toHaveBeenCalledWith('wq=1&sort=name&order=asc&view=grid')
+    expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toHaveValue('all')
+  })
 })
