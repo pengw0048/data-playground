@@ -3,6 +3,10 @@
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation, type NavigationToken } from './navigationOwnership'
+import {
+  extractWorkspaceBrowseQuery,
+  WORKSPACE_BROWSE_QUERY_KEYS,
+} from './workspaceBrowseQuery'
 
 export type RelationshipsMode = 'joins' | 'lineage'
 
@@ -11,6 +15,7 @@ export interface RelationshipsReturn {
   scope: 'all' | 'datasets'
   workspaceQuery?: string
   datasetQuery?: string
+  browseQuery?: string
 }
 
 export interface RelationshipsContext {
@@ -27,6 +32,7 @@ export interface Route {
   workspaceQuery?: string
   workspaceScope?: 'all' | 'datasets'
   workspaceDatasetQuery?: string
+  workspaceBrowseQuery?: string
   jobsQuery?: string
   inboxQuery?: string
   transformId?: string
@@ -85,6 +91,32 @@ function datasetRouteQuery(query: string | undefined, scope: 'all' | 'datasets')
   return safe.toString() || undefined
 }
 
+function browseParamsNeedCanonicalization(params: URLSearchParams): boolean {
+  const raw = new URLSearchParams()
+  for (const key of WORKSPACE_BROWSE_QUERY_KEYS) {
+    const values = params.getAll(key)
+    if (values.length > 1) return true
+    if (values[0] != null && values[0] !== '') raw.set(key, values[0])
+  }
+  if (![...raw.keys()].length) return false
+  const normalized = extractWorkspaceBrowseQuery(raw)
+  const norm = new URLSearchParams(normalized)
+  if ([...raw.keys()].length !== [...norm.keys()].length) return true
+  for (const key of raw.keys()) {
+    if (raw.get(key) !== norm.get(key)) return true
+  }
+  return false
+}
+
+function mergeBrowseParams(target: URLSearchParams, browseQuery: string | undefined): void {
+  if (!browseQuery) return
+  const browse = new URLSearchParams(browseQuery)
+  for (const key of WORKSPACE_BROWSE_QUERY_KEYS) {
+    const value = browse.get(key)
+    if (value) target.set(key, value)
+  }
+}
+
 export function parseDatasetViewerReturn(query: string): ParsedDatasetViewerReturn | undefined {
   const params = new URLSearchParams(query)
   const canvasId = params.get('returnCanvas') || undefined
@@ -127,13 +159,25 @@ export function parseHash(): Route {
       if (value) datasetParams.set(key, value)
     }
     const workspaceDatasetQuery = datasetParams.toString() || undefined
-    return {
+    const workspaceBrowseQuery = workspaceScope === 'all'
+      ? extractWorkspaceBrowseQuery(params) || undefined
+      : undefined
+    const route: Route = {
       view: 'workspace',
       workspaceResourceId: decodedId,
       ...(workspaceScope === 'datasets' ? { workspaceScope } : {}),
       ...(workspaceDatasetQuery ? { workspaceDatasetQuery } : {}),
+      ...(workspaceBrowseQuery ? { workspaceBrowseQuery } : {}),
       ...(workspaceScope === 'all' && workspaceQuery ? { workspaceQuery } : {}),
     }
+    if (workspaceScope === 'all' && browseParamsNeedCanonicalization(params)) {
+      route.canonicalHash = routeHash(
+        'workspace', undefined, decodedId, workspaceQuery, undefined, undefined, undefined,
+        undefined, workspaceDatasetQuery, undefined, undefined, undefined, undefined, undefined,
+        workspaceBrowseQuery,
+      )
+    }
+    return route
   }
   // Recents and Tables are intentionally redirected to the single local Workspace explorer.
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
@@ -172,12 +216,16 @@ export function parseHash(): Route {
     const resourceId = params.get('returnResource') || undefined
     const scope = params.get('returnScope') === 'datasets' ? 'datasets' : 'all'
     const datasetQuery = datasetRouteQuery(params.get('returnQuery') || undefined, scope)
+    const browseQuery = scope === 'all'
+      ? extractWorkspaceBrowseQuery(params.get('returnBrowse') || undefined) || undefined
+      : undefined
     const returnTo = resourceId ? {
       resourceId,
       scope,
       ...(scope === 'all' && params.get('returnQ')?.trim()
         ? { workspaceQuery: params.get('returnQ')!.trim() } : {}),
       ...(datasetQuery ? { datasetQuery } : {}),
+      ...(browseQuery ? { browseQuery } : {}),
     } satisfies RelationshipsReturn : undefined
     const context: RelationshipsContext = {
       ...(focusDatasetId ? { focusDatasetId } : {}),
@@ -193,7 +241,7 @@ export function parseHash(): Route {
   return { view: 'workspace', canonicalHash: '#/workspace' }
 }
 
-export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string): string {
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string, workspaceBrowseQuery?: string): string {
   const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}`
     : view === 'transforms' && transformId ? `#/transforms/${encodeURIComponent(transformId)}` : `#/${view}`
     + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
@@ -212,6 +260,7 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
       const value = datasetParams.get(key)
       if (value) workspaceParams.set(key, value)
     }
+    mergeBrowseParams(workspaceParams, workspaceBrowseQuery)
   }
   const transformParams = new URLSearchParams(transformQuery)
   if (view === 'transforms' && transformVersion) transformParams.set('version', transformVersion)
@@ -243,6 +292,10 @@ export function relationshipsHash(context?: RelationshipsContext): string {
     }
     const query = datasetRouteQuery(returnTo.datasetQuery, returnTo.scope)
     if (query) params.set('returnQuery', query)
+    if (returnTo.scope === 'all' && returnTo.browseQuery) {
+      const browse = extractWorkspaceBrowseQuery(returnTo.browseQuery)
+      if (browse) params.set('returnBrowse', browse)
+    }
   }
   return `#/relationships${params.size ? `?${params}` : ''}`
 }
@@ -280,7 +333,7 @@ export function canvasLink(id: string): string {
 }
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
-interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string; erFocusDatasetId?: string | null; erMode?: RelationshipsMode; erReturn?: RelationshipsReturn | null }
+interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; workspaceBrowseQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string; erFocusDatasetId?: string | null; erMode?: RelationshipsMode; erReturn?: RelationshipsReturn | null }
 interface RouterStore {
   getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; requestViewportFit: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken; skipViewportFit?: boolean }) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => () => void
@@ -304,7 +357,8 @@ const hashFor = (s: RouterState) => s.view === 'relationships'
     s.view === 'transforms' ? s.transformVersion ?? undefined : undefined,
     s.view === 'transforms' ? s.transformLibraryQuery : undefined,
     s.view === 'transforms' ? s.transformUpgradeCanvasId ?? undefined : undefined,
-    s.view === 'transforms' ? s.transformUpgradeNodeId ?? undefined : undefined)
+    s.view === 'transforms' ? s.transformUpgradeNodeId ?? undefined : undefined,
+    s.view === 'workspace' ? s.workspaceBrowseQuery || undefined : undefined)
 
 export interface RouterController {
   settleBootstrap: (navigationToken: NavigationToken) => void

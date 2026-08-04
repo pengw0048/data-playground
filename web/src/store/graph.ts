@@ -1445,6 +1445,7 @@ interface Store {
     resourceId?: string | null
     searchQuery?: string
     datasetQuery?: string
+    browseQuery?: string
   }) => void
   /** Clear a temporary Dataset viewer after Canvas navigation without publishing a Workspace route. */
   clearWorkspaceDatasetViewerState: (listQuery: string) => void
@@ -1452,6 +1453,9 @@ interface Store {
   returnFromWorkspaceDatasetViewer: (view: 'jobs' | 'inbox', query: string, listQuery: string) => void
   workspaceDatasetQuery: string
   setWorkspaceDatasetQuery: (query: string) => void
+  /** Committed Workspace browse projection (sort/kind/view); search draft and cursors stay out. */
+  workspaceBrowseQuery: string
+  setWorkspaceBrowseQuery: (query: string) => void
   jobsQuery: string
   setJobsQuery: (query: string) => void
   inboxQuery: string
@@ -2072,7 +2076,10 @@ export const useStore = create<Store>((set, get) => ({
       workspaceResourceId: target.resourceId,
       workspaceScope: target.scope,
       workspaceDatasetQuery: target.datasetQuery ?? '',
-      ...(target.scope === 'all' ? { workspaceSearchQuery: target.workspaceQuery ?? '' } : {}),
+      ...(target.scope === 'all' ? {
+        workspaceSearchQuery: target.workspaceQuery ?? '',
+        workspaceBrowseQuery: target.browseQuery ?? '',
+      } : {}),
     })
   },
   workspaceResourceId: null,
@@ -2105,6 +2112,7 @@ export const useStore = create<Store>((set, get) => ({
         workspaceSearchQuery: context.searchQuery.trim().replace(/\s+/g, ' '),
       } : {}),
       ...(context?.datasetQuery !== undefined ? { workspaceDatasetQuery: context.datasetQuery } : {}),
+      ...(context?.browseQuery !== undefined ? { workspaceBrowseQuery: context.browseQuery } : {}),
       view: 'workspace',
     })
   },
@@ -2129,6 +2137,12 @@ export const useStore = create<Store>((set, get) => ({
     startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceDatasetQuery, view: 'workspace' })
+  },
+  workspaceBrowseQuery: '',
+  setWorkspaceBrowseQuery: (query) => {
+    startNavigation()
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceBrowseQuery: query, view: 'workspace' })
   },
   jobsQuery: '',
   setJobsQuery: (query) => {
@@ -2173,6 +2187,7 @@ export const useStore = create<Store>((set, get) => ({
           : {
               workspaceSearchQuery: route.workspaceQuery ?? '',
               workspaceDatasetQuery: route.workspaceDatasetQuery ?? '',
+              workspaceBrowseQuery: route.workspaceBrowseQuery ?? '',
             }),
       })
     } else if (route.view === 'jobs') set({ view: 'jobs', jobsQuery: route.jobsQuery ?? '' })

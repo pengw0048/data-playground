@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
   workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
+  workspaceBrowseQuery: '', setWorkspaceBrowseQuery: vi.fn((query: string) => { store.workspaceBrowseQuery = query }),
   workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
   clearWorkspaceDatasetViewerState: vi.fn(),
   returnFromWorkspaceDatasetViewer: vi.fn(),
@@ -139,6 +140,8 @@ describe('WorkspaceExplorer', () => {
     vi.resetAllMocks()
     store.workspaceResourceId = null
     store.workspaceSearchQuery = ''
+    store.workspaceBrowseQuery = ''
+    store.setWorkspaceBrowseQuery = vi.fn((query: string) => { store.workspaceBrowseQuery = query })
     store.workspaceScope = 'all'
     store.workspaceDatasetQuery = ''
     store.firstRunChoice = false
@@ -733,14 +736,18 @@ describe('WorkspaceExplorer', () => {
   it('defaults to a compact list and exposes selected Canvas actions in grid view', async () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.getCanvas.mockResolvedValue({ id: 'canvas-1', name: 'Analysis', version: 3, nodes: [], edges: [] })
-    render(<WorkspaceExplorer />)
+    const view = render(<WorkspaceExplorer />)
 
     const views = await screen.findByRole('group', { name: 'Workspace view' })
     expect(within(views).getByRole('button', { name: 'list' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByText('Last modified')).toBeVisible()
     expect(screen.getByText('Last opened')).toBeVisible()
     fireEvent.click(within(views).getByRole('button', { name: 'grid' }))
-    expect(within(views).getByRole('button', { name: 'grid' })).toHaveAttribute('aria-pressed', 'true')
+    expect(store.setWorkspaceBrowseQuery).toHaveBeenCalled()
+    expect(store.workspaceBrowseQuery).toContain('view=grid')
+    view.rerender(<WorkspaceExplorer />)
+    expect(within(screen.getByRole('group', { name: 'Workspace view' })).getByRole('button', { name: 'grid' }))
+      .toHaveAttribute('aria-pressed', 'true')
 
     fireEvent.click(screen.getByLabelText('Select Analysis'))
     expect(screen.getByText('1 selected')).toBeVisible()
@@ -754,11 +761,15 @@ describe('WorkspaceExplorer', () => {
       container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false,
       completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
     })
-    render(<WorkspaceExplorer />)
+    const view = render(<WorkspaceExplorer />)
 
     const sort = await screen.findByRole('combobox', { name: 'Sort Workspace' })
     mocks.workspaceBrowse.mockClear()
     fireEvent.change(sort, { target: { value: 'name-desc' } })
+    expect(store.setWorkspaceBrowseQuery).toHaveBeenCalled()
+    expect(store.workspaceBrowseQuery).toContain('sort=name')
+    expect(store.workspaceBrowseQuery).toContain('order=desc')
+    view.rerender(<WorkspaceExplorer />)
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
       { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc' },
@@ -767,10 +778,36 @@ describe('WorkspaceExplorer', () => {
     fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
       target: { value: 'canvas' },
     })
+    expect(store.workspaceBrowseQuery).toContain('kind=canvas')
+    view.rerender(<WorkspaceExplorer />)
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'workspace-local-root',
       { limit: 50, cursor: undefined, source: 'local', sort: 'name', order: 'desc', kinds: ['canvas'] },
     ))
+  })
+
+  it('restores committed browse projection from the store without treating a search draft as canonical', async () => {
+    store.workspaceBrowseQuery = 'wq=1&sort=updated&order=desc&kind=dataset&view=grid'
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('combobox', { name: 'Sort Workspace' })).toHaveValue('updated-desc')
+    expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toHaveValue('dataset')
+    expect(within(screen.getByRole('group', { name: 'Workspace view' })).getByRole('button', { name: 'grid' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', sort: 'updated', order: 'desc', kinds: ['dataset'] },
+    ))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' }), {
+      target: { value: 'draft-only' },
+    })
+    expect(store.setWorkspaceSearchQuery).not.toHaveBeenCalled()
+    expect(store.setWorkspaceBrowseQuery).not.toHaveBeenCalled()
   })
 
   it('hides unsupported query controls before browsing a connected source', async () => {

@@ -1052,6 +1052,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const workspaceScope = useStore((s) => s.workspaceScope)
   const workspaceSearchQuery = useStore((s) => s.workspaceSearchQuery)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
+  const workspaceBrowseQuery = useStore((s) => s.workspaceBrowseQuery)
   const catalogSource = useStore((s) => s.kernelInfo)
   const atomicMetadataEditable = catalogSource?.capabilities?.includes('catalog.atomic_metadata_edit') ?? false
   const unregisterSupported = catalogSource?.capabilities?.includes('catalog.cas_unregister') ?? false
@@ -1328,6 +1329,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       scope: workspaceScope,
       workspaceQuery: workspaceSearchQuery,
       datasetQuery: workspaceDatasetQuery,
+      browseQuery: workspaceBrowseQuery,
     },
   })
 
