@@ -46,6 +46,13 @@ test.describe('full researcher acceptance matrix', () => {
     expect(declared.ok()).toBeTruthy()
 
     await page.getByRole('button', { name: 'Back to Workspace', exact: true }).click()
+    // The catalog fixture can leave the file browser on a later page. Search for the related
+    // table as a user would instead of assuming its default-order page follows catalog_119.
+    const search = page.getByRole('textbox', {
+      name: 'Search views, datasets, canvases, and containers',
+    })
+    await search.fill(left.name)
+    await search.press('Enter')
     await openWorkspaceTable(page, left.name)
     await page.getByTestId('detail-relationships').click()
     await expect(page.getByText('Lineage', { exact: true }).first()).toBeVisible()
