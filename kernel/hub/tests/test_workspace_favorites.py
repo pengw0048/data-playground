@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import uuid
 
@@ -40,6 +41,15 @@ def test_favorites_are_idempotent_actor_scoped_and_identity_stable():
     dataset_ref = f"dataset:{dataset_id}"
     alice = f"alice-{token}"
     bob = f"bob-{token}"
+    with metadb.session() as session:
+        canvas_before_favorite = session.get(metadb.Canvas, canvas_id)
+        placement_before_favorite = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "canvas",
+            metadb.WorkspacePlacement.target_id == canvas_id,
+        ))
+        assert canvas_before_favorite is not None and placement_before_favorite is not None
+        original_updated_at = canvas_before_favorite.updated_at
+        original_placement_version = placement_before_favorite.version
 
     with TestClient(app) as client:
         first = client.put(f"/api/workspace/favorites/{canvas_ref}", headers=_hdr(alice))
@@ -51,6 +61,15 @@ def test_favorites_are_idempotent_actor_scoped_and_identity_stable():
         assert client.put(
             f"/api/workspace/favorites/{dataset_ref}", headers=_hdr(alice),
         ).status_code == 200
+        with metadb.session() as session:
+            canvas_after_favorite = session.get(metadb.Canvas, canvas_id)
+            placement_after_favorite = session.scalar(select(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_kind == "canvas",
+                metadb.WorkspacePlacement.target_id == canvas_id,
+            ))
+            assert canvas_after_favorite is not None and placement_after_favorite is not None
+            assert canvas_after_favorite.updated_at == original_updated_at
+            assert placement_after_favorite.version == original_placement_version
 
         # Bob's shelf stays empty; Alice sees both favorites.
         bob_page = client.get("/api/workspace/favorites", headers=_hdr(bob)).json()
@@ -75,7 +94,6 @@ def test_favorites_are_idempotent_actor_scoped_and_identity_stable():
             assert placement is not None
             canvas = session.get(metadb.Canvas, canvas_id)
             assert canvas is not None
-            before_updated = canvas.updated_at
             placement_version = placement.version
             placement.name = "Renamed favorite canvas"
             canvas.name = "Renamed favorite canvas"
@@ -90,8 +108,6 @@ def test_favorites_are_idempotent_actor_scoped_and_identity_stable():
             canvas = session.get(metadb.Canvas, canvas_id)
             assert placement is not None and canvas is not None
             assert placement.version == placement_version
-            # Favorite writes must not advance resource updatedAt; the rename above did.
-            assert canvas.updated_at == before_updated or canvas.name == "Renamed favorite canvas"
 
         # Unfavorite is idempotent and works after the resource is gone.
         assert client.delete(
@@ -142,3 +158,39 @@ def test_favorites_are_idempotent_actor_scoped_and_identity_stable():
         assert local.status_code == 200
         local_page = client.get("/api/workspace/favorites").json()
         assert any(item["id"] == dataset_ref for item in local_page["items"])
+
+
+def test_favorite_kind_filter_pages_the_filtered_query_without_false_empty_pages():
+    metadb.migrate_db()
+    token = uuid.uuid4().hex
+    owner = f"favorite-page-{token}"
+    base = metadb._now()
+    with metadb.session() as session:
+        session.add(metadb.User(id=owner, name="Favorite pager"))
+        # Newer non-matching rows used to exhaust the fixed over-fetch window and falsely report
+        # that the Canvas-only shelf was empty.
+        for index in range(5):
+            session.add(metadb.WorkspaceFavorite(
+                owner_id=owner,
+                resource_id=f"dataset:missing-{token}-{index}",
+                created_at=base + datetime.timedelta(seconds=10 + index),
+            ))
+        for index in range(3):
+            session.add(metadb.WorkspaceFavorite(
+                owner_id=owner,
+                resource_id=f"canvas:missing-{token}-{index}",
+                created_at=base + datetime.timedelta(seconds=index),
+            ))
+
+    first = metadb.workspace_favorites_browse(uid=owner, limit=1, kinds={"canvas"})
+    assert [item["id"] for item in first["items"]] == [f"canvas:missing-{token}-2"]
+    assert first["hasMore"] is True
+    second = metadb.workspace_favorites_browse(
+        uid=owner, limit=1, kinds={"canvas"}, cursor=first["nextCursor"])
+    assert [item["id"] for item in second["items"]] == [f"canvas:missing-{token}-1"]
+    assert second["hasMore"] is True
+    third = metadb.workspace_favorites_browse(
+        uid=owner, limit=1, kinds={"canvas"}, cursor=second["nextCursor"])
+    assert [item["id"] for item in third["items"]] == [f"canvas:missing-{token}-0"]
+    assert third["hasMore"] is False
+    assert third["nextCursor"] is None

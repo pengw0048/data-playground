@@ -4,6 +4,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const themeValues = new Map<string, string>()
 
+const apiMocks = vi.hoisted(() => ({
+  workspaceFavoriteStatus: vi.fn(async () => ({ favorited: [] as string[] })),
+  workspaceFavoriteAdd: vi.fn(async () => ({ ok: true, favorited: true, resourceId: 'canvas:canvas-1' })),
+  workspaceFavoriteRemove: vi.fn(async () => ({ ok: true, favorited: false, resourceId: 'canvas:canvas-1' })),
+}))
+
 const state = vi.hoisted(() => ({
   setJobsQuery: vi.fn(),
   newFile: vi.fn(),
@@ -25,7 +31,10 @@ const state = vi.hoisted(() => ({
   past: [] as unknown[],
   future: [] as unknown[],
   peers: {} as Record<string, { name: string; color: string }>,
+  pushToast: vi.fn(),
 }))
+
+vi.mock('../api/client', () => ({ api: apiMocks }))
 
 vi.mock('../store/graph', () => ({
   roleCanEdit: (role: string | null) => role === 'owner' || role === 'editor',
@@ -80,6 +89,7 @@ beforeEach(() => {
     name: 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review',
     nodes: [],
   }
+  apiMocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [] })
   document.documentElement.removeAttribute('data-theme')
 })
 
@@ -252,6 +262,24 @@ describe('TopBar Settings handoff', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
     expect(trigger).toHaveFocus()
+  })
+})
+
+describe('Canvas favorite', () => {
+  it('keeps the primary Canvas header in sync with personal favorite state', async () => {
+    apiMocks.workspaceFavoriteStatus.mockResolvedValueOnce({ favorited: ['canvas:canvas-1'] })
+    render(<TopBar />)
+
+    const remove = await screen.findByRole('button', {
+      name: `Remove ${state.doc.name} from Favorites`,
+    })
+    expect(remove).toHaveAttribute('aria-pressed', 'true')
+    await userEvent.setup().click(remove)
+
+    await waitFor(() => expect(apiMocks.workspaceFavoriteRemove).toHaveBeenCalledWith('canvas:canvas-1'))
+    expect(await screen.findByRole('button', {
+      name: `Add ${state.doc.name} to Favorites`,
+    })).toHaveAttribute('aria-pressed', 'false')
   })
 })
 

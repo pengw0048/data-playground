@@ -7673,6 +7673,9 @@ def workspace_favorites_browse(
     decoded = _workspace_favorite_cursor_decode(cursor)
     with session() as s:
         query = select(WorkspaceFavorite).where(WorkspaceFavorite.owner_id == uid)
+        query = query.where(or_(*(
+            WorkspaceFavorite.resource_id.like(f"{kind}:%") for kind in sorted(allowed)
+        )))
         if decoded is not None:
             stamp, resource_id = decoded
             query = query.where(tuple_(
@@ -7681,14 +7684,11 @@ def workspace_favorites_browse(
         rows = list(s.scalars(query.order_by(
             WorkspaceFavorite.created_at.desc(),
             WorkspaceFavorite.resource_id.desc(),
-        ).limit(limit * 4 + 1)))  # over-fetch for kind filter + unavailable keep
+        ).limit(limit + 1)))
 
     items: list[dict] = []
-    next_cursor = None
-    for row in rows:
-        kind = row.resource_id.split(":", 1)[0]
-        if kind not in allowed:
-            continue
+    page_rows = rows[:limit]
+    for row in page_rows:
         try:
             resolved = workspace_providers.resolve(row.resource_id, uid=uid)
             resource = resolved.get("resource")
@@ -7704,11 +7704,13 @@ def workspace_favorites_browse(
             if item.get("referenceState") in {"permission_lost"}:
                 item = _workspace_favorite_unavailable(row.resource_id)
         items.append(item)
-        if len(items) == limit:
-            next_cursor = _workspace_favorite_cursor_encode(row.created_at, row.resource_id)
-            break
 
-    has_more = next_cursor is not None
+    has_more = len(rows) > limit
+    next_cursor = (
+        _workspace_favorite_cursor_encode(
+            page_rows[-1].created_at, page_rows[-1].resource_id)
+        if has_more and page_rows else None
+    )
     return {
         "container": {
             "id": _workspace_ref("container", _WORKSPACE_FAVORITES_SHELF_ID),
