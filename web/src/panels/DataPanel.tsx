@@ -21,6 +21,9 @@ import type { ColumnSchema, PortSpec } from '../types/graph'
 import type {
   ProfileResult, RetainedResultIdentity, RunOutput, SampleProvenance, SampleResult,
 } from '../types/api'
+import {
+  chartSeriesColor, chartSeriesLabel, orderChartSeriesLabels, summarizeChartSeries,
+} from '../lib/chartSeries'
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
@@ -246,6 +249,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         type: String(node?.data.config.chartType ?? 'bar'),
         xLabel: String(node?.data.config.x || 'All rows'),
         grouped: node?.data.config.agg !== 'none',
+        seriesLabel: String(node?.data.config.series || '') || undefined,
         yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
           ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
           : (node?.data.config.y ?? 'y')),
@@ -441,6 +445,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
           grouped={node?.data.config.agg !== 'none'} completeness={res.completeness}
           scope="preview"
+          seriesLabel={String(node?.data.config.series || '') || undefined}
           xLabel={String(node?.data.config.x ?? 'x')}
           yLabel={String(node?.data.config.agg && node?.data.config.agg !== 'none' ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})` : (node?.data.config.y ?? 'y'))} />
       ) : isMetric ? (
@@ -1143,24 +1148,33 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   return <span>{String(value)}</span>
 }
 
-// A dependency-free SVG chart of the (x, y) series the `chart` node emits — bar / line / area /
-// scatter. Colors are theme tokens so it works in dark mode; the axis labels come from the node's
-// chosen columns. Kept simple on purpose (the heavy lifting — grouping/aggregation — is server-side).
-function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness = 'unknown', scope = 'preview' }: {
+// A dependency-free SVG chart of the (x [, series], y) relation the `chart` node emits — bar /
+// line / area / scatter. Colors are theme tokens (or a fixed series palette); axis labels come from
+// the node's chosen columns. Heavy lifting — grouping/aggregation and top-12/Other — is server-side.
+function ChartView({
+  rows, type, xLabel, yLabel, grouped = false, seriesLabel, completeness = 'unknown', scope = 'preview',
+}: {
   rows: Record<string, unknown>[]
   type: string
   xLabel: string
   yLabel: string
   grouped?: boolean
+  seriesLabel?: string
   completeness?: SampleResult['completeness']
   scope?: 'preview' | 'full-result' | 'published-dataset'
 }) {
+  const hasSeriesColumn = rows.some((row) => 'series' in row)
   const pts = rows.flatMap((row) => {
     const raw = row.y
     if (raw == null || (typeof raw === 'string' && raw.trim() === '')) return []
     if (typeof raw !== 'number' && typeof raw !== 'string') return []
     const y = Number(raw)
-    return Number.isFinite(y) ? [{ x: row.x, y }] : []
+    if (!Number.isFinite(y)) return []
+    return [{
+      x: row.x,
+      y,
+      series: hasSeriesColumn ? chartSeriesLabel(row.series) : undefined,
+    }]
   })
   const omitted = rows.length - pts.length
   const omittedMessage = omitted === 1
@@ -1172,38 +1186,17 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
       {omitted > 0 && <div className="mt-1">{omittedMessage}</div>}
     </div>
   )
-  const W = 640, H = 320, padL = 48, padR = 16, padT = 16, padB = 44
-  const plotW = W - padL - padR, plotH = H - padT - padB
-  const ys = pts.map((p) => p.y)
-  // bar/area fill to the zero baseline (0 must be in range); line/scatter scale to the DATA range so
-  // a far-from-zero or all-negative series isn't squashed into a flat band at one edge.
-  const baseline = type === 'bar' || type === 'area'
-  const dMax = Math.max(...ys), dMin = Math.min(...ys)
-  const yMax = baseline ? Math.max(0, dMax) : dMax, yMin = baseline ? Math.min(0, dMin) : dMin
-  const ySpan = (yMax - yMin) || 1
-  const yPix = (v: number) => padT + plotH - ((v - yMin) / ySpan) * plotH
-  const y0 = yPix(Math.min(Math.max(0, yMin), yMax))  // 0 clamped into the plotted range → the baseline row
-  const numX = pts.every((p) => typeof p.x === 'number')
-  const xs = pts.map((p) => Number(p.x)), xMin = Math.min(...xs), xMax = Math.max(...xs), xSpan = xMax - xMin || 1
-  const bandW = plotW / pts.length
-  const xPix = (i: number) => type === 'bar'
-    ? padL + (i + 0.5) * bandW
-    : (type === 'scatter' && numX)
-      ? padL + ((xs[i] - xMin) / xSpan) * plotW
-      : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
+
+  const multi = hasSeriesColumn && pts.some((point) => point.series != null)
+  const seriesOrder = multi
+    ? orderChartSeriesLabels(pts.map((point) => point.series!).filter(Boolean))
+    : []
   const fmt = (v: number) => new Intl.NumberFormat(undefined, {
     notation: Math.abs(v) >= 1_000 ? 'compact' : 'standard',
     maximumFractionDigits: Math.abs(v) < 0.01 ? 3 : 1,
   }).format(v)
-  const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
-  // Bars occupy the centre of an ordinal band. A point scale puts the first and last centres on the
-  // plot boundary, clipping both bars; cap the minimum width to the band so dense charts stay inside.
-  const barW = Math.min(bandW, Math.max(1, bandW * 0.72))
-  const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
-  const yTicks = yMax === yMin
-    ? [yMin]
-    : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
-  const unit = grouped ? 'group' : 'point'
+  const seriesSummary = multi ? summarizeChartSeries(seriesOrder) : null
+  const unit = grouped ? (multi ? 'cell' : 'group') : 'point'
   const units = pts.length === 1 ? unit : `${unit}s`
   const scopeSummary = completeness === 'capped'
     ? `Showing ${pts.length.toLocaleString()} ${units} · display capped`
@@ -1213,11 +1206,133 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
   const ariaScope = completeness === 'capped'
     ? `showing ${pts.length} capped ${units}`
     : scope === 'preview' ? `${units}, preview sample` : 'saved result'
+  const ariaSeries = seriesSummary
+    ? `, ${seriesSummary}${seriesLabel ? ` by ${seriesLabel}` : ''}`
+    : ''
+  const colorFor = (label: string | undefined) => (
+    label == null ? 'hsl(var(--primary))' : chartSeriesColor(label, seriesOrder)
+  )
+  const tip = (xValue: unknown, yValue: number, series?: string) => (
+    series
+      ? `${xLabel}: ${String(xValue)}; ${seriesLabel || 'Series'}: ${series}; ${yLabel}: ${fmt(yValue)}`
+      : `${xLabel}: ${String(xValue)}; ${yLabel}: ${fmt(yValue)}`
+  )
+
+  // Preserve the exact single-series layout when Series is unset (including raw point charts).
+  if (!multi) {
+    const W = 640, H = 320, padL = 48, padR = 16, padT = 16, padB = 44
+    const plotW = W - padL - padR, plotH = H - padT - padB
+    const ys = pts.map((p) => p.y)
+    const baseline = type === 'bar' || type === 'area'
+    const dMax = Math.max(...ys), dMin = Math.min(...ys)
+    const yMax = baseline ? Math.max(0, dMax) : dMax, yMin = baseline ? Math.min(0, dMin) : dMin
+    const ySpan = (yMax - yMin) || 1
+    const yPix = (v: number) => padT + plotH - ((v - yMin) / ySpan) * plotH
+    const y0 = yPix(Math.min(Math.max(0, yMin), yMax))
+    const numX = pts.every((p) => typeof p.x === 'number')
+    const xs = pts.map((p) => Number(p.x)), xMin = Math.min(...xs), xMax = Math.max(...xs), xSpan = xMax - xMin || 1
+    const bandW = plotW / pts.length
+    const xPix = (i: number) => type === 'bar'
+      ? padL + (i + 0.5) * bandW
+      : (type === 'scatter' && numX)
+        ? padL + ((xs[i] - xMin) / xSpan) * plotW
+        : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
+    const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
+    const barW = Math.min(bandW, Math.max(1, bandW * 0.72))
+    const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+    const yTicks = yMax === yMin
+      ? [yMin]
+      : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
+    return (
+      <div className="p-3">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img"
+          aria-label={`${type} chart, ${ariaScope}`}>
+          <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
+          {yTicks.map((v, index) => (
+            <g key={index}>
+              <line x1={padL} y1={yPix(v)} x2={W - padR} y2={yPix(v)}
+                stroke="hsl(var(--border))" strokeOpacity={index === 0 ? 1 : 0.55} />
+              <text x={padL - 6} y={yPix(v) + 3} textAnchor="end" fontSize="10"
+                fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
+            </g>
+          ))}
+          {(type === 'bar') && pts.map((p, i) => (
+            <rect key={i} x={xPix(i) - barW / 2} y={Math.min(yPix(p.y), y0)} width={barW}
+              height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85}>
+              <title>{tip(p.x, p.y)}</title>
+            </rect>
+          ))}
+          {(type === 'area') && <polygon points={`${padL},${y0} ${line} ${xPix(pts.length - 1)},${y0}`} fill="hsl(var(--primary))" opacity={0.2} />}
+          {(type === 'line' || type === 'area') && <polyline points={line} fill="none" stroke="hsl(var(--primary))" strokeWidth={1.75} />}
+          {(type === 'scatter' || type === 'line' || type === 'area') && pts.map((p, i) => (
+            <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85}>
+              <title>{tip(p.x, p.y)}</title>
+            </circle>
+          ))}
+          {tickIdx.map((i) => (
+            <text key={i} x={xPix(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10" fill="hsl(var(--muted-foreground))">
+              {String(pts[i]?.x).slice(0, 10)}
+            </text>
+          ))}
+          <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
+            fill="hsl(var(--muted-foreground))" fontWeight="600"
+            transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
+          <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
+        </svg>
+        {scopeSummary && (
+          <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{scopeSummary}</div>
+        )}
+        {omitted > 0 && (
+          <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
+            {omittedMessage}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const xCategories = [...new Map(pts.map((point) => [String(point.x), point.x])).entries()]
+    .map(([, value]) => value)
+  const byXSeries = new Map<string, number>()
+  for (const point of pts) {
+    byXSeries.set(`${String(point.x)}\u0000${point.series ?? ''}`, point.y)
+  }
+  const W = 640, H = 360, padL = 48, padR = 16, padT = 16, padB = 72
+  const plotW = W - padL - padR, plotH = H - padT - padB
+  const ys = pts.map((p) => p.y)
+  const baseline = type === 'bar' || type === 'area'
+  const dMax = Math.max(...ys), dMin = Math.min(...ys)
+  const yMax = baseline ? Math.max(0, dMax) : dMax, yMin = baseline ? Math.min(0, dMin) : dMin
+  const ySpan = (yMax - yMin) || 1
+  const yPix = (v: number) => padT + plotH - ((v - yMin) / ySpan) * plotH
+  const y0 = yPix(Math.min(Math.max(0, yMin), yMax))
+  const categoryCount = Math.max(1, xCategories.length)
+  const bandW = plotW / categoryCount
+  const seriesCount = Math.max(1, seriesOrder.length)
+  const clusterGap = type === 'bar' ? Math.min(bandW * 0.12, 6) : 0
+  const clusterInner = Math.max(1, bandW - clusterGap)
+  const barSlot = type === 'bar' ? clusterInner / seriesCount : clusterInner
+  const barW = Math.min(bandW, Math.max(1, (type === 'bar' ? barSlot : bandW) * 0.72))
+  const categoryCenter = (index: number) => padL + (index + 0.5) * bandW
+  const barX = (categoryIndex: number, seriesIndex: number) => {
+    const start = padL + categoryIndex * bandW + clusterGap / 2
+    return start + seriesIndex * barSlot + (barSlot - barW) / 2
+  }
+  const pointX = (categoryIndex: number) => (
+    categoryCount === 1 ? padL + plotW / 2 : padL + (categoryIndex / (categoryCount - 1)) * plotW
+  )
+  const tickIdx = Array.from(new Set([0, ...Array.from(
+    { length: Math.min(8, categoryCount) },
+    (_, k) => Math.round(k * (categoryCount - 1) / Math.max(1, Math.min(8, categoryCount) - 1)),
+  )]))
+  const yTicks = yMax === yMin
+    ? [yMin]
+    : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
 
   return (
     <div className="p-3">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 340 }} role="img" aria-label={`${type} chart, ${ariaScope}`}>
-        {/* y axis: labelled grid plus the zero baseline when it is in range */}
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 380 }}
+        role="img" aria-label={`${type} chart, ${ariaScope}${ariaSeries}`}>
         <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="hsl(var(--border))" />
         {yTicks.map((v, index) => (
           <g key={index}>
@@ -1227,32 +1342,75 @@ function ChartView({ rows, type, xLabel, yLabel, grouped = false, completeness =
               fill="hsl(var(--muted-foreground))">{fmt(v)}</text>
           </g>
         ))}
-        {(type === 'bar') && pts.map((p, i) => (
-          <rect key={i} x={xPix(i) - barW / 2} y={Math.min(yPix(p.y), y0)} width={barW}
-            height={Math.abs(yPix(p.y) - y0)} fill="hsl(var(--primary))" opacity={0.85}>
-            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
-          </rect>
+        {type === 'bar' && xCategories.map((xValue, categoryIndex) => (
+          seriesOrder.map((series, seriesIndex) => {
+            const yValue = byXSeries.get(`${String(xValue)}\u0000${series}`)
+            if (yValue == null) return null
+            return (
+              <rect key={`${categoryIndex}-${series}`}
+                x={barX(categoryIndex, seriesIndex)} y={Math.min(yPix(yValue), y0)} width={barW}
+                height={Math.abs(yPix(yValue) - y0)} fill={colorFor(series)} opacity={0.85}>
+                <title>{tip(xValue, yValue, series)}</title>
+              </rect>
+            )
+          })
         ))}
-        {(type === 'area') && <polygon points={`${padL},${y0} ${line} ${xPix(pts.length - 1)},${y0}`} fill="hsl(var(--primary))" opacity={0.2} />}
-        {(type === 'line' || type === 'area') && <polyline points={line} fill="none" stroke="hsl(var(--primary))" strokeWidth={1.75} />}
-        {(type === 'scatter' || type === 'line' || type === 'area') && pts.map((p, i) => (
-          <circle key={i} cx={xPix(i)} cy={yPix(p.y)} r={type === 'scatter' ? 3 : 2.2} fill="hsl(var(--primary))" opacity={0.85}>
-            <title>{`${xLabel}: ${String(p.x)}; ${yLabel}: ${fmt(p.y)}`}</title>
-          </circle>
-        ))}
-        {/* x tick labels */}
+        {(type === 'line' || type === 'area' || type === 'scatter') && seriesOrder.map((series) => {
+          const seriesPts = xCategories.flatMap((xValue, categoryIndex) => {
+            const yValue = byXSeries.get(`${String(xValue)}\u0000${series}`)
+            return yValue == null ? [] : [{
+              x: xValue,
+              y: yValue,
+              cx: pointX(categoryIndex),
+            }]
+          })
+          if (!seriesPts.length) return null
+          const line = seriesPts.map((point) => `${point.cx},${yPix(point.y)}`).join(' ')
+          const color = colorFor(series)
+          return (
+            <g key={series}>
+              {type === 'area' && (
+                <polygon
+                  points={`${seriesPts[0].cx},${y0} ${line} ${seriesPts[seriesPts.length - 1].cx},${y0}`}
+                  fill={color} opacity={0.16} />
+              )}
+              {(type === 'line' || type === 'area') && (
+                <polyline points={line} fill="none" stroke={color} strokeWidth={1.75} />
+              )}
+              {seriesPts.map((point, index) => (
+                <circle key={index} cx={point.cx} cy={yPix(point.y)}
+                  r={type === 'scatter' ? 3 : 2.2} fill={color} opacity={0.85}>
+                  <title>{tip(point.x, point.y, series)}</title>
+                </circle>
+              ))}
+            </g>
+          )
+        })}
         {tickIdx.map((i) => (
-          <text key={i} x={xPix(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10" fill="hsl(var(--muted-foreground))">
-            {String(pts[i]?.x).slice(0, 10)}
+          <text key={i} x={categoryCenter(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10"
+            fill="hsl(var(--muted-foreground))">
+            {String(xCategories[i]).slice(0, 10)}
           </text>
         ))}
         <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
           fill="hsl(var(--muted-foreground))" fontWeight="600"
           transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
-        <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
+        <text x={padL + plotW / 2} y={H - 28} textAnchor="middle" fontSize="10.5"
+          fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
       </svg>
-      {scopeSummary && (
-        <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{scopeSummary}</div>
+      <ul className="mt-1 flex flex-wrap justify-center gap-x-3 gap-y-1" aria-label="Chart series legend">
+        {seriesOrder.map((series) => (
+          <li key={series} className="flex max-w-[9.5rem] items-center gap-1.5 text-[10.5px] text-muted-foreground"
+            title={series} aria-label={series}>
+            <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ background: colorFor(series) }} />
+            <span className="truncate font-medium text-foreground">{series}</span>
+          </li>
+        ))}
+      </ul>
+      {(seriesSummary || scopeSummary) && (
+        <div className="mt-1 text-center text-[10.5px] text-muted-foreground">
+          {[seriesSummary, scopeSummary].filter(Boolean).join(' · ')}
+        </div>
       )}
       {omitted > 0 && (
         <div role="status" className="mt-1 text-center text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
@@ -1356,7 +1514,7 @@ function UserCodeFailure({
 // Page a durable run output through its server-owned run/node/port identity. The kernel resolves the
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
 type ArtifactPresentation =
-  | { kind: 'chart'; type: string; xLabel: string; yLabel: string; grouped: boolean }
+  | { kind: 'chart'; type: string; xLabel: string; yLabel: string; grouped: boolean; seriesLabel?: string }
   | { kind: 'metric' }
 
 export function FullResult({
@@ -1530,6 +1688,7 @@ export function FullResult({
       {presentation?.kind === 'chart'
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}
+          seriesLabel={presentation.seriesLabel}
           completeness={data.completeness} scope={pageScope} />
         : presentation?.kind === 'metric'
           ? <MetricValue rows={rows} />

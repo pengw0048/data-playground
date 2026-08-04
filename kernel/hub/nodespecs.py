@@ -183,11 +183,13 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
     NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
              inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset
              # chartType is presentation-only (see executionConfig / resolve_config / manifest folds).
+             # series is semantic Series / Color by (aggregated Charts only).
              params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),
                      ParamSpec(name="x", type="string", label="group by (X)"),
                      ParamSpec(name="xMode", type="select", options=["column", "expression"], default="column", label="X source"),
                      ParamSpec(name="y", type="string", label="value (Y)"),
                      ParamSpec(name="yMode", type="select", options=["column", "expression"], default="column", label="Y source"),
+                     ParamSpec(name="series", type="string", label="Series / Color by"),
                      ParamSpec(name="agg", type="select", options=["none", "count", "sum", "mean", "min", "max"], default="count", label="aggregate Y by X")],
              blurb="Create a chart from selected columns"),
     NodeSpec(kind="vector-search", title="vector-search", category="query", tag="vector",

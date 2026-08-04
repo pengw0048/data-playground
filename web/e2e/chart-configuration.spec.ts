@@ -165,3 +165,67 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
     await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
   }
 })
+
+test('Chart Series / Color by aggregates, legends, and keeps chartType presentation-only', async ({ page }) => {
+  const canvasId = `chart-series-${Date.now()}`
+  try {
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Chart series', version: 1, requirements: [],
+      nodes: [
+        { id: 'source', type: 'source', position: { x: 80, y: 160 }, data: {
+          title: 'Events', status: 'draft', config: { uri: 'events' }, history: [],
+        } },
+        { id: 'chart', type: 'chart', position: { x: 390, y: 160 }, data: {
+          title: 'Events chart', status: 'draft',
+          config: { chartType: 'bar', agg: 'count', xMode: 'column', x: 'user_id' }, history: [],
+        } },
+      ],
+      edges: [{ id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' } }],
+    } })
+    expect(created.ok(), await created.text()).toBe(true)
+
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    const chart = page.locator('.react-flow__node-chart')
+    await expect(chart).toBeVisible()
+    await expect(chart.getByRole('combobox', { name: 'X column' })).toHaveValue('user_id', { timeout: 15_000 })
+
+    await chart.getByText('Events chart', { exact: true }).click()
+    await chart.getByRole('button', { name: 'Run up to here' }).click()
+    await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
+    await expect(chart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Close' }).click()
+
+    await chart.getByLabel('Series / Color by column').selectOption('event')
+    await expect(chart.locator('[title="stale"]')).toBeVisible()
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      const graph = await response.json() as {
+        nodes: Array<{ id: string; data: { status: string; config: Record<string, unknown> } }>
+      }
+      const node = graph.nodes.find((item) => item.id === 'chart')
+      return [node?.data.config.series, node?.data.status]
+    }).toEqual(['event', 'stale'])
+
+    await chart.getByText('Events chart', { exact: true }).click()
+    await chart.getByRole('button', { name: 'Run up to here' }).click()
+    await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
+    await expect(chart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Close' }).click()
+    await chart.getByRole('button', { name: 'View chart result' }).click()
+    await expect(page.getByRole('img', { name: /bar chart, saved result.*series/i })).toBeVisible()
+    await expect(page.getByRole('list', { name: 'Chart series legend' })).toBeVisible()
+    await expect(page.getByRole('list', { name: 'Chart series legend' }).getByText('view')).toBeVisible()
+
+    const runPosts: string[] = []
+    await page.route('**/api/run', async (route) => {
+      if (route.request().method() === 'POST') runPosts.push(route.request().url())
+      await route.continue()
+    })
+    await chart.getByLabel('Chart').selectOption('line')
+    await expect(page.getByRole('img', { name: /line chart, saved result.*series/i })).toBeVisible()
+    await expect(chart.locator('[title="latest"]')).toBeVisible()
+    expect(runPosts).toEqual([])
+  } finally {
+    await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+  }
+})

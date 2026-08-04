@@ -3,6 +3,7 @@ import type { ColumnSchema } from '../../types/graph'
 import {
   chartableColumns,
   numericChartColumns,
+  seriesChartColumns,
   suggestedChartDimension,
   suggestedChartMeasure,
 } from './chart'
@@ -29,6 +30,8 @@ describe('Chart schema recommendations', () => {
     expect(numericChartColumns(columns).map((column) => column.name)).toEqual([
       'id', 'user_id', 'amount',
     ])
+    expect(seriesChartColumns(columns).map((column) => column.name)).toEqual(['event'])
+    expect(seriesChartColumns(columns, 'event')).toEqual([])
   })
 
   it('falls back through time and scalar fields for unfamiliar schemas', () => {

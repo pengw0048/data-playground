@@ -9649,6 +9649,12 @@ def test_plan_hash_ignores_chart_presentation_type():
     assert bar == r._plan_hash(graph_with("scatter"), "ch")
     assert bar == r._plan_hash(graph_with("area"), "ch")
     assert bar != r._plan_hash(graph_with("bar", agg="sum", y="amount"), "ch")
+    assert bar != r._plan_hash(Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        N("ch", "chart", {
+            "chartType": "bar", "agg": "count", "xMode": "column", "x": "event", "series": "event",
+        }),
+    ], "edges": [E("src", "ch")]}), "ch")
 
 
 def test_direct_managed_write_invocations_publish_distinct_revisions(tmp_path):
@@ -12106,6 +12112,61 @@ def test_chart_node_produces_series():
         chart_graph({"chartType": "bar", "x": "event", "y": "event", "agg": "max"}), "ch", 50,
     )
     assert not minmax_result.get("error")  # TRY_CAST → NULL y, not a raw ConversionException
+
+
+def test_chart_series_dimension_groups_and_bounds_other(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "chart-series.parquet"
+    # 14 named series → top 12 by absolute measure + Other. Null/blank collapse to one label.
+    rows = []
+    for series_index in range(14):
+        label = f"model-{series_index:02d}"
+        for x in ("train", "eval"):
+            rows.append({"split": x, "model": label, "amount": float(series_index + 1)})
+    rows.append({"split": "train", "model": None, "amount": 100.0})
+    rows.append({"split": "eval", "model": "  ", "amount": 50.0})
+    pq.write_table(pa.Table.from_pylist(rows), source)
+
+    def chart_graph(cfg):
+        return {"id": "chart-series", "version": 1, "nodes": [
+            N("source", "source", {"uri": str(source)}),
+            N("chart", "chart", cfg),
+        ], "edges": [E("source", "chart")]}
+
+    _, result = _full_result(chart_graph({
+        "chartType": "bar", "agg": "sum", "x": "split", "y": "amount", "series": "model",
+    }), "chart", 200)
+    assert {column["name"] for column in result["columns"]} == {"x", "series", "y"}
+    series_labels = {row["series"] for row in result["rows"]}
+    assert "(blank)" in series_labels
+    assert "Other" in series_labels
+    named = sorted(label for label in series_labels if label not in {"Other", "(blank)"})
+    # Absolute measure ranks (blank) first, then model-13..model-03; model-00..02 collapse to Other.
+    assert named == [f"model-{index:02d}" for index in range(3, 14)]
+    assert len(named) == 11
+    other_total = sum(row["y"] for row in result["rows"] if row["series"] == "Other")
+    assert other_total == 12.0
+
+    # Unset Series keeps the exact one-series (x, y) contract.
+    _, plain = _full_result(chart_graph({
+        "chartType": "bar", "agg": "sum", "x": "split", "y": "amount",
+    }), "chart", 50)
+    assert {column["name"] for column in plain["columns"]} == {"x", "y"}
+    assert "series" not in {column["name"] for column in plain["columns"]}
+
+    # Raw-value mode refuses Series in this slice.
+    started = client.post("/api/run", json={
+        "graph": chart_graph({
+            "chartType": "scatter", "agg": "none", "x": "split", "y": "amount", "series": "model",
+        }),
+        "targetNodeId": "chart", "confirmed": True,
+    })
+    assert started.status_code == 200, started.text
+    refused = _poll(started.json()["runId"])
+    assert refused["status"] == "failed"
+    assert "Series" in str(refused)
 
 
 def test_chart_counts_all_rows_when_only_binary_and_identifier_fields_exist(tmp_path):

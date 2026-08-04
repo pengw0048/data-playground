@@ -1660,6 +1660,7 @@ class BuildEngine:
             y_mode = str(cfg.get("yMode", "column"))
             x = str(cfg.get("x") or "").strip()
             y = str(cfg.get("y") or "").strip()
+            series = str(cfg.get("series") or "").strip()
             if x_mode == "column" and not x:
                 x = _default_chart_dimension(base)
             if agg != "count" and y_mode == "column" and not y:
@@ -1679,9 +1680,23 @@ class BuildEngine:
                 raise NotPreviewable(node, "Choose a numeric Y column, or enter a Y SQL expression.")
             if agg not in ("none", "count") and not y:  # sum/mean/min/max need a Y (don't silently count)
                 raise NotPreviewable(node, f"Choose a numeric Y value to {agg}.")
+            if series and agg == "none":
+                raise NotPreviewable(
+                    node,
+                    "Series / Color by needs a Summary aggregate. Switch away from Raw values, or clear Series.",
+                )
+            if series and ungrouped_count:
+                raise NotPreviewable(
+                    node,
+                    "Series / Color by needs an X grouping. Choose an X column, or clear Series.",
+                )
             try:
                 xq = _chart_axis_expression(base, x, x_mode, label="X") if x else None
                 yq = _chart_axis_expression(base, y, y_mode, label="Y") if y else None
+                sq = (
+                    _chart_axis_expression(base, series, "column", label="Series")
+                    if series else None
+                )
             except (SQLPolicyError, duckdb.Error, ValueError) as exc:
                 axis = "SQL expression" if "expression" in (x_mode, y_mode) else "field selection"
                 raise NotPreviewable(node, f"Fix the chart {axis} before running it.") from exc
@@ -1694,6 +1709,10 @@ class BuildEngine:
                 return db.conn().sql(
                     f"SELECT {xq} AS x, {yq} AS y FROM {quote_identifier(v)}"
                 )
+            if sq is not None:
+                # Series is semantic: collapse high cardinality to top-12 + Other before persist so
+                # retained results, exports, and the renderer share one bounded contract.
+                return _chart_series_relation(v, xq=xq, yq=yq, sq=sq, agg=agg)
             yexpr = "count(*)" if agg == "count" or not yq else f"{_agg_name(agg)}({yq})"
             # Grouped series is a real dataset output, so the durable artifact must retain every group.
             # The interactive chart renderer owns its explicit 2,000-point display budget; imposing the
@@ -2144,6 +2163,60 @@ def _agg_name(agg: str) -> str:
     if a not in _AGG_ALLOWED:
         raise ValueError(f"unsupported aggregate '{agg}' (allowed: {', '.join(sorted(_AGG_ALLOWED))})")
     return {"mean": "avg"}.get(a, a)
+
+
+# Bounded Series / Color by contract for aggregated Charts. Ranking uses total absolute measure so
+# the top named series are stable across chart types; remainder collapses to an explicit Other label
+# before the result is persisted.
+CHART_SERIES_LIMIT = 12
+CHART_SERIES_OTHER = "Other"
+CHART_SERIES_BLANK = "(blank)"
+
+
+def _chart_series_relation(view_name: str, *, xq: str, yq: str | None, sq: str, agg: str) -> Relation:
+    blank = _sql_str(CHART_SERIES_BLANK)
+    other = _sql_str(CHART_SERIES_OTHER)
+    series_raw = (
+        f"COALESCE(NULLIF(TRIM(CAST(({sq}) AS VARCHAR)), ''), '{blank}')"
+    )
+    if agg == "count" or not yq:
+        base_select = f"SELECT ({xq}) AS x, {series_raw} AS series_raw FROM {quote_identifier(view_name)}"
+        weight_expr = "COUNT(*)::DOUBLE"
+        value_expr = "COUNT(*)"
+    else:
+        base_select = (
+            f"SELECT ({xq}) AS x, {series_raw} AS series_raw, ({yq}) AS y_val "
+            f"FROM {quote_identifier(view_name)}"
+        )
+        weight_expr = "COALESCE(SUM(ABS(TRY_CAST(y_val AS DOUBLE))), 0)::DOUBLE"
+        value_expr = f"{_agg_name(agg)}(y_val)"
+    sql = f"""
+WITH base AS (
+  {base_select}
+),
+weights AS (
+  SELECT series_raw, {weight_expr} AS weight
+  FROM base
+  GROUP BY series_raw
+),
+ranked AS (
+  SELECT series_raw,
+         ROW_NUMBER() OVER (ORDER BY weight DESC NULLS LAST, series_raw ASC) AS rn
+  FROM weights
+),
+labeled AS (
+  SELECT b.x,
+         CASE WHEN r.rn <= {CHART_SERIES_LIMIT} THEN b.series_raw ELSE '{other}' END AS series
+         {"" if agg == "count" or not yq else ", b.y_val"}
+  FROM base b
+  INNER JOIN ranked r USING (series_raw)
+)
+SELECT x, series, TRY_CAST(({value_expr}) AS DOUBLE) AS y
+FROM labeled
+GROUP BY x, series
+ORDER BY x, series
+"""
+    return db.conn().sql(sql)
 
 
 _CHART_NESTED_OR_BINARY = re.compile(r"(?:LIST|ARRAY|STRUCT|MAP|UNION|BLOB|BIT)", re.I)
