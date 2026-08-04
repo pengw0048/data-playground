@@ -24,6 +24,13 @@ import { examples } from '../examples'
 import { parseDatasetViewerReturn, type ParsedDatasetViewerReturn } from '../router'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 import { DatasetLineageSummary } from '../components/DatasetLineageSummary'
+import {
+  browseStateFromQuery,
+  serializeBrowseState,
+  type WorkspaceBrowseKind,
+  type WorkspaceBrowseSortMode,
+  type WorkspaceBrowseViewMode,
+} from '../workspaceBrowseQuery'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
@@ -516,6 +523,8 @@ function WorkspaceMixedExplorer() {
   const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
   const searchQuery = useStore((s) => s.workspaceSearchQuery)
   const setWorkspaceSearchQuery = useStore((s) => s.setWorkspaceSearchQuery)
+  const browseQuery = useStore((s) => s.workspaceBrowseQuery)
+  const setWorkspaceBrowseQuery = useStore((s) => s.setWorkspaceBrowseQuery)
   const openFile = useStore((s) => s.openFile)
   const select = useStore((s) => s.select)
   const activateLoadedCanvasRoute = useStore((s) => s.activateLoadedCanvasRoute)
@@ -555,10 +564,23 @@ function WorkspaceMixedExplorer() {
   const [hasMore, setHasMore] = useState(false)
   const [pageCursors, setPageCursors] = useState<(string | null)[]>([null])
   const [pageIndex, setPageIndex] = useState(0)
-  const [viewMode, setViewMode] = useState<'list' | 'grid'>('list')
-  const [sortMode, setSortMode] = useState<'source' | 'name-asc' | 'name-desc' | 'updated-desc' | 'updated-asc'>('source')
-  const [kindFilter, setKindFilter] = useState<'all' | 'container' | 'canvas' | 'dataset' | 'dataset_view'>('all')
   const [selectedResourceIds, setSelectedResourceIds] = useState<Set<string>>(new Set())
+  const { sortMode, kindFilter, viewMode } = useMemo(
+    () => browseStateFromQuery(browseQuery),
+    [browseQuery],
+  )
+  const commitBrowseState = (next: {
+    sortMode?: WorkspaceBrowseSortMode
+    kindFilter?: WorkspaceBrowseKind | 'all'
+    viewMode?: WorkspaceBrowseViewMode
+  }) => {
+    setWorkspaceBrowseQuery(serializeBrowseState({
+      sortMode: next.sortMode ?? sortMode,
+      kindFilter: next.kindFilter ?? kindFilter,
+      viewMode: next.viewMode ?? viewMode,
+    }))
+    setSelectedResourceIds(new Set())
+  }
   const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
   const [sources, setSources] = useState<WorkspaceSourceStatus[]>([])
   const [loading, setLoading] = useState(true)
@@ -656,8 +678,8 @@ function WorkspaceMixedExplorer() {
         ? LOCAL_QUERY_CAPABILITIES
         : { sort: [], kindFilter: false, reason: "Sorting and type filters aren't available for this source." })
       setQueryCapabilities(capabilities)
-      if (!capabilities.sort.length && sortMode !== 'source') setSortMode('source')
-      if (!capabilities.kindFilter && kindFilter !== 'all') setKindFilter('all')
+      // Unsupported sort/kind stay in the committed URL projection so a later local container can
+      // restore them. Only the request/UI clamp to what this source can honor.
       if (!page.container) {
         const unavailable = page.sources?.map(statusMessage).find(Boolean)
           ?? 'Workspace source is unavailable'
@@ -1154,8 +1176,7 @@ function WorkspaceMixedExplorer() {
 
       {!searchQuery && !loading && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
         {sortSupported && <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
-          setSortMode(event.target.value as typeof sortMode)
-          setSelectedResourceIds(new Set())
+          commitBrowseState({ sortMode: event.target.value as WorkspaceBrowseSortMode })
         }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="source">Default order</option>
@@ -1165,8 +1186,7 @@ function WorkspaceMixedExplorer() {
           <option value="updated-asc">Least recently updated</option>
         </select>}
         {kindFilterSupported && <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
-          setKindFilter(event.target.value as typeof kindFilter)
-          setSelectedResourceIds(new Set())
+          commitBrowseState({ kindFilter: event.target.value as WorkspaceBrowseKind | 'all' })
         }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="all">All types</option>
@@ -1176,9 +1196,7 @@ function WorkspaceMixedExplorer() {
           <option value="dataset_view">Saved views</option>
         </select>}
         {error && (sortMode !== 'source' || kindFilter !== 'all') && <button type="button" onClick={() => {
-          setSortMode('source')
-          setKindFilter('all')
-          setSelectedResourceIds(new Set())
+          commitBrowseState({ sortMode: 'source', kindFilter: 'all' })
         }} className="rounded-md border border-border px-2 py-1 font-semibold text-primary hover:bg-accent">Reset view</button>}
         {!error && <>
         <label className="inline-flex cursor-pointer items-center gap-2 text-muted-foreground">
@@ -1208,7 +1226,7 @@ function WorkspaceMixedExplorer() {
         <span className="flex-1" />
         <div role="group" aria-label="Workspace view" className="flex rounded-md border border-border bg-background p-0.5">
           {(['list', 'grid'] as const).map((mode) => <button key={mode} type="button" aria-pressed={viewMode === mode}
-            onClick={() => setViewMode(mode)} className={`rounded px-2 py-1 text-[11px] font-semibold capitalize ${viewMode === mode ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>{mode}</button>)}
+            onClick={() => commitBrowseState({ viewMode: mode })} className={`rounded px-2 py-1 text-[11px] font-semibold capitalize ${viewMode === mode ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>{mode}</button>)}
         </div>
       </div>}
 
@@ -2320,6 +2338,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   const workspaceScope = useStore((state) => state.workspaceScope)
   const workspaceSearchQuery = useStore((state) => state.workspaceSearchQuery)
   const workspaceDatasetQuery = useStore((state) => state.workspaceDatasetQuery)
+  const workspaceBrowseQuery = useStore((state) => state.workspaceBrowseQuery)
   const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
   const [canonicalContextError, setCanonicalContextError] = useState<string | null>(null)
   const [canonicalContextRevision, setCanonicalContextRevision] = useState(0)
@@ -2380,6 +2399,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
         scope: workspaceScope,
         workspaceQuery: workspaceSearchQuery,
         datasetQuery: workspaceDatasetQuery,
+        browseQuery: workspaceBrowseQuery,
       },
     })
   }

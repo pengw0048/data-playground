@@ -28,6 +28,74 @@ describe('Workspace routes', () => {
     })
   })
 
+  it('round-trips committed Workspace browse projection without pagination cursors', () => {
+    const browse = 'wq=1&sort=name&order=asc&kind=canvas&view=grid'
+    window.location.hash = routeHash(
+      'workspace', undefined, 'container:folder-1', 'robot', undefined, undefined, undefined,
+      'all', undefined, undefined, undefined, undefined, undefined, undefined, browse,
+    )
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceResourceId: 'container:folder-1',
+      workspaceQuery: 'robot',
+      workspaceBrowseQuery: browse,
+    })
+    expect(window.location.hash).not.toMatch(/cursor=/i)
+  })
+
+  it('canonicalizes malformed browse projection values without breaking the route', () => {
+    window.location.hash = '#/workspace?view=tiles&sort=bogus&order=asc&kind=canvas'
+    expect(parseHash()).toEqual({
+      view: 'workspace',
+      workspaceBrowseQuery: 'wq=1&kind=canvas',
+      canonicalHash: '#/workspace?wq=1&kind=canvas',
+    })
+  })
+
+  it('preserves legacy Workspace URLs and keeps datasets-scope sort out of browse projection', () => {
+    window.location.hash = '#/workspace'
+    expect(parseHash()).toEqual({ view: 'workspace' })
+
+    const datasetQuery = new URLSearchParams({
+      dq: 'robot', sort: 'updated', order: 'desc',
+    }).toString()
+    window.location.hash = routeHash(
+      'workspace', undefined, 'dataset:x', undefined, undefined, undefined, undefined,
+      'datasets', datasetQuery,
+    )
+    expect(parseHash()).toEqual({
+      view: 'workspace', workspaceResourceId: 'dataset:x', workspaceScope: 'datasets',
+      workspaceDatasetQuery: datasetQuery,
+    })
+    expect(parseHash().workspaceBrowseQuery).toBeUndefined()
+  })
+
+  it('round-trips Relationships return browse projection', () => {
+    window.location.hash = relationshipsHash({
+      focusDatasetId: 'dataset:1',
+      mode: 'lineage',
+      returnTo: {
+        resourceId: 'container:folder-1',
+        scope: 'all',
+        workspaceQuery: 'robot',
+        browseQuery: 'wq=1&view=grid',
+      },
+    })
+    expect(parseHash()).toEqual({
+      view: 'relationships',
+      relationshipsContext: {
+        focusDatasetId: 'dataset:1',
+        mode: 'lineage',
+        returnTo: {
+          resourceId: 'container:folder-1',
+          scope: 'all',
+          workspaceQuery: 'robot',
+          browseQuery: 'wq=1&view=grid',
+        },
+      },
+    })
+  })
+
   it('round-trips Datasets scope state without reusing the mixed-search query', () => {
     const resourceId = 'dataset:registration/with spaces'
     const datasetQuery = new URLSearchParams({
@@ -252,6 +320,78 @@ describe('Workspace routes', () => {
     })
   })
 
+  it('pushes distinct Workspace browse decisions and restores them through Back/Forward', async () => {
+    const state = {
+      view: 'workspace' as DpView,
+      doc: { id: 'canvas-current', nodes: [] as { id: string }[] }, selectedId: null as string | null,
+      workspaceResourceId: null as string | null,
+      workspaceSearchQuery: '',
+      workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '',
+      workspaceBrowseQuery: '',
+      jobsQuery: '', inboxQuery: '', transformResourceId: null as string | null,
+      transformVersion: null as string | null, transformUpgradeCanvasId: null as string | null,
+      transformUpgradeNodeId: null as string | null, transformLibraryQuery: '',
+    }
+    const subscribers = new Set<(snapshot: typeof state) => void>()
+    const publish = () => { for (const subscriber of subscribers) subscriber(state) }
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: (route: {
+          view: DpView
+          workspaceResourceId?: string
+          workspaceQuery?: string
+          workspaceBrowseQuery?: string
+          workspaceDatasetQuery?: string
+          workspaceScope?: 'all' | 'datasets'
+        }) => {
+          if (route.view !== 'workspace') {
+            state.view = route.view
+            publish()
+            return
+          }
+          state.view = 'workspace'
+          state.workspaceResourceId = route.workspaceResourceId ?? null
+          state.workspaceSearchQuery = route.workspaceQuery ?? ''
+          state.workspaceBrowseQuery = route.workspaceBrowseQuery ?? ''
+          state.workspaceDatasetQuery = route.workspaceDatasetQuery ?? ''
+          state.workspaceScope = route.workspaceScope ?? 'all'
+          publish()
+        },
+        select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(),
+        requestViewportFit: vi.fn(), pushToast: vi.fn(), openFile: vi.fn(async () => false),
+      }),
+      subscribe: (subscriber: (snapshot: typeof state) => void) => {
+        subscribers.add(subscriber)
+        return () => { subscribers.delete(subscriber) }
+      },
+    }
+    history.replaceState(null, '', '#/workspace')
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+
+    state.workspaceBrowseQuery = 'wq=1&view=grid'
+    publish()
+    await vi.waitFor(() => expect(location.hash).toBe('#/workspace?wq=1&view=grid'))
+
+    state.workspaceBrowseQuery = 'wq=1&sort=name&order=asc&view=grid'
+    publish()
+    await vi.waitFor(() => expect(location.hash).toBe('#/workspace?wq=1&sort=name&order=asc&view=grid'))
+
+    history.back()
+    await vi.waitFor(() => {
+      expect(state.workspaceBrowseQuery).toBe('wq=1&view=grid')
+      expect(location.hash).toBe('#/workspace?wq=1&view=grid')
+    })
+    history.forward()
+    await vi.waitFor(() => {
+      expect(state.workspaceBrowseQuery).toBe('wq=1&sort=name&order=asc&view=grid')
+      expect(location.hash).toBe('#/workspace?wq=1&sort=name&order=asc&view=grid')
+    })
+  })
+
   it('does not let a stale invalid Canvas route clear a newer node reveal', async () => {
     let resolveOldOpen!: (opened: boolean) => void
     const oldOpen = new Promise<boolean>((resolve) => { resolveOldOpen = resolve })
@@ -262,7 +402,7 @@ describe('Workspace routes', () => {
       workspaceResourceId: null,
       workspaceSearchQuery: '',
       workspaceScope: 'all' as const,
-      workspaceDatasetQuery: '',
+      workspaceDatasetQuery: '', workspaceBrowseQuery: '',
       jobsQuery: '', inboxQuery: '', transformResourceId: null, transformVersion: null,
       transformUpgradeCanvasId: null, transformUpgradeNodeId: null, transformLibraryQuery: '',
       nodeRevealRequest: null as { canvasId: string; nodeId: string } | null,
@@ -336,7 +476,7 @@ describe('Workspace routes', () => {
       view: 'canvas' as DpView,
       doc: { id: 'canvas-a', nodes: [] as { id: string }[] }, selectedId: null as string | null,
       workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
-      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      workspaceDatasetQuery: '', workspaceBrowseQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
       transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
       transformLibraryQuery: '',
     }
@@ -395,7 +535,7 @@ describe('Workspace routes', () => {
       view: 'jobs' as DpView,
       doc: { id: 'canvas-current', nodes: [{ id: 'step-1' }] }, selectedId: null as string | null,
       workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
-      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      workspaceDatasetQuery: '', workspaceBrowseQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
       transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
       transformLibraryQuery: '',
     }
@@ -425,7 +565,7 @@ describe('Workspace routes', () => {
       view: 'canvas' as DpView,
       doc: { id: 'canvas-current', nodes: [] as { id: string }[] }, selectedId: null as string | null,
       workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
-      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      workspaceDatasetQuery: '', workspaceBrowseQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
       transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
       transformLibraryQuery: '',
     }
