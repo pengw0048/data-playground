@@ -79,3 +79,89 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
   }
 })
+
+test('Chart presentation type redraws without invalidating or rerunning', async ({ page }) => {
+  const canvasId = `chart-presentation-${Date.now()}`
+  try {
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Chart presentation', version: 1, requirements: [],
+      nodes: [
+        { id: 'source', type: 'source', position: { x: 80, y: 160 }, data: {
+          title: 'Events', status: 'draft', config: { uri: 'events' }, history: [],
+        } },
+        { id: 'chart', type: 'chart', position: { x: 390, y: 160 }, data: {
+          title: 'Events chart', status: 'draft',
+          config: { chartType: 'bar', agg: 'count', xMode: 'column', x: 'event' }, history: [],
+        } },
+      ],
+      edges: [{ id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' } }],
+    } })
+    expect(created.ok(), await created.text()).toBe(true)
+
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    const chart = page.locator('.react-flow__node-chart')
+    await expect(chart).toBeVisible()
+    await expect(chart.getByRole('combobox', { name: 'X column' })).toHaveValue('event', { timeout: 15_000 })
+
+    await chart.getByText('Events chart', { exact: true }).click()
+    await chart.getByRole('button', { name: 'Run up to here' }).click()
+    await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
+    await expect(chart).toContainText('4 rows', { timeout: 15_000 })
+    await page.getByRole('button', { name: 'Close' }).click()
+    await chart.getByRole('button', { name: 'View chart result' }).click()
+    await expect(page.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
+    await expect(chart.locator('[title="latest"]')).toBeVisible()
+
+    const runPosts: string[] = []
+    const previewPosts: string[] = []
+    const planPosts: string[] = []
+    await page.route('**/api/run**', async (route) => {
+      const request = route.request()
+      if (request.method() !== 'POST') {
+        await route.continue()
+        return
+      }
+      const url = request.url()
+      const path = new URL(url).pathname
+      if (path.includes('/api/run/preview')) previewPosts.push(url)
+      else if (
+        path.includes('/api/run/estimate')
+        || path.includes('/api/run/write-admission')
+        || path.includes('/api/run/retained-result')
+        || path.includes('/api/execution-manifest')
+      ) {
+        planPosts.push(url)
+      } else if (path === '/api/run' || path === '/api/run/') {
+        runPosts.push(url)
+      }
+      await route.continue()
+    })
+
+    for (const [value, label] of [
+      ['line', 'line chart, saved result'],
+      ['scatter', 'scatter chart, saved result'],
+      ['area', 'area chart, saved result'],
+      ['bar', 'bar chart, saved result'],
+    ] as const) {
+      await chart.getByLabel('Chart').selectOption(value)
+      await expect(page.getByRole('img', { name: label })).toBeVisible()
+      await expect(chart.locator('[title="latest"]')).toBeVisible()
+      await expect(chart).toContainText('4 rows')
+    }
+
+    expect(runPosts).toEqual([])
+    expect(previewPosts).toEqual([])
+    expect(planPosts).toEqual([])
+
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      const graph = await response.json() as {
+        nodes: Array<{ id: string; data: { status: string; config: Record<string, unknown> } }>
+      }
+      const node = graph.nodes.find((item) => item.id === 'chart')
+      return [node?.data.status, node?.data.config.chartType]
+    }).toEqual(['latest', 'bar'])
+  } finally {
+    await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+  }
+})

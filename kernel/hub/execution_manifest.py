@@ -146,6 +146,11 @@ def _canonical_graph(
             # execution, so it must not fork durable execution identity.
             config = {key: value for key, value in config.items() if key != "scope"}
             data["config"] = config
+        if node.type == "chart":
+            # chartType is presentation-only (Bars/Line/Points/Area). The engine computes the same
+            # (x, y) series from agg/axis fields; keep visual type out of execution identity.
+            config = {key: value for key, value in config.items() if key != "chartType"}
+            data["config"] = config
         if node.type == "transform" and config.get("source") == "library":
             # The exact promoted `(id, version)` is the durable definition. Never retain a stale
             # inline body as a second, hidden persistence or replay path.

@@ -386,8 +386,32 @@ function compareIdentityText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0
 }
 
+// Presentation-only Chart fields. The engine computes the same (x, y) series from agg/axis modes
+// and expressions; the renderer alone consumes chartType. Keep this list next to the projection
+// seam so identity and invalidation stay aligned without a broader node-kind registry.
+const CHART_PRESENTATION_CONFIG_KEYS = new Set(['chartType'])
+
+function presentationOnlyConfigKeys(nodeType: string): ReadonlySet<string> | null {
+  return nodeType === 'chart' ? CHART_PRESENTATION_CONFIG_KEYS : null
+}
+
+function isPresentationOnlyConfigPatch(
+  node: CanvasDoc['nodes'][number],
+  patch: NodeConfig,
+): boolean {
+  const keys = presentationOnlyConfigKeys(node.type)
+  if (!keys) return false
+  const patchKeys = Object.keys(patch)
+  return patchKeys.length > 0 && patchKeys.every((key) => keys.has(key))
+}
+
 function executionConfig(node: CanvasDoc['nodes'][number]): Record<string, unknown> {
   const config = node.data.config
+  if (node.type === 'chart' && 'chartType' in config) {
+    // chartType switches Bars/Line/Points/Area without changing the retained (x, y) relation.
+    const { chartType: _chartType, ...semanticConfig } = config
+    return semanticConfig
+  }
   if (node.type !== 'transform' || !('scope' in config)) return config
   // `scope` was a display-only Transform label. Legacy documents may retain it, but it cannot
   // stale previews or fork profile/write identity because execution never reads it.
@@ -1923,9 +1947,17 @@ function mutateNodeConfig(
   replacementTitle?: string,
 ) {
   if (!roleCanEdit(get().canvasRole)) return
-  // A metadata request launched for the previous configuration must not repopulate the size or
-  // schema we clear below while the debounced refresh for this edit is still waiting to start.
-  _schemaSeq += 1
+  const existing = get().doc.nodes.find((node) => node.id === id)
+  // Presentation-only Chart edits (chartType) must stay saved/undoable/collaborative without
+  // marking the Chart or its downstream cone stale, bumping schema, or invalidating admissions.
+  const presentationOnly = existing != null
+    && replacementTitle === undefined
+    && isPresentationOnlyConfigPatch(existing, config)
+  if (!presentationOnly) {
+    // A metadata request launched for the previous configuration must not repopulate the size or
+    // schema we clear below while the debounced refresh for this edit is still waiting to start.
+    _schemaSeq += 1
+  }
   if (replacementTitle !== undefined) {
     // Choosing a dataset is one user action. Keep the binding and visible title in one history
     // checkpoint so Undo can never expose a new binding under the previous dataset name.
@@ -1939,6 +1971,14 @@ function mutateNodeConfig(
     _cfgEdit = { id, t: now }
   }
   set((s) => {
+    if (presentationOnly) {
+      const nodes: CanvasNode[] = s.doc.nodes.map((n) => (
+        n.id === id
+          ? { ...n, data: { ...n.data, config: { ...n.data.config, ...config } } }
+          : n
+      ))
+      return { doc: { ...s.doc, nodes } }
+    }
     const stale = downstream(s.doc, id)
     const nodes: CanvasNode[] = s.doc.nodes.map((n) => {
       if (n.id === id) {

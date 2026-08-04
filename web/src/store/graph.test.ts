@@ -2414,6 +2414,50 @@ describe('graph store — core authority ops', () => {
     expect(profilePlanIdentity(legacyScope, 'transform')).toBe(profilePlanIdentity(doc, 'transform'))
   })
 
+  it('treats Chart chartType as presentation-only for identity and freshness', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    source.data.status = 'latest'
+    const chart = NODE('chart', 'chart')
+    chart.data.config = {
+      chartType: 'bar', agg: 'count', xMode: 'column', yMode: 'column', x: 'event',
+    }
+    chart.data.status = 'latest'
+    const downstreamFilter = NODE('downstream', 'filter')
+    downstreamFilter.data.config = { predicate: 'y > 0' }
+    downstreamFilter.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [],
+      nodes: [source, chart, downstreamFilter],
+      edges: [
+        { id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' as const } },
+        { id: 'chart-downstream', source: 'chart', target: 'downstream', data: { wire: 'dataset' as const } },
+      ],
+    }
+    useStore.setState({ doc, canvasRole: 'owner', sizes: { chart: 4, downstream: 2 } })
+
+    const identity = previewPlanIdentity(doc, 'chart')
+    expect(profilePlanIdentity(doc, 'chart')).toBe(identity)
+
+    for (const chartType of ['line', 'scatter', 'area'] as const) {
+      useStore.getState().updateConfig('chart', { chartType })
+      const next = useStore.getState().doc
+      expect(previewPlanIdentity(next, 'chart')).toBe(identity)
+      expect(profilePlanIdentity(next, 'chart')).toBe(identity)
+      expect(next.nodes.find((node) => node.id === 'chart')).toMatchObject({
+        data: { status: 'latest', config: { chartType } },
+      })
+      expect(next.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('latest')
+      expect(useStore.getState().sizes).toEqual({ chart: 4, downstream: 2 })
+    }
+
+    useStore.getState().updateConfig('chart', { agg: 'sum', y: 'amount' })
+    const afterSemantic = useStore.getState().doc
+    expect(previewPlanIdentity(afterSemantic, 'chart')).not.toBe(identity)
+    expect(afterSemantic.nodes.find((node) => node.id === 'chart')?.data.status).toBe('stale')
+    expect(afterSemantic.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('stale')
+  })
+
   it('keeps an in-flight profile attached across an unrelated branch edit', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }
