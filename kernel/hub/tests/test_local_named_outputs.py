@@ -78,6 +78,17 @@ class _Engine:
         return dict(self._relations)
 
 
+class _TerminalLeafEngine(_Engine):
+    def __init__(self, relations: dict[str, dict[str, _Relation]]):
+        self._relations_by_node = relations
+
+    def build(self, node_id: str):
+        return self._relations_by_node[node_id]
+
+    def relations(self, node_id: str):
+        return dict(self._relations_by_node[node_id])
+
+
 class _Adapter:
     def __init__(self):
         self.writes: list[str] = []
@@ -205,6 +216,92 @@ def test_local_runner_publishes_and_recovers_complete_named_output_set(
 
         recovered = RunStatus.model_validate(metadb.get_run_state(final.run_id))
         assert recovered.outputs == final.outputs and recovered.total_rows is None
+    finally:
+        storage.close()
+        metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_whole_graph_run_retains_each_terminal_leaf_without_intermediates(
+        tmp_path, monkeypatch):
+    token = uuid.uuid4().hex
+    user_id, canvas_id = f"user-{token}", f"canvas-{token}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=user_id, name="Terminal leaf test"))
+        session.flush()
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id=user_id,
+            name="Terminal leaf test",
+            version=1,
+            doc="{}",
+        ))
+    graph = Graph(
+        id=canvas_id,
+        nodes=[
+            GraphNode(id="intermediate", type="section", data={"config": {}}),
+            GraphNode(
+                id="left-leaf", type="section",
+                data={"config": {"outputs": ["left"]}},
+            ),
+            GraphNode(
+                id="right-leaf", type="section",
+                data={"config": {"outputs": ["right"]}},
+            ),
+        ],
+        edges=[
+            {"id": "intermediate-left", "source": "intermediate", "target": "left-leaf"},
+            {"id": "intermediate-right", "source": "intermediate", "target": "right-leaf"},
+        ],
+    )
+    plan = CompilePlan(
+        steps=[
+            PlanStep(node_id="intermediate", kind="section", label="Intermediate"),
+            PlanStep(node_id="left-leaf", kind="section", label="Left"),
+            PlanStep(node_id="right-leaf", kind="section", label="Right"),
+        ],
+    )
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    adapter = _Adapter()
+    runner = LocalRunner(
+        lambda _uri: adapter,
+        {},
+        object(),
+        str(tmp_path),
+        node_specs=SPECS,
+        storage=storage,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "BuildEngine",
+        lambda *_args, **_kwargs: _TerminalLeafEngine({
+            "intermediate": {"out": _Relation("out", 5)},
+            "left-leaf": {"left": _Relation("left", 2)},
+            "right-leaf": {"right": _Relation("right", 3)},
+        }),
+    )
+    runner.on_status = lambda saved_graph, status: metadb.save_run_state(
+        status.run_id,
+        status.model_dump(),
+        canvas_id=saved_graph.id,
+        publish_region=status.status in ("done", "failed"),
+    )
+    try:
+        started = runner.run(
+            plan, graph, None, "local", run_id=f"run-{uuid.uuid4().hex}")
+        final = _wait_terminal(runner, started.run_id)
+
+        assert final.status == "done" and final.target_node_id is None
+        assert [(output.node_id, output.port_id, output.rows) for output in final.outputs] == [
+            ("left-leaf", "left", 2),
+            ("right-leaf", "right", 3),
+        ]
+        assert "intermediate" not in {output.node_id for output in final.outputs}
+        recovered = RunStatus.model_validate(metadb.get_run_state(final.run_id))
+        assert recovered.outputs == final.outputs
+        assert metadb.retained_run_output_candidates(
+            canvas_id, "left-leaf", "left")[0]["run_id"] == final.run_id
+        assert metadb.retained_run_output_candidates(
+            canvas_id, "right-leaf", "right")[0]["run_id"] == final.run_id
     finally:
         storage.close()
         metadb.delete_canvas_cascade(canvas_id)

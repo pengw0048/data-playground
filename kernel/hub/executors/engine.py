@@ -534,6 +534,11 @@ class BuildEngine:
         # a node builds either one Relation (single output) or a dict of named output ports
         # (multi-output — e.g. a section that emit()s several named result sets)
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
+        # Some adapters expose a one-shot Arrow reader. A full graph may legitimately fan one output
+        # into several downstream branches, so reuse at that boundary must be execution-local and
+        # replayable. Only actual fan-out ports are spooled; ordinary intermediates remain lazy and
+        # terminal-result retention is handled separately by the runner.
+        self._fanout_relations: dict[tuple[str, str], Relation] = {}
         self._prepared_nodes: set[str] = set()
         self._prepared_states: dict[str, object] = {}
         self._delivered_prepared_states: set[str] = set()
@@ -553,6 +558,7 @@ class BuildEngine:
                     continue
                 self._execution_node_ids.add(current)
                 pending.extend(parents.get(current, ()))
+        self._fanout_output_keys = self._execution_fanout_output_keys()
         if self.schema_only:
             from hub.local_run_inputs import prepared_ancestor_source_node_ids
             self._prepared_ancestor_source_ids = prepared_ancestor_source_node_ids(
@@ -576,12 +582,78 @@ class BuildEngine:
         node = self._nodes[node_id]
         if handle is not None:
             if handle in relations:
-                return relations[handle]
+                return self._replayable_fanout_relation(node_id, handle, relations[handle])
             raise NotPreviewable(node, f"output port '{handle}' was not produced")
         if len(relations) == 1:
-            return next(iter(relations.values()))
+            port_id, relation = next(iter(relations.items()))
+            return self._replayable_fanout_relation(node_id, port_id, relation)
         raise NotPreviewable(
             node, "select an output port for this multi-output node")
+
+    def _execution_fanout_output_keys(self) -> set[tuple[str, str]]:
+        """Ports read by multiple branches in this execution cone.
+
+        Full-run adapters may return streaming Arrow readers that cannot be scanned twice. Materialize
+        only these branch points, never every intermediate node. Targeted runs count only their
+        ancestor cone; previews retain their existing bounded, in-memory behavior.
+        """
+        if not self.full or self.schema_only:
+            return set()
+        counts: dict[tuple[str, str], int] = {}
+        for edge in self.graph.edges:
+            source = self._nodes.get(edge.source)
+            target = self._nodes.get(edge.target)
+            if (
+                source is None or target is None
+                or source.id not in self._execution_node_ids
+                or target.id not in self._execution_node_ids
+                or _disabled(source) or _disabled(target)
+            ):
+                continue
+            if self.node_specs and source.type in self.node_specs:
+                port_id = g.require_output_port(
+                    self.graph, source.id, self.node_specs, edge.source_handle).id
+            else:
+                port_id = edge.source_handle or "out"
+            # A multi-output builder may derive several lazy queries from its one input even though
+            # the canvas shows only one edge (Assert's pass/violations ports are the built-in example).
+            # Treat that input as a fan-out boundary as well so every derived query sees the same rows.
+            target_outputs = (
+                g.effective_output_ports_for_node(target, self.node_specs[target.type])
+                if self.node_specs and target.type in self.node_specs else []
+            )
+            consumers = 2 if len(target_outputs) > 1 else 1
+            key = (str(source.id), str(port_id))
+            counts[key] = counts.get(key, 0) + consumers
+        return {key for key, count in counts.items() if count > 1}
+
+    def _replayable_fanout_relation(
+            self, node_id: str, port_id: str, relation: Relation) -> Relation:
+        key = (str(node_id), str(port_id))
+        if key not in self._fanout_output_keys:
+            return relation
+        cached = self._fanout_relations.get(key)
+        if cached is not None:
+            return cached
+
+        # Parquet keeps this bounded by the filesystem rather than Python memory and gives each branch
+        # an independent scan. The runner owns spill_files and removes the artifact in its finally.
+        import os
+        spill_dir = os.path.join(_spill_root(), "fanout")
+        os.makedirs(spill_dir, exist_ok=True)
+        path = os.path.join(spill_dir, f"{db.unique_view('fanout')}.parquet")
+        try:
+            relation.write_parquet(path)
+        except BaseException:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        self.spill_files.append(path)
+        replayable = db.conn().read_parquet(path)
+        self._fanout_relations[key] = replayable
+        return replayable
 
     def relations(self, node_id: str) -> dict[str, Relation]:
         """Return every effective output in declaration order.

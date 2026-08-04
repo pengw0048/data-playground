@@ -32,10 +32,11 @@ from hub.plugins.runner import (
 from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
 from hub.run_outputs import (
     discard_unpublished_outputs,
-    expected_run_outputs,
+    expected_plan_run_outputs,
     outputs_cache_document,
     preflight_output_table,
     preflight_run_output_target,
+    replace_output,
     require_single_run_output,
     settle_uncommitted_outputs,
     sole_output,
@@ -392,7 +393,7 @@ class SubprocessRunner:
             cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
             title = node.data.get("title") if isinstance(node.data, dict) else None
             spec = SinkSpec.from_config(cfg, title)
-            preflight_output_table(status, spec.name)
+            preflight_output_table(status, spec.name, node_id=step.node_id)
             if self.resolve_adapter is None:
                 target_uri = spec.target_uri(self.workspace, self.storage)
                 if is_object_uri(target_uri) or spec.partition_by:
@@ -467,10 +468,10 @@ class SubprocessRunner:
     def _set_catalog_output_version(
             status: RunStatus, output: RunOutput, version: str | None) -> None:
         """Replace the child-reported catalog identity with the parent's exact receipt."""
-        status.outputs = [RunOutput.model_validate({
+        replace_output(status, RunOutput.model_validate({
             **output.model_dump(),
             "version": version,
-        })]
+        }))
 
     def _publish_object_sinks(self, sinks: dict[str, dict], status: RunStatus) -> None:
         if not sinks:
@@ -478,7 +479,10 @@ class SubprocessRunner:
         if len(sinks) != 1:
             raise RuntimeError("managed subprocess sink publication requires one exact sink")
         step_id, item = next(iter(sinks.items()))
-        output = sole_output(status, committed=True)
+        output = next((
+            output for output in status.outputs
+            if output.node_id == step_id and output.outcome == "committed"
+        ), None)
         if output is None or output.uri != item["uri"] or output.table != item["name"]:
             raise RuntimeError(
                 f"child returned an unexpected output binding for managed sink '{step_id}'")
@@ -508,21 +512,28 @@ class SubprocessRunner:
             placement: Placement, run_id: str | None = None,
             request_id: str | None = None, attempt_id: str | None = None,
             input_manifest: list[dict[str, str]] | None = None) -> RunStatus:
-        output_target = preflight_run_output_target(plan, target_node_id)
+        preflight_run_output_target(plan, target_node_id)
         from hub.sampling import explicit_sample_provenance
-        provenance = (explicit_sample_provenance(
-            graph, output_target, self.resolve_adapter, returned_rows=0)
-            if output_target is not None and self.resolve_adapter is not None else None)
-        expected_outputs = ([output.model_copy(update={"sample_provenance": provenance})
-                             for output in expected_run_outputs(graph, output_target, self.node_specs)]
-                            if output_target is not None else [])
+        expected_outputs = expected_plan_run_outputs(
+            plan, graph, target_node_id, self.node_specs)
+        provenance_by_node = {
+            node_id: explicit_sample_provenance(
+                graph, node_id, self.resolve_adapter, returned_rows=0)
+            for node_id in dict.fromkeys(output.node_id for output in expected_outputs)
+        } if self.resolve_adapter is not None else {}
+        expected_outputs = [
+            output.model_copy(update={
+                "sample_provenance": provenance_by_node.get(output.node_id),
+            })
+            for output in expected_outputs
+        ]
         from hub.backends import require_destination_credential_support
         require_destination_credential_support(self, plan, graph, self.workspace)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         _ = attempt_id  # OPS-01 port parity; managed publication stamps attempts itself
         status = RunStatus(run_id=run_id, status="queued", placement="local", per_node=per,
-                           target_node_id=output_target, request_id=request_id,
+                           target_node_id=(target_node_id or plan.target_node_id), request_id=request_id,
                            outputs=expected_outputs)
         job_extra: dict = {"runId": run_id}
         from hub.local_run_inputs import LocalRunInputError, source_nodes, validate_manifest_graph
@@ -560,8 +571,11 @@ class SubprocessRunner:
             job_extra["sinkAttempts"] = {
                 step_id: item["uri"] for step_id, item in object_sinks.items()}
 
-            target = next((node for node in graph.nodes if node.id == output_target), None)
-            if target is not None and target.type != "write":
+            result_outputs = [
+                output for output in expected_outputs
+                if output.publication_kind == "result"
+            ]
+            if result_outputs:
                 begin_local = getattr(self.storage, "begin_result", None)
                 if callable(begin_local):
                     if self.on_status is None:
@@ -578,7 +592,7 @@ class SubprocessRunner:
                         "results": reservations, "cache_key": phash if cacheable else None,
                         "run_state_owner": True,
                     }
-                    for index, output in enumerate(expected_outputs):
+                    for index, output in enumerate(result_outputs):
                         result_uri = begin_local(
                             f"{phash}:{output.node_id}:{output.port_id}:{index}", run_id)
                         reservation = {
@@ -620,8 +634,8 @@ class SubprocessRunner:
                         "results": results, "cache_key": phash if cacheable else None,
                         "run_state_owner": True,
                     }
-                    for index, output in enumerate(expected_outputs):
-                        name = (f"__result_{phash}" if len(expected_outputs) == 1
+                    for index, output in enumerate(result_outputs):
+                        name = (f"__result_{phash}" if len(result_outputs) == 1
                                 else f"__result_{phash}_{index:02d}")
                         logical_uri = self.storage.output_uri(name, ".parquet")
                         allocation_key = (
@@ -1189,7 +1203,10 @@ class SubprocessRunner:
         if local_result is not None and st is not None:
             cancelled = run_id in self._cancelled
             reservations = local_result["results"]
-            child_outputs = st.outputs
+            child_outputs = [
+                output for output in st.outputs
+                if output.publication_kind == "result"
+            ]
             committed_count = 0
             valid_child_commit = (
                 not cancelled and proc.returncode == 0
@@ -1235,12 +1252,13 @@ class SubprocessRunner:
                     st.status = "failed"
                     st.error = "parent local-result commit failed"
                     preserved = {
-                        output.port_id: output for output in st.outputs
+                        (output.node_id, output.port_id): output for output in st.outputs
                         if output.outcome == "committed" and output.uri in local_result_committed}
                     discard_unpublished_outputs(st, "failed", st.error)
                     for index, output in enumerate(st.outputs):
-                        if output.port_id in preserved:
-                            st.outputs[index] = preserved[output.port_id]
+                        key = (output.node_id, output.port_id)
+                        if key in preserved:
+                            st.outputs[index] = preserved[key]
                     st.total_rows = None
             else:
                 _abort_local_results(
@@ -1259,7 +1277,10 @@ class SubprocessRunner:
         if owned_result is not None and st is not None:
             cancelled = run_id in self._cancelled
             reservations = owned_result["results"]
-            child_outputs = st.outputs
+            child_outputs = [
+                output for output in st.outputs
+                if output.publication_kind == "result"
+            ]
             committed_count = 0
             valid_child_commit = (
                 not cancelled
@@ -1301,13 +1322,14 @@ class SubprocessRunner:
                     st.status = "failed"
                     st.error = "parent object-result commit failed"
                     preserved = {
-                        output.port_id: output for output in st.outputs
+                        (output.node_id, output.port_id): output for output in st.outputs
                         if output.outcome == "committed"
                         and output.uri in object_result_committed}
                     discard_unpublished_outputs(st, "failed", st.error)
                     for index, output in enumerate(st.outputs):
-                        if output.port_id in preserved:
-                            st.outputs[index] = preserved[output.port_id]
+                        key = (output.node_id, output.port_id)
+                        if key in preserved:
+                            st.outputs[index] = preserved[key]
                     st.total_rows = None
             else:
                 _abandon_object_results(
@@ -1321,7 +1343,11 @@ class SubprocessRunner:
                 st.total_rows = None
         # a subprocess run wrote its output in the CHILD's catalog (discarded) — register it here so
         # it shows up in the parent's live catalog, just like an in-process run.
-        catalog_output = sole_output(st, committed=True) if st is not None else None
+        catalog_outputs = ([
+            output for output in st.outputs
+            if output.publication_kind == "catalog" and output.outcome == "committed"
+        ] if st is not None else [])
+        catalog_output = catalog_outputs[0] if len(catalog_outputs) == 1 else None
         if (st and st.status == "done" and catalog_output is not None
                 and catalog_output.table and catalog_output.uri not in managed_sink_uris
                 and self.catalog is not None):
@@ -1365,9 +1391,9 @@ class SubprocessRunner:
                 if st.status in ("failed", "cancelled"):
                     settle_uncommitted_outputs(st, st.status, st.error)
                 committed_output = sole_output(st, committed=True)
-                if st.status == "done" and st.target_node_id is not None \
-                        and (not st.outputs or any(
-                            output.outcome != "committed" for output in st.outputs)):
+                if st.status == "done" and (
+                        (st.target_node_id is not None and not st.outputs)
+                        or any(output.outcome != "committed" for output in st.outputs)):
                     st.status = "failed"
                     st.error = "subprocess completed without every expected output"
                     discard_unpublished_outputs(st, "failed", st.error)

@@ -34,7 +34,7 @@ from hub.run_outputs import (
     committed_document_outputs,
     committed_output_snapshot,
     discard_unpublished_outputs,
-    initialize_run_outputs,
+    expected_plan_run_outputs,
     outputs_cache_document,
     preflight_output_table,
     preflight_run_output_target,
@@ -496,7 +496,7 @@ class LocalRunner:
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None, cancel_check=None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
-        output_target = preflight_run_output_target(plan, target_node_id)
+        preflight_run_output_target(plan, target_node_id)
         if any(step.kind == "write" for step in plan.steps):
             from hub.plugins.catalog import unmanaged_publication_supported
             if not unmanaged_publication_supported(self.catalog):
@@ -507,13 +507,22 @@ class LocalRunner:
         # attempt_id is accepted for OPS-01 port parity (managed publication stamps its own attempts).
         _ = attempt_id
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
-                           target_node_id=output_target, request_id=request_id)
+                           target_node_id=(target_node_id or plan.target_node_id),
+                           request_id=request_id,
+                           outputs=expected_plan_run_outputs(
+                               plan, graph, target_node_id, self.node_specs))
         from hub.sampling import explicit_sample_provenance
-        initialize_run_outputs(
-            status, graph, output_target, self.node_specs,
-            explicit_sample_provenance(graph, output_target, self.resolve_adapter, returned_rows=0)
-            if output_target is not None else None,
-        )
+        provenance_by_node = {
+            node_id: explicit_sample_provenance(
+                graph, node_id, self.resolve_adapter, returned_rows=0)
+            for node_id in dict.fromkeys(output.node_id for output in status.outputs)
+        }
+        status.outputs = [
+            output.model_copy(update={
+                "sample_provenance": provenance_by_node[output.node_id],
+            })
+            for output in status.outputs
+        ]
         with self._lock:
             self.runs[run_id] = status
             self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
@@ -736,7 +745,10 @@ class LocalRunner:
                     read_guards.append(read_leases.enter_context(managed_read_lease(
                         normalized, owner=f"run:{run_id}", ttl_seconds=ttl)))
             phash = self._plan_hash(graph, target)
-            cacheable = self._plan_cacheable(graph, target)
+            cacheable = (
+                self._plan_cacheable(graph, target)
+                and len({output.node_id for output in status.outputs}) <= 1
+            )
             cached, cache_pin = self._cache_acquire(
                 phash, f"run:{run_id}", ttl, run_id) if cacheable else (None, None)
             engine = BuildEngine(graph, self.resolve_adapter, self.registry, full=True,
@@ -889,16 +901,20 @@ class LocalRunner:
                     status.progress = _step_progress(status)  # fraction of steps complete (deterministic)
                     self._emit(graph, status)  # per-node progress → DB (cross-instance polling sees it advance)
 
-                # A direct non-sink target publishes every declared port. Assert still runs its quality
-                # gate above first; when that gate permits completion, both pass and violations are durable
-                # researcher-visible results rather than a hidden special case.
-                if target and nm.get(target) and nm[target].type != "write":
+                # Keep only terminal result leaves. The graph still executes once as one fused plan;
+                # intermediate relations stay lazy and are never independently materialized.
+                result_node_ids = list(dict.fromkeys(
+                    output.node_id for output in status.outputs
+                    if output.publication_kind == "result"
+                ))
+                if result_node_ids:
                     # Keep the ready artifact binding private until its exact RunState owner commits.
                     # ``self.runs`` points at ``status`` and is polled concurrently, so materializing into
                     # that object would expose an unowned URI during a slow/unknown terminal commit.
                     provisional_result = status.model_copy(deep=True)
-                    rows_seen = self._materialize_results(
-                        target, engine, provisional_result, cached, phash, cancel)
+                    for result_node_id in result_node_ids:
+                        rows_seen = self._materialize_results(
+                            result_node_id, engine, provisional_result, cached, phash, cancel)
                     status.rows_processed = rows_seen
                     last_step_published = False
 
@@ -1225,25 +1241,31 @@ class LocalRunner:
 
         # This exact-key and declaration-order barrier happens before the first artifact allocation.
         relations = engine.relations(node_id)
-        expected = [output.model_copy(deep=True) for output in status.outputs]
-        if list(relations) != [output.port_id for output in expected]:
+        expected = [
+            (slot, output.model_copy(deep=True))
+            for slot, output in enumerate(status.outputs)
+            if output.node_id == node_id and output.publication_kind == "result"
+        ]
+        if list(relations) != [output.port_id for _slot, output in expected]:
             raise RuntimeError("runtime output order does not match the declared run output set")
-        for index, output in enumerate(expected):
+        for index, (slot, output) in enumerate(expected):
             if cancel.is_set():
                 raise RuntimeError("run cancelled before output materialization")
             try:
                 uri, rows = self._materialize_result(
                     node_id, output.port_id, relations[output.port_id], status,
-                    phash, index, cancel)
+                    phash, slot, cancel)
                 commit_output(
-                    status, port_id=output.port_id, uri=uri, rows=rows)
+                    status, node_id=node_id, port_id=output.port_id, uri=uri, rows=rows)
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
-                settle_output(status, output.port_id, "failed", detail)
-                for skipped in expected[index + 1:]:
+                settle_output(
+                    status, output.port_id, "failed", detail, node_id=node_id)
+                for _skipped_slot, skipped in expected[index + 1:]:
                     settle_output(
                         status, skipped.port_id, "skipped",
-                        f"not attempted after output port '{output.port_id}' failed")
+                        f"not attempted after output port '{output.port_id}' failed",
+                        node_id=node_id)
                 raise
         return int(status.outputs[0].rows or 0) if len(status.outputs) == 1 else 0
 
@@ -1277,7 +1299,7 @@ class LocalRunner:
                 output_name, ".parquet")
             uri = logical_uri
         committed_output_snapshot(
-            status, port_id=port_id, uri=uri, rows=0)
+            status, node_id=node_id, port_id=port_id, uri=uri, rows=0)
         if is_object_uri(logical_uri):
             from hub.handoff import (
                 allocate_attempt, is_attempt_uri, physical_attempt_uri, write_manifest)
@@ -1297,7 +1319,7 @@ class LocalRunner:
                     self._owned_object_result_uris.setdefault(
                         status.run_id, set()).add(uri)
             committed_output_snapshot(
-                status, port_id=port_id, uri=uri, rows=0)
+                status, node_id=node_id, port_id=port_id, uri=uri, rows=0)
             data_uri = uri.rstrip("/") + "/part-00000.parquet"
             try:
                 res = self._adapter_write(
@@ -1355,7 +1377,11 @@ class LocalRunner:
         """Return the one parent-reserved URI bound to this exact declared output."""
         if self.forced_results is None:
             return None
-        expected = [(output.node_id, output.port_id) for output in status.outputs]
+        expected = [
+            (output.node_id, output.port_id)
+            for output in status.outputs
+            if output.publication_kind == "result"
+        ]
         actual: list[tuple[str, str]] = []
         uris: dict[tuple[str, str], str] = {}
         for item in self.forced_results:
@@ -1475,7 +1501,7 @@ class LocalRunner:
             raise RuntimeError("run cancelled before output commit")
         # The table identity is known before destination resolution, allocation, or an adapter write.
         # Reject a snapshot that cannot enter the public contract before any irreversible sink effect.
-        preflight_output_table(status, spec.name)
+        preflight_output_table(status, spec.name, node_id=node.id)
         parent_contract = self.forced_sink_targets is not None
         from hub import metadb
         parent_uris = metadb.catalog_lineage_parent_tokens(
@@ -1588,7 +1614,7 @@ class LocalRunner:
                 # The immutable attempt is the published identity and is known before its writer
                 # starts. Locally allocated attempts are discarded if even that identity is invalid.
                 committed_output_snapshot(
-                    status, uri=attempt_uri, table=spec.name, rows=0)
+                    status, node_id=node.id, uri=attempt_uri, table=spec.name, rows=0)
                 physical_uri = (attempt_uri if spec.partition_by else
                                 attempt_uri.rstrip("/") + "/part-00000.parquet")
                 kwargs = {"partition_by": spec.partition_by} if spec.partition_by else {}
@@ -1640,15 +1666,14 @@ class LocalRunner:
                 before_publish=(None if pre_publish is None
                                 else lambda: pre_publish(check_cancel=True)),
             )
-            committed_snapshot = committed_output_snapshot(
-                status,
+            commit_output(
+                status, node_id=node.id,
                 uri=receipt.publication.artifact_uri,
                 table=spec.name,
                 version=receipt.publication.catalog_version,
                 rows=receipt.rows,
                 write_receipt=receipt,
             )
-            status.outputs = [committed_snapshot]
             return receipt.rows
         elif managed_local_file:
             from hub.local_writes import write_managed_local_file
@@ -1709,7 +1734,7 @@ class LocalRunner:
                 actual_schema = relation_columns(parent_rel)
             def write_candidate(candidate_uri: str) -> None:
                 committed_output_snapshot(
-                    status, uri=candidate_uri, table=spec.name, rows=0)
+                    status, node_id=node.id, uri=candidate_uri, table=spec.name, rows=0)
                 result = self._adapter_write(
                     logical_adapter, candidate_uri, parent_rel, spec.mode, cancel)
                 if result.get("uri", candidate_uri) != candidate_uri:
@@ -1725,21 +1750,20 @@ class LocalRunner:
                 before_publish=(None if pre_publish is None
                                 else lambda: pre_publish(check_cancel=True)),
             )
-            committed_snapshot = committed_output_snapshot(
-                status,
+            commit_output(
+                status, node_id=node.id,
                 uri=receipt.publication.artifact_uri,
                 table=spec.name,
                 version=receipt.publication.catalog_version,
                 rows=receipt.rows,
                 write_receipt=receipt,
             )
-            status.outputs = [committed_snapshot]
             return receipt.rows
         else:
             # Built-in sink semantics have a deterministic published URI. Custom adapters may return
             # another URI, which is checked authoritatively immediately after their write below.
             committed_output_snapshot(
-                status,
+                status, node_id=node.id,
                 uri=expected_sink_uri(spec, logical_uri, logical_adapter),
                 table=spec.name,
                 rows=0,
@@ -1755,7 +1779,8 @@ class LocalRunner:
         # Adapter-returned identities are untrusted. Validate the exact public snapshot before the
         # cancellation/publication fence and, critically, before catalog registration.
         committed_snapshot = committed_output_snapshot(
-            status, uri=committed.uri, table=committed.name, rows=committed.rows)
+            status, node_id=node.id, uri=committed.uri,
+            table=committed.name, rows=committed.rows)
 
         try:
             if pre_publish is not None:
@@ -1795,11 +1820,15 @@ class LocalRunner:
             published_version = _catalog_publication_version(published)
             if published_version is not None:
                 committed_snapshot = committed_output_snapshot(
-                    status, uri=committed.uri, table=committed.name,
+                    status, node_id=node.id, uri=committed.uri, table=committed.name,
                     version=published_version, rows=committed.rows)
         if managed_local_file and not self.storage.release_result(attempt_uri, status.run_id):
             raise RuntimeError("managed local revision publication is missing its durable owner")
-        status.outputs = [committed_snapshot]
+        commit_output(
+            status, node_id=node.id, uri=str(committed_snapshot.uri),
+            table=committed_snapshot.table, version=committed_snapshot.version,
+            rows=int(committed_snapshot.rows or 0),
+            write_receipt=committed_snapshot.write_receipt)
         return committed.rows
 
     def _source_uri(self, nm_node: str, graph: Graph) -> str | None:
