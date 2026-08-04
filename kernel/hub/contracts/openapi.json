@@ -7951,6 +7951,11 @@
             "title": "Nodeid",
             "type": "string"
           },
+          "reused": {
+            "default": false,
+            "title": "Reused",
+            "type": "boolean"
+          },
           "rows": {
             "anyOf": [
               {
@@ -10835,6 +10840,16 @@
               }
             ],
             "title": "Requestid"
+          },
+          "reusedBoundary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReusableExecutionBoundary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "rowsProcessed": {
             "default": 0,

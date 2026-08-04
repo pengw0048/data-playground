@@ -91,6 +91,7 @@ from hub.models import (
     RunOutput,
     RunStatus,
     SampleResult,
+    ReusableExecutionBoundary,
     WriteAdmission,
     WriteAdmissionRequest,
     WriteDestination,
@@ -1541,19 +1542,6 @@ class BoundaryAdmissionRequest(BaseModel):
     graph: Graph
     target_node_id: str = Field(min_length=1, max_length=256)
     parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
-
-
-class ReusableExecutionBoundary(BaseModel):
-    """Opaque server-admitted reusable local boundary. Never includes an artifact URI."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-    canvas_id: str
-    target_node_id: str
-    boundary_node_id: str
-    boundary_port_id: str
-    boundary_run_id: str
-    boundary_execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 BoundaryAdmissionReason = Literal[
@@ -3518,6 +3506,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     dispatch_graph = graph
     dispatch_manifest: list[dict[str, str]] | None = None
     prebound_local_run_id: str | None = None
+    boundary_resume: dict | None = None
     if local_admission:
         assert local_submission_id is not None
         graph_canvas = (str(getattr(graph, "id", "") or "") or None)
@@ -3594,9 +3583,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         graph._execution_manifest_sha256 = execution_sha256
         graph._execution_manifest_doc = execution_doc
         dispatch_graph = _bind_local_run_manifest(graph, persisted, deps, target_node_id)
-        # Admit at most one exact retained upstream boundary for the local planner. This leaf only
-        # selects/revalidates; suffix execution belongs to the dependent leaf.
-        _admit_local_run_boundary(
+        # Admit at most one exact retained upstream boundary. When admitted, the first vertical
+        # resumes only the suffix on the in-process local runner; admission miss keeps the full run.
+        boundary_admission = _admit_local_run_boundary(
             graph=intent_graph,
             canvas_id=operational_canvas,
             target_node_id=target_node_id,
@@ -3604,6 +3593,38 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             uid=uid,
             deps=deps,
         )
+        if boundary_admission.admitted:
+            from hub.run_boundary_suffix import BoundarySuffixError, prepare_boundary_suffix
+
+            persisted_boundary = metadb.run_boundary_admission(
+                prebound_local_run_id, include_artifact_uri=True)
+            if persisted_boundary is None:
+                raise RuntimeError("admitted reusable boundary disappeared before dispatch")
+            try:
+                suffix_graph, suffix_plan, reused_nodes, reused_boundary = prepare_boundary_suffix(
+                    intent_graph,
+                    persisted=persisted_boundary,
+                    target_node_id=str(target_node_id),
+                    deps=deps,
+                )
+            except BoundarySuffixError as exc:
+                metadb.clear_run_boundary_admission(prebound_local_run_id)
+                raise APIError(
+                    409, str(exc),
+                    code=APIErrorCode.CONFLICT, retryable=False,
+                ) from exc
+            # Durable identity stays on the original semantic admission, not the synthetic suffix graph.
+            suffix_graph._execution_manifest_sha256 = graph._execution_manifest_sha256
+            suffix_graph._execution_manifest_doc = graph._execution_manifest_doc
+            # Built-in local resume stays on the in-process LocalRunner for the first vertical so the
+            # synthetic managed Source and its read guard do not need a separate kernel transport.
+            runner = deps.runner
+            plan = suffix_plan
+            dispatch_graph = suffix_graph
+            boundary_resume = {
+                "reused_nodes": reused_nodes,
+                "reused_boundary": reused_boundary,
+            }
         if isinstance(runner, KernelBackend):
             # A newly spawned kernel runs boot recovery before serving. Start it only after admission and
             # exact reopen, but before the queued dispatch claim exists; otherwise that boot recovery can
@@ -3614,8 +3635,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         # response-loss replay can observe that claim immediately; without this ordering it would route
         # the same run through the fallback runner until the first call returned from dispatch.
         prior_owner = deps.run_index.get(prebound_local_run_id)
-        if prior_owner is None:
-            deps.run_index[prebound_local_run_id] = runner
+        deps.run_index[prebound_local_run_id] = runner
         try:
             claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
                 run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
@@ -3624,10 +3644,14 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         except BaseException:
             if prior_owner is None and deps.run_index.get(prebound_local_run_id) is runner:
                 deps.run_index.pop(prebound_local_run_id, None)
+            elif prior_owner is not None:
+                deps.run_index[prebound_local_run_id] = prior_owner
             raise
         if not should_dispatch:
             if prior_owner is None and deps.run_index.get(prebound_local_run_id) is runner:
                 deps.run_index.pop(prebound_local_run_id, None)
+            elif prior_owner is not None:
+                deps.run_index[prebound_local_run_id] = prior_owner
             return RunStatus(**claimed_status), _runner_for(
                 prebound_local_run_id, deps=deps)
     if graph._execution_manifest_sha256 is None:
@@ -3721,7 +3745,12 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 status = invoke_backend_run(
                     runner, plan, dispatch_graph, target_node_id, est.placement,
                     run_id=dispatch_run_id, request_id=request_id,
-                    input_manifest=dispatch_manifest)
+                    input_manifest=dispatch_manifest,
+                    reused_nodes=(
+                        boundary_resume["reused_nodes"] if boundary_resume else None),
+                    reused_boundary=(
+                        boundary_resume["reused_boundary"] if boundary_resume else None),
+                )
             except Exception as exc:
                 if prebound_local_run_id is None:
                     raise
