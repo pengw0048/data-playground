@@ -324,6 +324,36 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await expectNoTechnicalResultEvidence(jobsResult, runId, 'filter:out')
     }
 
+    // Exercise a readable retained identity whose adapter fails while opening the rows. Keep this
+    // separate from the definitive-expiry case below: once the artifact is removed, recovery must
+    // stop before issuing a row-sample request.
+    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
+    await page.route(sampleRoute, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          columns: [],
+          rows: [],
+          rowCount: null,
+          hasMore: false,
+          truncated: false,
+          completeness: 'unknown',
+          error: true,
+          reason: 'adapter failed while opening the retained artifact',
+        }),
+      })
+    })
+    await page.goto(`/#/canvas/${doc.id}`)
+    const errorFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await errorFilter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const errorResult = page.getByTestId('panel-data')
+    await expect(errorResult.getByText('Couldn’t read full result')).toBeVisible()
+    await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
+    await expectNoTechnicalResultEvidence(errorResult, runId, 'filter:out')
+    await page.unroute(sampleRoute)
+
     const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
     expect(historyResponse.ok(), await historyResponse.text()).toBe(true)
     const history = await historyResponse.json() as Array<{
@@ -359,33 +389,6 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       ) })
     }
     await expectNoTechnicalResultEvidence(expiredResult, runId, 'filter:out')
-
-    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
-    await page.route(sampleRoute, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          columns: [],
-          rows: [],
-          rowCount: null,
-          hasMore: false,
-          truncated: false,
-          completeness: 'unknown',
-          error: true,
-          reason: 'adapter failed while opening the retained artifact',
-        }),
-      })
-    })
-    await page.goto(`/#/canvas/${doc.id}`)
-    const errorFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
-    await errorFilter.click()
-    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
-    const errorResult = page.getByTestId('panel-data')
-    await expect(errorResult.getByText('Couldn’t read full result')).toBeVisible()
-    await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
-    await expectNoTechnicalResultEvidence(errorResult, runId, 'filter:out')
-    await page.unroute(sampleRoute)
   })
 
   test('states a capped chart window once while keeping whole-result export', async ({ page }) => {
