@@ -10,6 +10,11 @@ Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 
 ## Unreleased
 
+## [0.3.2] — 2026-08-04
+
+This patch release makes relationship exploration and prepared research demos presentation-ready
+without changing the supported local-workstation and trusted-team deployment boundary.
+
 ### Added
 
 - A deterministic demo provisioner creates three related synthetic video-research datasets and
