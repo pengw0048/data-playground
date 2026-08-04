@@ -1529,6 +1529,60 @@ class CanvasResultRecovery(BaseModel):
     results: list[RetainedResultIdentity]
 
 
+class BoundaryAdmissionRequest(BaseModel):
+    """Select one reusable retained boundary for a local linear target cone.
+
+    The client names only the downstream target. The server selects the nearest exact retained
+    upstream output; artifact URIs are never accepted from the client.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+    target_node_id: str = Field(min_length=1, max_length=256)
+    parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
+
+
+class ReusableExecutionBoundary(BaseModel):
+    """Opaque server-admitted reusable local boundary. Never includes an artifact URI."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    canvas_id: str
+    target_node_id: str
+    boundary_node_id: str
+    boundary_port_id: str
+    boundary_run_id: str
+    boundary_execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+BoundaryAdmissionReason = Literal[
+    "admitted",
+    "no_candidate",
+    "not_linear",
+    "stale",
+    "expired",
+    "unreadable",
+    "unauthorized",
+    "unsupported_artifact",
+]
+
+
+class BoundaryAdmission(BaseModel):
+    """One selection outcome for a reusable local boundary.
+
+    A non-admitted reason is an ordinary full-run signal for the dependent leaf, not an HTTP error.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    admitted: bool
+    reason: BoundaryAdmissionReason
+    target_node_id: str
+    boundary: ReusableExecutionBoundary | None = None
+    message: str | None = Field(default=None, max_length=4096)
+
+
 class ExampleRowsEditorPreviewRequest(BaseModel):
     """Editor-only Transform preview over one bounded, non-persisted JSON fixture."""
 
@@ -3540,6 +3594,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         graph._execution_manifest_sha256 = execution_sha256
         graph._execution_manifest_doc = execution_doc
         dispatch_graph = _bind_local_run_manifest(graph, persisted, deps, target_node_id)
+        # Admit at most one exact retained upstream boundary for the local planner. This leaf only
+        # selects/revalidates; suffix execution belongs to the dependent leaf.
+        _admit_local_run_boundary(
+            graph=intent_graph,
+            canvas_id=operational_canvas,
+            target_node_id=target_node_id,
+            run_id=prebound_local_run_id,
+            uid=uid,
+            deps=deps,
+        )
         if isinstance(runner, KernelBackend):
             # A newly spawned kernel runs boot recovery before serving. Start it only after admission and
             # exact reopen, but before the queued dispatch claim exists; otherwise that boot recovery can
@@ -4833,6 +4897,265 @@ def _retained_result_readability(
         return "missing"
     except Exception:  # noqa: BLE001 - a transient check failure must not falsify result state
         return "unknown"
+
+
+def _target_cone_is_linear(cone: Graph, target_node_id: str) -> bool:
+    """True when the target cone is a single path with no fan-in or fan-out."""
+    incoming: dict[str, list[str]] = {}
+    outgoing: dict[str, list[str]] = {}
+    for edge in cone.edges:
+        incoming.setdefault(edge.target, []).append(edge.source)
+        outgoing.setdefault(edge.source, []).append(edge.target)
+    node_ids = {node.id for node in cone.nodes}
+    if target_node_id not in node_ids:
+        return False
+    roots = [node_id for node_id in node_ids if not incoming.get(node_id)]
+    if len(roots) != 1:
+        return False
+    for node_id in node_ids:
+        if len(incoming.get(node_id, [])) > 1:
+            return False
+        outs = outgoing.get(node_id, [])
+        if node_id == target_node_id:
+            if outs:
+                return False
+        elif len(outs) != 1:
+            return False
+    return True
+
+
+def _linear_upstream_node_ids(cone: Graph, target_node_id: str) -> list[str]:
+    """Nearest-first upstream node ids on a linear cone, excluding the target itself."""
+    incoming = {edge.target: edge.source for edge in cone.edges}
+    order: list[str] = []
+    current = incoming.get(target_node_id)
+    seen: set[str] = set()
+    while current is not None and current not in seen:
+        seen.add(current)
+        order.append(current)
+        current = incoming.get(current)
+    return order
+
+
+def _boundary_admission(
+        *,
+        admitted: bool,
+        reason: BoundaryAdmissionReason,
+        target_node_id: str,
+        boundary: ReusableExecutionBoundary | None = None,
+        message: str | None = None,
+        artifact_uri: str | None = None,
+) -> tuple[BoundaryAdmission, str | None]:
+    return (
+        BoundaryAdmission(
+            admitted=admitted,
+            reason=reason,
+            target_node_id=target_node_id,
+            boundary=boundary,
+            message=message,
+        ),
+        artifact_uri,
+    )
+
+
+def _select_reusable_execution_boundary(
+        graph: Graph,
+        canvas_id: str,
+        target_node_id: str,
+        uid: str,
+        deps,
+        *,
+        requested_bindings: list[ParameterBinding] | None = None,
+) -> tuple[BoundaryAdmission, str | None]:
+    """Select at most one nearest exact retained upstream output as a reusable local boundary.
+
+    Reuses the retained-result proof and managed read guard. Does not rewrite the graph or skip
+    suffix execution; that belongs to the dependent leaf.
+    """
+    if target_node_id not in graph_mod.node_map(graph):
+        return _boundary_admission(
+            admitted=False, reason="no_candidate", target_node_id=target_node_id,
+            message="target node is missing from the graph")
+    # Linearity is topological. Parameter resolution belongs to the retained-result proof below.
+    cone = _target_execution_graph(graph, target_node_id)
+    if not _target_cone_is_linear(cone, target_node_id):
+        return _boundary_admission(
+            admitted=False, reason="not_linear", target_node_id=target_node_id,
+            message="reusable boundaries require a linear target cone")
+    last_reason: BoundaryAdmissionReason = "no_candidate"
+    last_message = "no exact retained upstream result is available"
+    for node_id in _linear_upstream_node_ids(cone, target_node_id):
+        node = graph_mod.node_map(cone).get(node_id)
+        if node is None or node.type == "source":
+            continue
+        try:
+            port_id = _inspection_port(cone, node_id, None, deps)
+        except APIError:
+            last_reason = "no_candidate"
+            last_message = "upstream node has no reusable output port"
+            continue
+        try:
+            identity = _current_retained_result(
+                graph, canvas_id, node_id, port_id, uid, deps,
+                requested_bindings=requested_bindings,
+                allow_local_snapshot_registration=True)
+        except APIError as exc:
+            code = getattr(exc, "code", None)
+            if code == APIErrorCode.RETAINED_UPSTREAM_EXPIRED:
+                last_reason = "expired"
+                last_message = str(exc.detail)
+            elif code == APIErrorCode.PERMISSION_DENIED:
+                last_reason = "unauthorized"
+                last_message = str(exc.detail)
+            elif code == APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE:
+                last_reason = "no_candidate"
+                last_message = str(exc.detail)
+            else:
+                last_reason = "stale"
+                last_message = str(exc.detail)
+            continue
+        readability = _retained_result_readability(identity, deps)
+        if readability == "missing":
+            last_reason = "expired"
+            last_message = "retained upstream artifact is missing or expired"
+            continue
+        if readability != "readable":
+            last_reason = "unreadable"
+            last_message = "retained upstream artifact could not be proved readable"
+            continue
+        uri = identity.output.uri or ""
+        if metadb._local_result_candidate(uri) is None:
+            last_reason = "unsupported_artifact"
+            last_message = "retained upstream artifact is not a managed local result"
+            continue
+        boundary = ReusableExecutionBoundary(
+            canvas_id=canvas_id,
+            target_node_id=target_node_id,
+            boundary_node_id=node_id,
+            boundary_port_id=port_id,
+            boundary_run_id=identity.run_id,
+            boundary_execution_manifest_sha256=identity.execution_manifest_sha256,
+        )
+        return _boundary_admission(
+            admitted=True, reason="admitted", target_node_id=target_node_id,
+            boundary=boundary, artifact_uri=uri)
+    return _boundary_admission(
+        admitted=False, reason=last_reason, target_node_id=target_node_id,
+        message=last_message)
+
+
+def _revalidate_reusable_execution_boundary(
+        graph: Graph,
+        canvas_id: str,
+        uid: str,
+        deps,
+        persisted: dict,
+        *,
+        requested_bindings: list[ParameterBinding] | None = None,
+) -> tuple[bool, BoundaryAdmissionReason, str | None]:
+    """Re-prove one persisted boundary before dispatch; fail closed to an ordinary full run."""
+    try:
+        identity = _current_retained_result(
+            graph, canvas_id, persisted["boundary_node_id"], persisted["boundary_port_id"],
+            uid, deps, requested_bindings=requested_bindings,
+            allow_local_snapshot_registration=True)
+    except APIError as exc:
+        code = getattr(exc, "code", None)
+        if code == APIErrorCode.RETAINED_UPSTREAM_EXPIRED:
+            return False, "expired", str(exc.detail)
+        if code == APIErrorCode.PERMISSION_DENIED:
+            return False, "unauthorized", str(exc.detail)
+        if code == APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE:
+            return False, "no_candidate", str(exc.detail)
+        return False, "stale", str(exc.detail)
+    if (
+        identity.run_id != persisted["boundary_run_id"]
+        or identity.execution_manifest_sha256 != persisted["boundary_execution_manifest_sha256"]
+        or metadb._local_result_candidate(identity.output.uri or "") != persisted.get("artifact_uri")
+    ):
+        return False, "stale", "retained boundary identity changed before dispatch"
+    readability = _retained_result_readability(identity, deps)
+    if readability == "missing":
+        return False, "expired", "retained boundary artifact is missing or expired"
+    if readability != "readable":
+        return False, "unreadable", "retained boundary artifact could not be proved readable"
+    return True, "admitted", None
+
+
+def _admit_local_run_boundary(
+        *,
+        graph: Graph,
+        canvas_id: str | None,
+        target_node_id: str | None,
+        run_id: str,
+        uid: str,
+        deps,
+        requested_bindings: list[ParameterBinding] | None = None,
+) -> BoundaryAdmission:
+    """Select, persist, and revalidate at most one boundary for a local run admission."""
+    if not canvas_id or not target_node_id:
+        return BoundaryAdmission(
+            admitted=False, reason="no_candidate", target_node_id=target_node_id or "",
+            message="reusable boundaries require a saved canvas target")
+    selection, artifact_uri = _select_reusable_execution_boundary(
+        graph, canvas_id, target_node_id, uid, deps,
+        requested_bindings=requested_bindings)
+    if not selection.admitted or selection.boundary is None or artifact_uri is None:
+        metadb.clear_run_boundary_admission(run_id)
+        return selection
+    try:
+        metadb.admit_run_boundary(
+            run_id=run_id,
+            canvas_id=canvas_id,
+            target_node_id=target_node_id,
+            boundary_node_id=selection.boundary.boundary_node_id,
+            boundary_port_id=selection.boundary.boundary_port_id,
+            boundary_run_id=selection.boundary.boundary_run_id,
+            boundary_execution_manifest_sha256=(
+                selection.boundary.boundary_execution_manifest_sha256),
+            artifact_uri=artifact_uri,
+        )
+    except Exception:  # noqa: BLE001 - boundary reuse must never block an ordinary full run
+        logging.getLogger("hub.runs").exception(
+            "failed to persist reusable execution boundary for run %s", run_id)
+        metadb.clear_run_boundary_admission(run_id)
+        return BoundaryAdmission(
+            admitted=False, reason="no_candidate", target_node_id=target_node_id,
+            message="reusable boundary could not be persisted")
+    persisted = metadb.run_boundary_admission(run_id, include_artifact_uri=True)
+    if persisted is None:
+        return BoundaryAdmission(
+            admitted=False, reason="no_candidate", target_node_id=target_node_id,
+            message="reusable boundary disappeared after admission")
+    ok, reason, message = _revalidate_reusable_execution_boundary(
+        graph, canvas_id, uid, deps, persisted,
+        requested_bindings=requested_bindings)
+    if not ok:
+        metadb.clear_run_boundary_admission(run_id)
+        return BoundaryAdmission(
+            admitted=False, reason=reason, target_node_id=target_node_id, message=message)
+    metadb.mark_run_boundary_revalidated(run_id)
+    return selection
+
+
+@router.post("/run/boundary-admission", response_model=BoundaryAdmission)
+def admit_reusable_execution_boundary(
+        req: BoundaryAdmissionRequest,
+        uid: str = Depends(current_user)) -> BoundaryAdmission:
+    """Select and revalidate one opaque reusable local boundary without executing a suffix."""
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
+        raise _retained_editor_error(
+            404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    deps = get_deps()
+    selection, _artifact_uri = _select_reusable_execution_boundary(
+        req.graph, canvas_id, req.target_node_id, uid, deps,
+        requested_bindings=(
+            req.parameter_bindings
+            if "parameter_bindings" in req.model_fields_set else None),
+    )
+    return selection
 
 
 @router.post("/run/current-results", response_model=CanvasResultRecovery)

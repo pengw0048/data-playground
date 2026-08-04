@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0053_run_boundary_admission", "0052_rejected_run_owner"),
         ("0052_rejected_run_owner", "0051_canvas_result_latest"),
         ("0051_canvas_result_latest", "0050_receipt_names"),
         ("0050_receipt_names", "0046_relationship_incident"),
@@ -105,8 +106,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0052_rejected_run_owner"]
-    assert metadb.expected_schema_head() == "0052_rejected_run_owner"
+    assert scripts.get_heads() == ["0053_run_boundary_admission"]
+    assert metadb.expected_schema_head() == "0053_run_boundary_admission"
 
 
 def test_fresh_schema_omits_retired_row_identity_storage(tmp_path):
@@ -910,6 +911,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0033_temporal_resample_task.py": (
             "0d47e6da5b505575950b01bb20f1fe340c91a744ee451f15c135727fddc7306c"
+        ),
+        "0053_run_boundary_admission.py": (
+            "16ea8aa614d349b2ae58c920c983df863053b4d83bf4bfb30ce21796a1409133"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

@@ -576,6 +576,32 @@ class RunInputAdmission(Base):
     )
 
 
+class RunBoundaryAdmission(Base):
+    """One opaque reusable retained-output boundary bound to a local run admission.
+
+    Artifact URI stays process-local for reopen/revalidation. Wire responses must never echo it.
+    """
+    __tablename__ = "run_boundary_admissions"
+    run_id: Mapped[str] = mapped_column(
+        String, ForeignKey("run_input_admissions.run_id", ondelete="CASCADE"), primary_key=True)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False, index=True)
+    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_port_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_run_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_execution_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    revalidated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "length(boundary_execution_manifest_sha256) = 64",
+            name="ck_run_boundary_manifest_sha256",
+        ),
+    )
+
+
 class ExecutionManifest(Base):
     """One immutable content-addressed definition for graph-backed execution."""
     __tablename__ = "execution_manifests"
@@ -11008,6 +11034,113 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
         return run_id, True
 
 
+def admit_run_boundary(
+        *,
+        run_id: str,
+        canvas_id: str,
+        target_node_id: str,
+        boundary_node_id: str,
+        boundary_port_id: str,
+        boundary_run_id: str,
+        boundary_execution_manifest_sha256: str,
+        artifact_uri: str,
+) -> dict:
+    """Persist one opaque retained-output boundary for an already-admitted local run.
+
+    The artifact URI is retained only for server-side reopen/revalidation. Callers must never return
+    it on the wire. Replacing an existing row drops the prior durable local-result owner refs first.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", str(boundary_execution_manifest_sha256)):
+        raise ValueError("run boundary admission requires a SHA-256 execution manifest")
+    uri = _local_result_candidate(artifact_uri)
+    if uri is None:
+        raise ValueError("run boundary admission requires a managed local result artifact")
+    run_key = str(run_id)
+    canvas = str(canvas_id)
+    with session() as s:
+        admission = s.get(RunInputAdmission, run_key, with_for_update=True)
+        if admission is None:
+            raise RuntimeError("local run admission was not persisted")
+        if admission.canvas_id != canvas:
+            raise RuntimeError("run boundary canvas does not match its local admission")
+        if admission.target_node_id != str(target_node_id):
+            raise RuntimeError("run boundary target does not match its local admission")
+        if s.get(Canvas, canvas, with_for_update=True) is None:
+            raise RuntimeError("run boundary canvas does not exist")
+        existing = s.get(RunBoundaryAdmission, run_key, with_for_update=True)
+        if existing is not None:
+            _drop_local_result_owner(s, "run_boundary_admission", run_key)
+            s.delete(existing)
+            s.flush()
+        row = RunBoundaryAdmission(
+            run_id=run_key,
+            canvas_id=canvas,
+            target_node_id=str(target_node_id),
+            boundary_node_id=str(boundary_node_id),
+            boundary_port_id=str(boundary_port_id),
+            boundary_run_id=str(boundary_run_id),
+            boundary_execution_manifest_sha256=str(boundary_execution_manifest_sha256),
+            artifact_uri=uri,
+        )
+        s.add(row)
+        s.flush()
+        sync_local_result_owner(s, "run_boundary_admission", run_key, uri)
+        return {
+            "run_id": row.run_id,
+            "canvas_id": row.canvas_id,
+            "target_node_id": row.target_node_id,
+            "boundary_node_id": row.boundary_node_id,
+            "boundary_port_id": row.boundary_port_id,
+            "boundary_run_id": row.boundary_run_id,
+            "boundary_execution_manifest_sha256": row.boundary_execution_manifest_sha256,
+            "artifact_uri": row.artifact_uri,
+            "created_at": row.created_at,
+            "revalidated_at": row.revalidated_at,
+        }
+
+
+def run_boundary_admission(run_id: str, *, include_artifact_uri: bool = False) -> dict | None:
+    """Return one persisted boundary identity. Artifact URI is opt-in for server reopen only."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id))
+        if row is None:
+            return None
+        doc = {
+            "run_id": row.run_id,
+            "canvas_id": row.canvas_id,
+            "target_node_id": row.target_node_id,
+            "boundary_node_id": row.boundary_node_id,
+            "boundary_port_id": row.boundary_port_id,
+            "boundary_run_id": row.boundary_run_id,
+            "boundary_execution_manifest_sha256": row.boundary_execution_manifest_sha256,
+            "created_at": row.created_at,
+            "revalidated_at": row.revalidated_at,
+        }
+        if include_artifact_uri:
+            doc["artifact_uri"] = row.artifact_uri
+        return doc
+
+
+def mark_run_boundary_revalidated(run_id: str) -> None:
+    """Stamp successful pre-dispatch revalidation without changing the immutable identity."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id), with_for_update=True)
+        if row is None:
+            raise RuntimeError("run boundary admission was not persisted")
+        row.revalidated_at = _db_now(s)
+
+
+def clear_run_boundary_admission(run_id: str) -> bool:
+    """Drop one boundary admission and its durable local-result owner refs."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id), with_for_update=True)
+        if row is None:
+            return False
+        _drop_local_result_owner(s, "run_boundary_admission", str(run_id))
+        s.delete(row)
+        return True
+
+
 def local_file_input_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
     """Return one reusable ready artifact for a content-identified ordinary local input."""
     with session() as s:
@@ -11644,6 +11777,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
         if obj.run_id:
+            _drop_local_result_owner_locked(s, "run_boundary_admission", obj.run_id)
             _drop_local_result_owner_locked(s, "run_input_admission", obj.run_id)
     return True
 
@@ -11805,6 +11939,7 @@ def delete_canvas_cascade(canvas_id: str, *, db_session=None) -> None:
         for sh in shares:
             s.delete(sh)
         for admission in admissions:
+            local_owners.append(("run_boundary_admission", admission.run_id))
             local_owners.append(("run_input_admission", admission.run_id))
             s.delete(admission)
         for wait in durable_waits:
@@ -15689,7 +15824,7 @@ _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_result", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
     "dataset_view", "distribution_report", "durable_task", "profile_job",
-    "run_input_admission", "run_record", "run_state", "sparse_output",
+    "run_boundary_admission", "run_input_admission", "run_record", "run_state", "sparse_output",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
@@ -15760,6 +15895,11 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
                 if candidate is not None:
                     candidates.add(candidate)
     elif owner_kind in ("catalog_entry", "managed_file_revision"):
+        for value in values:
+            candidate = _local_result_candidate(value)
+            if candidate is not None:
+                candidates.add(candidate)
+    elif owner_kind == "run_boundary_admission":
         for value in values:
             candidate = _local_result_candidate(value)
             if candidate is not None:
