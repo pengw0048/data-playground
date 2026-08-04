@@ -367,10 +367,11 @@ export function PerNodeBreakdown({ nodes }: { nodes: PerNodeStat[] }) {
               <span className="w-28 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap text-foreground" title={n.nodeId}>
                 {n.label || n.nodeId}
               </span>
+              {n.reused && <span className="w-12 shrink-0 text-[9px] font-medium text-muted-foreground">reused</span>}
               <div className="relative h-3.5 min-w-0 flex-1 rounded-sm bg-border/60">
                 <div className="absolute inset-y-0 left-0 rounded-sm" style={{ width: `${pct}%`, backgroundColor: st.color, opacity: 0.85 }} />
               </div>
-              <span className="w-14 shrink-0 text-right text-muted-foreground">{n.ms != null ? fmtMs(n.ms) : '—'}</span>
+              <span className="w-14 shrink-0 text-right text-muted-foreground">{n.reused ? '—' : n.ms != null ? fmtMs(n.ms) : '—'}</span>
               <span className="w-16 shrink-0 text-right text-muted-foreground">{n.rows != null ? `${n.rows.toLocaleString()}` : ''}</span>
             </div>
           )

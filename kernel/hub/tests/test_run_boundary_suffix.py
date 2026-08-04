@@ -18,7 +18,11 @@ from hub import metadb
 from hub.deps import get_deps
 from hub.main import app
 from hub.models import Graph
-from hub.run_boundary_suffix import prepare_boundary_suffix
+from hub.run_boundary_suffix import (
+    BoundarySuffixError,
+    build_suffix_graph,
+    prepare_boundary_suffix,
+)
 
 
 client = TestClient(app)
@@ -229,6 +233,30 @@ def test_downstream_run_reuses_nearest_boundary_without_reexecuting_prefix(
     assert "uri" not in (status.get("reusedBoundary") or {})
 
 
+def test_explicit_subprocess_backend_is_not_silently_switched(
+        retained_intermediate, monkeypatch):
+    graph, _boundary_run_id, _output = retained_intermediate
+    selected = copy.deepcopy(graph)
+    selected["executionBackend"] = "local-subprocess"
+
+    def reject_local_runner(*_args, **_kwargs):
+        raise AssertionError("explicit subprocess run was routed through LocalRunner")
+
+    monkeypatch.setattr(get_deps().runner, "run", reject_local_runner)
+    started = client.post("/api/run", json={
+        "graph": selected,
+        "targetNodeId": "filter",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+    })
+
+    assert started.status_code == 200, started.text
+    status = _wait(started.json()["runId"])
+    assert status["status"] == "done", status
+    assert status.get("reusedBoundary") is None
+    assert metadb.run_boundary_admission(status["runId"]) is None
+
+
 def test_resumed_result_matches_full_recompute(retained_intermediate):
     graph, _boundary_run_id, output = retained_intermediate
 
@@ -325,7 +353,9 @@ def test_post_admission_integrity_failure_fails_explicitly(
     assert started.status_code == 200, started.text
     status = _wait(started.json()["runId"])
     assert status["status"] == "failed", status
-    assert status.get("reusedBoundary") is None or status["status"] == "failed"
+    assert status["reusedBoundary"]["boundaryNodeId"] == "sample"
+    assert all(output["outcome"] != "committed" for output in status["outputs"])
+    assert status.get("error")
 
 
 def test_fan_in_falls_back_to_full_run(retained_intermediate, monkeypatch):
@@ -381,6 +411,8 @@ def test_suffix_graph_keeps_original_manifest_identity(retained_intermediate):
     intent = Graph.model_validate(graph)
     intent._execution_manifest_sha256 = "a" * 64
     intent._execution_manifest_doc = "{}"
+    artifact_uri = metadb._local_result_candidate(output["uri"])
+    assert artifact_uri is not None
     persisted = {
         "canvas_id": graph["id"],
         "target_node_id": "filter",
@@ -388,10 +420,10 @@ def test_suffix_graph_keeps_original_manifest_identity(retained_intermediate):
         "boundary_port_id": "out",
         "boundary_run_id": "run-boundary",
         "boundary_execution_manifest_sha256": "b" * 64,
-        "artifact_uri": metadb._local_result_candidate(output["uri"]),
     }
     suffix, plan, reused, boundary = prepare_boundary_suffix(
-        intent, persisted=persisted, target_node_id="filter", deps=deps)
+        intent, persisted=persisted, artifact_uri=artifact_uri,
+        target_node_id="filter", deps=deps)
     assert suffix._execution_manifest_sha256 == "a" * 64
     step_ids = {step.node_id for step in plan.steps}
     assert "filter" in step_ids
@@ -399,4 +431,45 @@ def test_suffix_graph_keeps_original_manifest_identity(retained_intermediate):
     assert {item.node_id for item in reused} == {"source", "sample"}
     assert all(item.reused for item in reused)
     assert boundary.boundary_node_id == "sample"
-    assert list(suffix._input_artifact_uris.values()) == [persisted["artifact_uri"]]
+    assert list(suffix._input_artifact_uris.values()) == [artifact_uri]
+
+
+def test_suffix_cut_requires_the_admitted_named_port_and_preserves_edge_contract():
+    graph = Graph.model_validate({
+        "id": "named-suffix",
+        "name": "Named suffix",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {"id": "source", "type": "source", "data": {"config": {"uri": "events"}}},
+            {"id": "assert", "type": "assert", "data": {"config": {
+                "predicate": "amount > 0", "severity": "warn",
+            }}},
+            {"id": "filter", "type": "filter", "data": {"config": {
+                "predicate": "amount > 1",
+            }}},
+        ],
+        "edges": [
+            {
+                "id": "source-assert", "source": "source", "sourceHandle": "out",
+                "target": "assert", "targetHandle": "in", "data": {"wire": "dataset"},
+            },
+            {
+                "id": "assert-filter", "source": "assert", "sourceHandle": "pass",
+                "target": "filter", "targetHandle": "in", "data": {"wire": "dataset"},
+            },
+        ],
+    })
+
+    suffix, _ref_id, _prefix = build_suffix_graph(
+        graph, boundary_node_id="assert", boundary_port_id="pass",
+        artifact_uri="/tmp/named-boundary.parquet", target_node_id="filter")
+
+    assert len(suffix.edges) == 1
+    assert suffix.edges[0].source_handle == "out"
+    assert suffix.edges[0].target_handle == "in"
+    assert suffix.edges[0].data.wire == "dataset"
+    with pytest.raises(BoundarySuffixError, match="output port"):
+        build_suffix_graph(
+            graph, boundary_node_id="assert", boundary_port_id="out",
+            artifact_uri="/tmp/named-boundary.parquet", target_node_id="filter")

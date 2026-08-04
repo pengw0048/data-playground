@@ -33,6 +33,7 @@ test('resumes a downstream local run from the nearest retained boundary @ux-smok
     id: canvasId,
     name: 'UX boundary resume',
     version: 1,
+    executionBackend: 'local-out-of-core',
     requirements: [] as string[],
     nodes: [
       {

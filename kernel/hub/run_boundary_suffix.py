@@ -15,7 +15,6 @@ from hub import graph as graph_mod
 from hub.models import (
     Graph,
     GraphEdge,
-    GraphEdgeData,
     GraphNode,
     PerNodeStatus,
     Position,
@@ -107,7 +106,7 @@ def build_suffix_graph(
         if edge.source in prefix and edge.target not in prefix:
             if edge.source != boundary_node_id:
                 raise BoundarySuffixError("linear boundary cut saw a non-boundary prefix edge")
-            if edge.source_handle not in (None, boundary_port_id, "out"):
+            if edge.source_handle not in (None, boundary_port_id):
                 raise BoundarySuffixError("boundary output port does not match the cut edge")
             edge_id = _reserve_internal_id(
                 _boundary_internal_id(
@@ -119,9 +118,9 @@ def build_suffix_graph(
                 id=edge_id,
                 source=ref_id,
                 target=edge.target,
-                source_handle=None,
+                source_handle="out",
                 target_handle=edge.target_handle,
-                data=GraphEdgeData(),
+                data=edge.data.model_copy(deep=True),
             ))
         elif edge.source not in prefix and edge.target not in prefix:
             edges.append(edge)
@@ -188,12 +187,12 @@ def prepare_boundary_suffix(
         intent_graph: Graph,
         *,
         persisted: dict,
+        artifact_uri: str,
         target_node_id: str,
         deps,
 ) -> tuple[Graph, object, list[PerNodeStatus], ReusableExecutionBoundary]:
     """Build the suffix compile/dispatch graph for one admitted boundary."""
-    artifact_uri = persisted.get("artifact_uri")
-    if not isinstance(artifact_uri, str) or not artifact_uri:
+    if not artifact_uri:
         raise BoundarySuffixError("admitted boundary is missing its managed artifact")
     suffix, _ref_id, prefix = build_suffix_graph(
         intent_graph,

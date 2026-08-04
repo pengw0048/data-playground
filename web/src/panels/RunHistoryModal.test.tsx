@@ -144,6 +144,14 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
     expect(screen.getByText('Plan build time per node')).toBeInTheDocument()
     expect(screen.getByText('90 ms')).toBeInTheDocument()
   })
+
+  it('labels a retained boundary prefix without inventing build time', () => {
+    render(<PerNodeBreakdown nodes={[
+      { nodeId: 'sample', label: 'sample', status: 'done', reused: true, ms: null },
+    ]} />)
+    expect(screen.getByText('reused')).toBeInTheDocument()
+    expect(screen.getByText('—')).toBeInTheDocument()
+  })
 })
 
 describe('Run history Jobs identity', () => {

@@ -487,7 +487,7 @@ function RunOutputs({ outputs, showErrors = true }: { outputs: RunOutput[]; show
   )
 }
 
-function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: string; label?: string | null; rows?: number | null; error?: string | null }[] }; compact?: boolean }) {
+function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: string; label?: string | null; rows?: number | null; error?: string | null; reused?: boolean }[] }; compact?: boolean }) {
   const items = st.perNode.filter((p) => p.nodeId !== '__error_gate__' || !compact)
   return (
     <div className={cn('flex flex-col gap-1', compact ? 'mt-3' : 'mt-1.5')}>
@@ -498,6 +498,7 @@ function PerNode({ st, compact }: { st: { perNode: { nodeId: string; status: str
             <div className="flex items-center gap-2 text-[11px]">
               <span className={cn('w-2.5', p.status === 'running' && 'dp-running-glyph')} style={{ color: statusText[p.status as keyof typeof statusText] ?? statusText.queued }}>{s.glyph}</span>
               <span className={cn(p.status === 'failed' ? 'font-semibold text-destructive' : 'text-muted-foreground')}>{p.label ?? p.nodeId}</span>
+              {p.reused && <span className="rounded bg-muted px-1 py-px text-[9px] font-medium text-muted-foreground">reused</span>}
               <span className="flex-1" />
               {p.rows != null && p.status === 'done' && <span className="text-muted-foreground">{p.rows.toLocaleString()} rows</span>}
             </div>

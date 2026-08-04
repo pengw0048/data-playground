@@ -3583,27 +3583,32 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         graph._execution_manifest_sha256 = execution_sha256
         graph._execution_manifest_doc = execution_doc
         dispatch_graph = _bind_local_run_manifest(graph, persisted, deps, target_node_id)
-        # Admit at most one exact retained upstream boundary. When admitted, the first vertical
-        # resumes only the suffix on the in-process local runner; admission miss keeps the full run.
-        boundary_admission = _admit_local_run_boundary(
-            graph=intent_graph,
-            canvas_id=operational_canvas,
-            target_node_id=target_node_id,
-            run_id=prebound_local_run_id,
-            uid=uid,
-            deps=deps,
-        )
-        if boundary_admission.admitted:
+        # The first resume vertical belongs to LocalRunner. Explicit Kernel and subprocess choices
+        # keep their execution contract and do not probe or persist an unused boundary admission.
+        if runner is not deps.runner:
+            metadb.clear_run_boundary_admission(prebound_local_run_id)
+            boundary_admission = None
+            boundary_artifact_uri = None
+        else:
+            boundary_admission, boundary_artifact_uri = _admit_local_run_boundary(
+                graph=intent_graph,
+                canvas_id=operational_canvas,
+                target_node_id=target_node_id,
+                run_id=prebound_local_run_id,
+                uid=uid,
+                deps=deps,
+            )
+        if boundary_admission is not None and boundary_admission.admitted:
             from hub.run_boundary_suffix import BoundarySuffixError, prepare_boundary_suffix
 
-            persisted_boundary = metadb.run_boundary_admission(
-                prebound_local_run_id, include_artifact_uri=True)
-            if persisted_boundary is None:
+            persisted_boundary = metadb.run_boundary_admission(prebound_local_run_id)
+            if persisted_boundary is None or boundary_artifact_uri is None:
                 raise RuntimeError("admitted reusable boundary disappeared before dispatch")
             try:
                 suffix_graph, suffix_plan, reused_nodes, reused_boundary = prepare_boundary_suffix(
                     intent_graph,
                     persisted=persisted_boundary,
+                    artifact_uri=boundary_artifact_uri,
                     target_node_id=str(target_node_id),
                     deps=deps,
                 )
@@ -3616,9 +3621,6 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             # Durable identity stays on the original semantic admission, not the synthetic suffix graph.
             suffix_graph._execution_manifest_sha256 = graph._execution_manifest_sha256
             suffix_graph._execution_manifest_doc = graph._execution_manifest_doc
-            # Built-in local resume stays on the in-process LocalRunner for the first vertical so the
-            # synthetic managed Source and its read guard do not need a separate kernel transport.
-            runner = deps.runner
             plan = suffix_plan
             dispatch_graph = suffix_graph
             boundary_resume = {
@@ -5130,18 +5132,18 @@ def _admit_local_run_boundary(
         uid: str,
         deps,
         requested_bindings: list[ParameterBinding] | None = None,
-) -> BoundaryAdmission:
-    """Select, persist, and revalidate at most one boundary for a local run admission."""
+) -> tuple[BoundaryAdmission, str | None]:
+    """Select and persist one boundary; keep its storage address in this call stack only."""
     if not canvas_id or not target_node_id:
         return BoundaryAdmission(
             admitted=False, reason="no_candidate", target_node_id=target_node_id or "",
-            message="reusable boundaries require a saved canvas target")
+            message="reusable boundaries require a saved canvas target"), None
     selection, artifact_uri = _select_reusable_execution_boundary(
         graph, canvas_id, target_node_id, uid, deps,
         requested_bindings=requested_bindings)
     if not selection.admitted or selection.boundary is None or artifact_uri is None:
         metadb.clear_run_boundary_admission(run_id)
-        return selection
+        return selection, None
     try:
         metadb.admit_run_boundary(
             run_id=run_id,
@@ -5159,21 +5161,21 @@ def _admit_local_run_boundary(
         metadb.clear_run_boundary_admission(run_id)
         return BoundaryAdmission(
             admitted=False, reason="no_candidate", target_node_id=target_node_id,
-            message="reusable boundary could not be persisted")
+            message="reusable boundary could not be persisted"), None
     persisted = metadb.run_boundary_admission(run_id)
     if persisted is None:
         return BoundaryAdmission(
             admitted=False, reason="no_candidate", target_node_id=target_node_id,
-            message="reusable boundary disappeared after admission")
+            message="reusable boundary disappeared after admission"), None
     ok, reason, message = _revalidate_reusable_execution_boundary(
         graph, canvas_id, uid, deps, persisted,
         requested_bindings=requested_bindings)
     if not ok:
         metadb.clear_run_boundary_admission(run_id)
         return BoundaryAdmission(
-            admitted=False, reason=reason, target_node_id=target_node_id, message=message)
+            admitted=False, reason=reason, target_node_id=target_node_id, message=message), None
     metadb.mark_run_boundary_revalidated(run_id)
-    return selection
+    return selection, artifact_uri
 
 
 @router.post("/run/boundary-admission", response_model=BoundaryAdmission)
