@@ -45,6 +45,8 @@ from hub.models import (
     WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceCanonicalDatasetContext,
+    WorkspaceFavoriteMutationResult,
+    WorkspaceFavoriteStatus,
     WorkspaceProviderSource,
     WorkspaceResource,
     WorkspaceResourceResolution,
@@ -812,6 +814,51 @@ def browse_workspace_container(
             container_id, uid=uid, limit=limit, cursor=cursor)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/workspace/favorites", response_model=WorkspaceBrowsePage)
+def browse_workspace_favorites(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=4096),
+        kind: list[Literal["canvas", "dataset"]] = Query(default=[]),
+        uid: str = Depends(current_user),
+) -> dict:
+    """One bounded personal Favorites page; revalidates authorization on every read."""
+    try:
+        return metadb.workspace_favorites_browse(
+            uid=uid, limit=limit, cursor=cursor, kinds=set(kind) or None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/workspace/favorites/status", response_model=WorkspaceFavoriteStatus)
+def workspace_favorite_status(
+        id: list[str] = Query(default=[], max_length=200),
+        uid: str = Depends(current_user),
+) -> dict:
+    """Batch favorite membership for the current page of Workspace rows."""
+    return metadb.workspace_favorite_status(id, uid=uid)
+
+
+@router.put("/workspace/favorites/{resource_id:path}", response_model=WorkspaceFavoriteMutationResult)
+def put_workspace_favorite(resource_id: str, uid: str = Depends(current_user)) -> dict:
+    """Idempotently favorite one currently visible dataset or Canvas."""
+    try:
+        return metadb.workspace_favorite_add(resource_id, uid=uid)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.delete(
+    "/workspace/favorites/{resource_id:path}", response_model=WorkspaceFavoriteMutationResult)
+def delete_workspace_favorite(resource_id: str, uid: str = Depends(current_user)) -> dict:
+    """Idempotently unfavorite; succeeds even when the resource is unavailable."""
+    try:
+        return metadb.workspace_favorite_remove(resource_id, uid=uid)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

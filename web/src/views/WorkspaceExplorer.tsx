@@ -33,11 +33,15 @@ import {
 } from '../workspaceBrowseQuery'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
+const FAVORITES_SHELF_ID = 'workspace-favorites'
 const PAGE_SIZE = 50
 const WORKSPACE_SEARCH_PAGE_SIZE = 25
 const WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS = 100
 const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
   id: `container:${LOCAL_ROOT_ID}`, kind: 'container', name: 'Workspace', detached: false, source: 'local',
+}
+const FAVORITES_BREADCRUMB: WorkspaceResource = {
+  id: `container:${FAVORITES_SHELF_ID}`, kind: 'container', name: 'Favorites', detached: false, source: 'local',
 }
 const NON_EMPTY_LOCAL_FOLDER_REASON = "Move or remove this Folder's contents before deleting it."
 const PROVIDER_PLACEMENT_CACHE_MAX_DATASETS = 64
@@ -46,6 +50,28 @@ const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
 const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for this run; it is not a data column.'
 const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
   sort: ['name', 'updated'], kindFilter: true,
+}
+
+type WorkspaceFavoritesApi = {
+  isFavorited: (resourceId: string) => boolean
+  canFavorite: (resource: WorkspaceResource) => boolean
+  toggleFavorite: (resource: WorkspaceResource) => void
+  rememberFavorited: (resourceIds: string[]) => void
+}
+
+const WorkspaceFavoritesContext = createContext<WorkspaceFavoritesApi>({
+  isFavorited: () => false,
+  canFavorite: () => false,
+  toggleFavorite: () => undefined,
+  rememberFavorited: () => undefined,
+})
+
+export function useWorkspaceFavorites(): WorkspaceFavoritesApi {
+  return useContext(WorkspaceFavoritesContext)
+}
+
+function canFavoriteResource(resource: WorkspaceResource): boolean {
+  return resource.kind === 'canvas' || resource.kind === 'dataset'
 }
 
 function selectSuggestedNameOnce(event: FocusEvent<HTMLInputElement>) {
@@ -564,6 +590,8 @@ function WorkspaceMixedExplorer() {
   const [hasMore, setHasMore] = useState(false)
   const [pageCursors, setPageCursors] = useState<(string | null)[]>([null])
   const [pageIndex, setPageIndex] = useState(0)
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const [favoriteIds, setFavoriteIds] = useState<Set<string>>(() => new Set())
   const [selectedResourceIds, setSelectedResourceIds] = useState<Set<string>>(new Set())
   const { sortMode, kindFilter, viewMode } = useMemo(
     () => browseStateFromQuery(browseQuery),
@@ -655,6 +683,41 @@ function WorkspaceMixedExplorer() {
       }
     }
     try {
+      if (favoritesOnly) {
+        const kinds = kindFilter === 'canvas' || kindFilter === 'dataset' ? [kindFilter] : undefined
+        const page = await api.workspaceFavorites({
+          limit: PAGE_SIZE,
+          cursor: pageCursor ?? undefined,
+          kinds,
+        })
+        if (sequence !== request.current) return
+        setCompleteness(page.completeness)
+        setSources(page.sources ?? [])
+        setConnectedSources([])
+        setQueryCapabilities(page.queryCapabilities ?? {
+          sort: [], kindFilter: true, reason: 'Favorites are ordered by when you starred them.',
+        })
+        if (kindFilter !== 'all' && kindFilter !== 'canvas' && kindFilter !== 'dataset') {
+          setKindFilter('all')
+        }
+        const shelf = page.container ?? FAVORITES_BREADCRUMB
+        setContainerId(identity(shelf))
+        loadedContainer.current = identity(shelf)
+        setContainer(shelf)
+        if (!paging) setCrumbs([shelf])
+        setItems(page.items)
+        setFavoriteIds(new Set(page.items.map((item) => item.id)))
+        setSelectedResourceIds(new Set())
+        setPageIndex(targetPage)
+        setPageCursors((current) => {
+          const next = sameContainer && targetPage > 0 ? current.slice(0, targetPage + 1) : [null]
+          next[targetPage] = pageCursor
+          if (page.nextCursor) next[targetPage + 1] = page.nextCursor
+          return next
+        })
+        setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+        return
+      }
       const localSource = !isProviderBrowseIdentity(targetId)
       const [sort, order] = sortMode === 'source' ? [undefined, undefined]
         : sortMode.split('-') as ['name' | 'updated', 'asc' | 'desc']
@@ -701,6 +764,18 @@ function WorkspaceMixedExplorer() {
         return next
       })
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+      const favoriteCandidates = page.items.filter(canFavoriteResource).map((item) => item.id)
+      if (favoriteCandidates.length) {
+        try {
+          const status = await api.workspaceFavoriteStatus(favoriteCandidates)
+          if (sequence !== request.current) return
+          setFavoriteIds(new Set(status.favorited))
+        } catch {
+          if (sequence === request.current) setFavoriteIds(new Set())
+        }
+      } else {
+        setFavoriteIds(new Set())
+      }
     } catch (caught) {
       if (sequence !== request.current) return
       if (paging) setLoadMoreError(errorMessage(caught))
@@ -708,7 +783,7 @@ function WorkspaceMixedExplorer() {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [providerPlacementObservations, sortMode, kindFilter])
+  }, [providerPlacementObservations, sortMode, kindFilter, favoritesOnly])
 
   useEffect(() => {
     let cancelled = false
@@ -780,6 +855,12 @@ function WorkspaceMixedExplorer() {
         }
         setSelectedDataset(resolved.resource)
         setSelectedSource(resolved.source)
+        try {
+          const status = await api.workspaceFavoriteStatus([resolved.resource.id])
+          if (!cancelled && status.favorited.includes(resolved.resource.id)) {
+            setFavoriteIds((current) => new Set(current).add(resolved.resource!.id))
+          }
+        } catch { /* favorite chrome is best-effort on detail open */ }
         if (isExternal(resolved.resource)) {
           setSelectedTable(null); setSelectedDetached(null)
           if (resolved.source.completeness !== 'complete') {
@@ -815,6 +896,7 @@ function WorkspaceMixedExplorer() {
     // Folder navigation changes the target of every create/move action. Make that context switch
     // synchronously, then let route resolution refresh the authoritative contents. Otherwise a
     // quick follow-up action can run against the folder we just left.
+    setFavoritesOnly(false)
     const alreadySelected = identity(resource) === containerId
       && (requestedResourceId === resource.id
         || (identity(resource) === LOCAL_ROOT_ID && requestedResourceId === null))
@@ -840,6 +922,44 @@ function WorkspaceMixedExplorer() {
     setLoading(true)
     setWorkspaceResource(identity(resource) === LOCAL_ROOT_ID ? null : resource.id)
   }
+
+  const favoritesApi = useMemo<WorkspaceFavoritesApi>(() => ({
+    isFavorited: (resourceId) => favoriteIds.has(resourceId),
+    canFavorite: canFavoriteResource,
+    rememberFavorited: (resourceIds) => {
+      if (!resourceIds.length) return
+      setFavoriteIds((current) => {
+        let changed = false
+        const updated = new Set(current)
+        for (const id of resourceIds) {
+          if (!updated.has(id)) {
+            updated.add(id)
+            changed = true
+          }
+        }
+        return changed ? updated : current
+      })
+    },
+    toggleFavorite: (resource) => {
+      if (!canFavoriteResource(resource)) return
+      const next = !favoriteIds.has(resource.id)
+      void (async () => {
+        try {
+          if (next) await api.workspaceFavoriteAdd(resource.id)
+          else await api.workspaceFavoriteRemove(resource.id)
+          setFavoriteIds((current) => {
+            const updated = new Set(current)
+            if (next) updated.add(resource.id)
+            else updated.delete(resource.id)
+            return updated
+          })
+          if (favoritesOnly && !next) setRevision((current) => current + 1)
+        } catch (caught) {
+          pushToast(`Could not update favorite: ${errorMessage(caught)}`, 'error')
+        }
+      })()
+    },
+  }), [favoriteIds, favoritesOnly, pushToast])
 
   const open = (resource: WorkspaceResource) => {
     if (itemAvailability(resource) && !hasDetachedDatasetRecovery(resource)) return
@@ -1077,7 +1197,7 @@ function WorkspaceMixedExplorer() {
       void openCreatedSourceCanvas(canvasId, nodeId)
     }} /> : null
 
-  if (selectedDataset && isExternal(selectedDataset)) return <>
+  if (selectedDataset && isExternal(selectedDataset)) return <WorkspaceFavoritesContext.Provider value={favoritesApi}>
     <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
       canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
       exactRevision={providerViewerRoute.exactRevision}
@@ -1093,11 +1213,13 @@ function WorkspaceMixedExplorer() {
         setDatasetRemoveResource(null); setSelectedDataset(null); setWorkspaceResource(null); reload()
         pushToast('Dataset removed from its connected source', 'success')
       }} />}
-  </>
+  </WorkspaceFavoritesContext.Provider>
 
-  if (selectedTable) return <>
+  if (selectedTable) return <WorkspaceFavoritesContext.Provider value={favoritesApi}>
     <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
       workspaceResourceId={selectedDataset?.id}
+      favorited={!!selectedDataset && favoritesApi.isFavorited(selectedDataset.id)}
+      onToggleFavorite={selectedDataset ? () => favoritesApi.toggleFavorite(selectedDataset) : undefined}
       initialRevisionId={providerViewerRoute.exactRevision?.revisionId}
       initialRevisionDatasetId={providerViewerRoute.exactRevision?.datasetId}
       backLabel={datasetViewerBackLabel(providerViewerRoute.viewerReturn)}
@@ -1114,13 +1236,21 @@ function WorkspaceMixedExplorer() {
       }}
       onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />
     {datasetActionDialog}
-  </>
+  </WorkspaceFavoritesContext.Provider>
 
   return (
+    <WorkspaceFavoritesContext.Provider value={favoritesApi}>
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[60px] flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-7 py-2.5">
         <nav aria-label="Workspace path" className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground">
-          <button onClick={() => crumbs[0] ? enterContainer(crumbs[0], [crumbs[0]]) : setWorkspaceResource(null)} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
+          <button onClick={() => {
+            if (favoritesOnly) {
+              setFavoritesOnly(false)
+              setWorkspaceResource(null)
+              return
+            }
+            crumbs[0] ? enterContainer(crumbs[0], [crumbs[0]]) : setWorkspaceResource(null)
+          }} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
           {crumbs.slice(1).map((crumb, index) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => enterContainer(crumb, crumbs.slice(0, index + 2))} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
         </nav>
         <span className="flex-1" />
@@ -1175,6 +1305,16 @@ function WorkspaceMixedExplorer() {
       </div>}
 
       {!searchQuery && !loading && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
+        <button type="button" aria-pressed={favoritesOnly} data-testid="workspace-favorites-filter"
+          onClick={() => {
+            setFavoritesOnly((current) => !current)
+            setSelectedResourceIds(new Set())
+            setWorkspaceSearchQuery('')
+            setSearchDraft('')
+          }}
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold ${favoritesOnly ? 'border-primary bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground'}`}>
+          <Icon name="star" size={12} filled={favoritesOnly} /> Favorites
+        </button>
         {sortSupported && <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
           commitBrowseState({ sortMode: event.target.value as WorkspaceBrowseSortMode })
         }}
@@ -1190,10 +1330,10 @@ function WorkspaceMixedExplorer() {
         }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="all">All types</option>
-          <option value="container">Folders</option>
+          {!favoritesOnly && <option value="container">Folders</option>}
           <option value="canvas">Canvases</option>
           <option value="dataset">Datasets</option>
-          <option value="dataset_view">Saved views</option>
+          {!favoritesOnly && <option value="dataset_view">Saved views</option>}
         </select>}
         {error && (sortMode !== 'source' || kindFilter !== 'all') && <button type="button" onClick={() => {
           commitBrowseState({ sortMode: 'source', kindFilter: 'all' })
@@ -1301,6 +1441,7 @@ function WorkspaceMixedExplorer() {
             })}
           </div></> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
             ? 'This Workspace location is unavailable.'
+            : favoritesOnly ? 'No favorites yet. Star a dataset or Canvas from Workspace.'
             : hasMore ? 'This page has no items. Continue to the next page.'
             : isExternal(container) ? canvasDestination(container, 'create')
               ? 'This connected source folder is empty. Create a Canvas here to get started.'
@@ -1308,11 +1449,11 @@ function WorkspaceMixedExplorer() {
               : 'This folder is empty. Create a Canvas here to get started.'}</span></div>}
           {loadMoreError && <div role="alert" className="mt-3 self-center text-[12px] text-destructive">Couldn't load this page: {loadMoreError}</div>}
           {(pageIndex > 0 || hasMore) && <nav aria-label="Workspace pages" className="mt-3 flex items-center justify-center gap-2 text-[12px]">
-            <button type="button" onClick={() => void load(containerId, pageCursors[pageIndex - 1] ?? null, pageIndex - 1)}
+            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : containerId, pageCursors[pageIndex - 1] ?? null, pageIndex - 1)}
               disabled={pageIndex === 0 || loadingMore} data-testid="workspace-previous-page"
               className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">Previous</button>
             <span className="min-w-16 text-center text-muted-foreground">Page {pageIndex + 1}</span>
-            <button type="button" onClick={() => void load(containerId, cursor, pageIndex + 1)}
+            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : containerId, cursor, pageIndex + 1)}
               disabled={!hasMore || !cursor || loadingMore} data-testid="workspace-next-page"
               className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry' : 'Next'}</button>
           </nav>}
@@ -1427,6 +1568,7 @@ function WorkspaceMixedExplorer() {
         }} />}
       {relinkDialog}
     </div>
+    </WorkspaceFavoritesContext.Provider>
   )
 }
 
@@ -1436,6 +1578,7 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
   files: CanvasFile[]
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const favorites = useWorkspaceFavorites()
   const [groups, setGroups] = useState<WorkspaceSearchGroup[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(false)
@@ -1487,6 +1630,14 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
       })
       setCursor(page.nextCursor ?? null)
       setHasMore(page.hasMore)
+      const favoriteCandidates = page.groups.flatMap((group) => group.items)
+        .filter(canFavoriteResource).map((item) => item.id)
+      if (favoriteCandidates.length) {
+        try {
+          const status = await api.workspaceFavoriteStatus(favoriteCandidates)
+          if (sequence === request.current) favorites.rememberFavorited(status.favorited)
+        } catch { /* search star chrome is best-effort */ }
+      }
       const pageOccurrences = page.groups.flatMap((group) => group.items
         .filter((resource) => isExternal(resource) && resource.kind === 'dataset'
           && resource.mountId && resource.providerPlacementId)
@@ -2219,10 +2370,13 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
 }) {
   const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const favorites = useContext(WorkspaceFavoritesContext)
   const currentUserId = useStore((state) => state.currentUser?.id)
   const menuOpen = openId === resource.id
   const unavailable = itemAvailability(resource)
   const canOpen = !unavailable || hasDetachedDatasetRecovery(resource)
+  const favoritable = contextSelectionCount === 1 && favorites.canFavorite(resource)
+  const favorited = favoritable && favorites.isFavorited(resource.id)
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'Saved view' : 'Dataset'
   const source = isExternal(resource) ? `Connected source ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
     : isCatalogFolder(resource) ? 'Catalog organization'
@@ -2240,6 +2394,10 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
   const openedAtTitle = openedAtValue ? new Date(openedAtValue).toLocaleString() : undefined
   const actions: ResourceMenuAction[] = [
     ...(canOpen && contextSelectionCount === 1 ? [{ label: resource.kind === 'dataset' ? 'Open in Workspace' : 'Open', onSelect: onOpen }] : []),
+    ...(favoritable ? [{
+      label: favorited ? 'Remove from Favorites' : 'Add to Favorites',
+      onSelect: () => favorites.toggleFavorite(resource),
+    }] : []),
     ...(onNewFolder ? [{ label: 'New folder', onSelect: onNewFolder }] : []),
     ...(onRenameFolder ? [{ label: 'Rename', onSelect: onRenameFolder }] : []),
     ...(onDeleteFolder ? [{ label: 'Delete', onSelect: onDeleteFolder, danger: true }] : []),
@@ -2300,6 +2458,14 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
         <span>{resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}</span>
       </>}
     </button>
+    {favoritable && <button type="button" aria-pressed={favorited}
+      aria-label={favorited ? `Remove ${resource.name} from Favorites` : `Add ${resource.name} to Favorites`}
+      onClick={() => favorites.toggleFavorite(resource)}
+      className={grid
+        ? 'absolute right-10 top-2 z-10 shrink-0 rounded-md border border-border bg-card p-1 text-muted-foreground hover:text-foreground'
+        : 'mr-1 shrink-0 rounded-md border border-border bg-card p-1 text-muted-foreground hover:text-foreground'}>
+      <Icon name="star" size={13} filled={favorited} />
+    </button>}
     {resource.unavailableReason && unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
       className={grid ? 'pb-2 text-[11px] font-semibold text-primary underline' : 'mr-2 shrink-0 font-semibold text-primary underline'}>Retry</button>}
     {hasOverflowMenu && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
@@ -2334,6 +2500,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
   onRemove?: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const favorites = useWorkspaceFavorites()
   const openRelationships = useStore((state) => state.openRelationships)
   const workspaceScope = useStore((state) => state.workspaceScope)
   const workspaceSearchQuery = useStore((state) => state.workspaceSearchQuery)
@@ -2461,6 +2628,12 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, exact
           <div title={resource.name} className="truncate text-[15px] font-bold text-foreground">{resource.name}</div>
           <div className="truncate text-[10.5px] text-muted-foreground">Dataset · {resource.provider ?? resource.mountId ?? 'connected source'}</div>
         </div>
+        {favorites.canFavorite(resource) && <button type="button" aria-pressed={favorites.isFavorited(resource.id)}
+          aria-label={favorites.isFavorited(resource.id) ? `Remove ${resource.name} from Favorites` : `Add ${resource.name} to Favorites`}
+          onClick={() => favorites.toggleFavorite(resource)}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
+          <Icon name="star" size={12} filled={favorites.isFavorited(resource.id)} /> Favorite
+        </button>}
         <button type="button" onClick={openLineageGraph} disabled={!canonicalContext?.sourceUri}
           title={!canonicalContext?.sourceUri ? 'Lineage becomes available after this dataset connection is verified.' : undefined}
           className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-45">

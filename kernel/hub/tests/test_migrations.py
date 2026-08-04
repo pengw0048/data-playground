@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0054_workspace_favorites", "0053_run_boundary_admission"),
         ("0053_run_boundary_admission", "0052_rejected_run_owner"),
         ("0052_rejected_run_owner", "0051_canvas_result_latest"),
         ("0051_canvas_result_latest", "0050_receipt_names"),
@@ -106,8 +107,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0053_run_boundary_admission"]
-    assert metadb.expected_schema_head() == "0053_run_boundary_admission"
+    assert scripts.get_heads() == ["0054_workspace_favorites"]
+    assert metadb.expected_schema_head() == "0054_workspace_favorites"
 
 
 def test_fresh_schema_omits_retired_row_identity_storage(tmp_path):

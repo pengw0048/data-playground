@@ -228,6 +228,21 @@ class WorkspaceFolderCreateReplay(Base):
     )
 
 
+class WorkspaceFavorite(Base):
+    """Personal convenience bookmark for one Workspace dataset or Canvas."""
+    __tablename__ = "workspace_favorites"
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    resource_id: Mapped[str] = mapped_column(String(768), primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint(
+            "resource_id LIKE 'canvas:%' OR resource_id LIKE 'dataset:%'",
+            name="ck_workspace_favorites_kind",
+        ),
+        Index("ix_workspace_favorites_owner_created", "owner_id", "created_at"),
+    )
+
+
 class DatasetView(Base):
     """One owner-scoped immutable DatasetView plus a retained submission tombstone."""
 
@@ -7514,6 +7529,217 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         return {"resource": _workspace_public_placement_resource(
                     s, placement, detached=not live),
                 "ancestors": _workspace_ancestors(s, placement.container_id)}
+
+
+_WORKSPACE_FAVORITE_KINDS = frozenset({"canvas", "dataset"})
+_WORKSPACE_FAVORITES_SHELF_ID = "workspace-favorites"
+_WORKSPACE_FAVORITE_CURSOR_VERSION = 1
+
+
+def _workspace_favorite_parse(resource_id: str) -> tuple[str, str]:
+    try:
+        kind, identity = resource_id.split(":", 1)
+    except ValueError as exc:
+        raise ValueError("invalid Workspace favorite reference") from exc
+    if kind not in _WORKSPACE_FAVORITE_KINDS or not identity or len(resource_id) > 768:
+        raise ValueError("Workspace favorites support only datasets and Canvases")
+    return kind, identity
+
+
+def _workspace_favorite_unavailable(resource_id: str) -> dict:
+    kind, _identity = resource_id.split(":", 1)
+    return {
+        "id": resource_id,
+        "kind": kind,
+        "name": "Unavailable favorite",
+        "parentId": None,
+        "placementId": None,
+        "version": None,
+        "canvasVersion": None,
+        "updatedAt": None,
+        "detached": True,
+        "source": "local",
+        "referenceState": "detached",
+        "favorited": True,
+        "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "unavailableReason": "Unavailable: This favorite is no longer available.",
+    }
+
+
+def _workspace_favorite_cursor_encode(created_at: datetime.datetime, resource_id: str) -> str:
+    raw = json.dumps(
+        [_WORKSPACE_FAVORITE_CURSOR_VERSION, created_at.isoformat(), resource_id],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_favorite_cursor_decode(
+        cursor: str | None) -> tuple[datetime.datetime, str] | None:
+    if cursor is None:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        version, created_at, resource_id = json.loads(raw)
+        if version != _WORKSPACE_FAVORITE_CURSOR_VERSION:
+            raise ValueError("unsupported favorite cursor")
+        stamp = datetime.datetime.fromisoformat(created_at)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("invalid favorite cursor")
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid favorite cursor") from exc
+    return stamp, resource_id
+
+
+def workspace_favorite_add(resource_id: str, *, uid: str) -> dict:
+    """Idempotently favorite one currently visible dataset or Canvas for the actor."""
+    _workspace_favorite_parse(resource_id)
+    # Revalidate authorization through the same resolve path browse/open use.
+    from hub import workspace_providers
+    resolved = workspace_providers.resolve(resource_id, uid=uid)
+    resource = resolved.get("resource")
+    if resource is None:
+        raise KeyError(f"Workspace resource '{resource_id}' not found")
+    # Permission-lost / redacted provider rows must not become new favorites; unfavorite still works.
+    if resource.get("referenceState") == "permission_lost":
+        raise KeyError(f"Workspace resource '{resource_id}' not found")
+    with session() as s:
+        dialect = s.get_bind().dialect.name
+        values = {
+            "owner_id": uid,
+            "resource_id": resource_id,
+            "created_at": _now(),
+        }
+        if dialect in ("postgresql", "sqlite"):
+            if dialect == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as dialect_insert
+            else:
+                from sqlalchemy.dialects.sqlite import insert as dialect_insert
+            s.execute(dialect_insert(WorkspaceFavorite).values(**values).on_conflict_do_nothing(
+                index_elements=[WorkspaceFavorite.owner_id, WorkspaceFavorite.resource_id]))
+        elif s.get(WorkspaceFavorite, (uid, resource_id)) is None:  # pragma: no cover
+            s.add(WorkspaceFavorite(**values))
+    return {"ok": True, "favorited": True, "resourceId": resource_id}
+
+
+def workspace_favorite_remove(resource_id: str, *, uid: str) -> dict:
+    """Idempotently remove a favorite even when the target resource is unavailable."""
+    # Accept any historically stored id shape so clients can clear a stale row.
+    if not resource_id or len(resource_id) > 768:
+        raise ValueError("invalid Workspace favorite reference")
+    with session() as s:
+        row = s.get(WorkspaceFavorite, (uid, resource_id))
+        if row is not None:
+            s.delete(row)
+    return {"ok": True, "favorited": False, "resourceId": resource_id}
+
+
+def workspace_favorite_status(resource_ids: list[str], *, uid: str) -> dict:
+    """Return which of the requested resource ids are favorited by the actor."""
+    unique = []
+    seen: set[str] = set()
+    for resource_id in resource_ids:
+        if not resource_id or resource_id in seen or len(resource_id) > 768:
+            continue
+        seen.add(resource_id)
+        unique.append(resource_id)
+        if len(unique) >= 200:
+            break
+    if not unique:
+        return {"favorited": []}
+    with session() as s:
+        rows = list(s.scalars(select(WorkspaceFavorite.resource_id).where(
+            WorkspaceFavorite.owner_id == uid,
+            WorkspaceFavorite.resource_id.in_(unique),
+        )))
+    return {"favorited": rows}
+
+
+def workspace_favorites_browse(
+        *, uid: str, limit: int = 50, cursor: str | None = None,
+        kinds: set[str] | frozenset[str] | None = None) -> dict:
+    """Page the actor's favorites after revalidating authorization for each entry."""
+    from hub import workspace_providers
+
+    limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    allowed = frozenset(kinds) if kinds else _WORKSPACE_FAVORITE_KINDS
+    if not allowed <= _WORKSPACE_FAVORITE_KINDS:
+        raise ValueError("Workspace favorites support only datasets and Canvases")
+    decoded = _workspace_favorite_cursor_decode(cursor)
+    with session() as s:
+        query = select(WorkspaceFavorite).where(WorkspaceFavorite.owner_id == uid)
+        if decoded is not None:
+            stamp, resource_id = decoded
+            query = query.where(tuple_(
+                WorkspaceFavorite.created_at, WorkspaceFavorite.resource_id,
+            ) < tuple_(stamp, resource_id))
+        rows = list(s.scalars(query.order_by(
+            WorkspaceFavorite.created_at.desc(),
+            WorkspaceFavorite.resource_id.desc(),
+        ).limit(limit * 4 + 1)))  # over-fetch for kind filter + unavailable keep
+
+    items: list[dict] = []
+    next_cursor = None
+    for row in rows:
+        kind = row.resource_id.split(":", 1)[0]
+        if kind not in allowed:
+            continue
+        try:
+            resolved = workspace_providers.resolve(row.resource_id, uid=uid)
+            resource = resolved.get("resource")
+        except KeyError:
+            resource = None
+        except Exception:  # noqa: BLE001 — favorites must not fail the shelf on provider faults
+            resource = None
+        if resource is None or resource.get("referenceState") == "permission_lost":
+            item = _workspace_favorite_unavailable(row.resource_id)
+        else:
+            item = {**resource, "favorited": True}
+            # Never leak provider path/name when the occurrence is not currently usable.
+            if item.get("referenceState") in {"permission_lost"}:
+                item = _workspace_favorite_unavailable(row.resource_id)
+        items.append(item)
+        if len(items) == limit:
+            next_cursor = _workspace_favorite_cursor_encode(row.created_at, row.resource_id)
+            break
+
+    has_more = next_cursor is not None
+    return {
+        "container": {
+            "id": _workspace_ref("container", _WORKSPACE_FAVORITES_SHELF_ID),
+            "kind": "container",
+            "name": "Favorites",
+            "parentId": None,
+            "placementId": None,
+            "version": 1,
+            "detached": False,
+            "source": "local",
+            "referenceState": "current",
+            "favorited": False,
+            "providerMutation": False,
+            "canCreateFolder": False,
+            "canRenameFolder": False,
+            "canDeleteFolder": False,
+            "folderMutationUnavailableReason": "Favorites is a personal shelf, not a Folder.",
+        },
+        "items": items,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": [],
+            "kindFilter": True,
+            "reason": "Favorites are ordered by when you starred them.",
+        },
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+        "completeness": "page" if has_more else "complete",
+        "sources": [{"id": "local", "kind": "local",
+                     "completeness": "page" if has_more else "complete"}],
+    }
 
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)

@@ -1033,6 +1033,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
   folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
   backLabel = 'Back to Workspace', workspaceResourceId: workspaceResourceIdOverride,
+  favorited = false, onToggleFavorite,
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
@@ -1044,6 +1045,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   initialRevisionDatasetId?: string
   backLabel?: string
   workspaceResourceId?: string
+  favorited?: boolean
+  onToggleFavorite?: () => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1349,6 +1352,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               {exactVersionContext ?? 'Current version'}
             </div>
           </div>
+          {onToggleFavorite && <button type="button" aria-pressed={favorited}
+            aria-label={favorited ? `Remove ${table.name} from Favorites` : `Add ${table.name} to Favorites`}
+            onClick={onToggleFavorite}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
+            <Icon name="star" size={12} filled={favorited} /> Favorite
+          </button>}
           <button type="button" onClick={openLineageGraph} data-testid="detail-relationships"
             className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-[11.5px] font-semibold text-foreground hover:bg-accent">
             <Icon name="lineage" size={12} /> Lineage

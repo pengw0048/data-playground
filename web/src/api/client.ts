@@ -303,6 +303,30 @@ export const api = {
     for (const kind of params?.kinds ?? []) query.append('kind', kind)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
+  workspaceFavorites: (params?: {
+    cursor?: string
+    limit?: number
+    kinds?: Array<'canvas' | 'dataset'>
+  }) => {
+    const query = new URLSearchParams()
+    if (params?.cursor) query.set('cursor', params.cursor)
+    if (params?.limit) query.set('limit', String(params.limit))
+    for (const kind of params?.kinds ?? []) query.append('kind', kind)
+    return req<WorkspaceBrowsePage>(`/workspace/favorites${query.size ? `?${query}` : ''}`)
+  },
+  workspaceFavoriteStatus: (ids: string[]) => {
+    const query = new URLSearchParams()
+    for (const id of ids) query.append('id', id)
+    return req<{ favorited: string[] }>(`/workspace/favorites/status${query.size ? `?${query}` : ''}`)
+  },
+  workspaceFavoriteAdd: (resourceId: string) =>
+    req<{ ok: boolean; favorited: boolean; resourceId: string }>(
+      `/workspace/favorites/${encodeURIComponent(resourceId)}`, { method: 'PUT' },
+    ),
+  workspaceFavoriteRemove: (resourceId: string) =>
+    req<{ ok: boolean; favorited: boolean; resourceId: string }>(
+      `/workspace/favorites/${encodeURIComponent(resourceId)}`, { method: 'DELETE' },
+    ),
   workspaceResource: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`, {
       signal: options?.signal,
