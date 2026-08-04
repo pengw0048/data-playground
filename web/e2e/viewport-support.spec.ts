@@ -201,7 +201,7 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // A Source card is an orientation surface, not a provenance dump. Opaque binding and field
     // detail stay in the Inspector disclosure, even at the smallest supported desktop width.
-    await expect(node).toContainText(/Datasets · Current version · \d[\d,]* rows? · \d+ columns?/)
+    await expect(node).toContainText(/Datasets · \d[\d,]* rows? · \d+ columns?/)
     await expect(node.getByText(/^Fields/i)).toHaveCount(0)
     const connectionDetails = page.getByTestId('inspector').getByText('Data details', { exact: true })
     await expectFullyInViewport(page, connectionDetails, 'source connection details')
