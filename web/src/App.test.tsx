@@ -51,6 +51,7 @@ describe('App auth bootstrap', () => {
     useStore.setState({ bootstrap: mocks.bootstrap, view: 'canvas', authEnabled: false } as never)
     localStorage.clear()
     history.replaceState(null, '', '/')
+    document.title = 'Data Playground'
   })
 
   afterEach(() => { vi.unstubAllGlobals() })
@@ -247,5 +248,87 @@ describe('App auth bootstrap', () => {
     expect(await screen.findByTestId('canvas')).toBeVisible()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(status).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('App document title', () => {
+  beforeEach(() => {
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        clear: () => storage.clear(),
+        getItem: (key: string) => storage.get(key) ?? null,
+        removeItem: (key: string) => { storage.delete(key) },
+        setItem: (key: string, value: string) => { storage.set(key, String(value)) },
+      } satisfies Storage,
+    })
+    vi.restoreAllMocks()
+    mocks.bootstrap.mockReset().mockResolvedValue(undefined)
+    mocks.initRouter.mockReset().mockReturnValue({ settleBootstrap: mocks.settleBootstrap })
+    mocks.settleBootstrap.mockReset()
+    useStore.setState({
+      bootstrap: mocks.bootstrap,
+      view: 'canvas',
+      authEnabled: false,
+      doc: { id: 'canvas-private', name: 'Private alpha', version: 1, nodes: [], edges: [] },
+      erMode: 'joins',
+    } as never)
+    localStorage.clear()
+    history.replaceState(null, '', '/')
+    document.title = 'stale previous title'
+  })
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('keeps bootstrap and failed deep-link loading titles neutral', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    mocks.bootstrap.mockImplementation(async () => new Promise<never>(() => {}))
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('app-destination-bootstrap')).toBeVisible()
+    expect(document.title).toBe('Data Playground')
+
+    history.replaceState(null, '', '#/canvas/canvas-shared')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    useStore.setState({ view: 'canvas' })
+
+    await waitFor(() => expect(document.title).toBe('Data Playground'))
+    expect(document.title).not.toContain('Private alpha')
+  })
+
+  it('follows rename and shell navigation without leaking the previous Canvas name', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    useStore.setState({
+      doc: { id: 'canvas-a', name: 'Alpha', version: 1, nodes: [], edges: [] },
+    } as never)
+    history.replaceState(null, '', '#/canvas/canvas-a')
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(document.title).toBe('Alpha · Data Playground'))
+
+    useStore.setState({
+      doc: { id: 'canvas-a', name: 'Alpha renamed', version: 1, nodes: [], edges: [] },
+    } as never)
+    await waitFor(() => expect(document.title).toBe('Alpha renamed · Data Playground'))
+
+    useStore.setState({ view: 'jobs' })
+    history.replaceState(null, '', '#/jobs')
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    await waitFor(() => expect(document.title).toBe('Jobs · Data Playground'))
+    expect(document.title).not.toContain('Alpha')
+  })
+
+  it('titles the login gate without the previous Canvas name', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: true, userId: null })
+
+    render(<App />)
+
+    expect(await screen.findByTestId('login')).toBeVisible()
+    expect(document.title).toBe('Sign in · Data Playground')
+    expect(document.title).not.toContain('Private alpha')
   })
 })
