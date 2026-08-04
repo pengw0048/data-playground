@@ -55,6 +55,16 @@ def _uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def new_canvas_file_key() -> str:
+    """Opaque immutable Canvas file key: a full UUID4 string.
+
+    Only Canvas creation uses this helper. Other metadata rows keep the truncated ``_uid()``
+    contract. Clients may supply their own key; the server mints one only when the caller omits
+    an id. Legacy stored ids remain valid; uniqueness and authorization stay database-authoritative.
+    """
+    return str(uuid.uuid4())
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -90,7 +100,7 @@ class User(Base):
 
 class Canvas(Base):
     __tablename__ = "canvases"
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_canvas_file_key)
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String, default="untitled")
     version: Mapped[int] = mapped_column(Integer, default=1)
@@ -4267,7 +4277,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
                 s, uid=uid, transform=transform))
         nodes: list[dict] = []
         _workspace_place_sources(nodes, sources)
-        canvas_id = _uid()
+        canvas_id = new_canvas_file_key()
         doc = {
             "id": canvas_id, "name": canvas_name, "version": 1,
             "nodes": nodes, "edges": [],

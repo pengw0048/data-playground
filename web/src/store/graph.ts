@@ -20,6 +20,7 @@ import {
   type Route,
 } from '../router'
 import { ownsNavigation, startNavigation, type NavigationToken } from '../navigationOwnership'
+import { newCanvasFileKey } from '../canvas/fileKey'
 import { exampleDoc } from '../examples'
 import {
   api, KernelError, setApiUser,
@@ -1593,9 +1594,7 @@ function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, 
 }
 
 function emptyDoc(): CanvasDoc {
-  // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
-  // collide across freshly-loaded tabs/tests and leak one canvas's runs/history into another
-  return { id: `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`, name: 'untitled', version: 1, nodes: [], edges: [] }
+  return { id: newCanvasFileKey(), name: 'untitled', version: 1, nodes: [], edges: [] }
 }
 
 function replaceDraft(drafts: LocalCanvasDraft[], draft: LocalCanvasDraft): LocalCanvasDraft[] {
@@ -4328,7 +4327,7 @@ export const useStore = create<Store>((set, get) => ({
       }
       replacePristine = runsEmpty
     }
-    const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
+    const id = replacePristine ? current.doc.id : newCanvasFileKey()
     const example = exampleDoc(key, id)  // bare seeded names remain the offline runnable fallback
     if (!example) return get().newFile()
     const resolved = await canonicalizeExampleSources(example)

@@ -709,11 +709,10 @@ class Playground:
         return {"canvases": rows}
 
     def create_canvas(self, args: dict) -> dict:
-        import uuid
-
+        from hub import metadb
         from hub.routers import workspace as ws
         name = (args.get("name") or "untitled").strip() or "untitled"
-        cid = "canvas_" + uuid.uuid4().hex[:12]
+        cid = metadb.new_canvas_file_key()
         created = ws.create_canvas(
             {"id": cid, "name": name, "version": 1, "nodes": [], "edges": []},
             uid=self.user_id,

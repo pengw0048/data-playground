@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, type CanvasCopyRequest } from '../api/client'
+import { newCanvasFileKey } from '../canvas/fileKey'
 import { useStore } from '../store/graph'
 import type { CanvasCopyValidation, WorkspaceResource } from '../types/api'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
@@ -32,7 +33,7 @@ export function CanvasCopyModal({ source, initialDestination, onClose, onCreated
   const session = useRef({ principalId, view })
   const initialDestinationRef = useRef(initialDestination)
   const alive = useRef(true)
-  const [copyId] = useState(() => crypto.randomUUID())
+  const [copyId] = useState(() => newCanvasFileKey())
   const [name, setName] = useState(`${source.name || 'Untitled canvas'} copy`)
   const [path, setPath] = useState<WorkspaceResource[]>([])
   const [container, setContainer] = useState<WorkspaceResource | null>(null)

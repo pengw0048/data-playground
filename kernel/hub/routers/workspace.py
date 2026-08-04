@@ -1389,7 +1389,7 @@ def create_canvas(
 ) -> dict:
     # The route owns persisted identity. Raw clients may omit these fields or submit stale values;
     # neither should leak into the document later returned to every other Canvas consumer.
-    cid = doc.get("id") or metadb._uid()
+    cid = doc.get("id") or metadb.new_canvas_file_key()
     persisted_doc = {**doc, "id": cid, "version": 1}
     _validate_canvas_execution_contract(persisted_doc)
     try:
