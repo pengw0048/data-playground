@@ -1,6 +1,7 @@
 // Minimal hash router — no dependency, works offline. The URL reflects the app's view + open canvas
 // so the browser back/forward buttons work, a refresh restores where you were, and Share can produce
-// a link that opens straight into a specific canvas (#/canvas/<id>).
+// a link that opens straight into a specific canvas (#/canvas/<file-key>/<optional-title-slug>).
+import { canvasTitleSlug } from './canvas/titleSlug'
 import type { DpView } from './store/graph'
 import { ownsNavigation, startNavigation, type NavigationToken } from './navigationOwnership'
 import {
@@ -139,6 +140,18 @@ function decodeRouteSegment(value: string | undefined): string | undefined {
   }
 }
 
+function canvasPath(canvasId: string, title?: string | null): string {
+  const slug = canvasTitleSlug(title)
+  return `#/canvas/${encodeURIComponent(canvasId)}${slug ? `/${encodeURIComponent(slug)}` : ''}`
+}
+
+function canvasFileKeyFromHash(hash: string): string | undefined {
+  const path = hash.replace(/^#\/?/, '').split('?', 1)[0]
+  const [seg, id] = path.split('/')
+  if (seg !== 'canvas') return undefined
+  return decodeRouteSegment(id)
+}
+
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
   const [path, rawQuery = ''] = h.split('?', 2)
@@ -146,6 +159,7 @@ export function parseHash(): Route {
   const params = new URLSearchParams(rawQuery)
   const workspaceQuery = params.get('q')?.trim() || undefined
   const decodedId = decodeRouteSegment(id)
+  // Optional decorative slug after the file key is ignored for lookup; only the key authorizes.
   if (seg === 'canvas' && decodedId) return {
     view: 'canvas', canvasId: decodedId,
     nodeId: params.get('node') || undefined,
@@ -241,8 +255,8 @@ export function parseHash(): Route {
   return { view: 'workspace', canonicalHash: '#/workspace' }
 }
 
-export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string, workspaceBrowseQuery?: string): string {
-  const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}`
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string, workspaceBrowseQuery?: string, canvasTitle?: string | null): string {
+  const path = view === 'canvas' && canvasId ? canvasPath(canvasId, canvasTitle)
     : view === 'transforms' && transformId ? `#/transforms/${encodeURIComponent(transformId)}` : `#/${view}`
     + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
   const workspaceParams = new URLSearchParams()
@@ -328,12 +342,15 @@ export function datasetViewerHash(
 }
 
 /** A shareable absolute link that opens straight into this canvas. */
-export function canvasLink(id: string): string {
-  return `${location.origin}${location.pathname}${routeHash('canvas', id)}`
+export function canvasLink(id: string, title?: string | null): string {
+  return `${location.origin}${location.pathname}${routeHash(
+    'canvas', id, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, undefined, title,
+  )}`
 }
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
-interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; workspaceBrowseQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string; erFocusDatasetId?: string | null; erMode?: RelationshipsMode; erReturn?: RelationshipsReturn | null }
+interface RouterState { view: DpView; doc: { id: string; name?: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; workspaceBrowseQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string; erFocusDatasetId?: string | null; erMode?: RelationshipsMode; erReturn?: RelationshipsReturn | null }
 interface RouterStore {
   getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; requestViewportFit: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken; skipViewportFit?: boolean }) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => () => void
@@ -358,7 +375,8 @@ const hashFor = (s: RouterState) => s.view === 'relationships'
     s.view === 'transforms' ? s.transformLibraryQuery : undefined,
     s.view === 'transforms' ? s.transformUpgradeCanvasId ?? undefined : undefined,
     s.view === 'transforms' ? s.transformUpgradeNodeId ?? undefined : undefined,
-    s.view === 'workspace' ? s.workspaceBrowseQuery || undefined : undefined)
+    s.view === 'workspace' ? s.workspaceBrowseQuery || undefined : undefined,
+    s.view === 'canvas' ? s.doc.name : undefined)
 
 export interface RouterController {
   settleBootstrap: (navigationToken: NavigationToken) => void
@@ -413,7 +431,12 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
         else if (r.nodeId) {
           current.clearNodeReveal()
           current.pushToast('The requested node is no longer in this Canvas.', 'info')
-          if (ownsNavigation(navigationToken)) history.replaceState(null, '', hashFor(store.getState()))
+        }
+        // Missing, stale, wrong, or omitted title slugs never affect authorization. Replace the URL
+        // with the canonical file-key (+ current slug) + node query without adding a history entry.
+        if (ownsNavigation(navigationToken)) {
+          const want = hashFor(store.getState())
+          if (location.hash !== want) history.replaceState(null, '', want)
         }
       } else if (ownsNavigation(navigationToken)) {
         if (r.canonicalHash && location.hash !== r.canonicalHash) {
@@ -440,10 +463,14 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
     if (applyingToken !== null && ownsNavigation(applyingToken)) return
     const want = hashFor(s)
     if (location.hash !== want) {
-      // Node focus is a deep-linkable selection inside one canvas, not a new destination. Keep the
-      // current history entry shareable without making Back walk through every inspector click.
+      // Same Canvas file key (including title-slug edits and node focus) replaces the entry so Back
+      // does not walk every rename. Distinct Canvas keys still push a history entry.
+      const currentKey = canvasFileKeyFromHash(location.hash)
+      const wantKey = canvasFileKeyFromHash(want)
+      const sameCanvas = !!currentKey && currentKey === wantKey
+        && want.startsWith('#/canvas/')
       const samePath = location.hash.split('?', 1)[0] === want.split('?', 1)[0]
-      const replaceRouteState = (samePath && want.startsWith('#/canvas/'))
+      const replaceRouteState = sameCanvas
         || (samePath && want.startsWith('#/relationships'))
       if (replaceRouteState) history.replaceState(null, '', want)
       // State-owned navigation must not emit hashchange and make the router claim a competing token.

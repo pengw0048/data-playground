@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  canvasLink,
   datasetViewerHash,
   initRouter,
   parseDatasetViewerReturn,
@@ -285,6 +286,37 @@ describe('Workspace routes', () => {
   it('round-trips a canvas node deep link', () => {
     window.location.hash = routeHash('canvas', 'canvas-1', undefined, undefined, undefined, 'write-1')
     expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'canvas-1', nodeId: 'write-1' })
+  })
+
+  it('accepts an optional decorative title slug without using it for lookup', () => {
+    window.location.hash = routeHash(
+      'canvas', 'file-key-1', undefined, undefined, undefined, 'node-1',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      '销售分析 Draft',
+    )
+    expect(window.location.hash).toBe(
+      `#/canvas/file-key-1/${encodeURIComponent('销售分析-Draft')}?node=node-1`,
+    )
+    expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'file-key-1', nodeId: 'node-1' })
+
+    window.location.hash = '#/canvas/legacy_short/wrong-slug-for-another-title?node=step'
+    expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'legacy_short', nodeId: 'step' })
+
+    window.location.hash = '#/canvas/abcdef123456'
+    expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'abcdef123456' })
+
+    // Malformed slug encoding must not hide a valid file key.
+    window.location.hash = '#/canvas/good-key/%E0%A4%A'
+    expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'good-key' })
+  })
+
+  it('omits the slug for untitled canvases and keeps share links keyed by file identity', () => {
+    expect(routeHash('canvas', 'id-1', undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'untitled'))
+      .toBe('#/canvas/id-1')
+    expect(canvasLink('id-1', 'Purchases per user')).toBe(
+      `${location.origin}${location.pathname}#/canvas/id-1/Purchases-per-user`,
+    )
   })
 
   it.each([
@@ -596,5 +628,88 @@ describe('Workspace routes', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1)
     expect(removeListener).toHaveBeenCalledWith('hashchange', hashListener)
     expect(removeListener).toHaveBeenCalledWith('popstate', popListener)
+  })
+
+  it('canonicalizes missing or wrong title slugs without a history entry and keeps node focus', async () => {
+    const state = {
+      view: 'canvas' as DpView,
+      doc: { id: 'file-key', name: 'Sales Analysis', nodes: [{ id: 'write-1' }] },
+      selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+      nodeRevealRequest: null as { canvasId: string; nodeId: string } | null,
+    }
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: (route: { view: DpView }) => { state.view = route.view },
+        select: (id: string | null) => { state.selectedId = id },
+        requestNodeReveal: (canvasId: string, nodeId: string) => {
+          state.nodeRevealRequest = { canvasId, nodeId }
+        },
+        clearNodeReveal: () => { state.nodeRevealRequest = null },
+        requestViewportFit: vi.fn(), pushToast: vi.fn(),
+        openFile: vi.fn(async () => true),
+      }),
+      subscribe: vi.fn(() => () => {}),
+    }
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+    const before = history.length
+
+    history.replaceState(null, '', '#/canvas/file-key/wrong-title?node=write-1')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(location.hash).toBe('#/canvas/file-key/Sales-Analysis?node=write-1'))
+    expect(state.selectedId).toBe('write-1')
+    expect(state.nodeRevealRequest).toEqual({ canvasId: 'file-key', nodeId: 'write-1' })
+    expect(history.length).toBe(before)
+
+    history.replaceState(null, '', '#/canvas/file-key?node=write-1')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(location.hash).toBe('#/canvas/file-key/Sales-Analysis?node=write-1'))
+    expect(history.length).toBe(before)
+  })
+
+  it('replaces history on rename slug changes and pushes when switching Canvas file keys', async () => {
+    const state = {
+      view: 'canvas' as DpView,
+      doc: { id: 'canvas-a', name: 'Alpha', nodes: [] as { id: string }[] },
+      selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+    }
+    const subscribers = new Set<(snapshot: typeof state) => void>()
+    const publish = () => { for (const subscriber of subscribers) subscriber({ ...state }) }
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: vi.fn(), select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(),
+        requestViewportFit: vi.fn(), pushToast: vi.fn(), openFile: vi.fn(async () => true),
+      }),
+      subscribe: (subscriber: (snapshot: typeof state) => void) => {
+        subscribers.add(subscriber)
+        return () => { subscribers.delete(subscriber) }
+      },
+    }
+    history.replaceState(null, '', '#/canvas/canvas-a/Alpha')
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+    const lengthAfterSettle = history.length
+
+    state.doc = { ...state.doc, name: 'Beta Draft' }
+    publish()
+    expect(location.hash).toBe('#/canvas/canvas-a/Beta-Draft')
+    expect(history.length).toBe(lengthAfterSettle)
+
+    state.doc = { id: 'canvas-b', name: 'Other', nodes: [] }
+    publish()
+    expect(location.hash).toBe('#/canvas/canvas-b/Other')
+    expect(history.length).toBe(lengthAfterSettle + 1)
   })
 })

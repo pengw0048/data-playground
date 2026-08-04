@@ -25,6 +25,7 @@ const VISIBILITIES: { value: CanvasVisibility; label: string }[] = [
 // the current policy and copy the link; only the server-reported owner gets mutation controls.
 export function ShareModal({ onClose }: { onClose: () => void }) {
   const canvasId = useStore((s) => s.doc.id)
+  const canvasName = useStore((s) => s.doc.name)
   const canvasRole = useStore((s) => s.canvasRole)
   const users = useStore((s) => s.users)
   const currentUser = useStore((s) => s.currentUser)
@@ -34,6 +35,7 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
   const sharing = useCanvasSharing(canvasId, isOwner)
   const [pick, setPick] = useState('')
   const [role, setRole] = useState<ShareRole>('editor')
+  const shareHref = canvasLink(canvasId, canvasName)
 
   const visibleShares = sharing.shares.filter((share) => share.userId !== currentUser?.id)
   const sharedIds = new Set([currentUser?.id, ...visibleShares.map((share) => share.userId)])
@@ -81,11 +83,11 @@ export function ShareModal({ onClose }: { onClose: () => void }) {
           <div>
             <div className={sectionLabel}>Link</div>
             <div className="flex gap-1.5">
-              <Input readOnly value={canvasLink(canvasId)} onClick={(event) => (event.target as HTMLInputElement).select()}
+              <Input readOnly value={shareHref} onClick={(event) => (event.target as HTMLInputElement).select()}
                 className="h-8 flex-1 bg-muted text-[11.5px] text-muted-foreground" />
               <Button data-testid="copy-link" type="button" variant="outline" size="sm"
                 onClick={() => {
-                  navigator.clipboard?.writeText(canvasLink(canvasId)).then(
+                  navigator.clipboard?.writeText(shareHref).then(
                     () => pushToast('Link copied', 'success'),
                     () => pushToast('Could not copy the link', 'error'),
                   )
