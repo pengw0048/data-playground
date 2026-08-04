@@ -529,6 +529,252 @@ def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retain
     }
 
 
+def test_canvas_reopen_recovers_every_terminal_result_from_one_whole_graph_run(tmp_path):
+    lance = pytest.importorskip("lance")
+    canvas_id = f"retained-whole-graph-{uuid.uuid4().hex}"
+    source_uri = str(tmp_path / f"{canvas_id}.lance")
+    lance.write_dataset(pa.table({
+        "event": ["view", "purchase", "view", "purchase"],
+        "amount": [1, 2, 3, 4],
+    }), source_uri)
+    registered = client.post("/api/catalog/register", json={
+        "uri": source_uri, "name": f"whole-{uuid.uuid4().hex}",
+    })
+    assert registered.status_code == 200, registered.text
+    graph = {
+        "id": canvas_id,
+        "name": "Retained whole graph",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 100},
+                "data": {"title": "Events", "config": {
+                    "uri": source_uri,
+                    "datasetRef": {
+                        "kind": "exact",
+                        "datasetId": registered.json()["registrationId"],
+                        "revisionId": "1",
+                    },
+                }},
+            },
+            {
+                "id": "sample-a", "type": "sample", "position": {"x": 240, "y": 0},
+                "data": {"title": "Sample A", "config": {"n": 2, "seed": 11}},
+            },
+            {
+                "id": "sample-b", "type": "sample", "position": {"x": 240, "y": 200},
+                "data": {"title": "Sample B", "config": {"n": 3, "seed": 22}},
+            },
+        ],
+        "edges": [
+            {"id": "source-a", "source": "source", "sourceHandle": "out",
+             "target": "sample-a", "targetHandle": "in", "data": {"wire": "dataset"}},
+            {"id": "source-b", "source": "source", "sourceHandle": "out",
+             "target": "sample-b", "targetHandle": "in", "data": {"wire": "dataset"}},
+        ],
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id=metadb.DEFAULT_USER_ID,
+            name="Retained whole graph",
+        ))
+    try:
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done" and status["targetNodeId"] is None
+        assert [(output["nodeId"], output["portId"]) for output in status["outputs"]] == [
+            ("sample-a", "out"),
+            ("sample-b", "out"),
+        ]
+        assert [
+            (output["sampleProvenance"]["strategy"], output["sampleProvenance"]["seed"])
+            for output in status["outputs"]
+        ] == [("reservoir", 11), ("reservoir", 22)]
+
+        reopened = client.post("/api/run/current-results", json={"graph": graph})
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["latestNodeIds"] == ["sample-a", "sample-b", "source"]
+        assert reopened.json()["staleNodeIds"] == []
+        assert {
+            result["output"]["nodeId"] for result in reopened.json()["results"]
+        } == {"sample-a", "sample-b"}
+        for node_id in ("sample-a", "sample-b"):
+            retained = _retained_result(graph, node_id=node_id)
+            assert retained.status_code == 200, retained.text
+            assert retained.json()["runId"] == status["runId"]
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        get_deps().catalog.unregister(source_uri)
+        shutil.rmtree(source_uri, ignore_errors=True)
+
+
+def test_whole_graph_run_preserves_write_and_result_leaf_receipts(tmp_path):
+    lance = pytest.importorskip("lance")
+    canvas_id = f"retained-write-and-result-{uuid.uuid4().hex}"
+    source_uri = str(tmp_path / f"{canvas_id}.lance")
+    lance.write_dataset(pa.table({"value": [1, 2, 3, 4]}), source_uri)
+    registered = client.post("/api/catalog/register", json={
+        "uri": source_uri, "name": f"mixed-source-{uuid.uuid4().hex}",
+    })
+    assert registered.status_code == 200, registered.text
+    output_name = f"mixed-output-{uuid.uuid4().hex}.parquet"
+    graph = {
+        "id": canvas_id,
+        "name": "Write and result leaves",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 100},
+                "data": {"title": "Source", "config": {
+                    "uri": source_uri,
+                    "datasetRef": {
+                        "kind": "exact",
+                        "datasetId": registered.json()["registrationId"],
+                        "revisionId": "1",
+                    },
+                }},
+            },
+            {
+                "id": "sample", "type": "sample", "position": {"x": 240, "y": 0},
+                "data": {"title": "Sample", "config": {"n": 2, "seed": 7}},
+            },
+            {
+                "id": "write", "type": "write", "position": {"x": 240, "y": 200},
+                "data": {"title": "Published output", "config": {
+                    "filename": output_name,
+                    "writeMode": "overwrite",
+                }},
+            },
+        ],
+        "edges": [
+            {"id": "source-sample", "source": "source", "sourceHandle": "out",
+             "target": "sample", "targetHandle": "in", "data": {"wire": "dataset"}},
+            {"id": "source-write", "source": "source", "sourceHandle": "out",
+             "target": "write", "targetHandle": "in", "data": {"wire": "dataset"}},
+        ],
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id=metadb.DEFAULT_USER_ID,
+            name="Write and result leaves",
+        ))
+    published_uri = None
+    try:
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done" and status["targetNodeId"] is None
+        outputs = {(item["nodeId"], item["publicationKind"]): item
+                   for item in status["outputs"]}
+        assert set(outputs) == {("sample", "result"), ("write", "catalog")}
+        sample_page = client.post(f"/api/run/{status['runId']}/sample", json={
+            "nodeId": "sample", "portId": "out", "k": 10, "offset": 0,
+        })
+        assert sample_page.status_code == 200, sample_page.text
+        assert len(sample_page.json()["rows"]) == 2
+        assert outputs[("write", "catalog")]["rows"] == 4
+        published_uri = outputs[("write", "catalog")]["uri"]
+
+        reopened = client.post("/api/run/current-results", json={"graph": graph})
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["latestNodeIds"] == ["sample", "source", "write"]
+        assert reopened.json()["staleNodeIds"] == []
+        retained = _retained_result(graph, node_id="sample")
+        assert retained.status_code == 200, retained.text
+        assert retained.json()["runId"] == status["runId"]
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        get_deps().catalog.unregister(source_uri)
+        if published_uri:
+            get_deps().catalog.unregister(published_uri)
+            try:
+                os.unlink(str(published_uri).removeprefix("file://"))
+            except OSError:
+                pass
+        shutil.rmtree(source_uri, ignore_errors=True)
+
+
+def test_whole_graph_assert_ports_replay_one_shot_source(tmp_path):
+    lance = pytest.importorskip("lance")
+    canvas_id = f"retained-assert-ports-{uuid.uuid4().hex}"
+    source_uri = str(tmp_path / f"{canvas_id}.lance")
+    lance.write_dataset(pa.table({"value": [1, 2, 3, 4]}), source_uri)
+    registered = client.post("/api/catalog/register", json={
+        "uri": source_uri, "name": f"assert-source-{uuid.uuid4().hex}",
+    })
+    assert registered.status_code == 200, registered.text
+    graph = {
+        "id": canvas_id,
+        "name": "Assert port replay",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"title": "Source", "config": {
+                    "uri": source_uri,
+                    "datasetRef": {
+                        "kind": "exact",
+                        "datasetId": registered.json()["registrationId"],
+                        "revisionId": "1",
+                    },
+                }},
+            },
+            {
+                "id": "assert", "type": "assert", "position": {"x": 240, "y": 0},
+                "data": {"title": "Values above two", "config": {
+                    "predicate": "value > 2", "severity": "warn",
+                }},
+            },
+        ],
+        "edges": [{
+            "id": "source-assert", "source": "source", "sourceHandle": "out",
+            "target": "assert", "targetHandle": "in", "data": {"wire": "dataset"},
+        }],
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id=metadb.DEFAULT_USER_ID,
+            name="Assert port replay",
+        ))
+    try:
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done" and status["targetNodeId"] is None
+        assert {
+            output["portId"]: output["rows"] for output in status["outputs"]
+        } == {"out": 2, "pass": 4}
+        for port_id, expected_rows in (("out", 2), ("pass", 4)):
+            page = client.post(f"/api/run/{status['runId']}/sample", json={
+                "nodeId": "assert", "portId": port_id, "k": 10, "offset": 0,
+            })
+            assert page.status_code == 200, page.text
+            assert len(page.json()["rows"]) == expected_rows
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        get_deps().catalog.unregister(source_uri)
+        shutil.rmtree(source_uri, ignore_errors=True)
+
+
 def test_canvas_reopen_keeps_transient_result_check_unknown(retained_sample, monkeypatch):
     graph, _run_id, _output = retained_sample
     monkeypatch.setattr(

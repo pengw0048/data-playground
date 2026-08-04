@@ -387,6 +387,15 @@ def test_subprocess_run_unit_rejects_multi_output_before_plan_or_claim(
 def test_subprocess_run_all_keeps_execution_target_none_with_one_write(
         tmp_path, monkeypatch):
     runner = _runner(tmp_path)
+    allocations: list[str] = []
+    runner.storage = SimpleNamespace(
+        begin_result=lambda key, _run_id: allocations.append(key) or str(
+            tmp_path / f"terminal-{len(allocations)}.parquet"),
+        result_lock_fd=lambda *_args: None,
+        result_namespace_identity=lambda: ("test",),
+        namespace_id="test",
+    )
+    runner.on_status = lambda *_args: None
     graph = Graph(id="g", nodes=[
         _node("write", "write", {"name": "result"}),
         _node("independent-check", "assert", {
@@ -400,9 +409,10 @@ def test_subprocess_run_all_keeps_execution_target_none_with_one_write(
         return {"stack": SimpleNamespace(close=lambda: None), "guards": [],
                 "attempts": {}, "local_sources": {}}
 
-    def spawn(status, _extra, _graph, target):
+    def spawn(status, extra, _graph, target):
         seen["spawn_target"] = target
         seen["status"] = status
+        seen["forced_results"] = extra["forcedResults"]
         return status
 
     monkeypatch.setattr(runner, "_claim_source_leases", claim)
@@ -413,9 +423,13 @@ def test_subprocess_run_all_keeps_execution_target_none_with_one_write(
 
     assert seen["claim_target"] is None
     assert seen["spawn_target"] is None
-    assert status.target_node_id == "write"
+    assert status.target_node_id is None
     assert [(output.node_id, output.outcome) for output in status.outputs] == [
-        ("write", "pending")]
+        ("write", "pending"),
+        ("independent-check", "pending"),
+        ("independent-check", "pending"),
+    ]
+    assert len(seen["forced_results"]) == 2
 
 
 def test_subprocess_multiple_writes_fail_before_identity_or_claim(

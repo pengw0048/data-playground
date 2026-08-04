@@ -55,7 +55,8 @@ from hub.plugins.adapters import (
     revision_adapter_for_uri,
 )
 from hub.run_outputs import (
-    UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
+    UnsupportedRunOutputs, expected_plan_run_outputs, expected_run_outputs,
+    preflight_run_output_target,
     require_single_run_output,
 )
 from hub.run_parameters import ParameterResolutionError, resolve_graph_parameters
@@ -1727,10 +1728,13 @@ def _run_output_preflight(plan, requested_target: str | None) -> str | None:
     return output_target
 
 
-def _require_backend_run_output_support(backend, graph, node_id: str, deps) -> bool:
+def _require_backend_run_output_support(
+        backend, graph, node_id: str | None, deps,
+        declared_output_count: int | None = None) -> bool:
     """Admit a multi-output full run only when its selected execution owner opts in explicitly."""
-    outputs = expected_run_outputs(graph, node_id, deps.node_specs)
-    if len(outputs) <= 1:
+    output_count = (declared_output_count if declared_output_count is not None else
+                    len(expected_run_outputs(graph, str(node_id), deps.node_specs)))
+    if output_count <= 1:
         return False
     if backend_supports_named_multi_output_runs(backend):
         return True
@@ -1747,15 +1751,27 @@ def _require_backend_run_output_support(backend, graph, node_id: str, deps) -> b
     )
 
 
+def _plan_run_output_count(plan, graph, requested_target: str | None, deps) -> int:
+    try:
+        return len(expected_plan_run_outputs(
+            plan, graph, requested_target, deps.node_specs))
+    except UnsupportedRunOutputs as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.MULTI_OUTPUT_UNSUPPORTED,
+            retryable=False,
+        ) from exc
+
+
 def _controller_regions_for_run(
         deps, graph, execution_target: str | None, output_target: str | None,
         sizes: dict, multi_output: bool) -> list:
     """Plan once through the controller's public ownership seam and enforce output capability."""
     regions = deps.controller.plan_for_run(graph, execution_target, sizes=sizes)
-    if multi_output and output_target is not None and regions:
+    if multi_output and regions:
         # RunController still has a singular final-publication state machine.  Treat it as the actual
         # owner only when it will really split; collapsed plans continue through the selected runner.
-        _require_backend_run_output_support(deps.controller, graph, output_target, deps)
+        _require_backend_run_output_support(
+            deps.controller, graph, output_target, deps, 2)
     return regions
 
 
@@ -2824,10 +2840,17 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
         deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
-    multi_output = False
-    if output_target is not None:
-        multi_output = _require_backend_run_output_support(
-            runner, graph, output_target, deps)
+    if req.target_node_id is None:
+        output_count = _plan_run_output_count(plan, graph, None, deps)
+        multi_output = output_count > 1
+        if multi_output:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps, output_count)
+    else:
+        multi_output = False
+        if output_target is not None:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, req.target_node_id, deps)
     if multi_output:
@@ -3310,10 +3333,17 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(
             409, "the selected execution backend cannot consume the managed-local write admission; "
             "discard it and retry with local-out-of-core")
-    multi_output = False
-    if output_target is not None:
-        multi_output = _require_backend_run_output_support(
-            runner, graph, output_target, deps)
+    if target_node_id is None:
+        output_count = _plan_run_output_count(plan, graph, None, deps)
+        multi_output = output_count > 1
+        if multi_output:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps, output_count)
+    else:
+        multi_output = False
+        if output_target is not None:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     managed_write = bool(write_admission is not None and write_admission.managed)
@@ -4248,9 +4278,13 @@ def _retained_current_output(
         raise _retained_editor_error(
             409, "retained upstream execution plan is invalid",
             APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    admission_target = admission["target_node_id"]
     if (
-        admission["target_node_id"] != target.id
+        admission_target not in (None, target.id)
         or admission["target_port_id"] is not None
+        or output.node_id != target.id
+        or (admission_target is None and any(
+            edge.source == target.id for edge in retained_graph.edges))
     ):
         raise _retained_editor_error(
             409, "retained result targets a different execution plan",
@@ -4374,9 +4408,16 @@ def _retained_current_output(
         # carries the same intent in the dedicated ``writeIntent`` field.  Remove the duplicate
         # before rebuilding both sides so a reopened editor graph and its retained manifest use the
         # same semantic identity.
-        for digest_graph in (retained_graph, retained_cone, current_for_digest):
+        graph_targets = (
+            (retained_graph, admission_target),
+            (retained_cone, target.id),
+            (current_for_digest, target.id),
+        )
+        for digest_graph, digest_target_id in graph_targets:
+            if digest_target_id is None:
+                continue
             digest_target = next(
-                (node for node in digest_graph.nodes if node.id == target.id), None)
+                (node for node in digest_graph.nodes if node.id == digest_target_id), None)
             if digest_target is None:
                 raise _retained_editor_error(
                     409, "current upstream execution plan cannot be verified",
@@ -4384,12 +4425,13 @@ def _retained_current_output(
             digest_config = dict(digest_target.data.get("config") or {})
             digest_config.pop("_admittedWriteIntent", None)
             digest_target.data["config"] = digest_config
+    target_write_intent = retained_write_intent if target.type == "write" else None
     try:
-        rebuilt_retained_digest, _ = build_execution_manifest(
+        rebuilt_original_digest, _ = build_execution_manifest(
             retained_graph,
-            target_node_id=target.id,
+            target_node_id=admission_target,
             target_port_id=None,
-            input_manifest=retained_inputs,
+            input_manifest=admission["input_manifest"],
             write_intent=retained_write_intent,
             deps=deps,
         )
@@ -4398,7 +4440,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=retained_write_intent,
+            write_intent=target_write_intent,
             deps=deps,
         )
         retained_digest, _ = build_execution_manifest(
@@ -4406,7 +4448,7 @@ def _retained_current_output(
             target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
-            write_intent=retained_write_intent,
+            write_intent=target_write_intent,
             deps=deps,
         )
     except ExecutionManifestError as exc:
@@ -4414,7 +4456,7 @@ def _retained_current_output(
             409, "current upstream execution plan cannot be verified",
             APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
     if (
-        rebuilt_retained_digest != str(manifest_sha256)
+        rebuilt_original_digest != str(manifest_sha256)
         or current_digest != retained_digest
     ):
         raise _retained_editor_error(

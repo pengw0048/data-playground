@@ -42,11 +42,60 @@ def preflight_run_output_target(
     ``requested`` remains the execution-cone selector elsewhere; callers must not replace it with the
     returned output identity because ``None`` means execute the complete topological graph.
     """
-    writes = [step.node_id for step in plan.steps if step.kind == "write"]
+    writes = [
+        step.node_id
+        for step in getattr(plan, "steps", ())
+        if step.kind == "write"
+    ]
     if len(writes) > 1:
         raise UnsupportedRunOutputs(
             "full runs do not yet support multiple write outputs; select one target")
     return effective_run_target(plan, requested)
+
+
+def run_output_node_ids(
+        plan: CompilePlan, graph: Graph, requested: str | None) -> list[str]:
+    """Return the declaration-ordered result owners for one logical run.
+
+    A targeted run owns only its selected node. A whole-graph run owns each top-level terminal node,
+    so one fused execution can survive reopen without materializing every intermediate relation.
+    """
+    preflight_run_output_target(plan, requested)
+    selected = requested if requested is not None else plan.target_node_id
+    if selected is not None:
+        return [selected]
+
+    step_ids = {step.node_id for step in plan.steps}
+    nodes = g.node_map(graph)
+    has_downstream = {
+        edge.source
+        for edge in graph.edges
+        if edge.source in step_ids and edge.target in step_ids
+    }
+    targets = [
+        step.node_id for step in plan.steps
+        if step.node_id not in has_downstream
+        and (node := nodes.get(step.node_id)) is not None
+        and node.parent_id is None
+    ]
+    if not targets and plan.steps:
+        raise UnsupportedRunOutputs("full run has no terminal output node")
+    return targets
+
+
+def expected_plan_run_outputs(
+        plan: CompilePlan, graph: Graph, requested: str | None,
+        node_specs: dict) -> list[RunOutput]:
+    """Snapshot every output retained by a targeted or whole-graph run."""
+    outputs = [
+        output
+        for node_id in run_output_node_ids(plan, graph, requested)
+        for output in expected_run_outputs(graph, node_id, node_specs)
+    ]
+    if len(outputs) > g.MAX_EFFECTIVE_OUTPUT_PORTS:
+        raise UnsupportedRunOutputs(
+            "full run exposes more than 64 terminal outputs; select one target")
+    return outputs
 
 
 def expected_run_outputs(
@@ -96,13 +145,21 @@ def sole_output(status: RunStatus, *, committed: bool = False) -> RunOutput | No
     return output
 
 
-def _selected_output(status: RunStatus, port_id: str | None) -> tuple[int, RunOutput]:
+def _selected_output(
+        status: RunStatus, port_id: str | None,
+        node_id: str | None = None) -> tuple[int, RunOutput]:
+    candidates = [
+        (index, output) for index, output in enumerate(status.outputs)
+        if node_id is None or output.node_id == node_id
+    ]
     if port_id is None:
-        if len(status.outputs) != 1:
-            raise RuntimeError("a multi-output run requires an explicit output port")
-        return 0, status.outputs[0]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "a multi-output run requires an explicit output node and port")
+        return candidates[0]
     matches = [(index, output) for index, output in enumerate(status.outputs)
-               if output.port_id == port_id]
+               if output.port_id == port_id
+               and (node_id is None or output.node_id == node_id)]
     if len(matches) != 1:
         raise RuntimeError(f"run does not expect output port '{port_id}'")
     return matches[0]
@@ -111,9 +168,10 @@ def _selected_output(status: RunStatus, port_id: str | None) -> tuple[int, RunOu
 def committed_output_snapshot(
         status: RunStatus, *, uri: str, rows: int, table: str | None = None,
         version: str | None = None, port_id: str | None = None,
+        node_id: str | None = None,
         write_receipt=None) -> RunOutput:
     """Build and validate a committed snapshot without making it public."""
-    _index, expected = _selected_output(status, port_id)
+    _index, expected = _selected_output(status, port_id, node_id)
     provenance = (expected.sample_provenance.model_copy(update={"returned_rows": rows})
                   if expected.sample_provenance is not None else None)
     return RunOutput(
@@ -132,28 +190,49 @@ def committed_output_snapshot(
     )
 
 
-def preflight_output_table(status: RunStatus, table: str) -> None:
+def preflight_output_table(
+        status: RunStatus, table: str, *, node_id: str | None = None) -> None:
     """Validate the known catalog identity against the actual expected output before effects."""
     committed_output_snapshot(
-        status, uri="dp-preflight://run-output", rows=0, table=table)
+        status, uri="dp-preflight://run-output", rows=0, table=table,
+        node_id=node_id)
 
 
 def commit_output(
         status: RunStatus, *, uri: str, rows: int, table: str | None = None,
-        version: str | None = None, port_id: str | None = None) -> RunOutput:
-    index, _expected = _selected_output(status, port_id)
+        version: str | None = None, port_id: str | None = None,
+        node_id: str | None = None, write_receipt=None) -> RunOutput:
+    index, _expected = _selected_output(status, port_id, node_id)
     committed = committed_output_snapshot(
-        status, uri=uri, rows=rows, table=table, version=version, port_id=port_id)
+        status, uri=uri, rows=rows, table=table, version=version,
+        port_id=port_id, node_id=node_id, write_receipt=write_receipt)
     status.outputs[index] = committed
     return committed
 
 
+def replace_output(status: RunStatus, output: RunOutput) -> None:
+    """Replace one output receipt without disturbing independent terminal siblings."""
+    index, expected = _selected_output(status, output.port_id, output.node_id)
+    expected_identity = (
+        expected.node_id, expected.port_id, expected.port_label,
+        expected.wire, expected.publication_kind,
+    )
+    output_identity = (
+        output.node_id, output.port_id, output.port_label,
+        output.wire, output.publication_kind,
+    )
+    if output_identity != expected_identity:
+        raise RuntimeError("replacement output does not match its declared identity")
+    status.outputs[index] = output
+
+
 def settle_output(
-        status: RunStatus, port_id: str, outcome: str, error: str | None = None) -> None:
+        status: RunStatus, port_id: str, outcome: str, error: str | None = None,
+        *, node_id: str | None = None) -> None:
     """Set one uncommitted port to a truthful terminal outcome without touching its siblings."""
     if outcome not in ("failed", "skipped", "cancelled"):
         raise ValueError(f"invalid non-committed output outcome '{outcome}'")
-    index, output = _selected_output(status, port_id)
+    index, output = _selected_output(status, port_id, node_id)
     if output.outcome == "committed":
         raise RuntimeError(f"committed output port '{port_id}' cannot be relabelled")
     status.outputs[index] = RunOutput(

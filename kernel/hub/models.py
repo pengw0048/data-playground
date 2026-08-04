@@ -2185,16 +2185,14 @@ class RunStatus(Wire):
         if self.job_type == "run":
             if self.target_port_id is not None:
                 raise ValueError("ordinary runs do not have one profile target port")
-            if self.outputs and self.target_node_id is None:
-                raise ValueError("run outputs require a targetNodeId")
             if self.target_node_id is not None and any(
                     output.node_id != self.target_node_id for output in self.outputs):
                 raise ValueError("every run output nodeId must match targetNodeId")
-            if self.status == "done" and self.target_node_id is not None:
-                if not self.outputs or any(
-                        output.outcome != "committed" for output in self.outputs):
-                    raise ValueError(
-                        "a successful targeted run requires committed outputs")
+            if self.status == "done" and (
+                    (self.target_node_id is not None and not self.outputs)
+                    or any(output.outcome != "committed" for output in self.outputs)):
+                raise ValueError(
+                    "a successful run requires every declared output to be committed")
             validate_run_output_rows(
                 self.outputs, self.total_rows, field_name="totalRows")
             if self.status in ("done", "failed", "cancelled") and any(
@@ -2276,16 +2274,14 @@ class RunHistoryRecord(Wire):
                 raise ValueError("ordinary run history cannot carry a profile target port")
             if self.profile is not None:
                 raise ValueError("run history cannot carry a profile result")
-            if self.outputs and self.target_node_id is None:
-                raise ValueError("run-history outputs require a targetNodeId")
             if self.target_node_id is not None and any(
                     output.node_id != self.target_node_id for output in self.outputs):
                 raise ValueError("every history output nodeId must match targetNodeId")
-            if self.status == "done" and self.target_node_id is not None:
-                if not self.outputs or any(
-                        output.outcome != "committed" for output in self.outputs):
-                    raise ValueError(
-                        "successful targeted run history requires committed outputs")
+            if self.status == "done" and (
+                    (self.target_node_id is not None and not self.outputs)
+                    or any(output.outcome != "committed" for output in self.outputs)):
+                raise ValueError(
+                    "successful run history requires every declared output to be committed")
             validate_run_output_rows(self.outputs, self.rows, field_name="history rows")
         return self
 

@@ -11291,7 +11291,6 @@ def _canvas_result_history_records(
         record for record in records
         if record.job_type == "run"
         and record.status == "done"
-        and record.target_node_id is not None
         and record.outputs != "[]"
         and _utc_datetime(record.created_at) >= cutoff
     ]
@@ -11323,14 +11322,29 @@ def _canvas_result_history_records(
         if latest_record is not None:
             retained.add(latest_record.id)
     for record in eligible:
-        target = str(record.target_node_id)
+        try:
+            output_docs = json.loads(record.outputs)
+        except (TypeError, ValueError):
+            output_docs = []
+        targets = {
+            str(output.get("node_id", output.get("nodeId")))
+            for output in output_docs
+            if isinstance(output, dict)
+            and output.get("outcome") == "committed"
+            and output.get("publication_kind", output.get("publicationKind")) == "result"
+            and output.get("node_id", output.get("nodeId"))
+        }
+        if record.target_node_id is not None:
+            targets.add(str(record.target_node_id))
         if record.id in retained:
             continue
-        count = per_target.get(target, 0)
-        if count >= policy.max_versions:
+        if not targets or all(
+                per_target.get(target, 0) >= policy.max_versions
+                for target in targets):
             continue
         retained.add(record.id)
-        per_target[target] = count + 1
+        for target in targets:
+            per_target[target] = per_target.get(target, 0) + 1
     return records, retained
 
 
@@ -13539,7 +13553,8 @@ def _upsert_canvas_result_latest(
         dict(output) for output in (status_doc.get("outputs") or [])
         if isinstance(output, dict)
         and output.get("outcome") == "committed"
-        and output.get("publication_kind", output.get("publicationKind")) == "result"
+        and output.get("publication_kind", output.get("publicationKind")) in ("result", "catalog")
+        and output.get("node_id", output.get("nodeId")) == str(target_node_id)
         and output.get("uri")
     ] if terminal_status == "done" else []
     result_wins = bool(result_outputs) and _projection_attempt_is_newer(
@@ -13563,6 +13578,34 @@ def _upsert_canvas_result_latest(
         )
     _delete_unreferenced_execution_manifests(s, old_manifest_identities)
     return row
+
+
+def _upsert_canvas_result_latest_targets(
+        s, *, canvas_id: str | None, run_id: str, target_node_id: str | None,
+        terminal_status: str, status_doc: dict,
+        execution_manifest_sha256: str | None) -> list[CanvasResultLatest]:
+    """Project one whole-graph terminal fact independently onto each retained leaf."""
+    output_targets = {
+        str(output.get("node_id", output.get("nodeId")))
+        for output in (status_doc.get("outputs") or [])
+        if isinstance(output, dict)
+        and output.get("node_id", output.get("nodeId"))
+    }
+    targets = sorted(output_targets or ({str(target_node_id)} if target_node_id else set()))
+    rows = []
+    for target in targets:
+        row = _upsert_canvas_result_latest(
+            s,
+            canvas_id=canvas_id,
+            run_id=run_id,
+            target_node_id=target,
+            terminal_status=terminal_status,
+            status_doc=status_doc,
+            execution_manifest_sha256=execution_manifest_sha256,
+        )
+        if row is not None:
+            rows.append(row)
+    return rows
 
 
 def _sync_canvas_result_latest_local_owner(s, row: CanvasResultLatest | None) -> None:
@@ -13784,7 +13827,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             s, "run_state", run_id, output_refs,
             publish=bool(publish_region and st in ("done", "failed")),
             publish_kind="region")
-        canvas_result_latest = _upsert_canvas_result_latest(
+        canvas_result_latest = _upsert_canvas_result_latest_targets(
             s,
             canvas_id=(str(canvas_id) if projection_canvas is not None else None),
             run_id=str(run_id),
@@ -13813,7 +13856,8 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if st in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=False)
-        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
+        for projected_result in canvas_result_latest:
+            _sync_canvas_result_latest_local_owner(s, projected_result)
         if st in _TERMINAL_RUN:
             for obj in stale:
                 _drop_local_result_owner_locked(s, "run_state", obj.run_id)
@@ -15226,7 +15270,7 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         pruned = [*stale, *([state] if prune_current else [])]
         _replace_attempt_refs(
             s, "run_state", run_id, _result_doc_refs(published))
-        canvas_result_latest = _upsert_canvas_result_latest(
+        canvas_result_latest = _upsert_canvas_result_latest_targets(
             s,
             canvas_id=(
                 str(state.canvas_id)
@@ -15271,7 +15315,8 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         elif terminal in ("done", "failed"):
             _release_terminal_local_result_writers(
                 s, run_id, allow_unreferenced=True)
-        _sync_canvas_result_latest_local_owner(s, canvas_result_latest)
+        for projected_result in canvas_result_latest:
+            _sync_canvas_result_latest_local_owner(s, projected_result)
         for obj in pruned:
             _drop_local_result_owner_locked(s, "run_state", obj.run_id)
         return True
