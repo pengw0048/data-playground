@@ -42,9 +42,11 @@ def preflight_run_output_target(
     ``requested`` remains the execution-cone selector elsewhere; callers must not replace it with the
     returned output identity because ``None`` means execute the complete topological graph.
     """
-    if requested is not None:
-        return requested
-    writes = [step.node_id for step in plan.steps if step.kind == "write"]
+    writes = [
+        step.node_id
+        for step in getattr(plan, "steps", ())
+        if step.kind == "write"
+    ]
     if len(writes) > 1:
         raise UnsupportedRunOutputs(
             "full runs do not yet support multiple write outputs; select one target")
