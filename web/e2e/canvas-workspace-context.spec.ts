@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { canvasIdFromLocation } from './support/canvasRoute'
 
 test.describe('Canvas Workspace placement context @ux-smoke', () => {
   test('creates an immediately chosen example beside a blank Canvas in the same nested folder', async ({ page }, testInfo) => {
@@ -44,7 +45,7 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
       await expect(createCanvas.getByLabel('Canvas name')).toHaveValue(blankName)
       await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
       await expect(page).toHaveURL(/#\/canvas\//)
-      blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+      blankId = canvasIdFromLocation(page.url())
       await expect.poll(() => historyStarted).toBe(true)
       expect(historyCanvasId).toBe(blankId)
 
@@ -52,7 +53,7 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
       await expect(example).toBeVisible()
       await example.click()
       await expect(page.locator('.react-flow__node').first()).toBeVisible()
-      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+      exampleId = canvasIdFromLocation(page.url())
       expect(exampleId).not.toBe(blankId)
 
       releaseHistory()
@@ -106,7 +107,7 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     await createCanvas.getByLabel('Canvas name').fill(canvas)
     await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+    const canvasId = canvasIdFromLocation(page.url())
 
     const location = page.getByRole('navigation', { name: 'Canvas Workspace location' })
     await expect(location).toContainText(`Workspace/${parent}/${child}`)

@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { access, unlink, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { canvasIdFromLocation } from './support/canvasRoute'
 import { workspaceResource } from './support/workspace'
 
 type RegisteredDataset = {
@@ -63,7 +64,7 @@ test('adds, previews, uses, and removes a local dataset in the unified Workspace
     await useDialog.getByLabel('New canvas name').fill(canvasName)
     await useDialog.getByRole('button', { name: 'Create and open' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
-    canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+    canvasId = canvasIdFromLocation(page.url())
     await expect(page.locator('.react-flow__node', { hasText: registeredName })).toBeVisible()
 
     await page.getByTestId('app-menu').click()

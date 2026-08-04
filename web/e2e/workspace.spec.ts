@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { canvasIdFromLocation, canvasRoutePattern } from './support/canvasRoute'
 import { workspaceResource } from './support/workspace'
 
 test.describe('local Workspace golden journey @ux-smoke', () => {
@@ -46,7 +47,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await page.getByRole('button', { name: 'Clear Workspace search' }).click()
 
       await (await workspaceResource(page, 'canvas', canvasName)).click()
-      await expect(page).toHaveURL(new RegExp(`/#/canvas/${canvasId}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId))
       await page.goBack()
       await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
       await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
@@ -128,7 +129,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await createCanvas.getByLabel('Canvas name').fill(emptyName)
       await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
       await expect(page).toHaveURL(/#\/canvas\//)
-      emptyCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      emptyCanvasId = canvasIdFromLocation(page.url())
 
       await page.getByTestId('app-menu').click()
       await page.getByText('Back to Workspace').click()
@@ -137,7 +138,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await page.getByLabel('New canvas name').fill(exploreName)
       await page.getByRole('button', { name: 'Create and open' }).click()
       await expect(page).toHaveURL(/#\/canvas\//)
-      exploreCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      exploreCanvasId = canvasIdFromLocation(page.url())
       await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
 
       await page.reload()
@@ -151,7 +152,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       await chooseCanvas.click()
       await page.getByLabel('Target canvas').selectOption({ label: `${emptyName} · ${emptyCanvasId}` })
       await page.getByRole('button', { name: 'Add and open' }).click()
-      await expect(page).toHaveURL(new RegExp(`/#/canvas/${emptyCanvasId}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(emptyCanvasId))
       await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
       await page.reload()
       await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
@@ -219,7 +220,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
         'Canvases refreshed. Try adding the Source again.',
       )
       await page.getByRole('button', { name: 'Add and open' }).click()
-      await expect(page).toHaveURL(new RegExp(`/#/canvas/${canvasId}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId))
       await expect(page.locator('.react-flow__node-source').filter({
         hasText: selected.name,
       })).toHaveCount(1)

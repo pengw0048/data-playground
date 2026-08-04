@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { canvasRoutePattern } from './support/canvasRoute'
 
 async function json<T>(response: { ok(): boolean; status(): number; text(): Promise<string>; json(): Promise<unknown> }, label: string): Promise<T> {
   expect(response.ok(), `${label}: ${response.status()} ${await response.text()}`).toBeTruthy()
@@ -108,7 +109,7 @@ test('a real managed Write retains one bounded cross-surface evidence chain @ux-
     const openInCanvas = page.getByRole('link', { name: 'Open in Canvas' })
     await expect(openInCanvas).toHaveAttribute('href', `#/canvas/${canvasId}?node=write`)
     await openInCanvas.click()
-    await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}\\?node=write$`))
+    await expect(page).toHaveURL(canvasRoutePattern(canvasId, 'write'))
     const selectedWrite = page.locator('.react-flow__node.selected[data-id="write"]')
     await expect(selectedWrite).toBeVisible()
     await expect(selectedWrite).toBeInViewport({ ratio: 1 })
@@ -251,13 +252,13 @@ test('Canvas Inbox previews outcomes in place and refreshes from confirmed mark-
   await page.reload()
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('2')
   await page.getByTestId('canvas-inbox').click()
-  await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}$`))
+  await expect(page).toHaveURL(canvasRoutePattern(canvasId))
   const preview = page.getByRole('dialog', { name: 'Inbox preview' })
   await expect(preview).toBeVisible()
   releaseCanvas()
   await preview.getByRole('button', { name: 'Mark read' }).click()
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('1')
-  await expect(page).toHaveURL(new RegExp(`#\\/canvas/${canvasId}$`))
+  await expect(page).toHaveURL(canvasRoutePattern(canvasId))
   await preview.getByRole('button', { name: 'View all Inbox' }).click()
   await expect(page).toHaveURL(/#\/inbox$/)
   await page.unroute(`**/api/canvas/${canvasId}`)

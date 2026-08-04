@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync } from 'node:fs'
+import { canvasRoutePattern } from './support/canvasRoute'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
@@ -190,7 +191,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     const bytes = readFileSync(file!)
     expect(bytes.subarray(0, 4).toString()).toBe('PAR1')
     expect(bytes.subarray(-4).toString()).toBe('PAR1')
-    await expect(page).toHaveURL(new RegExp(`/#/canvas/${doc.id}$`))
+    await expect(page).toHaveURL(canvasRoutePattern(doc.id))
   })
 
   test('recovers the exact retained result in a fresh browser and stops after a stale edit', async ({ page, browser, baseURL }) => {
