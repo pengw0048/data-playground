@@ -28,7 +28,7 @@ vi.mock('../theme/mode', () => ({ resolvedTheme: () => 'light' }))
 
 // React Flow's canvas geometry is irrelevant here; expose connection and Fit View deterministically.
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: ({ nodes, edges, onConnect, onEdgeClick, onMove, children }: {
+  ReactFlow: ({ nodes, edges, onConnect, onEdgeClick, onNodesChange, onMove, nodesDraggable, children }: {
     nodes: { id: string; data: {
       table: CatalogTable; fields: Array<{ name: string; role: string }>
       focused: boolean; lineage: boolean; onFocus: () => void; onOpen: () => void
@@ -36,14 +36,20 @@ vi.mock('@xyflow/react', () => ({
     edges: { id: string; data?: { rel?: unknown }; sourceHandle?: string; targetHandle?: string; label?: string; style?: { stroke?: string } }[]
     onConnect: (connection: { source: string; target: string }) => void
     onEdgeClick: (event: unknown, edge: { id: string; data?: { rel?: unknown } }) => void
+    onNodesChange?: (changes: Array<{ id: string; type: 'position'; position: { x: number; y: number } }>) => void
     onMove?: (event: unknown, viewport: { zoom: number }) => void
+    nodesDraggable?: boolean
     children?: ReactNode
-  }) => <div data-testid="flow">
+  }) => <div data-testid="flow" data-nodes-draggable={String(nodesDraggable)}>
     {nodes.map((node) => <button key={node.id} data-testid={`node-${node.id}`}
       data-focused={String(node.data.focused)} data-x={node.position.x} data-y={node.position.y}
       data-fields={node.data.fields.map((field) => `${field.role}:${field.name}`).join(',')}
       onClick={node.data.lineage ? node.data.onOpen : node.data.onFocus}>{node.data.table.name}</button>)}
     <button onClick={() => onMove?.({}, { zoom: 1 })}>zoom graph</button>
+    <button disabled={!nodes.length || !onNodesChange}
+      onClick={() => onNodesChange?.([{ id: nodes[0].id, type: 'position', position: { x: 777, y: 888 } }])}>
+      move first node
+    </button>
     <button disabled={nodes.length < 2} onClick={() => onConnect({ source: nodes[0].id, target: nodes[1].id })}>connect tables</button>
     {edges.filter((edge) => edge.data?.rel).map((edge) => (
       <button key={edge.id} data-testid={`edge-${edge.id}`} onClick={(event) => onEdgeClick(event, edge)}>relationship edge</button>
@@ -66,6 +72,16 @@ vi.mock('@xyflow/react', () => ({
 
 import { ERDiagram, EntityNode } from './ERDiagram'
 
+const storedPositions = new Map<string, string>()
+const localStorageMock = {
+  getItem: (key: string) => storedPositions.get(key) ?? null,
+  setItem: (key: string, value: string) => { storedPositions.set(key, value) },
+  removeItem: (key: string) => { storedPositions.delete(key) },
+  clear: () => { storedPositions.clear() },
+  key: (index: number) => [...storedPositions.keys()][index] ?? null,
+  get length() { return storedPositions.size },
+}
+
 const ORDERS: CatalogTable = {
   id: 'orders', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders',
   columns: [{ name: 'customer_id', type: 'int', capabilities: [] }],
@@ -80,6 +96,8 @@ const PAGE = { items: [ORDERS, CUSTOMERS], total: 2, hasMore: false }
 describe('ERDiagram request truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorageMock.clear()
+    vi.stubGlobal('localStorage', localStorageMock)
     store.erFocusUri = null
     store.erFocusDatasetId = null
     store.erMode = 'joins'
@@ -102,7 +120,10 @@ describe('ERDiagram request truth', () => {
     mocks.workspaceLineageResource.mockResolvedValue({ id: 'dataset:resolved', kind: 'dataset', name: 'resolved', source: 'provider', detached: false })
     mocks.fitView.mockReset()
   })
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
 
   it('shows catalog and relationship load failures with independent retries', async () => {
     mocks.tablesPage.mockRejectedValueOnce(new Error('Failed to fetch')).mockResolvedValueOnce(PAGE)
@@ -428,7 +449,7 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByRole('button', { name: 'Open dataset customers' })).toBeInTheDocument()
   })
 
-  it('does not invent a key role from a column capability', async () => {
+  it('shows a key-capable column as a join key without claiming it is a primary key', async () => {
     store.erFocusUri = CUSTOMERS.uri
     store.erMode = 'lineage'
     mocks.tablesPage.mockResolvedValue({ items: [CUSTOMERS], total: 1, hasMore: false })
@@ -440,10 +461,10 @@ describe('ERDiagram request truth', () => {
 
     render(<ERDiagram />)
 
-    expect(await screen.findByTestId('node-customers')).toHaveAttribute('data-fields', 'field:id')
+    expect(await screen.findByTestId('node-customers')).toHaveAttribute('data-fields', 'KEY:id')
   })
 
-  it('does not present an inferred catalog key as a declared PK', async () => {
+  it('shows an inferred catalog key without presenting it as a declared PK', async () => {
     store.erFocusUri = ORDERS.uri
     store.erMode = 'lineage'
     mocks.tablesPage.mockResolvedValue({ items: [ORDERS], total: 1, hasMore: false })
@@ -455,7 +476,53 @@ describe('ERDiagram request truth', () => {
 
     render(<ERDiagram />)
 
-    expect(await screen.findByTestId('node-orders')).toHaveAttribute('data-fields', 'field:customer_id')
+    expect(await screen.findByTestId('node-orders')).toHaveAttribute('data-fields', 'KEY:customer_id')
+  })
+
+  it('omits unrelated schema columns and keeps long key lists locally scrollable', () => {
+    const fields = Array.from({ length: 8 }, (_, index) => ({
+      name: `key_${index}`, role: 'KEY' as const, type: 'string',
+    }))
+    render(<EntityNode data={{
+      table: { ...CUSTOMERS, columns: [
+        ...fields.map((field) => ({ name: field.name, type: field.type, capabilities: ['key'] })),
+        { name: 'description', type: 'string', capabilities: [] },
+      ] },
+      fields,
+      focused: true,
+      lineage: true,
+      expanded: true,
+      opening: false,
+      onFocus: vi.fn(),
+      onOpen: vi.fn(),
+    }} />)
+
+    const fieldList = screen.getByTestId('er-entity-fields')
+    expect(fieldList).toHaveClass('nowheel', 'nodrag', 'overflow-y-auto')
+    expect(fieldList).not.toHaveTextContent('description')
+    expect(screen.getByRole('button', { name: 'Back to dataset customers' })).toHaveClass('entity-drag-handle')
+  })
+
+  it('lets a lineage entity keep a manually dragged position independently of its auto layout', async () => {
+    store.erFocusUri = ORDERS.uri
+    store.erMode = 'lineage'
+    mocks.tablesPage.mockResolvedValue({ items: [ORDERS], total: 1, hasMore: false })
+    mocks.lineage.mockResolvedValue({
+      rootUri: ORDERS.uri,
+      nodes: [{ id: ORDERS.id, name: ORDERS.name, uri: ORDERS.uri, kind: 'table' }],
+      edges: [],
+    })
+    const { unmount } = render(<ERDiagram />)
+
+    expect(await screen.findByTestId('flow')).toHaveAttribute('data-nodes-draggable', 'true')
+    fireEvent.click(screen.getByRole('button', { name: 'move first node' }))
+    await waitFor(() => expect(screen.getByTestId('node-orders')).toHaveAttribute('data-x', '777'))
+    expect(screen.getByTestId('node-orders')).toHaveAttribute('data-y', '888')
+
+    unmount()
+    render(<ERDiagram />)
+    expect(await screen.findByTestId('node-orders')).toHaveAttribute('data-x', '777')
+    expect(screen.getByTestId('node-orders')).toHaveAttribute('data-y', '888')
   })
 
   it('opens a high-fan-out lineage as a readable subset and expands it on demand', async () => {
