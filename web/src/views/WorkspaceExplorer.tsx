@@ -706,7 +706,7 @@ function WorkspaceMixedExplorer() {
         setContainerId(identity(shelf))
         loadedContainer.current = identity(shelf)
         setContainer(shelf)
-        if (!paging) setCrumbs([shelf])
+        if (!paging) setCrumbs([WORKSPACE_ROOT_BREADCRUMB, shelf])
         setItems(page.items)
         setFavoriteIds(new Set(page.items.map((item) => item.id)))
         setSelectedResourceIds(new Set())
@@ -736,7 +736,7 @@ function WorkspaceMixedExplorer() {
         setContainerId(RECENT_SHELF_ID)
         loadedContainer.current = RECENT_SHELF_ID
         setContainer(RECENT_BREADCRUMB)
-        if (!paging) setCrumbs([RECENT_BREADCRUMB])
+        if (!paging) setCrumbs([WORKSPACE_ROOT_BREADCRUMB, RECENT_BREADCRUMB])
         providerPlacementObservations.observe(page.items, [], { current: true })
         setItems(page.items)
         setSelectedResourceIds(new Set())

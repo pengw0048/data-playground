@@ -2070,6 +2070,12 @@ export const useStore = create<Store>((set, get) => ({
     if (state.doc.id !== canvasId) return false
     startNavigation()
     if (state.view !== 'canvas') _fileNavigationGeneration += 1
+    const uid = state.currentUser?.id
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), canvasId)
+      rememberCanvasOpenedAt(uid, canvasId)
+      void api.workspaceOpened(`canvas:${canvasId}`).catch(() => { /* open metadata is best-effort */ })
+    }
     const nodeExists = !!nodeId && state.doc.nodes.some((node) => node.id === nodeId)
     set({
       view: 'canvas',

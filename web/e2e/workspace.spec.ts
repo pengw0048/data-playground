@@ -148,7 +148,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
 
       await Promise.all([
         page.waitForResponse((response) => response.url().includes('/api/workspace/recent') && response.ok()),
-        page.getByRole('button', { name: 'Recent' }).click(),
+        page.getByTestId('workspace-recent-filter').click(),
       ])
       await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText('Recent')
       await expect.poll(async () => page.locator(

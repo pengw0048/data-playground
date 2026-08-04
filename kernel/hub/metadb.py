@@ -7029,51 +7029,45 @@ def workspace_recent(
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
     decoded = _workspace_recent_cursor_decode(cursor)
     collected: list[dict] = []
-    scan_cursor = decoded
-    # Scan past revoked rows so a page still fills when access was lost.
-    for _ in range(8):
-        batch_limit = max(limit - len(collected) + 1, 1)
-        with session() as s:
-            query = (
-                select(WorkspaceActorOpen)
-                .where(WorkspaceActorOpen.user_id == uid)
-                .order_by(
-                    WorkspaceActorOpen.last_opened_at.desc(),
-                    WorkspaceActorOpen.resource_ref.asc(),
-                )
-                .limit(batch_limit)
+    # One actor retains at most _WORKSPACE_OPEN_MAX_PER_ACTOR observations, so scan that complete
+    # bounded window. A fixed number of small batches could return an empty page when many newer
+    # observations were revoked even though an older authorized resource still exists.
+    with session() as s:
+        query = (
+            select(WorkspaceActorOpen)
+            .where(WorkspaceActorOpen.user_id == uid)
+            .order_by(
+                WorkspaceActorOpen.last_opened_at.desc(),
+                WorkspaceActorOpen.resource_ref.asc(),
             )
-            if scan_cursor is not None:
-                opened_at, resource_ref = scan_cursor
-                query = query.where(or_(
-                    WorkspaceActorOpen.last_opened_at < opened_at,
-                    and_(
-                        WorkspaceActorOpen.last_opened_at == opened_at,
-                        WorkspaceActorOpen.resource_ref > resource_ref,
-                    ),
-                ))
-            rows = list(s.scalars(query).all())
-        if not rows:
-            break
-        for row in rows:
-            scan_cursor = (row.last_opened_at, row.resource_ref)
-            try:
-                resolved = workspace_resolve(row.resource_ref, uid=uid)
-            except KeyError:
-                workspace_forget_open(uid, row.resource_ref)
-                continue
-            resource = resolved["resource"]
-            if resource is None or resource.get("kind") not in _WORKSPACE_OPEN_KINDS:
-                workspace_forget_open(uid, row.resource_ref)
-                continue
-            if resource.get("detached"):
-                workspace_forget_open(uid, row.resource_ref)
-                continue
-            resource = {**resource, "lastOpenedAt": _core_utc_iso(row.last_opened_at)}
-            collected.append(resource)
-            if len(collected) > limit:
-                break
-        if len(collected) > limit or len(rows) < batch_limit:
+            .limit(_WORKSPACE_OPEN_MAX_PER_ACTOR)
+        )
+        if decoded is not None:
+            opened_at, resource_ref = decoded
+            query = query.where(or_(
+                WorkspaceActorOpen.last_opened_at < opened_at,
+                and_(
+                    WorkspaceActorOpen.last_opened_at == opened_at,
+                    WorkspaceActorOpen.resource_ref > resource_ref,
+                ),
+            ))
+        rows = list(s.scalars(query).all())
+    for row in rows:
+        try:
+            resolved = workspace_resolve(row.resource_ref, uid=uid)
+        except KeyError:
+            workspace_forget_open(uid, row.resource_ref)
+            continue
+        resource = resolved["resource"]
+        if resource is None or resource.get("kind") not in _WORKSPACE_OPEN_KINDS:
+            workspace_forget_open(uid, row.resource_ref)
+            continue
+        if resource.get("detached"):
+            workspace_forget_open(uid, row.resource_ref)
+            continue
+        resource = {**resource, "lastOpenedAt": _core_utc_iso(row.last_opened_at)}
+        collected.append(resource)
+        if len(collected) > limit:
             break
     page = collected[:limit]
     has_more = len(collected) > limit

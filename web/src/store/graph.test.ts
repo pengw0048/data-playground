@@ -7,6 +7,7 @@ const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   currentResults: vi.fn(), retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
+  workspaceOpened: vi.fn(),
   resolveExampleSources: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
@@ -40,6 +41,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.getCanvas
         : property === 'canvasTransformReferences'
           ? apiMocks.canvasTransformReferences
+        : property === 'workspaceOpened'
+          ? apiMocks.workspaceOpened
         : property === 'resolveExampleSources'
           ? apiMocks.resolveExampleSources
         : property === 'createCanvas'
@@ -202,6 +205,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.exampleRowsEditorPreview.mockReset()
     apiMocks.getCanvas.mockReset()
     apiMocks.canvasTransformReferences.mockReset().mockResolvedValue([])
+    apiMocks.workspaceOpened.mockReset().mockResolvedValue({})
     apiMocks.resolveExampleSources.mockReset().mockResolvedValue({ resolutions: [] })
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
       { ok: true, id: doc.id, created: true }
@@ -269,6 +273,7 @@ describe('graph store — core authority ops', () => {
     expect(state.selectedIds).toEqual(['source'])
     expect(state.nodeRevealRequest).toMatchObject({ canvasId: 'c', nodeId: 'source' })
     expect(state.toasts).toEqual([])
+    expect(apiMocks.workspaceOpened).toHaveBeenCalledWith('canvas:c')
   })
 
   it('clears a stale return node while preserving the loaded Canvas document', () => {

@@ -262,3 +262,42 @@ def test_workspace_open_move_preserves_observation(workspace_scope):
         sort="opened", order="desc", kinds={"canvas"})
     assert page["items"][0]["id"] == ref
     assert page["items"][0]["lastOpenedAt"]
+
+
+def test_workspace_recent_scans_past_a_bounded_window_of_revoked_rows(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-recent-revoked")
+    canvas = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-recent-valid",
+    )
+    valid_ref = f"canvas:{canvas['id']}"
+    base = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+    metadb.workspace_record_open(metadb.DEFAULT_USER_ID, valid_ref, at=base)
+    stale_refs = [f"canvas:missing-{token}-{index}" for index in range(17)]
+    try:
+        with metadb.session() as session:
+            session.add_all([
+                metadb.WorkspaceActorOpen(
+                    user_id=metadb.DEFAULT_USER_ID,
+                    resource_ref=resource_ref,
+                    last_opened_at=base + datetime.timedelta(minutes=index + 1),
+                )
+                for index, resource_ref in enumerate(stale_refs)
+            ])
+
+        recent = metadb.workspace_recent(metadb.DEFAULT_USER_ID, limit=1)
+
+        assert [item["id"] for item in recent["items"]] == [valid_ref]
+        assert recent["hasMore"] is False
+        with metadb.session() as session:
+            assert session.scalar(select(func.count()).select_from(
+                metadb.WorkspaceActorOpen).where(
+                    metadb.WorkspaceActorOpen.resource_ref.in_(stale_refs))) == 0
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceActorOpen).where(
+                metadb.WorkspaceActorOpen.resource_ref.in_(stale_refs)))
