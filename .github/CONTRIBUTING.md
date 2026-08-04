@@ -25,11 +25,10 @@ To reproduce the kernel dependency environment without changing the lockfile, us
 
 ## Development version identity
 
-`main` carries the next development-line identity `0.3.0-dev.0` in package manifests; Python package
-metadata normalizes it to `0.3.0.dev0`. The minor-version step is intentional because `main` includes
-breaking provider and MCP contracts since v0.2.3. This marks source builds as development snapshots;
-it does not cut or promise a release. Release closeout replaces the suffix with the exact clean tag
-version across the release-owned manifests; `scripts/check_release_versions.py --release` rejects a
+Development branches carry a distinct `X.Y.Z-dev.N` identity in package manifests; Python package
+metadata normalizes it to `X.Y.Z.devN`. This marks source builds as development snapshots and does
+not cut or promise a release. Release closeout replaces the suffix with the exact clean tag version
+across the release-owned manifests; `scripts/check_release_versions.py --release` rejects a
 development identity for a tagged release.
 
 Metadata schema changes add a new forward Alembic migration from the current head — a linear chain
