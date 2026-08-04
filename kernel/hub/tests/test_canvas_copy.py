@@ -99,6 +99,7 @@ def test_viewer_copy_is_private_atomic_and_idempotent_after_source_deletion():
     created = _create(payload, validation, viewer)
     assert created.status_code == 200
     created_id = created.json()["id"]
+    assert created_id == payload["copyId"]
 
     with metadb.session() as session:
         copy = session.get(metadb.Canvas, created_id)
@@ -125,6 +126,45 @@ def test_viewer_copy_is_private_atomic_and_idempotent_after_source_deletion():
     }
     collision = _create({**payload, "name": "Changed intent"}, validation, viewer)
     assert collision.status_code == 409
+
+
+def test_copy_replays_pre_file_key_identity_without_creating_a_second_canvas():
+    owner = _user("legacy-copy-owner")
+    source_id = _canvas(owner)
+    payload = _payload(source_id)
+    validation = _validate(payload, owner).json()
+    request_digest = canvas_copy.request_digest(
+        source_canvas_id=source_id,
+        source_canvas_version=payload["sourceCanvasVersion"],
+        source_subject_id=None,
+        container_id=payload["containerId"],
+        container_version=payload["expectedContainerVersion"],
+        name=payload["name"],
+    )
+    legacy_id = canvas_copy.legacy_canvas_id(owner, payload["copyId"])
+    legacy_doc = {
+        "id": legacy_id, "name": payload["name"], "version": 1,
+        "nodes": [], "edges": [],
+        "_copyIntent": {
+            "digest": validation["copyIntentDigest"], "requestDigest": request_digest,
+        },
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=legacy_id, owner_id=owner, name=payload["name"], version=1,
+            doc=json.dumps(legacy_doc),
+        ))
+    try:
+        replayed = _create(payload, validation, owner)
+        assert replayed.status_code == 200
+        assert replayed.json() == {
+            "ok": True, "id": legacy_id, "created": False, "replayed": True,
+        }
+        with metadb.session() as session:
+            assert session.get(metadb.Canvas, payload["copyId"]) is None
+    finally:
+        metadb.delete_canvas_cascade(source_id)
+        metadb.delete_canvas_cascade(legacy_id)
 
 
 def test_current_copy_fails_closed_when_source_changes_after_validation():

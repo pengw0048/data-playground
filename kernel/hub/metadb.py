@@ -55,6 +55,16 @@ def _uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def new_canvas_file_key() -> str:
+    """Opaque immutable Canvas file key: a full UUID4 string.
+
+    Only Canvas creation uses this helper. Other metadata rows keep the truncated ``_uid()``
+    contract. Clients may supply their own key; the server mints one only when the caller omits
+    an id. Legacy stored ids remain valid; uniqueness and authorization stay database-authoritative.
+    """
+    return str(uuid.uuid4())
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -90,7 +100,7 @@ class User(Base):
 
 class Canvas(Base):
     __tablename__ = "canvases"
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_canvas_file_key)
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String, default="untitled")
     version: Mapped[int] = mapped_column(Integer, default=1)
@@ -3624,9 +3634,8 @@ def _workspace_ensure_root_placement_in_session(
     )
 
 
-def import_native_canvas(
-        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool:
-    """Insert one exact native import or verify an equivalent concurrent/retry winner."""
+def _native_canvas_import_values(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> tuple[dict, dict]:
     if re.fullmatch(r"[0-9a-f]{64}", str(intent_digest)) is None:
         raise ValueError("native Canvas intent digest is invalid")
     stored_doc = {
@@ -3640,6 +3649,35 @@ def import_native_canvas(
         "name": str(doc.get("name") or "untitled"), "version": 1,
         "doc": canonical_doc,
     }
+    return stored_doc, values
+
+
+def native_canvas_import_replay(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool | None:
+    """Return an exact import replay without creating a missing row."""
+    stored_doc, values = _native_canvas_import_values(
+        uid=uid, canvas_id=canvas_id, doc=doc, intent_digest=intent_digest)
+    with session() as s:
+        existing = s.get(Canvas, str(canvas_id))
+        if existing is None:
+            return None
+        try:
+            existing_doc = json.loads(existing.doc)
+        except (TypeError, ValueError) as exc:
+            raise NativeCanvasImportConflict(
+                "native Canvas import id is already bound to invalid content") from exc
+        if (existing.owner_id != str(uid) or existing.version != 1
+                or existing.name != values["name"] or existing_doc != stored_doc):
+            raise NativeCanvasImportConflict(
+                "native Canvas import id is already bound to different import intent")
+        return True
+
+
+def import_native_canvas(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool:
+    """Insert one exact native import or verify an equivalent concurrent/retry winner."""
+    stored_doc, values = _native_canvas_import_values(
+        uid=uid, canvas_id=canvas_id, doc=doc, intent_digest=intent_digest)
     with session() as s:
         dialect = s.get_bind().dialect.name
         if dialect == "postgresql":
@@ -4267,7 +4305,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
                 s, uid=uid, transform=transform))
         nodes: list[dict] = []
         _workspace_place_sources(nodes, sources)
-        canvas_id = _uid()
+        canvas_id = new_canvas_file_key()
         doc = {
             "id": canvas_id, "name": canvas_name, "version": 1,
             "nodes": nodes, "edges": [],

@@ -1301,6 +1301,18 @@ async def import_native_canvas(request: Request, uid: str = Depends(current_user
     except PermissionError as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
     try:
+        replayed = metadb.native_canvas_import_replay(
+            uid=uid, canvas_id=canvas_id, doc=doc,
+            intent_digest=native_canvas.import_intent_digest(parsed))
+        if replayed:
+            return {"ok": True, "id": canvas_id, "created": False, "replayed": True}
+        legacy_id = native_canvas.legacy_import_canvas_id(uid, str(body.import_id))
+        legacy_doc = {**parsed["canvas"], "id": legacy_id, "version": 1}
+        legacy_replayed = metadb.native_canvas_import_replay(
+            uid=uid, canvas_id=legacy_id, doc=legacy_doc,
+            intent_digest=native_canvas.import_intent_digest(parsed))
+        if legacy_replayed:
+            return {"ok": True, "id": legacy_id, "created": False, "replayed": True}
         created = metadb.import_native_canvas(
             uid=uid, canvas_id=canvas_id, doc=doc,
             intent_digest=native_canvas.import_intent_digest(parsed))
@@ -1341,6 +1353,10 @@ def create_canvas_copy(body: CanvasCopyCreateBody,
         if metadb.canvas_copy_replay(
                 uid, created_id, body.copy_intent_digest, request_digest):
             return {"ok": True, "id": created_id, "created": False, "replayed": True}
+        legacy_id = canvas_copy.legacy_canvas_id(uid, str(body.copy_id))
+        if metadb.canvas_copy_replay(
+                uid, legacy_id, body.copy_intent_digest, request_digest):
+            return {"ok": True, "id": legacy_id, "created": False, "replayed": True}
         canvas, items, intent, manifest_sha256 = _prepare_canvas_copy(body, uid)
         if intent != body.copy_intent_digest or not canvas_copy.validation_matches(
                 body.validation_digest, intent, items):
@@ -1389,7 +1405,7 @@ def create_canvas(
 ) -> dict:
     # The route owns persisted identity. Raw clients may omit these fields or submit stale values;
     # neither should leak into the document later returned to every other Canvas consumer.
-    cid = doc.get("id") or metadb._uid()
+    cid = doc.get("id") or metadb.new_canvas_file_key()
     persisted_doc = {**doc, "id": cid, "version": 1}
     _validate_canvas_execution_contract(persisted_doc)
     try:

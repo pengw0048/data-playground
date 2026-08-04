@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
+import { newCanvasFileKey } from '../canvas/fileKey'
 import type { NativeCanvasValidation } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
@@ -12,7 +13,7 @@ type ActiveRequest = { generation: number; controller: AbortController }
 type ImportSession = { principalId: string | null; canvasId: string; view: string }
 
 function newImportId(): string {
-  return crypto.randomUUID()
+  return newCanvasFileKey()
 }
 
 // Native import is intentionally a browser file flow, not a multipart upload surface. The browser

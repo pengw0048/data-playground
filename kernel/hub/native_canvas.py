@@ -80,11 +80,21 @@ def filename_for(name: str) -> str:
     return f"{safe}{FILENAME_SUFFIX}"
 
 
-def import_canvas_id(uid: str, import_id: str) -> str:
+def _normalized_import_id(import_id: str) -> str:
     try:
-        normalized_import_id = str(UUID(import_id))
+        return str(UUID(import_id))
     except (AttributeError, TypeError, ValueError) as exc:
         raise NativeCanvasError("importId must be a UUID") from exc
+
+
+def import_canvas_id(_uid: str, import_id: str) -> str:
+    """Use the caller-minted retry key as the imported Canvas file key."""
+    return _normalized_import_id(import_id)
+
+
+def legacy_import_canvas_id(uid: str, import_id: str) -> str:
+    """Pre-file-key import identity, retained only to replay requests created before the upgrade."""
+    normalized_import_id = _normalized_import_id(import_id)
     digest = hashlib.sha256(
         f"native-canvas-import-v1\0{uid}\0{normalized_import_id}".encode()).hexdigest()
     return f"native-import-{digest[:32]}"

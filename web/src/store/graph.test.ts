@@ -5450,6 +5450,24 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
+  it('mints a full-strength UUID file key for blank Canvas create and preserves it on retry', async () => {
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+
+    const created = await useStore.getState().newFile()
+    expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+    if (!created.ok) throw new Error('expected a local blank draft')
+    expect(created.canvasId).toMatch(uuidV4)
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).toBe(created.canvasId)
+
+    const draft = useStore.getState().localDrafts.find((item) => item.canvasId === created.canvasId)!
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: created.canvasId, created: true })
+    await useStore.getState().retryLocalDraft(draft.draftId)
+
+    expect(apiMocks.createCanvas.mock.calls[1][0]).toEqual(expect.objectContaining({ id: created.canvasId }))
+    expect(useStore.getState().doc.id).toBe(created.canvasId)
+  })
+
   it('keeps a local-first owner draft when a 5xx leaves create outcome unknown', async () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new KernelError(502, 'proxy lost the hub response'))
 

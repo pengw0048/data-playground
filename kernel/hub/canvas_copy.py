@@ -20,11 +20,21 @@ class CanvasCopyError(ValueError):
     pass
 
 
-def canvas_id(uid: str, copy_id: str) -> str:
+def _normalized_copy_id(copy_id: str) -> str:
     try:
-        normalized = str(UUID(copy_id))
+        return str(UUID(copy_id))
     except (AttributeError, TypeError, ValueError) as exc:
         raise CanvasCopyError("copyId must be a UUID") from exc
+
+
+def canvas_id(_uid: str, copy_id: str) -> str:
+    """Use the caller-minted retry key as the new Canvas file key."""
+    return _normalized_copy_id(copy_id)
+
+
+def legacy_canvas_id(uid: str, copy_id: str) -> str:
+    """Pre-file-key copy identity, retained only to replay requests created before the upgrade."""
+    normalized = _normalized_copy_id(copy_id)
     digest = hashlib.sha256(f"canvas-copy-v1\0{uid}\0{normalized}".encode()).hexdigest()
     return f"canvas-copy-{digest[:32]}"
 
