@@ -105,3 +105,38 @@ def test_profile_identity_changes_for_the_selected_output_port():
     right = profile_plan_digest(graph, "metric", "right", lambda _uri: adapter)
 
     assert left != right
+
+
+def test_profile_identity_ignores_chart_presentation_type():
+    graph = Graph.model_validate({
+        "id": "chart-identity",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"config": {"uri": "file:///data.parquet"}},
+            },
+            {
+                "id": "chart", "type": "chart", "position": {"x": 1, "y": 0},
+                "data": {"config": {
+                    "chartType": "bar", "agg": "count", "xMode": "column", "x": "event",
+                }},
+            },
+        ],
+        "edges": [{
+            "id": "edge", "source": "source", "target": "chart",
+            "data": {"wire": "dataset"},
+        }],
+    })
+    adapter = _Adapter({"file:///data.parquet": "generation-1"})
+    baseline = profile_plan_digest(graph, "chart", "out", lambda _uri: adapter)
+
+    for chart_type in ("line", "scatter", "area"):
+        switched = deepcopy(graph)
+        switched.nodes[1].data["config"]["chartType"] = chart_type
+        assert profile_plan_digest(switched, "chart", "out", lambda _uri: adapter) == baseline
+
+    semantic = deepcopy(graph)
+    semantic.nodes[1].data["config"]["agg"] = "sum"
+    semantic.nodes[1].data["config"]["y"] = "amount"
+    assert profile_plan_digest(semantic, "chart", "out", lambda _uri: adapter) != baseline

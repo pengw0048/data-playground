@@ -9629,6 +9629,28 @@ def test_plan_hash_ignores_legacy_transform_scope():
         graph_with("dataset", "def fn(row): return {**row, 'changed': True}"), "xf")
 
 
+def test_plan_hash_ignores_chart_presentation_type():
+    from hub.models import Graph
+    r = get_deps().runner
+
+    def graph_with(chart_type, *, agg="count", y=None):
+        config = {
+            "chartType": chart_type, "agg": agg, "xMode": "column", "x": "event",
+        }
+        if y is not None:
+            config["y"] = y
+        return Graph(**{"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": _uri("events")}),
+            N("ch", "chart", config),
+        ], "edges": [E("src", "ch")]})
+
+    bar = r._plan_hash(graph_with("bar"), "ch")
+    assert bar == r._plan_hash(graph_with("line"), "ch")
+    assert bar == r._plan_hash(graph_with("scatter"), "ch")
+    assert bar == r._plan_hash(graph_with("area"), "ch")
+    assert bar != r._plan_hash(graph_with("bar", agg="sum", y="amount"), "ch")
+
+
 def test_direct_managed_write_invocations_publish_distinct_revisions(tmp_path):
     # A direct call without a caller-owned submission identity is a new invocation. Managed writes
     # must consume a fresh exact-head admission instead of returning an older publication from the

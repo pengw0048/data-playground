@@ -233,7 +233,11 @@ def resolve_config(node: GraphNode) -> dict:
                 "format": cfg.get("format", "parquet"), "writeMode": cfg.get("writeMode", "overwrite"),
                 "destId": cfg.get("destId"), "destPath": cfg.get("destPath", ""),
                 "partitionBy": cfg.get("partitionBy", "")}
-    return dict(cfg)  # metric/chart/vector-search/section and plugin configs stay verbatim
+    if t == "chart":
+        # chartType is presentation-only. Semantic identity retains agg, axis modes/expressions,
+        # and any other Chart fields the engine may read; the renderer alone consumes chartType.
+        return {key: value for key, value in cfg.items() if key != "chartType"}
+    return dict(cfg)  # metric/vector-search/section and plugin configs stay verbatim
 
 
 def _op_and_config(node: GraphNode, node_ir: dict | None = None) -> tuple[str, dict]:

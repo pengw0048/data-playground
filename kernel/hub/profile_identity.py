@@ -43,6 +43,9 @@ def profile_plan_digest(graph: Graph, node_id: str, port_id: str, resolve_adapte
     for node in sorted(by_id.values(), key=lambda item: item.id):
         data = node.data if isinstance(node.data, dict) else {}
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        if node.type == "chart":
+            # chartType is presentation-only; keep profile recovery identity aligned with execution.
+            config = {key: value for key, value in config.items() if key != "chartType"}
         nodes.append({
             "id": node.id,
             "type": node.type,

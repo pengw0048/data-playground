@@ -182,6 +182,7 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              blurb="Check every row against a rule — error severity blocks downstream writes"),
     NodeSpec(kind="chart", title="chart", category="inspect", tag="chart",
              inputs=[_in()], outputs=[_out()],  # emits the (x, y) series → chains like any dataset
+             # chartType is presentation-only (see executionConfig / resolve_config / manifest folds).
              params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),
                      ParamSpec(name="x", type="string", label="group by (X)"),
                      ParamSpec(name="xMode", type="select", options=["column", "expression"], default="column", label="X source"),

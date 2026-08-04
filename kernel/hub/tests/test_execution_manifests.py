@@ -203,6 +203,31 @@ def test_digest_ignores_legacy_transform_scope_label():
     assert second_order == first_order
 
 
+def test_digest_ignores_chart_presentation_type():
+    graph = Graph.model_validate({
+        "id": "chart-type", "version": 1,
+        "nodes": [{
+            "id": "chart", "type": "chart", "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "chartType": "bar", "agg": "count", "xMode": "column", "x": "event",
+            }},
+        }], "edges": [],
+    })
+    line = graph.model_copy(deep=True)
+    line.nodes[0].data["config"]["chartType"] = "line"
+
+    digest, payload = _build(graph, inputs=[], target="chart")
+    observed, observed_payload = _build(line, inputs=[], target="chart")
+    assert observed == digest
+    assert observed_payload == payload
+    assert "chartType" not in validate_execution_manifest(digest, payload)["graph"]["nodes"][0]["data"]["config"]
+
+    semantic = graph.model_copy(deep=True)
+    semantic.nodes[0].data["config"]["agg"] = "sum"
+    semantic.nodes[0].data["config"]["y"] = "amount"
+    assert _build(semantic, inputs=[], target="chart")[0] != digest
+
+
 def test_digest_retains_only_titles_consumed_by_execution():
     baseline, _ = _build()
 
