@@ -76,6 +76,18 @@ describe('NodeCard result summary', () => {
     expect(screen.getByTitle('stale')).toBeVisible()
   })
 
+  it('does not draw a success glyph when the node has no saved result', () => {
+    const idle: NodeData = {
+      ...useStore.getState().doc.nodes[0].data,
+      status: 'idle',
+    }
+
+    render(<ReactFlowProvider><NodeCard id="target" data={idle} /></ReactFlowProvider>)
+
+    expect(screen.getByTitle('no saved result')).toBeEmptyDOMElement()
+    expect(screen.queryByText('✓')).not.toBeInTheDocument()
+  })
+
   it('hides output-run history on Source nodes', () => {
     const data = useStore.getState().doc.nodes[0].data
     useStore.setState({ selectedIds: ['target'] })

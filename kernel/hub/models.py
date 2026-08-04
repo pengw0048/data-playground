@@ -26,7 +26,7 @@ from hub.version import current_version
 # (a metric or a node value driving another node's param). All must be representable on an edge.
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
 NodeStatus = Literal[
-    "draft", "checking", "latest", "stale", "unknown", "queued", "running", "failed",
+    "draft", "idle", "checking", "latest", "stale", "unknown", "queued", "running", "failed",
 ]
 Placement = Literal["local", "distributed"]
 DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]

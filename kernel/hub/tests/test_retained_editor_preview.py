@@ -504,7 +504,7 @@ def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retain
 
     assert recovered.status_code == 200, recovered.text
     assert recovered.json() == {
-        "latestNodeIds": ["sample", "source"],
+        "latestNodeIds": ["sample"],
         "failedNodeIds": [],
         "staleNodeIds": [],
         "unknownNodeIds": [],
@@ -523,7 +523,7 @@ def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retain
     assert missing.json() == {
         "latestNodeIds": [],
         "failedNodeIds": [],
-        "staleNodeIds": ["sample", "source"],
+        "staleNodeIds": ["sample"],
         "unknownNodeIds": [],
         "results": [],
     }
@@ -600,7 +600,7 @@ def test_canvas_reopen_recovers_every_terminal_result_from_one_whole_graph_run(t
 
         reopened = client.post("/api/run/current-results", json={"graph": graph})
         assert reopened.status_code == 200, reopened.text
-        assert reopened.json()["latestNodeIds"] == ["sample-a", "sample-b", "source"]
+        assert reopened.json()["latestNodeIds"] == ["sample-a", "sample-b"]
         assert reopened.json()["staleNodeIds"] == []
         assert {
             result["output"]["nodeId"] for result in reopened.json()["results"]
@@ -690,7 +690,7 @@ def test_whole_graph_run_preserves_write_and_result_leaf_receipts(tmp_path):
 
         reopened = client.post("/api/run/current-results", json={"graph": graph})
         assert reopened.status_code == 200, reopened.text
-        assert reopened.json()["latestNodeIds"] == ["sample", "source", "write"]
+        assert reopened.json()["latestNodeIds"] == ["sample", "write"]
         assert reopened.json()["staleNodeIds"] == []
         retained = _retained_result(graph, node_id="sample")
         assert retained.status_code == 200, retained.text
@@ -787,7 +787,7 @@ def test_canvas_reopen_keeps_transient_result_check_unknown(retained_sample, mon
         "latestNodeIds": [],
         "failedNodeIds": [],
         "staleNodeIds": [],
-        "unknownNodeIds": ["sample", "source"],
+        "unknownNodeIds": ["sample"],
         "results": [],
     }
 
@@ -821,7 +821,7 @@ def test_failed_rerun_stays_visible_without_discarding_prior_current_result(reta
     recovered = client.post("/api/run/current-results", json={"graph": graph})
     assert recovered.status_code == 200, recovered.text
     assert recovered.json() == {
-        "latestNodeIds": ["source"],
+        "latestNodeIds": [],
         "failedNodeIds": ["sample"],
         "staleNodeIds": [],
         "unknownNodeIds": [],

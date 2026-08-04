@@ -1939,7 +1939,9 @@ function mutateNodeConfig(
     const stale = downstream(s.doc, id)
     const nodes: CanvasNode[] = s.doc.nodes.map((n) => {
       if (n.id === id) {
-        const status: NodeStatus = n.data.status === 'draft' ? 'draft' : 'stale'
+        const status: NodeStatus = n.data.status === 'draft' || n.data.status === 'idle'
+          ? n.data.status
+          : 'stale'
         return {
           ...n,
           data: {
@@ -3024,7 +3026,8 @@ export const useStore = create<Store>((set, get) => ({
         for (const nodeId of downstream(s.doc, source.node_id)) stale.add(nodeId)
       }
       return {
-        doc: { ...s.doc, nodes: s.doc.nodes.map((node) => stale.has(node.id) && node.data.status !== 'draft'
+        doc: { ...s.doc, nodes: s.doc.nodes.map((node) => stale.has(node.id)
+          && node.data.status !== 'draft' && node.data.status !== 'idle'
           ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
           : node) },
         runs: { ...s.runs, [id]: {
@@ -5216,9 +5219,10 @@ useStore.subscribe((s) => {
 // Map backend per-node run states onto each node's card status so the WHOLE graph animates during a
 // run (queued → running → done) and a failing INTERMEDIATE node turns red — not just the target sink.
 // Transient by design: only nodes that actually advanced get a new object (idle ticks return {} → no
-// doc-identity change → no autosave/PUT churn), and terminal states settle to latest/failed/stale.
+// doc-identity change → no autosave/PUT churn). A completed step waits in `checking` until durable
+// result recovery proves whether that node owns a reopenable output.
 const _PERNODE_STATUS: Record<string, NodeStatus> = {
-  queued: 'queued', running: 'running', done: 'latest', failed: 'failed', cancelled: 'stale',
+  queued: 'queued', running: 'running', done: 'checking', failed: 'failed', cancelled: 'stale',
 }
 
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
@@ -5293,6 +5297,7 @@ function recoverCanvasResults(
           || structSig(state.doc) !== structure) return {}
       const latest = new Set(recovery.latestNodeIds)
       const failed = new Set(recovery.failedNodeIds)
+      const stale = new Set(recovery.staleNodeIds)
       const unknown = new Set(recovery.unknownNodeIds ?? [])
       let nodesChanged = false
       const nodes = state.doc.nodes.map((node) => {
@@ -5302,7 +5307,9 @@ function recoverCanvasResults(
           : latest.has(node.id)
             ? 'latest'
             : unknown.has(node.id)
-              ? 'unknown' : 'stale'
+              ? 'unknown'
+              : stale.has(node.id)
+                ? 'stale' : 'idle'
         nodesChanged = true
         return { ...node, data: { ...node.data, status } }
       })
@@ -5652,10 +5659,23 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
             || s.currentUser?.id !== reattachUserId || currentNode?.type !== 'write'
             || currentNode.data.lastRun?.writeReceiptRunId !== runId
             || (existing?.writeOutcome && existing.writeOutcome.runId !== runId)) return {}
-        return { runs: { ...s.runs, [node.id]: {
-          ...(existing ?? { phase: 'idle' as const }),
-          writeOutcome: { runId, receipt: outcome.receipt, outputs: outcome.outputs },
-        } } }
+        const recoveredStatus = currentNode.data.status === 'checking'
+          || currentNode.data.status === 'idle'
+          ? 'latest' as const
+          : currentNode.data.status
+        return {
+          ...(recoveredStatus !== currentNode.data.status ? {
+            doc: { ...s.doc, nodes: s.doc.nodes.map((candidate) => (
+              candidate.id === node.id
+                ? { ...candidate, data: { ...candidate.data, status: recoveredStatus } }
+                : candidate
+            )) },
+          } : {}),
+          runs: { ...s.runs, [node.id]: {
+            ...(existing ?? { phase: 'idle' as const }),
+            writeOutcome: { runId, receipt: outcome.receipt, outputs: outcome.outputs },
+          } },
+        }
       })
     }).catch(() => {
       // Missing, revoked, pruned, duplicated, or temporarily unavailable evidence stays unknown.
@@ -5933,6 +5953,9 @@ function pollGraphRun(
       void get().refreshSchemas()
       void get().refreshCatalog()
     }
+    // Per-step completion proves execution, not a saved per-node artifact. Resolve checks from the
+    // server's current readable result inventory; fused intermediates settle to icon-free `idle`.
+    recoverCanvasResults(get, set, get().doc)
     settleAnimatingNodes(set)
     if (status.status === 'failed') {
       const failed = status.perNode?.find((step) => step.status === 'failed')
@@ -6019,7 +6042,11 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       const g = get()
       const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
       g.updateData(nodeId, {
-        status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',
+        // A successful execution is not yet proof that this node owns a reopenable artifact.
+        // Durable Write receipts are direct evidence; every other target waits for recovery.
+        status: status.status === 'done'
+          ? publishedWrite ? 'latest' : 'checking'
+          : status.status === 'failed' ? 'failed' : 'stale',
         lastRun: status.status === 'done'
           ? {
               ...(resultRows !== undefined ? { rows: resultRows } : {}),
@@ -6059,6 +6086,9 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         void g.refreshSchemas()
         void g.refreshCatalog()
       }
+      // Upstream `done` entries may have been fused into this run. Only independently readable
+      // outputs earn a persistent check; re-resolve every temporary `checking` badge now.
+      recoverCanvasResults(get, set, get().doc)
       stopPolling()
       return
     }

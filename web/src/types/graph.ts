@@ -3,7 +3,7 @@ import type { WireType } from '../theme/tokens'
 import type { DatasetRevisionResolution } from './api'
 
 export type NodeStatus =
-  | 'draft' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed'
+  | 'draft' | 'idle' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed'
 export type TransformSource = 'library' | 'adhoc'
 export type ProcessorMode =
   | 'map' | 'map_batches' | 'filter' | 'flat_map' | 'flat_map_generator'
