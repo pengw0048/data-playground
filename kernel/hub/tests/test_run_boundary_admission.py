@@ -217,6 +217,79 @@ def test_boundary_admission_selects_nearest_retained_intermediate(retained_inter
     assert output["uri"] not in response.text
 
 
+def test_boundary_admission_follows_the_connected_named_output(tmp_path):
+    lance = pytest.importorskip("lance")
+    canvas_id = f"boundary-named-{uuid.uuid4().hex}"
+    source_uri = str(tmp_path / f"{canvas_id}.lance")
+    lance.write_dataset(pa.table({"value": [1, 2, 3, 4]}), source_uri)
+    registered = client.post("/api/catalog/register", json={
+        "uri": source_uri, "name": f"exact-{uuid.uuid4().hex}",
+    })
+    assert registered.status_code == 200, registered.text
+    graph = {
+        "id": canvas_id,
+        "name": "Named boundary",
+        "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"title": "Source", "config": {
+                    "uri": source_uri,
+                    "datasetRef": {
+                        "kind": "exact",
+                        "datasetId": registered.json()["registrationId"],
+                        "revisionId": "1",
+                    },
+                }},
+            },
+            {
+                "id": "assert", "type": "assert", "position": {"x": 200, "y": 0},
+                "data": {"title": "Quality", "config": {
+                    "predicate": "value > 2", "severity": "warn",
+                }},
+            },
+        ],
+        "edges": [{
+            "id": "source-assert", "source": "source", "sourceHandle": "out",
+            "target": "assert", "targetHandle": "in", "data": {"wire": "dataset"},
+        }],
+    }
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="Named boundary"))
+    try:
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _wait(started.json()["runId"])
+        assert status["status"] == "done", status
+        _wait_for_history_projection(status["runId"])
+
+        graph["nodes"].append({
+            "id": "filter", "type": "filter", "position": {"x": 400, "y": 0},
+            "data": {"title": "Continue", "config": {"predicate": "value >= 1"}},
+        })
+        graph["edges"].append({
+            "id": "assert-filter", "source": "assert", "sourceHandle": "pass",
+            "target": "filter", "targetHandle": "in", "data": {"wire": "dataset"},
+        })
+        response = client.post("/api/run/boundary-admission", json={
+            "graph": graph, "targetNodeId": "filter",
+        })
+
+        assert response.status_code == 200, response.text
+        assert response.json()["boundary"]["boundaryPortId"] == "pass"
+        assert response.json()["boundary"]["boundaryRunId"] == status["runId"]
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        get_deps().catalog.unregister(source_uri)
+        shutil.rmtree(source_uri, ignore_errors=True)
+
+
 def test_boundary_admission_rejects_client_artifact_uri(retained_intermediate):
     graph, _run_id, output = retained_intermediate
 
@@ -286,7 +359,8 @@ def test_boundary_admission_rejects_expired_artifact(retained_intermediate):
     assert response.json()["reason"] in {"expired", "stale", "no_candidate"}
 
 
-def test_local_run_persists_and_revalidates_boundary_after_restart(retained_intermediate):
+def test_local_run_persists_only_boundary_identity_and_revalidates_after_restart(
+        retained_intermediate):
     graph, boundary_run_id, output = retained_intermediate
 
     started = client.post("/api/run", json={
@@ -300,24 +374,25 @@ def test_local_run_persists_and_revalidates_boundary_after_restart(retained_inte
     assert downstream["status"] == "done", downstream
     run_id = downstream["runId"]
 
-    persisted = metadb.run_boundary_admission(run_id, include_artifact_uri=True)
+    persisted = metadb.run_boundary_admission(run_id)
     assert persisted is not None
     assert persisted["boundary_run_id"] == boundary_run_id
     assert persisted["boundary_node_id"] == "sample"
     assert persisted["boundary_port_id"] == "out"
-    assert persisted["artifact_uri"] == metadb._local_result_candidate(output["uri"])
     assert persisted["revalidated_at"] is not None
+    assert "artifact_uri" not in persisted
+    assert output["uri"] not in repr(persisted)
 
     with metadb.session() as session:
         refs = list(session.scalars(select(metadb.LocalResultReference).where(
             metadb.LocalResultReference.owner_kind == "run_boundary_admission",
             metadb.LocalResultReference.owner_key == run_id,
         )))
-    assert [ref.uri for ref in refs] == [persisted["artifact_uri"]]
+    assert refs == []
 
     # Hub restart: forget process state and re-read the durable admission identity.
     get_deps().run_index.clear()
-    revived = metadb.run_boundary_admission(run_id, include_artifact_uri=True)
+    revived = metadb.run_boundary_admission(run_id)
     assert revived == persisted
     ok, reason, message = runs_router._revalidate_reusable_execution_boundary(
         Graph.model_validate(graph),
@@ -396,7 +471,7 @@ def test_same_named_nodes_do_not_collide(tmp_path):
         shutil.rmtree(source_uri, ignore_errors=True)
 
 
-def test_clearing_boundary_releases_owner_refs(retained_intermediate):
+def test_clearing_boundary_removes_only_the_persisted_identity(retained_intermediate):
     graph, boundary_run_id, output = retained_intermediate
     started = client.post("/api/run", json={
         "graph": graph,
@@ -407,7 +482,7 @@ def test_clearing_boundary_releases_owner_refs(retained_intermediate):
     assert started.status_code == 200, started.text
     downstream = _wait(started.json()["runId"])
     run_id = downstream["runId"]
-    persisted = metadb.run_boundary_admission(run_id, include_artifact_uri=True)
+    persisted = metadb.run_boundary_admission(run_id)
     assert persisted is not None
     assert persisted["boundary_run_id"] == boundary_run_id
 

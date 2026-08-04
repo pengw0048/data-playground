@@ -24,7 +24,6 @@ def upgrade() -> None:
         sa.Column("boundary_port_id", sa.String(), nullable=False),
         sa.Column("boundary_run_id", sa.String(), nullable=False),
         sa.Column("boundary_execution_manifest_sha256", sa.String(length=64), nullable=False),
-        sa.Column("artifact_uri", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revalidated_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(

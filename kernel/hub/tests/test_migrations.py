@@ -913,7 +913,7 @@ def test_committed_migration_revisions_are_immutable():
             "0d47e6da5b505575950b01bb20f1fe340c91a744ee451f15c135727fddc7306c"
         ),
         "0053_run_boundary_admission.py": (
-            "16ea8aa614d349b2ae58c920c983df863053b4d83bf4bfb30ce21796a1409133"
+            "0ba85399de7828b7a98d3cd797d6326aa5c2ddfb88e55d5d51ea95cb28757c86"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

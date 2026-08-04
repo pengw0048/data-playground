@@ -4899,6 +4899,9 @@ def _retained_result_readability(
         return "unknown"
 
 
+_BOUNDARY_TABLE_WIRES = frozenset(("dataset", "selection", "sample", "sql-view"))
+
+
 def _target_cone_is_linear(cone: Graph, target_node_id: str) -> bool:
     """True when the target cone is a single path with no fan-in or fan-out."""
     incoming: dict[str, list[str]] = {}
@@ -4924,16 +4927,17 @@ def _target_cone_is_linear(cone: Graph, target_node_id: str) -> bool:
     return True
 
 
-def _linear_upstream_node_ids(cone: Graph, target_node_id: str) -> list[str]:
-    """Nearest-first upstream node ids on a linear cone, excluding the target itself."""
-    incoming = {edge.target: edge.source for edge in cone.edges}
-    order: list[str] = []
-    current = incoming.get(target_node_id)
+def _linear_upstream_outputs(
+        cone: Graph, target_node_id: str) -> list[tuple[str, str | None]]:
+    """Nearest-first upstream node/output pairs on a linear cone, excluding the target."""
+    incoming = {edge.target: edge for edge in cone.edges}
+    order: list[tuple[str, str | None]] = []
+    current_target = target_node_id
     seen: set[str] = set()
-    while current is not None and current not in seen:
-        seen.add(current)
-        order.append(current)
-        current = incoming.get(current)
+    while (edge := incoming.get(current_target)) is not None and edge.source not in seen:
+        seen.add(edge.source)
+        order.append((edge.source, edge.source_handle))
+        current_target = edge.source
     return order
 
 
@@ -4984,12 +4988,12 @@ def _select_reusable_execution_boundary(
             message="reusable boundaries require a linear target cone")
     last_reason: BoundaryAdmissionReason = "no_candidate"
     last_message = "no exact retained upstream result is available"
-    for node_id in _linear_upstream_node_ids(cone, target_node_id):
+    for node_id, connected_port_id in _linear_upstream_outputs(cone, target_node_id):
         node = graph_mod.node_map(cone).get(node_id)
         if node is None or node.type == "source":
             continue
         try:
-            port_id = _inspection_port(cone, node_id, None, deps)
+            port_id = _inspection_port(cone, node_id, connected_port_id, deps)
         except APIError:
             last_reason = "no_candidate"
             last_message = "upstream node has no reusable output port"
@@ -5022,6 +5026,10 @@ def _select_reusable_execution_boundary(
         if readability != "readable":
             last_reason = "unreadable"
             last_message = "retained upstream artifact could not be proved readable"
+            continue
+        if identity.output.wire not in _BOUNDARY_TABLE_WIRES:
+            last_reason = "unsupported_artifact"
+            last_message = "retained upstream output is not a reusable table"
             continue
         uri = identity.output.uri or ""
         if metadb._local_result_candidate(uri) is None:
@@ -5071,9 +5079,11 @@ def _revalidate_reusable_execution_boundary(
     if (
         identity.run_id != persisted["boundary_run_id"]
         or identity.execution_manifest_sha256 != persisted["boundary_execution_manifest_sha256"]
-        or metadb._local_result_candidate(identity.output.uri or "") != persisted.get("artifact_uri")
     ):
         return False, "stale", "retained boundary identity changed before dispatch"
+    if (identity.output.wire not in _BOUNDARY_TABLE_WIRES
+            or metadb._local_result_candidate(identity.output.uri or "") is None):
+        return False, "unsupported_artifact", "retained boundary is not a managed local table"
     readability = _retained_result_readability(identity, deps)
     if readability == "missing":
         return False, "expired", "retained boundary artifact is missing or expired"
@@ -5113,7 +5123,6 @@ def _admit_local_run_boundary(
             boundary_run_id=selection.boundary.boundary_run_id,
             boundary_execution_manifest_sha256=(
                 selection.boundary.boundary_execution_manifest_sha256),
-            artifact_uri=artifact_uri,
         )
     except Exception:  # noqa: BLE001 - boundary reuse must never block an ordinary full run
         logging.getLogger("hub.runs").exception(
@@ -5122,7 +5131,7 @@ def _admit_local_run_boundary(
         return BoundaryAdmission(
             admitted=False, reason="no_candidate", target_node_id=target_node_id,
             message="reusable boundary could not be persisted")
-    persisted = metadb.run_boundary_admission(run_id, include_artifact_uri=True)
+    persisted = metadb.run_boundary_admission(run_id)
     if persisted is None:
         return BoundaryAdmission(
             admitted=False, reason="no_candidate", target_node_id=target_node_id,
