@@ -10,6 +10,21 @@ Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 
 ## Unreleased
 
+## [0.3.3] — 2026-08-04
+
+This patch release makes whole-Canvas execution results truthful and restart-durable without
+changing the supported local-workstation and trusted-team deployment boundary.
+
+### Changed
+
+- One fused whole-graph run now publishes every top-level terminal result, including named result
+  ports and a catalog Write alongside independent result leaves. Reopening the Canvas recovers each
+  leaf only while its exact execution plan and artifact or catalog version remain current.
+- Execution temporarily spools only real fan-out boundaries, including multi-output nodes, so
+  one-shot Arrow and Lance inputs deliver the same rows to every branch. Intermediate relations stay
+  lazy, temporary fan-out files are deleted after the run, and configured result-history limits
+  continue to apply only to retained terminal versions.
+
 ## [0.3.2] — 2026-08-04
 
 This patch release makes relationship exploration and prepared research demos presentation-ready
