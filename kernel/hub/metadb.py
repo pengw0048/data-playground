@@ -586,6 +586,28 @@ class RunInputAdmission(Base):
     )
 
 
+class RunBoundaryAdmission(Base):
+    """One opaque reusable retained-output identity bound to a local run admission."""
+    __tablename__ = "run_boundary_admissions"
+    run_id: Mapped[str] = mapped_column(
+        String, ForeignKey("run_input_admissions.run_id", ondelete="CASCADE"), primary_key=True)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False, index=True)
+    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_port_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_run_id: Mapped[str] = mapped_column(String, nullable=False)
+    boundary_execution_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    revalidated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "length(boundary_execution_manifest_sha256) = 64",
+            name="ck_run_boundary_manifest_sha256",
+        ),
+    )
+
+
 class ExecutionManifest(Base):
     """One immutable content-addressed definition for graph-backed execution."""
     __tablename__ = "execution_manifests"
@@ -11044,6 +11066,97 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
         s.flush()
         sync_local_result_owner(s, "run_input_admission", run_id, manifest)
         return run_id, True
+
+
+def admit_run_boundary(
+        *,
+        run_id: str,
+        canvas_id: str,
+        target_node_id: str,
+        boundary_node_id: str,
+        boundary_port_id: str,
+        boundary_run_id: str,
+        boundary_execution_manifest_sha256: str,
+) -> dict:
+    """Persist one bounded retained-output identity for an already-admitted local run."""
+    if not re.fullmatch(r"[0-9a-f]{64}", str(boundary_execution_manifest_sha256)):
+        raise ValueError("run boundary admission requires a SHA-256 execution manifest")
+    run_key = str(run_id)
+    canvas = str(canvas_id)
+    with session() as s:
+        admission = s.get(RunInputAdmission, run_key, with_for_update=True)
+        if admission is None:
+            raise RuntimeError("local run admission was not persisted")
+        if admission.canvas_id != canvas:
+            raise RuntimeError("run boundary canvas does not match its local admission")
+        if admission.target_node_id != str(target_node_id):
+            raise RuntimeError("run boundary target does not match its local admission")
+        if s.get(Canvas, canvas, with_for_update=True) is None:
+            raise RuntimeError("run boundary canvas does not exist")
+        existing = s.get(RunBoundaryAdmission, run_key, with_for_update=True)
+        if existing is not None:
+            s.delete(existing)
+            s.flush()
+        row = RunBoundaryAdmission(
+            run_id=run_key,
+            canvas_id=canvas,
+            target_node_id=str(target_node_id),
+            boundary_node_id=str(boundary_node_id),
+            boundary_port_id=str(boundary_port_id),
+            boundary_run_id=str(boundary_run_id),
+            boundary_execution_manifest_sha256=str(boundary_execution_manifest_sha256),
+        )
+        s.add(row)
+        s.flush()
+        return {
+            "run_id": row.run_id,
+            "canvas_id": row.canvas_id,
+            "target_node_id": row.target_node_id,
+            "boundary_node_id": row.boundary_node_id,
+            "boundary_port_id": row.boundary_port_id,
+            "boundary_run_id": row.boundary_run_id,
+            "boundary_execution_manifest_sha256": row.boundary_execution_manifest_sha256,
+            "created_at": row.created_at,
+            "revalidated_at": row.revalidated_at,
+        }
+
+
+def run_boundary_admission(run_id: str) -> dict | None:
+    """Return one persisted boundary identity without storage addresses or capabilities."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id))
+        if row is None:
+            return None
+        return {
+            "run_id": row.run_id,
+            "canvas_id": row.canvas_id,
+            "target_node_id": row.target_node_id,
+            "boundary_node_id": row.boundary_node_id,
+            "boundary_port_id": row.boundary_port_id,
+            "boundary_run_id": row.boundary_run_id,
+            "boundary_execution_manifest_sha256": row.boundary_execution_manifest_sha256,
+            "created_at": row.created_at,
+            "revalidated_at": row.revalidated_at,
+        }
+
+
+def mark_run_boundary_revalidated(run_id: str) -> None:
+    """Stamp successful pre-dispatch revalidation without changing the immutable identity."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id), with_for_update=True)
+        if row is None:
+            raise RuntimeError("run boundary admission was not persisted")
+        row.revalidated_at = _db_now(s)
+
+
+def clear_run_boundary_admission(run_id: str) -> bool:
+    """Drop one boundary admission identity."""
+    with session() as s:
+        row = s.get(RunBoundaryAdmission, str(run_id), with_for_update=True)
+        if row is None:
+            return False
+        s.delete(row)
+        return True
 
 
 def local_file_input_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
