@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0055_workspace_actor_opens", "0054_workspace_favorites"),
         ("0054_workspace_favorites", "0053_run_boundary_admission"),
         ("0053_run_boundary_admission", "0052_rejected_run_owner"),
         ("0052_rejected_run_owner", "0051_canvas_result_latest"),
@@ -107,8 +108,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0054_workspace_favorites"]
-    assert metadb.expected_schema_head() == "0054_workspace_favorites"
+    assert scripts.get_heads() == ["0055_workspace_actor_opens"]
+    assert metadb.expected_schema_head() == "0055_workspace_actor_opens"
 
 
 def test_fresh_schema_omits_retired_row_identity_storage(tmp_path):
@@ -768,6 +769,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0055_workspace_actor_opens.py": (
+            "7f69f4bc7819f7debc3ebd3cbf5413a205527a97794bb36bc732484f20f781dc"
+        ),
         "0054_workspace_favorites.py": (
             "31fa22cdc3ff04a428bdb738b7414601ffbf79755ca38b8007309142fdee87a1"
         ),

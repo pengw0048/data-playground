@@ -47,6 +47,7 @@ from hub.models import (
     WorkspaceCanonicalDatasetContext,
     WorkspaceFavoriteMutationResult,
     WorkspaceFavoriteStatus,
+    WorkspaceOpenObservation,
     WorkspaceProviderSource,
     WorkspaceResource,
     WorkspaceResourceResolution,
@@ -767,7 +768,7 @@ def browse_workspace_container(
         limit: int = Query(default=50, ge=1, le=100),
         cursor: str | None = Query(default=None, max_length=4096),
         source: Literal["local", "provider"] | None = Query(default=None),
-        sort: Literal["name", "updated"] | None = Query(default=None),
+        sort: Literal["name", "updated", "opened"] | None = Query(default=None),
         order: Literal["asc", "desc"] = Query(default="asc"),
         kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
         = Query(default=[]),
@@ -833,6 +834,19 @@ def browse_workspace_favorites(
         raise HTTPException(422, str(exc)) from exc
 
 
+@router.get("/workspace/recent", response_model=WorkspaceBrowsePage)
+def browse_workspace_recent(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=4096),
+        uid: str = Depends(current_user),
+) -> dict:
+    """Bounded personal Recently opened shelf; reuses the Workspace browse page contract."""
+    try:
+        return metadb.workspace_recent(uid, limit=limit, cursor=cursor)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @router.get("/workspace/favorites/status", response_model=WorkspaceFavoriteStatus)
 def workspace_favorite_status(
         id: list[str] = Query(default=[], max_length=200),
@@ -859,6 +873,46 @@ def delete_workspace_favorite(resource_id: str, uid: str = Depends(current_user)
     """Idempotently unfavorite; succeeds even when the resource is unavailable."""
     try:
         return metadb.workspace_favorite_remove(resource_id, uid=uid)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post(
+    "/workspace/resources/{resource_id}/opened",
+    response_model=WorkspaceOpenObservation,
+)
+def record_workspace_opened(
+        resource_id: str,
+        uid: str = Depends(current_user),
+) -> dict:
+    """Record one successful open after Workspace authorization confirms the resource.
+
+    Hover, selection, denied, and failed opens must not call this. The observation is personal and
+    does not mutate resource ``updatedAt``, provider state, Canvas version/CAS, or Jobs history.
+    """
+    try:
+        kind, _identity = resource_id.split(":", 1)
+    except ValueError as exc:
+        raise HTTPException(422, "invalid Workspace resource reference") from exc
+    if kind not in metadb._WORKSPACE_OPEN_KINDS:
+        raise HTTPException(
+            422, "Recently opened only records canvases, datasets, and saved views")
+    try:
+        resolved = workspace_providers.resolve(resource_id, uid=uid)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    resource = resolved.get("resource")
+    if resource is None:
+        raise HTTPException(404, f"Workspace resource '{resource_id}' not found")
+    if resource.get("detached"):
+        raise HTTPException(404, f"Workspace resource '{resource_id}' not found")
+    source = resolved.get("source") or {}
+    if source.get("completeness") in {"unavailable", "unsupported"}:
+        raise HTTPException(404, f"Workspace resource '{resource_id}' not found")
+    # Prefer the resolved stable id (registration alias may rewrite dataset identity).
+    observed_id = resource.get("id") if isinstance(resource.get("id"), str) else resource_id
+    try:
+        return metadb.workspace_record_open(uid, observed_id)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

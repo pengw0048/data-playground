@@ -172,6 +172,27 @@ class WorkspacePlacement(Base):
     )
 
 
+class WorkspaceActorOpen(Base):
+    """Per-actor last-opened observation for a stable Workspace resource identity.
+
+    Personal convenience metadata only: never mutates provider state, Canvas CAS, or resource
+    ``updated_at``. Favorites (#1340) can share this actor×resource keying later.
+    """
+    __tablename__ = "workspace_actor_opens"
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    resource_ref: Mapped[str] = mapped_column(String(640), primary_key=True)
+    last_opened_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        Index("ix_workspace_actor_opens_user_opened", "user_id", "last_opened_at"),
+        CheckConstraint(
+            "resource_ref LIKE 'canvas:%' OR resource_ref LIKE 'dataset:%' "
+            "OR resource_ref LIKE 'dataset_view:%'",
+            name="ck_workspace_actor_opens_ref",
+        ),
+    )
+
+
 class WorkspaceExternalOverlayAnchor(Base):
     """One hidden, writable local destination fenced by one provider binding generation."""
     __tablename__ = "workspace_external_overlay_anchors"
@@ -5974,12 +5995,15 @@ def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
 def _workspace_placement_resource(
         row: WorkspacePlacement, *, detached: bool,
         canvas_version: int | None = None,
-        updated_at: datetime.datetime | None = None) -> dict:
+        updated_at: datetime.datetime | None = None,
+        last_opened_at: datetime.datetime | None = None) -> dict:
     return {
         "id": _workspace_ref(row.target_kind, row.target_id), "kind": row.target_kind,
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
         **({"updatedAt": _core_utc_iso(updated_at)} if updated_at is not None else {}),
+        **({"lastOpenedAt": _core_utc_iso(last_opened_at)}
+           if last_opened_at is not None else {}),
         **({"canvasVersion": canvas_version}
            if row.target_kind == "canvas" and canvas_version is not None else {}),
     }
@@ -6854,6 +6878,226 @@ def _workspace_dataset_view_visible_clause(uid: str):
 
 _WORKSPACE_QUERY_CURSOR_VERSION = 3
 _WORKSPACE_BROWSE_KINDS = frozenset({"container", "canvas", "dataset", "dataset_view"})
+_WORKSPACE_OPEN_KINDS = frozenset({"canvas", "dataset", "dataset_view"})
+_WORKSPACE_OPEN_MAX_PER_ACTOR = 200
+_WORKSPACE_OPEN_COALESCE_SECONDS = 60
+
+
+def _workspace_open_ref(kind: str, identity: str) -> str:
+    if kind not in _WORKSPACE_OPEN_KINDS or not identity:
+        raise ValueError("invalid Workspace open resource reference")
+    ref = _workspace_ref(kind, identity)
+    if len(ref) > 640:
+        raise ValueError("Workspace open resource reference is too long")
+    return ref
+
+
+def _workspace_open_join(kind: str, target_id_column, *, uid: str):
+    return (
+        WorkspaceActorOpen,
+        and_(
+            WorkspaceActorOpen.user_id == uid,
+            WorkspaceActorOpen.resource_ref == func.concat(f"{kind}:", target_id_column),
+        ),
+    )
+
+
+def workspace_record_open(
+        uid: str, resource_ref: str, *,
+        at: datetime.datetime | None = None) -> dict:
+    """Upsert one personal last-opened observation after authorization succeeded.
+
+    Repeated opens within ``_WORKSPACE_OPEN_COALESCE_SECONDS`` reuse the existing row so ordinary
+    navigation does not create unbounded writes. Cap retained observations per actor.
+    """
+    try:
+        kind, identity = resource_ref.split(":", 1)
+        normalized = _workspace_open_ref(kind, identity)
+    except ValueError as exc:
+        raise ValueError("invalid Workspace open resource reference") from exc
+    opened_at = at or _now()
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=datetime.timezone.utc)
+    with session() as s:
+        row = s.get(WorkspaceActorOpen, (uid, normalized))
+        previous = row.last_opened_at if row is not None else None
+        if previous is not None and previous.tzinfo is None:
+            previous = previous.replace(tzinfo=datetime.timezone.utc)
+        if (previous is not None
+                and (opened_at - previous).total_seconds()
+                < _WORKSPACE_OPEN_COALESCE_SECONDS):
+            return {
+                "resourceId": normalized,
+                "lastOpenedAt": _core_utc_iso(previous),
+                "coalesced": True,
+            }
+        if row is None:
+            row = WorkspaceActorOpen(
+                user_id=uid, resource_ref=normalized, last_opened_at=opened_at)
+            s.add(row)
+        else:
+            row.last_opened_at = opened_at
+        s.flush()
+        excess = list(s.scalars(
+            select(WorkspaceActorOpen)
+            .where(WorkspaceActorOpen.user_id == uid)
+            .order_by(
+                WorkspaceActorOpen.last_opened_at.desc(),
+                WorkspaceActorOpen.resource_ref.asc(),
+            )
+            .offset(_WORKSPACE_OPEN_MAX_PER_ACTOR)
+        ).all())
+        for stale in excess:
+            s.delete(stale)
+        s.flush()
+        return {
+            "resourceId": normalized,
+            "lastOpenedAt": _core_utc_iso(row.last_opened_at),
+            "coalesced": False,
+        }
+
+
+def workspace_forget_open(uid: str, resource_ref: str) -> bool:
+    """Drop one observation without requiring the resource to still exist."""
+    with session() as s:
+        row = s.get(WorkspaceActorOpen, (uid, resource_ref))
+        if row is None:
+            return False
+        s.delete(row)
+        return True
+
+
+def _workspace_attach_last_opened(uid: str, items: list[dict]) -> list[dict]:
+    """Project personal lastOpenedAt onto already-authorized Workspace list items."""
+    refs = [
+        item["id"] for item in items
+        if item.get("kind") in _WORKSPACE_OPEN_KINDS and isinstance(item.get("id"), str)
+    ]
+    if not refs:
+        return items
+    with session() as s:
+        rows = list(s.execute(
+            select(WorkspaceActorOpen.resource_ref, WorkspaceActorOpen.last_opened_at).where(
+                WorkspaceActorOpen.user_id == uid,
+                WorkspaceActorOpen.resource_ref.in_(refs),
+            )
+        ).all())
+    opened = {ref: opened_at for ref, opened_at in rows}
+    for item in items:
+        opened_at = opened.get(item.get("id"))
+        if opened_at is not None:
+            item["lastOpenedAt"] = _core_utc_iso(opened_at)
+    return items
+
+
+def _workspace_recent_cursor_encode(
+        opened_at: datetime.datetime, resource_ref: str) -> str:
+    payload = [
+        _WORKSPACE_QUERY_CURSOR_VERSION, "recent", "opened", "desc",
+        opened_at.isoformat(), resource_ref,
+    ]
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_recent_cursor_decode(
+        cursor: str | None) -> tuple[datetime.datetime, str] | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Workspace recent cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+    except (binascii.Error, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid Workspace recent cursor") from exc
+    if (not isinstance(payload, list) or len(payload) != 6
+            or payload[0] != _WORKSPACE_QUERY_CURSOR_VERSION
+            or payload[1:4] != ["recent", "opened", "desc"]
+            or not isinstance(payload[4], str) or not isinstance(payload[5], str)):
+        raise ValueError("invalid Workspace recent cursor")
+    try:
+        opened_at = datetime.datetime.fromisoformat(payload[4])
+    except ValueError as exc:
+        raise ValueError("invalid Workspace recent cursor") from exc
+    return opened_at, payload[5]
+
+
+def workspace_recent(
+        uid: str, *, limit: int = 50, cursor: str | None = None) -> dict:
+    """Bounded personal Recently opened shelf using the Workspace browse page contract."""
+    limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    decoded = _workspace_recent_cursor_decode(cursor)
+    collected: list[dict] = []
+    scan_cursor = decoded
+    # Scan past revoked rows so a page still fills when access was lost.
+    for _ in range(8):
+        batch_limit = max(limit - len(collected) + 1, 1)
+        with session() as s:
+            query = (
+                select(WorkspaceActorOpen)
+                .where(WorkspaceActorOpen.user_id == uid)
+                .order_by(
+                    WorkspaceActorOpen.last_opened_at.desc(),
+                    WorkspaceActorOpen.resource_ref.asc(),
+                )
+                .limit(batch_limit)
+            )
+            if scan_cursor is not None:
+                opened_at, resource_ref = scan_cursor
+                query = query.where(or_(
+                    WorkspaceActorOpen.last_opened_at < opened_at,
+                    and_(
+                        WorkspaceActorOpen.last_opened_at == opened_at,
+                        WorkspaceActorOpen.resource_ref > resource_ref,
+                    ),
+                ))
+            rows = list(s.scalars(query).all())
+        if not rows:
+            break
+        for row in rows:
+            scan_cursor = (row.last_opened_at, row.resource_ref)
+            try:
+                resolved = workspace_resolve(row.resource_ref, uid=uid)
+            except KeyError:
+                workspace_forget_open(uid, row.resource_ref)
+                continue
+            resource = resolved["resource"]
+            if resource is None or resource.get("kind") not in _WORKSPACE_OPEN_KINDS:
+                workspace_forget_open(uid, row.resource_ref)
+                continue
+            if resource.get("detached"):
+                workspace_forget_open(uid, row.resource_ref)
+                continue
+            resource = {**resource, "lastOpenedAt": _core_utc_iso(row.last_opened_at)}
+            collected.append(resource)
+            if len(collected) > limit:
+                break
+        if len(collected) > limit or len(rows) < batch_limit:
+            break
+    page = collected[:limit]
+    has_more = len(collected) > limit
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = _workspace_recent_cursor_encode(
+            datetime.datetime.fromisoformat(last["lastOpenedAt"]), last["id"])
+    return {
+        "container": None,
+        "items": page,
+        "connectedSources": [],
+        "queryCapabilities": {
+            "sort": ["opened"],
+            "kindFilter": False,
+            "reason": "Recently opened lists personal successful opens newest first.",
+        },
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+        "completeness": "page" if has_more else "complete",
+        "sources": [{
+            "id": "local", "kind": "local", "completeness": "complete",
+        }],
+    }
 
 
 @dataclass(frozen=True)
@@ -7007,17 +7251,23 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             literal(0).label("kind_rank"),
             WorkspaceContainer.name.label("name"),
             missing_timestamp.label("updated_at"),
+            missing_timestamp.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
         ).where(*container_where))
     if "canvas" in kinds:
+        open_table, open_on = _workspace_open_join(
+            "canvas", WorkspacePlacement.target_id, uid=uid)
         streams.append(select(
             WorkspacePlacement.id.label("row_id"),
             literal("canvas").label("kind"),
             literal(1).label("kind_rank"),
             WorkspacePlacement.name.label("name"),
             Canvas.updated_at.label("updated_at"),
+            open_table.last_opened_at.label("last_opened_at"),
             Canvas.version.label("canvas_version"),
-        ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).where(
+        ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).outerjoin(
+            open_table, open_on,
+        ).where(
             WorkspacePlacement.target_kind == "canvas",
             or_(
                 Canvas.owner_id == uid,
@@ -7030,29 +7280,37 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             *placement_where,
         ))
     if "dataset" in kinds:
+        open_table, open_on = _workspace_open_join(
+            "dataset", WorkspacePlacement.target_id, uid=uid)
         streams.append(select(
             WorkspacePlacement.id.label("row_id"),
             literal("dataset").label("kind"),
             literal(2).label("kind_rank"),
             WorkspacePlacement.name.label("name"),
             CatalogEntry.updated_at.label("updated_at"),
+            open_table.last_opened_at.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
         ).outerjoin(
             CatalogEntry,
             CatalogEntry.registration_id == WorkspacePlacement.target_id,
-        ).where(
+        ).outerjoin(open_table, open_on).where(
             WorkspacePlacement.target_kind == "dataset",
             *placement_where,
         ))
     if "dataset_view" in kinds:
+        open_table, open_on = _workspace_open_join(
+            "dataset_view", WorkspacePlacement.target_id, uid=uid)
         streams.append(select(
             WorkspacePlacement.id.label("row_id"),
             literal("dataset_view").label("kind"),
             literal(3).label("kind_rank"),
             WorkspacePlacement.name.label("name"),
             DatasetView.created_at.label("updated_at"),
+            open_table.last_opened_at.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
-        ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).where(
+        ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).outerjoin(
+            open_table, open_on,
+        ).where(
             WorkspacePlacement.target_kind == "dataset_view",
             DatasetView.owner_id == uid,
             DatasetView.deleted_at.is_(None),
@@ -7067,12 +7325,13 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
     """Run one filtered and globally ordered local Workspace page in the metadata database.
 
     ``updated`` uses the authoritative target timestamp where the current model has one: Canvas
-    ``updated_at``, Catalog entry ``updated_at``, and immutable DatasetView ``created_at``. Local
-    Folder rows and detached Dataset placements have no timestamp column and therefore sort as
-    unknown after timestamped resources, with a deterministic name/kind/id tie-break.
+    ``updated_at``, Catalog entry ``updated_at``, and immutable DatasetView ``created_at``.
+    ``opened`` uses personal ``last_opened_at`` and never mutates resource timestamps. Local Folder
+    rows and never-opened placements sort as unknown after timestamped resources, with a
+    deterministic name/kind/id tie-break.
     """
-    if sort not in {"name", "updated"}:
-        raise ValueError("Workspace sort must be 'name' or 'updated'")
+    if sort not in {"name", "updated", "opened"}:
+        raise ValueError("Workspace sort must be 'name', 'updated', or 'opened'")
     if order not in {"asc", "desc"}:
         raise ValueError("Workspace order must be 'asc' or 'desc'")
     if not kinds or not kinds <= _WORKSPACE_BROWSE_KINDS:
@@ -7091,7 +7350,9 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
 
         listing = union_all(*streams).subquery()
         name_order = _workspace_name_order(func.lower(listing.c.name))
-        null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
+        stamp_column = (
+            listing.c.last_opened_at if sort == "opened" else listing.c.updated_at)
+        null_order = case((stamp_column.is_(None), 1), else_=0)
         if sort == "name":
             primary = name_order.asc() if order == "asc" else name_order.desc()
             ordering = [primary, listing.c.kind_rank.asc(), listing.c.row_id.asc()]
@@ -7103,15 +7364,14 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                 if decoded is not None else None
             )
         else:
-            primary = (listing.c.updated_at.asc() if order == "asc"
-                       else listing.c.updated_at.desc())
+            primary = stamp_column.asc() if order == "asc" else stamp_column.desc()
             ordering = [
                 null_order.asc(),
                 primary, name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
             ]
             after = (
                 _workspace_query_updated_after(
-                    listing.c.updated_at, null_order, name_order,
+                    stamp_column, null_order, name_order,
                     listing.c.kind_rank, listing.c.row_id, decoded,
                     descending=order == "desc",
                 )
@@ -7123,6 +7383,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
             listing.c.kind_rank,
             name_order.label("sort_name"),
             listing.c.updated_at,
+            listing.c.last_opened_at,
             listing.c.canvas_version,
         ).order_by(*ordering).limit(limit + 1)
         if after is not None:
@@ -7158,9 +7419,13 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                               and placement.target_id not in live_datasets),
                     canvas_version=row.canvas_version,
                     updated_at=row.updated_at,
+                    last_opened_at=row.last_opened_at,
                 ))
         has_more = len(rows) > limit
         last_row = page_rows[-1] if page_rows else None
+        cursor_stamp = (
+            last_row.last_opened_at if sort == "opened" else last_row.updated_at
+        ) if last_row is not None else None
         next_cursor = (
             _workspace_query_cursor_encode(
                 container_id=container_id,
@@ -7170,7 +7435,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                 name=last_row.sort_name,
                 kind_rank=last_row.kind_rank,
                 row_id=last_row.row_id,
-                updated_at=last_row.updated_at,
+                updated_at=cursor_stamp,
             )
             if has_more and last_row is not None else None
         )
@@ -7291,9 +7556,11 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         page = rows[:limit]
         has_more = len(rows) > limit
         next_cursor = (_workspace_cursor_encode(*page[-1][0]) if has_more and page else None)
+        items = [item for _key, item in page]
+        _workspace_attach_last_opened(uid, items)
         return {
             "container": _workspace_container_resource(s, container),
-            "items": [item for _key, item in page], "nextCursor": next_cursor,
+            "items": items, "nextCursor": next_cursor,
             "hasMore": has_more, "completeness": "page" if has_more else "complete",
         }
 
@@ -7454,6 +7721,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
                 identity=last_row.row_id, updated_at=last_row.updated_at)
             if has_more and last_row is not None else None
         )
+        _workspace_attach_last_opened(uid, items)
         return {
             "items": items,
             "nextCursor": next_cursor,

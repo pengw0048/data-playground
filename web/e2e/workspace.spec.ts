@@ -87,6 +87,92 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     }
   })
 
+  test('tracks personal recently opened order without changing updatedAt', async ({ page }) => {
+    const suffix = Date.now()
+    const firstId = `workspace-recent-a-${suffix}`
+    const secondId = `workspace-recent-b-${suffix}`
+    const firstName = `Recent open A ${suffix}`
+    const secondName = `Recent open B ${suffix}`
+    for (const [id, name] of [[firstId, firstName], [secondId, secondName]] as const) {
+      const created = await page.request.post('/api/canvas', {
+        data: { id, name, version: 1, nodes: [], edges: [] },
+      })
+      expect(created.ok()).toBe(true)
+    }
+
+    try {
+      await page.goto('/#/workspace')
+      await expect(await workspaceResource(page, 'canvas', firstName)).toBeVisible()
+      const before = await page.request.get(
+        '/api/workspace/containers/workspace-local-root?sort=name&order=asc&kind=canvas&limit=100',
+      )
+      expect(before.ok()).toBe(true)
+      const beforeItem = (await before.json()).items.find(
+        (item: { id: string }) => item.id === `canvas:${firstId}`,
+      ) as { updatedAt?: string | null }
+      expect(beforeItem).toBeTruthy()
+
+      // Browser open path records the observation after a successful authorized Canvas fetch.
+      const openFirst = page.waitForResponse((response) => (
+        response.request().method() === 'POST'
+        && response.url().includes('/opened')
+        && response.url().includes(encodeURIComponent(`canvas:${firstId}`))
+        && response.ok()
+      ))
+      await (await workspaceResource(page, 'canvas', firstName)).click()
+      await expect(page).toHaveURL(new RegExp(`/#/canvas/${firstId}$`))
+      await openFirst
+      await page.goBack()
+      await expect(await workspaceResource(page, 'canvas', secondName)).toBeVisible()
+
+      // Keep timestamps distinct beyond coalesce and SQLite second rounding.
+      await page.waitForTimeout(1100)
+      const openSecond = page.waitForResponse((response) => (
+        response.request().method() === 'POST'
+        && response.url().includes('/opened')
+        && response.url().includes(encodeURIComponent(`canvas:${secondId}`))
+        && response.ok()
+      ))
+      await (await workspaceResource(page, 'canvas', secondName)).click()
+      await expect(page).toHaveURL(new RegExp(`/#/canvas/${secondId}$`))
+      await openSecond
+      await page.goBack()
+      await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
+
+      const recorded = await page.request.get('/api/workspace/recent?limit=20')
+      expect(recorded.ok()).toBe(true)
+      const recentIds = (await recorded.json()).items
+        .filter((item: { id: string }) => item.id === `canvas:${firstId}` || item.id === `canvas:${secondId}`)
+        .map((item: { id: string }) => item.id)
+      expect(recentIds).toEqual([`canvas:${secondId}`, `canvas:${firstId}`])
+
+      await Promise.all([
+        page.waitForResponse((response) => response.url().includes('/api/workspace/recent') && response.ok()),
+        page.getByRole('button', { name: 'Recent' }).click(),
+      ])
+      await expect(page.getByRole('navigation', { name: 'Workspace path' })).toContainText('Recent')
+      await expect.poll(async () => page.locator(
+        '[data-testid="workspace-scroll-surface"] button[aria-label^="Open canvas Recent open"]',
+      ).evaluateAll((els) => els.map((el) => el.getAttribute('aria-label')))).toEqual([
+        `Open canvas ${secondName}`,
+        `Open canvas ${firstName}`,
+      ])
+
+      const after = await page.request.get(
+        '/api/workspace/containers/workspace-local-root?sort=opened&order=desc&kind=canvas&limit=100',
+      )
+      expect(after.ok()).toBe(true)
+      const afterItem = (await after.json()).items.find(
+        (item: { id: string }) => item.id === `canvas:${firstId}`,
+      ) as { updatedAt?: string | null; lastOpenedAt?: string | null }
+      expect(afterItem?.lastOpenedAt).toBeTruthy()
+      expect(afterItem?.updatedAt ?? null).toEqual(beforeItem.updatedAt ?? null)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(firstId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(secondId)}`)
+    }
+  })
+
   test('reload makes an agent-created Canvas actionable without a browser refresh', async ({ page }) => {
     const suffix = Date.now()
     const canvasId = `workspace-agent-created-${suffix}`

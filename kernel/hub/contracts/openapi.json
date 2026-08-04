@@ -13169,6 +13169,31 @@
         "title": "WorkspaceMoveCanvasBody",
         "type": "object"
       },
+      "WorkspaceOpenObservation": {
+        "description": "Result of recording one personal successful Workspace open.",
+        "properties": {
+          "coalesced": {
+            "default": false,
+            "title": "Coalesced",
+            "type": "boolean"
+          },
+          "lastOpenedAt": {
+            "format": "date-time",
+            "title": "Lastopenedat",
+            "type": "string"
+          },
+          "resourceId": {
+            "title": "Resourceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resourceId",
+          "lastOpenedAt"
+        ],
+        "title": "WorkspaceOpenObservation",
+        "type": "object"
+      },
       "WorkspaceProviderRelinkRequest": {
         "properties": {
           "mountId": {
@@ -13259,7 +13284,8 @@
             "items": {
               "enum": [
                 "name",
-                "updated"
+                "updated",
+                "opened"
               ],
               "type": "string"
             },
@@ -13428,6 +13454,18 @@
             "default": false,
             "title": "Lastknown",
             "type": "boolean"
+          },
+          "lastOpenedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastopenedat"
           },
           "lastResolvedAt": {
             "anyOf": [
@@ -28951,7 +28989,8 @@
                 {
                   "enum": [
                     "name",
-                    "updated"
+                    "updated",
+                    "opened"
                   ],
                   "type": "string"
                 },
@@ -29993,6 +30032,108 @@
         "summary": "Delete Detached Workspace Dataset"
       }
     },
+    "/api/workspace/recent": {
+      "get": {
+        "description": "Bounded personal Recently opened shelf; reuses the Workspace browse page contract.",
+        "operationId": "browse_workspace_recent_api_workspace_recent_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceBrowsePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Browse Workspace Recent"
+      }
+    },
     "/api/workspace/resources/{resource_id}": {
       "get": {
         "description": "Resolve a stable local/provider reference plus its bounded navigation ancestors.",
@@ -30155,6 +30296,88 @@
           }
         },
         "summary": "Canonical Workspace Provider Dataset"
+      }
+    },
+    "/api/workspace/resources/{resource_id}/opened": {
+      "post": {
+        "description": "Record one successful open after Workspace authorization confirms the resource.\n\nHover, selection, denied, and failed opens must not call this. The observation is personal and\ndoes not mutate resource ``updatedAt``, provider state, Canvas version/CAS, or Jobs history.",
+        "operationId": "record_workspace_opened_api_workspace_resources__resource_id__opened_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "title": "Resource Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceOpenObservation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Record Workspace Opened"
       }
     },
     "/api/workspace/resources/{resource_id}/provider-dataset": {
