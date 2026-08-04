@@ -10,11 +10,29 @@ Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 
 ## Unreleased
 
-Development builds now carry the distinct `0.3.0-dev.0` manifest identity. Installed Python
-artifacts and `/api/version` report its PEP 440-normalized form, `0.3.0.dev0`; this is not a
-published `0.2.3` artifact or a release-support claim.
+## [0.3.0] — 2026-08-03
+
+This release turns the versioned-data and durable-execution foundation into a more coherent
+researcher workflow: browse and organize work in Workspace, build and reopen a Canvas, inspect or
+recover its latest results, and follow runs and publications through Jobs, Inbox, and dataset
+history. The supported profiles remain a local workstation and a trusted-team shared service.
+Remote execution adapters remain optional; this release does not claim that a remote execution
+target is configured or certified on Kiwi.
 
 ### Added
+
+- Workspace now behaves as one file browser for datasets, folders, and Canvases, with list and grid
+  views, paging, sorting where the selected source supports it, multi-select actions, contextual
+  menus, and capability-gated rename, move, copy, and delete actions.
+- Canvas results produced by `0.3.0` survive hub and kernel restarts. The latest result for each
+  executed target node is kept with the Canvas, while workspace defaults and per-Canvas settings can
+  additionally retain a bounded number of recent result versions for a bounded number of days.
+- Jobs default to the current user's work while preserving an explicit workspace-wide view for
+  trusted collaborators and operators. Inbox outcomes remain owner-scoped.
+- Canvas-level execution-target selection is persisted with the Canvas and refuses unavailable or
+  incompatible targets before a run starts.
+- Dataset lineage opens in the dataset context, preserves shareable focus in the URL, links related
+  dataset cards back to their details, and expands field-level evidence when the provider supplies it.
 
 - Field metadata, bounded field-lineage evidence, and typed row references make it possible to
   inspect the provenance of a field without guessing from names or exposing unbounded metadata.
@@ -45,6 +63,28 @@ published `0.2.3` artifact or a release-support claim.
   invalid names are no longer silently sanitized.
 - Managed-sidecar merge work is durable and exact. Researchers choose an exact core-owned base and
   explicit mappings; plugins can produce a sidecar candidate but cannot claim destination authority.
+- Source, Transform, Write, Chart, Jobs, Inbox, Settings, and dataset-detail surfaces use task-first
+  controls and plain user-facing language; diagnostics and implementation identities remain secondary
+  evidence instead of dominating routine work.
+- Chart configuration starts from known input columns and a runnable default aggregation while still
+  allowing an explicit SQL expression; chart results use the full-input execution path rather than a
+  misleading sample preview.
+- The optional `lance` dependency now requires `pylance>=0.38.0` for the native transaction,
+  recovery, and exact-revision statistics contracts used by managed local datasets.
+
+### Metadata and upgrade
+
+- **Alembic history:** `0001_schema_baseline` through `0052_rejected_run_owner` (head), advancing
+  published `0.2.x` workspaces from `0039_folder_replays` through one linear forward chain.
+- Follow [the stopped in-place upgrade runbook](docs/UPGRADING.md): identify and stop every writer,
+  take one consistency backup of metadata, managed bytes, configuration, and credential references,
+  run one `dataplay migrate` with the exact `0.3.0` artifact, and verify the candidate-reported schema
+  head before reopening traffic.
+- Live upgrade, database downgrade, and running a `0.2.x` binary against metadata migrated to `0.3.0`
+  are not supported. Rollback means restoring the complete pre-upgrade consistency set.
+- The `0051_canvas_result_latest` migration creates retention metadata but cannot reconstruct output
+  artifacts from historical `0.2.x` runs. Re-run a Canvas after upgrading to establish its retained
+  current-result projection.
 
 ### Breaking changes
 
@@ -54,6 +94,35 @@ published `0.2.3` artifact or a release-support claim.
 - The MCP catalog surface replaces `list_datasets` with bounded metadata tools: `search_catalog`,
   `get_dataset_context`, `get_relationship_graph`, and `get_dataset_lineage`. Agents must respect
   cursors, availability states, and truncation before treating metadata as complete.
+- MCP clients connecting a Join must now provide `targetHandle: "a" | "b"`; an unqualified Join input
+  is rejected instead of being assigned implicitly.
+- Dataset MCP resource URIs are returned by `search_catalog` and `get_dataset_context`, but are no
+  longer enumerated by `resources/list`, whose protocol response has no continuation field.
+
+### Known limitations
+
+- The supported deployment boundary remains a trusted workspace, not mutually distrusting tenants.
+  User code, installed plugins, workers, and operators are trusted with that workspace.
+- The bundled local execution targets are the only targets certified for the Kiwi demo deployment.
+  Pod, Ray Jobs, MultiKueue, and LAX execution require separately registered runners, data transport,
+  admission, cancellation, and operator-link validation before the UI may offer them as available.
+- External catalog discovery does not imply provider write-back. Provider sorting, mutation, exact
+  reopen, lineage, and media behavior are exposed only when that provider reports the capability.
+- Repository Compose, Kubernetes, KubeRay, and deployment examples are validation references, not
+  production manifests. Supported browser use remains desktop-first.
+- Wheel and image publication targets GitHub Releases and GHCR, not PyPI.
+
+### Verify the published release
+
+```bash
+# After downloading all assets from the GitHub Release:
+sha256sum -c SHA256SUMS
+
+gh attestation verify ./data_playground-0.3.0-py3-none-any.whl \
+  --repo pengw0048/data-playground
+gh attestation verify oci://ghcr.io/pengw0048/data-playground:0.3.0 \
+  --repo pengw0048/data-playground
+```
 
 ## [0.2.3] — 2026-07-22
 

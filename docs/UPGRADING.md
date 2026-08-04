@@ -147,9 +147,8 @@ printf '%s\n' "$CANDIDATE_SCHEMA" | tee "$BACKUP/candidate-expected-schema.txt"
 Probe diagnostics are retained separately in `candidate-probe.stderr.log`, so the two value files
 remain single-value comparison inputs. A failed probe exits before either migration or startup.
 
-The current development manifests use `0.3.0-dev.0`. Python package metadata and `/api/version`
-normalize that identity to `0.3.0.dev0`; use the installed candidate's recorded value, not a
-hand-written version string, for every verification below.
+The `v0.3.0` release uses the exact clean `0.3.0` package identity. Use the installed
+candidate's recorded value, not a hand-written version string, for every verification below.
 
 Run the one-shot migration with the candidate. Use the block for the deployment's metadata profile.
 
@@ -198,6 +197,11 @@ DP_GIT_SHA="$CANDIDATE_SHA" \
 5. Managed revision identities and history are retained; exact old revisions reopen with the
    same content, including the revision restored as a new head before the upgrade.
 6. Run history, Jobs, Inbox outcomes, Cred references, and plugin settings are retained.
+
+The migration retains historical run records, but it cannot reconstruct result artifacts that a
+`0.2.x` workspace did not already own. Re-run each Canvas whose latest output should be available
+after restart; the successful `0.3.0` run establishes that Canvas's retained current-result
+projection and applies its configured result-history policy.
 
 Only unblock users after these checks succeed. Save the target `/api/version`, schema, and
 verification output with the backup record.
