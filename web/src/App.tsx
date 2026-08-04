@@ -20,6 +20,7 @@ import { ErrorBoundary } from './ui/ErrorBoundary'
 import { useCollapsibleRegion } from './layoutPreferences'
 import { confirmedLocalMode, rememberAuthMode } from './localIdentity'
 import { HubLiveness } from './HubLiveness'
+import { useDocumentTitle } from './useDocumentTitle'
 
 type AuthState =
   | { kind: 'checking' }
@@ -121,12 +122,21 @@ export default function App() {
     }
   }, [view])
 
+  const route = parseHash()
+  const switchedToShellRoute = location.hash !== initialHash.current && route.view !== 'canvas'
+  const awaitingDestination = !destinationReady
+    && !(route.view === 'canvas' && route.canvasId)
+    && !switchedToShellRoute
+  const titlePhase = auth.kind === 'checking' || auth.kind === 'unavailable' ? auth.kind
+    : auth.kind === 'login' ? 'login'
+    : awaitingDestination ? 'bootstrapping'
+    : 'ready'
+  useDocumentTitle(titlePhase)
+
   if (auth.kind === 'checking') return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
   if (auth.kind === 'unavailable') return <AuthBootstrapUnavailable state={auth} onRetry={() => void checkAuth()} />
   if (auth.kind === 'login') return <Login onLoggedIn={(userId) => setAuth({ kind: 'authenticated', userId })} />
-  const route = parseHash()
-  const switchedToShellRoute = location.hash !== initialHash.current && route.view !== 'canvas'
-  if (!destinationReady && !(route.view === 'canvas' && route.canvasId) && !switchedToShellRoute) {
+  if (awaitingDestination) {
     // A bare or shell URL has no Canvas identity to render while bootstrap decides its destination.
     // Keep this frame visually neutral; otherwise the empty initial document looks like real work
     // with failed access before Workspace or another shell route replaces it.
