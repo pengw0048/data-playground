@@ -4885,8 +4885,10 @@ def recover_canvas_results(
                 break
             identities.append(identity)
         if not valid:
-            affected = {node.id for node in graph_mod.upstream_chain(req.graph, target_id)}
-            (unknown if availability_unknown else stale).update(affected)
+            # A retained target proves only that target's own saved output. Its upstream steps may
+            # have been fused into the run without producing independently reopenable artifacts.
+            # Do not turn a missing target artifact into stale badges for those intermediates.
+            (unknown if availability_unknown else stale).add(target_id)
             continue
         terminal_is_result = (
             projection.get("terminal_status") == "done"
@@ -4900,16 +4902,12 @@ def recover_canvas_results(
         if terminal_is_result or not terminal_matches_result_plan:
             # A later attempt for another plan does not invalidate the exact result that was just
             # proved current for this graph (for example, the user reverted an unsuccessful edit).
-            latest.update(node.id for node in graph_mod.upstream_chain(req.graph, target_id))
+            latest.add(target_id)
             results.extend(identities)
         elif projection.get("terminal_status") == "failed":
             # Same execution manifest means the failed attempt targeted the exact plan whose prior
             # result remains retained. Keep failure visible without discarding that successful data.
             failed.add(target_id)
-            latest.update(
-                node.id for node in graph_mod.upstream_chain(req.graph, target_id)
-                if node.id != target_id
-            )
             results.extend(identities)
         else:
             stale.add(target_id)

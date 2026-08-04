@@ -67,10 +67,11 @@ export const wire: Record<WireType, { color: string; shape: 'dot' | 'ring' | 'sq
 }
 
 export type StatusKey =
-  | 'draft' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed' | 'done'
+  | 'draft' | 'idle' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed' | 'done'
 
 export const status: Record<StatusKey, { color: string; glyph: string; label: string }> = {
   draft: { color: color.draft, glyph: '○', label: 'draft' },
+  idle: { color: color.draft, glyph: '', label: 'no saved result' },
   checking: { color: color.checking, glyph: '…', label: 'checking' },
   latest: { color: color.latest, glyph: '✓', label: 'latest' },
   stale: { color: color.stale, glyph: '▲', label: 'stale' },
@@ -85,6 +86,7 @@ export const status: Record<StatusKey, { color: string; glyph: string; label: st
 // WCAG AA as text on the light chip surface.
 export const statusText: Record<StatusKey, string> = {
   draft: 'var(--status-draft)',
+  idle: 'var(--status-draft)',
   checking: 'var(--status-queued)',
   latest: 'var(--status-latest)',
   stale: 'var(--status-stale)',

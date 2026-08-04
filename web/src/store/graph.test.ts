@@ -665,7 +665,7 @@ describe('graph store — core authority ops', () => {
       'checking', 'checking', 'draft', 'checking', 'stale', 'checking',
     ])
     await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
-      'stale', 'stale', 'draft', 'stale', 'stale', 'stale',
+      'idle', 'idle', 'draft', 'idle', 'stale', 'idle',
     ]))
     // The returned snapshot is not mutated; the same boundary can safely receive it from restore.
     expect(snapshot.nodes.map((node) => node.data.status)).toEqual([
@@ -677,9 +677,70 @@ describe('graph store — core authority ops', () => {
       'checking', 'checking', 'draft', 'checking', 'stale', 'checking',
     ])
     await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
-      'stale', 'stale', 'draft', 'stale', 'stale', 'stale',
+      'idle', 'idle', 'draft', 'idle', 'stale', 'idle',
     ]))
     await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not spread a saved sink result check across fused upstream steps', async () => {
+    const snapshot = {
+      id: 'c', version: 1, name: 'fused result', requirements: [], nodes: [
+        { ...NODE('source'), data: { ...NODE('source').data, status: 'latest' as const } },
+        { ...NODE('aggregate', 'aggregate'), data: {
+          ...NODE('aggregate', 'aggregate').data, status: 'latest' as const,
+        } },
+        { ...NODE('chart', 'chart'), data: { ...NODE('chart', 'chart').data, status: 'latest' as const } },
+      ],
+      edges: [
+        { id: 'source-aggregate', source: 'source', target: 'aggregate' },
+        { id: 'aggregate-chart', source: 'aggregate', target: 'chart' },
+      ],
+    }
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [],
+      results: [{
+        runId: 'chart-run', executionManifestSha256: 'a'.repeat(64), parameterBindings: [],
+        output: {
+          nodeId: 'chart', portId: 'out', wire: 'dataset', publicationKind: 'result',
+          outcome: 'committed', uri: '/results/chart.parquet',
+        },
+      }],
+    })
+
+    useStore.getState().loadDoc(snapshot, 'owner')
+
+    await vi.waitFor(() => expect(
+      useStore.getState().doc.nodes.map((node) => [node.id, node.data.status]),
+    ).toEqual([
+      ['source', 'idle'],
+      ['aggregate', 'idle'],
+      ['chart', 'latest'],
+    ]))
+  })
+
+  it('does not keep a check after execution when the target has no saved result', async () => {
+    const target = NODE('target')
+    const running = {
+      runId: 'ephemeral-target', status: 'running', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    }
+    apiMocks.run.mockResolvedValueOnce(running)
+    apiMocks.runStatus.mockResolvedValueOnce({
+      ...running, status: 'done', rowsProcessed: 10, totalRows: 10, ms: 5,
+      perNode: [{ nodeId: 'target', status: 'done' }],
+      outputs: [{
+        nodeId: 'target', portId: 'out', wire: 'dataset', publicationKind: 'result',
+        outcome: 'committed', uri: '/ephemeral/target.parquet', rows: 10,
+      }],
+    })
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [target], edges: [] },
+    })
+
+    await useStore.getState().run('target')
+
+    await vi.waitFor(() => expect(useStore.getState().runs.target.phase).toBe('done'))
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('idle'))
   })
 
   it('rechecks an unknown persisted badge and preserves uncertainty after a transient storage check', async () => {
@@ -1581,6 +1642,9 @@ describe('graph store — core authority ops', () => {
         { ...running.outputs[1], outcome: 'committed', uri: '/outputs/right.parquet', rows: 6 },
       ],
     })
+    apiMocks.currentResults.mockResolvedValue({
+      latestNodeIds: ['section'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
 
     await useStore.getState().requestRun('section')
     expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'section')
@@ -1770,8 +1834,11 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: 'c' }), undefined, false, expect.any(String),
     )
     expect(apiMocks.estimate).not.toHaveBeenCalled()
-    // the single pass reports every step, so each executed node ends with its own result readout
-    expect(useStore.getState().doc.nodes.every((node) => node.data.status === 'latest')).toBe(true)
+    // Per-step completion is not a saved result. With no retained outputs in this fixture, no card
+    // may claim a reopenable current result after the terminal inventory check.
+    await vi.waitFor(() => expect(
+      useStore.getState().doc.nodes.every((node) => node.data.status === 'idle'),
+    ).toBe(true))
     expect(useStore.getState().doc.nodes.filter((node) => node.data.lastRun)).toHaveLength(9)
     expect(useStore.getState().toasts).toHaveLength(0)
   })
@@ -2079,7 +2146,7 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: doc.id }), 'target', 50, 0, undefined,
     )
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
-    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'idle'])
 
     useStore.getState().loadDoc(doc, 'owner')
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
@@ -2246,6 +2313,9 @@ describe('graph store — core authority ops', () => {
           outcome: 'committed', uri: '/outputs/out.parquet', rows: 299,
         },
       ],
+    })
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['target'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
     })
     useStore.setState({ doc })
 
