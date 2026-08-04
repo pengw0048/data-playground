@@ -56,7 +56,7 @@ export function EntityNode({ data }: { data: EntityData }) {
           : `Focus graph on ${table.name}`}
         title={lineage ? undefined : 'Focus the graph on this table'}
         className={cn(
-          'nodrag flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left hover:bg-accent disabled:cursor-wait',
+          'entity-drag-handle flex w-full min-w-0 cursor-grab items-center gap-2 px-3 py-2.5 text-left hover:bg-accent active:cursor-grabbing disabled:cursor-wait',
           expanded && fields.length > 0 && 'border-b border-border',
         )}>
         <span className={cn(
@@ -70,7 +70,8 @@ export function EntityNode({ data }: { data: EntityData }) {
           </span>
         </span>
       </button>
-      {expanded && fields.length > 0 && <div className="flex max-h-[144px] flex-col overflow-x-hidden overflow-y-auto py-1">
+      {expanded && fields.length > 0 && <div data-testid="er-entity-fields"
+        className="nodrag nowheel flex max-h-[144px] flex-col overflow-x-hidden overflow-y-auto overscroll-contain py-1">
         {fields.map((field) => <div key={field.name} className="relative flex min-h-6 items-center gap-1.5 px-3 py-0.5 text-left text-[11px]">
           <Handle id={`column-in:${field.name}`} type="target" position={Position.Left}
             className="!h-1.5 !w-1.5 !border-0 !bg-primary" />
@@ -180,6 +181,12 @@ function loadPositions(): Record<string, { x: number; y: number }> {
 }
 function savePositions(p: Record<string, { x: number; y: number }>): void {
   try { localStorage.setItem(_POS_KEY, JSON.stringify(p)) } catch { /* storage full / disabled — layout just won't persist */ }
+}
+
+function storedPositionKey(mode: 'joins' | 'lineage', id: string): string {
+  // Relationship and lineage layouts answer different questions. Keep their manual arrangements
+  // independent so dragging a lineage card never scrambles the same table in the ER view.
+  return mode === 'lineage' ? `lineage:${id}` : id
 }
 
 function keyColsLower(t: CatalogTable): string[] {
@@ -343,13 +350,13 @@ function relationshipFields(
   // an existing Map entry changes the role without moving that field out of its endpoint-first slot.
   for (const key of table.keys ?? []) for (const column of key.columns) {
     if (key.confidence === 'declared') roles.set(column, 'PK')
+    else if (!roles.has(column)) roles.set(column, 'KEY')
   }
   for (const column of table.columns) {
-    if (roles.size >= 6) break
-    if (!roles.has(column.name)) roles.set(column.name, 'field')
+    if (column.capabilities?.includes('key') && !roles.has(column.name)) roles.set(column.name, 'KEY')
   }
   const byName = new Map(table.columns.map((column) => [column.name, column]))
-  return [...roles].slice(0, 6).map(([name, role]) => ({
+  return [...roles].slice(0, 64).map(([name, role]) => ({
     name,
     role,
     column: byName.get(name),
@@ -367,13 +374,13 @@ function lineageFields(
   }
   for (const key of table.keys ?? []) for (const column of key.columns) {
     if (key.confidence === 'declared') roles.set(column, 'PK')
+    else if (!roles.has(column)) roles.set(column, 'KEY')
   }
   for (const column of table.columns) {
-    if (roles.size >= 6) break
-    if (!roles.has(column.name)) roles.set(column.name, 'field')
+    if (column.capabilities?.includes('key') && !roles.has(column.name)) roles.set(column.name, 'KEY')
   }
   const byName = new Map(table.columns.map((column) => [column.name, column]))
-  return [...roles].slice(0, 6).map(([name, role]) => ({
+  return [...roles].slice(0, 64).map(([name, role]) => ({
     name,
     role,
     column: byName.get(name),
@@ -659,8 +666,10 @@ export function ERDiagram() {
   }, [erReturn, openingNode, pushToast, returnFromRelationships, setWorkspaceResource, visibleFocus])
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
+    dragHandle: '.entity-drag-handle',
     position: mode === 'lineage'
-      ? lineagePositions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 180 }
+      ? positions[storedPositionKey(mode, t.id)]
+        ?? lineagePositions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 180 }
       : positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
     data: {
       table: t,
@@ -769,11 +778,13 @@ export function ERDiagram() {
     setPositions((p) => {
       if (!changes.some((ch) => ch.type === 'position' && ch.position)) return p
       const next = { ...p }
-      for (const ch of changes) if (ch.type === 'position' && ch.position) next[ch.id] = ch.position
+      for (const ch of changes) if (ch.type === 'position' && ch.position) {
+        next[storedPositionKey(mode, ch.id)] = ch.position
+      }
       savePositions(next)
       return next
     })
-  }, [])
+  }, [mode])
 
   const hasFocusedRoute = !!focus || !!erFocusDatasetId
   const capped = !hasFocusedRoute && total > visible.length
@@ -914,11 +925,11 @@ export function ERDiagram() {
       )}
 
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes}
-        onNodesChange={mode === 'joins' ? onNodesChange : undefined}
+        onNodesChange={onNodesChange}
         onConnect={mode === 'joins' ? onConnect : undefined}
         onEdgeClick={mode === 'joins' ? onEdgeClick : undefined}
         onMove={(_event, viewport) => updateExpandedEntities(viewport.zoom)}
-        nodesDraggable={mode === 'joins'} nodesConnectable={mode === 'joins'}
+        nodesDraggable nodesConnectable={mode === 'joins'}
         minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />

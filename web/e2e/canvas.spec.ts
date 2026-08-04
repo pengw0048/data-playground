@@ -2078,6 +2078,7 @@ test.describe('Data Playground canvas', () => {
     } })
     expect(created.ok()).toBe(true)
     await page.goto(`/#/canvas/${lineageCanvasId}`)
+    await page.evaluate(() => localStorage.removeItem('dp-er-positions'))
     const writeCard = page.locator('.react-flow__node[data-id="write"]')
     await writeCard.locator('[title="Click (when selected) or double-click to rename"]').click()
     const publication = page.getByTestId('inspector').getByLabel('Write publication')
@@ -2099,6 +2100,31 @@ test.describe('Data Playground canvas', () => {
       await zoomIn.click()
     }
     await expect(eventField).toBeVisible({ timeout: 10_000 })
+    const focusedEntity = entities.filter({ hasText: 'events' }).first()
+    await expect(focusedEntity.getByText('event', { exact: true })).toHaveCount(0)
+
+    // Lineage cards expose only identity/relationship columns, and their title is a real drag
+    // handle. A deliberate drag must arrange the graph without activating Dataset navigation;
+    // the manually chosen position then survives reopening the same shareable route.
+    const focusedNodeId = await focusedEntity.getAttribute('data-id')
+    expect(focusedNodeId).toBeTruthy()
+    const dragHandle = focusedEntity.getByRole('button', { name: 'Back to dataset events' })
+    const beforeDrag = await boxOf(focusedEntity)
+    const handleBox = await boxOf(dragHandle)
+    const lineageUrl = page.url()
+    await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(handleBox.x + handleBox.width / 2 + 80, handleBox.y + handleBox.height / 2 + 60, { steps: 12 })
+    await page.mouse.up()
+    await expect(page).toHaveURL(lineageUrl)
+    await expect.poll(async () => (await boxOf(focusedEntity)).x - beforeDrag.x).toBeGreaterThan(40)
+    const savedLineagePosition = await page.evaluate((nodeId) => {
+      const positions = JSON.parse(localStorage.getItem('dp-er-positions') || '{}') as Record<string, { x: number; y: number }>
+      return positions[`lineage:${nodeId}`]
+    }, focusedNodeId!)
+    expect(savedLineagePosition).toEqual(expect.objectContaining({
+      x: expect.any(Number), y: expect.any(Number),
+    }))
 
     const focusedHash = new URL(page.url()).hash
     await page.reload()
@@ -2110,6 +2136,18 @@ test.describe('Data Playground canvas', () => {
       await zoomIn.click()
     }
     await expect(eventField).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => page.evaluate((nodeId) => {
+      const positions = JSON.parse(localStorage.getItem('dp-er-positions') || '{}') as Record<string, { x: number; y: number }>
+      return positions[`lineage:${nodeId}`]
+    }, focusedNodeId!)).toEqual(savedLineagePosition)
+    await expect.poll(async () => focusedEntity.evaluate((element, expected) => {
+      const match = /translate\(([-\d.]+)px,\s*([-\d.]+)px\)/.exec(element.style.transform)
+      if (!match) return Number.POSITIVE_INFINITY
+      return Math.max(
+        Math.abs(Number(match[1]) - expected.x),
+        Math.abs(Number(match[2]) - expected.y),
+      )
+    }, savedLineagePosition!)).toBeLessThan(0.001)
 
     // Lineage is navigation, not a static poster: opening a neighbouring card lands on that
     // dataset's normal detail page, and browser Back restores the graph and its route context.

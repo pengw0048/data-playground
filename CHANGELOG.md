@@ -10,6 +10,18 @@ Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 
 ## Unreleased
 
+### Added
+
+- A deterministic demo provisioner creates three related synthetic video-research datasets and
+  three runnable Canvases covering curation, model evaluation, and vector-similarity review
+  workflows.
+
+### Changed
+
+- Relationship and lineage cards show only mapped, declared, or inferred key columns instead of
+  filling wide tables with arbitrary schema fields. Long key lists scroll inside the card, and
+  researchers can drag lineage cards into a useful arrangement that persists when they reopen it.
+
 ## [0.3.1] — 2026-08-03
 
 This release turns the versioned-data and durable-execution foundation into a more coherent
