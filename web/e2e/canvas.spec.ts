@@ -668,7 +668,7 @@ test.describe('Data Playground canvas', () => {
     const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
     const search = locator.getByRole('textbox', { name: 'Search existing nodes' })
     await search.fill('duplicate-off-screen')
-    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('stale · disabled')
+    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('no saved result · disabled')
     await search.press('Enter')
 
     await expect(locator).toBeHidden()
