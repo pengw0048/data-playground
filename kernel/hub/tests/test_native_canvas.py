@@ -203,6 +203,7 @@ def test_import_warns_for_missing_data_creates_once_and_replays_after_response_l
             assert unconfirmed.status_code == 409
             created = client.post("/api/canvas/native-import", json={**payload, "validationDigest": digest, "confirmWarnings": True}, headers={"X-DP-User": OWNER})
             assert created.status_code == 200 and created.json()["created"] is True
+            assert created.json()["id"] == payload["importId"]
             replayed = client.post("/api/canvas/native-import", json={**payload, "validationDigest": digest, "confirmWarnings": True}, headers={"X-DP-User": OWNER})
             assert replayed.status_code == 200
             assert replayed.json() == {"ok": True, "id": created.json()["id"], "created": False, "replayed": True}
@@ -213,6 +214,47 @@ def test_import_warns_for_missing_data_creates_once_and_replays_after_response_l
     finally:
         metadb.delete_canvas_cascade(source_id)
         metadb.delete_canvas_cascade(native_canvas.import_canvas_id(OWNER, "018f5d64-bce4-7f1b-9b9f-5035482e2ed3"))
+
+
+def test_import_replays_pre_file_key_identity_without_creating_a_second_canvas():
+    import_id = "018f5d64-bce4-7f1b-9b9f-5035482e2ed4"
+    legacy_id = native_canvas.legacy_import_canvas_id(OWNER, import_id)
+    envelope = native_canvas.export_envelope(_doc("native-legacy-replay"), get_deps())
+    payload = {
+        "filename": "legacy-replay.dp-canvas.json", "importId": import_id,
+        "envelope": envelope,
+    }
+    parsed = native_canvas.parse_envelope(envelope, filename=payload["filename"])
+    legacy_doc = {**parsed["canvas"], "id": legacy_id, "version": 1}
+    metadb.delete_canvas_cascade(legacy_id)
+    metadb.delete_canvas_cascade(import_id)
+    try:
+        assert metadb.import_native_canvas(
+            uid=OWNER, canvas_id=legacy_id, doc=legacy_doc,
+            intent_digest=native_canvas.import_intent_digest(parsed),
+        ) is True
+        with TestClient(app) as client:
+            checked = client.post(
+                "/api/canvas/native-import/validate", json=payload,
+                headers={"X-DP-User": OWNER},
+            )
+            replayed = client.post(
+                "/api/canvas/native-import",
+                json={
+                    **payload, "validationDigest": checked.json()["validationDigest"],
+                    "confirmWarnings": True,
+                },
+                headers={"X-DP-User": OWNER},
+            )
+        assert replayed.status_code == 200
+        assert replayed.json() == {
+            "ok": True, "id": legacy_id, "created": False, "replayed": True,
+        }
+        with metadb.session() as session:
+            assert session.get(metadb.Canvas, import_id) is None
+    finally:
+        metadb.delete_canvas_cascade(legacy_id)
+        metadb.delete_canvas_cascade(import_id)
 
 
 def test_validation_rejects_filename_mismatch_missing_node_and_secret_bearing_export():

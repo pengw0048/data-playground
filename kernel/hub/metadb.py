@@ -3634,9 +3634,8 @@ def _workspace_ensure_root_placement_in_session(
     )
 
 
-def import_native_canvas(
-        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool:
-    """Insert one exact native import or verify an equivalent concurrent/retry winner."""
+def _native_canvas_import_values(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> tuple[dict, dict]:
     if re.fullmatch(r"[0-9a-f]{64}", str(intent_digest)) is None:
         raise ValueError("native Canvas intent digest is invalid")
     stored_doc = {
@@ -3650,6 +3649,35 @@ def import_native_canvas(
         "name": str(doc.get("name") or "untitled"), "version": 1,
         "doc": canonical_doc,
     }
+    return stored_doc, values
+
+
+def native_canvas_import_replay(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool | None:
+    """Return an exact import replay without creating a missing row."""
+    stored_doc, values = _native_canvas_import_values(
+        uid=uid, canvas_id=canvas_id, doc=doc, intent_digest=intent_digest)
+    with session() as s:
+        existing = s.get(Canvas, str(canvas_id))
+        if existing is None:
+            return None
+        try:
+            existing_doc = json.loads(existing.doc)
+        except (TypeError, ValueError) as exc:
+            raise NativeCanvasImportConflict(
+                "native Canvas import id is already bound to invalid content") from exc
+        if (existing.owner_id != str(uid) or existing.version != 1
+                or existing.name != values["name"] or existing_doc != stored_doc):
+            raise NativeCanvasImportConflict(
+                "native Canvas import id is already bound to different import intent")
+        return True
+
+
+def import_native_canvas(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool:
+    """Insert one exact native import or verify an equivalent concurrent/retry winner."""
+    stored_doc, values = _native_canvas_import_values(
+        uid=uid, canvas_id=canvas_id, doc=doc, intent_digest=intent_digest)
     with session() as s:
         dialect = s.get_bind().dialect.name
         if dialect == "postgresql":
