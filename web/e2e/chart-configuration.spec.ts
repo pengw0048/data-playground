@@ -57,7 +57,7 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await page.getByRole('button', { name: 'Close' }).click()
 
     await chart.getByLabel('Summary').selectOption('sum')
-    await expect(chart.getByRole('combobox', { name: 'Y column' })).toHaveValue('amount')
+    await expect(chart.getByRole('combobox', { name: 'Y column', exact: true })).toHaveValue('amount')
 
     await chart.getByRole('button', { name: 'Use SQL expression for X' }).click()
     const xExpression = chart.getByRole('textbox', { name: 'X SQL expression' })
@@ -225,6 +225,22 @@ test('Chart Series / Color by aggregates, legends, and keeps chartType presentat
     await expect(page.getByRole('img', { name: /line chart, saved result.*series/i })).toBeVisible()
     await expect(chart.locator('[title="latest"]')).toBeVisible()
     expect(runPosts).toEqual([])
+
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      const graph = await response.json() as {
+        nodes: Array<{ id: string; data: { config: Record<string, unknown> } }>
+      }
+      return graph.nodes.find((item) => item.id === 'chart')?.data.config.chartType
+    }).toBe('line')
+    const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}/runs`)
+    const history = await historyResponse.json() as Array<{ runId?: string; outputs: Array<{ nodeId: string; portId: string }> }>
+    const chartRun = history.find((item) => item.runId && item.outputs.some((output) => output.nodeId === 'chart'))
+    expect(chartRun?.runId).toBeTruthy()
+    await page.goto(`/#/jobs?run=${encodeURIComponent(chartRun!.runId!)}&output=${encodeURIComponent('chart:out')}`)
+    await expect(page.getByRole('complementary', { name: 'Saved result' })).toBeVisible()
+    await expect(page.getByRole('img', { name: /line chart, saved result.*series/i })).toBeVisible()
+    await expect(page.getByRole('list', { name: 'Chart series legend' })).toBeVisible()
   } finally {
     await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
   }

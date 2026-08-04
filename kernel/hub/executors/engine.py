@@ -2171,13 +2171,22 @@ def _agg_name(agg: str) -> str:
 CHART_SERIES_LIMIT = 12
 CHART_SERIES_OTHER = "Other"
 CHART_SERIES_BLANK = "(blank)"
+CHART_SERIES_LITERAL_PREFIX = "Value: "
 
 
 def _chart_series_relation(view_name: str, *, xq: str, yq: str | None, sq: str, agg: str) -> Relation:
     blank = _sql_str(CHART_SERIES_BLANK)
     other = _sql_str(CHART_SERIES_OTHER)
+    literal_prefix = _sql_str(CHART_SERIES_LITERAL_PREFIX)
+    series_text = f"TRIM(CAST(({sq}) AS VARCHAR))"
+    # Reserve the two synthetic labels without silently merging real category values into them.
+    # Prefixing every source value that already starts with the escape prefix keeps this encoding
+    # injective (for example, `Other` -> `Value: Other`, while `Value: Other` gains another prefix).
     series_raw = (
-        f"COALESCE(NULLIF(TRIM(CAST(({sq}) AS VARCHAR)), ''), '{blank}')"
+        f"CASE WHEN {series_text} IS NULL OR {series_text} = '' THEN '{blank}' "
+        f"WHEN {series_text} IN ('{blank}', '{other}') "
+        f"OR starts_with({series_text}, '{literal_prefix}') "
+        f"THEN '{literal_prefix}' || {series_text} ELSE {series_text} END"
     )
     if agg == "count" or not yq:
         base_select = f"SELECT ({xq}) AS x, {series_raw} AS series_raw FROM {quote_identifier(view_name)}"

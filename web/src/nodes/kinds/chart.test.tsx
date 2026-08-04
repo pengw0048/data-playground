@@ -11,6 +11,7 @@ import {
 const columns: ColumnSchema[] = [
   { name: 'id', type: 'int64', capabilities: [] },
   { name: 'event', type: 'string', capabilities: [] },
+  { name: 'owner_id', type: 'string', capabilities: [] },
   { name: 'user_id', type: 'int64', capabilities: [] },
   { name: 'amount', type: 'float64', capabilities: [] },
   { name: 'created_at', type: 'timestamp[us]', capabilities: [] },
@@ -25,13 +26,13 @@ describe('Chart schema recommendations', () => {
 
   it('offers scalar input fields while keeping Y choices numeric', () => {
     expect(chartableColumns(columns).map((column) => column.name)).toEqual([
-      'id', 'event', 'user_id', 'amount', 'created_at',
+      'id', 'event', 'owner_id', 'user_id', 'amount', 'created_at',
     ])
     expect(numericChartColumns(columns).map((column) => column.name)).toEqual([
       'id', 'user_id', 'amount',
     ])
-    expect(seriesChartColumns(columns).map((column) => column.name)).toEqual(['event'])
-    expect(seriesChartColumns(columns, 'event')).toEqual([])
+    expect(seriesChartColumns(columns).map((column) => column.name)).toEqual(['event', 'owner_id'])
+    expect(seriesChartColumns(columns, 'event').map((column) => column.name)).toEqual(['owner_id'])
   })
 
   it('falls back through time and scalar fields for unfamiliar schemas', () => {

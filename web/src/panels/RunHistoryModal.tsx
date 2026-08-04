@@ -10,6 +10,7 @@ import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
 import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
 import { CanvasCopyModal, type CanvasCopySource } from './CanvasCopyModal'
+import { useRunArtifactPresentation } from '../lib/artifactPresentation'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
@@ -89,7 +90,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
                   {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
-                    <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
+                    <HistoryOutputs canvasId={canvasId} historyId={r.id} runId={r.runId ?? undefined}
                       outputs={r.outputs} openKey={resultOpen}
                       onToggle={(key) => setResultOpen(resultOpen === key ? null : key)} />
                   )}
@@ -237,13 +238,19 @@ function historyOutputKey(runId: string, output: RunOutput): string {
   return JSON.stringify([runId, output.nodeId, output.portId])
 }
 
-function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
+function HistoryOutputs({ canvasId, historyId, runId, outputs, openKey, onToggle }: {
+  canvasId: string
   historyId: string
   runId?: string
   outputs: RunOutput[]
   openKey: string | null
   onToggle: (key: string) => void
 }) {
+  const openedOutput = outputs.find((output) => historyOutputKey(historyId, output) === openKey)
+  const presentation = useRunArtifactPresentation(
+    canvasId, historyId, openedOutput?.nodeId,
+    openedOutput?.outcome === 'committed' && !!openedOutput.uri,
+  )
   return (
     <div aria-label={`Outputs for run ${historyId}`} className="border-t border-border bg-muted/20">
       {outputs.map((output) => {
@@ -286,7 +293,7 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
                   total={output.publicationKind === 'result' ? output.rows ?? null : null}
                   runId={runId} nodeId={output.nodeId} portId={output.portId}
                   publicationKind={output.publicationKind}
-                  name={`${output.nodeId}-${label}`} />
+                  name={`${output.nodeId}-${label}`} presentation={presentation} />
               </div>
             )}
           </div>

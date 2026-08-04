@@ -24,6 +24,7 @@ import type {
 import {
   chartSeriesColor, chartSeriesLabel, orderChartSeriesLabels, summarizeChartSeries,
 } from '../lib/chartSeries'
+import type { ArtifactPresentation } from '../lib/artifactPresentation'
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
@@ -1210,7 +1211,7 @@ function ChartView({
     ? `, ${seriesSummary}${seriesLabel ? ` by ${seriesLabel}` : ''}`
     : ''
   const colorFor = (label: string | undefined) => (
-    label == null ? 'hsl(var(--primary))' : chartSeriesColor(label, seriesOrder)
+    label == null ? 'hsl(var(--primary))' : chartSeriesColor(label)
   )
   const tip = (xValue: unknown, yValue: number, series?: string) => (
     series
@@ -1294,8 +1295,13 @@ function ChartView({
   const xCategories = [...new Map(pts.map((point) => [String(point.x), point.x])).entries()]
     .map(([, value]) => value)
   const byXSeries = new Map<string, number>()
+  const seriesStats = new Map<string, { points: number; total: number }>()
   for (const point of pts) {
     byXSeries.set(`${String(point.x)}\u0000${point.series ?? ''}`, point.y)
+    if (point.series != null) {
+      const current = seriesStats.get(point.series) ?? { points: 0, total: 0 }
+      seriesStats.set(point.series, { points: current.points + 1, total: current.total + point.y })
+    }
   }
   const W = 640, H = 360, padL = 48, padR = 16, padT = 16, padB = 72
   const plotW = W - padL - padR, plotH = H - padT - padB
@@ -1318,9 +1324,7 @@ function ChartView({
     const start = padL + categoryIndex * bandW + clusterGap / 2
     return start + seriesIndex * barSlot + (barSlot - barW) / 2
   }
-  const pointX = (categoryIndex: number) => (
-    categoryCount === 1 ? padL + plotW / 2 : padL + (categoryIndex / (categoryCount - 1)) * plotW
-  )
+  const pointX = (categoryIndex: number) => categoryCenter(categoryIndex)
   const tickIdx = Array.from(new Set([0, ...Array.from(
     { length: Math.min(8, categoryCount) },
     (_, k) => Math.round(k * (categoryCount - 1) / Math.max(1, Math.min(8, categoryCount) - 1)),
@@ -1400,10 +1404,14 @@ function ChartView({
       </svg>
       <ul className="mt-1 flex flex-wrap justify-center gap-x-3 gap-y-1" aria-label="Chart series legend">
         {seriesOrder.map((series) => (
-          <li key={series} className="flex max-w-[9.5rem] items-center gap-1.5 text-[10.5px] text-muted-foreground"
-            title={series} aria-label={series}>
+          <li key={series} className="flex max-w-[13rem] items-center gap-1.5 text-[10.5px] text-muted-foreground"
+            title={`${series}: ${seriesStats.get(series)?.points ?? 0} visible ${unit}s; visible total ${fmt(seriesStats.get(series)?.total ?? 0)}`}
+            aria-label={`${series}, ${seriesStats.get(series)?.points ?? 0} visible ${unit}s, visible total ${fmt(seriesStats.get(series)?.total ?? 0)}`}>
             <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ background: colorFor(series) }} />
             <span className="truncate font-medium text-foreground">{series}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground">
+              {seriesStats.get(series)?.points ?? 0} · Σ {fmt(seriesStats.get(series)?.total ?? 0)}
+            </span>
           </li>
         ))}
       </ul>
@@ -1513,10 +1521,6 @@ function UserCodeFailure({
 
 // Page a durable run output through its server-owned run/node/port identity. The kernel resolves the
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
-type ArtifactPresentation =
-  | { kind: 'chart'; type: string; xLabel: string; yLabel: string; grouped: boolean; seriesLabel?: string }
-  | { kind: 'metric' }
-
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
   onRunUnavailable, currentResult = false, fillAvailableHeight = false,

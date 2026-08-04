@@ -3,22 +3,6 @@
 export const CHART_SERIES_OTHER = 'Other'
 export const CHART_SERIES_BLANK = '(blank)'
 
-/** Fixed categorical palette (12 named series). Other uses a muted token separately. */
-export const CHART_SERIES_COLORS = [
-  'hsl(211 72% 48%)',
-  'hsl(162 55% 38%)',
-  'hsl(28 78% 48%)',
-  'hsl(280 45% 48%)',
-  'hsl(348 65% 48%)',
-  'hsl(190 60% 40%)',
-  'hsl(45 80% 42%)',
-  'hsl(320 50% 48%)',
-  'hsl(95 45% 38%)',
-  'hsl(230 55% 55%)',
-  'hsl(15 70% 46%)',
-  'hsl(175 40% 36%)',
-] as const
-
 export const CHART_SERIES_OTHER_COLOR = 'hsl(var(--muted-foreground))'
 
 export function chartSeriesLabel(value: unknown): string {
@@ -36,11 +20,22 @@ export function orderChartSeriesLabels(labels: Iterable<string>): string[] {
   return unique.includes(CHART_SERIES_OTHER) ? [...named, CHART_SERIES_OTHER] : named
 }
 
-export function chartSeriesColor(label: string, ordered: readonly string[]): string {
+/**
+ * Derive color from the label itself, not from the labels visible on the current page. Full-result
+ * pagination can expose only a subset of categories; position-based palettes make a category change
+ * color between pages even though the retained result is unchanged.
+ */
+export function chartSeriesColor(label: string): string {
   if (label === CHART_SERIES_OTHER) return CHART_SERIES_OTHER_COLOR
-  const index = ordered.indexOf(label)
-  if (index < 0) return CHART_SERIES_COLORS[0]
-  return CHART_SERIES_COLORS[index % CHART_SERIES_COLORS.length]
+  let hash = 2166136261
+  for (let index = 0; index < label.length; index += 1) {
+    hash = Math.imul(hash ^ label.charCodeAt(index), 16777619)
+  }
+  const stable = hash >>> 0
+  const hue = stable % 360
+  const saturation = 58 + ((stable >>> 9) % 12)
+  const lightness = 40 + ((stable >>> 17) % 8)
+  return `hsl(${hue} ${saturation}% ${lightness}%)`
 }
 
 export function summarizeChartSeries(ordered: readonly string[]): string {

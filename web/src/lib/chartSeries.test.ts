@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  CHART_SERIES_COLORS,
   CHART_SERIES_OTHER,
   CHART_SERIES_OTHER_COLOR,
   chartSeriesColor,
@@ -16,14 +15,10 @@ describe('chartSeries helpers', () => {
     ])
   })
 
-  it('maps stable colors from ordered labels and reserves muted Other', () => {
-    const ordered = orderChartSeriesLabels(['b', 'a', CHART_SERIES_OTHER])
-    expect(chartSeriesColor('a', ordered)).toBe(CHART_SERIES_COLORS[0])
-    expect(chartSeriesColor('b', ordered)).toBe(CHART_SERIES_COLORS[1])
-    expect(chartSeriesColor(CHART_SERIES_OTHER, ordered)).toBe(CHART_SERIES_OTHER_COLOR)
-    expect(chartSeriesColor('a', orderChartSeriesLabels(['b', 'a']))).toBe(
-      chartSeriesColor('a', orderChartSeriesLabels(['a', 'b'])),
-    )
+  it('maps stable colors from labels across page subsets and reserves muted Other', () => {
+    expect(chartSeriesColor('alpha')).toBe(chartSeriesColor('alpha'))
+    expect(chartSeriesColor('alpha')).not.toBe(chartSeriesColor('beta'))
+    expect(chartSeriesColor(CHART_SERIES_OTHER)).toBe(CHART_SERIES_OTHER_COLOR)
   })
 
   it('labels blank series values explicitly', () => {

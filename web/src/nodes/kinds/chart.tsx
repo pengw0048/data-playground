@@ -36,7 +36,6 @@ export function seriesChartColumns(columns: ColumnSchema[], exclude?: string): C
   return chartableColumns(columns).filter((column) => (
     column.name !== exclude
     && CATEGORICAL.test(chartColumnType(column))
-    && !ID_LIKE.test(column.name)
   ))
 }
 
@@ -224,7 +223,7 @@ function Chart({ id, data }: NodeComponentProps) {
           </span>
           {seriesAvailable ? (
             <select aria-label="Series / Color by column" value={series}
-              disabled={seriesColumns.length === 0}
+              disabled={seriesColumns.length === 0 && !series}
               onClick={(event) => event.stopPropagation()}
               onChange={(event) => updateConfig(id, { series: event.target.value })}
               className={cn('nodrag min-w-0', miniSelectClass)}>

@@ -12149,6 +12149,25 @@ def test_chart_series_dimension_groups_and_bounds_other(tmp_path):
     other_total = sum(row["y"] for row in result["rows"] if row["series"] == "Other")
     assert other_total == 12.0
 
+    # Synthetic labels never absorb real category values with the same spelling. Prefixing an
+    # already-prefixed value keeps the mapping injective instead of moving the collision elsewhere.
+    reserved_source = tmp_path / "chart-series-reserved.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"split": "train", "model": None, "amount": 1.0},
+        {"split": "train", "model": "Other", "amount": 2.0},
+        {"split": "train", "model": "(blank)", "amount": 3.0},
+        {"split": "train", "model": "Value: Other", "amount": 4.0},
+    ]), reserved_source)
+    _, reserved = _full_result({"id": "chart-series-reserved", "version": 1, "nodes": [
+        N("source", "source", {"uri": str(reserved_source)}),
+        N("chart", "chart", {
+            "chartType": "bar", "agg": "sum", "x": "split", "y": "amount", "series": "model",
+        }),
+    ], "edges": [E("source", "chart")]}, "chart", 50)
+    assert {row["series"] for row in reserved["rows"]} == {
+        "(blank)", "Value: (blank)", "Value: Other", "Value: Value: Other",
+    }
+
     # Unset Series keeps the exact one-series (x, y) contract.
     _, plain = _full_result(chart_graph({
         "chartType": "bar", "agg": "sum", "x": "split", "y": "amount",
