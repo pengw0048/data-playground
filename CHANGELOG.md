@@ -103,6 +103,8 @@ target is configured or certified on Kiwi.
 
 - Full release acceptance now searches for a relationship fixture after returning from a paginated
   catalog instead of assuming that the target sorts after the previously opened dataset.
+- The locked optional runtime stack now resolves `aiohttp` 3.14.3, which fixes CVE-2026-69244 in
+  the C HTTP response parser used by the container image.
 
 ### Known limitations
 
