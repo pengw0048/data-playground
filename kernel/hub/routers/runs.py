@@ -2840,11 +2840,17 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
         deps, _pick_runner(deps, plan, uid, graph), graph, req.target_node_id)
-    output_count = _plan_run_output_count(plan, graph, req.target_node_id, deps)
-    multi_output = output_count > 1
-    if multi_output:
-        multi_output = _require_backend_run_output_support(
-            runner, graph, output_target, deps, output_count)
+    if req.target_node_id is None:
+        output_count = _plan_run_output_count(plan, graph, None, deps)
+        multi_output = output_count > 1
+        if multi_output:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps, output_count)
+    else:
+        multi_output = False
+        if output_target is not None:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, req.target_node_id, deps)
     if multi_output:
@@ -3327,11 +3333,17 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(
             409, "the selected execution backend cannot consume the managed-local write admission; "
             "discard it and retry with local-out-of-core")
-    output_count = _plan_run_output_count(plan, graph, target_node_id, deps)
-    multi_output = output_count > 1
-    if multi_output:
-        multi_output = _require_backend_run_output_support(
-            runner, graph, output_target, deps, output_count)
+    if target_node_id is None:
+        output_count = _plan_run_output_count(plan, graph, None, deps)
+        multi_output = output_count > 1
+        if multi_output:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps, output_count)
+    else:
+        multi_output = False
+        if output_target is not None:
+            multi_output = _require_backend_run_output_support(
+                runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
     managed_write = bool(write_admission is not None and write_admission.managed)
