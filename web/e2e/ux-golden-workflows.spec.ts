@@ -342,7 +342,10 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expiredFilter.click()
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const expiredResult = page.getByTestId('panel-data')
-    await expect(expiredFilter).toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
+    // #1335: a green/current check means the exact artifact is reopenable. After expiry the card
+    // must not keep the latest glyph or rows·time line even though Jobs metadata remains.
+    await expect(expiredFilter.getByTitle('latest')).toHaveCount(0)
+    await expect(expiredFilter).not.toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
     await expect(expiredResult.getByText('Current result unavailable')).toBeVisible()
     await expect(expiredResult.getByText(/calculation is still up to date/i)).toBeVisible()
     await expect(expiredResult.getByRole('button', { name: 'Rerun and save result' })).toBeVisible()
@@ -352,7 +355,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await page.setViewportSize(viewport)
       await expect(expiredResult).toBeVisible()
       await expiredResult.screenshot({ path: testInfo.outputPath(
-        `issue-1109-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
+        `issue-1335-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
       ) })
     }
     await expectNoTechnicalResultEvidence(expiredResult, runId, 'filter:out')

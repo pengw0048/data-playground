@@ -5379,7 +5379,11 @@ function recoverCanvasResults(
       const unknown = new Set(recovery.unknownNodeIds ?? [])
       let nodesChanged = false
       const nodes = state.doc.nodes.map((node) => {
-        if (node.data.status !== 'checking') return node
+        // Revalidate every terminal result claim — not only reopen `checking` badges. A green
+        // check must disappear when the same server proof later reports the artifact gone.
+        if (node.data.status !== 'checking'
+            && node.data.status !== 'latest'
+            && node.data.status !== 'unknown') return node
         const status: NodeStatus = failed.has(node.id)
           ? 'failed'
           : latest.has(node.id)
@@ -5388,6 +5392,7 @@ function recoverCanvasResults(
               ? 'unknown'
               : stale.has(node.id)
                 ? 'stale' : 'idle'
+        if (status === node.data.status) return node
         nodesChanged = true
         return { ...node, data: { ...node.data, status } }
       })
@@ -5420,7 +5425,9 @@ function recoverCanvasResults(
           || structSig(state.doc) !== structure) return {}
       let changed = false
       const nodes = state.doc.nodes.map((node) => {
-        if (node.data.status !== 'checking') return node
+        if (node.data.status !== 'checking'
+            && node.data.status !== 'latest'
+            && node.data.status !== 'unknown') return node
         changed = true
         return { ...node, data: { ...node.data, status: 'unknown' as NodeStatus } }
       })

@@ -96,16 +96,23 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     bindingsIdentity: string
     identity: RetainedResultIdentity
   } | null>(null)
-  const [retainedResultUnavailable, setRetainedResultUnavailable] = useState(false)
+  // Latches across the status flip from `latest` → `idle` when View data proves the exact artifact
+  // is gone, so the panel can keep the bounded rerun action after the green check disappears.
+  const [currentResultMissing, setCurrentResultMissing] = useState(false)
   const planIdentity = previewPlanIdentity(doc, nodeId, selectedPortId)
   const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
-  const recoveredResult = !editorPreview && node?.data.status === 'latest'
+  const recoveredResult = !editorPreview
+    && (node?.data.status === 'latest'
+      || (node?.data.status === 'idle' && !!node.data.lastRun))
     && retainedResult?.nodeId === nodeId
     && retainedResult.portId === retainedPortId
     && retainedResult.planIdentity === planIdentity
     && retainedResult.bindingsIdentity === bindingsIdentity
     ? retainedResult.identity
     : undefined
+  // Plan-matched retained identity means this is still the exact current result, even after the
+  // green check was cleared because the artifact itself became unreadable.
+  const exactCurrentResult = node?.data.status === 'latest' || !!recoveredResult
   // A terminal run can fail or be cancelled after another named output was durably committed.
   // Keep that artifact readable without implying that non-committed sibling ports succeeded.
   const selectedOutput = !editorPreview
@@ -124,14 +131,21 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
+    setCurrentResultMissing(false)
+  }, [nodeId, retainedPortId, planIdentity, bindingsIdentity])
+  useEffect(() => {
     const requestGeneration = ++retainedRequestGeneration.current
     setRetainedResult(null)
-    setRetainedResultUnavailable(false)
-    if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
+    const canLookupRetained = node?.data.status === 'latest'
+      || (node?.data.status === 'idle' && !!node.data.lastRun)
+    if (editorPreview || !canLookupRetained || committedRunOutput
         || retainedPortId === undefined) return
     const requestDoc = doc
     const requestPlanIdentity = planIdentity
     const requestBindingsIdentity = bindingsIdentity
+    const statusAllowsRecovery = (status: string | undefined, lastRun: unknown) => (
+      status === 'latest' || (status === 'idle' && !!lastRun)
+    )
     void api.retainedResult(requestDoc, nodeId, retainedPortId, parameterBindings)
       .then((identity) => {
         const current = useStore.getState()
@@ -139,7 +153,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         const currentBindings = current.runs[nodeId]?.parameterBindings
         if (
           retainedRequestGeneration.current !== requestGeneration
-          || currentNode?.data.status !== 'latest'
+          || !statusAllowsRecovery(currentNode?.data.status, currentNode?.data.lastRun)
           || (currentBindings !== undefined) !== parameterBindingsKnown
           || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
           || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
@@ -161,7 +175,10 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
         ) return
         if (isDefinitivelyUnavailableRetainedResult(error)) {
-          setRetainedResultUnavailable(true)
+          setCurrentResultMissing(true)
+          // Green check means the exact current output is reopenable. Drop it as soon as the same
+          // retained-result proof View data uses says otherwise; keep lastRun as history only.
+          current.updateData(nodeId, { status: 'idle' })
         }
         // Never substitute a merely newer or older artifact client-side. Transport and temporary
         // server failures deliberately stay indeterminate so the result view can be retried.
@@ -170,9 +187,16 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   // equivalent binding order do not issue another durable lookup.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    editorPreview, nodeId, retainedPortId, node?.data.status, committedRunOutput?.uri,
-    parameterBindingsKnown, planIdentity, bindingsIdentity,
+    editorPreview, nodeId, retainedPortId, node?.data.status, node?.data.lastRun,
+    committedRunOutput?.uri, parameterBindingsKnown, planIdentity, bindingsIdentity,
   ])
+  const clearCurrentResultBadge = () => {
+    setCurrentResultMissing(true)
+    const current = useStore.getState()
+    if (current.doc.nodes.find((candidate) => candidate.id === nodeId)?.data.status === 'latest') {
+      current.updateData(nodeId, { status: 'idle' })
+    }
+  }
   useEffect(() => {
     // A Chart is a full-input visualization. Once a saved output exists, opening the
     // panel reads that artifact directly instead of issuing a preview request that can only refuse.
@@ -266,7 +290,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       publicationKind={selectedOutput.publicationKind}
       name={String(node?.data.title || node?.id || 'result')}
       presentation={artifactPresentation} fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)} currentResult />)
+      onRunUnavailable={() => requestRun(nodeId)}
+      onCurrentResultMissing={clearCurrentResultBadge}
+      currentResult={exactCurrentResult} />)
   }
 
   if (!preview || preview.portId !== requestPortId) {
@@ -286,7 +312,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   if (res.failureCategory === 'syntax_error' && res.syntaxError) {
     return withOutputPorts(<SyntaxFailure failure={res.syntaxError} />)
   }
-  if (!editorPreview && node?.data.status === 'latest' && retainedResultUnavailable && res.notPreviewable) {
+  if (!editorPreview && currentResultMissing && res.notPreviewable) {
     return withOutputPorts(<CurrentResultUnavailable
       onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
   }
@@ -324,7 +350,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation}
         fillAvailableHeight={fillAvailableHeight}
-        onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
+        onRunUnavailable={() => requestRun(nodeId)}
+        onCurrentResultMissing={clearCurrentResultBadge}
+        currentResult={exactCurrentResult} />)
     }
     if (editorPreview) {
       const testTarget = editorPreview.testTarget ?? 'code'
@@ -335,6 +363,16 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         reason={res.reason ?? 'A current upstream result is not available.'}
         onRun={editorPreview.onRunUpstream}
         runLabel="Run upstream"
+        modeToggle={resultModeToggle} />)
+    }
+    // Fused execution can finish a step without materializing its own artifact. Keep lastRun as
+    // history, but tell the researcher the green-check contract needs an explicit saved result.
+    if (node?.data.status === 'idle' && node.data.lastRun && !selectedOutput?.uri) {
+      return withOutputPorts(<NotPreviewable
+        title="Result was not saved"
+        reason="This step ran, but its result was not saved. Run this step to calculate and save a result you can reopen."
+        onRun={canEdit ? () => requestRun(nodeId) : undefined}
+        runLabel="Run this step"
         modeToggle={resultModeToggle} />)
     }
     if (res.suggestedAction === 'run') {
@@ -356,7 +394,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       name={String(node?.data.title || node?.id || 'result')}
       modeToggle={resultModeToggle} presentation={artifactPresentation}
       fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
+      onRunUnavailable={() => requestRun(nodeId)}
+      onCurrentResultMissing={clearCurrentResultBadge}
+      currentResult={exactCurrentResult} />)
   }
 
   const columns = res.columns
@@ -1523,7 +1563,7 @@ function UserCodeFailure({
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
-  onRunUnavailable, currentResult = false, fillAvailableHeight = false,
+  onRunUnavailable, onCurrentResultMissing, currentResult = false, fillAvailableHeight = false,
 }: {
   uri: string
   total: number | null
@@ -1535,6 +1575,7 @@ export function FullResult({
   modeToggle?: ReactNode
   presentation?: ArtifactPresentation
   onRunUnavailable?: () => void
+  onCurrentResultMissing?: () => void
   fillAvailableHeight?: boolean
   currentResult?: boolean
 }) {
@@ -1543,6 +1584,7 @@ export function FullResult({
   const [detail, setDetail] = useState<number | null>(null)
   const [offset, setOffset] = useState(0)
   const previousOffsets = useRef<number[]>([])
+  const missingNotified = useRef(false)
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
@@ -1567,6 +1609,15 @@ export function FullResult({
       .catch((e) => { if (live) setErr(e instanceof Error ? e : new Error(String(e))) })
     return () => { live = false }
   }, [uri, runId, nodeId, portId, offset, retry, pageSize])
+  useEffect(() => { missingNotified.current = false }, [uri, runId, nodeId, portId])
+  useEffect(() => {
+    if (!err || !currentResult || !onCurrentResultMissing || missingNotified.current) return
+    const status = err.status
+    if (status === 404 || status === 409 || status === 410) {
+      missingNotified.current = true
+      onCurrentResultMissing()
+    }
+  }, [err, currentResult, onCurrentResultMissing])
 
   const exportFull = async () => {
     if (!runId || !nodeId || !portId || !canExportFull || exporting) return

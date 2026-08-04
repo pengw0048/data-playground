@@ -520,10 +520,12 @@ def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retain
     os.unlink(output["uri"])
     missing = client.post("/api/run/current-results", json={"graph": graph})
     assert missing.status_code == 200, missing.text
+    # Exact plan still matches, but the artifact is gone — no green check and no "stale graph"
+    # claim. The client settles checking badges to icon-free idle from the empty sets.
     assert missing.json() == {
         "latestNodeIds": [],
         "failedNodeIds": [],
-        "staleNodeIds": ["sample"],
+        "staleNodeIds": [],
         "unknownNodeIds": [],
         "results": [],
     }

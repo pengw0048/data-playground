@@ -5192,6 +5192,7 @@ def recover_canvas_results(
         identities: list[RetainedResultIdentity] = []
         valid = bool(output_docs)
         availability_unknown = False
+        artifact_missing = False
         for output_doc in output_docs:
             if not isinstance(output_doc, dict):
                 valid = False
@@ -5210,17 +5211,26 @@ def recover_canvas_results(
             if identity.run_id != projection.get("result_run_id"):
                 valid = False
                 break
+            # Each named output port is proved independently; one unreadability cannot borrow
+            # evidence from a sibling port on the same node.
             readability = _retained_result_readability(identity, deps)
             if readability != "readable":
                 valid = False
                 availability_unknown = readability == "unknown"
+                artifact_missing = readability == "missing"
                 break
             identities.append(identity)
         if not valid:
             # A retained target proves only that target's own saved output. Its upstream steps may
             # have been fused into the run without producing independently reopenable artifacts.
             # Do not turn a missing target artifact into stale badges for those intermediates.
-            (unknown if availability_unknown else stale).add(target_id)
+            # Plan-current but unreadable → leave the node out of every set so the client settles
+            # to icon-free idle (no green check). Plan mismatch stays stale; transient checks stay
+            # unknown.
+            if availability_unknown:
+                unknown.add(target_id)
+            elif not artifact_missing:
+                stale.add(target_id)
             continue
         terminal_is_result = (
             projection.get("terminal_status") == "done"
