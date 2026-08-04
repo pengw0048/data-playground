@@ -2063,8 +2063,9 @@ test.describe('Data Playground canvas', () => {
   test('the relationships graph preserves Dataset lineage context and widens to the catalog', async ({ page }) => {
     test.setTimeout(75_000)
     await page.setViewportSize({ width: 1280, height: 720 })
-    const lineageCanvasId = `lineage-navigation-${Date.now()}`
-    const lineageOutput = `lineage-navigation-${Date.now()}.parquet`
+    const lineageFixtureId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const lineageCanvasId = `lineage-navigation-${lineageFixtureId}`
+    const lineageOutput = `lineage-navigation-${lineageFixtureId}.parquet`
     const created = await page.request.post('/api/canvas', { data: {
       id: lineageCanvasId,
       name: 'Lineage navigation fixture',
@@ -2093,14 +2094,21 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
     await expect(page).toHaveURL(/#\/relationships\?.*focus=.*&mode=lineage.*returnResource=/)
     const entities = page.locator('.react-flow__node')
-    const eventField = entities.filter({ hasText: 'events' }).first().getByText('user_id')
-    for (let attempt = 0; attempt < 5 && !(await eventField.isVisible()); attempt += 1) {
-      const zoomIn = page.getByRole('button', { name: 'Zoom In' })
-      if (await zoomIn.isDisabled()) break
-      await zoomIn.click()
-    }
-    await expect(eventField).toBeVisible({ timeout: 10_000 })
     const focusedEntity = entities.filter({ hasText: 'events' }).first()
+    const eventField = focusedEntity.getByText('user_id')
+    const revealEventField = async () => {
+      await expect(focusedEntity).toBeVisible()
+      // Mount-time fitting settles across several animation frames and can truthfully start at
+      // React Flow's 0.2 minimum. Keep following the rendered state until semantic detail opens,
+      // instead of assuming a fixed number of clicks from an unstable starting viewport.
+      await expect.poll(async () => {
+        if (await eventField.isVisible()) return true
+        const zoomIn = page.getByRole('button', { name: 'Zoom In' })
+        if (!(await zoomIn.isDisabled())) await zoomIn.click()
+        return eventField.isVisible()
+      }, { timeout: 10_000 }).toBe(true)
+    }
+    await revealEventField()
     await expect(focusedEntity.getByText('event', { exact: true })).toHaveCount(0)
 
     // Lineage cards expose only identity/relationship columns, and their title is a real drag
@@ -2130,12 +2138,7 @@ test.describe('Data Playground canvas', () => {
     await page.reload()
     await expect(page).toHaveURL((url) => url.hash === focusedHash)
     await expect(page.getByTestId('er-mode-lineage')).toHaveClass(/bg-accent/)
-    for (let attempt = 0; attempt < 5 && !(await eventField.isVisible()); attempt += 1) {
-      const zoomIn = page.getByRole('button', { name: 'Zoom In' })
-      if (await zoomIn.isDisabled()) break
-      await zoomIn.click()
-    }
-    await expect(eventField).toBeVisible({ timeout: 10_000 })
+    await revealEventField()
     await expect.poll(() => page.evaluate((nodeId) => {
       const positions = JSON.parse(localStorage.getItem('dp-er-positions') || '{}') as Record<string, { x: number; y: number }>
       return positions[`lineage:${nodeId}`]
