@@ -10,7 +10,7 @@ Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 
 ## Unreleased
 
-## [0.3.0] — 2026-08-03
+## [0.3.1] — 2026-08-03
 
 This release turns the versioned-data and durable-execution foundation into a more coherent
 researcher workflow: browse and organize work in Workspace, build and reopen a Canvas, inspect or
@@ -24,7 +24,7 @@ target is configured or certified on Kiwi.
 - Workspace now behaves as one file browser for datasets, folders, and Canvases, with list and grid
   views, paging, sorting where the selected source supports it, multi-select actions, contextual
   menus, and capability-gated rename, move, copy, and delete actions.
-- Canvas results produced by `0.3.0` survive hub and kernel restarts. The latest result for each
+- Canvas results produced by `0.3.1` survive hub and kernel restarts. The latest result for each
   executed target node is kept with the Canvas, while workspace defaults and per-Canvas settings can
   additionally retain a bounded number of recent result versions for a bounded number of days.
 - Jobs default to the current user's work while preserving an explicit workspace-wide view for
@@ -78,9 +78,9 @@ target is configured or certified on Kiwi.
   published `0.2.x` workspaces from `0039_folder_replays` through one linear forward chain.
 - Follow [the stopped in-place upgrade runbook](docs/UPGRADING.md): identify and stop every writer,
   take one consistency backup of metadata, managed bytes, configuration, and credential references,
-  run one `dataplay migrate` with the exact `0.3.0` artifact, and verify the candidate-reported schema
+  run one `dataplay migrate` with the exact `0.3.1` artifact, and verify the candidate-reported schema
   head before reopening traffic.
-- Live upgrade, database downgrade, and running a `0.2.x` binary against metadata migrated to `0.3.0`
+- Live upgrade, database downgrade, and running a `0.2.x` binary against metadata migrated to `0.3.1`
   are not supported. Rollback means restoring the complete pre-upgrade consistency set.
 - The `0051_canvas_result_latest` migration creates retention metadata but cannot reconstruct output
   artifacts from historical `0.2.x` runs. Re-run a Canvas after upgrading to establish its retained
@@ -98,6 +98,11 @@ target is configured or certified on Kiwi.
   is rejected instead of being assigned implicitly.
 - Dataset MCP resource URIs are returned by `search_catalog` and `get_dataset_context`, but are no
   longer enumerated by `resources/list`, whose protocol response has no continuation field.
+
+### Fixed
+
+- Full release acceptance now searches for a relationship fixture after returning from a paginated
+  catalog instead of assuming that the target sorts after the previously opened dataset.
 
 ### Known limitations
 
@@ -118,11 +123,17 @@ target is configured or certified on Kiwi.
 # After downloading all assets from the GitHub Release:
 sha256sum -c SHA256SUMS
 
-gh attestation verify ./data_playground-0.3.0-py3-none-any.whl \
+gh attestation verify ./data_playground-0.3.1-py3-none-any.whl \
   --repo pengw0048/data-playground
-gh attestation verify oci://ghcr.io/pengw0048/data-playground:0.3.0 \
+gh attestation verify oci://ghcr.io/pengw0048/data-playground:0.3.1 \
   --repo pengw0048/data-playground
 ```
+
+## [0.3.0] — 2026-08-03
+
+This candidate was rejected before publication because full UX release acceptance depended on the
+retained Workspace page when reopening a relationship fixture. The `v0.3.0` tag remains immutable
+evidence; no GitHub Release or release assets were published.
 
 ## [0.2.3] — 2026-07-22
 
