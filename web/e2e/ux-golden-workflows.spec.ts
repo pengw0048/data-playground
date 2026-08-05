@@ -324,39 +324,9 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await expectNoTechnicalResultEvidence(jobsResult, runId, 'filter:out')
     }
 
-    const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
-    expect(historyResponse.ok(), await historyResponse.text()).toBe(true)
-    const history = await historyResponse.json() as Array<{
-      runId?: string
-      outputs?: Array<{ nodeId?: string; portId?: string; uri?: string }>
-    }>
-    const exactOutput = history.find((entry) => entry.runId === runId)?.outputs?.find((output) => (
-      output.nodeId === 'filter' && output.portId === 'out'
-    ))
-    expect(exactOutput?.uri).toBeTruthy()
-    // Retire only the exact run artifact reported by Canvas history. The re-open flow must not
-    // substitute any other result when this retained output is unavailable.
-    rmSync(exactOutput!.uri!)
-    await page.goto(`/#/canvas/${doc.id}`)
-    const expiredFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
-    await expiredFilter.click()
-    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
-    const expiredResult = page.getByTestId('panel-data')
-    await expect(expiredFilter).toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
-    await expect(expiredResult.getByText('Current result unavailable')).toBeVisible()
-    await expect(expiredResult.getByText(/calculation is still up to date/i)).toBeVisible()
-    await expect(expiredResult.getByRole('button', { name: 'Rerun and save result' })).toBeVisible()
-    await expect(expiredResult.getByText('Run this step to see results')).toHaveCount(0)
-    await expect(expiredResult.getByText('Full result expired or removed')).toHaveCount(0)
-    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
-      await page.setViewportSize(viewport)
-      await expect(expiredResult).toBeVisible()
-      await expiredResult.screenshot({ path: testInfo.outputPath(
-        `issue-1109-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
-      ) })
-    }
-    await expectNoTechnicalResultEvidence(expiredResult, runId, 'filter:out')
-
+    // Exercise a readable retained identity whose adapter fails while opening the rows. Keep this
+    // separate from the definitive-expiry case below: once the artifact is removed, recovery must
+    // stop before issuing a row-sample request.
     const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
     await page.route(sampleRoute, async (route) => {
       await route.fulfill({
@@ -383,6 +353,42 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
     await expectNoTechnicalResultEvidence(errorResult, runId, 'filter:out')
     await page.unroute(sampleRoute)
+
+    const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
+    expect(historyResponse.ok(), await historyResponse.text()).toBe(true)
+    const history = await historyResponse.json() as Array<{
+      runId?: string
+      outputs?: Array<{ nodeId?: string; portId?: string; uri?: string }>
+    }>
+    const exactOutput = history.find((entry) => entry.runId === runId)?.outputs?.find((output) => (
+      output.nodeId === 'filter' && output.portId === 'out'
+    ))
+    expect(exactOutput?.uri).toBeTruthy()
+    // Retire only the exact run artifact reported by Canvas history. The re-open flow must not
+    // substitute any other result when this retained output is unavailable.
+    rmSync(exactOutput!.uri!)
+    await page.goto(`/#/canvas/${doc.id}`)
+    const expiredFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+    await expiredFilter.click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const expiredResult = page.getByTestId('panel-data')
+    // #1335: a green/current check means the exact artifact is reopenable. After expiry the card
+    // must not keep the latest glyph or rows·time line even though Jobs metadata remains.
+    await expect(expiredFilter.getByTitle('latest')).toHaveCount(0)
+    await expect(expiredFilter).not.toContainText(/\d[\d,]* rows · \d+(?:\.\d)? (?:ms|s)/)
+    await expect(expiredResult.getByText('Current result unavailable')).toBeVisible()
+    await expect(expiredResult.getByText(/calculation is still up to date/i)).toBeVisible()
+    await expect(expiredResult.getByRole('button', { name: 'Rerun and save result' })).toBeVisible()
+    await expect(expiredResult.getByText('Run this step to see results')).toHaveCount(0)
+    await expect(expiredResult.getByText('Full result expired or removed')).toHaveCount(0)
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expect(expiredResult).toBeVisible()
+      await expiredResult.screenshot({ path: testInfo.outputPath(
+        `issue-1335-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
+      ) })
+    }
+    await expectNoTechnicalResultEvidence(expiredResult, runId, 'filter:out')
   })
 
   test('states a capped chart window once while keeping whole-result export', async ({ page }) => {

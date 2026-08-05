@@ -5192,35 +5192,57 @@ def recover_canvas_results(
         identities: list[RetainedResultIdentity] = []
         valid = bool(output_docs)
         availability_unknown = False
+        artifact_missing = False
         for output_doc in output_docs:
             if not isinstance(output_doc, dict):
                 valid = False
-                break
+                continue
             port_id = output_doc.get("port_id", output_doc.get("portId"))
             if not isinstance(port_id, str) or not port_id:
                 valid = False
-                break
+                continue
             try:
                 identity = _current_retained_result(
                     req.graph, canvas_id, target_id, port_id, uid, deps,
                     allow_local_snapshot_registration=True)
-            except APIError:
+            except APIError as exc:
                 valid = False
-                break
+                code = getattr(exc, "code", None)
+                artifact_missing = artifact_missing or code in {
+                    APIErrorCode.RETAINED_UPSTREAM_EXPIRED,
+                    APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE,
+                }
+                availability_unknown = availability_unknown or code == APIErrorCode.PERMISSION_DENIED
+                continue
             if identity.run_id != projection.get("result_run_id"):
                 valid = False
-                break
+                continue
+            # Each named output port is proved independently; one unreadability cannot borrow
+            # evidence from a sibling port on the same node.
             readability = _retained_result_readability(identity, deps)
             if readability != "readable":
                 valid = False
-                availability_unknown = readability == "unknown"
-                break
+                availability_unknown = availability_unknown or readability == "unknown"
+                artifact_missing = artifact_missing or readability == "missing"
+                continue
             identities.append(identity)
+        # Each readable port is useful exact-current evidence even when a sibling port disappeared.
+        # The node-level badge remains conservative (all declared outputs must be readable), while
+        # View data can still reopen the surviving named output.
+        results.extend(identities)
         if not valid:
             # A retained target proves only that target's own saved output. Its upstream steps may
             # have been fused into the run without producing independently reopenable artifacts.
             # Do not turn a missing target artifact into stale badges for those intermediates.
-            (unknown if availability_unknown else stale).add(target_id)
+            # Plan-current but unreadable → leave the node out of every set so the client settles
+            # to icon-free idle (no green check). Plan mismatch stays stale; transient checks stay
+            # unknown.
+            if availability_unknown:
+                unknown.add(target_id)
+            elif artifact_missing:
+                pass
+            else:
+                stale.add(target_id)
             continue
         terminal_is_result = (
             projection.get("terminal_status") == "done"
@@ -5235,12 +5257,10 @@ def recover_canvas_results(
             # A later attempt for another plan does not invalidate the exact result that was just
             # proved current for this graph (for example, the user reverted an unsuccessful edit).
             latest.add(target_id)
-            results.extend(identities)
         elif projection.get("terminal_status") == "failed":
             # Same execution manifest means the failed attempt targeted the exact plan whose prior
             # result remains retained. Keep failure visible without discarding that successful data.
             failed.add(target_id)
-            results.extend(identities)
         else:
             stale.add(target_id)
     return CanvasResultRecovery(

@@ -520,13 +520,51 @@ def test_canvas_reopen_rebuilds_badges_only_from_readable_current_results(retain
     os.unlink(output["uri"])
     missing = client.post("/api/run/current-results", json={"graph": graph})
     assert missing.status_code == 200, missing.text
+    # Exact plan still matches, but the artifact is gone — no green check and no "stale graph"
+    # claim. The client settles checking badges to icon-free idle from the empty sets.
     assert missing.json() == {
         "latestNodeIds": [],
         "failedNodeIds": [],
-        "staleNodeIds": ["sample"],
+        "staleNodeIds": [],
         "unknownNodeIds": [],
         "results": [],
     }
+
+
+def test_canvas_reopen_keeps_a_readable_named_output_when_its_sibling_is_missing(
+        retained_sample, monkeypatch):
+    graph, run_id, output = retained_sample
+    projection = metadb.canvas_result_latest(graph["id"])[0]
+    projection["result_outputs"] = [
+        {"port_id": "out"},
+        {"port_id": "missing-sibling"},
+    ]
+    monkeypatch.setattr(metadb, "canvas_result_latest", lambda _canvas_id: [projection])
+    original = runs_router._current_retained_result
+
+    def retained_for_port(*args, **kwargs):
+        port_id = args[3]
+        identity = original(*args[:3], "out", *args[4:], **kwargs)
+        if port_id == "out":
+            return identity
+        missing_output = identity.output.model_copy(update={
+            "port_id": "missing-sibling",
+            "uri": output["uri"] + ".missing",
+        })
+        return identity.model_copy(update={"output": missing_output})
+
+    monkeypatch.setattr(runs_router, "_current_retained_result", retained_for_port)
+
+    recovered = client.post("/api/run/current-results", json={"graph": graph})
+
+    assert recovered.status_code == 200, recovered.text
+    body = recovered.json()
+    assert body["latestNodeIds"] == []
+    assert body["staleNodeIds"] == []
+    assert body["unknownNodeIds"] == []
+    assert [(item["runId"], item["output"]["portId"]) for item in body["results"]] == [
+        (run_id, "out"),
+    ]
 
 
 def test_canvas_reopen_recovers_every_terminal_result_from_one_whole_graph_run(tmp_path):

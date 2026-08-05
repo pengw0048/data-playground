@@ -56,9 +56,9 @@ beforeEach(() => {
   apiMock.datasetRevision.mockReset()
   apiMock.sample.mockReset()
   apiMock.runOutputSample.mockReset()
-  apiMock.retainedResult.mockReset().mockRejectedValue(
-    new apiMock.KernelError(404, 'retained result not found'),
-  )
+  // Most tests exercise preview/profile behavior, not retained-result absence. A transient default
+  // keeps those fixtures from mutating their Canvas status; absence tests install a typed 4xx.
+  apiMock.retainedResult.mockReset().mockRejectedValue(new TypeError('retained lookup unavailable'))
   apiMock.preview.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({
     columns: [], rowCount: 10, sampled: true, completeness: 'sample',
@@ -1127,6 +1127,29 @@ describe('durable full results', () => {
     expect(screen.queryByText('Run this step to see results')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Rerun and save result' }))
     expect(requestRun).toHaveBeenCalledWith('target')
+  })
+
+  it('removes the green badge without calling a permission loss an expired result', async () => {
+    apiMock.retainedResult.mockRejectedValueOnce(
+      new apiMock.KernelError(403, 'retained result access denied'),
+    )
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'aggregate', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        notPreviewable: true, suggestedAction: 'run', reason: 'Aggregate requires a saved result',
+      }) },
+      runs: {}, canvasRole: 'viewer',
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByText('Current result access denied')).toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('unknown')
+    expect(screen.queryByText('Current result unavailable')).not.toBeInTheDocument()
   })
 
   it('starts a full run for an actionable Preview sample without retrying the preview', async () => {

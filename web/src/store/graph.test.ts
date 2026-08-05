@@ -748,6 +748,39 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('idle'))
   })
 
+  it('clears a live green check when current-results later omits that node', async () => {
+    const snapshot = {
+      id: 'c', version: 1, name: 'expire live badge', requirements: [], edges: [], nodes: [
+        { ...NODE('source'), data: {
+          ...NODE('source').data,
+          status: 'latest' as const,
+          lastRun: { rows: 10, ms: 5, placement: 'local' as const },
+        } },
+      ],
+    }
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['source'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [],
+      results: [{
+        runId: 'source-run', executionManifestSha256: 'a'.repeat(64), parameterBindings: [],
+        output: {
+          nodeId: 'source', portId: 'out', wire: 'dataset', publicationKind: 'result',
+          outcome: 'committed', uri: '/results/source.parquet',
+        },
+      }],
+    })
+    useStore.getState().loadDoc(snapshot, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('latest'))
+
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
+    useStore.getState().loadDoc(snapshot, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('idle'))
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual({
+      rows: 10, ms: 5, placement: 'local',
+    })
+  })
+
   it('rechecks an unknown persisted badge and preserves uncertainty after a transient storage check', async () => {
     let finishRecovery!: (recovery: any) => void
     apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
@@ -2151,7 +2184,10 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: doc.id }), 'target', 50, 0, undefined,
     )
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
-    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'idle'])
+    // Post-run recovery revalidates every green check against current-results. Without a readable
+    // retained source proof the mock returns, the upstream check becomes icon-free idle rather than
+    // remaining latest until refreshPreviewInputs stales it.
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['idle', 'idle'])
 
     useStore.getState().loadDoc(doc, 'owner')
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)

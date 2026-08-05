@@ -29,10 +29,29 @@ import type { ArtifactPresentation } from '../lib/artifactPresentation'
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
 
-function isDefinitivelyUnavailableRetainedResult(error: unknown): boolean {
+type CurrentResultProblem = 'missing' | 'denied'
+
+function currentResultProblem(error: unknown): CurrentResultProblem | null {
   // The retained-result endpoint promises a structured KernelError. Only its definitive HTTP
-  // outcomes mean an exact saved result cannot be opened; transport failures stay retryable.
-  return error instanceof KernelError && (error.status === 404 || error.status === 409 || error.status === 410)
+  // outcomes mean an exact saved result cannot be opened; transport failures stay indeterminate.
+  if (!(error instanceof KernelError)) return null
+  if (error.status === 401 || error.status === 403) return 'denied'
+  if (error.status === 404 || error.status === 409 || error.status === 410) return 'missing'
+  return null
+}
+
+function settleNodeResultStatus(nodeId: string, status: 'idle' | 'unknown') {
+  // Availability is server-owned operational state, not a Canvas edit. A viewer must lose a false
+  // green badge too, so this cannot go through the role-gated updateData mutation.
+  useStore.setState((state) => {
+    let changed = false
+    const nodes = state.doc.nodes.map((node) => {
+      if (node.id !== nodeId || node.data.status === status) return node
+      changed = true
+      return { ...node, data: { ...node.data, status } }
+    })
+    return changed ? { doc: { ...state.doc, nodes } } : {}
+  })
 }
 
 export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }: {
@@ -96,16 +115,24 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     bindingsIdentity: string
     identity: RetainedResultIdentity
   } | null>(null)
-  const [retainedResultUnavailable, setRetainedResultUnavailable] = useState(false)
+  // Latches across the status flip from `latest` → `idle` when View data proves the exact artifact
+  // is gone, so the panel can keep the bounded rerun action after the green check disappears.
+  const [currentResultProblemState, setCurrentResultProblemState] = useState<CurrentResultProblem | null>(null)
   const planIdentity = previewPlanIdentity(doc, nodeId, selectedPortId)
   const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
-  const recoveredResult = !editorPreview && node?.data.status === 'latest'
+  const recoveredResult = !editorPreview
+    && (node?.data.status === 'latest'
+      || (node?.data.status === 'idle' && !!node.data.lastRun)
+      || currentResultProblemState !== null)
     && retainedResult?.nodeId === nodeId
     && retainedResult.portId === retainedPortId
     && retainedResult.planIdentity === planIdentity
     && retainedResult.bindingsIdentity === bindingsIdentity
     ? retainedResult.identity
     : undefined
+  // Plan-matched retained identity means this is still the exact current result, even after the
+  // green check was cleared because the artifact itself became unreadable.
+  const exactCurrentResult = node?.data.status === 'latest' || !!recoveredResult
   // A terminal run can fail or be cancelled after another named output was durably committed.
   // Keep that artifact readable without implying that non-committed sibling ports succeeded.
   const selectedOutput = !editorPreview
@@ -124,14 +151,24 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
+    setCurrentResultProblemState(null)
+  }, [nodeId, retainedPortId, planIdentity, bindingsIdentity])
+  useEffect(() => {
     const requestGeneration = ++retainedRequestGeneration.current
+    // Keep the exact identity that just failed to open long enough to render its bounded error.
+    // A status-only badge demotion must not make the panel fall back to an unrelated sample.
+    if (currentResultProblemState !== null) return
     setRetainedResult(null)
-    setRetainedResultUnavailable(false)
-    if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
+    const canLookupRetained = node?.data.status === 'latest'
+      || (node?.data.status === 'idle' && !!node.data.lastRun)
+    if (editorPreview || !canLookupRetained || committedRunOutput
         || retainedPortId === undefined) return
     const requestDoc = doc
     const requestPlanIdentity = planIdentity
     const requestBindingsIdentity = bindingsIdentity
+    const statusAllowsRecovery = (status: string | undefined, lastRun: unknown) => (
+      status === 'latest' || (status === 'idle' && !!lastRun)
+    )
     void api.retainedResult(requestDoc, nodeId, retainedPortId, parameterBindings)
       .then((identity) => {
         const current = useStore.getState()
@@ -139,7 +176,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         const currentBindings = current.runs[nodeId]?.parameterBindings
         if (
           retainedRequestGeneration.current !== requestGeneration
-          || currentNode?.data.status !== 'latest'
+          || !statusAllowsRecovery(currentNode?.data.status, currentNode?.data.lastRun)
           || (currentBindings !== undefined) !== parameterBindingsKnown
           || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
           || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
@@ -160,8 +197,12 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
           || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
         ) return
-        if (isDefinitivelyUnavailableRetainedResult(error)) {
-          setRetainedResultUnavailable(true)
+        const problem = currentResultProblem(error)
+        if (problem !== null) {
+          setCurrentResultProblemState(problem)
+          // Green means readable *and* authorized. Missing artifacts settle to idle; permission
+          // loss stays unknown rather than pretending the saved result was deleted.
+          settleNodeResultStatus(nodeId, problem === 'missing' ? 'idle' : 'unknown')
         }
         // Never substitute a merely newer or older artifact client-side. Transport and temporary
         // server failures deliberately stay indeterminate so the result view can be retried.
@@ -170,9 +211,14 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   // equivalent binding order do not issue another durable lookup.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    editorPreview, nodeId, retainedPortId, node?.data.status, committedRunOutput?.uri,
-    parameterBindingsKnown, planIdentity, bindingsIdentity,
+    editorPreview, nodeId, retainedPortId, node?.data.status, node?.data.lastRun,
+    committedRunOutput?.uri, parameterBindingsKnown, planIdentity, bindingsIdentity,
+    currentResultProblemState,
   ])
+  const clearCurrentResultBadge = (problem: CurrentResultProblem) => {
+    setCurrentResultProblemState(problem)
+    settleNodeResultStatus(nodeId, problem === 'missing' ? 'idle' : 'unknown')
+  }
   useEffect(() => {
     // A Chart is a full-input visualization. Once a saved output exists, opening the
     // panel reads that artifact directly instead of issuing a preview request that can only refuse.
@@ -257,6 +303,18 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       }
     : isMetric ? { kind: 'metric' } : undefined
 
+  // Keep a definitive full-result outcome stable. Demoting the card must not unmount the failed
+  // full-result read and reveal an unrelated bounded sample beneath it.
+  if (!editorPreview && currentResultProblemState === 'missing') {
+    return withOutputPorts(<CurrentResultUnavailable
+      onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
+  }
+  if (!editorPreview && currentResultProblemState === 'denied') {
+    return withOutputPorts(<FullResultMessage
+      title="Current result access denied"
+      reason="You no longer have access to this saved result. Ask the owner to restore access, or run this step again if you can edit the Canvas." />)
+  }
+
   // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
   // toggle or let an old preview error cover the last successful full result.
   if (!editorPreview && isChart && selectedOutput?.uri) {
@@ -266,7 +324,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       publicationKind={selectedOutput.publicationKind}
       name={String(node?.data.title || node?.id || 'result')}
       presentation={artifactPresentation} fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)} currentResult />)
+      onRunUnavailable={() => requestRun(nodeId)}
+      onCurrentResultProblem={clearCurrentResultBadge}
+      currentResult={exactCurrentResult} />)
   }
 
   if (!preview || preview.portId !== requestPortId) {
@@ -285,10 +345,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const res = preview.result!
   if (res.failureCategory === 'syntax_error' && res.syntaxError) {
     return withOutputPorts(<SyntaxFailure failure={res.syntaxError} />)
-  }
-  if (!editorPreview && node?.data.status === 'latest' && retainedResultUnavailable && res.notPreviewable) {
-    return withOutputPorts(<CurrentResultUnavailable
-      onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
   }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
@@ -324,7 +380,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation}
         fillAvailableHeight={fillAvailableHeight}
-        onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
+        onRunUnavailable={() => requestRun(nodeId)}
+        onCurrentResultProblem={clearCurrentResultBadge}
+        currentResult={exactCurrentResult} />)
     }
     if (editorPreview) {
       const testTarget = editorPreview.testTarget ?? 'code'
@@ -335,6 +393,16 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         reason={res.reason ?? 'A current upstream result is not available.'}
         onRun={editorPreview.onRunUpstream}
         runLabel="Run upstream"
+        modeToggle={resultModeToggle} />)
+    }
+    // Fused execution can finish a step without materializing its own artifact. Keep lastRun as
+    // history, but tell the researcher the green-check contract needs an explicit saved result.
+    if (node?.data.status === 'idle' && node.data.lastRun && !selectedOutput?.uri) {
+      return withOutputPorts(<NotPreviewable
+        title="Result was not saved"
+        reason="This step ran, but its result was not saved. Run this step to calculate and save a result you can reopen."
+        onRun={canEdit ? () => requestRun(nodeId) : undefined}
+        runLabel="Run this step"
         modeToggle={resultModeToggle} />)
     }
     if (res.suggestedAction === 'run') {
@@ -356,7 +424,9 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       name={String(node?.data.title || node?.id || 'result')}
       modeToggle={resultModeToggle} presentation={artifactPresentation}
       fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
+      onRunUnavailable={() => requestRun(nodeId)}
+      onCurrentResultProblem={clearCurrentResultBadge}
+      currentResult={exactCurrentResult} />)
   }
 
   const columns = res.columns
@@ -1523,7 +1593,7 @@ function UserCodeFailure({
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
-  onRunUnavailable, currentResult = false, fillAvailableHeight = false,
+  onRunUnavailable, onCurrentResultProblem, currentResult = false, fillAvailableHeight = false,
 }: {
   uri: string
   total: number | null
@@ -1535,6 +1605,7 @@ export function FullResult({
   modeToggle?: ReactNode
   presentation?: ArtifactPresentation
   onRunUnavailable?: () => void
+  onCurrentResultProblem?: (problem: CurrentResultProblem) => void
   fillAvailableHeight?: boolean
   currentResult?: boolean
 }) {
@@ -1543,6 +1614,7 @@ export function FullResult({
   const [detail, setDetail] = useState<number | null>(null)
   const [offset, setOffset] = useState(0)
   const previousOffsets = useRef<number[]>([])
+  const missingNotified = useRef(false)
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
   const pushToast = useStore((s) => s.pushToast)
@@ -1567,6 +1639,18 @@ export function FullResult({
       .catch((e) => { if (live) setErr(e instanceof Error ? e : new Error(String(e))) })
     return () => { live = false }
   }, [uri, runId, nodeId, portId, offset, retry, pageSize])
+  useEffect(() => { missingNotified.current = false }, [uri, runId, nodeId, portId])
+  useEffect(() => {
+    if (!err || !currentResult || !onCurrentResultProblem || missingNotified.current) return
+    const status = err.status
+    const problem = status === 401 || status === 403
+      ? 'denied'
+      : status === 404 || status === 409 || status === 410 ? 'missing' : null
+    if (problem !== null) {
+      missingNotified.current = true
+      onCurrentResultProblem(problem)
+    }
+  }, [err, currentResult, onCurrentResultProblem])
 
   const exportFull = async () => {
     if (!runId || !nodeId || !portId || !canExportFull || exporting) return
