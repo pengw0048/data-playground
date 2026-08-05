@@ -31,6 +31,14 @@ export function numericChartColumns(columns: ColumnSchema[]): ColumnSchema[] {
   return chartableColumns(columns).filter((column) => NUMERIC.test(chartColumnType(column)))
 }
 
+/** Scalar categorical columns suitable for Series / Color by (no SQL expressions in this slice). */
+export function seriesChartColumns(columns: ColumnSchema[], exclude?: string): ColumnSchema[] {
+  return chartableColumns(columns).filter((column) => (
+    column.name !== exclude
+    && CATEGORICAL.test(chartColumnType(column))
+  ))
+}
+
 /** A useful zero-config dimension: a category first, then time, then any scalar field. */
 export function suggestedChartDimension(columns: ColumnSchema[]): ColumnSchema | undefined {
   const scalar = chartableColumns(columns)
@@ -133,15 +141,19 @@ function Chart({ id, data }: NodeComponentProps) {
   const yMode = (data.config.yMode as AxisMode) ?? 'column'
   const x = String(data.config.x ?? '')
   const y = String(data.config.y ?? '')
+  const series = String(data.config.series ?? '')
   const inputColumns = useInputColumns(id)
   const columns = chartableColumns(inputColumns)
   const measures = numericChartColumns(inputColumns)
+  const seriesColumns = seriesChartColumns(inputColumns, x || undefined)
   const defaultX = suggestedChartDimension(inputColumns)
   const defaultY = suggestedChartMeasure(inputColumns, x)
   const inputHasX = !!x && inputColumns.some((column) => column.name === x)
   const inputHasY = !!y && inputColumns.some((column) => column.name === y)
   const xIsChartable = !!x && columns.some((column) => column.name === x)
   const yIsChartable = !!y && measures.some((column) => column.name === y)
+  const seriesAvailable = agg !== 'none'
+  const seriesKnown = seriesColumns.some((column) => column.name === series)
 
   // A newly connected Chart should already be useful. Persist the recommendation so the visible
   // controls, saved Canvas, durable run, and reopened result all agree on the same fields.
@@ -151,22 +163,29 @@ function Chart({ id, data }: NodeComponentProps) {
     else if (xMode === 'column' && !x && defaultX) patch.x = defaultX.name
     if (agg !== 'count' && yMode === 'column' && inputHasY && !yIsChartable) patch.y = defaultY?.name ?? ''
     else if (agg !== 'count' && yMode === 'column' && !y && defaultY) patch.y = defaultY.name
+    // Raw-value mode cannot color by Series in this slice; clear a leftover selection so the
+    // saved Canvas never claims a semantic Series that the engine would refuse.
+    if (!seriesAvailable && series) patch.series = ''
+    else if (series && series === (patch.x ?? x)) patch.series = ''
     if (Object.keys(patch).length) updateConfig(id, patch)
-  }, [agg, defaultX, defaultY, id, inputHasX, inputHasY, updateConfig,
+  }, [agg, defaultX, defaultY, id, inputHasX, inputHasY, series, seriesAvailable, updateConfig,
     x, xIsChartable, xMode, y, yIsChartable, yMode])
 
   const axisName = (value: string, mode: AxisMode) => mode === 'expression' ? 'SQL' : (value || '…')
-  const summary = agg === 'count'
+  const seriesSuffix = seriesAvailable && series ? ` · color by ${series}` : ''
+  const summary = (agg === 'count'
     ? (x || defaultX?.name
         ? `Count rows by ${axisName(x || defaultX?.name || '', xMode)}`
         : 'Count all rows')
     : agg === 'none'
       ? `${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`
-      : `${AGG_LABELS[agg]} ${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`
+      : `${AGG_LABELS[agg]} ${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`)
+    + seriesSuffix
 
   const changeAgg = (next: Agg) => {
     const patch: Record<string, unknown> = { agg: next }
     if (next !== 'count' && yMode === 'column' && !y && defaultY) patch.y = defaultY.name
+    if (next === 'none') patch.series = ''
     updateConfig(id, patch)
   }
 
@@ -187,13 +206,39 @@ function Chart({ id, data }: NodeComponentProps) {
           fallback={defaultX?.name}
           allowEmpty={agg === 'count'}
           placeholder="date_trunc('day', created_at)"
-          onChange={(value, mode) => updateConfig(id, { x: value, xMode: mode })} />
+          onChange={(value, mode) => {
+            const patch: Record<string, unknown> = { x: value, xMode: mode }
+            if (series && series === value) patch.series = ''
+            updateConfig(id, patch)
+          }} />
         {agg !== 'count' && (
           <AxisEditor axis="Y" value={y || defaultY?.name || ''} mode={yMode} columns={measures}
             fallback={defaultY?.name}
             placeholder="amount * exchange_rate"
             onChange={(value, mode) => updateConfig(id, { y: value, yMode: mode })} />
         )}
+        <div className="flex flex-col gap-[3px]">
+          <span className="text-[9.5px] font-semibold uppercase tracking-[0.4px] text-muted-foreground">
+            Series / Color by
+          </span>
+          {seriesAvailable ? (
+            <select aria-label="Series / Color by column" value={series}
+              disabled={seriesColumns.length === 0 && !series}
+              onClick={(event) => event.stopPropagation()}
+              onChange={(event) => updateConfig(id, { series: event.target.value })}
+              className={cn('nodrag min-w-0', miniSelectClass)}>
+              <option value="">One series · no color split</option>
+              {series && !seriesKnown && <option value={series}>{series} · unavailable</option>}
+              {seriesColumns.map((column) => (
+                <option key={column.name} value={column.name}>{column.name} · {typeLabel(column)}</option>
+              ))}
+            </select>
+          ) : (
+            <div role="status" className="rounded-md border border-dashed border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">
+              Series needs a Summary aggregate. Switch away from Raw values to color by a category.
+            </div>
+          )}
+        </div>
       </div>
     </NodeCard>
   )

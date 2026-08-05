@@ -2458,6 +2458,41 @@ describe('graph store — core authority ops', () => {
     expect(afterSemantic.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('stale')
   })
 
+  it('treats Chart Series selection as semantic execution config', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    source.data.status = 'latest'
+    const chart = NODE('chart', 'chart')
+    chart.data.config = {
+      chartType: 'bar', agg: 'count', xMode: 'column', x: 'user_id',
+    }
+    chart.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, chart],
+      edges: [{ id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' as const } }],
+    }
+    useStore.setState({ doc, canvasRole: 'owner' })
+    const identity = previewPlanIdentity(doc, 'chart')
+
+    useStore.getState().updateConfig('chart', { series: 'event' })
+    const withSeries = useStore.getState().doc
+    expect(previewPlanIdentity(withSeries, 'chart')).not.toBe(identity)
+    expect(withSeries.nodes.find((node) => node.id === 'chart')?.data.status).toBe('stale')
+
+    useStore.setState({
+      doc: {
+        ...withSeries,
+        nodes: withSeries.nodes.map((node) => (
+          node.id === 'chart' ? { ...node, data: { ...node.data, status: 'latest' } } : node
+        )),
+      },
+    })
+    const seriesIdentity = previewPlanIdentity(useStore.getState().doc, 'chart')
+    useStore.getState().updateConfig('chart', { chartType: 'line' })
+    expect(previewPlanIdentity(useStore.getState().doc, 'chart')).toBe(seriesIdentity)
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'chart')?.data.status).toBe('latest')
+  })
+
   it('keeps an in-flight profile attached across an unrelated branch edit', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }

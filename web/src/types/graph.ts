@@ -90,6 +90,8 @@ export interface NodeConfig {
   y?: string
   xMode?: 'column' | 'expression'
   yMode?: 'column' | 'expression'
+  /** Schema-backed Series / Color by column (aggregated Charts only). */
+  series?: string
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'

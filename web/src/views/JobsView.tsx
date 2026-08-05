@@ -11,6 +11,7 @@ import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModa
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { DistributionReportPage } from './DistributionReports'
+import { useRunArtifactPresentation } from '../lib/artifactPresentation'
 
 const PAGE_SIZE = 50
 const STATUSES = ['', 'queued', 'running', 'done', 'failed', 'cancelled'] as const
@@ -307,6 +308,10 @@ export function JobsView() {
     selected?.checkpoint
     && outputParam === outputKey(selected.checkpoint.clientKey, selected.checkpoint.outputPortId)
   ) ? selected.checkpoint : null
+  const selectedPresentation = useRunArtifactPresentation(
+    selected?.canvasId, selected?.id, selectedOutput?.nodeId,
+    selectedOutput?.outcome === 'committed' && !!selectedOutput.uri,
+  )
   const act = async (item: WorkspaceJobDto, action: 'cancel' | 'retry') => {
     const runId = item.runId ?? item.id
     setActing(`${runId}:${action}`); setActionError('')
@@ -431,7 +436,7 @@ export function JobsView() {
       {selected && selectedOutput?.outcome === 'committed' && selectedOutput.uri && (
         <aside aria-label="Saved result" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
           <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Saved result<span className="flex-1" /><button aria-label="Close saved result" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
-          <FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId} publicationKind={selectedOutput.publicationKind} name={selectedOutput.table ?? selectedOutput.portLabel ?? selectedOutput.portId} />
+          <FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId} publicationKind={selectedOutput.publicationKind} name={selectedOutput.table ?? selectedOutput.portLabel ?? selectedOutput.portId} presentation={selectedPresentation} />
         </aside>
       )}
       {selected && checkpointOutput && (
