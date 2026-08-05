@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { canvasIdFromLocation, canvasRoutePattern } from './support/canvasRoute'
 
 test('deep-links an exact Transform and atomically creates its target Canvas', async ({ page, request }) => {
   const createdUser = await request.post('/api/users', {
@@ -45,7 +46,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   await page.getByLabel('New Canvas name').fill(`Exact ${title}`)
   await page.getByRole('button', { name: 'Create and open' }).click()
   await expect(page).toHaveURL(/#\/canvas\/[^?]+\?node=[^&]+$/)
-  const canvasId = decodeURIComponent(new URL(page.url()).hash.split('?')[0].replace('#/canvas/', ''))
+  const canvasId = canvasIdFromLocation(page.url())
   const node = page.locator('.react-flow__node').filter({ hasText: title })
   await expect(node).toHaveCount(1)
   await expect(node).toContainText(transform.version)
@@ -86,9 +87,7 @@ test('deep-links an exact Transform and atomically creates its target Canvas', a
   expect(new URL(page.url()).hash).not.toContain('q=')
 
   await backToExactNode.click()
-  await expect(page).toHaveURL(
-    new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=${encodeURIComponent(transformNodeId)}$`),
-  )
+  await expect(page).toHaveURL(canvasRoutePattern(canvasId, transformNodeId))
 
   expect((await request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`, { headers })).ok()).toBe(true)
   expect((await request.delete(

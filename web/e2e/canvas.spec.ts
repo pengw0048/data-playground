@@ -2,6 +2,7 @@ import { copyFile, mkdir, unlink } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { test, expect, type APIRequestContext, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
+import { canvasIdFromLocation, canvasRoutePattern } from './support/canvasRoute'
 import { backToWorkspace, createCanvasFromWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 // These specs encode, as assertions, the interaction/visual invariants behind bugs a human had
@@ -166,7 +167,7 @@ async function openWorkspaceDataset(page: Page, name: string) {
 }
 
 async function addWorkspaceDatasetToCurrentCanvas(page: Page, name: string) {
-  const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+  const canvasId = canvasIdFromLocation(page.url())
   await backToWorkspace(page)
   await openWorkspaceDataset(page, name)
   await page.getByTestId('detail-use').click()
@@ -232,7 +233,7 @@ test.describe('Data Playground canvas', () => {
       await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
       const nodes = page.locator('.react-flow__node')
       await expect(nodes).toHaveCount(5)
-      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      exampleId = canvasIdFromLocation(page.url())
       const persisted = await canvasFor(page, exampleId)
       const source = persisted.nodes.find((node) => (node as { type?: string }).type === 'source') as {
         data?: { config?: { uri?: string; tableId?: string; registrationId?: string } }
@@ -442,7 +443,7 @@ test.describe('Data Playground canvas', () => {
 
       await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
       await expect(page.locator('.react-flow__node')).toHaveCount(5)
-      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+      exampleId = canvasIdFromLocation(page.url())
       await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' }))
         .toContainText(`Workspace/${parent}/${child}`)
 
@@ -474,11 +475,11 @@ test.describe('Data Playground canvas', () => {
     // Explicit blank + no durable run history is the sole in-place replacement case.
     await page.getByRole('button', { name: 'Start a blank Canvas' }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
-    const pristineId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const pristineId = canvasIdFromLocation(page.url())
     expect(await canvasesFor(page)).toHaveLength(1)
     await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
     await expect(page.locator('.react-flow__node').first()).toBeVisible()
-    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).toBe(pristineId)
+    expect(canvasIdFromLocation(page.url())).toBe(pristineId)
     expect(await canvasesFor(page)).toHaveLength(1)
     const viewport = page.locator('.react-flow__viewport')
     await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
@@ -490,7 +491,7 @@ test.describe('Data Playground canvas', () => {
     // durable storage; cancelling this click gives the existing autosave debounce time to finish.
     await createCanvasFromWorkspace(page, 'untitled')
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
-    const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const blankId = canvasIdFromLocation(page.url())
     const blankHash = await page.evaluate(() => location.hash)
     const afterBlankCount = (await canvasesFor(page)).length
     await expect(page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' })).toBeVisible()
@@ -510,7 +511,7 @@ test.describe('Data Playground canvas', () => {
     releaseHistory()
     await expect(page.getByText(/Canvas changed while preparing the example; your edit was kept/)).toBeVisible()
     expect((await page.evaluate(() => location.hash)).split('?')[0]).toBe(blankHash.split('?')[0])
-    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])).toBe(blankId)
+    expect(canvasIdFromLocation(page.url())).toBe(blankId)
     expect(await canvasesFor(page)).toHaveLength(afterBlankCount)
     await expect.poll(async () => (await canvasFor(page, blankId)).nodes.length).toBe(1)
 
@@ -523,7 +524,7 @@ test.describe('Data Playground canvas', () => {
     // A lost PUT response retains a version-fenced local draft; it must not turn into a speculative create.
     await createCanvasFromWorkspace(page, 'untitled')
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
-    const responseLossId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const responseLossId = canvasIdFromLocation(page.url())
     let abortedPut = false
     await page.route(`**/api/canvas/${responseLossId}*`, (route) => {
       if (route.request().method() === 'PUT') {
@@ -536,7 +537,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
     await expect.poll(() => abortedPut).toBe(true)
     await expect(page.locator('.react-flow__node').first()).toBeVisible()
-    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).toBe(responseLossId)
+    expect(canvasIdFromLocation(page.url())).toBe(responseLossId)
     expect((await canvasFor(page, responseLossId)).nodes).toEqual([])
   })
 
@@ -590,7 +591,7 @@ test.describe('Data Playground canvas', () => {
 
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('?')[0].split('/').pop()!)
+    const canvasId = canvasIdFromLocation(page.url())
     await expect.poll(async () => {
       const saved = await canvasFor(page, canvasId)
       const nodeTypes = Object.fromEntries((saved.nodes as Array<{ id: string; type: string }>).map((node) => [node.id, node.type]))
@@ -763,7 +764,7 @@ test.describe('Data Playground canvas', () => {
 
     await page.goto(`/#/canvas/${canvasId}?node=deleted-node`)
     await expect(page.getByText('The requested node is no longer in this Canvas.')).toBeVisible()
-    await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${canvasId}$`))
+    await expect(page).toHaveURL(canvasRoutePattern(canvasId))
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await page.unroute(`**/api/canvas/${canvasId}`)
   })
@@ -1103,7 +1104,7 @@ test.describe('Data Playground canvas', () => {
     await page.getByRole('textbox', { name: 'Canvas name' }).fill(name)
     await page.reload()
 
-    await expect(page).toHaveURL(new RegExp(`#\/canvas\/${canvasId}$`))
+    await expect(page).toHaveURL(canvasRoutePattern(canvasId))
     await expect(page.getByTestId('canvas-title')).toContainText(name)
     await expect(page.getByTestId('autosave')).toHaveText(/saved locally/)
     await expect.poll(async () => {
@@ -1310,7 +1311,7 @@ test.describe('Data Playground canvas', () => {
   test('native Canvas upload validates and creates a separate Canvas while the optional foreign importer stays hidden', async ({ page }) => {
     await fresh(page)
     const original = await page.evaluate(() => location.hash)
-    const canvasId = decodeURIComponent(original.split('/').pop()!)
+    const canvasId = canvasIdFromLocation(original)
     const exported = await page.request.get(`/api/canvas/${canvasId}/native-export`)
     expect(exported.ok()).toBe(true)
     const envelope = await exported.json()
@@ -1333,7 +1334,7 @@ test.describe('Data Playground canvas', () => {
     await addNode(page, 'Shape', 'filter')
     await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
     const original = await page.evaluate(() => location.hash)
-    const sourceId = decodeURIComponent(original.split('?')[0].split('/').pop()!)
+    const sourceId = canvasIdFromLocation(original)
     await page.getByTestId('app-menu').click()
     await page.getByTestId('copy-canvas').click()
     await page.getByLabel('New Canvas name').fill('E2E independent copy')
@@ -1341,7 +1342,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('1 nodes · 0 connections · 0 requirements')).toBeVisible()
     await page.getByRole('button', { name: 'Duplicate and open' }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
-    const copyId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const copyId = canvasIdFromLocation(page.url())
     const copied = await (await page.request.get(`/api/canvas/${copyId}`)).json()
     expect(copied.name).toBe('E2E independent copy')
     expect(copied.nodes).toHaveLength(1)
@@ -1382,7 +1383,7 @@ test.describe('Data Playground canvas', () => {
 
     await create.click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
-    const copyId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const copyId = canvasIdFromLocation(page.url())
     const copied = await (await page.request.get(`/api/canvas/${copyId}`)).json() as {
       nodes: Array<{ type: string; data: Record<string, unknown> }>
     }
@@ -1801,7 +1802,7 @@ test.describe('Data Playground canvas', () => {
 
   test('a section editor uses canvas containment instead of inline nodes', async ({ page }) => {
     await fresh(page)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const canvasId = canvasIdFromLocation(page.url())
     await addNode(page, 'Compute', 'section')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByText('Edit script →').click()
@@ -2300,7 +2301,7 @@ test.describe('Data Playground canvas', () => {
     // makes must show up in the ALREADY-OPEN tab with no reload (the collab external-edit nudge).
     await fresh(page)
     await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 }) // persisted → MCP can load it
-    const cid = (await page.evaluate(() => location.hash)).replace('#/canvas/', '')
+    const cid = canvasIdFromLocation(await page.evaluate(() => location.hash))
     expect(cid).toBeTruthy()
     await waitForCollabRoom(page, cid)
     // add a node purely via MCP (no browser interaction) — the request is the agent's tool call
@@ -2363,7 +2364,7 @@ test.describe('Data Playground canvas', () => {
     // A server-created blank Canvas is already saved and must not be echoed back as a second
     // version. Make one real user edit so Version history has an honest snapshot to restore.
     await addNode(page, 'Shape', 'filter')
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+    const canvasId = canvasIdFromLocation(page.url())
     await expect.poll(async () => (await canvasFor(page, canvasId)).nodes.length).toBe(1)
     await page.getByTestId('app-menu').click()
     await page.getByText('Version history').click()
@@ -2434,7 +2435,7 @@ test.describe('Data Playground canvas', () => {
 
   test('run history can create a Canvas without exposing the retained execution manifest @ux-smoke', async ({ page }) => {
     await fresh(page)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const canvasId = canvasIdFromLocation(page.url())
     const digest = 'c'.repeat(64)
     await page.route(`**/api/canvas/${canvasId}/runs`, async (route) => {
       await route.fulfill({ json: [{
@@ -2738,7 +2739,7 @@ test.describe('Data Playground canvas', () => {
       await expect(viewer).not.toContainText(`${exact.datasetId}@${alternateRevisionId}`)
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
 
-      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId, 'source'))
       const inspector = page.getByTestId('inspector')
       await expect(inspector).toContainText('DATASET')
       await expect(inspector).toContainText('Saved version')
@@ -2761,7 +2762,7 @@ test.describe('Data Playground canvas', () => {
       await expect(page.getByTestId('dataset-viewer').getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
 
       await page.goForward()
-      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=source$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId, 'source'))
       await expect(page.getByTestId('inspector')).toContainText('Saved version')
       await expect(page.getByTestId('inspector')).not.toContainText(exact.revisionId)
       await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
@@ -2778,7 +2779,7 @@ test.describe('Data Playground canvas', () => {
       await expect(staleViewer.getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
       await staleViewer.getByRole('button', { name: 'Back to Canvas' }).click()
 
-      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId))
       await expect(page.getByTestId('inspector')).toHaveCount(0)
       await expect(page.getByText('The requested node is no longer in this Canvas.')).toBeVisible()
       await expect(page.locator('.react-flow__node[data-id="source"]')).toContainText('Unsaved researcher title')
@@ -2866,7 +2867,7 @@ test.describe('Data Playground canvas', () => {
       await expect(viewer.getByLabel('Dataset preview scope')).toContainText('from this selected version')
       await expect(viewer.getByRole('button', { name: 'Back to Canvas' })).toBeVisible()
       await viewer.getByRole('button', { name: 'Back to Canvas' }).click()
-      await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasId)}\\?node=write$`))
+      await expect(page).toHaveURL(canvasRoutePattern(canvasId, 'write'))
       await expect(page.getByTestId('inspector').getByLabel('Write publication')).toContainText(publishedName)
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
@@ -3181,7 +3182,7 @@ test.describe('Data Playground canvas', () => {
 
     try {
       await fresh(page)
-      canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      canvasId = canvasIdFromLocation(page.url())
       await addNode(page, 'Sources & sinks', 'source')
       const source = page.locator('.react-flow__node-source')
       const inspector = page.getByTestId('inspector')

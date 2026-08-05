@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { canvasRoutePattern } from './support/canvasRoute'
 
 const LONG_CANVAS_NAME = 'Quarterly customer acquisition and retention cohort analysis with regional attribution — July 2026 final review'
 const VIEWPORTS = [
@@ -125,7 +126,7 @@ test('browser Back cannot carry a title rollback into another Canvas', async ({ 
     await page.getByRole('textbox', { name: 'Canvas name' }).fill('Canvas A in progress')
 
     await page.goBack()
-    await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${encodeURIComponent(canvasB)}$`))
+    await expect(page).toHaveURL(canvasRoutePattern(canvasB))
     await expect(page.getByRole('textbox', { name: 'Canvas name' })).toHaveCount(0)
     await expect(page.getByTestId('canvas-title')).toHaveText(canvasBName)
 

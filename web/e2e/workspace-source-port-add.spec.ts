@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { canvasIdFromLocation } from './support/canvasRoute'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
 async function expectToolbarInsideCanvas(page: Page, viewportWidth: number) {
@@ -50,7 +51,7 @@ test.describe('Workspace Source port-add flow @ux-smoke', () => {
     const useDialog = page.getByRole('dialog', { name: 'Use events' })
     await useDialog.getByRole('button', { name: 'Create and open' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])
+    const canvasId = canvasIdFromLocation(page.url())
 
     const toolbar = page.getByTestId('toolbar')
     const viewportControls = page.getByTestId('canvas-viewport-controls')

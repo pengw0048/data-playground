@@ -1,4 +1,5 @@
 import { expect, type Locator, type Page } from '@playwright/test'
+import { canvasIdFromLocation } from './canvasRoute'
 
 export async function goToWorkspace(page: Page) {
   await page.goto('/#/workspace')
@@ -30,7 +31,7 @@ export async function createCanvasFromWorkspace(page: Page, name = `E2E Canvas $
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.getByTestId('toolbar')).toBeVisible()
-  return decodeURIComponent(new URL(page.url()).hash.split('?')[0].split('/').pop()!)
+  return canvasIdFromLocation(page.url())
 }
 
 export async function workspaceResource(

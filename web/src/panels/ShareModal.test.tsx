@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   removeShare: vi.fn(),
   pushToast: vi.fn(),
   state: {
-    doc: { id: 'canvas-1' },
+    doc: { id: 'canvas-1', name: 'Research notebook' },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
     authEnabled: true,
     users: [
@@ -142,5 +142,12 @@ describe('ShareModal — server-authoritative sharing truth', () => {
     expect(screen.getByTestId('copy-link')).toBeVisible()
     expect(screen.queryByText('Visibility')).toBeNull()
     expect(screen.queryByText('Collaborators')).toBeNull()
+  })
+
+  it('includes the current title slug after the immutable file key in the share link', async () => {
+    mocks.state.authEnabled = false
+    render(<ShareModal onClose={vi.fn()} />)
+    const link = screen.getByDisplayValue(/#\/canvas\/canvas-1\/Research-notebook$/)
+    expect(link).toBeVisible()
   })
 })

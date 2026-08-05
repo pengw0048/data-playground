@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { canvasIdFromLocation, canvasRoutePattern } from './support/canvasRoute'
 
 test.describe('Workspace capability actions @ux-smoke', () => {
   test('creates, renames, reloads, and reopens nested local folders at 1280x720', async ({ page }) => {
@@ -29,7 +30,7 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await createCanvas.getByLabel('Canvas name').fill(canvas)
     await createCanvas.getByRole('button', { name: 'Create canvas' }).click()
     await expect(page).toHaveURL(/#\/canvas\//)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const canvasId = canvasIdFromLocation(page.url())
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
 
@@ -52,7 +53,7 @@ test.describe('Workspace capability actions @ux-smoke', () => {
     await page.getByRole('button', { name: `Open folder ${renamed}` }).click()
     await page.getByRole('button', { name: `Open folder ${child}` }).click()
     await page.getByRole('button', { name: `Open canvas ${canvas}` }).click()
-    await expect(page).toHaveURL(new RegExp(`/#/canvas/${canvasId}$`))
+    await expect(page).toHaveURL(canvasRoutePattern(canvasId))
   })
 
   test('moves a local Canvas from its overflow menu and undoes the placement move', async ({ page }) => {

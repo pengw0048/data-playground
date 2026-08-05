@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test } from '@playwright/test'
+import { canvasIdFromLocation } from './support/canvasRoute'
 import {
   prepareProviderAcceptanceFixture,
   providerAcceptanceNames,
@@ -364,9 +365,7 @@ test.describe('provider Workspace Source acceptance', () => {
     const source = page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })
     await expect(source).toHaveCount(1)
     await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
-    const canvasId = decodeURIComponent(
-      new URL(page.url()).hash.split('/').pop()!.split('?')[0],
-    )
+    const canvasId = canvasIdFromLocation(page.url())
 
     const exactProviderCanvas = await (await page.request.get(`/api/canvas/${canvasId}`)).json() as {
       nodes: Array<{ id: string; type: string; data: { config: {

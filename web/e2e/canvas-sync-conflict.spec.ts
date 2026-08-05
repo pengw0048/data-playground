@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { canvasIdFromLocation } from './support/canvasRoute'
 
 test('the sync conflict chip reopens the recovery choice, before and after a reload', async ({ page }) => {
   test.setTimeout(90_000)
@@ -55,7 +56,7 @@ test('the sync conflict chip reopens the recovery choice, before and after a rel
     await expect(page.getByTestId('canvas-title')).toContainText('(recovered)', { timeout: 8_000 })
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
     await expect(chip).toHaveCount(0)
-    recoveredId = new URL(page.url()).hash.replace('#/canvas/', '')
+    recoveredId = canvasIdFromLocation(page.url())
     expect(recoveredId).not.toBe(canvasId)
   } finally {
     await page.request.delete(`/api/canvas/${canvasId}`)
