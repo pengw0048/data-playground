@@ -6,7 +6,8 @@ import { KernelError } from '../api/client'
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceFavorites: vi.fn(), workspaceFavoriteStatus: vi.fn(),
   workspaceFavoriteAdd: vi.fn(), workspaceFavoriteRemove: vi.fn(),
-  workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
+  workspaceRecent: vi.fn(), workspaceOpened: vi.fn(), workspaceResource: vi.fn(),
+  workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
   unregisterTable: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRemoveDetachedDataset: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
@@ -166,6 +167,14 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [] })
     mocks.workspaceFavoriteAdd.mockResolvedValue({ ok: true, favorited: true, resourceId: DATASET.id })
     mocks.workspaceFavoriteRemove.mockResolvedValue({ ok: true, favorited: false, resourceId: DATASET.id })
+    mocks.workspaceRecent.mockResolvedValue({
+      container: null, items: [], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['opened'], kindFilter: false },
+    })
+    mocks.workspaceOpened.mockResolvedValue({
+      resourceId: 'canvas:canvas-1', lastOpenedAt: '2026-03-01T00:00:00+00:00', coalesced: false,
+    })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.workspaceCanonicalDataset.mockResolvedValue(CANONICAL_DATASET_CONTEXT)
@@ -2755,5 +2764,32 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.workspaceFavorites).toHaveBeenCalled())
     expect(store.setWorkspaceBrowseQuery).toHaveBeenCalledWith('wq=1&sort=name&order=asc&view=grid')
     expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toHaveValue('all')
+  })
+
+  it('opens Recent as a shelf beside Favorites without turning it into a sort mode', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated', 'opened'], kindFilter: true },
+    })
+    mocks.workspaceRecent.mockResolvedValue({
+      container: null, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['opened'], kindFilter: false },
+    })
+    render(<WorkspaceExplorer />)
+
+    const recent = await screen.findByTestId('workspace-recent-filter')
+    fireEvent.click(recent)
+
+    await waitFor(() => expect(mocks.workspaceRecent).toHaveBeenCalledWith({
+      limit: 50, cursor: undefined,
+    }))
+    expect(recent).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('workspace-favorites-filter')).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Recent')
+    expect(screen.queryByRole('combobox', { name: 'Sort Workspace' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Open canvas Analysis' })).toBeVisible()
   })
 })

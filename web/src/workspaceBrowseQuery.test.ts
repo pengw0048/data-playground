@@ -30,6 +30,12 @@ describe('workspaceBrowseQuery', () => {
     expect(serializeBrowseState({
       sortMode: 'source', kindFilter: 'all', viewMode: 'list',
     })).toBe('')
+
+    const opened = serializeBrowseState({
+      sortMode: 'opened-desc', kindFilter: 'all', viewMode: 'list',
+    })
+    expect(opened).toContain('sort=opened')
+    expect(browseStateFromQuery(opened).sortMode).toBe('opened-desc')
   })
 
   it('falls back safely for unknown, duplicate, malformed, and oversized values', () => {

@@ -379,6 +379,8 @@ export interface WorkspaceResource {
   canvasVersion?: number | null
   /** Authoritative modification time when the backing resource exposes one. */
   updatedAt?: string | null
+  /** Personal successful-open time for the current actor; never mutates updatedAt. */
+  lastOpenedAt?: string | null
   /** Stable built-in Catalog folder binding when this local container is a folder projection. */
   catalogFolderId?: string | null
   catalogFolderState?: 'current' | 'detached' | null
@@ -423,7 +425,7 @@ export interface WorkspaceSourceStatus {
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
 }
 export interface WorkspaceQueryCapabilities {
-  sort: Array<'name' | 'updated'>
+  sort: Array<'name' | 'updated' | 'opened'>
   kindFilter: boolean
   reason?: string | null
 }

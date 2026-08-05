@@ -290,7 +290,7 @@ export const api = {
     cursor?: string
     limit?: number
     source?: 'local' | 'provider'
-    sort?: 'name' | 'updated'
+    sort?: 'name' | 'updated' | 'opened'
     order?: 'asc' | 'desc'
     kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
   }) => {
@@ -326,6 +326,17 @@ export const api = {
   workspaceFavoriteRemove: (resourceId: string) =>
     req<{ ok: boolean; favorited: boolean; resourceId: string }>(
       `/workspace/favorites/${encodeURIComponent(resourceId)}`, { method: 'DELETE' },
+    ),
+  workspaceRecent: (params?: { cursor?: string; limit?: number }) => {
+    const query = new URLSearchParams()
+    if (params?.cursor) query.set('cursor', params.cursor)
+    if (params?.limit) query.set('limit', String(params.limit))
+    return req<WorkspaceBrowsePage>(`/workspace/recent${query.size ? `?${query}` : ''}`)
+  },
+  workspaceOpened: (resourceId: string) =>
+    req<{ resourceId: string; lastOpenedAt: string; coalesced: boolean }>(
+      `/workspace/resources/${encodeURIComponent(resourceId)}/opened`,
+      { method: 'POST' },
     ),
   workspaceResource: (resourceId: string, options?: { signal?: AbortSignal }) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`, {

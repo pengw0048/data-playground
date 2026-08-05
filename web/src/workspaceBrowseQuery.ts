@@ -13,7 +13,7 @@ export const WORKSPACE_BROWSE_QUERY_KEYS = [
   'wq', 'sort', 'order', 'kind', 'view', 'cf',
 ] as const
 
-export type WorkspaceBrowseSortField = 'name' | 'updated'
+export type WorkspaceBrowseSortField = 'name' | 'updated' | 'opened'
 export type WorkspaceBrowseSortOrder = 'asc' | 'desc'
 export type WorkspaceBrowseKind = 'container' | 'canvas' | 'dataset' | 'dataset_view'
 export type WorkspaceBrowseViewMode = 'list' | 'grid'
@@ -25,6 +25,7 @@ export type WorkspaceBrowseSortMode =
   | 'name-desc'
   | 'updated-desc'
   | 'updated-asc'
+  | 'opened-desc'
 
 export interface WorkspaceBrowseQuery {
   version: typeof WORKSPACE_BROWSE_QUERY_VERSION
@@ -36,7 +37,7 @@ export interface WorkspaceBrowseQuery {
   columnFilters?: Record<string, string>
 }
 
-const SORT_FIELDS = new Set<WorkspaceBrowseSortField>(['name', 'updated'])
+const SORT_FIELDS = new Set<WorkspaceBrowseSortField>(['name', 'updated', 'opened'])
 const SORT_ORDERS = new Set<WorkspaceBrowseSortOrder>(['asc', 'desc'])
 const KINDS = new Set<WorkspaceBrowseKind>(['container', 'canvas', 'dataset', 'dataset_view'])
 const VIEWS = new Set<WorkspaceBrowseViewMode>(['list', 'grid'])

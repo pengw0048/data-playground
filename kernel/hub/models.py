@@ -1288,6 +1288,8 @@ class WorkspaceResource(Wire):
     version: int | None = None
     canvas_version: int | None = Field(default=None, ge=1)
     updated_at: datetime.datetime | None = None
+    # Personal successful-open timestamp; never advances collaborative resource updated_at.
+    last_opened_at: datetime.datetime | None = None
     catalog_folder_id: str | None = None
     catalog_folder_state: Literal["current", "detached"] | None = None
     catalog_folder_path: str | None = None
@@ -1351,9 +1353,16 @@ class WorkspaceSourceStatus(Wire):
 
 class WorkspaceQueryCapabilities(Wire):
     """Queries that are truthful for every item returned by this browse lens."""
-    sort: list[Literal["name", "updated"]] = []
+    sort: list[Literal["name", "updated", "opened"]] = []
     kind_filter: bool = False
     reason: str | None = Field(default=None, max_length=256)
+
+
+class WorkspaceOpenObservation(Wire):
+    """Result of recording one personal successful Workspace open."""
+    resource_id: str
+    last_opened_at: datetime.datetime
+    coalesced: bool = False
 
 
 class WorkspaceBrowsePage(Wire):

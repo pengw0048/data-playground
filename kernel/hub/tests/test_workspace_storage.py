@@ -5092,7 +5092,7 @@ def test_workspace_connected_source_lens_is_separate_bounded_and_resolvable(
         assert [item["name"] for item in local_page["items"]] == [
             f"workspace-{token}-z-local", f"workspace-{token}-a-local"]
         assert local_page["queryCapabilities"] == {
-            "sort": ["name", "updated"], "kindFilter": True, "reason": None}
+            "sort": ["name", "updated", "opened"], "kindFilter": True, "reason": None}
         assert [source["kind"] for source in local_page["sources"]] == [
             "local", "configuration"]
         assert local_page["sources"][1]["error"] == "catalog mount configuration is invalid"
@@ -5296,7 +5296,7 @@ def test_workspace_normal_local_browse_keeps_sort_and_filter_capabilities(worksp
     page = response.json()
     assert page["connectedSources"] == []
     assert page["queryCapabilities"] == {
-        "sort": ["name", "updated"], "kindFilter": True, "reason": None}
+        "sort": ["name", "updated", "opened"], "kindFilter": True, "reason": None}
 
 
 def test_workspace_default_browse_mixes_local_and_connected_source_roots(

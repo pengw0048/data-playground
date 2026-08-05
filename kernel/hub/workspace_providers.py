@@ -1742,7 +1742,7 @@ def browse_local_source(
         ),
         "connectedSources": connected_sources,
         "queryCapabilities": {
-            "sort": ["name", "updated"],
+            "sort": ["name", "updated", "opened"],
             "kindFilter": True,
             "reason": None,
         },

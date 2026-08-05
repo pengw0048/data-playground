@@ -4,7 +4,6 @@ import {
 } from 'react'
 import { api, KernelError, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
-import { canvasOpenedAt } from '../store/canvasRecents'
 import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceResource, WorkspaceSearchGroup,
@@ -34,6 +33,7 @@ import {
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const FAVORITES_SHELF_ID = 'workspace-favorites'
+const RECENT_SHELF_ID = 'workspace-recent'
 const PAGE_SIZE = 50
 const WORKSPACE_SEARCH_PAGE_SIZE = 25
 const WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS = 100
@@ -43,13 +43,16 @@ const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
 const FAVORITES_BREADCRUMB: WorkspaceResource = {
   id: `container:${FAVORITES_SHELF_ID}`, kind: 'container', name: 'Favorites', detached: false, source: 'local',
 }
+const RECENT_BREADCRUMB: WorkspaceResource = {
+  id: `container:${RECENT_SHELF_ID}`, kind: 'container', name: 'Recent', detached: false, source: 'local',
+}
 const NON_EMPTY_LOCAL_FOLDER_REASON = "Move or remove this Folder's contents before deleting it."
 const PROVIDER_PLACEMENT_CACHE_MAX_DATASETS = 64
 const PROVIDER_PLACEMENT_CACHE_MAX_PLACEMENTS = 6
 const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
 const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for this run; it is not a data column.'
 const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
-  sort: ['name', 'updated'], kindFilter: true,
+  sort: ['name', 'updated', 'opened'], kindFilter: true,
 }
 
 type WorkspaceFavoritesApi = {
@@ -590,7 +593,9 @@ function WorkspaceMixedExplorer() {
   const [hasMore, setHasMore] = useState(false)
   const [pageCursors, setPageCursors] = useState<(string | null)[]>([null])
   const [pageIndex, setPageIndex] = useState(0)
-  const [favoritesOnly, setFavoritesOnly] = useState(false)
+  const [activeShelf, setActiveShelf] = useState<'favorites' | 'recent' | null>(null)
+  const favoritesOnly = activeShelf === 'favorites'
+  const recentOnly = activeShelf === 'recent'
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(() => new Set())
   const [selectedResourceIds, setSelectedResourceIds] = useState<Set<string>>(new Set())
   const { sortMode, kindFilter, viewMode } = useMemo(
@@ -701,7 +706,7 @@ function WorkspaceMixedExplorer() {
         setContainerId(identity(shelf))
         loadedContainer.current = identity(shelf)
         setContainer(shelf)
-        if (!paging) setCrumbs([shelf])
+        if (!paging) setCrumbs([WORKSPACE_ROOT_BREADCRUMB, shelf])
         setItems(page.items)
         setFavoriteIds(new Set(page.items.map((item) => item.id)))
         setSelectedResourceIds(new Set())
@@ -715,9 +720,39 @@ function WorkspaceMixedExplorer() {
         setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
         return
       }
+      if (recentOnly) {
+        const page = await api.workspaceRecent({
+          limit: PAGE_SIZE,
+          cursor: pageCursor ?? undefined,
+        })
+        if (sequence !== request.current) return
+        setCompleteness(page.completeness)
+        setSources(page.sources ?? [])
+        setConnectedSources([])
+        setQueryCapabilities(page.queryCapabilities ?? {
+          sort: ['opened'], kindFilter: false,
+          reason: 'Recently opened lists personal successful opens newest first.',
+        })
+        setContainerId(RECENT_SHELF_ID)
+        loadedContainer.current = RECENT_SHELF_ID
+        setContainer(RECENT_BREADCRUMB)
+        if (!paging) setCrumbs([WORKSPACE_ROOT_BREADCRUMB, RECENT_BREADCRUMB])
+        providerPlacementObservations.observe(page.items, [], { current: true })
+        setItems(page.items)
+        setSelectedResourceIds(new Set())
+        setPageIndex(targetPage)
+        setPageCursors((current) => {
+          const next = sameContainer && targetPage > 0 ? current.slice(0, targetPage + 1) : [null]
+          next[targetPage] = pageCursor
+          if (page.nextCursor) next[targetPage + 1] = page.nextCursor
+          return next
+        })
+        setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+        return
+      }
       const localSource = !isProviderBrowseIdentity(targetId)
       const [sort, order] = sortMode === 'source' ? [undefined, undefined]
-        : sortMode.split('-') as ['name' | 'updated', 'asc' | 'desc']
+        : sortMode.split('-') as ['name' | 'updated' | 'opened', 'asc' | 'desc']
       const params: Parameters<typeof api.workspaceBrowse>[1] = {
         limit: PAGE_SIZE,
         cursor: pageCursor ?? undefined,
@@ -780,7 +815,7 @@ function WorkspaceMixedExplorer() {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [providerPlacementObservations, sortMode, kindFilter, favoritesOnly])
+  }, [providerPlacementObservations, sortMode, kindFilter, favoritesOnly, recentOnly])
 
   useEffect(() => {
     let cancelled = false
@@ -836,7 +871,10 @@ function WorkspaceMixedExplorer() {
           setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
           try {
             const view = await api.datasetView(identity(resolved.resource))
-            if (!cancelled) setSelectedView(view)
+            if (!cancelled) {
+              setSelectedView(view)
+              void api.workspaceOpened(resolved.resource.id).catch(() => { /* open metadata is best-effort */ })
+            }
           } catch (caught) {
             if (!cancelled) setResolutionError(errorMessage(caught))
           }
@@ -862,6 +900,8 @@ function WorkspaceMixedExplorer() {
           setSelectedTable(null); setSelectedDetached(null)
           if (resolved.source.completeness !== 'complete') {
             setResolutionError(statusMessage(resolved.source) ?? 'Workspace path is partial')
+          } else {
+            void api.workspaceOpened(resolved.resource.id).catch(() => { /* open metadata is best-effort */ })
           }
           return
         }
@@ -869,6 +909,9 @@ function WorkspaceMixedExplorer() {
         try {
           setSelectedTable(null); setSelectedDetached(null)
           setSelectedTable(await api.tableByRegistration(identity(resolved.resource)))
+          if (!cancelled) {
+            void api.workspaceOpened(resolved.resource.id).catch(() => { /* open metadata is best-effort */ })
+          }
         }
         catch (caught) {
           if (cancelled) return
@@ -893,7 +936,7 @@ function WorkspaceMixedExplorer() {
     // Folder navigation changes the target of every create/move action. Make that context switch
     // synchronously, then let route resolution refresh the authoritative contents. Otherwise a
     // quick follow-up action can run against the folder we just left.
-    setFavoritesOnly(false)
+    setActiveShelf(null)
     const alreadySelected = identity(resource) === containerId
       && (requestedResourceId === resource.id
         || (identity(resource) === LOCAL_ROOT_ID && requestedResourceId === null))
@@ -980,6 +1023,10 @@ function WorkspaceMixedExplorer() {
     if (!viewerReturn) {
       if (providerViewerRoute.exactRevision) {
         switchWorkspaceScope('all', { resourceId: `container:${containerId}`, datasetQuery: '' })
+        return
+      }
+      if (activeShelf) {
+        setWorkspaceResource(null)
         return
       }
       setWorkspaceResource(`container:${containerId}`)
@@ -1241,8 +1288,8 @@ function WorkspaceMixedExplorer() {
       <header className="flex min-h-[60px] flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-7 py-2.5">
         <nav aria-label="Workspace path" className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground">
           <button onClick={() => {
-            if (favoritesOnly) {
-              setFavoritesOnly(false)
+            if (activeShelf) {
+              setActiveShelf(null)
               setWorkspaceResource(null)
               return
             }
@@ -1305,7 +1352,7 @@ function WorkspaceMixedExplorer() {
         <button type="button" aria-pressed={favoritesOnly} data-testid="workspace-favorites-filter"
           onClick={() => {
             const nextFavoritesOnly = !favoritesOnly
-            setFavoritesOnly(nextFavoritesOnly)
+            setActiveShelf(nextFavoritesOnly ? 'favorites' : null)
             if (nextFavoritesOnly && kindFilter !== 'all' && kindFilter !== 'canvas' && kindFilter !== 'dataset') {
               commitBrowseState({ kindFilter: 'all' })
             }
@@ -1316,7 +1363,17 @@ function WorkspaceMixedExplorer() {
           className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold ${favoritesOnly ? 'border-primary bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground'}`}>
           <Icon name="star" size={12} filled={favoritesOnly} /> Favorites
         </button>
-        {sortSupported && <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
+        <button type="button" aria-pressed={recentOnly} data-testid="workspace-recent-filter"
+          onClick={() => {
+            setActiveShelf(recentOnly ? null : 'recent')
+            setSelectedResourceIds(new Set())
+            setWorkspaceSearchQuery('')
+            setSearchDraft('')
+          }}
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold ${recentOnly ? 'border-primary bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground'}`}>
+          <Icon name="clock" size={12} /> Recent
+        </button>
+        {sortSupported && !activeShelf && <select aria-label="Sort Workspace" value={sortMode} onChange={(event) => {
           commitBrowseState({ sortMode: event.target.value as WorkspaceBrowseSortMode })
         }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
@@ -1325,8 +1382,9 @@ function WorkspaceMixedExplorer() {
           <option value="name-desc">Name Z–A</option>
           <option value="updated-desc">Recently updated</option>
           <option value="updated-asc">Least recently updated</option>
+          {queryCapabilities.sort.includes('opened') ? <option value="opened-desc">Recently opened</option> : null}
         </select>}
-        {kindFilterSupported && <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
+        {kindFilterSupported && !recentOnly && <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
           commitBrowseState({ kindFilter: event.target.value as WorkspaceBrowseKind | 'all' })
         }}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
@@ -1440,7 +1498,9 @@ function WorkspaceMixedExplorer() {
                 && (!isExternal(resource) || resource.providerMutation)
                 ? () => setDatasetRemoveResource(resource) : undefined} />
             })}
-          </div></> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
+          </div></> : visibleConnectedSources.length ? null : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{recentOnly
+            ? 'No recently opened items yet.'
+            : !container
             ? 'This Workspace location is unavailable.'
             : favoritesOnly ? 'No favorites yet. Star a dataset or Canvas from Workspace.'
             : hasMore ? 'This page has no items. Continue to the next page.'
@@ -1450,11 +1510,11 @@ function WorkspaceMixedExplorer() {
               : 'This folder is empty. Create a Canvas here to get started.'}</span></div>}
           {loadMoreError && <div role="alert" className="mt-3 self-center text-[12px] text-destructive">Couldn't load this page: {loadMoreError}</div>}
           {(pageIndex > 0 || hasMore) && <nav aria-label="Workspace pages" className="mt-3 flex items-center justify-center gap-2 text-[12px]">
-            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : containerId, pageCursors[pageIndex - 1] ?? null, pageIndex - 1)}
+            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : recentOnly ? RECENT_SHELF_ID : containerId, pageCursors[pageIndex - 1] ?? null, pageIndex - 1)}
               disabled={pageIndex === 0 || loadingMore} data-testid="workspace-previous-page"
               className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">Previous</button>
             <span className="min-w-16 text-center text-muted-foreground">Page {pageIndex + 1}</span>
-            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : containerId, cursor, pageIndex + 1)}
+            <button type="button" onClick={() => void load(favoritesOnly ? FAVORITES_SHELF_ID : recentOnly ? RECENT_SHELF_ID : containerId, cursor, pageIndex + 1)}
               disabled={!hasMore || !cursor || loadingMore} data-testid="workspace-next-page"
               className="rounded-md border border-border bg-card px-3 py-1.5 font-semibold disabled:opacity-50">{loadingMore ? 'Loading…' : loadMoreError ? 'Retry' : 'Next'}</button>
           </nav>}
@@ -2388,8 +2448,7 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   const grid = viewMode === 'grid'
   const updatedAt = workspaceTimestampLabel(resource.updatedAt)
-  const openedAtValue = resource.kind === 'canvas'
-    ? canvasOpenedAt(currentUserId, identity(resource)) : null
+  const openedAtValue = resource.lastOpenedAt ?? null
   const openedAt = workspaceTimestampLabel(openedAtValue)
   const updatedAtTitle = resource.updatedAt ? new Date(resource.updatedAt).toLocaleString() : undefined
   const openedAtTitle = openedAtValue ? new Date(openedAtValue).toLocaleString() : undefined

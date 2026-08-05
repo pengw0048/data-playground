@@ -52,7 +52,11 @@ export type CanvasCreationResult =
   | { ok: false }
 
 type NavigationOptions = { navigationToken?: NavigationToken }
-type CanvasNavigationOptions = NavigationOptions & { skipViewportFit?: boolean }
+type CanvasNavigationOptions = NavigationOptions & {
+  skipViewportFit?: boolean
+  /** When false, load the Canvas without recording a personal Recently opened observation. */
+  observeOpen?: boolean
+}
 type OpenFileOptions = CanvasNavigationOptions & { serverCopy?: boolean }
 
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
@@ -2066,6 +2070,12 @@ export const useStore = create<Store>((set, get) => ({
     if (state.doc.id !== canvasId) return false
     startNavigation()
     if (state.view !== 'canvas') _fileNavigationGeneration += 1
+    const uid = state.currentUser?.id
+    if (uid) {
+      localStorage.setItem(OPEN_KEY(uid), canvasId)
+      rememberCanvasOpenedAt(uid, canvasId)
+      void api.workspaceOpened(`canvas:${canvasId}`).catch(() => { /* open metadata is best-effort */ })
+    }
     const nodeExists = !!nodeId && state.doc.nodes.some((node) => node.id === nodeId)
     set({
       view: 'canvas',
@@ -4115,7 +4125,11 @@ export const useStore = create<Store>((set, get) => ({
           }
           if (!opened) {
             if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId, { navigationToken })
-            else if (fallback) await get().openFile(fallback, { navigationToken })
+            else if (fallback) await get().openFile(fallback, {
+              navigationToken,
+              // Shell routes keep a Canvas loaded underneath; that is not a researcher open.
+              observeOpen: route.view === 'canvas',
+            })
             if (ownsNavigation(navigationToken)) {
               // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
               if (!fallbackDraft && !fallback) get().applyRoute({ view: 'workspace' }, navigationToken)
@@ -4218,10 +4232,14 @@ export const useStore = create<Store>((set, get) => ({
       if (!isCurrent()) return false
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
-      if (uid) {
+      if (uid && isCurrent()) {
         localStorage.setItem(OPEN_KEY(uid), id)
         rememberCanvasOpenedAt(uid, id)
+        if (options?.observeOpen !== false) {
+          void api.workspaceOpened(`canvas:${id}`).catch(() => { /* open metadata is best-effort */ })
+        }
       }
+      if (!isCurrent()) return false
       // Opening any authoritative Canvas resolves first-run choice, including a Canvas created by
       // Workspace "Use data" rather than one of the banner's own buttons.
       set({ view: 'canvas', firstRunChoice: false })
@@ -4334,6 +4352,9 @@ export const useStore = create<Store>((set, get) => ({
     if (uid) {
       localStorage.setItem(OPEN_KEY(uid), doc.id)
       rememberCanvasOpenedAt(uid, doc.id)
+      if (persistence === 'remote') {
+        void api.workspaceOpened(`canvas:${doc.id}`).catch(() => { /* open metadata is best-effort */ })
+      }
     }
     set({ view: 'canvas', firstRunChoice: false })
     if (signal && persistence === 'remote') void get().refreshFiles()
@@ -4464,6 +4485,9 @@ export const useStore = create<Store>((set, get) => ({
     if (uid) {
       localStorage.setItem(OPEN_KEY(uid), doc.id)
       rememberCanvasOpenedAt(uid, doc.id)
+      if (persistence === 'remote') {
+        void api.workspaceOpened(`canvas:${doc.id}`).catch(() => { /* open metadata is best-effort */ })
+      }
     }
     set({ view: 'canvas', firstRunChoice: false })
     get().requestViewportFit(get().doc)
