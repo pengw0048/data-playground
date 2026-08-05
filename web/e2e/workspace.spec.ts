@@ -120,7 +120,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
         && response.ok()
       ))
       await (await workspaceResource(page, 'canvas', firstName)).click()
-      await expect(page).toHaveURL(new RegExp(`/#/canvas/${firstId}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(firstId))
       await openFirst
       await page.goBack()
       await expect(await workspaceResource(page, 'canvas', secondName)).toBeVisible()
@@ -134,7 +134,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
         && response.ok()
       ))
       await (await workspaceResource(page, 'canvas', secondName)).click()
-      await expect(page).toHaveURL(new RegExp(`/#/canvas/${secondId}$`))
+      await expect(page).toHaveURL(canvasRoutePattern(secondId))
       await openSecond
       await page.goBack()
       await expect(page.getByRole('navigation', { name: 'Workspace path' })).toBeVisible()
