@@ -642,7 +642,9 @@ def _bucket_placement(placement: str | None) -> str:
 def invoke_backend_run(backend, plan, graph, target_node_id, placement, *,
                        run_id: str | None = None, request_id: str | None = None,
                        attempt_id: str | None = None,
-                       input_manifest: list[dict[str, str]] | None = None):
+                       input_manifest: list[dict[str, str]] | None = None,
+                       reused_nodes=None,
+                       reused_boundary=None):
     """Call ``backend.run`` forwarding optional correlation kwargs when the backend accepts them.
 
     The ``ExecutionBackend`` Protocol keeps the four positional parameters; optional ``run_id``,
@@ -664,6 +666,10 @@ def invoke_backend_run(backend, plan, graph, target_node_id, placement, *,
         kwargs["attempt_id"] = attempt_id
     if input_manifest is not None and "input_manifest" in params:
         kwargs["input_manifest"] = input_manifest
+    if reused_nodes is not None and "reused_nodes" in params:
+        kwargs["reused_nodes"] = reused_nodes
+    if reused_boundary is not None and "reused_boundary" in params:
+        kwargs["reused_boundary"] = reused_boundary
     status = backend.run(plan, graph, target_node_id, placement, **kwargs)
     if request_id and getattr(status, "request_id", None) in (None, ""):
         try:

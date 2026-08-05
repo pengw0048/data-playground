@@ -833,6 +833,16 @@ export interface PerNodeStatus {
   ms?: number | null
   label?: string | null
   error?: string | null   // set on the failed step — the error + a fix hint, attributed to its node
+  reused?: boolean
+}
+
+export interface ReusableExecutionBoundary {
+  canvasId: string
+  targetNodeId: string
+  boundaryNodeId: string
+  boundaryPortId: string
+  boundaryRunId: string
+  boundaryExecutionManifestSha256: string
 }
 
 export type RunOutputOutcome = 'pending' | 'committed' | 'failed' | 'skipped' | 'cancelled'
@@ -1096,6 +1106,7 @@ export interface RunStatus {
   planDigest?: string | null
   profileAttemptOrder?: number | null
   executionManifestSha256?: string | null
+  reusedBoundary?: ReusableExecutionBoundary | null
 }
 
 export interface PlanStep {

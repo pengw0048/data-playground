@@ -2058,6 +2058,19 @@ class PerNodeStatus(Wire):
     ms: int | None = None
     label: str | None = None
     error: str | None = None  # set on the step that failed — the error (+ a fix hint) attributed to its node
+    # True when this node was satisfied by an admitted retained boundary rather than executed now.
+    reused: bool = False
+
+
+class ReusableExecutionBoundary(Wire):
+    """Opaque server-admitted reusable local boundary. Never includes an artifact URI."""
+
+    canvas_id: str
+    target_node_id: str
+    boundary_node_id: str
+    boundary_port_id: str
+    boundary_run_id: str
+    boundary_execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class RunBackendRef(Wire):
@@ -2176,6 +2189,8 @@ class RunStatus(Wire):
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
     backend_ref: RunBackendRef | None = None
+    # Present when this run consumed one admitted retained boundary instead of re-executing its prefix.
+    reused_boundary: ReusableExecutionBoundary | None = None
 
     @model_validator(mode="before")
     @classmethod

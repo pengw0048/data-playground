@@ -495,7 +495,9 @@ class LocalRunner:
     # -- run --------------------------------------------------------------- #
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None, cancel_check=None,
-            request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
+            request_id: str | None = None, attempt_id: str | None = None,
+            reused_nodes: list[PerNodeStatus] | None = None,
+            reused_boundary=None) -> RunStatus:
         preflight_run_output_target(plan, target_node_id)
         if any(step.kind == "write" for step in plan.steps):
             from hub.plugins.catalog import unmanaged_publication_supported
@@ -503,12 +505,15 @@ class LocalRunner:
                 raise RuntimeError(
                     "local write sinks require catalog registration with read-back support")
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
-        per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
+        prefix = list(reused_nodes or [])
+        per_node = prefix + [
+            PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         # attempt_id is accepted for OPS-01 port parity (managed publication stamps its own attempts).
         _ = attempt_id
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
                            target_node_id=(target_node_id or plan.target_node_id),
                            request_id=request_id,
+                           reused_boundary=reused_boundary,
                            outputs=expected_plan_run_outputs(
                                plan, graph, target_node_id, self.node_specs))
         from hub.sampling import explicit_sample_provenance
