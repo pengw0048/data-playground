@@ -4,7 +4,9 @@ import type { DatasetViewDefinition } from '../types/api'
 import { KernelError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
-  workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
+  workspaceBrowse: vi.fn(), workspaceFavorites: vi.fn(), workspaceFavoriteStatus: vi.fn(),
+  workspaceFavoriteAdd: vi.fn(), workspaceFavoriteRemove: vi.fn(),
+  workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
   unregisterTable: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRemoveDetachedDataset: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
@@ -155,6 +157,15 @@ describe('WorkspaceExplorer', () => {
     store.openFile.mockResolvedValue(true)
     store.activateLoadedCanvasRoute.mockImplementation((canvasId: string) => store.doc.id === canvasId)
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
+    mocks.workspaceFavorites.mockResolvedValue({
+      container: { id: 'container:workspace-favorites', kind: 'container', name: 'Favorites', version: 1, detached: false },
+      items: [], nextCursor: null, hasMore: false, completeness: 'complete',
+      queryCapabilities: { sort: [], kindFilter: true, reason: 'Favorites are ordered by when you starred them.' },
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [] })
+    mocks.workspaceFavoriteAdd.mockResolvedValue({ ok: true, favorited: true, resourceId: DATASET.id })
+    mocks.workspaceFavoriteRemove.mockResolvedValue({ ok: true, favorited: false, resourceId: DATASET.id })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.workspaceCanonicalDataset.mockResolvedValue(CANONICAL_DATASET_CONTEXT)
@@ -730,7 +741,11 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByRole('button', { name: 'Open canvas Analysis' })).toBeEnabled()
-    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('OpenAdd to Favorites')
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
   })
 
   it('defaults to a compact list and exposes selected Canvas actions in grid view', async () => {
@@ -1049,7 +1064,10 @@ describe('WorkspaceExplorer', () => {
     expect(row).toBeDisabled()
     expect(row.parentElement).toHaveTextContent('Unavailable')
     expect(row.parentElement).toHaveTextContent('This Canvas is no longer available.')
-    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('Add to Favorites')
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
   })
 
   it('keeps a source-only provider Folder free of Folder writes while retaining local Canvas creation', async () => {
@@ -1141,7 +1159,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(searchableFolder.id)
 
     fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
-    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('OpenRenameMoveDelete')
+    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('OpenAdd to FavoritesRenameMoveDelete')
   })
 
   it('keeps detached Canvas search results read-only', async () => {
@@ -1156,7 +1174,9 @@ describe('WorkspaceExplorer', () => {
     const row = await screen.findByRole('button', { name: 'Open canvas Analysis' })
     expect(row).toBeDisabled()
     expect(row.parentElement).toHaveTextContent('Unavailable')
-    expect(screen.queryByRole('button', { name: 'More actions for Analysis' })).not.toBeInTheDocument()
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('Add to Favorites')
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
   })
 
   it('keeps completed search pages visible when loading the continuation fails', async () => {
@@ -2696,5 +2716,44 @@ describe('WorkspaceExplorer', () => {
       mountId: 'warehouse', resourceId: 'remote-dataset',
     }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(fresh.id)
+  })
+
+  it('favorites a dataset from the row control and shows it in the Favorites shelf', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [DATASET, CANVAS], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+    })
+    mocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [] })
+    mocks.workspaceFavorites.mockResolvedValue({
+      container: { id: 'container:workspace-favorites', kind: 'container', name: 'Favorites', version: 1, detached: false },
+      items: [{ ...DATASET, favorited: true }], nextCursor: null, hasMore: false, completeness: 'complete',
+      queryCapabilities: { sort: [], kindFilter: true, reason: 'Favorites are ordered by when you starred them.' },
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+    await screen.findByRole('button', { name: 'Open dataset observations' })
+    fireEvent.click(screen.getByRole('button', { name: 'Add observations to Favorites' }))
+    await waitFor(() => expect(mocks.workspaceFavoriteAdd).toHaveBeenCalledWith(DATASET.id))
+    fireEvent.click(screen.getByTestId('workspace-favorites-filter'))
+    await waitFor(() => expect(mocks.workspaceFavorites).toHaveBeenCalled())
+    expect(await screen.findByRole('button', { name: 'Open dataset observations' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open canvas Analysis' })).toBeNull()
+  })
+
+  it('clears a folder-only type filter when opening Favorites', async () => {
+    store.workspaceBrowseQuery = 'wq=1&sort=name&order=asc&kind=container&view=grid'
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByTestId('workspace-favorites-filter'))
+
+    await waitFor(() => expect(mocks.workspaceFavorites).toHaveBeenCalled())
+    expect(store.setWorkspaceBrowseQuery).toHaveBeenCalledWith('wq=1&sort=name&order=asc&view=grid')
+    expect(screen.getByRole('combobox', { name: 'Filter Workspace by type' })).toHaveValue('all')
   })
 })

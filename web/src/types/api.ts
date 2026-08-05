@@ -410,6 +410,8 @@ export interface WorkspaceResource {
   folderMutationUnavailableReason?: string | null
   /** Bounded provider reason when this occurrence or its canonical dataset is not usable. */
   unavailableReason?: string | null
+  /** Personal favorite membership for the current actor when the server annotated the row. */
+  favorited?: boolean
 }
 export interface WorkspaceSourceStatus {
   id: string

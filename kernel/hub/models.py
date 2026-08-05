@@ -1321,6 +1321,17 @@ class WorkspaceResource(Wire):
     # Provider mounts stay source-only.  This explicit false is intentionally independent of the
     # local placement capability so clients cannot mistake a local Canvas move for provider writeback.
     provider_mutation: bool = False
+    favorited: bool = False
+
+
+class WorkspaceFavoriteMutationResult(Wire):
+    ok: bool = True
+    favorited: bool
+    resource_id: str
+
+
+class WorkspaceFavoriteStatus(Wire):
+    favorited: list[str] = Field(default_factory=list)
 
 
 class WorkspaceSourceStatus(Wire):

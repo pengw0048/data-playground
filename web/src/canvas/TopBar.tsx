@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { api } from '../api/client'
 import { roleCanEdit, useStore, type GraphRunState } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { ProgressBar } from '../ui/controls'
@@ -157,6 +158,7 @@ export function TopBar() {
           <CanvasInboxPopover />
           <span aria-hidden className="mx-0.5 h-5 w-px shrink-0 bg-border" />
           <CanvasTitle />
+          <CanvasFavoriteButton />
           {canEdit && currentDraft?.syncState === 'conflict'
             ? <button data-testid="autosave" type="button" aria-label="Sync conflict — choose how to continue"
                 title={currentDraft.lastError} onClick={() => useStore.getState().notifyLocalDraftConflict(currentDraft.draftId)}
@@ -212,6 +214,55 @@ export function TopBar() {
       {copyOpen && <CanvasCopyModal source={{ canvasId: useStore.getState().doc.id, version: useStore.getState().doc.version, name: useStore.getState().doc.name ?? 'Untitled canvas' }} onClose={() => setCopyOpen(false)} />}
     </>
   )
+}
+
+function CanvasFavoriteButton() {
+  const canvasId = useStore((state) => state.doc.id)
+  const canvasName = useStore((state) => state.doc.name || 'Untitled canvas')
+  const canvasRole = useStore((state) => state.canvasRole)
+  const pushToast = useStore((state) => state.pushToast)
+  const [favorited, setFavorited] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setFavorited(null)
+    setBusy(false)
+    if (!canvasRole || !canvasId) return () => { cancelled = true }
+    void api.workspaceFavoriteStatus([`canvas:${canvasId}`]).then((status) => {
+      if (!cancelled) setFavorited(status.favorited.includes(`canvas:${canvasId}`))
+    }).catch(() => {
+      if (!cancelled) setFavorited(null)
+    })
+    return () => { cancelled = true }
+  }, [canvasId, canvasRole])
+
+  if (favorited === null) return null
+  const label = favorited
+    ? `Remove ${canvasName} from Favorites`
+    : `Add ${canvasName} to Favorites`
+  return <button type="button" aria-label={label} aria-pressed={favorited} title={label}
+    disabled={busy} onClick={() => {
+      const resourceId = `canvas:${canvasId}`
+      const next = !favorited
+      setBusy(true)
+      void (next ? api.workspaceFavoriteAdd(resourceId) : api.workspaceFavoriteRemove(resourceId))
+        .then(() => {
+          if (useStore.getState().doc.id === canvasId) setFavorited(next)
+        })
+        .catch((error: unknown) => {
+          if (useStore.getState().doc.id === canvasId) {
+            const message = error instanceof Error ? error.message : String(error)
+            pushToast(`Could not update favorite: ${message}`, 'error')
+          }
+        })
+        .finally(() => {
+          if (useStore.getState().doc.id === canvasId) setBusy(false)
+        })
+    }}
+    className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50">
+    <Icon name="star" size={14} filled={favorited} />
+  </button>
 }
 
 const AUTOMATIC_EXECUTION = '__automatic__'
