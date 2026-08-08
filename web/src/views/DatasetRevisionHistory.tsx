@@ -46,7 +46,6 @@ function delta(current?: number | null, parent?: number | null) {
 export function DatasetRevisionHistory({
   table, initialRevisionId, initialRevisionDatasetId, detailsInViewer = false,
   viewerDetail, viewerLoading = false, viewerError = null, onViewerRetry,
-  workspaceResourceId: workspaceResourceIdOverride,
 }: {
   table: CatalogTable
   initialRevisionId?: string
@@ -58,13 +57,9 @@ export function DatasetRevisionHistory({
   viewerLoading?: boolean
   viewerError?: string | null
   onViewerRetry?: () => void
-  /** Preserve the opaque Workspace placement while opening an immutable version. */
-  workspaceResourceId?: string
 }) {
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
-  const routedWorkspaceResourceId = useStore((state) => state.workspaceResourceId)
-  const workspaceResourceId = workspaceResourceIdOverride ?? routedWorkspaceResourceId
   const viewerReturn = detailsInViewer ? parseDatasetViewerReturn(encodedQuery) : undefined
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
   const [items, setItems] = useState<DatasetRevision[]>([])
@@ -252,12 +247,7 @@ export function DatasetRevisionHistory({
             const openControl = detailsInViewer
               ? <a
                   data-testid={`revision-open-${revision.revisionId}`}
-                  href={datasetViewerHash(
-                    revision.datasetId,
-                    revision.revisionId,
-                    viewerReturn,
-                    workspaceResourceId ?? undefined,
-                  )}
+                  href={datasetViewerHash(revision.datasetId, revision.revisionId, viewerReturn)}
                   aria-label={`Open data from ${versionTime}`} className={className}>
                   {content}
                 </a>
@@ -284,7 +274,7 @@ export function DatasetRevisionHistory({
       {selected && !detailsInViewer && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} onRetry={() => void openRevision(selected)}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
-        onRestore={setRestoreDetail} workspaceResourceId={workspaceResourceId ?? undefined} />}
+        onRestore={setRestoreDetail} />}
       {viewerRevision && <RevisionDetail revision={viewerRevision} detail={viewerDetail ?? null}
         parent={parent} loading={viewerLoading} error={viewerError}
         onRetry={onViewerRetry ?? (() => {})}
@@ -299,6 +289,7 @@ export function DatasetRevisionHistory({
         const restored = { datasetId: child.sourceDatasetId, revisionId: child.childRevisionId!,
           committedAt: null, retentionOwner: 'core' as const }
         navigateRevision(restored)
+        void loadFirst()
         if (!detailsInViewer) void openRevision(restored)
       }} />}
   </section>
@@ -311,14 +302,13 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
 }
 
 function RevisionDetail({ revision, detail, parent, loading, error, onRetry, canSave, onSave,
-  headRevisionId, onRestore, showPreview = true, workspaceResourceId }: {
+  headRevisionId, onRestore, showPreview = true }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
-  workspaceResourceId?: string
   /** The full-page dataset viewer already owns the selected bounded row preview. */
   showPreview?: boolean
 }) {
@@ -339,12 +329,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, onRetry, can
         </div>
       </div>
       <div className="flex shrink-0 flex-col gap-1">
-        {showPreview && <a href={datasetViewerHash(
-          detail.datasetId,
-          detail.revisionId,
-          undefined,
-          workspaceResourceId,
-        )}
+        {showPreview && <a href={datasetViewerHash(detail.datasetId, detail.revisionId)}
           className="rounded-md bg-primary px-2 py-1 text-center text-[10.5px] font-semibold text-primary-foreground hover:opacity-90">
           Open data
         </a>}
