@@ -1542,7 +1542,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
           <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table}
             initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId}
-            workspaceResourceId={workspaceResourceId ?? undefined}
             detailsInViewer viewerDetail={requestedExactDetail}
             viewerLoading={requestedExactLoading} viewerError={requestedExactError}
             onViewerRetry={() => { void loadRequestedExact() }} />
