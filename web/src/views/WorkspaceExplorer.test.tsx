@@ -2750,6 +2750,30 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('button', { name: 'Open canvas Analysis' })).toBeNull()
   })
 
+  it('keeps the Favorites shelf when its breadcrumb is clicked', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: { sort: ['name', 'updated'], kindFilter: true },
+    })
+    mocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [DATASET.id] })
+    mocks.workspaceFavorites.mockResolvedValue({
+      container: { id: 'container:workspace-favorites', kind: 'container', name: 'Favorites', version: 1, detached: false },
+      items: [{ ...DATASET, favorited: true }], nextCursor: null, hasMore: false, completeness: 'complete',
+      queryCapabilities: { sort: [], kindFilter: true, reason: 'Favorites are ordered by when you starred them.' },
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+    await screen.findByRole('button', { name: 'Open dataset observations' })
+    fireEvent.click(screen.getByTestId('workspace-favorites-filter'))
+    await waitFor(() => expect(mocks.workspaceFavorites).toHaveBeenCalled())
+    const path = screen.getByRole('navigation', { name: 'Workspace path' })
+    await within(path).findByRole('button', { name: 'Favorites' })
+    fireEvent.click(within(path).getByRole('button', { name: 'Favorites' }))
+    expect(await screen.findByRole('button', { name: 'Open dataset observations' })).toBeInTheDocument()
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith('container:workspace-favorites')
+  })
+
   it('clears a folder-only type filter when opening Favorites', async () => {
     store.workspaceBrowseQuery = 'wq=1&sort=name&order=asc&kind=container&view=grid'
     mocks.workspaceBrowse.mockResolvedValue({
