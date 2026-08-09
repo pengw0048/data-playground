@@ -140,3 +140,36 @@ def test_profile_identity_ignores_chart_presentation_type():
     semantic.nodes[1].data["config"]["agg"] = "sum"
     semantic.nodes[1].data["config"]["y"] = "amount"
     assert profile_plan_digest(semantic, "chart", "out", lambda _uri: adapter) != baseline
+
+
+def test_profile_identity_ignores_filter_builder_mirror():
+    graph = Graph.model_validate({
+        "id": "filter-identity",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"config": {"uri": "file:///data.parquet"}},
+            },
+            {
+                "id": "filter", "type": "filter", "position": {"x": 1, "y": 0},
+                "data": {"config": {"predicate": "event = 'purchase'"}},
+            },
+        ],
+        "edges": [{
+            "id": "edge", "source": "source", "target": "filter",
+            "data": {"wire": "dataset"},
+        }],
+    })
+    adapter = _Adapter({"file:///data.parquet": "generation-1"})
+    baseline = profile_plan_digest(graph, "filter", "out", lambda _uri: adapter)
+
+    mirrored = deepcopy(graph)
+    mirrored.nodes[1].data["config"]["filterBuilder"] = {
+        "conditions": [{"col": "event", "op": "=", "val": "purchase", "type": "string"}],
+    }
+    assert profile_plan_digest(mirrored, "filter", "out", lambda _uri: adapter) == baseline
+
+    semantic = deepcopy(graph)
+    semantic.nodes[1].data["config"]["predicate"] = "event = 'refund'"
+    assert profile_plan_digest(semantic, "filter", "out", lambda _uri: adapter) != baseline

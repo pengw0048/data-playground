@@ -2499,6 +2499,50 @@ describe('graph store — core authority ops', () => {
     expect(afterSemantic.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('stale')
   })
 
+  it('treats the Filter builder mirror as presentation-only for identity and freshness', () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    source.data.status = 'latest'
+    const filter = NODE('filter', 'filter')
+    filter.data.config = {
+      predicate: "event = 'purchase'",
+      filterBuilder: { conditions: [{ col: 'event', op: '=', val: 'purchase', type: 'string' }] },
+    }
+    filter.data.status = 'latest'
+    const downstream = NODE('downstream', 'sort')
+    downstream.data.config = { by: 'event' }
+    downstream.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [],
+      nodes: [source, filter, downstream],
+      edges: [
+        { id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' as const } },
+        { id: 'filter-downstream', source: 'filter', target: 'downstream', data: { wire: 'dataset' as const } },
+      ],
+    }
+    useStore.setState({ doc, canvasRole: 'owner', sizes: { filter: 4, downstream: 2 } })
+
+    const identity = previewPlanIdentity(doc, 'filter')
+    expect(profilePlanIdentity(doc, 'filter')).toBe(identity)
+
+    // Switching builder → raw SQL drops the mirror while the predicate text is identical.
+    useStore.getState().updateConfig('filter', { filterBuilder: undefined })
+    const next = useStore.getState().doc
+    expect(previewPlanIdentity(next, 'filter')).toBe(identity)
+    expect(next.nodes.find((node) => node.id === 'filter')?.data.status).toBe('latest')
+    expect(next.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('latest')
+    expect(useStore.getState().sizes).toEqual({ filter: 4, downstream: 2 })
+
+    useStore.getState().updateConfig('filter', {
+      predicate: "event = 'refund'",
+      filterBuilder: { conditions: [{ col: 'event', op: '=', val: 'refund', type: 'string' }] },
+    })
+    const afterSemantic = useStore.getState().doc
+    expect(previewPlanIdentity(afterSemantic, 'filter')).not.toBe(identity)
+    expect(afterSemantic.nodes.find((node) => node.id === 'filter')?.data.status).toBe('stale')
+    expect(afterSemantic.nodes.find((node) => node.id === 'downstream')?.data.status).toBe('stale')
+  })
+
   it('treats Chart Series selection as semantic execution config', () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }

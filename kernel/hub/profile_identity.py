@@ -46,6 +46,9 @@ def profile_plan_digest(graph: Graph, node_id: str, port_id: str, resolve_adapte
         if node.type == "chart":
             # chartType is presentation-only; keep profile recovery identity aligned with execution.
             config = {key: value for key, value in config.items() if key != "chartType"}
+        if node.type == "filter":
+            # filterBuilder mirrors the predicate for the builder UI; execution reads predicate only.
+            config = {key: value for key, value in config.items() if key != "filterBuilder"}
         nodes.append({
             "id": node.id,
             "type": node.type,

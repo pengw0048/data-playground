@@ -151,6 +151,10 @@ def _canonical_graph(
             # (x, y) series from agg/axis fields; keep visual type out of execution identity.
             config = {key: value for key, value in config.items() if key != "chartType"}
             data["config"] = config
+        if node.type == "filter":
+            # filterBuilder mirrors the predicate for the builder UI; execution reads predicate only.
+            config = {key: value for key, value in config.items() if key != "filterBuilder"}
+            data["config"] = config
         if node.type == "transform" and config.get("source") == "library":
             # The exact promoted `(id, version)` is the durable definition. Never retain a stale
             # inline body as a second, hidden persistence or replay path.
