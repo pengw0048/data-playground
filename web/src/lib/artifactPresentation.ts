@@ -1,8 +1,17 @@
 import { useEffect, useState } from 'react'
 import { api, type ExecutionManifestDocument } from '../api/client'
+import { normalizeTimeBucket, type TimeBucket } from './chartTemporal'
 
 export type ArtifactPresentation =
-  | { kind: 'chart'; type: string; xLabel: string; yLabel: string; grouped: boolean; seriesLabel?: string }
+  | {
+    kind: 'chart'
+    type: string
+    xLabel: string
+    yLabel: string
+    grouped: boolean
+    seriesLabel?: string
+    timeBucket?: TimeBucket
+  }
   | { kind: 'metric' }
 
 const record = (value: unknown): Record<string, unknown> | null => (
@@ -29,6 +38,7 @@ export function artifactPresentationFromManifest(
     xLabel: String(config.x || 'All rows'),
     grouped: agg !== 'none',
     seriesLabel: String(config.series || '') || undefined,
+    timeBucket: normalizeTimeBucket(config.timeBucket),
     yLabel: agg !== 'none' ? `${agg}(${String(config.y ?? '*')})` : String(config.y ?? 'y'),
   }
 }

@@ -187,6 +187,11 @@ BUILTIN_NODE_SPECS: list[NodeSpec] = [
              params=[ParamSpec(name="chartType", type="select", options=["bar", "line", "scatter", "area"], default="bar"),
                      ParamSpec(name="x", type="string", label="group by (X)"),
                      ParamSpec(name="xMode", type="select", options=["column", "expression"], default="column", label="X source"),
+                     # timeBucket is semantic: it changes the lowered relation (UTC date_trunc on a
+                     # column-mode temporal X) and therefore execution identity.
+                     ParamSpec(name="timeBucket", type="select",
+                               options=["none", "hour", "day", "week", "month", "quarter", "year"],
+                               default="none", label="X time bucket (UTC)"),
                      ParamSpec(name="y", type="string", label="value (Y)"),
                      ParamSpec(name="yMode", type="select", options=["column", "expression"], default="column", label="Y source"),
                      ParamSpec(name="series", type="string", label="Series / Color by"),

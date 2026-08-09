@@ -6,6 +6,7 @@ import { Field, MiniInput, MiniSelect, miniSelectClass } from '../../ui/controls
 import { useInputColumns } from '../fields'
 import { Icon } from '../../ui/Icon'
 import type { ColumnSchema } from '../../types/graph'
+import { isTemporalColumnType, normalizeTimeBucket, type TimeBucket } from '../../lib/chartTemporal'
 import { cn } from '@/lib/utils'
 
 type ChartType = 'bar' | 'line' | 'scatter' | 'area'
@@ -29,6 +30,11 @@ export function chartableColumns(columns: ColumnSchema[]): ColumnSchema[] {
 
 export function numericChartColumns(columns: ColumnSchema[]): ColumnSchema[] {
   return chartableColumns(columns).filter((column) => NUMERIC.test(chartColumnType(column)))
+}
+
+/** True for a typed date/timestamp column a UTC time bucket can group. */
+export function timeBucketableChartColumn(column: ColumnSchema): boolean {
+  return isTemporalColumnType(chartColumnType(column))
 }
 
 /** Scalar categorical columns suitable for Series / Color by (no SQL expressions in this slice). */
@@ -127,6 +133,10 @@ function AxisEditor({
 const AGG_LABELS: Record<Agg, string> = {
   count: 'Count rows', sum: 'Sum', mean: 'Average', min: 'Minimum', max: 'Maximum', none: 'Raw values',
 }
+const TIME_BUCKET_LABELS: Array<[TimeBucket, string]> = [
+  ['hour', 'Hour'], ['day', 'Day'], ['week', 'Week (ISO, Mon)'], ['month', 'Month'],
+  ['quarter', 'Quarter'], ['year', 'Year'],
+]
 const TYPE_LABELS: Record<ChartType, string> = {
   bar: 'Bars', line: 'Line', scatter: 'Points', area: 'Area',
 }
@@ -142,6 +152,7 @@ function Chart({ id, data }: NodeComponentProps) {
   const x = String(data.config.x ?? '')
   const y = String(data.config.y ?? '')
   const series = String(data.config.series ?? '')
+  const timeBucket = normalizeTimeBucket(data.config.timeBucket)
   const inputColumns = useInputColumns(id)
   const columns = chartableColumns(inputColumns)
   const measures = numericChartColumns(inputColumns)
@@ -154,6 +165,12 @@ function Chart({ id, data }: NodeComponentProps) {
   const yIsChartable = !!y && measures.some((column) => column.name === y)
   const seriesAvailable = agg !== 'none'
   const seriesKnown = seriesColumns.some((column) => column.name === series)
+  const xColumn = columns.find((column) => column.name === (x || defaultX?.name || ''))
+  const bucketAvailable = xMode === 'column' && xColumn != null && timeBucketableChartColumn(xColumn)
+  // Only a positively known non-temporal X (or an expression, which we never reinterpret) clears a
+  // saved bucket; a disconnected input keeps the config intact.
+  const bucketBlocked = xMode === 'expression'
+    || (xColumn != null && !timeBucketableChartColumn(xColumn))
 
   // A newly connected Chart should already be useful. Persist the recommendation so the visible
   // controls, saved Canvas, durable run, and reopened result all agree on the same fields.
@@ -167,19 +184,22 @@ function Chart({ id, data }: NodeComponentProps) {
     // saved Canvas never claims a semantic Series that the engine would refuse.
     if (!seriesAvailable && series) patch.series = ''
     else if (series && series === (patch.x ?? x)) patch.series = ''
+    if (timeBucket && bucketBlocked) patch.timeBucket = 'none'
     if (Object.keys(patch).length) updateConfig(id, patch)
-  }, [agg, defaultX, defaultY, id, inputHasX, inputHasY, series, seriesAvailable, updateConfig,
-    x, xIsChartable, xMode, y, yIsChartable, yMode])
+  }, [agg, bucketBlocked, defaultX, defaultY, id, inputHasX, inputHasY, series, seriesAvailable,
+    timeBucket, updateConfig, x, xIsChartable, xMode, y, yIsChartable, yMode])
 
   const axisName = (value: string, mode: AxisMode) => mode === 'expression' ? 'SQL' : (value || '…')
   const seriesSuffix = seriesAvailable && series ? ` · color by ${series}` : ''
+  const xShown = axisName(x || defaultX?.name || '', xMode)
+  const xSummary = timeBucket && !bucketBlocked ? `${timeBucket}(${xShown})` : xShown
   const summary = (agg === 'count'
     ? (x || defaultX?.name
-        ? `Count rows by ${axisName(x || defaultX?.name || '', xMode)}`
+        ? `Count rows by ${xSummary}`
         : 'Count all rows')
     : agg === 'none'
-      ? `${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`
-      : `${AGG_LABELS[agg]} ${axisName(y || defaultY?.name || '', yMode)} by ${axisName(x || defaultX?.name || '', xMode)}`)
+      ? `${axisName(y || defaultY?.name || '', yMode)} by ${xSummary}`
+      : `${AGG_LABELS[agg]} ${axisName(y || defaultY?.name || '', yMode)} by ${xSummary}`)
     + seriesSuffix
 
   const changeAgg = (next: Agg) => {
@@ -211,6 +231,22 @@ function Chart({ id, data }: NodeComponentProps) {
             if (series && series === value) patch.series = ''
             updateConfig(id, patch)
           }} />
+        {bucketAvailable && (
+          <div className="flex flex-col gap-[3px]">
+            <span className="text-[9.5px] font-semibold uppercase tracking-[0.4px] text-muted-foreground">
+              Time bucket · UTC
+            </span>
+            <select aria-label="X time bucket" value={timeBucket ?? 'none'}
+              onClick={(event) => event.stopPropagation()}
+              onChange={(event) => updateConfig(id, { timeBucket: event.target.value })}
+              className={cn('nodrag min-w-0', miniSelectClass)}>
+              <option value="none">No bucket · exact values</option>
+              {TIME_BUCKET_LABELS.map(([value, label]) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
+            </select>
+          </div>
+        )}
         {agg !== 'count' && (
           <AxisEditor axis="Y" value={y || defaultY?.name || ''} mode={yMode} columns={measures}
             fallback={defaultY?.name}

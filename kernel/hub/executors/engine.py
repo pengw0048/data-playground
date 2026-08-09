@@ -1661,6 +1661,9 @@ class BuildEngine:
             x = str(cfg.get("x") or "").strip()
             y = str(cfg.get("y") or "").strip()
             series = str(cfg.get("series") or "").strip()
+            bucket = str(cfg.get("timeBucket") or "").strip().lower()
+            if bucket == "none":
+                bucket = ""
             if x_mode == "column" and not x:
                 x = _default_chart_dimension(base)
             if agg != "count" and y_mode == "column" and not y:
@@ -1690,6 +1693,11 @@ class BuildEngine:
                     node,
                     "Series / Color by needs an X grouping. Choose an X column, or clear Series.",
                 )
+            if bucket and (x_mode != "column" or not x):
+                raise NotPreviewable(
+                    node,
+                    "Time bucket needs a column X. Clear the bucket, or choose an X column.",
+                )
             try:
                 xq = _chart_axis_expression(base, x, x_mode, label="X") if x else None
                 yq = _chart_axis_expression(base, y, y_mode, label="Y") if y else None
@@ -1700,6 +1708,11 @@ class BuildEngine:
             except (SQLPolicyError, duckdb.Error, ValueError) as exc:
                 axis = "SQL expression" if "expression" in (x_mode, y_mode) else "field selection"
                 raise NotPreviewable(node, f"Fix the chart {axis} before running it.") from exc
+            if bucket:
+                try:
+                    xq = _chart_time_bucket_expression(base, x, bucket)
+                except SQLPolicyError as exc:
+                    raise NotPreviewable(node, str(exc)) from exc
             v = self._view(base, "ch")
             if ungrouped_count:
                 return db.conn().sql(
@@ -2266,6 +2279,27 @@ def _default_chart_measure(relation: Relation, *, exclude: str = "") -> str:
                  if _CHART_MEASURE_LIKE.search(name) and not _CHART_ID_LIKE.search(name)), None) \
         or next((name for name, _field_type in fields if not _CHART_ID_LIKE.search(name)), None) \
         or ""
+
+
+# Chart X time buckets: a closed granularity set compiled to date_trunc over a quoted identifier.
+# tz-aware columns are normalized to UTC wall time first; 'week' is DuckDB's ISO Monday week.
+CHART_TIME_BUCKETS = ("hour", "day", "week", "month", "quarter", "year")
+_CHART_TIME_BUCKETABLE = re.compile(r"^(?:DATE|TIMESTAMP)", re.I)
+
+
+def _chart_time_bucket_expression(relation: Relation, column: str, bucket: str) -> str:
+    if bucket not in CHART_TIME_BUCKETS:
+        raise SQLPolicyError(
+            f"Unsupported time bucket '{bucket}' (allowed: {', '.join(CHART_TIME_BUCKETS)})."
+        )
+    name = identifier(column, relation.columns, label="chart X column")
+    field_type = str(relation.types[relation.columns.index(name)])
+    if not _CHART_TIME_BUCKETABLE.match(field_type):
+        raise SQLPolicyError("Time bucket needs a date or timestamp X column.")
+    quoted = quote_identifier(name)
+    if "WITH TIME ZONE" in field_type.upper():
+        quoted = f"({quoted} AT TIME ZONE 'UTC')"
+    return f"date_trunc('{bucket}', {quoted})"
 
 
 def _chart_axis_expression(relation: Relation, value: str, mode: str, *, label: str) -> str:

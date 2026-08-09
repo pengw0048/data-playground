@@ -166,6 +166,98 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
   }
 })
 
+test('Chart time buckets group a temporal X in UTC with readable chronological ticks', async ({ page }) => {
+  const canvasId = `chart-time-bucket-${Date.now()}`
+  try {
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Chart time bucket', version: 1, requirements: [],
+      nodes: [
+        { id: 'source', type: 'source', position: { x: 80, y: 160 }, data: {
+          title: 'Events', status: 'draft', config: { uri: 'events' }, history: [],
+        } },
+        { id: 'stamped', type: 'sql', position: { x: 300, y: 160 }, data: {
+          title: 'Stamped', status: 'draft', config: {
+            // Hourly stamps from Jan 30 22:00 across the Jan→Feb month boundary.
+            sql: "SELECT id, event, amount, TIMESTAMP '2024-01-30 22:00:00' + INTERVAL (id % 96) HOUR AS created_at FROM input",
+          }, history: [],
+        } },
+        { id: 'chart', type: 'chart', position: { x: 560, y: 160 }, data: {
+          title: 'Events over time', status: 'draft',
+          config: { chartType: 'bar', agg: 'count', xMode: 'column', x: 'created_at' }, history: [],
+        } },
+      ],
+      edges: [
+        { id: 'source-stamped', source: 'source', target: 'stamped', data: { wire: 'dataset' } },
+        { id: 'stamped-chart', source: 'stamped', target: 'chart', data: { wire: 'dataset' } },
+      ],
+    } })
+    expect(created.ok(), await created.text()).toBe(true)
+
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    const chart = page.locator('.react-flow__node-chart')
+    await expect(chart).toBeVisible()
+    await expect(chart.getByRole('combobox', { name: 'X column' })).toHaveValue('created_at', { timeout: 15_000 })
+
+    // A typed timestamp X offers the bucket selector; an expression X hides it.
+    const bucket = chart.getByRole('combobox', { name: 'X time bucket' })
+    await expect(bucket).toBeVisible()
+    await expect(bucket).toHaveValue('none')
+    await chart.getByRole('button', { name: 'Use SQL expression for X' }).click()
+    await expect(chart.getByRole('combobox', { name: 'X time bucket' })).toHaveCount(0)
+    await chart.getByRole('button', { name: 'Choose X from input columns' }).click()
+    await bucket.selectOption('day')
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      const graph = await response.json() as { nodes: Array<{ id: string; data: { config: Record<string, unknown> } }> }
+      return graph.nodes.find((node) => node.id === 'chart')?.data.config.timeBucket
+    }).toBe('day')
+
+    await chart.getByText('Events over time', { exact: true }).click()
+    await chart.getByRole('button', { name: 'Run up to here' }).click()
+    await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
+    await expect(chart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Close' }).click()
+    await chart.getByRole('button', { name: 'View chart result' }).click()
+    const resultChart = page.getByRole('img', { name: 'bar chart, saved result' })
+    await expect(resultChart).toBeVisible()
+    // Five UTC day groups (Jan 30 … Feb 3) on a labeled chronological axis.
+    await expect(resultChart.locator('rect')).toHaveCount(5)
+    await expect(resultChart.getByText('created_at · by day (UTC)', { exact: true })).toBeVisible()
+    await expect(resultChart.getByText('Jan 30', { exact: true })).toBeVisible()
+    await expect(resultChart.getByText('Feb 3', { exact: true })).toBeVisible()
+
+    // Presentation-only chart type reuses the same bucketed result without a new run.
+    const runPosts: string[] = []
+    await page.route('**/api/run', async (route) => {
+      if (route.request().method() === 'POST') runPosts.push(route.request().url())
+      await route.continue()
+    })
+    await chart.getByLabel('Chart').selectOption('line')
+    await expect(page.getByRole('img', { name: 'line chart, saved result' })).toBeVisible()
+    await expect(chart.locator('[title="latest"]')).toBeVisible()
+    expect(runPosts).toEqual([])
+    await page.unroute('**/api/run')
+    await page.getByRole('button', { name: 'Close' }).click()
+
+    // Changing the bucket is semantic: the Chart invalidates and recomputes to month groups.
+    await bucket.selectOption('month')
+    await expect(chart.locator('[title="stale"]')).toBeVisible()
+    await chart.getByText('Events over time', { exact: true }).click()
+    await chart.getByRole('button', { name: 'Run up to here' }).click()
+    await page.getByRole('button', { name: 'Run with unknown row count', exact: true }).click()
+    await expect(chart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Close' }).click()
+    await chart.getByRole('button', { name: 'View chart result' }).click()
+    const monthly = page.getByRole('img', { name: 'line chart, saved result' })
+    await expect(monthly).toBeVisible()
+    await expect(monthly.getByText('created_at · by month (UTC)', { exact: true })).toBeVisible()
+    await expect(monthly.getByText('Jan 2024', { exact: true })).toBeVisible()
+    await expect(monthly.getByText('Feb 2024', { exact: true })).toBeVisible()
+  } finally {
+    await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+  }
+})
+
 test('Chart Series / Color by aggregates, legends, and keeps chartType presentation-only', async ({ page }) => {
   const canvasId = `chart-series-${Date.now()}`
   try {

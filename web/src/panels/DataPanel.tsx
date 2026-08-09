@@ -24,6 +24,10 @@ import type {
 import {
   chartSeriesColor, chartSeriesLabel, orderChartSeriesLabels, summarizeChartSeries,
 } from '../lib/chartSeries'
+import {
+  formatTemporalTick, isTemporalColumnType, NO_DATE_LABEL, normalizeTimeBucket, parseTemporalUtc,
+  temporalTickBudget, temporalTickGranularity, type TimeBucket,
+} from '../lib/chartTemporal'
 import type { ArtifactPresentation } from '../lib/artifactPresentation'
 
 const PAGE = 50
@@ -297,6 +301,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         xLabel: String(node?.data.config.x || 'All rows'),
         grouped: node?.data.config.agg !== 'none',
         seriesLabel: String(node?.data.config.series || '') || undefined,
+        timeBucket: normalizeTimeBucket(node?.data.config.timeBucket),
         yLabel: String(node?.data.config.agg && node?.data.config.agg !== 'none'
           ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})`
           : (node?.data.config.y ?? 'y')),
@@ -515,7 +520,8 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       {isChart ? (
         <ChartView rows={res.rows} type={String(node?.data.config.chartType ?? 'bar')}
           grouped={node?.data.config.agg !== 'none'} completeness={res.completeness}
-          scope="preview"
+          scope="preview" columns={resultColumns}
+          timeBucket={normalizeTimeBucket(node?.data.config.timeBucket)}
           seriesLabel={String(node?.data.config.series || '') || undefined}
           xLabel={String(node?.data.config.x ?? 'x')}
           yLabel={String(node?.data.config.agg && node?.data.config.agg !== 'none' ? `${node?.data.config.agg}(${node?.data.config.y ?? '*'})` : (node?.data.config.y ?? 'y'))} />
@@ -1222,8 +1228,9 @@ function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
 // A dependency-free SVG chart of the (x [, series], y) relation the `chart` node emits — bar /
 // line / area / scatter. Colors are theme tokens (or a fixed series palette); axis labels come from
 // the node's chosen columns. Heavy lifting — grouping/aggregation and top-12/Other — is server-side.
-function ChartView({
+export function ChartView({
   rows, type, xLabel, yLabel, grouped = false, seriesLabel, completeness = 'unknown', scope = 'preview',
+  columns, timeBucket,
 }: {
   rows: Record<string, unknown>[]
   type: string
@@ -1233,9 +1240,11 @@ function ChartView({
   seriesLabel?: string
   completeness?: SampleResult['completeness']
   scope?: 'preview' | 'full-result' | 'published-dataset'
+  columns?: ColumnSchema[]
+  timeBucket?: TimeBucket
 }) {
   const hasSeriesColumn = rows.some((row) => 'series' in row)
-  const pts = rows.flatMap((row) => {
+  let pts = rows.flatMap((row) => {
     const raw = row.y
     if (raw == null || (typeof raw === 'string' && raw.trim() === '')) return []
     if (typeof raw !== 'number' && typeof raw !== 'string') return []
@@ -1247,6 +1256,30 @@ function ChartView({
       series: hasSeriesColumn ? chartSeriesLabel(row.series) : undefined,
     }]
   })
+
+  // A bucketed or schema-typed temporal X sorts chronologically (nulls last, one explicit
+  // "No date" group) and formats UTC ticks at the bucket's granularity.
+  const xColumn = columns?.find((column) => column.name === 'x')
+  const xEpochs = new Map(pts.map((point) => [point.x, parseTemporalUtc(point.x)]))
+  const finiteEpochs = [...xEpochs.values()].filter((epoch): epoch is number => epoch != null)
+  const temporalX = (timeBucket != null
+    || (xColumn != null && isTemporalColumnType(`${xColumn.type} ${xColumn.physicalType ?? ''}`)))
+    && finiteEpochs.length > 0
+    && pts.every((point) => point.x == null || xEpochs.get(point.x) != null)
+  if (temporalX) {
+    pts = [...pts].sort((a, b) => (
+      (xEpochs.get(a.x) ?? Number.POSITIVE_INFINITY) - (xEpochs.get(b.x) ?? Number.POSITIVE_INFINITY)
+    ))
+  }
+  const granularity = temporalTickGranularity(
+    timeBucket, Math.max(...finiteEpochs) - Math.min(...finiteEpochs))
+  const tickYears = temporalX && new Date(Math.min(...finiteEpochs)).getUTCFullYear()
+    !== new Date(Math.max(...finiteEpochs)).getUTCFullYear()
+  const xTickLabel = (value: unknown) => (temporalX
+    ? formatTemporalTick(xEpochs.get(value) ?? parseTemporalUtc(value), granularity, tickYears)
+    : String(value).slice(0, 10))
+  const xTipLabel = (value: unknown) => (temporalX && value == null ? NO_DATE_LABEL : String(value))
+  const xAxisLabel = timeBucket != null && temporalX ? `${xLabel} · by ${timeBucket} (UTC)` : xLabel
   const omitted = rows.length - pts.length
   const omittedMessage = omitted === 1
     ? '1 Y value omitted because it was null, blank, or non-numeric.'
@@ -1285,8 +1318,8 @@ function ChartView({
   )
   const tip = (xValue: unknown, yValue: number, series?: string) => (
     series
-      ? `${xLabel}: ${String(xValue)}; ${seriesLabel || 'Series'}: ${series}; ${yLabel}: ${fmt(yValue)}`
-      : `${xLabel}: ${String(xValue)}; ${yLabel}: ${fmt(yValue)}`
+      ? `${xAxisLabel}: ${xTipLabel(xValue)}; ${seriesLabel || 'Series'}: ${series}; ${yLabel}: ${fmt(yValue)}`
+      : `${xAxisLabel}: ${xTipLabel(xValue)}; ${yLabel}: ${fmt(yValue)}`
   )
 
   // Preserve the exact single-series layout when Series is unset (including raw point charts).
@@ -1310,7 +1343,10 @@ function ChartView({
         : (pts.length === 1 ? padL + plotW / 2 : padL + (i / (pts.length - 1)) * plotW)
     const line = pts.map((p, i) => `${xPix(i)},${yPix(p.y)}`).join(' ')
     const barW = Math.min(bandW, Math.max(1, bandW * 0.72))
-    const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(8, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(8, pts.length) - 1)))]))
+    const maxTicks = temporalX
+      ? temporalTickBudget(Math.max(...pts.map((p) => xTickLabel(p.x).length)), plotW)
+      : 8
+    const tickIdx = Array.from(new Set([0, ...Array.from({ length: Math.min(maxTicks, pts.length) }, (_, k) => Math.round(k * (pts.length - 1) / Math.max(1, Math.min(maxTicks, pts.length) - 1)))]))
     const yTicks = yMax === yMin
       ? [yMin]
       : Array.from({ length: 5 }, (_, index) => yMin + ((yMax - yMin) * index / 4))
@@ -1342,13 +1378,13 @@ function ChartView({
           ))}
           {tickIdx.map((i) => (
             <text key={i} x={xPix(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10" fill="hsl(var(--muted-foreground))">
-              {String(pts[i]?.x).slice(0, 10)}
+              {xTickLabel(pts[i]?.x)}
             </text>
           ))}
           <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
             fill="hsl(var(--muted-foreground))" fontWeight="600"
             transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
-          <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
+          <text x={padL + plotW / 2} y={H - 4} textAnchor="middle" fontSize="10.5" fill="hsl(var(--muted-foreground))" fontWeight="600">{xAxisLabel}</text>
         </svg>
         {scopeSummary && (
           <div className="mt-1 text-center text-[10.5px] text-muted-foreground">{scopeSummary}</div>
@@ -1395,9 +1431,12 @@ function ChartView({
     return start + seriesIndex * barSlot + (barSlot - barW) / 2
   }
   const pointX = (categoryIndex: number) => categoryCenter(categoryIndex)
+  const maxTicks = temporalX
+    ? temporalTickBudget(Math.max(...xCategories.map((value) => xTickLabel(value).length)), plotW)
+    : 8
   const tickIdx = Array.from(new Set([0, ...Array.from(
-    { length: Math.min(8, categoryCount) },
-    (_, k) => Math.round(k * (categoryCount - 1) / Math.max(1, Math.min(8, categoryCount) - 1)),
+    { length: Math.min(maxTicks, categoryCount) },
+    (_, k) => Math.round(k * (categoryCount - 1) / Math.max(1, Math.min(maxTicks, categoryCount) - 1)),
   )]))
   const yTicks = yMax === yMin
     ? [yMin]
@@ -1463,14 +1502,14 @@ function ChartView({
         {tickIdx.map((i) => (
           <text key={i} x={categoryCenter(i)} y={padT + plotH + 16} textAnchor="middle" fontSize="10"
             fill="hsl(var(--muted-foreground))">
-            {String(xCategories[i]).slice(0, 10)}
+            {xTickLabel(xCategories[i])}
           </text>
         ))}
         <text x={12} y={padT + plotH / 2} textAnchor="middle" fontSize="10.5"
           fill="hsl(var(--muted-foreground))" fontWeight="600"
           transform={`rotate(-90 12 ${padT + plotH / 2})`}>{yLabel}</text>
         <text x={padL + plotW / 2} y={H - 28} textAnchor="middle" fontSize="10.5"
-          fill="hsl(var(--muted-foreground))" fontWeight="600">{xLabel}</text>
+          fill="hsl(var(--muted-foreground))" fontWeight="600">{xAxisLabel}</text>
       </svg>
       <ul className="mt-1 flex flex-wrap justify-center gap-x-3 gap-y-1" aria-label="Chart series legend">
         {seriesOrder.map((series) => (
@@ -1777,6 +1816,7 @@ export function FullResult({
         ? <ChartView rows={rows} type={presentation.type}
           xLabel={presentation.xLabel} yLabel={presentation.yLabel} grouped={presentation.grouped}
           seriesLabel={presentation.seriesLabel}
+          columns={cols} timeBucket={presentation.timeBucket}
           completeness={data.completeness} scope={pageScope} />
         : presentation?.kind === 'metric'
           ? <MetricValue rows={rows} />

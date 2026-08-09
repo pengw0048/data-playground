@@ -27,4 +27,22 @@ describe('artifact presentation recovery', () => {
   it('does not guess presentation for an unrelated output', () => {
     expect(artifactPresentationFromManifest(document, 'missing')).toBeUndefined()
   })
+
+  it('recovers the executed time bucket and ignores unknown bucket values', () => {
+    const withBucket = (timeBucket: unknown): ExecutionManifestDocument => ({
+      ...document,
+      graph: { requirements: [], edges: [], nodes: [{
+        id: 'chart', type: 'chart', data: { config: { agg: 'count', x: 'created_at', timeBucket } },
+      }] },
+    })
+    expect(artifactPresentationFromManifest(withBucket('day'), 'chart')).toMatchObject({
+      kind: 'chart', timeBucket: 'day',
+    })
+    expect(artifactPresentationFromManifest(withBucket('none'), 'chart'))
+      .toMatchObject({ timeBucket: undefined })
+    expect(artifactPresentationFromManifest(withBucket('fortnight'), 'chart'))
+      .toMatchObject({ timeBucket: undefined })
+    // Legacy manifests without the field keep their table/chart presentation unchanged.
+    expect(artifactPresentationFromManifest(document, 'chart')).toMatchObject({ timeBucket: undefined })
+  })
 })

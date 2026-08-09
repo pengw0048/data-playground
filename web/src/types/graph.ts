@@ -92,6 +92,8 @@ export interface NodeConfig {
   yMode?: 'column' | 'expression'
   /** Schema-backed Series / Color by column (aggregated Charts only). */
   series?: string
+  /** UTC time bucket for a column-mode temporal X ('none' | hour…year). */
+  timeBucket?: string
   // write
   name?: string
   writeMode?: 'append' | 'overwrite'
