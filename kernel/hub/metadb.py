@@ -7415,6 +7415,50 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
     return streams
 
 
+def workspace_facet_counts(*, uid: str, container_id: str | None = None,
+                           query: str | None = None, name: str | None = None,
+                           kinds: set[str] | frozenset[str] | None = None,
+                           updated_after: datetime.datetime | None = None,
+                           updated_before: datetime.datetime | None = None,
+                           by_kind: bool = False) -> dict[str, int]:
+    """Grouped counts over the same filtered, actor-visible listing browse and search return.
+
+    ``container_id`` scopes to one Folder's direct children; ``query`` scopes to the global
+    search match. ``by_kind`` groups per kind; otherwise one total is returned under ``"all"``.
+    """
+    kind_set = frozenset(kinds or _WORKSPACE_BROWSE_KINDS)
+    if not kind_set or not kind_set <= _WORKSPACE_BROWSE_KINDS:
+        raise ValueError("Workspace type filter is invalid")
+    tokens: list[str] = []
+    if query is not None:
+        normalized = " ".join(query.split()).lower()
+        if not normalized:
+            raise ValueError("Workspace search query must not be empty")
+        if len(normalized.encode("utf-8")) > 512:
+            raise ValueError("Workspace search query must be at most 512 UTF-8 bytes")
+        tokens.extend(normalized.split())
+    tokens.extend(_workspace_filter_tokens(name))
+    updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
+    with session() as s:
+        if container_id is not None:
+            container = s.get(WorkspaceContainer, container_id)
+            if container is None or _workspace_external_overlay_anchor_for_container(
+                    s, container_id) is not None:
+                raise KeyError(f"workspace container '{container_id}' not found")
+        listing = union_all(*_workspace_listing_streams(
+            uid=uid, kinds=kind_set, container_id=container_id,
+            tokens=tokens or None)).subquery()
+        counted = (
+            select(listing.c.kind, func.count()).group_by(listing.c.kind) if by_kind
+            else select(literal("all"), func.count()).select_from(listing)
+        )
+        if updated_after is not None:
+            counted = counted.where(listing.c.updated_at >= updated_after)
+        if updated_before is not None:
+            counted = counted.where(listing.c.updated_at <= updated_before)
+        return {row[0]: row[1] for row in s.execute(counted).all()}
+
+
 def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                             cursor: str | None, sort: str, order: str,
                             kinds: frozenset[str], name: str | None = None,

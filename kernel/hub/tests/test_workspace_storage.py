@@ -1012,18 +1012,19 @@ def test_unavailable_provider_items_preserve_identity_without_source_admission(
 
 
 def _local_filter_capabilities(*mount_ids: str) -> list[dict]:
-    def entry(field: str, kind: str, options: list[dict] | None = None) -> dict:
+    def entry(field: str, kind: str, options: list[dict] | None = None,
+              facet: bool = False) -> dict:
         return {"field": field, "type": kind, "supported": True,
-                "options": options or [], "reason": None}
+                "options": options or [], "facet": facet, "reason": None}
 
     return [
         entry("name", "text"),
-        entry("kind", "categorical"),
+        entry("kind", "categorical", facet=True),
         entry("updated", "date_range"),
         entry("source", "categorical", [
             {"value": "local", "label": "Local"},
             *({"value": f"mount:{mount_id}", "label": mount_id} for mount_id in mount_ids),
-        ]),
+        ], facet=True),
     ]
 
 
@@ -5145,6 +5146,206 @@ def test_workspace_search_filters_locally_and_labels_provider_sources(
     finally:
         for canvas in canvases:
             metadb.delete_canvas_cascade(canvas["id"])
+
+
+def test_workspace_facets_exclude_their_own_predicate_and_adapt_to_the_rest(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-faceted")
+    metadb.workspace_create_container(folder["id"], f"workspace-{token}-sales folder")
+    canvases = [metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-{suffix}",
+    ) for suffix in ("sales report", "sales draft", "ops report")]
+    try:
+        with metadb.session() as session:
+            for canvas, month in zip(canvases, (1, 2, 3), strict=True):
+                session.get(metadb.Canvas, canvas["id"]).updated_at = datetime.datetime(
+                    2026, month, 1, tzinfo=datetime.timezone.utc)
+        with TestClient(app) as client:
+            def facets(params: list) -> dict:
+                response = client.get("/api/workspace/facets", params=params)
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            unfiltered = facets([("field", "kind"), ("containerId", folder["id"])])
+            assert unfiltered == {
+                "field": "kind", "completeness": "complete", "reason": None,
+                "nextCursor": None, "hasMore": False,
+                "options": [
+                    {"value": "container", "label": "Folders", "count": 1},
+                    {"value": "canvas", "label": "Canvases", "count": 3},
+                ],
+            }
+
+            named = facets([
+                ("field", "kind"), ("containerId", folder["id"]), ("name", "SALES")])
+            assert [(option["value"], option["count"]) for option in named["options"]] == [
+                ("container", 1), ("canvas", 2)]
+
+            ranged = facets([
+                ("field", "kind"), ("containerId", folder["id"]), ("name", "sales"),
+                ("updatedAfter", "2026-01-15T00:00:00Z")])
+            assert [(option["value"], option["count"]) for option in ranged["options"]] == [
+                ("canvas", 1)]
+
+            source = facets([
+                ("field", "source"), ("containerId", folder["id"]), ("kind", "canvas")])
+            assert source["options"] == [{"value": "local", "label": "Local", "count": 3}]
+            assert source["completeness"] == "complete"
+            assert [(option["value"], option["count"]) for option in facets([
+                ("field", "source"), ("containerId", folder["id"]),
+                ("kind", "canvas"), ("name", "sales")])["options"]] == [("local", 2)]
+
+            searched = facets([("field", "kind"), ("q", f"{token} sales")])
+            assert [(option["value"], option["count"]) for option in searched["options"]] == [
+                ("container", 1), ("canvas", 2)]
+            assert [(option["value"], option["count"]) for option in facets([
+                ("field", "kind"), ("q", f"{token} sales"),
+                ("updatedBefore", "2026-01-15T00:00:00Z")])["options"]] == [("canvas", 1)]
+
+            own_kind = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]), ("kind", "canvas")])
+            assert own_kind.status_code == 422
+            assert "excludes its own filter" in own_kind.text
+            own_source = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"]), ("sourceId", "local")])
+            assert own_source.status_code == 422
+
+            assert client.get("/api/workspace/facets", params=[
+                ("field", "kind")]).status_code == 422
+            assert client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]), ("q", "sales"),
+            ]).status_code == 422
+            assert client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", "absent-container")]).status_code == 404
+    finally:
+        for canvas in canvases:
+            metadb.delete_canvas_cascade(canvas["id"])
+
+
+def test_workspace_facets_stay_honest_for_mounted_sources(workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-mounted")
+    metadb.workspace_create_container(folder["id"], f"workspace-{token}-beta folder")
+    canvas = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-alpha canvas")
+    mount_id = f"facet-{token}"
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    try:
+        with TestClient(app) as client:
+            # The unfiltered kind facet counts the mount root as the Folder row the page shows.
+            unfiltered = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"])]).json()
+            assert [(option["value"], option["count"])
+                    for option in unfiltered["options"]] == [("container", 2), ("canvas", 1)]
+            assert unfiltered["completeness"] == "complete"
+
+            named = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]), ("name", "alpha")]).json()
+            assert [(option["value"], option["count"]) for option in named["options"]] == [
+                ("canvas", 1)]
+
+            source = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"])]).json()
+            assert source["options"] == [
+                {"value": "local", "label": "Local", "count": 2},
+                {"value": f"mount:{mount_id}", "label": mount_id, "count": None},
+            ]
+            assert source["completeness"] == "partial"
+            assert source["reason"] == (
+                "Connected sources do not report counts under Workspace filters.")
+
+            searched = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"]),
+                ("search", "facet-")]).json()
+            assert [option["value"] for option in searched["options"]] == [
+                f"mount:{mount_id}"]
+
+            first = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"]), ("limit", 1)]).json()
+            assert [option["value"] for option in first["options"]] == ["local"]
+            assert first["hasMore"] and first["nextCursor"] is not None
+            second = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"]), ("limit", 1),
+                ("cursor", first["nextCursor"])]).json()
+            assert [option["value"] for option in second["options"]] == [
+                f"mount:{mount_id}"]
+            assert not second["hasMore"]
+            mismatched = client.get("/api/workspace/facets", params=[
+                ("field", "source"), ("containerId", folder["id"]), ("limit", 1),
+                ("name", "alpha"), ("cursor", first["nextCursor"])])
+            assert mismatched.status_code == 422
+            assert "does not match" in mismatched.text
+
+            provider_scoped = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]),
+                ("sourceId", f"mount:{mount_id}")]).json()
+            assert provider_scoped == {
+                "field": "kind", "options": [], "nextCursor": None, "hasMore": False,
+                "completeness": "unavailable",
+                "reason": "This connected source does not report Workspace facet counts.",
+            }
+            assert client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]),
+                ("sourceId", "mount:absent")]).status_code == 422
+
+            connected = client.get("/api/workspace/facets", params=[
+                ("field", "kind"),
+                ("containerId", workspace_providers.mount_container_identity(mount_id)),
+            ]).json()
+            assert connected["completeness"] == "unavailable"
+
+            search_scope = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("q", f"{token} alpha")]).json()
+            assert [(option["value"], option["count"])
+                    for option in search_scope["options"]] == [("canvas", 1)]
+            assert search_scope["completeness"] == "partial"
+            assert search_scope["reason"] == (
+                "Connected sources do not report counts under Workspace filters.")
+    finally:
+        metadb.delete_canvas_cascade(canvas["id"])
+
+
+def test_workspace_facet_counts_are_actor_isolated(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-private")
+    canvas = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-secret canvas")
+    other = f"other-{token}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=other, name="Other"))
+    try:
+        with TestClient(app) as client:
+            params = [("field", "kind"), ("containerId", folder["id"])]
+            owner_page = client.get("/api/workspace/facets", params=params).json()
+            assert [(option["value"], option["count"])
+                    for option in owner_page["options"]] == [("canvas", 1)]
+            other_page = client.get(
+                "/api/workspace/facets", params=params,
+                headers={"X-DP-User": other}).json()
+            assert other_page["options"] == []
+            source_params = [("field", "source"), ("containerId", folder["id"])]
+            assert client.get("/api/workspace/facets", params=source_params).json()[
+                "options"] == [{"value": "local", "label": "Local", "count": 1}]
+            assert client.get(
+                "/api/workspace/facets", params=source_params,
+                headers={"X-DP-User": other}).json()["options"] == []
+    finally:
+        metadb.delete_canvas_cascade(canvas["id"])
+        with metadb.session() as session:
+            session.execute(delete(metadb.User).where(metadb.User.id == other))
 
 
 def test_workspace_batch_move_and_delete_are_atomic(workspace_scope):

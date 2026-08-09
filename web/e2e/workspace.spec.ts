@@ -663,4 +663,58 @@ test.describe('workspace column filters', () => {
       await page.request.delete(`/api/canvas/${encodeURIComponent(betaId)}`)
     }
   })
+
+  test('adapts kind options and counts to the other active filters and restores them on clear', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    const suffix = Date.now()
+    const alphaId = `workspace-facet-alpha-${suffix}`
+    const betaId = `workspace-facet-beta-${suffix}`
+    const alphaName = `Facet alpha ${suffix}`
+    const betaName = `Facet beta ${suffix}`
+    for (const [id, name] of [[alphaId, alphaName], [betaId, betaName]] as const) {
+      const created = await page.request.post('/api/canvas', {
+        data: { id, name, version: 1, nodes: [], edges: [] },
+      })
+      expect(created.ok()).toBe(true)
+    }
+
+    try {
+      await page.goto('/#/workspace')
+      await expect(await workspaceResource(page, 'canvas', alphaName)).toBeVisible()
+      const kindSelect = page.getByRole('combobox', { name: 'Filter Workspace by type' })
+
+      // A committed name filter narrows the kind menu to values that still match, with counts.
+      await page.getByTestId('workspace-filter-name').click()
+      await page.getByLabel('Name contains').fill(`facet alpha ${suffix}`)
+      await page.getByRole('button', { name: 'Apply' }).click()
+      await expect(kindSelect.getByRole('option', { name: 'Canvases (1)' })).toHaveCount(1)
+      await expect(kindSelect.getByRole('option', { name: /Datasets/ })).toHaveCount(0)
+      await expect(kindSelect.getByRole('option', { name: /Folders/ })).toHaveCount(0)
+      const sourceSelect = page.getByRole('combobox', { name: 'Filter Workspace by source' })
+      await expect(sourceSelect.getByRole('option', { name: 'Local (1)' })).toHaveCount(1)
+
+      // A range with no matches keeps the selected kind offered as an explicit zero.
+      await kindSelect.selectOption('canvas')
+      await page.getByTestId('workspace-filter-updated').click()
+      await page.getByLabel('From').fill('2099-01-01')
+      await page.getByRole('button', { name: 'Apply' }).click()
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+      await expect(kindSelect.getByRole('option', { name: 'Canvases (0)' })).toHaveCount(1)
+
+      await page.getByRole('button', { name: 'Clear updated filter' }).click()
+      await expect(kindSelect.getByRole('option', { name: 'Canvases (1)' })).toHaveCount(1)
+      await page.getByRole('button', { name: 'Clear filters' }).click()
+
+      // The committed search scope carries its own adaptive counts.
+      const search = page.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' })
+      await search.fill(`facet ${suffix}`)
+      await search.press('Enter')
+      await expect(page).toHaveURL(/#\/workspace\?q=/)
+      await expect(kindSelect.getByRole('option', { name: 'Canvases (2)' })).toHaveCount(1)
+      await expect(kindSelect.getByRole('option', { name: /Folders/ })).toHaveCount(0)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(alphaId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(betaId)}`)
+    }
+  })
 })

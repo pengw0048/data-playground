@@ -4,7 +4,8 @@ import type { DatasetViewDefinition } from '../types/api'
 import { KernelError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
-  workspaceBrowse: vi.fn(), workspaceFavorites: vi.fn(), workspaceFavoriteStatus: vi.fn(),
+  workspaceBrowse: vi.fn(), workspaceFacets: vi.fn(),
+  workspaceFavorites: vi.fn(), workspaceFavoriteStatus: vi.fn(),
   workspaceFavoriteAdd: vi.fn(), workspaceFavoriteRemove: vi.fn(),
   workspaceRecent: vi.fn(), workspaceOpened: vi.fn(), workspaceResource: vi.fn(),
   workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
@@ -98,6 +99,7 @@ vi.mock('./CatalogDiscovery', () => ({
 }))
 
 import { WorkspaceExplorer, workspaceTimestampLabel } from './WorkspaceExplorer'
+import { clearWorkspaceFacetCache } from '../workspaceFacets'
 
 const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const, name: 'Workspace', version: 1, detached: false }
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
@@ -141,6 +143,11 @@ describe('workspaceTimestampLabel', () => {
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    clearWorkspaceFacetCache()
+    mocks.workspaceFacets.mockResolvedValue({
+      field: 'kind', options: [], nextCursor: null, hasMore: false,
+      completeness: 'unavailable', reason: 'facets unavailable in this test',
+    })
     store.workspaceResourceId = null
     store.workspaceSearchQuery = ''
     store.workspaceBrowseQuery = ''
@@ -969,6 +976,126 @@ describe('WorkspaceExplorer', () => {
       .toBeGreaterThan(0)
     expect(within(screen.getByRole('group', { name: 'Active Workspace filters' }))
       .getByText('Name: draft')).toBeVisible()
+  })
+
+  it('adapts kind and source options with counts and omits values with no results', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceFacets.mockImplementation(async (params: { field: 'kind' | 'source' }) => params.field === 'kind'
+      ? {
+          field: 'kind', nextCursor: null, hasMore: false, completeness: 'complete', reason: null,
+          options: [
+            { value: 'container', label: 'Folders', count: 1 },
+            { value: 'canvas', label: 'Canvases', count: 3 },
+          ],
+        }
+      : {
+          field: 'source', nextCursor: null, hasMore: false, completeness: 'partial',
+          reason: 'Connected sources do not report counts under Workspace filters.',
+          options: [
+            { value: 'local', label: 'Local', count: 4 },
+            { value: 'mount:warehouse', label: 'warehouse', count: null },
+          ],
+        })
+    render(<WorkspaceExplorer />)
+
+    const kindSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by type' })
+    await waitFor(() => expect(within(kindSelect).getByRole('option', { name: 'Canvases (3)' })).toBeInTheDocument())
+    expect(within(kindSelect).getByRole('option', { name: 'Folders (1)' })).toBeInTheDocument()
+    expect(within(kindSelect).queryByRole('option', { name: /Datasets/ })).not.toBeInTheDocument()
+    expect(within(kindSelect).queryByRole('option', { name: /Saved views/ })).not.toBeInTheDocument()
+
+    const sourceSelect = screen.getByRole('combobox', { name: 'Filter Workspace by source' })
+    await waitFor(() => expect(within(sourceSelect).getByRole('option', { name: 'Local (4)' })).toBeInTheDocument())
+    expect(within(sourceSelect).getByRole('option', { name: 'warehouse' })).toBeInTheDocument()
+    expect(sourceSelect).toHaveAttribute(
+      'title', 'Connected sources do not report counts under Workspace filters.')
+
+    expect(mocks.workspaceFacets).toHaveBeenCalledWith(expect.objectContaining({
+      field: 'kind', containerId: 'workspace-local-root',
+    }))
+    expect(mocks.workspaceFacets).toHaveBeenCalledWith(expect.objectContaining({
+      field: 'source', containerId: 'workspace-local-root',
+    }))
+  })
+
+  it('excludes each facet own predicate and preserves selected values that disappeared', async () => {
+    store.workspaceBrowseQuery = 'wq=1&kind=dataset&cf=source%3Amount%253Agone'
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceFacets.mockImplementation(async (params: { field: 'kind' | 'source' }) => params.field === 'kind'
+      ? {
+          field: 'kind', nextCursor: null, hasMore: false, completeness: 'complete', reason: null,
+          options: [{ value: 'canvas', label: 'Canvases', count: 2 }],
+        }
+      : {
+          field: 'source', nextCursor: null, hasMore: false, completeness: 'complete', reason: null,
+          options: [{ value: 'local', label: 'Local', count: 2 }],
+        })
+    render(<WorkspaceExplorer />)
+
+    const kindSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by type' })
+    await waitFor(() => expect(within(kindSelect).getByRole('option', { name: 'Datasets (0)' })).toBeInTheDocument())
+    expect(within(kindSelect).getByRole('option', { name: 'Canvases (2)' })).toBeInTheDocument()
+    expect((kindSelect as HTMLSelectElement).value).toBe('dataset')
+
+    const sourceSelect = screen.getByRole('combobox', { name: 'Filter Workspace by source' })
+    await waitFor(() => expect(within(sourceSelect).getByRole('option', { name: 'gone (unavailable)' })).toBeInTheDocument())
+    expect((sourceSelect as HTMLSelectElement).value).toBe('mount:gone')
+
+    const kindCall = mocks.workspaceFacets.mock.calls.find((call) => call[0].field === 'kind')?.[0]
+    expect(kindCall.sourceId).toBe('mount:gone')
+    expect(kindCall.kinds).toBeUndefined()
+    const sourceCall = mocks.workspaceFacets.mock.calls.find((call) => call[0].field === 'source')?.[0]
+    expect(sourceCall.kinds).toEqual(['dataset'])
+    expect(sourceCall.sourceId).toBeUndefined()
+
+    fireEvent.click(within(screen.getByRole('group', { name: 'Active Workspace filters' }))
+      .getByRole('button', { name: 'Clear source filter' }))
+    expect(store.workspaceBrowseQuery).not.toContain('cf=source')
+  })
+
+  it('adapts the search kind options under the committed query scope', async () => {
+    store.workspaceSearchQuery = 'analysis'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'analysis',
+      groups: [{
+        source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' },
+        items: [CANVAS],
+      }],
+      nextCursor: null, hasMore: false, completeness: 'complete',
+    })
+    mocks.workspaceFacets.mockResolvedValue({
+      field: 'kind', options: [{ value: 'canvas', label: 'Canvases', count: 2 }],
+      nextCursor: null, hasMore: false, completeness: 'partial',
+      reason: 'Connected sources do not report counts under Workspace filters.',
+    })
+    render(<WorkspaceExplorer />)
+
+    const kindSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by type' })
+    await waitFor(() => expect(within(kindSelect).getByRole('option', { name: 'Canvases (2)' })).toBeInTheDocument())
+    expect(within(kindSelect).queryByRole('option', { name: /Folders/ })).not.toBeInTheDocument()
+    expect(kindSelect).toHaveAttribute(
+      'title', 'Connected sources do not report counts under Workspace filters.')
+    expect(mocks.workspaceFacets).toHaveBeenCalledTimes(1)
+    expect(mocks.workspaceFacets).toHaveBeenCalledWith(expect.objectContaining({
+      field: 'kind', q: 'analysis',
+    }))
+    expect(mocks.workspaceFacets.mock.calls[0]?.[0].containerId).toBeUndefined()
+  })
+
+  it('keeps plain typed filtering when a source cannot facet', async () => {
+    render(<WorkspaceExplorer />)
+    const kindSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by type' })
+    await waitFor(() => expect(mocks.workspaceFacets).toHaveBeenCalled())
+    expect(within(kindSelect).getByRole('option', { name: 'Canvases' })).toBeInTheDocument()
+    expect(within(kindSelect).getByRole('option', { name: 'Datasets' })).toBeInTheDocument()
+    expect(within(kindSelect).getByRole('option', { name: 'Folders' })).toBeInTheDocument()
+    expect(within(kindSelect).getByRole('option', { name: 'Saved views' })).toBeInTheDocument()
   })
 
   it('restores committed browse projection from the store without treating a search draft as canonical', async () => {

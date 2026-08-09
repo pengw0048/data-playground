@@ -7,8 +7,8 @@ import { useStore } from '../store/graph'
 import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceResource, WorkspaceSearchGroup,
-  WorkspaceCanonicalDatasetContext, WorkspaceFilterCapability, WorkspaceQueryCapabilities,
-  WorkspaceSourceStatus,
+  WorkspaceCanonicalDatasetContext, WorkspaceFacetPage, WorkspaceFilterCapability,
+  WorkspaceQueryCapabilities, WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { Modal } from '../ui/Modal'
@@ -33,6 +33,7 @@ import {
   type WorkspaceBrowseViewMode,
   type WorkspaceColumnFilters,
 } from '../workspaceBrowseQuery'
+import { useWorkspaceFacet } from '../workspaceFacets'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const FAVORITES_SHELF_ID = 'workspace-favorites'
@@ -58,14 +59,39 @@ const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
   sort: ['name', 'updated', 'opened'], kindFilter: true,
   filters: [
     { field: 'name', type: 'text', supported: true },
-    { field: 'kind', type: 'categorical', supported: true },
+    { field: 'kind', type: 'categorical', supported: true, facet: true },
     { field: 'updated', type: 'date_range', supported: true },
-    { field: 'source', type: 'categorical', supported: true, options: [{ value: 'local', label: 'Local' }] },
+    { field: 'source', type: 'categorical', supported: true, facet: true, options: [{ value: 'local', label: 'Local' }] },
   ],
 }
+const WORKSPACE_KIND_OPTIONS: Array<{ value: WorkspaceBrowseKind; label: string }> = [
+  { value: 'container', label: 'Folders' },
+  { value: 'canvas', label: 'Canvases' },
+  { value: 'dataset', label: 'Datasets' },
+  { value: 'dataset_view', label: 'Saved views' },
+]
 
 function supportedFilter(capabilities: WorkspaceQueryCapabilities, field: WorkspaceFilterCapability['field']): WorkspaceFilterCapability | undefined {
   return capabilities.filters?.find((entry) => entry.field === field && entry.supported)
+}
+
+function facetCountLabel(label: string, count: number | null | undefined): string {
+  return count == null ? label : `${label} (${count})`
+}
+
+/** Offer only kinds the facet still admits; a selected kind that disappeared keeps a zero row. */
+function adaptiveKindOptions(
+  facet: WorkspaceFacetPage | null,
+  selected: WorkspaceBrowseKind | 'all',
+  all: Array<{ value: WorkspaceBrowseKind; label: string }>,
+): Array<{ value: WorkspaceBrowseKind; label: string }> {
+  if (!facet || facet.completeness === 'unavailable') return all
+  const counted = new Map(facet.options.map((option) => [option.value, option]))
+  return all.flatMap((option) => {
+    const entry = counted.get(option.value)
+    if (entry) return [{ value: option.value, label: facetCountLabel(option.label, entry.count) }]
+    return selected === option.value ? [{ value: option.value, label: `${option.label} (0)` }] : []
+  })
 }
 
 function hasActiveColumnFilters(filters: WorkspaceColumnFilters): boolean {
@@ -1185,6 +1211,53 @@ function WorkspaceMixedExplorer() {
     sourceFilterCapability?.options?.find((option) => option.value === value)?.label
       ?? (value === 'local' ? 'Local' : value.replace(/^mount:/, ''))
   )
+  const facetActorId = useStore((state) => state.currentUser?.id) ?? 'local'
+  const facetDayRange = {
+    updatedAfter: updatedAfterFilter ? filterDayStart(updatedAfterFilter) : undefined,
+    updatedBefore: updatedBeforeFilter ? filterDayEnd(updatedBeforeFilter) : undefined,
+  }
+  const localBrowseLens = !searchQuery && !activeShelf && !isProviderBrowseIdentity(containerId)
+  const kindFacet = useWorkspaceFacet({
+    enabled: localBrowseLens && !!supportedFilter(queryCapabilities, 'kind')?.facet,
+    actorId: facetActorId, revision,
+    query: {
+      field: 'kind', containerId,
+      name: nameFilter, sourceId: sourceFilter, ...facetDayRange,
+    },
+  })
+  const sourceFacet = useWorkspaceFacet({
+    enabled: localBrowseLens && !!sourceFilterCapability?.facet,
+    actorId: facetActorId, revision,
+    query: {
+      field: 'source', containerId,
+      kinds: kindFilter !== 'all' ? [kindFilter] : undefined,
+      name: nameFilter, ...facetDayRange,
+    },
+  })
+  const searchKindFacet = useWorkspaceFacet({
+    enabled: !!searchQuery,
+    actorId: facetActorId, revision,
+    query: {
+      field: 'kind', q: searchQuery || undefined,
+      name: nameFilter, sourceId: sourceFilter, ...facetDayRange,
+    },
+  })
+  const adaptiveSourceFacet = sourceFacet && sourceFacet.completeness !== 'unavailable' ? sourceFacet : null
+  const sourceSelectOptions = (() => {
+    const options = adaptiveSourceFacet
+      ? adaptiveSourceFacet.options.map((option) => ({
+          value: option.value, label: facetCountLabel(option.label, option.count),
+        }))
+      : (sourceFilterCapability?.options ?? []).map((option) => ({ value: option.value, label: option.label }))
+    if (columnFilters.source && !options.some((option) => option.value === columnFilters.source)) {
+      options.push({
+        value: columnFilters.source,
+        label: adaptiveSourceFacet && columnFilters.source === 'local'
+          ? 'Local (0)' : `${sourceFilterLabel(columnFilters.source)} (unavailable)`,
+      })
+    }
+    return options
+  })()
   const clearAllFilters = () => commitBrowseState({ kindFilter: 'all', columnFilters: {} })
   const filterChips = columnFiltersActive
     ? <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel}
@@ -1412,12 +1485,12 @@ function WorkspaceMixedExplorer() {
         <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
           commitBrowseState({ kindFilter: event.target.value as WorkspaceBrowseKind | 'all' })
         }}
+          title={searchKindFacet?.completeness === 'partial' ? searchKindFacet.reason ?? undefined : undefined}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground">
           <option value="all">All types</option>
-          <option value="container">Folders</option>
-          <option value="canvas">Canvases</option>
-          <option value="dataset">Datasets</option>
-          <option value="dataset_view">Saved views</option>
+          {adaptiveKindOptions(searchKindFacet, kindFilter, WORKSPACE_KIND_OPTIONS).map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
         </select>
         <NameFilterPopover variant="toolbar" value={columnFilters.name}
           onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} />
@@ -1477,12 +1550,14 @@ function WorkspaceMixedExplorer() {
         {kindFilterSupported && !recentOnly && <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
           commitBrowseState({ kindFilter: event.target.value as WorkspaceBrowseKind | 'all' })
         }}
+          title={kindFacet?.completeness === 'partial' ? kindFacet.reason ?? undefined : undefined}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="all">All types</option>
-          {!favoritesOnly && <option value="container">Folders</option>}
-          <option value="canvas">Canvases</option>
-          <option value="dataset">Datasets</option>
-          {!favoritesOnly && <option value="dataset_view">Saved views</option>}
+          {adaptiveKindOptions(kindFacet, kindFilter, WORKSPACE_KIND_OPTIONS.filter((option) => (
+            !favoritesOnly || option.value === 'canvas' || option.value === 'dataset'
+          ))).map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
         </select>}
         {sourceFilterCapability && !activeShelf && <select aria-label="Filter Workspace by source"
           value={columnFilters.source ?? 'all'} onChange={(event) => {
@@ -1491,9 +1566,10 @@ function WorkspaceMixedExplorer() {
               source: event.target.value === 'all' ? undefined : event.target.value,
             })
           }}
+          title={adaptiveSourceFacet?.completeness === 'partial' ? adaptiveSourceFacet.reason ?? undefined : undefined}
           className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
           <option value="all">All sources</option>
-          {(sourceFilterCapability.options ?? []).map((option) => (
+          {sourceSelectOptions.map((option) => (
             <option key={option.value} value={option.value}>{option.label}</option>
           ))}
         </select>}

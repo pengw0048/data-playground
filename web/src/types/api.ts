@@ -433,6 +433,22 @@ export interface WorkspaceFilterCapability {
   type: 'text' | 'categorical' | 'date_range' | 'numeric_range'
   supported: boolean
   options?: WorkspaceFilterOption[]
+  /** Whether this filter offers adaptive options and counts under the active query. */
+  facet?: boolean
+  reason?: string | null
+}
+export interface WorkspaceFacetOption {
+  value: string
+  label: string
+  /** null marks a known option whose member count this source does not report. */
+  count?: number | null
+}
+export interface WorkspaceFacetPage {
+  field: 'kind' | 'source'
+  options: WorkspaceFacetOption[]
+  nextCursor?: string | null
+  hasMore: boolean
+  completeness: 'complete' | 'partial' | 'unavailable'
   reason?: string | null
 }
 export interface WorkspaceQueryCapabilities {

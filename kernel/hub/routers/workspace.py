@@ -45,6 +45,7 @@ from hub.models import (
     WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceCanonicalDatasetContext,
+    WorkspaceFacetPage,
     WorkspaceFavoriteMutationResult,
     WorkspaceFavoriteStatus,
     WorkspaceOpenObservation,
@@ -826,6 +827,36 @@ def browse_workspace_container(
             )
         return workspace_providers.browse(
             container_id, uid=uid, limit=limit, cursor=cursor)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/workspace/facets", response_model=WorkspaceFacetPage)
+def workspace_facets(
+        field: Literal["kind", "source"],
+        container_id: str | None = Query(default=None, alias="containerId", max_length=512),
+        q: str | None = Query(default=None, min_length=1, max_length=512),
+        kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
+        = Query(default=[]),
+        name: str | None = Query(default=None, min_length=1, max_length=256),
+        updated_after: datetime.datetime | None = Query(default=None, alias="updatedAfter"),
+        updated_before: datetime.datetime | None = Query(default=None, alias="updatedBefore"),
+        source_id: str | None = Query(default=None, alias="sourceId",
+                                      min_length=1, max_length=160),
+        search: str | None = Query(default=None, max_length=160),
+        limit: int = Query(default=20, ge=1, le=50),
+        cursor: str | None = Query(default=None, max_length=4096),
+        uid: str = Depends(current_user),
+) -> dict:
+    """Bounded options and counts for one categorical Workspace filter under the active query."""
+    try:
+        return workspace_providers.facet_page(
+            field, uid=uid, container_id=container_id, query=q,
+            kinds=set(kind) or None, name=name,
+            updated_after=updated_after, updated_before=updated_before,
+            source_id=source_id, search=search, limit=limit, cursor=cursor)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
