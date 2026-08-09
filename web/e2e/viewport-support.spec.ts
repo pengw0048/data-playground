@@ -4,8 +4,6 @@ import { fileURLToPath } from 'node:url'
 import { MIN_VIEWPORT } from '../support/min-viewport'
 import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
-const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
-
 // Smoke that every core desktop surface remains visible, unclipped, and operable at the declared
 // minimum viewport (docs/BROWSER_SUPPORT.md ↔ web/support/min-viewport.ts).
 
@@ -112,12 +110,9 @@ test.describe('minimum viewport support', () => {
     expect(doc).toContain('web/support/min-viewport.ts')
   })
 
-  test('core surfaces stay visible and operable at the tested desktop viewport', async ({ page }, testInfo) => {
+  test('core surfaces stay visible and operable at the minimum desktop viewport', async ({ page }) => {
     const vp = page.viewportSize()
-    const expectedViewport = testInfo.project.name === 'chromium-reference-viewport'
-      ? REFERENCE_VIEWPORT
-      : MIN_VIEWPORT
-    expect(vp, 'Playwright project must pin an exercised desktop viewport').toEqual(expectedViewport)
+    expect(vp, 'Playwright project must pin the supported minimum viewport').toEqual(MIN_VIEWPORT)
 
     await goToWorkspaceShell(page)
 
@@ -196,9 +191,6 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Add operation from dataset output' })).toBeVisible()
     await expect(page.getByTestId('toolbar-view-controls')).toHaveCount(0)
-    if (testInfo.project.name === 'chromium-reference-viewport') {
-      await expect(page.getByTestId('toolbar')).toHaveAttribute('data-density', 'comfortable')
-    }
     await expect(viewportControls.getByText('Fit view', { exact: true })).toHaveCount(0)
     for (const name of ['Zoom in', 'Zoom out', 'Fit view']) {
       await expectFullyInViewport(page, viewportControls.getByRole('button', { name }), `Canvas ${name}`)
@@ -259,10 +251,7 @@ test.describe('minimum viewport support', () => {
 
   test('wide provider full-page detail contains scrolling without hiding actions or background Workspace', async ({ page }, testInfo) => {
     const vp = page.viewportSize()
-    const expectedViewport = testInfo.project.name === 'chromium-reference-viewport'
-      ? REFERENCE_VIEWPORT
-      : MIN_VIEWPORT
-    expect(vp, 'Playwright project must pin an exercised desktop viewport').toEqual(expectedViewport)
+    expect(vp, 'Playwright project must pin the supported minimum viewport').toEqual(MIN_VIEWPORT)
 
     const root = {
       id: 'container:workspace-local-root', kind: 'container', name: 'Workspace',
