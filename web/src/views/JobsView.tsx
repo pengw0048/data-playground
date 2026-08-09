@@ -491,17 +491,24 @@ function JobSubject({ name }: { name: string }) {
 
 function JobExecutionBreakdown({ nodes }: { nodes: NonNullable<WorkspaceJobDto['perNode']> }) {
   const hasReusedPrefix = nodes.some((node) => node.reused)
+  const freshNodes = nodes.filter((node) => !node.reused)
+  const reuseSummary = freshNodes.length === 0
+    ? 'Reused execution'
+    : freshNodes.every((node) => node.status === 'done')
+      ? 'Reused prefix · executed suffix'
+      : 'Reused prefix · current run suffix'
   return (
     <section aria-label="Execution breakdown" className="min-w-0 sm:col-span-2">
       <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <strong className="text-foreground">Execution breakdown</strong>
-        {hasReusedPrefix && <span className="text-[10.5px] text-muted-foreground">Reused prefix · executed suffix</span>}
+        {hasReusedPrefix && <span className="text-[10.5px] text-muted-foreground">{reuseSummary}</span>}
       </div>
       <div role="list" className="overflow-hidden rounded-md border border-border bg-background">
-        {nodes.map((node) => {
-          const label = node.label || node.nodeId
+        {nodes.map((node, index) => {
+          const label = node.label || `Step ${index + 1}`
+          const accessibleLabel = node.label || String(index + 1)
           const work = node.reused ? 'reused' : node.status === 'done' ? 'executed' : readable(node.status)
-          return <div key={node.nodeId} role="listitem" aria-label={`Execution step ${label}`}
+          return <div key={node.nodeId} role="listitem" aria-label={`Execution step ${accessibleLabel}`}
             className="grid grid-cols-[minmax(0,1fr)_72px_64px] items-center gap-2 border-b border-border/70 px-2 py-1.5 last:border-b-0">
             <span className="truncate text-foreground" title={label}>{label}</span>
             <Badge variant={node.reused ? 'secondary' : 'outline'} className="h-5 w-fit rounded px-1.5 py-0 text-[9px] font-medium">{work}</Badge>
