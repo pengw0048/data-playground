@@ -65,7 +65,15 @@ function CatalogDiscoveryFixture() {
 }
 
 function openCatalogDetails() {
-  expect(screen.getByRole('heading', { name: 'Dataset details' })).toBeVisible()
+  expect(screen.getByRole('heading', { name: 'Catalog details' })).toBeVisible()
+}
+
+function expectDatasetInspectionBeforeCatalogMaintenance() {
+  const preview = screen.getByRole('region', { name: 'Data preview' })
+  const schema = screen.getByRole('region', { name: 'Schema' })
+  const catalogDetails = screen.getByRole('region', { name: 'Catalog details' })
+  expect(preview.compareDocumentPosition(schema) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  expect(schema.compareDocumentPosition(catalogDetails) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
 }
 
 function submitFolderCreate(path: string) {
@@ -237,6 +245,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(mocks.sample).not.toHaveBeenCalled()
     expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith(TABLE.id)
     expect(screen.getByTestId('detail-use-unavailable')).toHaveTextContent('Current version · view-only')
+    expectDatasetInspectionBeforeCatalogMaintenance()
     expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
     expect(screen.queryByTestId('refresh-dataset-facts')).not.toBeInTheDocument()
     expect(screen.queryByText(/verified latest head/i)).not.toBeInTheDocument()
@@ -640,6 +649,13 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(screen.getAllByRole('cell')).toHaveLength(50)
     expect(screen.getAllByText('Showing 50 preview rows.')).toHaveLength(1)
     expect(screen.getByTestId('detail-preview-scroll').querySelector('th')).toHaveClass('sticky', 'top-0')
+  })
+
+  it('orders row and schema inspection before catalog maintenance', async () => {
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+    await screen.findByRole('region', { name: 'Data preview' })
+    expectDatasetInspectionBeforeCatalogMaintenance()
   })
 
   it('keeps default schema and scrollable preview inspection keyboard reachable without diagnostics', async () => {

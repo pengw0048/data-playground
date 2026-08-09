@@ -2,8 +2,6 @@ import { test, expect, type Locator, type Page } from '@playwright/test'
 import { MIN_VIEWPORT } from '../support/min-viewport'
 import { backToWorkspace, workspaceResource } from './support/workspace'
 
-const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
-
 async function boxOf(locator: Locator) {
   const box = await locator.boundingBox()
   if (!box) throw new Error('element has no bounding box')
@@ -47,9 +45,8 @@ async function openCanvasWithSource(page: Page) {
   return node
 }
 
-test('node transient surfaces replace each other and stay clear of the toolbar', async ({ page }, testInfo) => {
-  const expectedViewport = testInfo.project.name === 'chromium-reference-viewport' ? REFERENCE_VIEWPORT : MIN_VIEWPORT
-  expect(page.viewportSize()).toEqual(expectedViewport)
+test('node transient surfaces replace each other and stay clear of the toolbar', async ({ page }) => {
+  expect(page.viewportSize()).toEqual(MIN_VIEWPORT)
   const node = await openCanvasWithSource(page)
   const picker = page.locator('.dp-panel').filter({ has: page.getByTestId('source-search') })
   const menu = page.getByRole('menu')
