@@ -55,13 +55,22 @@ export function TopBar() {
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const rerunAll = useStore((s) => s.rerunAll)
+  const retryExecutionRecovery = useStore((s) => s.retryExecutionRecovery)
+  const cancelDetachedRuns = useStore((s) => s.cancelDetachedRuns)
   const cancelGraphRun = useStore((s) => s.cancelGraphRun)
   const graphRun = useStore((s) => s.graphRun)
+  const executionRecovery = useStore((s) => s.executionRecovery)
+  const detachedRunCount = useStore((s) => Object.keys(s.detachedRuns).length)
   const hasRunEvidence = useStore((s) => s.doc.nodes.some((node) => (
     Boolean(node.data.status) && node.data.status !== 'draft'
   )))
   const authEnabled = useStore((s) => s.authEnabled)
   const graphProgress = rerunAllProgress(graphRun)
+  const graphRunActive = !!graphRun?.runId
+  const graphSubmissionStarting = graphRun?.phase === 'submitting'
+  const runCheckPending = executionRecovery?.phase === 'checking'
+  const graphRunUnknown = graphRun?.phase === 'unknown'
+  const runCheckUnknown = executionRecovery?.phase === 'unknown'
   // in a co-edit session undo/redo go through the CRDT manager (not the snapshot stacks), so enable the
   // buttons whenever collab is active — pressing with empty history is a harmless no-op
   const canUndo = useStore((s) => s.past.length > 0) || crdtUndoActive()
@@ -173,17 +182,41 @@ export function TopBar() {
           <PeerAvatars />
           <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
           <span className="relative">
-            <Button onClick={() => graphRun ? void cancelGraphRun() : rerunAll()}
-              disabled={!canEdit || !kernelUp || (!!graphRun && !graphRun.runId)}
-              title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Offline — reconnect before running'
-                : graphRun?.runId ? 'Stop the whole-graph run'
-                  : graphRun ? 'Starting the whole-graph run'
-                    : hasRunEvidence ? 'Re-run the whole graph' : 'Run the whole graph'}
+            <Button onClick={() => graphRunActive
+              ? void cancelGraphRun()
+              : detachedRunCount > 0 ? void cancelDetachedRuns()
+                : graphRunUnknown ? retryExecutionRecovery()
+                  : runCheckUnknown ? retryExecutionRecovery() : rerunAll()}
+              disabled={!kernelUp || (graphRunActive
+                ? !canEdit
+                : graphSubmissionStarting ? true
+                  : detachedRunCount > 0 ? !canEdit
+                    : graphRunUnknown ? false
+                      : runCheckPending ? true
+                  : runCheckUnknown ? false : !canEdit)}
+              title={!kernelUp ? 'Offline — reconnect before running'
+                : graphRunActive ? canEdit ? 'Stop the whole-graph run' : 'View-only canvas'
+                  : graphSubmissionStarting ? 'Starting the whole-graph run'
+                    : detachedRunCount > 0
+                      ? canEdit ? 'Stop the active run whose target is no longer on this Canvas' : 'View-only canvas'
+                      : graphRunUnknown ? 'Run status is unknown — retry the server check'
+                        : runCheckPending ? 'Checking this Canvas for an active run'
+                      : runCheckUnknown ? 'Run status is unknown — retry the server check'
+                        : !canEdit ? 'View-only canvas'
+                          : hasRunEvidence ? 'Re-run the whole graph' : 'Run the whole graph'}
               size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
-              {graphRun?.runId
+              {graphRunActive
                 ? <><Icon name="stop" size={12} /> Stop {graphProgress.done}/{graphProgress.total}</>
-                : graphRun
+                : graphSubmissionStarting
                   ? <><span className="dp-running-glyph">●</span> Starting…</>
+                  : detachedRunCount > 0
+                      ? <><Icon name="stop" size={12} /> Stop active run{detachedRunCount > 1 ? 's' : ''}</>
+                    : graphRunUnknown
+                      ? <><Icon name="refresh" size={13} /> Retry run check</>
+                      : runCheckPending
+                    ? <><span className="dp-running-glyph">●</span> Checking runs…</>
+                    : runCheckUnknown
+                      ? <><Icon name="refresh" size={13} /> Retry run check</>
                 : hasRunEvidence
                   ? <><Icon name="refresh" size={13} /> Rerun all</>
                   : <><Icon name="play" size={13} /> Run all</>}

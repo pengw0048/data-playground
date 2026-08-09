@@ -47,6 +47,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
   const cancelRun = useStore((s) => s.cancelRun)
+  const executionRecovery = useStore((s) => s.executionRecovery)
+  const graphRun = useStore((s) => s.graphRun)
+  const detachedRunActive = useStore((s) => Object.keys(s.detachedRuns).length > 0)
   const togglePanel = useStore((s) => s.togglePanel)
   const closePanel = useStore((s) => s.closePanel)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
@@ -263,11 +266,20 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={!kernelUp ? 'Offline — run unavailable' : busy ? 'Stop' : !runnable
+              label={!kernelUp ? 'Offline — run unavailable' : busy ? 'Stop'
+                : graphRun?.runId ? 'Rerun all is active'
+                  : graphRun?.phase === 'submitting' ? 'Rerun all is starting'
+                    : graphRun?.phase === 'unknown' ? 'Run status unknown — retry from the Canvas toolbar'
+                      : detachedRunActive ? 'An off-canvas run is active'
+                      : executionRecovery?.phase === 'checking' ? 'Checking for an active run'
+                  : executionRecovery ? 'Run status unknown — retry from the Canvas toolbar'
+                    : !runnable
                 ? blocked ?? 'Connect a source to run'
                 : invalid ?? (configuredManagedSidecarMerge ? 'Review saved-dataset column merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
-              disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && !busy)}
+              disabled={!canEdit || !kernelUp
+                || (!busy && (!!executionRecovery || !!graphRun || detachedRunActive))
+                || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}

@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
@@ -7,6 +8,7 @@ import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
 import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
 import { register } from '../nodes/registry'
+import type { RetainedResultIdentity } from '../types/api'
 import '../nodes/capabilities'
 
 const apiMock = vi.hoisted(() => ({
@@ -75,7 +77,7 @@ beforeEach(() => {
   })
   apiMock.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
     runId, status: 'cancelled', jobType: 'run',
-    rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+    rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
   }))
   apiMock.fullResultExportUrl.mockReset().mockReturnValue('/api/run/full-result-export')
   apiMock.preflightFullResultExport.mockReset().mockResolvedValue('/api/run/full-result-export')
@@ -83,7 +85,8 @@ beforeEach(() => {
     currentUser: { id: 'alice', name: 'Alice' },
     kernelUp: true,
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
-    previews: {}, runs: {}, toasts: [], fullscreenCode: null,
+    previews: {}, runs: {}, graphRun: null, detachedRuns: {}, supersededResultRunIds: [],
+    toasts: [], fullscreenCode: null,
   } as any)
 })
 
@@ -300,6 +303,28 @@ describe('durable full results', () => {
   const fullIdentity = {
     runId: 'run-direct', nodeId: 'target', portId: 'out', publicationKind: 'result' as const,
   }
+  const deferred = <T,>() => {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise
+      reject = rejectPromise
+    })
+    return { promise, resolve, reject }
+  }
+  const retainedChartDoc = (
+    status: 'draft' | 'idle' | 'checking' | 'latest' | 'stale' | 'unknown' | 'queued' | 'running' | 'failed' = 'latest',
+    withLastRun = true,
+  ) => ({
+    id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'chart', position: { x: 0, y: 0 },
+      data: {
+        title: 'Tasks', status,
+        config: { chartType: 'bar', x: 'task', y: 'count', agg: 'sum' }, history: [],
+        ...(withLastRun ? { lastRun: { rows: 2, ms: 10, placement: 'local' } } : {}),
+      },
+    }],
+  })
 
   it('reopens a completed result from persisted run history', async () => {
     apiMock.listRuns.mockResolvedValue([{ id: 'history-row', runId: 'run-real', status: 'done',
@@ -1011,6 +1036,525 @@ describe('durable full results', () => {
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
   })
 
+  it('waits through checking for retained Chart recovery and never previews when the exact output resolves', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    const checkingDoc = retainedChartDoc('checking')
+    useStore.setState({ doc: checkingDoc, previews: {}, runs: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(apiMock.retainedResult).not.toHaveBeenCalled()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    const doc = retainedChartDoc('latest')
+    act(() => { useStore.setState({ doc }) })
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledWith(
+      doc, 'target', 'out', undefined,
+    ))
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    const demoted = retainedChartDoc('idle')
+    act(() => { useStore.setState({ doc: demoted }) })
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    await act(async () => {
+      lookup.resolve({
+        runId: 'retained-chart-run', executionManifestSha256: 'a'.repeat(64),
+        output: committedOutput('/outputs/retained-chart.parquet', 2),
+      })
+      await lookup.promise
+    })
+
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'retained-chart-run', 'target', 'out', 2_000, 0,
+    )
+    expect(apiMock.preview).not.toHaveBeenCalled()
+  })
+
+  it('deduplicates retained Chart recovery across StrictMode effect replay', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'task', type: 'VARCHAR', capabilities: [] },
+        { name: 'count', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ task: 'walk', count: 4 }, { task: 'pick', count: 7 }],
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    useStore.setState({ doc: retainedChartDoc('latest'), previews: {}, runs: {} } as any)
+
+    render(<StrictMode><DataPanel nodeId="target" /></StrictMode>)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      lookup.resolve({
+        runId: 'strict-retained-run', executionManifestSha256: 'e'.repeat(64),
+        output: committedOutput('/outputs/strict-retained.parquet', 2),
+      })
+      await lookup.promise
+    })
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 2 rows')
+    expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let an unmounted retained lookup demote a newer exact result', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    const doc = retainedChartDoc('latest')
+    useStore.setState({ doc, previews: {}, runs: {} } as any)
+
+    const panel = render(<DataPanel nodeId="target" />)
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    panel.unmount()
+
+    act(() => {
+      useStore.setState({
+        doc: retainedChartDoc('latest'),
+        runs: { target: { phase: 'done', status: {
+          runId: 'newer-exact-run', status: 'done', targetNodeId: 'target',
+          rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+          outputs: [committedOutput('/outputs/newer-exact.parquet', 2)],
+        } } },
+      } as any)
+    })
+    await act(async () => {
+      lookup.reject(new apiMock.KernelError(404, 'superseded retained result'))
+      await lookup.promise.catch(() => undefined)
+    })
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('latest')
+  })
+
+  it.each(['unknown', 'latest'] as const)(
+    'makes a %s Chart lookup failure explicit and retries the exact saved result', async (status) => {
+      const doc = retainedChartDoc(status)
+      apiMock.retainedResult
+        .mockRejectedValueOnce(new TypeError('network unavailable'))
+        .mockResolvedValueOnce({
+          runId: 'retried-chart-run', executionManifestSha256: 'b'.repeat(64),
+          output: committedOutput('/outputs/retried-chart.parquet', 2),
+        })
+      apiMock.preview.mockResolvedValue(sample(0, 2, false))
+      apiMock.runOutputSample.mockResolvedValue({
+        columns: [
+          { name: 'x', type: 'VARCHAR', capabilities: [] },
+          { name: 'y', type: 'BIGINT', capabilities: [] },
+        ],
+        rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
+        rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+      })
+      useStore.setState({ doc, previews: {}, runs: {} } as any)
+      const user = userEvent.setup()
+
+      render(<DataPanel nodeId="target" />)
+
+      expect(await screen.findByText('Couldn’t check saved result')).toBeInTheDocument()
+      expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+      expect(apiMock.preview).not.toHaveBeenCalled()
+      await user.click(screen.getByRole('button', { name: 'Retry' }))
+      expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
+      expect(apiMock.retainedResult).toHaveBeenCalledTimes(2)
+      expect(apiMock.preview).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    ['draft', true], ['stale', true], ['failed', true], ['idle', false],
+  ] as const)('allows bounded preview for a Chart in %s without a current result', async (status, withLastRun) => {
+    const doc = retainedChartDoc(status, withLastRun)
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    useStore.setState({ doc, previews: {}, runs: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+    expect(apiMock.retainedResult).not.toHaveBeenCalled()
+  })
+
+  it.each(['checking', 'queued', 'running'] as const)(
+    'does not preview a Chart while result recovery is %s', async (status) => {
+      const doc = retainedChartDoc(status)
+      apiMock.preview.mockResolvedValue(sample(0, 2, false))
+      useStore.setState({ doc, previews: {}, runs: {} } as any)
+
+      render(<DataPanel nodeId="target" />)
+      await act(async () => undefined)
+
+      expect(apiMock.retainedResult).not.toHaveBeenCalled()
+      expect(apiMock.preview).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['estimating', 'confirm'] as const)(
+    'keeps a committed Chart visible while a new run is only %s', async (phase) => {
+      const output = committedOutput('/outputs/current-chart.parquet', 2)
+      const status = {
+        runId: 'current-chart-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+        outputs: [output],
+      }
+      apiMock.runOutputSample.mockResolvedValue({
+        columns: [
+          { name: 'task', type: 'VARCHAR', capabilities: [] },
+          { name: 'count', type: 'BIGINT', capabilities: [] },
+        ],
+        rows: [{ task: 'walk', count: 4 }, { task: 'pick', count: 7 }],
+        rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+      })
+      useStore.setState({
+        doc: retainedChartDoc('latest'), previews: {},
+        runs: { target: { phase: 'done', status } },
+      } as any)
+
+      render(<DataPanel nodeId="target" />)
+      expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 2 rows')
+
+      act(() => {
+        useStore.setState({ runs: { target: { phase, status } } } as any)
+      })
+
+      expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 2 rows')
+      expect(apiMock.retainedResult).not.toHaveBeenCalled()
+      expect(apiMock.preview).not.toHaveBeenCalled()
+    },
+  )
+
+  it('invalidates a resolved retained Chart for the full lifetime of a newer run attempt', async () => {
+    const olderOutput = committedOutput('/outputs/older-retained.parquet', 2)
+    const olderStatus = {
+      runId: 'older-retained-run', status: 'done', targetNodeId: 'target',
+      rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+      outputs: [olderOutput],
+    }
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'older-retained-run', executionManifestSha256: 'd'.repeat(64),
+      output: olderOutput,
+    })
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    useStore.setState({ doc: retainedChartDoc('latest'), previews: {}, runs: {} } as any)
+
+    const { rerender } = render(<DataPanel nodeId="target" />)
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
+
+    act(() => {
+      useStore.setState({
+        doc: retainedChartDoc('running'),
+        runs: { target: { phase: 'running', status: olderStatus } },
+      } as any)
+    })
+    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    act(() => {
+      useStore.setState({
+        doc: retainedChartDoc('failed'),
+        runs: { target: { phase: 'failed', status: olderStatus } },
+      } as any)
+    })
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
+    rerender(<DataPanel nodeId="other" />)
+    rerender(<DataPanel nodeId="target" />)
+    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
+  })
+
+  it.each(['resolved', 'missing'] as const)(
+    'does not let a pre-run %s lookup overwrite the failed newer attempt', async (outcome) => {
+      const lookup = deferred<RetainedResultIdentity>()
+      apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+      apiMock.preview.mockResolvedValue(sample(0, 2, false))
+      apiMock.runOutputSample.mockResolvedValue(sample(0, 2, false))
+      const latest = retainedChartDoc('latest')
+      useStore.setState({ doc: latest, previews: {}, runs: {} } as any)
+
+      render(<DataPanel nodeId="target" />)
+      await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+
+      act(() => {
+        useStore.setState({
+          doc: retainedChartDoc('running'),
+          runs: { target: { phase: 'running' } },
+        } as any)
+      })
+      act(() => {
+        useStore.setState({
+          doc: retainedChartDoc('failed'),
+          runs: { target: { phase: 'failed' } },
+        } as any)
+      })
+      await act(async () => {
+        if (outcome === 'resolved') {
+          lookup.resolve({
+            runId: 'superseded-run', executionManifestSha256: 'd'.repeat(64),
+            output: committedOutput('/outputs/superseded.parquet', 2),
+          })
+          await lookup.promise
+        } else {
+          lookup.reject(new apiMock.KernelError(404, 'superseded retained result'))
+          await lookup.promise.catch(() => undefined)
+        }
+      })
+
+      expect(useStore.getState().doc.nodes[0].data.status).toBe('failed')
+      await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+      expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
+    },
+  )
+
+  it('invalidates an in-flight retained lookup as soon as a targetless graph run is submitted', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    const latest = retainedChartDoc('latest')
+    useStore.setState({ doc: latest, previews: {}, runs: {}, graphRun: null } as any)
+
+    render(<DataPanel nodeId="target" />)
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      useStore.setState({ graphRun: { canvasId: latest.id } } as any)
+    })
+    await act(async () => {
+      lookup.reject(new apiMock.KernelError(404, 'superseded retained result'))
+      await lookup.promise.catch(() => undefined)
+    })
+
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('latest')
+
+    act(() => {
+      useStore.setState({ graphRun: null, doc: retainedChartDoc('failed') } as any)
+    })
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
+  })
+
+  it('revalidates a settled Chart result after an off-canvas run reaches terminal state', async () => {
+    const oldOutput = committedOutput('/outputs/before-off-canvas-run.parquet', 2)
+    const newOutput = committedOutput('/outputs/after-off-canvas-run.parquet', 3)
+    apiMock.retainedResult
+      .mockResolvedValueOnce({
+        runId: 'before-off-canvas-run', executionManifestSha256: 'd'.repeat(64), output: oldOutput,
+      })
+      .mockResolvedValueOnce({
+        runId: 'after-off-canvas-run', executionManifestSha256: 'e'.repeat(64), output: newOutput,
+      })
+    apiMock.runOutputSample.mockImplementation(async (runId: string) => ({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: runId === 'before-off-canvas-run'
+        ? [{ x: 'old', y: 2 }]
+        : [{ x: 'new-a', y: 1 }, { x: 'new-b', y: 2 }, { x: 'new-c', y: 3 }],
+      rowCount: runId === 'before-off-canvas-run' ? 1 : 3,
+      hasMore: false, truncated: false, completeness: 'complete',
+    }))
+    const doc = retainedChartDoc('latest')
+    useStore.setState({ doc, previews: {}, runs: {}, detachedRuns: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+    expect(await screen.findByRole('img', { name: 'bar chart, saved result' })).toBeInTheDocument()
+    expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      useStore.setState({
+        detachedRuns: {
+          'deleted-target-run': {
+            canvasId: doc.id, principalId: 'alice', status: {
+              runId: 'deleted-target-run', status: 'running', jobType: 'run',
+              targetNodeId: 'deleted-node', rowsProcessed: 1, ms: 5,
+              placement: 'local', perNode: [], outputs: [],
+            },
+          },
+        },
+      } as any)
+    })
+    expect(screen.queryByTestId('full-result-status')).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    act(() => { useStore.setState({ detachedRuns: {} } as any) })
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'after-off-canvas-run', 'target', 'out', 2_000, 0,
+    ))
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 3 rows')
+  })
+
+  it('revalidates after a graph run supersedes an old per-node output across panel remount', async () => {
+    const oldOutput = committedOutput('/outputs/pre-graph-run.parquet', 2)
+    const oldStatus = {
+      runId: 'pre-graph-run', status: 'done', targetNodeId: 'target',
+      rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+      outputs: [oldOutput],
+    }
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'post-graph-run', executionManifestSha256: 'f'.repeat(64),
+      output: committedOutput('/outputs/post-graph-run.parquet', 2),
+    })
+    apiMock.runOutputSample.mockResolvedValue({
+      columns: [
+        { name: 'x', type: 'VARCHAR', capabilities: [] },
+        { name: 'y', type: 'BIGINT', capabilities: [] },
+      ],
+      rows: [{ x: 'walk', y: 4 }, { x: 'pick', y: 7 }],
+      rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+    })
+    const doc = retainedChartDoc('latest')
+    useStore.setState({
+      doc, previews: {}, graphRun: null,
+      runs: { target: { phase: 'done', status: oldStatus } },
+    } as any)
+
+    const firstPanel = render(<DataPanel nodeId="target" />)
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 2 rows')
+    expect(apiMock.retainedResult).not.toHaveBeenCalled()
+
+    act(() => {
+      useStore.setState({
+        graphRun: { canvasId: doc.id }, supersededResultRunIds: ['pre-graph-run'],
+      } as any)
+    })
+    firstPanel.unmount()
+    act(() => {
+      useStore.setState({ graphRun: null, doc: retainedChartDoc('latest') } as any)
+    })
+
+    render(<DataPanel nodeId="target" />)
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'post-graph-run', 'target', 'out', 2_000, 0,
+    ))
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 2 rows')
+  })
+
+  it('keeps a non-Chart preview when a late retained 404 follows current-results demotion', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.preview.mockResolvedValue(sample(0, 50, true))
+    const latest = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: {
+        title: 'Events', status: 'latest', config: { uri: 'events' }, history: [],
+        lastRun: { rows: 105, ms: 10, placement: 'local' },
+      },
+    }] }
+    useStore.setState({ doc: latest, previews: {}, runs: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    const demoted = {
+      ...latest,
+      nodes: [{ ...latest.nodes[0], data: { ...latest.nodes[0].data, status: 'idle' as const } }],
+    }
+    act(() => { useStore.setState({ doc: demoted }) })
+    await act(async () => {
+      lookup.reject(new apiMock.KernelError(404, 'no retained result'))
+      await lookup.promise.catch(() => undefined)
+    })
+
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('rows 1–50')).toBeInTheDocument()
+    expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
+  })
+
+  it.each([404, 409, 410])('starts a Chart preview only after retained lookup proves HTTP %i has no result', async (status) => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    const doc = retainedChartDoc()
+    useStore.setState({ doc, previews: {}, runs: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    await act(async () => {
+      lookup.reject(new apiMock.KernelError(status, 'no retained Chart result'))
+      await lookup.promise.catch(() => undefined)
+    })
+
+    await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+    expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
+  })
+
+  it.each([404, 409, 410])(
+    'falls back to a bounded Chart preview when an in-memory committed output returns HTTP %i', async (status) => {
+      const output = committedOutput('/outputs/expired-chart.parquet', 2)
+      apiMock.runOutputSample.mockRejectedValueOnce(Object.assign(
+        new Error('saved Chart result expired'), { status },
+      ))
+      apiMock.preview.mockResolvedValue({
+        columns: [
+          { name: 'task', type: 'VARCHAR', capabilities: [] },
+          { name: 'count', type: 'BIGINT', capabilities: [] },
+        ],
+        rows: [{ task: 'walk', count: 4 }, { task: 'pick', count: 7 }],
+        rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+      })
+      useStore.setState({
+        doc: retainedChartDoc('latest'), previews: {},
+        runs: { target: { phase: 'done', status: {
+          runId: 'expired-chart-run', status: 'done', targetNodeId: 'target',
+          rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'local', perNode: [],
+          outputs: [output],
+        } } },
+      } as any)
+
+      render(<DataPanel nodeId="target" />)
+
+      await waitFor(() => expect(apiMock.preview).toHaveBeenCalledTimes(1))
+      expect(apiMock.retainedResult).not.toHaveBeenCalled()
+      expect(screen.queryByText('Full result expired or removed')).not.toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
+    },
+  )
+
+  it('does not preview a Chart after retained lookup is denied', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.preview.mockResolvedValue(sample(0, 2, false))
+    const doc = retainedChartDoc()
+    useStore.setState({ doc, previews: {}, runs: {} } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    expect(apiMock.preview).not.toHaveBeenCalled()
+
+    await act(async () => {
+      lookup.reject(new apiMock.KernelError(403, 'retained Chart access denied'))
+      await lookup.promise.catch(() => undefined)
+    })
+
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(screen.getByText('Current result access denied')).toBeInTheDocument()
+  })
+
   it('recovers saved result bindings from the server instead of guessing Canvas defaults', async () => {
     apiMock.retainedResult.mockResolvedValue({
       runId: 'parameterized-run',
@@ -1046,6 +1590,43 @@ describe('durable full results', () => {
       'parameterized-run', 'target', 'out', 50, 0,
     ))
     expect(screen.getByTestId('full-result-status')).toHaveTextContent('Complete · 105 rows')
+  })
+
+  it('treats omitted and explicit empty bindings as distinct retained lookup identities', async () => {
+    apiMock.retainedResult
+      .mockRejectedValueOnce(new apiMock.KernelError(404, 'no retained result for omitted bindings'))
+      .mockResolvedValueOnce({
+        runId: 'explicit-empty-run', executionManifestSha256: 'c'.repeat(64),
+        output: committedOutput('/outputs/explicit-empty.parquet', 105),
+      })
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: {
+        title: 'target', status: 'latest', config: {}, history: [],
+        lastRun: { rows: 105, ms: 10, placement: 'local' },
+      },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {}, canvasRole: 'owner',
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('status', { name: 'Current result unavailable' })).toBeInTheDocument()
+    expect(apiMock.retainedResult).toHaveBeenCalledWith(doc, 'target', 'out', undefined)
+
+    act(() => {
+      useStore.setState({ runs: { target: { phase: 'done', parameterBindings: [] } } } as any)
+    })
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(2))
+    expect(apiMock.retainedResult).toHaveBeenLastCalledWith(
+      expect.any(Object), 'target', 'out', [],
+    )
+    expect(await screen.findByTestId('full-result-status')).toHaveTextContent('Complete · 105 rows')
   })
 
   it('does not recover an old retained result after the node becomes stale', async () => {
@@ -1099,14 +1680,16 @@ describe('durable full results', () => {
     useStore.setState({
       doc,
       previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
-      runs: {},
+      runs: {}, canvasRole: 'owner',
       requestRun,
     } as any)
     const user = userEvent.setup()
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByText('Current result unavailable')).toBeInTheDocument()
+    await waitFor(() => expect(
+      screen.getByRole('status', { name: 'Current result unavailable' }),
+    ).toBeInTheDocument())
     expect(screen.getByText(/calculation is still up to date/i)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Rerun and save result' }))
     expect(requestRun).toHaveBeenCalledWith('target')
