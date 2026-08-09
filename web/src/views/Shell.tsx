@@ -22,10 +22,12 @@ import { ConfirmationDialog } from '../components/ConfirmationDialog'
 // inspection remain their existing secondary surfaces.
 export function Shell() {
   const view = useStore((s) => s.view)
+  const settingsRequestId = useStore((s) => s.settingsRequestId)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [unreadCount, setUnreadCount] = useState(0)
   const unreadRequest = useRef(0)
   const settingsTrigger = useRef<HTMLElement | null>(null)
+  useEffect(() => { if (settingsRequestId > 0) setSettingsOpen(true) }, [settingsRequestId])
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
     setSettingsOpen(true)

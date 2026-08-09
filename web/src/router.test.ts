@@ -53,6 +53,13 @@ describe('Workspace routes', () => {
     })
   })
 
+  it('requests the Settings modal for a direct settings URL', () => {
+    window.location.hash = '#/settings'
+    expect(parseHash()).toEqual({
+      view: 'workspace', canonicalHash: '#/workspace', settingsRequested: true,
+    })
+  })
+
   it('preserves legacy Workspace URLs and keeps datasets-scope sort out of browse projection', () => {
     window.location.hash = '#/workspace'
     expect(parseHash()).toEqual({ view: 'workspace' })

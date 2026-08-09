@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../api/client', () => ({ api: mocks }))
-vi.mock('../panels/SettingsModal', () => ({ SettingsModal: () => null }))
+vi.mock('../panels/SettingsModal', () => ({ SettingsModal: () => <div>settings modal</div> }))
 vi.mock('./ERDiagram', () => ({ ERDiagram: () => <div>relationships view</div> }))
 vi.mock('./WorkspaceExplorer', () => ({ WorkspaceExplorer: () => <div>workspace view</div> }))
 vi.mock('./JobsView', () => ({ JobsView: () => <div>jobs view</div> }))
@@ -33,6 +33,7 @@ describe('Shell primary navigation', () => {
       workspaceScope: 'all',
       currentUser: { id: 'local', name: 'Local' },
       authEnabled: false,
+      settingsRequestId: 0,
     } as never)
   })
 
@@ -85,6 +86,12 @@ describe('Shell primary navigation', () => {
 
     expect(screen.getByText('signed in')).toBeVisible()
     expect(screen.queryByText('local mode')).not.toBeInTheDocument()
+  })
+
+  it('opens the Settings modal when a route requests it', () => {
+    useStore.setState({ view: 'workspace', settingsRequestId: 1 } as never)
+    render(<Shell />)
+    expect(screen.getByText('settings modal')).toBeInTheDocument()
   })
 
   it('marks the current view in the navigation landmark', () => {
