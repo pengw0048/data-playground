@@ -2067,6 +2067,36 @@ def _require_login_capable_admin() -> None:
             "migrate' with DP_AUTH_PASSWORD to bootstrap the first administrator")
 
 
+def _migration_diagnostics(connection) -> str:
+    """Bounded post-failure facts for a migration that lost its version row (#1050)."""
+    from sqlalchemy import inspect
+
+    facts: list[str] = []
+    try:
+        rows = connection.exec_driver_sql("SELECT version_num FROM alembic_version").all()
+        facts.append(f"alembic_version={[row[0] for row in rows]!r}")
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never mask the original failure
+        facts.append(f"alembic_version_error={type(exc).__name__}: {exc}")
+    try:
+        names = sorted(inspect(connection).get_table_names())
+        facts.append(f"tables={len(names)}:[{','.join(names[:20])}]")
+    except Exception as exc:  # noqa: BLE001
+        facts.append(f"tables_error={type(exc).__name__}: {exc}")
+    if _is_sqlite_database():
+        try:
+            databases = connection.exec_driver_sql("PRAGMA database_list").all()
+            facts.append(f"databases={[(row[1], row[2]) for row in databases]!r}")
+            facts.append(
+                f"journal_mode={connection.exec_driver_sql('PRAGMA journal_mode').scalar()}")
+        except Exception as exc:  # noqa: BLE001
+            facts.append(f"pragma_error={type(exc).__name__}: {exc}")
+    try:
+        facts.append(f"in_transaction={connection.in_transaction()}")
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return "; ".join(facts)
+
+
 def _upgrade_schema_and_bootstrap() -> str:
     """Run the explicit migration contract on the current database connection."""
     from alembic import command
@@ -2087,12 +2117,15 @@ def _upgrade_schema_and_bootstrap() -> str:
             try:
                 command.upgrade(_alembic_cfg(connection), expected)
             except Exception as exc:
-                raise SchemaNotReadyError(f"metadata migration failed: {exc}") from exc
+                raise SchemaNotReadyError(
+                    f"metadata migration failed: {exc} "
+                    f"({_migration_diagnostics(connection)})") from exc
             current = _current_schema_heads(connection)
             if current != (expected,):
                 found = ", ".join(current) if current else "unversioned"
                 raise SchemaNotReadyError(
-                    f"metadata migration did not reach required head {expected!r} (current: {found})")
+                    f"metadata migration did not reach required head {expected!r} "
+                    f"(current: {found}; {_migration_diagnostics(connection)})")
     _bootstrap_metadata()
     return expected
 
