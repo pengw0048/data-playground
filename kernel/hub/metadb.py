@@ -6990,6 +6990,39 @@ def _workspace_attach_last_opened(uid: str, items: list[dict]) -> list[dict]:
     return items
 
 
+def _workspace_attach_updated_at(items: list[dict]) -> list[dict]:
+    """Project the authoritative target updatedAt onto already-authorized Workspace list items."""
+    by_kind: dict[str, list[str]] = {}
+    for item in items:
+        if item.get("updatedAt") is not None or not isinstance(item.get("id"), str):
+            continue
+        kind, _, identity = item["id"].partition(":")
+        if kind in _WORKSPACE_OPEN_KINDS and identity:
+            by_kind.setdefault(kind, []).append(identity)
+    if not by_kind:
+        return items
+    stamps: dict[str, datetime.datetime] = {}
+    with session() as s:
+        if "canvas" in by_kind:
+            for identity, stamp in s.execute(select(Canvas.id, Canvas.updated_at).where(
+                    Canvas.id.in_(by_kind["canvas"]))):
+                stamps[f"canvas:{identity}"] = stamp
+        if "dataset" in by_kind:
+            for identity, stamp in s.execute(select(
+                    CatalogEntry.registration_id, CatalogEntry.updated_at).where(
+                    CatalogEntry.registration_id.in_(by_kind["dataset"]))):
+                stamps[f"dataset:{identity}"] = stamp
+        if "dataset_view" in by_kind:
+            for identity, stamp in s.execute(select(DatasetView.id, DatasetView.created_at).where(
+                    DatasetView.id.in_(by_kind["dataset_view"]))):
+                stamps[f"dataset_view:{identity}"] = stamp
+    for item in items:
+        stamp = stamps.get(item.get("id"))
+        if stamp is not None:
+            item["updatedAt"] = _core_utc_iso(stamp)
+    return items
+
+
 def _workspace_recent_cursor_encode(
         opened_at: datetime.datetime, resource_ref: str) -> str:
     payload = [
@@ -7070,6 +7103,7 @@ def workspace_recent(
         if len(collected) > limit:
             break
     page = collected[:limit]
+    _workspace_attach_updated_at(page)
     has_more = len(collected) > limit
     next_cursor = None
     if has_more and page:
@@ -7966,6 +8000,8 @@ def workspace_favorites_browse(
             if item.get("referenceState") in {"permission_lost"}:
                 item = _workspace_favorite_unavailable(row.resource_id)
         items.append(item)
+    _workspace_attach_updated_at(items)
+    _workspace_attach_last_opened(uid, items)
 
     has_more = len(rows) > limit
     next_cursor = (
