@@ -24,10 +24,14 @@ async function expectExactRevision(page: import('@playwright/test').Page, revisi
 async function openHistory(page: import('@playwright/test').Page) {
   const catalog = await page.request.get('/api/catalog/tables?limit=1')
   expect(catalog.ok()).toBe(true)
-  const dataset = (await catalog.json()).items[0] as { id: string; name: string }
+  const dataset = (await catalog.json()).items[0] as { id: string; name: string; registrationId: string }
   expect(dataset).toBeTruthy()
   await page.route('**/api/catalog/tables/stable-dataset?registration=true', (route) =>
     route.fulfill({ json: dataset }))
+  // Version links route on the stable dataset identity; alias it to the seeded fixture.
+  await page.route('**/api/workspace/resources/dataset%3Astable-dataset', async (route) =>
+    route.fulfill({ response: await page.request.get(
+      `/api/workspace/resources/${encodeURIComponent(`dataset:${dataset.registrationId}`)}`) }))
   await page.route('**/api/catalog/tables/*/revisions*', (route) =>
     route.fulfill({ json: { items: [REVISION('rev-head'), REVISION('rev-old')], nextCursor: null, hasMore: false } }))
   await page.route('**/api/catalog/revision-details', (route) => {

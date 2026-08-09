@@ -360,11 +360,15 @@ test('browses and opens one exact retained dataset revision without drifting to 
     params: { q: 'events', mode: 'lexical', limit: 10 },
   })
   expect(catalog.ok()).toBe(true)
-  const dataset = (await catalog.json() as Array<{ id: string; name: string }>)
+  const dataset = (await catalog.json() as Array<{ id: string; name: string; registrationId: string }>)
     .find((item) => item.name === 'events')
   expect(dataset).toBeTruthy()
   await page.route('**/api/catalog/tables/stable-dataset?registration=true', (route) =>
     route.fulfill({ json: dataset }))
+  // Version links route on the stable dataset identity; alias it to the seeded fixture.
+  await page.route('**/api/workspace/resources/dataset%3Astable-dataset', async (route) =>
+    route.fulfill({ response: await page.request.get(
+      `/api/workspace/resources/${encodeURIComponent(`dataset:${dataset!.registrationId}`)}`) }))
 
   let historyRequests = 0
   await page.route('**/api/catalog/tables/*/revisions*', async (route) => {
