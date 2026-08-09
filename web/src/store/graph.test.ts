@@ -5782,7 +5782,15 @@ describe('graph store — core authority ops', () => {
     expect(conflict.actions?.map((action) => action.label)).toEqual([
       'Open server copy',
       'Keep local draft as new Canvas',
+      'Delete local draft',
     ])
+
+    // The delete action only requests confirmation; nothing is discarded until it is confirmed.
+    void conflict.actions?.[2].onClick()
+    expect(useStore.getState().confirmDiscardDraftId).toBe(doc.id)
+    expect(useStore.getState().localDrafts).toHaveLength(1)
+    useStore.getState().cancelDiscardLocalDraft()
+    expect(useStore.getState().confirmDiscardDraftId).toBeNull()
 
     useStore.getState().dismissToast(conflict.id)
     useStore.getState().notifyLocalDraftConflict(doc.id)

@@ -2,6 +2,7 @@ import { useStore } from '../store/graph'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Icon } from '../ui/Icon'
+import { ConfirmationDialog } from '../components/ConfirmationDialog'
 
 // Bottom-right toasts for errors/info so failures aren't silent, plus a slim top banner when the
 // kernel is offline (with a Retry that re-bootstraps). Rendered once in App, above every view.
@@ -11,6 +12,12 @@ export function Toaster() {
   const kernelUp = useStore((s) => s.kernelUp)
   const accessDenied = useStore((s) => s.accessDenied)
   const bootstrap = useStore((s) => s.bootstrap)
+  const confirmDiscardDraftId = useStore((s) => s.confirmDiscardDraftId)
+  const localDrafts = useStore((s) => s.localDrafts)
+  const cancelDiscard = useStore((s) => s.cancelDiscardLocalDraft)
+  const discardDraft = useStore((s) => s.discardLocalDraft)
+  const discardTarget = confirmDiscardDraftId
+    ? localDrafts?.find((draft) => draft.draftId === confirmDiscardDraftId) : undefined
 
   // Token-based tones: error reads as destructive; success/info share the neutral popover surface
   // (the check/note icon distinguishes them). No hardcoded hex — see index.css design tokens.
@@ -65,6 +72,15 @@ export function Toaster() {
           )
         })}
       </div>
+      {discardTarget && <ConfirmationDialog open
+        title={`Delete local draft “${discardTarget.name || 'untitled'}”?`}
+        description="This permanently deletes the changes saved only in this browser. It does not delete a server Canvas. This cannot be undone."
+        confirmLabel="Delete local draft"
+        onCancel={cancelDiscard}
+        onConfirm={() => {
+          cancelDiscard()
+          void discardDraft(discardTarget.draftId)
+        }} />}
     </>
   )
 }

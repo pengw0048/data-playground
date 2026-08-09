@@ -1548,6 +1548,10 @@ interface Store {
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
   exportLocalDraft: (draftId: string) => void
+  /** Draft pending delete confirmation (set from toast actions; the Toaster renders the dialog). */
+  confirmDiscardDraftId: string | null
+  requestDiscardLocalDraft: (draftId: string) => void
+  cancelDiscardLocalDraft: () => void
 }
 
 function hubExecutionAvailable(get: () => Store): boolean {
@@ -4857,9 +4861,17 @@ export const useStore = create<Store>((set, get) => ({
           label: 'Keep local draft as new Canvas',
           onClick: () => get().forkLocalDraft(draft.draftId),
         },
+        {
+          label: 'Delete local draft',
+          onClick: () => get().requestDiscardLocalDraft(draft.draftId),
+        },
       ],
     })
   },
+
+  confirmDiscardDraftId: null,
+  requestDiscardLocalDraft: (draftId) => set({ confirmDiscardDraftId: draftId }),
+  cancelDiscardLocalDraft: () => set({ confirmDiscardDraftId: null }),
 
   forkLocalDraft: async (draftId) => {
     const principalId = get().currentUser?.id
