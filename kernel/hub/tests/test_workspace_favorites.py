@@ -194,3 +194,47 @@ def test_favorite_kind_filter_pages_the_filtered_query_without_false_empty_pages
     assert [item["id"] for item in third["items"]] == [f"canvas:missing-{token}-0"]
     assert third["hasMore"] is False
     assert third["nextCursor"] is None
+
+
+def test_favorites_and_recent_carry_listing_timestamps():
+    metadb.migrate_db()
+    token = uuid.uuid4().hex
+    canvas_id = f"fav-ts-canvas-{token}"
+    uri = f"file:///fav-ts-{token}.parquet"
+    alice = f"alice-ts-{token}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=alice, name="Alice"))
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=alice, name="Stamped canvas", version=1,
+            doc=json.dumps({"id": canvas_id, "name": "Stamped canvas", "version": 1,
+                            "nodes": [], "edges": []}),
+        ))
+    metadb.catalog_upsert_entry(uri, "Stamped dataset", {
+        "id": f"tbl_fav_ts_{token}", "name": "Stamped dataset", "uri": uri, "version": "v1",
+    })
+    dataset_id = metadb.workspace_builtin_dataset_identity(uri)
+    with metadb.session() as session:
+        metadb._workspace_ensure_root_placement_in_session(
+            session, target_kind="canvas", target_id=canvas_id, name="Stamped canvas")
+    canvas_ref = f"canvas:{canvas_id}"
+    dataset_ref = f"dataset:{dataset_id}"
+
+    with TestClient(app) as client:
+        for ref in (canvas_ref, dataset_ref):
+            assert client.put(
+                f"/api/workspace/favorites/{ref}", headers=_hdr(alice)).status_code == 200
+        assert client.post(
+            f"/api/workspace/resources/{canvas_ref}/opened", headers=_hdr(alice),
+        ).status_code == 200
+
+        page = client.get("/api/workspace/favorites", headers=_hdr(alice)).json()
+        by_id = {item["id"]: item for item in page["items"]}
+        assert by_id[canvas_ref]["updatedAt"]
+        assert by_id[canvas_ref]["lastOpenedAt"]
+        assert by_id[dataset_ref]["updatedAt"]
+        assert by_id[dataset_ref].get("lastOpenedAt") is None
+
+        recent = client.get("/api/workspace/recent", headers=_hdr(alice)).json()
+        recent_canvas = next(item for item in recent["items"] if item["id"] == canvas_ref)
+        assert recent_canvas["updatedAt"]
+        assert recent_canvas["lastOpenedAt"]
