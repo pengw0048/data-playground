@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import concurrent.futures
+import datetime
 import functools
 import hashlib
 import json
@@ -1660,8 +1661,23 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     }
 
 
-_PROVIDER_QUERY_REASON = "Sorting and type filters aren't available for this source."
-_MIXED_QUERY_REASON = "Sorting and type filters aren't available in this view."
+_PROVIDER_QUERY_REASON = "Sorting and filters aren't available for this source."
+_MIXED_QUERY_REASON = "Sorting and filters aren't available in this view."
+_PROVIDER_FILTER_REASON = "This connected source does not support Workspace filters."
+
+
+def _local_filter_capabilities(folder_mounts: list[_MountedProvider]) -> list[dict]:
+    """Typed column filters the local lens honors; rows/owner stay absent until projected."""
+    return [
+        {"field": "name", "type": "text", "supported": True},
+        {"field": "kind", "type": "categorical", "supported": True},
+        {"field": "updated", "type": "date_range", "supported": True},
+        {"field": "source", "type": "categorical", "supported": True, "options": [
+            {"value": "local", "label": "Local"},
+            *({"value": f"mount:{item.mount.id}", "label": item.mount.id}
+              for item in folder_mounts),
+        ]},
+    ]
 
 
 def _connected_source_resource(mounted: _MountedProvider) -> dict:
@@ -1704,9 +1720,41 @@ def browse_local_source(
     sort: str | None = None,
     order: str = "asc",
     kinds: set[str] | frozenset[str] | None = None,
+    name: str | None = None,
+    updated_after: datetime.datetime | None = None,
+    updated_before: datetime.datetime | None = None,
+    source_id: str | None = None,
     bind_cursor: bool = True,
 ) -> dict:
     """Browse only durable local metadata and discover configured provider roots separately."""
+    mounts, invalid = _configured_mounts()
+    folder_mounts = [item for item in mounts if item.container_id == container_id]
+    query_capabilities = {
+        "sort": ["name", "updated", "opened"],
+        "kindFilter": True,
+        "filters": _local_filter_capabilities(folder_mounts),
+        "reason": None,
+    }
+    if source_id is not None and source_id != "local":
+        mounted = next((item for item in folder_mounts
+                        if f"mount:{item.mount.id}" == source_id), None)
+        if mounted is None:
+            raise ValueError(
+                "Source filter does not match a source available in this folder.")
+        if cursor is not None:
+            raise ValueError(
+                "Workspace query cursor does not match this folder, sort, and filter")
+        resolved = metadb.workspace_resolve(f"container:{container_id}", uid=uid)
+        return {
+            "container": resolved["resource"],
+            "items": [],
+            "connectedSources": [_connected_source_resource(mounted)],
+            "queryCapabilities": query_capabilities,
+            "nextCursor": None,
+            "hasMore": False,
+            "completeness": "complete",
+            "sources": [{"id": "local", "kind": "local", "completeness": "complete"}],
+        }
     inner_cursor = (
         _local_lens_cursor_decode(container_id, cursor) if bind_cursor else cursor
     )
@@ -1718,12 +1766,15 @@ def browse_local_source(
         sort=sort,
         order=order,
         kinds=kinds,
+        name=name,
+        updated_after=updated_after,
+        updated_before=updated_before,
     )
-    mounts, invalid = _configured_mounts()
-    connected_sources = [
-        _connected_source_resource(item)
-        for item in mounts
-        if item.container_id == container_id
+    # Item filters never apply to provider roots, so an actively filtered page omits them.
+    filtered = (source_id is not None or name is not None
+                or updated_after is not None or updated_before is not None)
+    connected_sources = [] if filtered else [
+        _connected_source_resource(item) for item in folder_mounts
     ]
     sources = [{
         "id": "local",
@@ -1741,11 +1792,7 @@ def browse_local_source(
             if bind_cursor and next_cursor is not None else next_cursor
         ),
         "connectedSources": connected_sources,
-        "queryCapabilities": {
-            "sort": ["name", "updated", "opened"],
-            "kindFilter": True,
-            "reason": None,
-        },
+        "queryCapabilities": query_capabilities,
         "sources": sources,
     }
 
@@ -1771,7 +1818,7 @@ def browse_connected_source(
             "items": [],
             "connectedSources": [],
             "queryCapabilities": {
-                "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+                "sort": [], "kindFilter": False, "filters": [], "reason": _PROVIDER_QUERY_REASON,
             },
             "nextCursor": None,
             "hasMore": False,
@@ -1837,7 +1884,7 @@ def browse_connected_source(
         "items": items,
         "connectedSources": [],
         "queryCapabilities": {
-            "sort": [], "kindFilter": False, "reason": _PROVIDER_QUERY_REASON,
+            "sort": [], "kindFilter": False, "filters": [], "reason": _PROVIDER_QUERY_REASON,
         },
         "nextCursor": next_cursor,
         "hasMore": next_cursor is not None,
@@ -1856,7 +1903,7 @@ def mixed_browse_contract(page: dict) -> dict:
         **page,
         "connectedSources": [],
         "queryCapabilities": {
-            "sort": [], "kindFilter": False, "reason": _MIXED_QUERY_REASON,
+            "sort": [], "kindFilter": False, "filters": [], "reason": _MIXED_QUERY_REASON,
         },
     }
 
@@ -2295,7 +2342,12 @@ def _provider_searches(sources: list[_Source], states: list[dict], *,
 
 
 def search(query: str, *, uid: str, limit: int = 25,
-           cursor: str | None = None) -> dict:
+           cursor: str | None = None,
+           kinds: set[str] | frozenset[str] | None = None,
+           name: str | None = None,
+           updated_after: datetime.datetime | None = None,
+           updated_before: datetime.datetime | None = None,
+           source_id: str | None = None) -> dict:
     """Search local metadata and declared provider search surfaces in source-grouped pages."""
     normalized = " ".join(query.split()).lower()
     if not normalized:
@@ -2308,9 +2360,26 @@ def search(query: str, *, uid: str, limit: int = 25,
     if invalid:
         sources.append(_Source("configuration"))
     source_ids = [_source_status(source, "pending")["id"] for source in sources]
+    if source_id is not None:
+        if source_id not in source_ids or source_id == "configuration":
+            raise ValueError(
+                "Source filter does not match a configured Workspace source.")
+        kept = [index for index, item in enumerate(source_ids) if item == source_id]
+        sources = [sources[index] for index in kept]
+        source_ids = [source_ids[index] for index in kept]
+    filters_active = (bool(kinds) or name is not None
+                      or updated_after is not None or updated_before is not None)
+    binding = normalized if not filters_active and source_id is None else "\n".join([
+        normalized,
+        json.dumps([
+            sorted(kinds) if kinds else None, name, source_id,
+            updated_after.isoformat() if updated_after is not None else None,
+            updated_before.isoformat() if updated_before is not None else None,
+        ], separators=(",", ":")),
+    ])
     fingerprint = _mount_fingerprint(mounts, invalid)
     states = _search_cursor_decode(
-        cursor, query=normalized, fingerprint=fingerprint, source_ids=source_ids)
+        cursor, query=binding, fingerprint=fingerprint, source_ids=source_ids)
     if states is None:
         states = [{
             "id": source_id, "active": True, "cursor": None,
@@ -2318,7 +2387,7 @@ def search(query: str, *, uid: str, limit: int = 25,
             "freshness": "unknown", "searchMode": "native",
         } for source_id in source_ids]
 
-    provider_pages = _provider_searches(
+    provider_pages = {} if filters_active else _provider_searches(
         sources, states, query=normalized, limit=limit)
     groups: list[dict] = []
     next_states: list[dict] = []
@@ -2332,7 +2401,9 @@ def search(query: str, *, uid: str, limit: int = 25,
             next_state = dict(previous)
         elif source.kind == "local":
             page = metadb.workspace_search(
-                normalized, uid=uid, limit=limit, cursor=previous["cursor"])
+                normalized, uid=uid, limit=limit, cursor=previous["cursor"],
+                kinds=kinds, name=name,
+                updated_after=updated_after, updated_before=updated_before)
             items = page["items"]
             completeness = "page" if page["nextCursor"] is not None else "complete"
             status = _search_source_status(
@@ -2349,6 +2420,16 @@ def search(query: str, *, uid: str, limit: int = 25,
             next_state = {
                 "id": previous["id"], "active": False, "cursor": None,
                 "completeness": "unavailable", "error": _configured_source_error(),
+                "freshness": "unknown", "searchMode": "unsupported",
+            }
+        elif filters_active:
+            # Never silently drop filters a provider cannot apply; label the source instead.
+            status = _search_source_status(
+                source, "unsupported", error=_PROVIDER_FILTER_REASON,
+                freshness="unknown", search_mode="unsupported")
+            next_state = {
+                "id": previous["id"], "active": False, "cursor": None,
+                "completeness": "unsupported", "error": _PROVIDER_FILTER_REASON,
                 "freshness": "unknown", "searchMode": "unsupported",
             }
         else:
@@ -2396,7 +2477,7 @@ def search(query: str, *, uid: str, limit: int = 25,
     partial = any(
         group["source"]["completeness"] in _ERROR_STATES for group in groups)
     next_cursor = (
-        _search_cursor_encode(normalized, fingerprint, next_states) if has_more else None)
+        _search_cursor_encode(binding, fingerprint, next_states) if has_more else None)
     return {
         "query": normalized,
         "groups": groups,

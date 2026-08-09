@@ -424,9 +424,22 @@ export interface WorkspaceSourceStatus {
   error?: string | null
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
 }
+export interface WorkspaceFilterOption {
+  value: string
+  label: string
+}
+export interface WorkspaceFilterCapability {
+  field: 'name' | 'kind' | 'source' | 'updated' | 'rows' | 'owner'
+  type: 'text' | 'categorical' | 'date_range' | 'numeric_range'
+  supported: boolean
+  options?: WorkspaceFilterOption[]
+  reason?: string | null
+}
 export interface WorkspaceQueryCapabilities {
   sort: Array<'name' | 'updated' | 'opened'>
   kindFilter: boolean
+  /** Typed column filters this lens honors; absent fields are not filterable here. */
+  filters?: WorkspaceFilterCapability[]
   reason?: string | null
 }
 export interface WorkspaceBrowsePage {
