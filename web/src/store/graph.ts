@@ -1477,6 +1477,8 @@ interface Store {
   // -- persistence --
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc, role?: CanvasRole | null, options?: { recoverServerState?: boolean }) => void
+  /** Install a Yjs document without trusting its persisted result badges as execution authority. */
+  applyCollaborativeDoc: (doc: CanvasDoc) => void
   applyExternalEdit: (canvasId?: string) => void
   // `targetCanvasId` binds a destructive replacement to the canvas the caller created. Imports use
   // it so a late response can never replace whichever canvas became active in the meantime.
@@ -4710,7 +4712,15 @@ export const useStore = create<Store>((set, get) => ({
     const normalized = backend?.trim() || undefined
     if (get().doc.executionBackend === normalized) return
     get().commit()
-    set((state) => ({ doc: { ...state.doc, executionBackend: normalized } }))
+    set((state) => {
+      const invalidated = invalidateCurrentResults(
+        state.doc, state.runs, state.doc.nodes.map((node) => node.id),
+      )
+      return {
+        doc: { ...state.doc, executionBackend: normalized, nodes: invalidated.nodes },
+        runs: invalidated.runs,
+      }
+    })
   },
   setResultRetention: (retention) => {
     if (!roleCanEdit(get().canvasRole)) return
@@ -5329,6 +5339,38 @@ export const useStore = create<Store>((set, get) => ({
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
 
+  applyCollaborativeDoc: (doc) => {
+    const previous = get()
+    if (doc.id !== previous.doc.id) return
+    const backendChanged = doc.executionBackend !== previous.doc.executionBackend
+    let needsResultRecovery = false
+    let runs = previous.runs
+    let nodes: CanvasNode[]
+    if (backendChanged) {
+      const invalidated = invalidateCurrentResults(
+        doc, previous.runs, doc.nodes.map((node) => node.id),
+      )
+      nodes = invalidated.nodes
+      runs = invalidated.runs
+    } else {
+      const previousNodes = new Map(previous.doc.nodes.map((node) => [node.id, node]))
+      nodes = doc.nodes.map((node) => {
+        const status = node.data.status
+        const previousStatus = previousNodes.get(node.id)?.data.status
+        // A peer's failed/checking/unknown status is live execution state and already fail-closed.
+        // Only `latest` can expose a current-result action, so only that promotion needs proof.
+        if (status !== 'latest' || status === previousStatus) return node
+        needsResultRecovery = true
+        return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
+      })
+    }
+    const next = nodes === doc.nodes ? doc : { ...doc, nodes }
+    set({ doc: next, ...(runs !== previous.runs ? { runs } : {}) })
+    // A Canvas/Yjs snapshot is never proof of a current result. Re-check any promoted `latest`
+    // claim before it can become green or expose the current-result action again.
+    if (needsResultRecovery) recoverCanvasResults(get, set, next)
+  },
+
   // An MCP client (the user's own agent) edited THIS canvas out-of-band — the collab room relayed an
   // 'external-edit' nudge. Debounce a burst of agent edits into one refetch, re-apply the server's doc
   // (so nodes appear live, as if you watched it build), and tell the user. Guarded to the open canvas.
@@ -5605,12 +5647,14 @@ function recoverCanvasResults(
   const generation = ++_retainedResultRecoveryGeneration
   const userId = get().currentUser?.id
   const structure = structSig(doc)
+  const executionBackend = doc.executionBackend
   void api.currentResults(doc).then((recovery) => {
     let installedBindings = false
     set((state) => {
       if (generation !== _retainedResultRecoveryGeneration
           || state.doc.id !== doc.id
           || state.currentUser?.id !== userId
+          || state.doc.executionBackend !== executionBackend
           || structSig(state.doc) !== structure) return {}
       const latest = new Set(recovery.latestNodeIds)
       const failed = new Set(recovery.failedNodeIds)
@@ -5661,6 +5705,7 @@ function recoverCanvasResults(
       if (generation !== _retainedResultRecoveryGeneration
           || state.doc.id !== doc.id
           || state.currentUser?.id !== userId
+          || state.doc.executionBackend !== executionBackend
           || structSig(state.doc) !== structure) return {}
       let changed = false
       const nodes = state.doc.nodes.map((node) => {

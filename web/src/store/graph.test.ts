@@ -688,6 +688,118 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
   })
 
+  it('keeps authoritative stale results fail-closed when collaboration replays a saved latest badge', async () => {
+    const snapshot = {
+      id: 'c', version: 2, name: 'changed target', executionBackend: 'local-subprocess',
+      requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: {
+          ...NODE('chart', 'chart').data,
+          status: 'latest' as const,
+          lastRun: { rows: 4, ms: 12, placement: 'local' as const },
+          history: [{ id: 'chart-v1', ts: 1, rows: 4, label: 'old target', config: {} }],
+        },
+      }],
+    }
+    const finishRecoveries: Array<(recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void> = []
+    apiMocks.currentResults.mockImplementation(() => new Promise((resolve) => {
+      finishRecoveries.push(resolve)
+    }))
+    const staleRecovery = {
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['chart'], unknownNodeIds: [], results: [] as never[],
+    }
+
+    useStore.getState().loadDoc(snapshot, 'owner')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    await vi.waitFor(() => expect(finishRecoveries).toHaveLength(1))
+    finishRecoveries[0](staleRecovery)
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+
+    // A synchronized peer can still hold the older persisted dataJson. It may request another
+    // server check, but it must never restore the green badge while that proof is in flight.
+    useStore.getState().applyCollaborativeDoc(snapshot)
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual(snapshot.nodes[0].data.lastRun)
+    expect(useStore.getState().doc.nodes[0].data.history).toEqual(snapshot.nodes[0].data.history)
+    await vi.waitFor(() => expect(finishRecoveries).toHaveLength(2))
+    finishRecoveries[1](staleRecovery)
+
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+    expect(apiMocks.currentResults).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a delayed current-result response from the previous execution target', async () => {
+    let finishRecovery!: (recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    const snapshot = {
+      id: 'c', version: 1, name: 'old target', requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: { ...NODE('chart', 'chart').data, status: 'latest' as const },
+      }],
+    }
+
+    useStore.getState().loadDoc(snapshot, 'owner')
+    await vi.waitFor(() => expect(apiMocks.currentResults).toHaveBeenCalledOnce())
+    useStore.getState().setExecutionBackend('local-subprocess')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
+    // Model a later same-target verification entering checking before the old request settles. The
+    // request's captured backend, rather than the transient badge, must own response eligibility.
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: state.doc.nodes.map((node) => ({
+        ...node, data: { ...node.data, status: 'checking' as const },
+      })) },
+    }))
+
+    finishRecovery({
+      latestNodeIds: ['chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
+
+    await Promise.resolve()
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    expect(useStore.getState().doc.executionBackend).toBe('local-subprocess')
+  })
+
+  it('preserves a live peer failure without requiring a retained current result', () => {
+    const running = {
+      ...NODE('chart', 'chart'),
+      data: { ...NODE('chart', 'chart').data, status: 'running' as const },
+    }
+    const failed = {
+      ...running,
+      data: {
+        ...running.data,
+        status: 'failed' as const,
+        lastRun: { rows: 0, ms: 12, placement: 'local' as const },
+      },
+    }
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [running] },
+    }))
+    apiMocks.currentResults.mockClear()
+
+    useStore.getState().applyCollaborativeDoc({
+      ...useStore.getState().doc, nodes: [failed],
+    })
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('failed')
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual(failed.data.lastRun)
+    expect(apiMocks.currentResults).not.toHaveBeenCalled()
+  })
+
   it('does not spread a saved sink result check across fused upstream steps', async () => {
     const snapshot = {
       id: 'c', version: 1, name: 'fused result', requirements: [], nodes: [
@@ -1194,6 +1306,102 @@ describe('graph store — core authority ops', () => {
       id: 'rerouted', source: 'source', target: 'new-target',
     })
     expect(useStore.getState().past).toHaveLength(1)
+  })
+
+  it('stales every exact result claim when the execution target changes and preserves history', () => {
+    const resultNode = (id: string, status: CanvasDoc['nodes'][number]['data']['status'], type = 'source') => ({
+      ...NODE(id, type),
+      data: {
+        ...NODE(id, type).data,
+        status,
+        lastRun: { rows: 4, ms: 12, placement: 'local' as const },
+        history: [{ id: `${id}-v1`, ts: 1, rows: 4, label: 'run', config: {} }],
+      },
+    })
+    const nodes = [
+      resultNode('latest', 'latest'),
+      resultNode('checking', 'checking'),
+      resultNode('unknown', 'unknown'),
+      resultNode('failed', 'failed'),
+      resultNode('draft', 'draft'),
+      resultNode('idle', 'idle'),
+      resultNode('stale', 'stale'),
+      resultNode('write', 'latest', 'write'),
+    ]
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
+      intent: { idempotencyKey: 'old-target-write' },
+    }
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes },
+      runs: { write: {
+        phase: 'done', writeAdmission: admission, writeSubmissionId: 'old-submission',
+        writeAdmissionFingerprint: 'old-target-fingerprint',
+        writeOutcome: { runId: 'historical-write', receipt: WRITE_RECEIPT('revision-1'), outputs: [] },
+      } },
+      past: [], future: [],
+    } as any))
+    const previousDoc = useStore.getState().doc
+    const durableData = new Map(previousDoc.nodes.map((node) => [node.id, {
+      lastRun: node.data.lastRun, history: node.data.history,
+    }]))
+
+    useStore.getState().setExecutionBackend('local-subprocess')
+
+    const state = useStore.getState()
+    expect(state.doc.executionBackend).toBe('local-subprocess')
+    expect(state.doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['latest', 'stale'],
+      ['checking', 'stale'],
+      ['unknown', 'stale'],
+      ['failed', 'stale'],
+      ['draft', 'draft'],
+      ['idle', 'idle'],
+      ['stale', 'stale'],
+      ['write', 'stale'],
+    ])
+    for (const node of state.doc.nodes) {
+      expect(node.data.lastRun).toBe(durableData.get(node.id)!.lastRun)
+      expect(node.data.history).toBe(durableData.get(node.id)!.history)
+    }
+    expect(state.runs.write).toMatchObject({
+      phase: 'done', writeOutcome: { runId: 'historical-write' },
+    })
+    expect(state.runs.write.writeAdmission).toBeUndefined()
+    expect(state.runs.write.writeSubmissionId).toBeUndefined()
+    expect(state.runs.write.writeAdmissionFingerprint).toBeUndefined()
+    expect(state.past).toEqual([previousDoc])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc).toBe(previousDoc)
+    expect(useStore.getState().doc.executionBackend).toBeUndefined()
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status))
+      .toEqual(nodes.map((node) => node.data.status))
+  })
+
+  it('treats a normalized execution-target re-selection as a true no-op', () => {
+    const latest = {
+      ...CURRENT_NODE('write', 'write'),
+      data: { ...CURRENT_NODE('write', 'write').data, history: [] },
+    }
+    useStore.setState((state) => ({
+      doc: { ...state.doc, executionBackend: 'ray-data', nodes: [latest] },
+      runs: { write: {
+        phase: 'done', writeAdmission: { nodeId: 'write' },
+        writeSubmissionId: 'same-submission', writeAdmissionFingerprint: 'same-fingerprint',
+      } },
+      past: [], future: [],
+    } as any))
+    const before = useStore.getState()
+
+    useStore.getState().setExecutionBackend('  ray-data  ')
+
+    const after = useStore.getState()
+    expect(after.doc).toBe(before.doc)
+    expect(after.runs).toBe(before.runs)
+    expect(after.past).toEqual([])
+    expect(after.doc.nodes[0].data.status).toBe('latest')
   })
 
   it('keeps a running managed Write identity across an upstream edge edit', () => {

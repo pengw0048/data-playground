@@ -65,6 +65,45 @@ describe('Yjs hydration decisions', () => {
     replica.destroy()
   })
 
+  it('fails closed a peer result claim when the peer changes the execution target', () => {
+    useStore.setState({
+      doc: {
+        ...doc,
+        nodes: [{
+          ...doc.nodes[0],
+          data: {
+            ...doc.nodes[0].data,
+            status: 'latest',
+            lastRun: { rows: 4, ms: 12, placement: 'local' as const },
+          },
+        }],
+      },
+    })
+    const peer = new Y.Doc()
+    peer.getMap('meta').set('name', doc.name)
+    peer.getMap('meta').set('executionBackend', 'local-subprocess')
+    const node = new Y.Map<unknown>()
+    node.set('type', 'source')
+    node.set('x', 0)
+    node.set('y', 0)
+    node.set('parentId', null)
+    node.set('dataJson', JSON.stringify({
+      ...useStore.getState().doc.nodes[0].data,
+      status: 'latest',
+    }))
+    peer.getMap<Y.Map<unknown>>('nodes').set('source', node)
+    startYSync(() => undefined)
+
+    completeYSync(b64(Y.encodeStateAsUpdate(peer)))
+
+    expect(useStore.getState().doc.executionBackend).toBe('local-subprocess')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual({
+      rows: 4, ms: 12, placement: 'local',
+    })
+    peer.destroy()
+  })
+
   it('round-trips the Canvas result-retention override', () => {
     useStore.setState({ doc: { ...doc, resultRetention: { history: 'recent' } } })
     const sent: Uint8Array[] = []

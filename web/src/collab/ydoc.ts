@@ -152,7 +152,7 @@ export function startYSync(send: (u: Uint8Array) => void): void {
       // a peer's edit (origin 'remote') must NOT be re-persisted by this client — only local edits and
       // local undo/redo autosave. The autosave subscriber (synchronous within this setState) reads this.
       collabApply.remote = origin === 'remote'
-      try { useStore.setState({ doc: yToDoc(useStore.getState().doc) }) } finally { applying = false; collabApply.remote = false }
+      try { useStore.getState().applyCollaborativeDoc(yToDoc(useStore.getState().doc)) } finally { applying = false; collabApply.remote = false }
     }
     // anything NOT applied from a peer is a local change (a store edit or an undo/redo) → put it on the
     // wire; a 'remote' update is an echo we must not rebroadcast.
