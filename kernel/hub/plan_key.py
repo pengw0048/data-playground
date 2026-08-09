@@ -70,6 +70,10 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
         elif n.type == "chart" and isinstance(cfg, dict):
             # chartType is presentation-only; the lowered chart relation ignores Bars/Line/Points/Area.
             cfg = {key: value for key, value in cfg.items() if key != "chartType"}
+        elif n.type == "filter" and isinstance(cfg, dict):
+            # filterBuilder mirrors the predicate for the builder UI; the lowered filter reads
+            # predicate only, so a builder/raw toggle must not fork cache identity.
+            cfg = {key: value for key, value in cfg.items() if key != "filterBuilder"}
         # bypassed/disabled/title are SIBLINGS of config on data, and the engine changes the lowered
         # relation based on them (engine.py reads node.data.bypassed / .disabled; a metric node emits its
         # title as the output value) — so they must be in the key, else a toggle or a metric rename serves

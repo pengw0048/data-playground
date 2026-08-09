@@ -394,9 +394,12 @@ function compareIdentityText(a: string, b: string): number {
 // and expressions; the renderer alone consumes chartType. Keep this list next to the projection
 // seam so identity and invalidation stay aligned without a broader node-kind registry.
 const CHART_PRESENTATION_CONFIG_KEYS = new Set(['chartType'])
+// filterBuilder mirrors the predicate for the builder UI; the engine reads predicate only.
+const FILTER_PRESENTATION_CONFIG_KEYS = new Set(['filterBuilder'])
 
 function presentationOnlyConfigKeys(nodeType: string): ReadonlySet<string> | null {
-  return nodeType === 'chart' ? CHART_PRESENTATION_CONFIG_KEYS : null
+  return nodeType === 'chart' ? CHART_PRESENTATION_CONFIG_KEYS
+    : nodeType === 'filter' ? FILTER_PRESENTATION_CONFIG_KEYS : null
 }
 
 function isPresentationOnlyConfigPatch(
@@ -414,6 +417,10 @@ function executionConfig(node: CanvasDoc['nodes'][number]): Record<string, unkno
   if (node.type === 'chart' && 'chartType' in config) {
     // chartType switches Bars/Line/Points/Area without changing the retained (x, y) relation.
     const { chartType: _chartType, ...semanticConfig } = config
+    return semanticConfig
+  }
+  if (node.type === 'filter' && 'filterBuilder' in config) {
+    const { filterBuilder: _filterBuilder, ...semanticConfig } = config
     return semanticConfig
   }
   if (node.type !== 'transform' || !('scope' in config)) return config

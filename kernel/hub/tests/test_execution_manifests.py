@@ -228,6 +228,30 @@ def test_digest_ignores_chart_presentation_type():
     assert _build(semantic, inputs=[], target="chart")[0] != digest
 
 
+def test_digest_ignores_filter_builder_mirror():
+    graph = Graph.model_validate({
+        "id": "filter-mirror", "version": 1,
+        "nodes": [{
+            "id": "filter", "type": "filter", "position": {"x": 0, "y": 0},
+            "data": {"config": {"predicate": "event = 'purchase'"}},
+        }], "edges": [],
+    })
+    mirrored = graph.model_copy(deep=True)
+    mirrored.nodes[0].data["config"]["filterBuilder"] = {
+        "conditions": [{"col": "event", "op": "=", "val": "purchase", "type": "string"}],
+    }
+
+    digest, payload = _build(graph, inputs=[], target="filter")
+    observed, observed_payload = _build(mirrored, inputs=[], target="filter")
+    assert observed == digest
+    assert observed_payload == payload
+    assert "filterBuilder" not in validate_execution_manifest(digest, payload)["graph"]["nodes"][0]["data"]["config"]
+
+    semantic = graph.model_copy(deep=True)
+    semantic.nodes[0].data["config"]["predicate"] = "event = 'refund'"
+    assert _build(semantic, inputs=[], target="filter")[0] != digest
+
+
 def test_digest_retains_only_titles_consumed_by_execution():
     baseline, _ = _build()
 
