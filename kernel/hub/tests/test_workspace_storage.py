@@ -1011,6 +1011,22 @@ def test_unavailable_provider_items_preserve_identity_without_source_admission(
     ) == []
 
 
+def _local_filter_capabilities(*mount_ids: str) -> list[dict]:
+    def entry(field: str, kind: str, options: list[dict] | None = None) -> dict:
+        return {"field": field, "type": kind, "supported": True,
+                "options": options or [], "reason": None}
+
+    return [
+        entry("name", "text"),
+        entry("kind", "categorical"),
+        entry("updated", "date_range"),
+        entry("source", "categorical", [
+            {"value": "local", "label": "Local"},
+            *({"value": f"mount:{mount_id}", "label": mount_id} for mount_id in mount_ids),
+        ]),
+    ]
+
+
 def _browse_provider_root_item(mount_id: str, provider_placement_id: str) -> dict:
     cursor = None
     while True:
@@ -4932,6 +4948,205 @@ def test_workspace_server_updated_query_keyset_survives_insert_before_cursor(wor
             metadb.delete_canvas_cascade(inserted["id"])
 
 
+def test_workspace_column_filters_combine_with_sort_and_bind_the_cursor(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-column-filters")
+    metadb.workspace_create_container(folder["id"], f"workspace-{token}-sales folder")
+    canvases = [metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-{suffix}",
+    ) for suffix in ("sales report", "sales draft", "ops report")]
+    try:
+        with metadb.session() as session:
+            for canvas, month in zip(canvases, (1, 2, 3), strict=True):
+                session.get(metadb.Canvas, canvas["id"]).updated_at = datetime.datetime(
+                    2026, month, 1, tzinfo=datetime.timezone.utc)
+        with TestClient(app) as client:
+            combined = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("kind", "canvas"), ("name", "SALES"),
+                    ("updatedAfter", "2026-01-15T00:00:00Z"),
+                    ("updatedBefore", "2026-12-31T00:00:00Z"),
+                    ("sort", "updated"), ("order", "desc"),
+                ])
+            assert combined.status_code == 200, combined.text
+            assert [item["name"] for item in combined.json()["items"]] == [
+                f"workspace-{token}-sales draft"]
+
+            # An updated range excludes rows with no timestamp, such as local Folders.
+            unranged = client.get(
+                f"/api/workspace/containers/{folder['id']}",
+                params=[("name", f"{token} sales")])
+            assert unranged.status_code == 200, unranged.text
+            assert {item["name"].removeprefix(f"workspace-{token}-")
+                    for item in unranged.json()["items"]} == {
+                        "sales folder", "sales report", "sales draft"}
+
+            first = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("kind", "canvas"), ("name", "sales"),
+                    ("sort", "name"), ("order", "asc"),
+                ])
+            assert first.status_code == 200, first.text
+            first_page = first.json()
+            assert [item["name"] for item in first_page["items"]] == [
+                f"workspace-{token}-sales draft"]
+            assert first_page["nextCursor"] is not None
+
+            second = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("kind", "canvas"), ("name", "sales"),
+                    ("sort", "name"), ("order", "asc"),
+                    ("cursor", first_page["nextCursor"]),
+                ])
+            assert second.status_code == 200, second.text
+            assert [item["name"] for item in second.json()["items"]] == [
+                f"workspace-{token}-sales report"]
+
+            mismatched = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("limit", 1), ("kind", "canvas"), ("name", "report"),
+                    ("sort", "name"), ("order", "asc"),
+                    ("cursor", first_page["nextCursor"]),
+                ])
+            assert mismatched.status_code == 422
+            assert "does not match" in mismatched.text
+
+            inverted = client.get(
+                f"/api/workspace/containers/{folder['id']}", params=[
+                    ("updatedAfter", "2026-03-01T00:00:00Z"),
+                    ("updatedBefore", "2026-01-01T00:00:00Z"),
+                ])
+            assert inverted.status_code == 422
+            assert "updated-after" in inverted.text
+    finally:
+        for canvas in canvases:
+            metadb.delete_canvas_cascade(canvas["id"])
+
+
+def test_workspace_source_filter_is_capability_advertised_and_honest(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-source-filter")
+    child = metadb.workspace_create_container(folder["id"], f"workspace-{token}-child")
+    mount_id = f"srcf-{token}"
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    with TestClient(app) as client:
+        local_only = client.get(
+            f"/api/workspace/containers/{folder['id']}",
+            params={"source": "local", "sourceId": "local"})
+        assert local_only.status_code == 200, local_only.text
+        page = local_only.json()
+        assert [item["id"] for item in page["items"]] == [f"container:{child['id']}"]
+        assert page["connectedSources"] == []
+        assert page["queryCapabilities"]["filters"] == _local_filter_capabilities(mount_id)
+
+        mount_only = client.get(
+            f"/api/workspace/containers/{folder['id']}",
+            params={"source": "local", "sourceId": f"mount:{mount_id}"})
+        assert mount_only.status_code == 200, mount_only.text
+        mount_page = mount_only.json()
+        assert mount_page["items"] == []
+        assert [item["mountId"] for item in mount_page["connectedSources"]] == [mount_id]
+        assert mount_page["completeness"] == "complete"
+        assert provider.list_calls == 0
+
+        unknown = client.get(
+            f"/api/workspace/containers/{folder['id']}",
+            params={"source": "local", "sourceId": "mount:absent"})
+        assert unknown.status_code == 422
+        assert "does not match a source available in this folder" in unknown.text
+
+        mixed = client.get(
+            f"/api/workspace/containers/{folder['id']}",
+            params={"name": "child"})
+        assert mixed.status_code == 422
+        assert "Sort and filters are available in local folders" in mixed.text
+
+        provider_lens = client.get(
+            "/api/workspace/containers/"
+            f"{workspace_providers.mount_container_identity(mount_id)}",
+            params={"source": "provider", "name": "shared"})
+        assert provider_lens.status_code == 422
+        assert "Workspace sort and filters are unavailable" in provider_lens.text
+
+
+def test_workspace_search_filters_locally_and_labels_provider_sources(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-searchable")
+    canvases = [metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-{suffix}",
+    ) for suffix in ("searchable early", "searchable late")]
+    mount_id = f"search-{token}"
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    try:
+        with metadb.session() as session:
+            for canvas, month in zip(canvases, (1, 2), strict=True):
+                session.get(metadb.Canvas, canvas["id"]).updated_at = datetime.datetime(
+                    2026, month, 1, tzinfo=datetime.timezone.utc)
+        with TestClient(app) as client:
+            filtered = client.get("/api/workspace/search", params=[
+                ("q", token), ("kind", "canvas"),
+                ("updatedAfter", "2026-01-15T00:00:00Z"),
+            ])
+            assert filtered.status_code == 200, filtered.text
+            page = filtered.json()
+            local_group = next(
+                group for group in page["groups"] if group["source"]["id"] == "local")
+            assert [item["name"] for item in local_group["items"]] == [
+                f"workspace-{token}-searchable late"]
+            provider_group = next(
+                group for group in page["groups"]
+                if group["source"]["id"] == f"mount:{mount_id}")
+            assert provider_group["items"] == []
+            assert provider_group["source"]["completeness"] == "unsupported"
+            assert provider_group["source"]["error"] == (
+                "This connected source does not support Workspace filters.")
+            assert page["completeness"] == "partial"
+
+            local_scope = client.get("/api/workspace/search", params=[
+                ("q", token), ("sourceId", "local")])
+            assert local_scope.status_code == 200, local_scope.text
+            assert [group["source"]["id"] for group in local_scope.json()["groups"]] == [
+                "local"]
+
+            unknown_scope = client.get("/api/workspace/search", params=[
+                ("q", token), ("sourceId", "mount:absent")])
+            assert unknown_scope.status_code == 422
+            assert "does not match a configured Workspace source" in unknown_scope.text
+
+            first = client.get("/api/workspace/search", params=[
+                ("q", token), ("kind", "canvas"), ("limit", 1)])
+            assert first.status_code == 200, first.text
+            cursor = first.json()["nextCursor"]
+            assert cursor is not None
+            mismatched = client.get("/api/workspace/search", params=[
+                ("q", token), ("kind", "dataset"), ("limit", 1), ("cursor", cursor)])
+            assert mismatched.status_code == 422
+            assert "invalid Workspace search cursor" in mismatched.text
+    finally:
+        for canvas in canvases:
+            metadb.delete_canvas_cascade(canvas["id"])
+
+
 def test_workspace_batch_move_and_delete_are_atomic(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
@@ -5092,7 +5307,8 @@ def test_workspace_connected_source_lens_is_separate_bounded_and_resolvable(
         assert [item["name"] for item in local_page["items"]] == [
             f"workspace-{token}-z-local", f"workspace-{token}-a-local"]
         assert local_page["queryCapabilities"] == {
-            "sort": ["name", "updated", "opened"], "kindFilter": True, "reason": None}
+            "sort": ["name", "updated", "opened"], "kindFilter": True,
+            "filters": _local_filter_capabilities(mount_id), "reason": None}
         assert [source["kind"] for source in local_page["sources"]] == [
             "local", "configuration"]
         assert local_page["sources"][1]["error"] == "catalog mount configuration is invalid"
@@ -5127,8 +5343,9 @@ def test_workspace_connected_source_lens_is_separate_bounded_and_resolvable(
         assert first_page["container"] == connected
         assert first_page["queryCapabilities"]["sort"] == []
         assert first_page["queryCapabilities"]["kindFilter"] is False
+        assert first_page["queryCapabilities"]["filters"] == []
         assert first_page["queryCapabilities"]["reason"] == (
-            "Sorting and type filters aren't available for this source."
+            "Sorting and filters aren't available for this source."
         )
         assert first_page["items"][0]["parentId"] == connected["id"]
         assert first_page["nextCursor"].startswith("provider.")
@@ -5296,7 +5513,8 @@ def test_workspace_normal_local_browse_keeps_sort_and_filter_capabilities(worksp
     page = response.json()
     assert page["connectedSources"] == []
     assert page["queryCapabilities"] == {
-        "sort": ["name", "updated", "opened"], "kindFilter": True, "reason": None}
+        "sort": ["name", "updated", "opened"], "kindFilter": True,
+        "filters": _local_filter_capabilities(), "reason": None}
 
 
 def test_workspace_default_browse_mixes_local_and_connected_source_roots(
@@ -5326,8 +5544,9 @@ def test_workspace_default_browse_mixes_local_and_connected_source_roots(
     assert not any(item["id"].startswith("container:mount.") for item in page["items"])
     assert page["queryCapabilities"]["sort"] == []
     assert page["queryCapabilities"]["kindFilter"] is False
+    assert page["queryCapabilities"]["filters"] == []
     assert page["queryCapabilities"]["reason"] == (
-        "Sorting and type filters aren't available in this view."
+        "Sorting and filters aren't available in this view."
     )
 
 

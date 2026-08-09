@@ -26,6 +26,7 @@ describe('workspaceBrowseQuery', () => {
       sortMode: 'name-asc',
       kindFilter: 'canvas',
       viewMode: 'grid',
+      columnFilters: {},
     })
     expect(serializeBrowseState({
       sortMode: 'source', kindFilter: 'all', viewMode: 'list',
@@ -63,15 +64,26 @@ describe('workspaceBrowseQuery', () => {
     })
   })
 
-  it('parses a bounded column-filter map and rejects unsafe keys', () => {
-    expect(parseColumnFilterMap('frame_id:12,score:high')).toEqual({
-      frame_id: '12', score: 'high',
+  it('round-trips typed column filters and drops unknown or malformed entries', () => {
+    expect(parseColumnFilterMap(
+      'name:sales%20report,source:mount%3Alake,updated_after:2026-08-01,updated_before:2026-08-05',
+    )).toEqual({
+      name: 'sales report', source: 'mount:lake',
+      updatedAfter: '2026-08-01', updatedBefore: '2026-08-05',
     })
-    expect(parseColumnFilterMap('../secret:1')).toBeUndefined()
-    expect(parseColumnFilterMap('ok:1,bad/key:2')).toEqual({ ok: '1' })
-    expect(Object.keys(parseColumnFilterMap(
-      Array.from({ length: 20 }, (_, i) => `c${i}:v`).join(','),
-    ) ?? {})).toHaveLength(16)
+    expect(parseColumnFilterMap('frame_id:12,score:high')).toBeUndefined()
+    expect(parseColumnFilterMap('updated_after:not-a-date,source:elsewhere')).toBeUndefined()
+    expect(parseColumnFilterMap('updated_after:2026-08-05,updated_before:2026-08-01')).toEqual({
+      updatedAfter: '2026-08-01', updatedBefore: '2026-08-05',
+    })
+
+    const encoded = serializeBrowseState({
+      sortMode: 'source', kindFilter: 'all', viewMode: 'list',
+      columnFilters: { name: 'a, b: c', source: 'local' },
+    })
+    expect(browseStateFromQuery(encoded).columnFilters).toEqual({
+      name: 'a, b: c', source: 'local',
+    })
   })
 
   it('normalizes and extracts browse keys without leaking dataset-viewer keys', () => {

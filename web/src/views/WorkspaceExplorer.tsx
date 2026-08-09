@@ -7,7 +7,8 @@ import { useStore } from '../store/graph'
 import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceResource, WorkspaceSearchGroup,
-  WorkspaceCanonicalDatasetContext, WorkspaceQueryCapabilities, WorkspaceSourceStatus,
+  WorkspaceCanonicalDatasetContext, WorkspaceFilterCapability, WorkspaceQueryCapabilities,
+  WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { Modal } from '../ui/Modal'
@@ -16,6 +17,7 @@ import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
   ContextMenuSeparator, ContextMenuTrigger,
 } from '../components/ui/context-menu'
+import { Popover, PopoverContent, PopoverTrigger } from '../components/ui/popover'
 import { AddDataModal, CatalogDetail } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
@@ -29,6 +31,7 @@ import {
   type WorkspaceBrowseKind,
   type WorkspaceBrowseSortMode,
   type WorkspaceBrowseViewMode,
+  type WorkspaceColumnFilters,
 } from '../workspaceBrowseQuery'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
@@ -53,6 +56,34 @@ const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
 const SYSTEM_ROW_ID_DESCRIPTION = 'System row ID supplied for this run; it is not a data column.'
 const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
   sort: ['name', 'updated', 'opened'], kindFilter: true,
+  filters: [
+    { field: 'name', type: 'text', supported: true },
+    { field: 'kind', type: 'categorical', supported: true },
+    { field: 'updated', type: 'date_range', supported: true },
+    { field: 'source', type: 'categorical', supported: true, options: [{ value: 'local', label: 'Local' }] },
+  ],
+}
+
+function supportedFilter(capabilities: WorkspaceQueryCapabilities, field: WorkspaceFilterCapability['field']): WorkspaceFilterCapability | undefined {
+  return capabilities.filters?.find((entry) => entry.field === field && entry.supported)
+}
+
+function hasActiveColumnFilters(filters: WorkspaceColumnFilters): boolean {
+  return !!(filters.name || filters.source || filters.updatedAfter || filters.updatedBefore)
+}
+
+/** Day-granular bounds are committed in the viewer's local time. */
+function filterDayStart(day: string): string {
+  return new Date(`${day}T00:00:00`).toISOString()
+}
+
+function filterDayEnd(day: string): string {
+  return new Date(`${day}T23:59:59.999`).toISOString()
+}
+
+function updatedRangeLabel(after?: string, before?: string): string {
+  if (after && before) return `${after} – ${before}`
+  return after ? `from ${after}` : `through ${before}`
 }
 
 type WorkspaceFavoritesApi = {
@@ -598,7 +629,7 @@ function WorkspaceMixedExplorer() {
   const recentOnly = activeShelf === 'recent'
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(() => new Set())
   const [selectedResourceIds, setSelectedResourceIds] = useState<Set<string>>(new Set())
-  const { sortMode, kindFilter, viewMode } = useMemo(
+  const { sortMode, kindFilter, viewMode, columnFilters } = useMemo(
     () => browseStateFromQuery(browseQuery),
     [browseQuery],
   )
@@ -606,14 +637,21 @@ function WorkspaceMixedExplorer() {
     sortMode?: WorkspaceBrowseSortMode
     kindFilter?: WorkspaceBrowseKind | 'all'
     viewMode?: WorkspaceBrowseViewMode
+    columnFilters?: WorkspaceColumnFilters
   }) => {
     setWorkspaceBrowseQuery(serializeBrowseState({
       sortMode: next.sortMode ?? sortMode,
       kindFilter: next.kindFilter ?? kindFilter,
       viewMode: next.viewMode ?? viewMode,
+      columnFilters: next.columnFilters ?? columnFilters,
     }))
     setSelectedResourceIds(new Set())
   }
+  const commitColumnFilters = (next: WorkspaceColumnFilters) => commitBrowseState({ columnFilters: next })
+  const {
+    name: nameFilter, source: sourceFilter,
+    updatedAfter: updatedAfterFilter, updatedBefore: updatedBeforeFilter,
+  } = columnFilters
   const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
   const [sources, setSources] = useState<WorkspaceSourceStatus[]>([])
   const [loading, setLoading] = useState(true)
@@ -764,6 +802,12 @@ function WorkspaceMixedExplorer() {
         params.order = order
       }
       if (localSource && kindFilter !== 'all') params.kinds = [kindFilter]
+      if (localSource) {
+        if (nameFilter) params.name = nameFilter
+        if (sourceFilter) params.sourceId = sourceFilter
+        if (updatedAfterFilter) params.updatedAfter = filterDayStart(updatedAfterFilter)
+        if (updatedBeforeFilter) params.updatedBefore = filterDayEnd(updatedBeforeFilter)
+      }
       const page = await api.workspaceBrowse(targetId, params)
       if (sequence !== request.current) return
       setCompleteness(page.completeness)
@@ -815,7 +859,8 @@ function WorkspaceMixedExplorer() {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [providerPlacementObservations, sortMode, kindFilter, favoritesOnly, recentOnly])
+  }, [providerPlacementObservations, sortMode, kindFilter, nameFilter, sourceFilter,
+    updatedAfterFilter, updatedBeforeFilter, favoritesOnly, recentOnly])
 
   useEffect(() => {
     let cancelled = false
@@ -1127,6 +1172,24 @@ function WorkspaceMixedExplorer() {
   const selectedResources = items.filter((resource) => selectedResourceIds.has(resource.id))
   const sortSupported = queryCapabilities.sort.length > 0
   const kindFilterSupported = queryCapabilities.kindFilter
+  const nameFilterCapability = supportedFilter(queryCapabilities, 'name')
+  const updatedFilterCapability = supportedFilter(queryCapabilities, 'updated')
+  const sourceFilterCapability = supportedFilter(queryCapabilities, 'source')
+  const columnFiltersActive = hasActiveColumnFilters(columnFilters)
+  const filtersNotAppliedReason = !columnFiltersActive ? null
+    : activeShelf ? 'Filters do not apply to this view.'
+    : !nameFilterCapability && !updatedFilterCapability && !sourceFilterCapability
+      ? queryCapabilities.reason ?? "Filters aren't available for this source."
+      : null
+  const sourceFilterLabel = (value: string) => (
+    sourceFilterCapability?.options?.find((option) => option.value === value)?.label
+      ?? (value === 'local' ? 'Local' : value.replace(/^mount:/, ''))
+  )
+  const clearAllFilters = () => commitBrowseState({ kindFilter: 'all', columnFilters: {} })
+  const filterChips = columnFiltersActive
+    ? <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel}
+        notApplied={filtersNotAppliedReason} onChange={commitColumnFilters} onClearAll={clearAllFilters} />
+    : null
   const visibleConnectedSources = kindFilter === 'all' || kindFilter === 'container'
     ? connectedSources : []
   const singleSelectedResource = selectedResources.length === 1 ? selectedResources[0] ?? null : null
@@ -1344,6 +1407,29 @@ function WorkspaceMixedExplorer() {
           : <>Select Search to look for “{normalizedSearchDraft}”.</>}
       </div>}
 
+      {searchQuery && <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-card px-7 py-1.5 text-[12px]">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Narrow results</span>
+        <select aria-label="Filter Workspace by type" value={kindFilter} onChange={(event) => {
+          commitBrowseState({ kindFilter: event.target.value as WorkspaceBrowseKind | 'all' })
+        }}
+          className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground">
+          <option value="all">All types</option>
+          <option value="container">Folders</option>
+          <option value="canvas">Canvases</option>
+          <option value="dataset">Datasets</option>
+          <option value="dataset_view">Saved views</option>
+        </select>
+        <NameFilterPopover variant="toolbar" value={columnFilters.name}
+          onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} />
+        <UpdatedFilterPopover variant="toolbar"
+          after={columnFilters.updatedAfter} before={columnFilters.updatedBefore}
+          onCommit={(range) => commitColumnFilters({
+            ...columnFilters, updatedAfter: undefined, updatedBefore: undefined, ...range,
+          })} />
+        {columnFiltersActive && <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel}
+          onChange={commitColumnFilters} onClearAll={clearAllFilters} />}
+      </div>}
+
       {!searchQuery && (sources.some(sourceNeedsAttention) || completeness === 'partial')
         && <SourceStatusBar sources={sources} completeness={completeness} />}
       {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
@@ -1398,8 +1484,30 @@ function WorkspaceMixedExplorer() {
           <option value="dataset">Datasets</option>
           {!favoritesOnly && <option value="dataset_view">Saved views</option>}
         </select>}
-        {error && (sortMode !== 'source' || kindFilter !== 'all') && <button type="button" onClick={() => {
-          commitBrowseState({ sortMode: 'source', kindFilter: 'all' })
+        {sourceFilterCapability && !activeShelf && <select aria-label="Filter Workspace by source"
+          value={columnFilters.source ?? 'all'} onChange={(event) => {
+            commitColumnFilters({
+              ...columnFilters,
+              source: event.target.value === 'all' ? undefined : event.target.value,
+            })
+          }}
+          className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
+          <option value="all">All sources</option>
+          {(sourceFilterCapability.options ?? []).map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>}
+        {viewMode === 'grid' && !activeShelf && nameFilterCapability && <NameFilterPopover variant="toolbar"
+          value={columnFilters.name}
+          onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} />}
+        {viewMode === 'grid' && !activeShelf && updatedFilterCapability && <UpdatedFilterPopover variant="toolbar"
+          after={columnFilters.updatedAfter} before={columnFilters.updatedBefore}
+          onCommit={(range) => commitColumnFilters({
+            ...columnFilters, updatedAfter: undefined, updatedBefore: undefined, ...range,
+          })} />}
+        {filterChips}
+        {error && (sortMode !== 'source' || kindFilter !== 'all' || columnFiltersActive) && <button type="button" onClick={() => {
+          commitBrowseState({ sortMode: 'source', kindFilter: 'all', columnFilters: {} })
         }} className="rounded-md border border-border px-2 py-1 font-semibold text-primary hover:bg-accent">Reset view</button>}
         {!error && <>
         <label className="inline-flex cursor-pointer items-center gap-2 text-muted-foreground">
@@ -1437,7 +1545,7 @@ function WorkspaceMixedExplorer() {
       <ContextMenuTrigger asChild>
       <div data-testid="workspace-scroll-surface" className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {searchQuery ? <WorkspaceSearchResults query={searchQuery} revision={revision} onOpen={open}
-          onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
+          onAction={startSearchAction} files={files} kindFilter={kindFilter} filters={columnFilters} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
           <button onClick={reload} className="font-semibold underline">Retry</button>
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : <div className="mx-auto flex min-h-full w-full max-w-[1600px] flex-col">
@@ -1449,7 +1557,15 @@ function WorkspaceMixedExplorer() {
                 onOpen={() => open(resource)} onRetry={reload} viewMode={viewMode} />)}
             </div>
           </section>}
-          {items.length ? <>{viewMode === 'list' && <WorkspaceListHeader />}
+          {items.length ? <>{viewMode === 'list' && <WorkspaceListHeader
+            nameFilter={!activeShelf && nameFilterCapability ? <NameFilterPopover variant="header"
+              value={columnFilters.name}
+              onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} /> : undefined}
+            updatedFilter={!activeShelf && updatedFilterCapability ? <UpdatedFilterPopover variant="header"
+              after={columnFilters.updatedAfter} before={columnFilters.updatedBefore}
+              onCommit={(range) => commitColumnFilters({
+                ...columnFilters, updatedAfter: undefined, updatedBefore: undefined, ...range,
+              })} /> : undefined} />}
           <div className={viewMode === 'grid' ? 'grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3' : 'grid gap-1'}>
             {items.map((resource) => {
               const rowSelected = selectedResourceIds.has(resource.id)
@@ -1508,6 +1624,7 @@ function WorkspaceMixedExplorer() {
             ? 'This Workspace location is unavailable.'
             : favoritesOnly ? 'No favorites yet. Star a dataset or Canvas from Workspace.'
             : hasMore ? 'This page has no items. Continue to the next page.'
+            : columnFiltersActive || kindFilter !== 'all' ? 'No items match the current filters.'
             : isExternal(container) ? canvasDestination(container, 'create')
               ? 'This connected source folder is empty. Create a Canvas here to get started.'
               : 'This connected source folder is empty.'
@@ -1637,10 +1754,12 @@ function WorkspaceMixedExplorer() {
   )
 }
 
-function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
+function WorkspaceSearchResults({ query, revision, onOpen, onAction, files, kindFilter = 'all', filters = {} }: {
   query: string; revision: number; onOpen: (resource: WorkspaceResource) => void
   onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas' | 'remove-dataset') => void
   files: CanvasFile[]
+  kindFilter?: WorkspaceBrowseKind | 'all'
+  filters?: WorkspaceColumnFilters
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const favorites = useWorkspaceFavorites()
@@ -1675,6 +1794,11 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
     try {
       const page = await api.workspaceSearch(query, {
         limit: WORKSPACE_SEARCH_PAGE_SIZE, cursor: nextCursor ?? undefined,
+        kinds: kindFilter !== 'all' ? [kindFilter] : undefined,
+        name: filters.name,
+        sourceId: filters.source,
+        updatedAfter: filters.updatedAfter ? filterDayStart(filters.updatedAfter) : undefined,
+        updatedBefore: filters.updatedBefore ? filterDayEnd(filters.updatedBefore) : undefined,
       })
       if (sequence !== request.current) return
       page.groups.forEach((group) => providerPlacementObservations.observe(
@@ -1758,7 +1882,8 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [query, providerPlacementObservations])
+  }, [query, kindFilter, filters.name, filters.source, filters.updatedAfter, filters.updatedBefore,
+    providerPlacementObservations])
 
   useEffect(() => {
     void load()
@@ -2399,9 +2524,152 @@ function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResourc
   return <Icon name={icon} size={size} />
 }
 
-function WorkspaceListHeader() {
-  return <div aria-hidden="true" className="mb-1 grid grid-cols-[minmax(0,1fr)_130px_130px_16px] gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-    <span>Name</span><span>Last modified</span><span>Last opened</span><span />
+const FILTER_TRIGGER_TOOLBAR_CLASS = 'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold'
+
+function filterTriggerToolbarClass(active: boolean): string {
+  return `${FILTER_TRIGGER_TOOLBAR_CLASS} ${active
+    ? 'border-primary bg-primary/10 text-foreground'
+    : 'border-border text-muted-foreground hover:text-foreground'}`
+}
+
+function NameFilterPopover({ value, onCommit, variant }: {
+  value: string | undefined
+  onCommit: (next: string | undefined) => void
+  variant: 'header' | 'toolbar'
+}) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  return <Popover open={open} onOpenChange={(next) => { if (next) setDraft(value ?? ''); setOpen(next) }}>
+    <PopoverTrigger asChild>
+      <button type="button" aria-label="Filter by name" data-testid="workspace-filter-name"
+        title={value ? `Name filter: ${value}` : 'Filter by name'}
+        className={variant === 'header'
+          ? `inline-flex items-center gap-1 normal-case ${value ? 'text-primary' : 'hover:text-foreground'}`
+          : filterTriggerToolbarClass(!!value)}>
+        <Icon name="filter" size={11} />{variant === 'toolbar' && <>Name{value ? `: ${value}` : ''}</>}
+      </button>
+    </PopoverTrigger>
+    <PopoverContent align="start" className="w-64 p-3"
+      onOpenAutoFocus={(event) => { event.preventDefault(); inputRef.current?.focus() }}>
+      <form onSubmit={(event) => {
+        event.preventDefault()
+        onCommit(draft.trim() ? draft : undefined)
+        setOpen(false)
+      }} className="grid gap-2 text-[12px]">
+        <label htmlFor="workspace-filter-name-value" className="font-semibold text-foreground">Name contains</label>
+        <input id="workspace-filter-name-value" ref={inputRef} value={draft}
+          onChange={(event) => setDraft(event.target.value)} maxLength={128}
+          className="rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:border-primary" />
+        <div className="flex items-center justify-end gap-2">
+          <button type="button" disabled={!value} onClick={() => { onCommit(undefined); setOpen(false) }}
+            className="rounded-md px-2 py-1 font-semibold text-muted-foreground hover:text-foreground disabled:opacity-50">Clear</button>
+          <button type="submit" className="rounded-md bg-foreground px-2.5 py-1 font-semibold text-background">Apply</button>
+        </div>
+      </form>
+    </PopoverContent>
+  </Popover>
+}
+
+function UpdatedFilterPopover({ after, before, onCommit, variant }: {
+  after: string | undefined
+  before: string | undefined
+  onCommit: (next: { updatedAfter?: string; updatedBefore?: string }) => void
+  variant: 'header' | 'toolbar'
+}) {
+  const [open, setOpen] = useState(false)
+  const [draftAfter, setDraftAfter] = useState('')
+  const [draftBefore, setDraftBefore] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const active = !!(after || before)
+  return <Popover open={open} onOpenChange={(next) => {
+    if (next) { setDraftAfter(after ?? ''); setDraftBefore(before ?? '') }
+    setOpen(next)
+  }}>
+    <PopoverTrigger asChild>
+      <button type="button" aria-label="Filter by last modified" data-testid="workspace-filter-updated"
+        title={active ? `Last modified ${updatedRangeLabel(after, before)}` : 'Filter by last modified'}
+        className={variant === 'header'
+          ? `inline-flex items-center gap-1 normal-case ${active ? 'text-primary' : 'hover:text-foreground'}`
+          : filterTriggerToolbarClass(active)}>
+        <Icon name="filter" size={11} />{variant === 'toolbar' && <>Updated{active ? ` ${updatedRangeLabel(after, before)}` : ''}</>}
+      </button>
+    </PopoverTrigger>
+    <PopoverContent align="start" className="w-64 p-3"
+      onOpenAutoFocus={(event) => { event.preventDefault(); inputRef.current?.focus() }}>
+      <form onSubmit={(event) => {
+        event.preventDefault()
+        onCommit({
+          updatedAfter: draftAfter || undefined,
+          updatedBefore: draftBefore || undefined,
+        })
+        setOpen(false)
+      }} className="grid gap-2 text-[12px]">
+        <span className="font-semibold text-foreground">Last modified between</span>
+        <label htmlFor="workspace-filter-updated-after" className="text-muted-foreground">From</label>
+        <input id="workspace-filter-updated-after" ref={inputRef} type="date" value={draftAfter}
+          onChange={(event) => setDraftAfter(event.target.value)}
+          className="rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:border-primary" />
+        <label htmlFor="workspace-filter-updated-before" className="text-muted-foreground">To</label>
+        <input id="workspace-filter-updated-before" type="date" value={draftBefore}
+          onChange={(event) => setDraftBefore(event.target.value)}
+          className="rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:border-primary" />
+        <div className="flex items-center justify-end gap-2">
+          <button type="button" disabled={!active} onClick={() => { onCommit({}); setOpen(false) }}
+            className="rounded-md px-2 py-1 font-semibold text-muted-foreground hover:text-foreground disabled:opacity-50">Clear</button>
+          <button type="submit" className="rounded-md bg-foreground px-2.5 py-1 font-semibold text-background">Apply</button>
+        </div>
+      </form>
+    </PopoverContent>
+  </Popover>
+}
+
+function ActiveFilterChips({ filters, sourceLabel, notApplied, onChange, onClearAll }: {
+  filters: WorkspaceColumnFilters
+  sourceLabel: (value: string) => string
+  notApplied?: string | null
+  onChange: (next: WorkspaceColumnFilters) => void
+  onClearAll: () => void
+}) {
+  const chips = [
+    ...(filters.name ? [{
+      key: 'name', label: `Name: ${filters.name}`,
+      cleared: { ...filters, name: undefined },
+    }] : []),
+    ...(filters.source ? [{
+      key: 'source', label: `Source: ${sourceLabel(filters.source)}`,
+      cleared: { ...filters, source: undefined },
+    }] : []),
+    ...(filters.updatedAfter || filters.updatedBefore ? [{
+      key: 'updated', label: `Updated ${updatedRangeLabel(filters.updatedAfter, filters.updatedBefore)}`,
+      cleared: { ...filters, updatedAfter: undefined, updatedBefore: undefined },
+    }] : []),
+  ]
+  if (!chips.length) return null
+  return <div role="group" aria-label="Active Workspace filters" className="flex min-w-0 flex-wrap items-center gap-1.5">
+    {chips.map((chip) => <span key={chip.key}
+      className="inline-flex max-w-64 items-center gap-1 rounded-full border border-primary/40 bg-primary/10 py-0.5 pl-2 pr-1 text-[11px] text-foreground">
+      <span className="truncate">{chip.label}</span>
+      <button type="button" aria-label={`Clear ${chip.key} filter`}
+        onClick={() => onChange(chip.cleared)} className="rounded-full p-0.5 hover:bg-primary/20">
+        <Icon name="close" size={10} />
+      </button>
+    </span>)}
+    <button type="button" onClick={onClearAll}
+      className="text-[11px] font-semibold text-muted-foreground underline hover:text-foreground">Clear filters</button>
+    {notApplied && <span role="status" className="text-[11px] text-amber-700 dark:text-amber-300">Not applied here: {notApplied}</span>}
+  </div>
+}
+
+function WorkspaceListHeader({ nameFilter, updatedFilter }: {
+  nameFilter?: ReactNode
+  updatedFilter?: ReactNode
+} = {}) {
+  return <div aria-hidden={!nameFilter && !updatedFilter ? 'true' : undefined}
+    className="mb-1 grid grid-cols-[minmax(0,1fr)_130px_130px_16px] gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+    <span className="inline-flex items-center gap-1.5">Name{nameFilter}</span>
+    <span className="inline-flex items-center gap-1.5">Last modified{updatedFilter}</span>
+    <span>Last opened</span><span />
   </div>
 }
 

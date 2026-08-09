@@ -810,6 +810,167 @@ describe('WorkspaceExplorer', () => {
     ))
   })
 
+  it('commits a typed name filter from the list header, sends it server-side, and clears it', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER, CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    const view = render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByTestId('workspace-filter-name'))
+    fireEvent.change(screen.getByLabelText('Name contains'), { target: { value: 'sales report' } })
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(store.workspaceBrowseQuery).toContain('cf=name%3Asales%2520report')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', name: 'sales report' },
+    ))
+
+    const chips = screen.getByRole('group', { name: 'Active Workspace filters' })
+    expect(within(chips).getByText('Name: sales report')).toBeVisible()
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(within(chips).getByRole('button', { name: 'Clear name filter' }))
+    expect(store.workspaceBrowseQuery).toBe('')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root', { limit: 50, cursor: undefined, source: 'local' },
+    ))
+  })
+
+  it('commits an updated-time range with local day bounds and clears all filters at once', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    const view = render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByTestId('workspace-filter-updated'))
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2026-08-01' } })
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: '2026-08-05' } })
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(store.workspaceBrowseQuery).toContain('updated_after%3A2026-08-01')
+    expect(store.workspaceBrowseQuery).toContain('updated_before%3A2026-08-05')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      {
+        limit: 50, cursor: undefined, source: 'local',
+        updatedAfter: new Date('2026-08-01T00:00:00').toISOString(),
+        updatedBefore: new Date('2026-08-05T23:59:59.999').toISOString(),
+      },
+    ))
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter Workspace by type' }), {
+      target: { value: 'canvas' },
+    })
+    view.rerender(<WorkspaceExplorer />)
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear filters' }))
+    expect(store.workspaceBrowseQuery).toBe('')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root', { limit: 50, cursor: undefined, source: 'local' },
+    ))
+  })
+
+  it('offers advertised source options and keeps carried filters visibly unapplied elsewhere', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], connectedSources: [CONNECTED_SOURCE],
+      nextCursor: null, hasMore: false, completeness: 'complete',
+      sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+      queryCapabilities: {
+        sort: ['name', 'updated', 'opened'], kindFilter: true,
+        filters: [
+          { field: 'name', type: 'text', supported: true },
+          { field: 'kind', type: 'categorical', supported: true },
+          { field: 'updated', type: 'date_range', supported: true },
+          {
+            field: 'source', type: 'categorical', supported: true,
+            options: [
+              { value: 'local', label: 'Local' },
+              { value: 'mount:warehouse', label: 'warehouse' },
+            ],
+          },
+        ],
+      },
+    })
+    const view = render(<WorkspaceExplorer />)
+
+    const sourceSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by source' })
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.change(sourceSelect, { target: { value: 'mount:warehouse' } })
+    expect(store.workspaceBrowseQuery).toContain('cf=source%3Amount%253Awarehouse')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', sourceId: 'mount:warehouse' },
+    ))
+
+    // A provider lens advertises no filters: controls disappear and carried filters are labeled.
+    const providerRoot = {
+      ...EXTERNAL_FOLDER, id: 'container:mount.bHVtYS1zdGFnaW5n', name: 'luma-staging',
+      mountId: 'luma-staging', resourceId: null, bindingId: null, localPlacement: null,
+    }
+    store.workspaceResourceId = providerRoot.id
+    store.workspaceBrowseQuery = 'wq=1&cf=name%3Adrafts'
+    mocks.workspaceResource.mockResolvedValue({
+      resource: providerRoot, ancestors: [ROOT],
+      source: { ...PROVIDER_COMPLETE, id: 'mount:luma-staging', mountId: 'luma-staging' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: providerRoot, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
+      queryCapabilities: {
+        sort: [], kindFilter: false, filters: [],
+        reason: "Sorting and filters aren't available for this source.",
+      },
+    })
+    mocks.workspaceBrowse.mockClear()
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined, source: 'provider' },
+    ))
+    await screen.findByText('Name: drafts')
+    expect(screen.getByText(/Not applied here:/)).toBeVisible()
+    expect(screen.queryByTestId('workspace-filter-name')).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Filter Workspace by source' })).not.toBeInTheDocument()
+  })
+
+  it('narrows a committed search with kind and column filters', async () => {
+    store.workspaceSearchQuery = 'analysis'
+    store.workspaceBrowseQuery = 'wq=1&kind=canvas&cf=name%3Adraft'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'analysis',
+      groups: [
+        { source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' }, items: [CANVAS] },
+        {
+          source: {
+            id: 'mount:warehouse', kind: 'provider', mountId: 'warehouse', provider: 'fixture',
+            completeness: 'unsupported', freshness: 'unknown', searchMode: 'unsupported',
+            error: 'This connected source does not support Workspace filters.',
+          },
+          items: [],
+        },
+      ],
+      nextCursor: null, hasMore: false, completeness: 'partial',
+    })
+    mocks.workspaceFavoriteStatus.mockResolvedValue({ favorited: [] })
+    render(<WorkspaceExplorer />)
+
+    await waitFor(() => expect(mocks.workspaceSearch).toHaveBeenCalledWith('analysis', {
+      limit: 25, cursor: undefined, kinds: ['canvas'], name: 'draft',
+      sourceId: undefined, updatedAfter: undefined, updatedBefore: undefined,
+    }))
+    expect(await screen.findByText('Partial search results')).toBeVisible()
+    expect(screen.getAllByText(/This connected source does not support Workspace filters\./).length)
+      .toBeGreaterThan(0)
+    expect(within(screen.getByRole('group', { name: 'Active Workspace filters' }))
+      .getByText('Name: draft')).toBeVisible()
+  })
+
   it('restores committed browse projection from the store without treating a search draft as canonical', async () => {
     store.workspaceBrowseQuery = 'wq=1&sort=updated&order=desc&kind=dataset&view=grid'
     mocks.workspaceBrowse.mockResolvedValue({
@@ -855,7 +1016,7 @@ describe('WorkspaceExplorer', () => {
       completeness: 'complete', sources: [PROVIDER_COMPLETE], connectedSources: [],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: "Sorting and type filters aren't available for this source.",
+        reason: "Sorting and filters aren't available for this source.",
       },
     })
     render(<WorkspaceExplorer />)
@@ -865,7 +1026,7 @@ describe('WorkspaceExplorer', () => {
     })).toBeVisible()
     expect(screen.queryByRole('combobox', { name: 'Sort Workspace' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
-    expect(screen.queryByText("Sorting and type filters aren't available for this source.")).not.toBeInTheDocument()
+    expect(screen.queryByText("Sorting and filters aren't available for this source.")).not.toBeInTheDocument()
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
       'mount.bHVtYS1zdGFnaW5n', { limit: 50, cursor: undefined, source: 'provider' },
     )
@@ -908,7 +1069,7 @@ describe('WorkspaceExplorer', () => {
       sources: [{ id: 'local', kind: 'local', completeness: 'complete' }, PROVIDER_COMPLETE],
       queryCapabilities: {
         sort: [], kindFilter: false,
-        reason: "Sorting and type filters aren't available in this view.",
+        reason: "Sorting and filters aren't available in this view.",
       },
     })
     render(<WorkspaceExplorer />)
@@ -918,7 +1079,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(providerRoot.id)
     expect(screen.queryByRole('combobox', { name: 'Sort Workspace' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Filter Workspace by type' })).not.toBeInTheDocument()
-    expect(screen.queryByText("Sorting and type filters aren't available in this view.")).not.toBeInTheDocument()
+    expect(screen.queryByText("Sorting and filters aren't available in this view.")).not.toBeInTheDocument()
   })
 
   it('moves multiple selected Canvases with one atomic Workspace request', async () => {

@@ -293,6 +293,10 @@ export const api = {
     sort?: 'name' | 'updated' | 'opened'
     order?: 'asc' | 'desc'
     kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
+    name?: string
+    updatedAfter?: string
+    updatedBefore?: string
+    sourceId?: string
   }) => {
     const query = new URLSearchParams()
     if (params?.cursor) query.set('cursor', params.cursor)
@@ -301,6 +305,10 @@ export const api = {
     if (params?.sort) query.set('sort', params.sort)
     if (params?.order) query.set('order', params.order)
     for (const kind of params?.kinds ?? []) query.append('kind', kind)
+    if (params?.name) query.set('name', params.name)
+    if (params?.updatedAfter) query.set('updatedAfter', params.updatedAfter)
+    if (params?.updatedBefore) query.set('updatedBefore', params.updatedBefore)
+    if (params?.sourceId) query.set('sourceId', params.sourceId)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
   workspaceFavorites: (params?: {
@@ -361,10 +369,23 @@ export const api = {
       `/workspace/resources/${encodeURIComponent(resourceId)}/relink`,
       { method: 'POST', body: JSON.stringify(body) },
     ),
-  workspaceSearch: (query: string, params?: { cursor?: string; limit?: number }) => {
+  workspaceSearch: (query: string, params?: {
+    cursor?: string
+    limit?: number
+    kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
+    name?: string
+    updatedAfter?: string
+    updatedBefore?: string
+    sourceId?: string
+  }) => {
     const search = new URLSearchParams({ q: query })
     if (params?.cursor) search.set('cursor', params.cursor)
     if (params?.limit) search.set('limit', String(params.limit))
+    for (const kind of params?.kinds ?? []) search.append('kind', kind)
+    if (params?.name) search.set('name', params.name)
+    if (params?.updatedAfter) search.set('updatedAfter', params.updatedAfter)
+    if (params?.updatedBefore) search.set('updatedBefore', params.updatedBefore)
+    if (params?.sourceId) search.set('sourceId', params.sourceId)
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },
   workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; requestId?: string; datasetIds?: string[]; providerDatasetRefs?: string[]; transformId?: string; transformVersion?: string }) =>

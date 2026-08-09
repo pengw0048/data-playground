@@ -2,7 +2,7 @@
  * Bounded, versioned Workspace browse projection for the shareable URL.
  *
  * Container identity and committed search (`q`) stay on the route path/query separately.
- * This module owns sort, kind filter, list/grid mode, and a reserved column-filter map.
+ * This module owns sort, kind filter, list/grid mode, and the typed column-filter map.
  * Opaque pagination cursors, search drafts, multi-selection, and loading are never encoded.
  */
 
@@ -27,14 +27,21 @@ export type WorkspaceBrowseSortMode =
   | 'updated-asc'
   | 'opened-desc'
 
+/** Committed typed column filters. Dates are day-granular `YYYY-MM-DD` values. */
+export interface WorkspaceColumnFilters {
+  name?: string
+  source?: string
+  updatedAfter?: string
+  updatedBefore?: string
+}
+
 export interface WorkspaceBrowseQuery {
   version: typeof WORKSPACE_BROWSE_QUERY_VERSION
   sort?: WorkspaceBrowseSortField
   order?: WorkspaceBrowseSortOrder
   kind?: WorkspaceBrowseKind
   view?: WorkspaceBrowseViewMode
-  /** Reserved for a later column-filter leaf; parsed and bounded today, unused by UI. */
-  columnFilters?: Record<string, string>
+  columnFilters?: WorkspaceColumnFilters
 }
 
 const SORT_FIELDS = new Set<WorkspaceBrowseSortField>(['name', 'updated', 'opened'])
@@ -42,10 +49,19 @@ const SORT_ORDERS = new Set<WorkspaceBrowseSortOrder>(['asc', 'desc'])
 const KINDS = new Set<WorkspaceBrowseKind>(['container', 'canvas', 'dataset', 'dataset_view'])
 const VIEWS = new Set<WorkspaceBrowseViewMode>(['list', 'grid'])
 
-const MAX_COLUMN_FILTERS = 16
-const MAX_COLUMN_FILTER_KEY_CHARS = 64
 const MAX_COLUMN_FILTER_VALUE_CHARS = 128
 const MAX_BROWSE_QUERY_CHARS = 1024
+
+const COLUMN_FILTER_WIRE_KEYS: Record<string, keyof WorkspaceColumnFilters> = {
+  name: 'name',
+  source: 'source',
+  updated_after: 'updatedAfter',
+  updated_before: 'updatedBefore',
+}
+const COLUMN_FILTER_KEY_ORDER = ['name', 'source', 'updated_after', 'updated_before'] as const
+
+const DATE_VALUE = /^\d{4}-\d{2}-\d{2}$/
+const SOURCE_VALUE = /^(local|mount:[^\s,]{1,128})$/
 
 const DEFAULT_QUERY: WorkspaceBrowseQuery = { version: WORKSPACE_BROWSE_QUERY_VERSION }
 
@@ -65,37 +81,60 @@ function isView(value: string | null): value is WorkspaceBrowseViewMode {
   return !!value && VIEWS.has(value as WorkspaceBrowseViewMode)
 }
 
-/** Decode a bounded `cf=col:value,col2:value2` map; drop oversized/malformed entries. */
-export function parseColumnFilterMap(raw: string | null | undefined): Record<string, string> | undefined {
-  if (!raw) return undefined
-  const filters: Record<string, string> = {}
-  for (const part of raw.split(',')) {
-    if (Object.keys(filters).length >= MAX_COLUMN_FILTERS) break
-    const trimmed = part.trim()
-    if (!trimmed) continue
-    const sep = trimmed.indexOf(':')
-    if (sep <= 0) continue
-    const key = trimmed.slice(0, sep).trim()
-    const value = trimmed.slice(sep + 1).trim()
-    if (!key || key.length > MAX_COLUMN_FILTER_KEY_CHARS) continue
-    if (value.length > MAX_COLUMN_FILTER_VALUE_CHARS) continue
-    // Reject path-like or credential-looking keys; column names are simple identifiers.
-    if (!/^[A-Za-z_][A-Za-z0-9_.$-]*$/.test(key)) continue
-    filters[key] = value
-  }
-  return Object.keys(filters).length ? filters : undefined
+function isDateValue(value: string): boolean {
+  return DATE_VALUE.test(value) && !Number.isNaN(new Date(`${value}T00:00:00`).getTime())
 }
 
-function serializeColumnFilterMap(filters: Record<string, string> | undefined): string | undefined {
+/** Drop invalid values, clamp lengths, and keep the updated range ordered. */
+export function normalizeColumnFilters(
+  filters: WorkspaceColumnFilters | undefined,
+): WorkspaceColumnFilters | undefined {
   if (!filters) return undefined
+  const normalized: WorkspaceColumnFilters = {}
+  const name = filters.name?.trim().replace(/\s+/g, ' ').slice(0, MAX_COLUMN_FILTER_VALUE_CHARS)
+  if (name) normalized.name = name
+  const source = filters.source?.trim()
+  if (source && SOURCE_VALUE.test(source)) normalized.source = source
+  let after = filters.updatedAfter?.trim()
+  let before = filters.updatedBefore?.trim()
+  if (after && !isDateValue(after)) after = undefined
+  if (before && !isDateValue(before)) before = undefined
+  if (after && before && after > before) [after, before] = [before, after]
+  if (after) normalized.updatedAfter = after
+  if (before) normalized.updatedBefore = before
+  return Object.keys(normalized).length ? normalized : undefined
+}
+
+/** Decode the bounded `cf=key:value,...` map; unknown keys and malformed values are dropped. */
+export function parseColumnFilterMap(
+  raw: string | null | undefined,
+): WorkspaceColumnFilters | undefined {
+  if (!raw) return undefined
+  const filters: WorkspaceColumnFilters = {}
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim()
+    const sep = trimmed.indexOf(':')
+    if (sep <= 0) continue
+    const key = COLUMN_FILTER_WIRE_KEYS[trimmed.slice(0, sep).trim()]
+    if (!key) continue
+    const encoded = trimmed.slice(sep + 1).trim()
+    if (!encoded || encoded.length > MAX_COLUMN_FILTER_VALUE_CHARS * 3) continue
+    try {
+      filters[key] = decodeURIComponent(encoded)
+    } catch {
+      continue
+    }
+  }
+  return normalizeColumnFilters(filters)
+}
+
+function serializeColumnFilterMap(filters: WorkspaceColumnFilters | undefined): string | undefined {
+  const normalized = normalizeColumnFilters(filters)
+  if (!normalized) return undefined
   const parts: string[] = []
-  for (const [key, value] of Object.entries(filters)) {
-    if (parts.length >= MAX_COLUMN_FILTERS) break
-    if (!key || key.length > MAX_COLUMN_FILTER_KEY_CHARS) continue
-    if (!/^[A-Za-z_][A-Za-z0-9_.$-]*$/.test(key)) continue
-    const safeValue = value.trim().slice(0, MAX_COLUMN_FILTER_VALUE_CHARS)
-    if (!safeValue) continue
-    parts.push(`${key}:${safeValue}`)
+  for (const wireKey of COLUMN_FILTER_KEY_ORDER) {
+    const value = normalized[COLUMN_FILTER_WIRE_KEYS[wireKey]!]
+    if (value) parts.push(`${wireKey}:${encodeURIComponent(value)}`)
   }
   return parts.length ? parts.join(',') : undefined
 }
@@ -114,9 +153,7 @@ export function normalizeWorkspaceBrowseQuery(
   const paired = sort && order ? { sort, order } : {}
   const kind = query.kind && KINDS.has(query.kind) ? query.kind : undefined
   const view = query.view && VIEWS.has(query.view) && query.view !== 'list' ? query.view : undefined
-  const columnFilters = query.columnFilters
-    ? parseColumnFilterMap(serializeColumnFilterMap(query.columnFilters) ?? null)
-    : undefined
+  const columnFilters = normalizeColumnFilters(query.columnFilters)
 
   return {
     version: WORKSPACE_BROWSE_QUERY_VERSION,
@@ -199,12 +236,14 @@ export function browseStateFromQuery(serialized: string): {
   sortMode: WorkspaceBrowseSortMode
   kindFilter: WorkspaceBrowseKind | 'all'
   viewMode: WorkspaceBrowseViewMode
+  columnFilters: WorkspaceColumnFilters
 } {
   const query = parseWorkspaceBrowseQuery(serialized)
   return {
     sortMode: sortModeFromBrowseQuery(query),
     kindFilter: query.kind ?? 'all',
     viewMode: query.view ?? 'list',
+    columnFilters: query.columnFilters ?? {},
   }
 }
 
@@ -212,7 +251,7 @@ export function serializeBrowseState(state: {
   sortMode: WorkspaceBrowseSortMode
   kindFilter: WorkspaceBrowseKind | 'all'
   viewMode: WorkspaceBrowseViewMode
-  columnFilters?: Record<string, string>
+  columnFilters?: WorkspaceColumnFilters
 }): string {
   return serializeWorkspaceBrowseQuery({
     version: WORKSPACE_BROWSE_QUERY_VERSION,

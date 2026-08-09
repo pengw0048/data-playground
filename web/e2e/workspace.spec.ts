@@ -597,3 +597,70 @@ test('keeps an exact Source binding through provider outage and retries at the s
     await page.request.delete(`/api/canvas/${canvasId}`)
   }
 })
+
+test.describe('workspace column filters', () => {
+  test('combines typed filters with kind, survives reload and Back/Forward, and clears cleanly', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    const suffix = Date.now()
+    const alphaId = `workspace-filter-alpha-${suffix}`
+    const betaId = `workspace-filter-beta-${suffix}`
+    const alphaName = `Filter alpha ${suffix}`
+    const betaName = `Filter beta ${suffix}`
+    for (const [id, name] of [[alphaId, alphaName], [betaId, betaName]] as const) {
+      const created = await page.request.post('/api/canvas', {
+        data: { id, name, version: 1, nodes: [], edges: [] },
+      })
+      expect(created.ok()).toBe(true)
+    }
+
+    try {
+      await page.goto('/#/workspace')
+      await expect(await workspaceResource(page, 'canvas', alphaName)).toBeVisible()
+
+      // Escape closes the popover and returns focus to the column-header trigger.
+      const nameTrigger = page.getByTestId('workspace-filter-name')
+      await nameTrigger.click()
+      await expect(page.getByLabel('Name contains')).toBeFocused()
+      await page.keyboard.press('Escape')
+      await expect(page.getByLabel('Name contains')).toHaveCount(0)
+      await expect(nameTrigger).toBeFocused()
+
+      await nameTrigger.click()
+      await page.getByLabel('Name contains').fill(`filter alpha ${suffix}`)
+      await page.getByRole('button', { name: 'Apply' }).click()
+      await expect(page).toHaveURL(/cf=name/)
+      await expect(page.getByRole('button', { name: `Open canvas ${alphaName}` })).toBeVisible()
+      await expect(page.getByRole('button', { name: `Open canvas ${betaName}` })).toHaveCount(0)
+
+      await page.getByRole('combobox', { name: 'Filter Workspace by type' }).selectOption('canvas')
+      await expect(page).toHaveURL(/kind=canvas/)
+      await expect(page.getByRole('button', { name: `Open canvas ${alphaName}` })).toBeVisible()
+
+      await page.getByTestId('workspace-filter-updated').click()
+      await page.getByLabel('From').fill('2099-01-01')
+      await page.getByRole('button', { name: 'Apply' }).click()
+      await expect(page).toHaveURL(/updated_after%3A2099-01-01/)
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+
+      await page.reload()
+      await expect(page).toHaveURL(/updated_after%3A2099-01-01/)
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+
+      await page.goBack()
+      await expect(page.getByRole('button', { name: `Open canvas ${alphaName}` })).toBeVisible()
+      await page.goForward()
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+
+      await page.getByRole('button', { name: 'Clear updated filter' }).click()
+      await expect(page.getByRole('button', { name: `Open canvas ${alphaName}` })).toBeVisible()
+      await expect(page.getByRole('button', { name: `Open canvas ${betaName}` })).toHaveCount(0)
+
+      await page.getByRole('button', { name: 'Clear filters' }).click()
+      await expect(page).toHaveURL(/#\/workspace$/)
+      await expect(await workspaceResource(page, 'canvas', betaName)).toBeVisible()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(alphaId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(betaId)}`)
+    }
+  })
+})

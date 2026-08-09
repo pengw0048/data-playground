@@ -1351,10 +1351,25 @@ class WorkspaceSourceStatus(Wire):
     ] | None = None
 
 
+class WorkspaceFilterOption(Wire):
+    value: str = Field(min_length=1, max_length=160)
+    label: str = Field(min_length=1, max_length=160)
+
+
+class WorkspaceFilterCapability(Wire):
+    """One typed column filter this browse lens can honor, or the direct reason it cannot."""
+    field: Literal["name", "kind", "source", "updated", "rows", "owner"]
+    type: Literal["text", "categorical", "date_range", "numeric_range"]
+    supported: bool = True
+    options: list[WorkspaceFilterOption] = []
+    reason: str | None = Field(default=None, max_length=256)
+
+
 class WorkspaceQueryCapabilities(Wire):
     """Queries that are truthful for every item returned by this browse lens."""
     sort: list[Literal["name", "updated", "opened"]] = []
     kind_filter: bool = False
+    filters: list[WorkspaceFilterCapability] = []
     reason: str | None = Field(default=None, max_length=256)
 
 

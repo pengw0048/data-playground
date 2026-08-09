@@ -5915,6 +5915,39 @@ def _workspace_search_matches(name_column, tokens: list[str]):
     return and_(*(func.lower(name_column).contains(token, autoescape=True) for token in tokens))
 
 
+def _workspace_filter_tokens(name: str | None) -> list[str]:
+    """Normalize a name filter with the same tokenization as Workspace search."""
+    if name is None:
+        return []
+    normalized = " ".join(name.split()).lower()
+    if len(normalized.encode("utf-8")) > 256:
+        raise ValueError("Workspace name filter must be at most 256 UTF-8 bytes")
+    return normalized.split()
+
+
+def _workspace_updated_range(
+    updated_after: datetime.datetime | None, updated_before: datetime.datetime | None,
+) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    def aware(value: datetime.datetime | None) -> datetime.datetime | None:
+        if value is None or value.tzinfo is not None:
+            return value
+        return value.replace(tzinfo=datetime.timezone.utc)
+
+    after, before = aware(updated_after), aware(updated_before)
+    if after is not None and before is not None and after > before:
+        raise ValueError("Workspace updated-after bound must not be later than updated-before")
+    return after, before
+
+
+def _workspace_filters_key(tokens: list[str], updated_after: datetime.datetime | None,
+                           updated_before: datetime.datetime | None) -> list:
+    return [
+        " ".join(tokens),
+        updated_after.isoformat() if updated_after is not None else None,
+        updated_before.isoformat() if updated_before is not None else None,
+    ]
+
+
 def _workspace_after(ordinal_column, name_column, id_column, rank: int, cursor):
     if cursor is None:
         return None
@@ -6909,7 +6942,7 @@ def _workspace_dataset_view_visible_clause(uid: str):
     ))
 
 
-_WORKSPACE_QUERY_CURSOR_VERSION = 3
+_WORKSPACE_QUERY_CURSOR_VERSION = 4
 _WORKSPACE_BROWSE_KINDS = frozenset({"container", "canvas", "dataset", "dataset_view"})
 _WORKSPACE_OPEN_KINDS = frozenset({"canvas", "dataset", "dataset_view"})
 _WORKSPACE_OPEN_MAX_PER_ACTOR = 200
@@ -7171,11 +7204,11 @@ class _WorkspaceQueryCursor:
 
 
 def _workspace_query_cursor_encode(*, container_id: str, sort: str, order: str,
-                                   kinds: frozenset[str],
+                                   kinds: frozenset[str], filters: list,
                                    name: str, kind_rank: int, row_id: str,
                                    updated_at: datetime.datetime | None) -> str:
     payload: list[object] = [
-        _WORKSPACE_QUERY_CURSOR_VERSION, container_id, sort, order, sorted(kinds),
+        _WORKSPACE_QUERY_CURSOR_VERSION, container_id, sort, order, sorted(kinds), filters,
     ]
     if sort == "name":
         payload.extend((name, kind_rank, row_id))
@@ -7193,8 +7226,8 @@ def _workspace_query_cursor_encode(*, container_id: str, sort: str, order: str,
 
 
 def _workspace_query_cursor_decode(cursor: str | None, *, container_id: str,
-                                   sort: str, order: str,
-                                   kinds: frozenset[str]) -> _WorkspaceQueryCursor | None:
+                                   sort: str, order: str, kinds: frozenset[str],
+                                   filters: list) -> _WorkspaceQueryCursor | None:
     if cursor is None:
         return None
     if len(cursor) > 4096:
@@ -7204,15 +7237,17 @@ def _workspace_query_cursor_decode(cursor: str | None, *, container_id: str,
         payload = json.loads(raw)
     except (binascii.Error, TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace query cursor") from exc
-    if not isinstance(payload, list) or len(payload) < 5:
+    if not isinstance(payload, list) or len(payload) < 6:
         raise ValueError("invalid Workspace query cursor")
-    version, cursor_container_id, cursor_sort, cursor_order, cursor_kinds = payload[:5]
+    version, cursor_container_id, cursor_sort, cursor_order, cursor_kinds, cursor_filters = (
+        payload[:6])
     if (version != _WORKSPACE_QUERY_CURSOR_VERSION
             or cursor_container_id != container_id
             or cursor_sort != sort or cursor_order != order
-            or cursor_kinds != sorted(kinds)):
+            or cursor_kinds != sorted(kinds)
+            or cursor_filters != filters):
         raise ValueError("Workspace query cursor does not match this folder, sort, and filter")
-    values = payload[5:]
+    values = payload[6:]
     if sort == "name":
         if len(values) != 3:
             raise ValueError("invalid Workspace query cursor")
@@ -7382,7 +7417,9 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
 
 def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                             cursor: str | None, sort: str, order: str,
-                            kinds: frozenset[str]) -> dict:
+                            kinds: frozenset[str], name: str | None = None,
+                            updated_after: datetime.datetime | None = None,
+                            updated_before: datetime.datetime | None = None) -> dict:
     """Run one filtered and globally ordered local Workspace page in the metadata database.
 
     ``updated`` uses the authoritative target timestamp where the current model has one: Canvas
@@ -7397,8 +7434,12 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
         raise ValueError("Workspace order must be 'asc' or 'desc'")
     if not kinds or not kinds <= _WORKSPACE_BROWSE_KINDS:
         raise ValueError("Workspace type filter is invalid")
+    tokens = _workspace_filter_tokens(name)
+    updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
+    filters = _workspace_filters_key(tokens, updated_after, updated_before)
     decoded = _workspace_query_cursor_decode(
-        cursor, container_id=container_id, sort=sort, order=order, kinds=kinds)
+        cursor, container_id=container_id, sort=sort, order=order, kinds=kinds,
+        filters=filters)
     with session() as s:
         container = s.get(WorkspaceContainer, container_id)
         if container is None:
@@ -7407,7 +7448,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
             raise KeyError(f"workspace container '{container_id}' not found")
 
         streams = _workspace_listing_streams(
-            uid=uid, kinds=kinds, container_id=container_id)
+            uid=uid, kinds=kinds, container_id=container_id, tokens=tokens or None)
 
         listing = union_all(*streams).subquery()
         name_order = _workspace_name_order(func.lower(listing.c.name))
@@ -7447,6 +7488,10 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
             listing.c.last_opened_at,
             listing.c.canvas_version,
         ).order_by(*ordering).limit(limit + 1)
+        if updated_after is not None:
+            query = query.where(listing.c.updated_at >= updated_after)
+        if updated_before is not None:
+            query = query.where(listing.c.updated_at <= updated_before)
         if after is not None:
             query = query.where(after)
         rows = list(s.execute(query).all())
@@ -7493,6 +7538,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                 sort=sort,
                 order=order,
                 kinds=kinds,
+                filters=filters,
                 name=last_row.sort_name,
                 kind_rank=last_row.kind_rank,
                 row_id=last_row.row_id,
@@ -7509,14 +7555,19 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
 
 def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
                      cursor: str | None = None, sort: str | None = None,
-                     order: str = "asc", kinds: set[str] | frozenset[str] | None = None) -> dict:
+                     order: str = "asc", kinds: set[str] | frozenset[str] | None = None,
+                     name: str | None = None,
+                     updated_after: datetime.datetime | None = None,
+                     updated_before: datetime.datetime | None = None) -> dict:
     """Read one bounded mixed local Workspace page without calling a catalog provider."""
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
-    if sort is not None or kinds is not None:
+    filtered = (name is not None or updated_after is not None or updated_before is not None)
+    if sort is not None or kinds is not None or filtered:
         return _workspace_browse_query(
             container_id, uid=uid, limit=limit, cursor=cursor,
             sort=sort or "name", order=order,
             kinds=frozenset(kinds or _WORKSPACE_BROWSE_KINDS),
+            name=name, updated_after=updated_after, updated_before=updated_before,
         )
     decoded = _workspace_cursor_decode(cursor)
     with session() as s:
@@ -7708,11 +7759,16 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
 
 
 def workspace_search(query: str, *, uid: str, limit: int = 25,
-                     cursor: str | None = None) -> dict:
+                     cursor: str | None = None,
+                     kinds: set[str] | frozenset[str] | None = None,
+                     name: str | None = None,
+                     updated_after: datetime.datetime | None = None,
+                     updated_before: datetime.datetime | None = None) -> dict:
     """Search current local Workspace metadata, most recently updated first.
 
     Results carry the same ``updatedAt`` as browse. Folders and detached Dataset placements have
-    no timestamp and sort last by name, matching the browse ``updated`` sort.
+    no timestamp and sort last by name, matching the browse ``updated`` sort. Optional column
+    filters narrow the same result set and are bound into the continuation cursor.
     """
     normalized = " ".join(query.split()).lower()
     if not normalized:
@@ -7720,11 +7776,21 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
     if len(normalized.encode("utf-8")) > 512:
         raise ValueError("Workspace search query must be at most 512 UTF-8 bytes")
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
-    tokens = normalized.split()
-    decoded = _workspace_search_cursor_decode(cursor, query=normalized)
+    kind_set = frozenset(kinds or _WORKSPACE_BROWSE_KINDS)
+    if not kind_set or not kind_set <= _WORKSPACE_BROWSE_KINDS:
+        raise ValueError("Workspace type filter is invalid")
+    name_tokens = _workspace_filter_tokens(name)
+    updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
+    tokens = normalized.split() + name_tokens
+    # Normalized queries collapse whitespace, so "\n" cannot collide with a plain query binding.
+    filters = _workspace_filters_key(name_tokens, updated_after, updated_before)
+    unfiltered = kind_set == _WORKSPACE_BROWSE_KINDS and filters == ["", None, None]
+    binding = normalized if unfiltered else "\n".join(
+        [normalized, json.dumps([sorted(kind_set), *filters], separators=(",", ":"))])
+    decoded = _workspace_search_cursor_decode(cursor, query=binding)
     with session() as s:
         listing = union_all(*_workspace_listing_streams(
-            uid=uid, kinds=_WORKSPACE_BROWSE_KINDS, tokens=tokens)).subquery()
+            uid=uid, kinds=kind_set, tokens=tokens)).subquery()
         name_order = _workspace_name_order(func.lower(listing.c.name))
         null_order = case((listing.c.updated_at.is_(None), 1), else_=0)
         page_query = select(
@@ -7738,6 +7804,10 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             null_order.asc(), listing.c.updated_at.desc(),
             name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
         ).limit(limit + 1)
+        if updated_after is not None:
+            page_query = page_query.where(listing.c.updated_at >= updated_after)
+        if updated_before is not None:
+            page_query = page_query.where(listing.c.updated_at <= updated_before)
         if decoded is not None:
             page_query = page_query.where(_workspace_query_updated_after(
                 listing.c.updated_at, null_order, name_order,
@@ -7778,7 +7848,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         last_row = page_rows[-1] if page_rows else None
         next_cursor = (
             _workspace_search_cursor_encode(
-                normalized, name=last_row.sort_name, rank=last_row.kind_rank,
+                binding, name=last_row.sort_name, rank=last_row.kind_rank,
                 identity=last_row.row_id, updated_at=last_row.updated_at)
             if has_more and last_row is not None else None
         )

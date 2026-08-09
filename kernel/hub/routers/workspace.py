@@ -772,11 +772,18 @@ def browse_workspace_container(
         order: Literal["asc", "desc"] = Query(default="asc"),
         kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
         = Query(default=[]),
+        name: str | None = Query(default=None, min_length=1, max_length=256),
+        updated_after: datetime.datetime | None = Query(default=None, alias="updatedAfter"),
+        updated_before: datetime.datetime | None = Query(default=None, alias="updatedBefore"),
+        source_id: str | None = Query(default=None, alias="sourceId",
+                                      min_length=1, max_length=160),
         uid: str = Depends(current_user),
 ) -> dict:
     """One bounded local, connected-source, or legacy mixed Workspace page."""
     try:
-        query_requested = sort is not None or order != "asc" or bool(kind)
+        filters_requested = (name is not None or updated_after is not None
+                             or updated_before is not None or source_id is not None)
+        query_requested = sort is not None or order != "asc" or bool(kind) or filters_requested
         connected_source = workspace_providers.is_connected_source_container(container_id)
         if source == "local":
             if connected_source:
@@ -789,6 +796,10 @@ def browse_workspace_container(
                 sort=sort,
                 order=order,
                 kinds=set(kind) or None,
+                name=name,
+                updated_after=updated_after,
+                updated_before=updated_before,
+                source_id=source_id,
             )
         if source == "provider":
             if not connected_source:
@@ -797,7 +808,7 @@ def browse_workspace_container(
             if query_requested:
                 raise ValueError(
                     "This connected source controls its own order. "
-                    "Workspace sort and type filters are unavailable.")
+                    "Workspace sort and filters are unavailable.")
             return workspace_providers.browse_connected_source(
                 container_id, uid=uid, limit=limit, cursor=cursor)
         if query_requested:
@@ -805,10 +816,12 @@ def browse_workspace_container(
                     or workspace_providers.is_configured_mount_container(container_id)):
                 raise ValueError(
                     "This folder includes a mounted data source that controls its own order. "
-                    "Sort and type filters are available in local folders.")
+                    "Sort and filters are available in local folders.")
             return workspace_providers.browse_local_source(
                 container_id, uid=uid, limit=limit, cursor=cursor,
                 sort=sort or "name", order=order, kinds=set(kind) or None,
+                name=name, updated_after=updated_after, updated_before=updated_before,
+                source_id=source_id,
                 bind_cursor=False,
             )
         return workspace_providers.browse(
@@ -919,10 +932,22 @@ def record_workspace_opened(
 
 @router.get("/workspace/search", response_model=WorkspaceSearchPage)
 def search_workspace(q: str, limit: int = 25, cursor: str | None = None,
+                     kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
+                     = Query(default=[]),
+                     name: str | None = Query(default=None, min_length=1, max_length=256),
+                     updated_after: datetime.datetime | None
+                     = Query(default=None, alias="updatedAfter"),
+                     updated_before: datetime.datetime | None
+                     = Query(default=None, alias="updatedBefore"),
+                     source_id: str | None = Query(default=None, alias="sourceId",
+                                                   min_length=1, max_length=160),
                      uid: str = Depends(current_user)) -> dict:
     """One bounded lexical page grouped by local and mounted provider source."""
     try:
-        return workspace_providers.search(q, uid=uid, limit=limit, cursor=cursor)
+        return workspace_providers.search(
+            q, uid=uid, limit=limit, cursor=cursor, kinds=set(kind) or None,
+            name=name, updated_after=updated_after, updated_before=updated_before,
+            source_id=source_id)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
