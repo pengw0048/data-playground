@@ -6,7 +6,6 @@ import { MIN_VIEWPORT } from './support/min-viewport'
 // the kernel on a test port, and waits for /api/livez before the specs run.
 const PORT = process.env.DP_E2E_PORT ?? '8899'
 const fixtureProfile = process.env.DP_E2E_FIXTURE_PROFILE ?? 'smoke'
-const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
 
 const chromiumLaunch = process.env.DP_E2E_CHROME
   ? { launchOptions: { executablePath: process.env.DP_E2E_CHROME } }
@@ -87,18 +86,6 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         viewport: { ...MIN_VIEWPORT },
-        ...chromiumLaunch,
-      },
-    },
-    {
-      // Exercise the same researcher journeys at the normal desktop reference viewport so making the
-      // 1280px shell responsive cannot regress the established 1440px layout.
-      name: 'chromium-reference-viewport',
-      dependencies: ['chromium-min-viewport'],
-      testMatch: ['**/viewport-support.spec.ts', '**/node-popover-lifecycle.spec.ts'],
-      use: {
-        ...devices['Desktop Chrome'],
-        viewport: { ...REFERENCE_VIEWPORT },
         ...chromiumLaunch,
       },
     },

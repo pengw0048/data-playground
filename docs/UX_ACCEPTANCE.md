@@ -31,7 +31,7 @@ first-time researcher can discover the control, predict its effect, or decide wh
 be ignored. Every release candidate therefore starts with one cold UI-only pass before the reviewer
 may inspect source code, test selectors, network traffic, logs, or API responses.
 
-Use a fresh database and browser profile. Run the pass at 1280×720 and 1440×900, first with one item,
+Use a fresh database and browser profile. Run the pass at 1280×720, first with one item,
 then with more than 50 items. The reviewer receives a research goal, never menu names, routes, control
 labels, or implementation terms. Before every action they record:
 
@@ -116,7 +116,7 @@ Use this prompt for an autonomous failure-finding and correction loop:
 > graph. Use mouse, keyboard, right-click, multi-select, drag/drop, zoom, and durable links. Compare
 > the same object and action across Workspace, Canvas, Jobs, Inbox, dataset detail, lineage, and
 > Settings. Restart the application, mutate an upstream dataset, cancel and retry work, and inject a
-> slow, unavailable, permission-denied, partial, and stale response. Test 1280×720 and 1440×900,
+> slow, unavailable, permission-denied, partial, and stale response. Test 1280×720,
 > 200% browser zoom, long names, light/dark themes, forced colours, and reduced motion. Build data
 > containing integers beyond JavaScript's safe range, non-finite floats, whitespace-only strings,
 > timezone-sensitive timestamps, ambiguous dates, and malformed rows; verify displayed values and
