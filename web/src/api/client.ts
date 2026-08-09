@@ -4,7 +4,7 @@ import type {
   CatalogBrowse, CatalogEdit, CatalogExampleSourceResolveResponse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, InstalledProcessorSource, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
   CanvasCopyValidation, CanvasResultRecovery, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
-  CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
+  CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult, WorkspaceFacetPage,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
   WorkspaceProviderRelinkResult, WorkspaceProviderSource, WorkspaceResource, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
@@ -310,6 +310,33 @@ export const api = {
     if (params?.updatedBefore) query.set('updatedBefore', params.updatedBefore)
     if (params?.sourceId) query.set('sourceId', params.sourceId)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
+  },
+  workspaceFacets: (params: {
+    field: 'kind' | 'source'
+    containerId?: string
+    q?: string
+    kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
+    name?: string
+    updatedAfter?: string
+    updatedBefore?: string
+    sourceId?: string
+    search?: string
+    limit?: number
+    cursor?: string
+    signal?: AbortSignal
+  }) => {
+    const query = new URLSearchParams({ field: params.field })
+    if (params.containerId) query.set('containerId', params.containerId)
+    if (params.q) query.set('q', params.q)
+    for (const kind of params.kinds ?? []) query.append('kind', kind)
+    if (params.name) query.set('name', params.name)
+    if (params.updatedAfter) query.set('updatedAfter', params.updatedAfter)
+    if (params.updatedBefore) query.set('updatedBefore', params.updatedBefore)
+    if (params.sourceId) query.set('sourceId', params.sourceId)
+    if (params.search) query.set('search', params.search)
+    if (params.limit) query.set('limit', String(params.limit))
+    if (params.cursor) query.set('cursor', params.cursor)
+    return req<WorkspaceFacetPage>(`/workspace/facets?${query}`, { signal: params.signal })
   },
   workspaceFavorites: (params?: {
     cursor?: string

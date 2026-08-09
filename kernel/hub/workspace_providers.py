@@ -1664,20 +1664,167 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
 _PROVIDER_QUERY_REASON = "Sorting and filters aren't available for this source."
 _MIXED_QUERY_REASON = "Sorting and filters aren't available in this view."
 _PROVIDER_FILTER_REASON = "This connected source does not support Workspace filters."
+_PROVIDER_FACET_REASON = "This connected source does not report Workspace facet counts."
+_PROVIDER_COUNT_REASON = "Connected sources do not report counts under Workspace filters."
 
 
 def _local_filter_capabilities(folder_mounts: list[_MountedProvider]) -> list[dict]:
     """Typed column filters the local lens honors; rows/owner stay absent until projected."""
     return [
         {"field": "name", "type": "text", "supported": True},
-        {"field": "kind", "type": "categorical", "supported": True},
+        {"field": "kind", "type": "categorical", "supported": True, "facet": True},
         {"field": "updated", "type": "date_range", "supported": True},
-        {"field": "source", "type": "categorical", "supported": True, "options": [
+        {"field": "source", "type": "categorical", "supported": True, "facet": True, "options": [
             {"value": "local", "label": "Local"},
             *({"value": f"mount:{item.mount.id}", "label": item.mount.id}
               for item in folder_mounts),
         ]},
     ]
+
+
+_FACET_KIND_LABELS = {
+    "container": "Folders", "canvas": "Canvases",
+    "dataset": "Datasets", "dataset_view": "Saved views",
+}
+_FACET_KIND_ORDER = ("container", "canvas", "dataset", "dataset_view")
+_FACET_MAX_LIMIT = 50
+_FACET_CURSOR_PREFIX = "wsfacet."
+_FACET_CURSOR_VERSION = 1
+
+
+def _facet_cursor_encode(binding: list, last_value: str) -> str:
+    raw = json.dumps(
+        [_FACET_CURSOR_VERSION, binding, last_value], separators=(",", ":")).encode()
+    return _FACET_CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _facet_cursor_decode(cursor: str | None, binding: list) -> str | None:
+    if cursor is None:
+        return None
+    if not cursor.startswith(_FACET_CURSOR_PREFIX) or len(cursor) > 4096:
+        raise ValueError("invalid Workspace facet cursor")
+    encoded = cursor.removeprefix(_FACET_CURSOR_PREFIX)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        version, bound, last_value = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid Workspace facet cursor") from exc
+    if (version != _FACET_CURSOR_VERSION or bound != binding
+            or not isinstance(last_value, str) or not last_value):
+        raise ValueError(
+            "Workspace facet cursor does not match this query and filter state")
+    return last_value
+
+
+def facet_page(
+    field: str,
+    *,
+    uid: str,
+    container_id: str | None = None,
+    query: str | None = None,
+    kinds: set[str] | frozenset[str] | None = None,
+    name: str | None = None,
+    updated_after: datetime.datetime | None = None,
+    updated_before: datetime.datetime | None = None,
+    source_id: str | None = None,
+    search: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict:
+    """Bounded adaptive options for one categorical filter of the local Workspace lens.
+
+    Every active predicate except the facet's own field constrains the counts. An option is
+    offered unless its count is known to be zero; sources that cannot report membership stay
+    explicitly unavailable or uncounted instead of receiving fabricated counts.
+    """
+    if field not in ("kind", "source"):
+        raise ValueError("Workspace facet field must be 'kind' or 'source'")
+    if (container_id is None) == (query is None):
+        raise ValueError(
+            "Workspace facets take exactly one scope: a folder or a search query")
+    if field == "kind" and kinds:
+        raise ValueError("A kind facet excludes its own filter; drop the kind parameter")
+    if field == "source" and source_id is not None:
+        raise ValueError("A source facet excludes its own filter; drop the sourceId parameter")
+    limit = max(1, min(int(limit), _FACET_MAX_LIMIT))
+
+    def unavailable(reason: str) -> dict:
+        return {"field": field, "options": [], "nextCursor": None, "hasMore": False,
+                "completeness": "unavailable", "reason": reason}
+
+    if container_id is not None and (
+            is_connected_source_container(container_id)
+            or container_id.startswith(_EXTERNAL_PREFIX)):
+        return unavailable(_PROVIDER_FACET_REASON)
+    mounts, invalid = _configured_mounts()
+    scope_mounts = (
+        [item for item in mounts if item.container_id == container_id]
+        if container_id is not None else mounts
+    )
+    if source_id is not None and source_id != "local":
+        if not any(f"mount:{item.mount.id}" == source_id for item in scope_mounts):
+            raise ValueError(
+                "Source filter does not match a source available in this folder."
+                if container_id is not None
+                else "Source filter does not match a configured Workspace source.")
+        return unavailable(_PROVIDER_FACET_REASON)
+
+    counts = metadb.workspace_facet_counts(
+        uid=uid, container_id=container_id, query=query, name=name,
+        kinds=None if field == "kind" else kinds,
+        updated_after=updated_after, updated_before=updated_before,
+        by_kind=field == "kind",
+    )
+    item_filters_active = (query is not None or name is not None
+                           or updated_after is not None or updated_before is not None)
+    if field == "kind":
+        # Mount roots are locally known Folder rows; count them where the page shows them.
+        if (container_id is not None and source_id is None
+                and not item_filters_active and scope_mounts):
+            counts["container"] = counts.get("container", 0) + len(scope_mounts)
+        options = [
+            {"value": kind, "label": _FACET_KIND_LABELS[kind], "count": counts[kind]}
+            for kind in _FACET_KIND_ORDER if counts.get(kind)
+        ]
+        uncounted_mounts = bool(scope_mounts) and query is not None
+    else:
+        options = [{"value": "local", "label": "Local", "count": counts.get("all", 0)}
+                   ] if counts.get("all") else []
+        options.extend(
+            {"value": f"mount:{item.mount.id}", "label": item.mount.id, "count": None}
+            for item in scope_mounts)
+        uncounted_mounts = bool(scope_mounts)
+    if invalid:
+        completeness, reason = "partial", _configured_source_error()
+    elif uncounted_mounts:
+        completeness, reason = "partial", _PROVIDER_COUNT_REASON
+    else:
+        completeness, reason = "complete", None
+
+    if search is not None:
+        needle = " ".join(search.split()).lower()
+        options = [option for option in options if needle in option["label"].lower()]
+    binding = [
+        field, container_id, " ".join(query.split()).lower() if query is not None else None,
+        sorted(kinds) if kinds else None, name, source_id,
+        updated_after.isoformat() if updated_after is not None else None,
+        updated_before.isoformat() if updated_before is not None else None,
+        search, _mount_fingerprint(mounts, invalid),
+    ]
+    after_value = _facet_cursor_decode(cursor, binding)
+    if after_value is not None:
+        index = next((position for position, option in enumerate(options)
+                      if option["value"] == after_value), None)
+        if index is None:
+            raise ValueError(
+                "Workspace facet cursor does not match this query and filter state")
+        options = options[index + 1:]
+    page = options[:limit]
+    has_more = len(options) > limit
+    next_cursor = (
+        _facet_cursor_encode(binding, page[-1]["value"]) if has_more and page else None)
+    return {"field": field, "options": page, "nextCursor": next_cursor,
+            "hasMore": has_more, "completeness": completeness, "reason": reason}
 
 
 def _connected_source_resource(mounted: _MountedProvider) -> dict:

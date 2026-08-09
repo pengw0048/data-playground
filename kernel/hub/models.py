@@ -1362,7 +1362,34 @@ class WorkspaceFilterCapability(Wire):
     type: Literal["text", "categorical", "date_range", "numeric_range"]
     supported: bool = True
     options: list[WorkspaceFilterOption] = []
+    facet: bool = False
     reason: str | None = Field(default=None, max_length=256)
+
+
+class WorkspaceFacetOption(Wire):
+    """One admissible value for a categorical Workspace filter under the active query."""
+    value: str = Field(min_length=1, max_length=160)
+    label: str = Field(min_length=1, max_length=160)
+    # None marks a known option whose member count this source does not report.
+    count: int | None = Field(default=None, ge=0)
+
+
+class WorkspaceFacetPage(Wire):
+    """Bounded adaptive options for one categorical filter, never a fabricated count."""
+    field: Literal["kind", "source"]
+    options: list[WorkspaceFacetOption] = []
+    next_cursor: str | None = None
+    has_more: bool = False
+    completeness: Literal["complete", "partial", "unavailable"] = "complete"
+    reason: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_cursor_state(self) -> "WorkspaceFacetPage":
+        if self.has_more != (self.next_cursor is not None):
+            raise ValueError("Workspace facet continuation state is inconsistent")
+        if self.completeness == "unavailable" and (self.options or self.has_more):
+            raise ValueError("an unavailable Workspace facet cannot carry options")
+        return self
 
 
 class WorkspaceQueryCapabilities(Wire):
