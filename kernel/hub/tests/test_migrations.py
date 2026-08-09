@@ -1458,6 +1458,26 @@ def test_process_local_sqlite_databases_use_no_file_lock_and_share_the_migrated_
         assert metadb.resolve_user("local") == "local"
 
 
+def test_shared_memory_migration_is_stable_across_repeated_fresh_engines():
+    url = "sqlite:///file::memory:?cache=shared&uri=true"
+    for _ in range(25):
+        with _isolated_metadata(url):
+            metadb.init_db()
+            assert metadb.require_schema_at_head() == metadb.expected_schema_head()
+
+
+def test_migration_diagnostics_report_version_tables_and_connection_facts():
+    with _isolated_metadata("sqlite:///file::memory:?cache=shared&uri=true"):
+        metadb.init_db()
+        with metadb.engine().connect() as connection:
+            facts = metadb._migration_diagnostics(connection)
+    assert f"alembic_version=['{metadb.expected_schema_head()}']" in facts
+    assert "tables=" in facts and "alembic_version," in facts
+    assert "databases=" in facts
+    assert "journal_mode=" in facts
+    assert "in_transaction=" in facts
+
+
 def test_nonempty_unversioned_database_is_not_silently_stamped(tmp_path):
     db_path = tmp_path / "legacy.db"
     with sqlite3.connect(db_path) as connection:
