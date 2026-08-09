@@ -12798,6 +12798,7 @@
           "queryCapabilities": {
             "$ref": "#/components/schemas/WorkspaceQueryCapabilities",
             "default": {
+              "filters": [],
               "kindFilter": false,
               "sort": []
             }
@@ -13103,6 +13104,86 @@
         "title": "WorkspaceFavoriteStatus",
         "type": "object"
       },
+      "WorkspaceFilterCapability": {
+        "description": "One typed column filter this browse lens can honor, or the direct reason it cannot.",
+        "properties": {
+          "field": {
+            "enum": [
+              "name",
+              "kind",
+              "source",
+              "updated",
+              "rows",
+              "owner"
+            ],
+            "title": "Field",
+            "type": "string"
+          },
+          "options": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceFilterOption"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "supported": {
+            "default": true,
+            "title": "Supported",
+            "type": "boolean"
+          },
+          "type": {
+            "enum": [
+              "text",
+              "categorical",
+              "date_range",
+              "numeric_range"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "type"
+        ],
+        "title": "WorkspaceFilterCapability",
+        "type": "object"
+      },
+      "WorkspaceFilterOption": {
+        "properties": {
+          "label": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "WorkspaceFilterOption",
+        "type": "object"
+      },
       "WorkspaceLocalPlacementCapability": {
         "description": "A local-only mutation destination paired with a provider resource read reference.",
         "properties": {
@@ -13277,6 +13358,14 @@
       "WorkspaceQueryCapabilities": {
         "description": "Queries that are truthful for every item returned by this browse lens.",
         "properties": {
+          "filters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceFilterCapability"
+            },
+            "title": "Filters",
+            "type": "array"
+          },
           "kindFilter": {
             "default": false,
             "title": "Kindfilter",
@@ -29050,6 +29139,76 @@
             }
           },
           {
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updatedAfter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updatedafter"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updatedBefore",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updatedbefore"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sourceId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sourceid"
+            }
+          },
+          {
             "in": "header",
             "name": "x-dp-user",
             "required": false,
@@ -30691,6 +30850,95 @@
                 }
               ],
               "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "enum": [
+                  "container",
+                  "canvas",
+                  "dataset",
+                  "dataset_view"
+                ],
+                "type": "string"
+              },
+              "title": "Kind",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updatedAfter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updatedafter"
+            }
+          },
+          {
+            "in": "query",
+            "name": "updatedBefore",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Updatedbefore"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sourceId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sourceid"
             }
           },
           {
