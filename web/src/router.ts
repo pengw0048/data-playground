@@ -43,6 +43,7 @@ export interface Route {
   transformQuery?: string
   relationshipsContext?: RelationshipsContext
   canonicalHash?: string
+  settingsRequested?: boolean
 }
 
 const DATASET_QUERY_KEYS = [
@@ -195,6 +196,10 @@ export function parseHash(): Route {
   }
   // Recents and Tables are intentionally redirected to the single local Workspace explorer.
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
+  // Settings is a modal over the Workspace shell, not a routed view; honor the direct URL once.
+  if (seg === 'settings') {
+    return { view: 'workspace', canonicalHash: '#/workspace', settingsRequested: true }
+  }
   // Distribution reports are a Jobs detail, not a second navigation system. Preserve the exact
   // report identity in the Jobs route so browser reopen/back follows the same authorized surface.
   if (seg === 'distribution-reports') {

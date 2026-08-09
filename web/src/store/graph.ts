@@ -1499,6 +1499,8 @@ interface Store {
   setTransformLibraryQuery: (query: string) => void
   /** Router/bootstrap-only atomic projection of an already parsed route. */
   applyRoute: (route: Route, navigationToken: NavigationToken) => void
+  /** Incremented when a route asks to open the Settings modal (#/settings). */
+  settingsRequestId: number
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -2225,12 +2227,14 @@ export const useStore = create<Store>((set, get) => ({
     if (get().view !== 'transforms') _fileNavigationGeneration += 1
     set({ transformLibraryQuery, view: 'transforms' })
   },
+  settingsRequestId: 0,
   applyRoute: (route, navigationToken) => {
     if (!ownsNavigation(navigationToken)) return
     if (route.view === 'workspace') {
       const workspaceScope = route.workspaceScope ?? 'all'
       set({
         view: 'workspace', workspaceResourceId: route.workspaceResourceId ?? null, workspaceScope,
+        ...(route.settingsRequested ? { settingsRequestId: get().settingsRequestId + 1 } : {}),
         ...(workspaceScope === 'datasets'
           ? { workspaceDatasetQuery: route.workspaceDatasetQuery ?? '' }
           : {
