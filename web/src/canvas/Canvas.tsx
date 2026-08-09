@@ -28,7 +28,7 @@ import { Icon } from '../ui/Icon'
 import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
-import { canvasFitOptions } from './viewportFit'
+import { canvasFitOptions, rightViewportShiftToReveal } from './viewportFit'
 import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
@@ -180,7 +180,7 @@ function useMinimapRoom() {
   return fits
 }
 
-export function Canvas() {
+export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) {
   const specsVersion = useStore((s) => s.specsVersion)
   const nodeTypes = useMemo(() => buildNodeTypes(), [specsVersion])
   const doc = useStore((s) => s.doc)
@@ -191,6 +191,10 @@ export function Canvas() {
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
+  const singleSelectedNodeId = selectedIds.length === 1
+    && doc.nodes.some((node) => node.id === selectedIds[0])
+    ? selectedIds[0]
+    : null
   const canUndo = useStore((s) => s.past.length > 0)
   const canRedo = useStore((s) => s.future.length > 0)
   const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
@@ -206,7 +210,9 @@ export function Canvas() {
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
   const disable = useStore((s) => s.disable)
-  const { screenToFlowPosition, setCenter, getZoom, fitView, viewportInitialized } = useReactFlow()
+  const {
+    screenToFlowPosition, setCenter, getZoom, getViewport, setViewport, fitView, viewportInitialized,
+  } = useReactFlow()
   const canvasRef = useRef<HTMLDivElement>(null)
   const flowWidth = useReactFlowStore((state) => state.width)
   const flowHeight = useReactFlowStore((state) => state.height)
@@ -216,6 +222,15 @@ export function Canvas() {
   const nodesInitialized = useNodesInitialized()
   const revealedRequestId = useRef<number | null>(null)
   const fittedRequestId = useRef<number | null>(null)
+  const previousSingleSelectionId = useRef<string | null>(null)
+  const previousInspectorCollapsed = useRef(inspectorCollapsed)
+  const selectionTrackingCanvasId = useRef(doc.id)
+  const settledFlowWidth = useRef<number | null>(null)
+  const pendingSelectionVisibility = useRef<{
+    canvasId: string
+    nodeId: string
+    beforeWidth: number
+  } | null>(null)
   // React Flow validates a reconnect before calling `onReconnect`. Keep the edge being moved here
   // so the validator can exclude it from the target-port and cycle checks.
   const reconnectingEdgeId = useRef<string | null>(null)
@@ -235,6 +250,30 @@ export function Canvas() {
     source: { nodeId: string; handleId: string | null }
   } | null>(null)
   const [contextPosition, setContextPosition] = useState({ x: 0, y: 0 })
+  const [activeNodePointer, setActiveNodePointer] = useState<{
+    nodeId: string
+    pointerId: number
+  } | null>(null)
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!activeNodePointer) return
+    const clearPointerOwnership = () => {
+      setActiveNodePointer(null)
+      setDraggingNodeId(null)
+    }
+    const clearMatchingPointer = (event: PointerEvent) => {
+      if (event.pointerId === activeNodePointer.pointerId) clearPointerOwnership()
+    }
+    window.addEventListener('pointerup', clearMatchingPointer, true)
+    window.addEventListener('pointercancel', clearMatchingPointer, true)
+    window.addEventListener('blur', clearPointerOwnership)
+    return () => {
+      window.removeEventListener('pointerup', clearMatchingPointer, true)
+      window.removeEventListener('pointercancel', clearMatchingPointer, true)
+      window.removeEventListener('blur', clearPointerOwnership)
+    }
+  }, [activeNodePointer])
 
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
@@ -382,6 +421,86 @@ export function Canvas() {
     viewportInitialized, setCenter, getZoom, acknowledgeNodeReveal,
   ])
 
+  // A sole selection mounts the Inspector, while expanding its collapsed rail takes another 256px
+  // from the Canvas. Ordinary selection still must not recenter the graph: after React Flow accepts
+  // the real narrower size, translate only enough to uncover a selected card clipped by that change.
+  useEffect(() => {
+    const surface = canvasRef.current?.getBoundingClientRect()
+    if (!surface) return
+
+    if (selectionTrackingCanvasId.current !== doc.id) {
+      selectionTrackingCanvasId.current = doc.id
+      previousSingleSelectionId.current = singleSelectedNodeId
+      previousInspectorCollapsed.current = inspectorCollapsed
+      settledFlowWidth.current = null
+      pendingSelectionVisibility.current = null
+    }
+
+    const inspectorMounted = singleSelectedNodeId !== null
+      && previousSingleSelectionId.current === null
+    const inspectorExpanded = singleSelectedNodeId !== null
+      && previousSingleSelectionId.current === singleSelectedNodeId
+      && previousInspectorCollapsed.current
+      && !inspectorCollapsed
+    if ((inspectorMounted || inspectorExpanded) && settledFlowWidth.current !== null) {
+      pendingSelectionVisibility.current = {
+        canvasId: doc.id,
+        nodeId: singleSelectedNodeId,
+        beforeWidth: settledFlowWidth.current,
+      }
+    } else if (!singleSelectedNodeId) {
+      pendingSelectionVisibility.current = null
+    }
+    previousSingleSelectionId.current = singleSelectedNodeId
+    previousInspectorCollapsed.current = inspectorCollapsed
+
+    // The flex layout updates before React Flow's ResizeObserver. Preserve the prior settled width
+    // until both measurements describe the same surface, just like the explicit reveal path above.
+    if (flowWidth <= 0 || flowHeight <= 0
+        || Math.abs(flowWidth - surface.width) > 0.5
+        || Math.abs(flowHeight - surface.height) > 0.5) return
+    settledFlowWidth.current = flowWidth
+
+    const pending = pendingSelectionVisibility.current
+    if (!pending) return
+    if (pending.canvasId !== doc.id || pending.nodeId !== singleSelectedNodeId) {
+      pendingSelectionVisibility.current = null
+      return
+    }
+    if (flowWidth >= pending.beforeWidth - 0.5) {
+      pendingSelectionVisibility.current = null
+      return
+    }
+    // Route and newly-connected-node reveals own their viewport transition. A fit request also wins;
+    // never stack a second ordinary-selection adjustment behind either explicit action.
+    if (nodeRevealRequest?.canvasId === doc.id || viewportFitRequest?.canvasId === doc.id) {
+      pendingSelectionVisibility.current = null
+      return
+    }
+    // React Flow can select an unselected node on pointer-down, before it reports a drag start.
+    // Keep the pending reveal until release so the viewport cannot move under either phase.
+    if (activeNodePointer?.nodeId === pending.nodeId || draggingNodeId === pending.nodeId) return
+
+    const selectedNode = Array.from(
+      canvasRef.current?.querySelectorAll<HTMLElement>('.react-flow__node') ?? [],
+    ).find((element) => element.dataset.id === singleSelectedNodeId)
+    if (!selectedNode) return
+    const nodeBounds = selectedNode.getBoundingClientRect()
+    const shift = rightViewportShiftToReveal(nodeBounds, surface, {
+      left: surface.left,
+      right: surface.left + pending.beforeWidth,
+    })
+    pendingSelectionVisibility.current = null
+    if (shift === null) return
+
+    const viewport = getViewport()
+    void setViewport({ ...viewport, x: viewport.x + shift }, { duration: 200 })
+  }, [
+    singleSelectedNodeId, inspectorCollapsed, flowWidth, flowHeight, rfNodes,
+    nodeRevealRequest, viewportFitRequest, activeNodePointer, draggingNodeId,
+    doc.id, getViewport, setViewport,
+  ])
+
   // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes
   // → rfEdges (and every WireEdge) don't rebuild on an unrelated keystroke.
@@ -499,6 +618,7 @@ export function Canvas() {
   // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.
   const onNodeDragStop = useCallback((e: MouseEvent | TouchEvent, dragged: Node) => {
+    setDraggingNodeId(null)
     if (!canEdit) return
     // This callback is an actual pointer drag release; React Flow's generic position changes also
     // cover initialization/reconciliation and cannot safely claim presentation ownership.
@@ -624,6 +744,13 @@ export function Canvas() {
     <div ref={canvasRef}
       data-node-reveal-pending={nodeRevealRequest?.canvasId === doc.id ? 'true' : 'false'}
       style={{ position: 'absolute', inset: 0 }}
+      onPointerDownCapture={(event) => {
+        if (event.button !== 0) return
+        const node = (event.target as HTMLElement).closest<HTMLElement>('.react-flow__node')
+        setActiveNodePointer(node?.dataset.id
+          ? { nodeId: node.dataset.id, pointerId: event.pointerId }
+          : null)
+      }}
       onContextMenu={(event) => {
         setContextPosition(screenToFlowPosition({ x: event.clientX, y: event.clientY }))
         select(null)
@@ -646,6 +773,7 @@ export function Canvas() {
         onReconnectStart={(_, edge) => { reconnectingEdgeId.current = edge.id }}
         onReconnectEnd={() => { reconnectingEdgeId.current = null }}
         onEdgeDoubleClick={(_, edge) => { if (canEdit) removeEdge(edge.id) }}
+        onNodeDragStart={(_, node) => setDraggingNodeId(node.id)}
         onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
         nodesDraggable={canEdit}

@@ -355,6 +355,133 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('opening the Inspector minimally reveals a clipped selected node @ux-smoke', async ({ page }) => {
+    const canvasId = `inspector-selected-node-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    let canvasPuts = 0
+    page.on('request', (request) => {
+      if (request.method() === 'PUT'
+          && new URL(request.url()).pathname === `/api/canvas/${canvasId}`) canvasPuts += 1
+    })
+    const graphNodes = [
+      { id: 'src', type: 'source', position: { x: 80, y: 180 }, data: { title: 'events', status: 'idle', config: { uri: 'events' } } },
+      { id: 'flt', type: 'filter', position: { x: 360, y: 180 }, data: { title: 'filter', status: 'idle', config: { predicate: "event = 'purchase'" } } },
+      { id: 'agg', type: 'aggregate', position: { x: 640, y: 180 }, data: { title: 'aggregate', status: 'idle', config: { groupBy: 'user_id', aggs: 'count(*) AS n' } } },
+      { id: 'srt', type: 'sort', position: { x: 920, y: 180 }, data: { title: 'sort', status: 'idle', config: { by: 'n DESC' } } },
+      { id: 'out', type: 'write', position: { x: 1_200, y: 180 }, data: { title: 'top_users', status: 'idle', config: { name: 'top_users' } } },
+    ]
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Inspector selected node visibility', version: 1, requirements: [],
+      nodes: graphNodes,
+      edges: graphNodes.slice(1).map((node, index) => ({
+        id: `edge-${index}`, source: graphNodes[index].id, target: node.id,
+      })),
+    } })
+    expect(created.ok()).toBe(true)
+    await page.setViewportSize({ width: 1280, height: 720 })
+
+    const flow = page.locator('.react-flow')
+    const rightmost = page.locator('[data-id="out"]')
+    const fit = page.getByRole('button', { name: 'Fit view', exact: true })
+
+    const expectMinimalReveal = async (
+      nodeBefore: { x: number; y: number; width: number; height: number },
+      zoomBefore: number,
+    ) => {
+      const inspector = page.getByTestId('inspector')
+      await expect(inspector).toBeVisible()
+      expect((await boxOf(inspector)).width).toBeCloseTo(300, 0)
+      const narrowed = await boxOf(flow)
+      const expectedShift = narrowed.x + narrowed.width - 12 - (nodeBefore.x + nodeBefore.width)
+      expect(expectedShift, 'the fixture must put the selected node behind the expanded Inspector').toBeLessThan(0)
+      await expect.poll(async () => {
+        const node = await boxOf(rightmost)
+        const currentFlow = await boxOf(flow)
+        return node.x >= currentFlow.x + 11.5
+          && node.x + node.width <= currentFlow.x + currentFlow.width - 11.5
+      }, { message: 'the selected node should remain inside the narrowed Canvas' }).toBe(true)
+      const nodeAfter = await boxOf(rightmost)
+      expect(Math.abs((nodeAfter.x - nodeBefore.x) - expectedShift)).toBeLessThan(1.5)
+      expect(Math.abs(nodeAfter.y - nodeBefore.y)).toBeLessThan(0.5)
+      expect(await canvasZoom(page)).toBeCloseTo(zoomBefore, 5)
+      const shelf = rightmost.getByRole('button', { name: 'Output versions' }).locator('..')
+      expect(contains(await boxOf(flow), await boxOf(shelf)), 'the selected action shelf stays usable').toBe(true)
+    }
+
+    try {
+      await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      await expect(page.locator('.react-flow__node')).toHaveCount(graphNodes.length)
+      await expect(page.getByTestId('inspector')).toHaveCount(0)
+      await fit.click()
+      await page.waitForTimeout(350)
+
+      const fullFlow = await boxOf(flow)
+      const beforeDrag = await boxOf(rightmost)
+      expect(contains(fullFlow, beforeDrag)).toBe(true)
+      expect(beforeDrag.x + beforeDrag.width).toBeGreaterThan(fullFlow.x + fullFlow.width - 300 - 12)
+
+      // React Flow selects an unselected node when its drag starts. Opening the Inspector must not
+      // animate the viewport while that pointer gesture still owns the node's coordinates.
+      const viewport = page.locator('.react-flow__viewport')
+      const viewportBeforeDrag = await viewport.getAttribute('style')
+      const dragHandle = await boxOf(rightmost.locator('[data-dp-card]').getByText('top_users', { exact: true }))
+      const dragStart = { x: dragHandle.x + dragHandle.width / 2, y: dragHandle.y + dragHandle.height / 2 }
+      await page.mouse.move(dragStart.x, dragStart.y)
+      await page.mouse.down()
+      await page.mouse.move(dragStart.x - 40, dragStart.y, { steps: 5 })
+      const inspectorDuringDrag = page.getByTestId('inspector')
+      await expect(inspectorDuringDrag).toBeVisible()
+      await page.waitForTimeout(250)
+      expect(await viewport.getAttribute('style')).toBe(viewportBeforeDrag)
+      const narrowedDuringDrag = await boxOf(flow)
+      const heldNode = await boxOf(rightmost)
+      expect(heldNode.x + heldNode.width).toBeGreaterThan(
+        narrowedDuringDrag.x + narrowedDuringDrag.width - 12,
+      )
+      const inspectorBounds = await boxOf(inspectorDuringDrag)
+      const releasePoint = { x: inspectorBounds.x + inspectorBounds.width / 2, y: dragStart.y }
+      expect(releasePoint.x).toBeGreaterThan(narrowedDuringDrag.x + narrowedDuringDrag.width)
+      await page.mouse.move(releasePoint.x, releasePoint.y, { steps: 5 })
+      expect(await viewport.getAttribute('style')).toBe(viewportBeforeDrag)
+      const beforeExternalRelease = await boxOf(rightmost)
+      const zoomBeforeExternalRelease = await canvasZoom(page)
+      await page.mouse.up()
+      await expectMinimalReveal(beforeExternalRelease, zoomBeforeExternalRelease)
+      await page.keyboard.press('Escape')
+      await expect(page.getByTestId('inspector')).toHaveCount(0)
+      await fit.click()
+      await page.waitForTimeout(500)
+      const positionsAfterDrag = ((await canvasFor(page, canvasId)).nodes as typeof graphNodes)
+        .map((node) => node.position)
+      canvasPuts = 0
+
+      const beforeSelection = await boxOf(rightmost)
+      const zoomBeforeSelection = await canvasZoom(page)
+      await rightmost.locator('[data-dp-card]').getByText('top_users', { exact: true }).click()
+      await expectMinimalReveal(beforeSelection, zoomBeforeSelection)
+
+      // The same boundary changes when a user restores a collapsed Inspector. Fit within the 44px
+      // rail first so expanding it would cover the selected node without the visibility adjustment.
+      await page.getByRole('button', { name: 'Collapse Inspector', exact: true }).click()
+      await expect(page.getByRole('button', { name: 'Expand Inspector', exact: true })).toBeVisible()
+      await fit.click()
+      await page.waitForTimeout(350)
+      const beforeExpansion = await boxOf(rightmost)
+      const zoomBeforeExpansion = await canvasZoom(page)
+      await page.getByRole('button', { name: 'Expand Inspector', exact: true }).click()
+      await expectMinimalReveal(beforeExpansion, zoomBeforeExpansion)
+
+      // Viewport-only reveals never dirty the graph. Wait beyond autosave's debounce before reading
+      // durable state so a node-position mutation cannot hide behind the server's prior document.
+      await page.waitForTimeout(500)
+      expect(canvasPuts).toBe(0)
+      const persisted = await canvasFor(page, canvasId)
+      expect((persisted.nodes as typeof graphNodes).map((node) => node.position))
+        .toEqual(positionsAfterDrag)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
+
   test('Fit view keeps dense graphs readable and reachable at both desktop sizes @canvas-viewport', async ({ page }) => {
     const canvasId = `dense-readable-fit-${Date.now()}`
     const nodes = Array.from({ length: 14 }, (_, index) => {
