@@ -3005,6 +3005,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 return RunStatus.model_validate(current), _runner_for(
                     local_run_id, deps=deps)
 
+    # Boundary selection must prove the caller's unresolved semantic graph under the requested
+    # bindings.  The resolved execution graph no longer contains parameterRef sentinels, so resolving
+    # it again against a retained candidate would drop the canonical parameter identity and reject an
+    # otherwise exact boundary.
+    boundary_intent_graph = graph.model_copy(deep=True)
     if retained_local_manifest is None:
         graph = _resolve_parameters(graph, bindings, target_node_id, deps)
         intent_graph = graph.model_copy(deep=True)
@@ -3595,13 +3600,14 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             boundary_artifact_uri = None
         else:
             boundary_admission, boundary_artifact_uri = _admit_local_run_boundary(
-                graph=intent_graph,
+                graph=boundary_intent_graph,
                 canvas_id=operational_canvas,
                 target_node_id=target_node_id,
                 run_id=prebound_local_run_id,
                 uid=uid,
                 deps=deps,
                 required_input_manifest=dispatch_manifest,
+                requested_bindings=bindings,
             )
         if boundary_admission is not None and boundary_admission.admitted:
             from hub.run_boundary_suffix import BoundarySuffixError, prepare_boundary_suffix

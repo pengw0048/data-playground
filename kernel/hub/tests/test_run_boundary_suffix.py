@@ -371,6 +371,62 @@ def test_source_head_advance_rejects_boundary_and_runs_prefix(
         shutil.rmtree(source_uri, ignore_errors=True)
 
 
+def test_parameterized_run_reuses_same_binding_and_rejects_changed_binding(
+        retained_intermediate):
+    graph, _boundary_run_id, _output = retained_intermediate
+    parameterized = copy.deepcopy(graph)
+    parameterized["parameters"] = [{
+        "name": "sample_rows", "type": "integer", "required": True,
+    }]
+    parameterized["nodes"][1]["data"]["config"]["n"] = {
+        "parameterRef": "sample_rows",
+    }
+    same_binding = [{"name": "sample_rows", "value": 3}]
+
+    intermediate = client.post("/api/run", json={
+        "graph": parameterized,
+        "targetNodeId": "sample",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+        "parameterBindings": same_binding,
+    })
+    assert intermediate.status_code == 200, intermediate.text
+    intermediate_status = _wait(intermediate.json()["runId"])
+    assert intermediate_status["status"] == "done", intermediate_status
+    _wait_for_history_projection(intermediate_status["runId"])
+
+    resumed = client.post("/api/run", json={
+        "graph": parameterized,
+        "targetNodeId": "filter",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+        "parameterBindings": same_binding,
+    })
+    assert resumed.status_code == 200, resumed.text
+    resumed_status = _wait(resumed.json()["runId"])
+    assert resumed_status["status"] == "done", resumed_status
+    assert resumed_status["reusedBoundary"]["boundaryRunId"] == intermediate_status["runId"]
+    by_id = {item["nodeId"]: item for item in resumed_status["perNode"]}
+    assert by_id["source"]["reused"] is True
+    assert by_id["sample"]["reused"] is True
+    assert by_id["filter"]["reused"] is False
+
+    changed = client.post("/api/run", json={
+        "graph": parameterized,
+        "targetNodeId": "filter",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+        "parameterBindings": [{"name": "sample_rows", "value": 4}],
+    })
+    assert changed.status_code == 200, changed.text
+    changed_status = _wait(changed.json()["runId"])
+    assert changed_status["status"] == "done", changed_status
+    assert changed_status.get("reusedBoundary") is None
+    changed_by_id = {item["nodeId"]: item for item in changed_status["perNode"]}
+    assert changed_by_id["source"]["reused"] is False
+    assert changed_by_id["sample"]["reused"] is False
+
+
 def test_explicit_subprocess_backend_is_not_silently_switched(
         retained_intermediate, monkeypatch):
     graph, _boundary_run_id, _output = retained_intermediate
