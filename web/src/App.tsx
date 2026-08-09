@@ -151,7 +151,7 @@ export default function App() {
           <div style={{ position: 'absolute', inset: 0, overflow: 'hidden', display: 'flex' }}>
             {/* canvas region (left, flexible) — Canvas fills it; TopBar/Toolbar/AgentDock overlay it */}
             <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
-              <Canvas />
+              <Canvas inspectorCollapsed={inspectorCollapsed} />
               <TopBar />
               <Toolbar />
               <AgentDock />
