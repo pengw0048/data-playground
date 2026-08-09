@@ -160,6 +160,9 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
       await expect(chart.locator('[title="latest"]')).toBeVisible()
       await expect(chart).toContainText('4 rows')
     }
+    // A presentation edit must not enqueue delayed Inspector planning (350 ms) or schema/size
+    // refresh (500 ms). Observe past both debounces before accepting the zero-request window.
+    await page.waitForTimeout(700)
 
     expect(runPosts).toEqual([])
     expect(previewPosts).toEqual([])
