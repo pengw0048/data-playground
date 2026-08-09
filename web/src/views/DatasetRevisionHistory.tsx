@@ -17,13 +17,12 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 const statusOf = (error: unknown) => error instanceof KernelError ? error.status
   : typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined
 
+// Local time, matching Jobs and the rest of the shell.
 function timestamp(value?: string | null) {
   if (!value) return 'Commit time not provided'
   const parsed = new Date(value)
   if (Number.isNaN(parsed.valueOf())) return value
-  return `${new Intl.DateTimeFormat('en', {
-    dateStyle: 'medium', timeStyle: 'medium', timeZone: 'UTC',
-  }).format(parsed)} UTC`
+  return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'medium' }).format(parsed)
 }
 
 function bytes(value?: number | null) {
