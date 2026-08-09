@@ -172,8 +172,14 @@ test.describe('minimum viewport support', () => {
     await expect(detail.getByRole('status').filter({
       hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
     })).toBeVisible({ timeout: 15_000 })
+    await expectFullyInViewport(page, detail.getByTestId('detail-preview-scroll'), 'dataset row preview')
     await expect(detail.getByTestId('detail-relationships')).toBeVisible()
-    await expect(detail.getByRole('heading', { name: 'Dataset details' })).toBeVisible()
+    await expect(detail.getByRole('heading', { name: 'Catalog details' })).toBeVisible()
+    const previewHeading = await boxOf(detail.getByRole('heading', { name: 'Data preview' }))
+    const schemaHeading = await boxOf(detail.getByRole('heading', { name: 'Schema' }))
+    const catalogHeading = await boxOf(detail.getByRole('heading', { name: 'Catalog details' }))
+    expect(previewHeading.y, 'row preview should precede Schema').toBeLessThan(schemaHeading.y)
+    expect(schemaHeading.y, 'Schema should precede catalog maintenance').toBeLessThan(catalogHeading.y)
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
     await keyAction.scrollIntoViewIfNeeded()
     await expectFullyInViewport(page, keyAction, 'column key action')

@@ -1403,30 +1403,6 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               {table.usage ? <span>· used {table.usage}×</span> : null}
             </div>
 
-            <section aria-labelledby="dataset-details-title" className="rounded-lg border border-border p-3">
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <h2 id="dataset-details-title" className="text-[12px] font-bold text-foreground">Dataset details</h2>
-                {dirty && <span className="text-[10.5px] font-semibold text-primary">Unsaved changes</span>}
-              </div>
-              <div className="mt-3 grid gap-2 md:grid-cols-2">
-                <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
-                <Field label="Folder"><CatalogFolderSelect value={folder} onChange={setFolder}
-                  disabled={!atomicMetadataEditable} testId="detail-folder" /></Field>
-                <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
-                <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
-                <div className="md:col-span-2"><Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field></div>
-              </div>
-              {!atomicMetadataEditable && <div className="mt-2 text-[11px] text-muted-foreground">This catalog is read-only. These values come from the connected data source.</div>}
-              {conflict && <div role="alert" className="mt-2 flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
-                <span>Another editor saved changes first.</span>
-                <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button>{conflictBase && <button onClick={() => void save(conflictBase)} className="font-semibold underline">Reapply</button>}</span>
-              </div>}
-              <div className="mt-3 flex justify-end gap-2">
-                <button onClick={discard} disabled={!dirty || busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50" data-testid="detail-discard">Discard</button>
-                <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save changes'}</button>
-              </div>
-            </section>
-
             <section aria-labelledby="dataset-preview-title" className="rounded-xl border border-border bg-card p-3 shadow-sm">
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
                 <div>
@@ -1511,9 +1487,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </div>
           ) : null}
 
-          <section>
+          <section aria-labelledby="dataset-schema-title">
             <div className="mb-1 flex items-baseline justify-between gap-2">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</div>
+              <h2 id="dataset-schema-title" className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Schema</h2>
               <span className="flex items-center gap-1 text-[10.5px] text-muted-foreground">
                 <span>{requestedExact && !requestedExactDetail ? 'Selected version' : `${displayColumns.length} columns`}</span>
                 {!requestedExact && <><span aria-hidden="true">·</span><span>{persistedDeclaredKey.length > 1 ? 'Saved composite key' : persistedDeclaredKey.length === 1 ? 'Saved key' : 'No saved key'}</span></>}
@@ -1542,7 +1518,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                   <span title={`${column.type} · reported by the data source`} className="truncate text-muted-foreground">{friendlyColumnType(column.type)}</span>
                   {requestedExact ? <span /> : <button type="button" onClick={() => togglePk(column.name)}
                     disabled={!atomicMetadataEditable} data-testid={state === 'Not a key' ? `detail-pk-${column.name}` : `detail-key-state-${column.name}`} aria-label={action}
-                    title={`${action}. Saved together with the dataset details.`}
+                    title={`${action}. Saved together with the catalog details.`}
                     className={`justify-self-start rounded px-1.5 py-0.5 text-[10px] font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${selected ? 'bg-primary/10 text-primary' : 'border border-border text-muted-foreground hover:bg-accent'}`}>
                     {state}
                   </button>}
@@ -1550,6 +1526,30 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 </div>
               })}
             </div> : <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">No columns were reported for this dataset.</div>}
+          </section>
+
+          <section aria-labelledby="catalog-details-title" className="rounded-lg border border-border p-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 id="catalog-details-title" className="text-[12px] font-bold text-foreground">Catalog details</h2>
+              {dirty && <span className="text-[10.5px] font-semibold text-primary">Unsaved changes</span>}
+            </div>
+            <div className="mt-3 grid gap-2 md:grid-cols-2">
+              <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
+              <Field label="Folder"><CatalogFolderSelect value={folder} onChange={setFolder}
+                disabled={!atomicMetadataEditable} testId="detail-folder" /></Field>
+              <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
+              <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
+              <div className="md:col-span-2"><Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field></div>
+            </div>
+            {!atomicMetadataEditable && <div className="mt-2 text-[11px] text-muted-foreground">This catalog is read-only. These values come from the connected data source.</div>}
+            {conflict && <div role="alert" className="mt-2 flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
+              <span>Another editor saved changes first.</span>
+              <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button>{conflictBase && <button onClick={() => void save(conflictBase)} className="font-semibold underline">Reapply</button>}</span>
+            </div>}
+            <div className="mt-3 flex justify-end gap-2">
+              <button onClick={discard} disabled={!dirty || busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50" data-testid="detail-discard">Discard</button>
+              <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save changes'}</button>
+            </div>
           </section>
 
           <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table}
