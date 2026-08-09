@@ -6,6 +6,7 @@ import {
   seriesChartColumns,
   suggestedChartDimension,
   suggestedChartMeasure,
+  timeBucketableChartColumn,
 } from './chart'
 
 const columns: ColumnSchema[] = [
@@ -44,6 +45,17 @@ describe('Chart schema recommendations', () => {
       { name: 'row_id', type: 'bigint', capabilities: [] },
       { name: 'score', type: 'double', capabilities: [] },
     ])?.name).toBe('score')
+  })
+
+  it('offers time buckets for typed date/timestamp X columns only', () => {
+    expect(timeBucketableChartColumn({ name: 'created_at', type: 'timestamp[us]', capabilities: [] })).toBe(true)
+    expect(timeBucketableChartColumn({
+      name: 'seen_at', type: 'timestamp', physicalType: 'TIMESTAMP WITH TIME ZONE', capabilities: [],
+    })).toBe(true)
+    expect(timeBucketableChartColumn({ name: 'day', type: 'date32[day]', capabilities: [] })).toBe(true)
+    expect(timeBucketableChartColumn({ name: 'wake_time', type: 'time64[us]', capabilities: [] })).toBe(false)
+    expect(timeBucketableChartColumn({ name: 'gap', type: 'interval', capabilities: [] })).toBe(false)
+    expect(timeBucketableChartColumn({ name: 'date_label', type: 'string', capabilities: [] })).toBe(false)
   })
 
   it('does not recommend image bytes or row identifiers as a chart dimension', () => {

@@ -9655,6 +9655,23 @@ def test_plan_hash_ignores_chart_presentation_type():
             "chartType": "bar", "agg": "count", "xMode": "column", "x": "event", "series": "event",
         }),
     ], "edges": [E("src", "ch")]}), "ch")
+    assert bar != r._plan_hash(Graph(**{"id": "c", "version": 1, "nodes": [
+        N("src", "source", {"uri": _uri("events")}),
+        N("ch", "chart", {
+            "chartType": "bar", "agg": "count", "xMode": "column", "x": "event", "timeBucket": "day",
+        }),
+    ], "edges": [E("src", "ch")]}), "ch")
+
+
+def test_chart_time_bucket_is_semantic_config():
+    from hub.ir import resolve_config
+    from hub.models import GraphNode
+    node = GraphNode(**N("ch", "chart", {
+        "chartType": "bar", "agg": "count", "xMode": "column", "x": "created_at", "timeBucket": "month",
+    }))
+    resolved = resolve_config(node)
+    assert resolved["timeBucket"] == "month"
+    assert "chartType" not in resolved
 
 
 def test_direct_managed_write_invocations_publish_distinct_revisions(tmp_path):
@@ -12186,6 +12203,130 @@ def test_chart_series_dimension_groups_and_bounds_other(tmp_path):
     refused = _poll(started.json()["runId"])
     assert refused["status"] == "failed"
     assert "Series" in str(refused)
+
+
+def test_chart_time_bucket_matches_reference_utc_sql(tmp_path):
+    import duckdb as ddb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    stamps = [
+        "2023-12-31 23:30:00", "2024-01-01 00:15:00",  # year boundary (Mon ISO week starts 01-01)
+        "2024-01-31 23:59:59", "2024-02-01 00:00:00",  # month boundary
+        "2024-02-29 12:05:00", "2024-02-29 12:40:00",  # leap day, same hour
+        "2024-04-01 06:00:00", None, None,             # Q2 + an explicit null group
+    ]
+    from datetime import datetime
+    source = tmp_path / "chart-buckets.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"ts": datetime.fromisoformat(s) if s else None, "amount": float(i + 1)}
+        for i, s in enumerate(stamps)
+    ]), source)
+
+    def chart_graph(cfg):
+        return {"id": "chart-buckets", "version": 1, "nodes": [
+            N("source", "source", {"uri": str(source)}),
+            N("chart", "chart", cfg),
+        ], "edges": [E("source", "chart")]}
+
+    ref = ddb.connect()
+    for bucket in ("hour", "day", "week", "month", "quarter", "year"):
+        _, result = _full_result(chart_graph({
+            "chartType": "bar", "agg": "count", "xMode": "column", "x": "ts", "timeBucket": bucket,
+        }), "chart", 50)
+        expected = {
+            (x.isoformat() if x else None): float(y)
+            for x, y in ref.execute(
+                "SELECT date_trunc(?, ts), count(*) FROM read_parquet(?) GROUP BY 1",
+                [bucket, str(source)],
+            ).fetchall()
+        }
+        assert {row["x"]: row["y"] for row in result["rows"]} == expected, bucket
+        assert expected[None] == 2.0  # nulls stay one explicit group
+        x_column = next(column for column in result["columns"] if column["name"] == "x")
+        assert "timestamp" in str(x_column["type"]).lower()
+
+    _, summed = _full_result(chart_graph({
+        "chartType": "bar", "agg": "sum", "xMode": "column", "x": "ts", "y": "amount",
+        "timeBucket": "month",
+    }), "chart", 50)
+    expected = {
+        (x.isoformat() if x else None): float(y)
+        for x, y in ref.execute(
+            "SELECT date_trunc('month', ts), sum(amount) FROM read_parquet(?) GROUP BY 1",
+            [str(source)],
+        ).fetchall()
+    }
+    assert {row["x"]: row["y"] for row in summed["rows"]} == expected
+
+    # Series + bucket share the same compiled X.
+    _, split = _full_result(chart_graph({
+        "chartType": "bar", "agg": "count", "xMode": "column", "x": "ts", "series": "amount",
+        "timeBucket": "year",
+    }), "chart", 50)
+    assert {column["name"] for column in split["columns"]} == {"x", "series", "y"}
+    assert {row["x"] for row in split["rows"]} <= {"2023-01-01T00:00:00", "2024-01-01T00:00:00", None}
+
+
+def test_chart_time_bucket_normalizes_tz_aware_inputs_to_utc(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    plus5 = timezone(timedelta(hours=5))
+    stamps = [
+        datetime(2024, 3, 1, 1, 30, tzinfo=plus5),   # 2024-02-29 20:30 UTC → leap day
+        datetime(2024, 1, 1, 3, 0, tzinfo=plus5),    # 2023-12-31 22:00 UTC → prior year
+        datetime(2024, 6, 15, 12, 0, tzinfo=plus5),  # 2024-06-15 07:00 UTC
+    ]
+    source = tmp_path / "chart-tz.parquet"
+    pq.write_table(pa.Table.from_pydict({
+        "ts": pa.array(stamps, type=pa.timestamp("us", tz="UTC")),
+    }), source)
+
+    def run_bucket(bucket):
+        _, result = _full_result({"id": "chart-tz", "version": 1, "nodes": [
+            N("source", "source", {"uri": str(source)}),
+            N("chart", "chart", {
+                "chartType": "bar", "agg": "count", "xMode": "column", "x": "ts",
+                "timeBucket": bucket,
+            }),
+        ], "edges": [E("source", "chart")]}, "chart", 50)
+        return {row["x"]: row["y"] for row in result["rows"]}
+
+    # Deterministic UTC boundaries regardless of the hub session time zone.
+    assert run_bucket("day") == {
+        "2024-02-29T00:00:00": 1.0, "2023-12-31T00:00:00": 1.0, "2024-06-15T00:00:00": 1.0,
+    }
+    assert run_bucket("year") == {"2024-01-01T00:00:00": 2.0, "2023-01-01T00:00:00": 1.0}
+
+
+def test_chart_time_bucket_refuses_untypeable_configurations(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "chart-bucket-refusals.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"label": "a", "amount": 1.0}, {"label": "b", "amount": 2.0},
+    ]), source)
+
+    def refusal(cfg):
+        started = client.post("/api/run", json={
+            "graph": {"id": "chart-bucket-refusals", "version": 1, "nodes": [
+                N("source", "source", {"uri": str(source)}),
+                N("chart", "chart", {"chartType": "bar", "agg": "count", **cfg}),
+            ], "edges": [E("source", "chart")]},
+            "targetNodeId": "chart", "confirmed": True,
+        })
+        assert started.status_code == 200, started.text
+        status = _poll(started.json()["runId"])
+        assert status["status"] == "failed"
+        return str(status)
+
+    assert "date or timestamp" in refusal({"xMode": "column", "x": "label", "timeBucket": "day"})
+    assert "column X" in refusal({"xMode": "expression", "x": "upper(label)", "timeBucket": "day"})
+    assert "Unsupported time bucket" in refusal({"xMode": "column", "x": "label", "timeBucket": "fortnight"})
 
 
 def test_chart_counts_all_rows_when_only_binary_and_identifier_fields_exist(tmp_path):
