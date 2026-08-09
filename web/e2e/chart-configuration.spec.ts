@@ -111,10 +111,12 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
     await chart.getByRole('button', { name: 'View chart result' }).click()
     await expect(page.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
     await expect(chart.locator('[title="latest"]')).toBeVisible()
+    await page.waitForTimeout(700) // settle metadata work attributable to opening the result
 
     const runPosts: string[] = []
     const previewPosts: string[] = []
     const planPosts: string[] = []
+    const graphPosts: string[] = []
     await page.route('**/api/run**', async (route) => {
       const request = route.request()
       if (request.method() !== 'POST') {
@@ -136,6 +138,16 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
       }
       await route.continue()
     })
+    await page.route('**/api/graph/**', async (route) => {
+      const request = route.request()
+      if (request.method() === 'POST') {
+        const path = new URL(request.url()).pathname
+        if (['/api/graph/plan', '/api/graph/schema', '/api/graph/estimate'].includes(path)) {
+          graphPosts.push(request.url())
+        }
+      }
+      await route.continue()
+    })
 
     for (const [value, label] of [
       ['line', 'line chart, saved result'],
@@ -152,6 +164,7 @@ test('Chart presentation type redraws without invalidating or rerunning', async 
     expect(runPosts).toEqual([])
     expect(previewPosts).toEqual([])
     expect(planPosts).toEqual([])
+    expect(graphPosts).toEqual([])
 
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}`)

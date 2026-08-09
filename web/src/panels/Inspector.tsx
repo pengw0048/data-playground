@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  currentPreviews, parameterBindingsIdentity, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
+  currentPreviews, executionConfig, parameterBindingsIdentity, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -882,7 +882,7 @@ function RunPlan({ nodeId }: { nodeId: string }) {
   const kernelUp = useStore((s) => s.kernelUp)
   const [regions, setRegions] = useState<PlanRegion[] | null>(null)
   const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
-    doc.nodes.map((n) => [n.id, n.type, n.data.config]), parameterBindings ?? []])
+    doc.nodes.map((n) => [n.id, n.type, executionConfig(n)]), parameterBindings ?? []])
   useEffect(() => {
     if (!kernelUp) { setRegions(null); return }
     let off = false
