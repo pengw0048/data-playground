@@ -489,6 +489,39 @@ function JobSubject({ name }: { name: string }) {
   )
 }
 
+function JobExecutionBreakdown({ nodes }: { nodes: NonNullable<WorkspaceJobDto['perNode']> }) {
+  const hasReusedPrefix = nodes.some((node) => node.reused)
+  const freshNodes = nodes.filter((node) => !node.reused)
+  const reuseSummary = freshNodes.length === 0
+    ? 'Reused execution'
+    : freshNodes.every((node) => node.status === 'done')
+      ? 'Reused prefix · executed suffix'
+      : 'Reused prefix · current run suffix'
+  return (
+    <section aria-label="Execution breakdown" className="min-w-0 sm:col-span-2">
+      <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <strong className="text-foreground">Execution breakdown</strong>
+        {hasReusedPrefix && <span className="text-[10.5px] text-muted-foreground">{reuseSummary}</span>}
+      </div>
+      <div role="list" className="overflow-hidden rounded-md border border-border bg-background">
+        {nodes.map((node, index) => {
+          const label = node.label || `Step ${index + 1}`
+          const accessibleLabel = node.label || String(index + 1)
+          const work = node.reused ? 'reused' : node.status === 'done' ? 'executed' : readable(node.status)
+          return <div key={node.nodeId} role="listitem" aria-label={`Execution step ${accessibleLabel}`}
+            className="grid grid-cols-[minmax(0,1fr)_72px_64px] items-center gap-2 border-b border-border/70 px-2 py-1.5 last:border-b-0">
+            <span className="truncate text-foreground" title={label}>{label}</span>
+            <Badge variant={node.reused ? 'secondary' : 'outline'} className="h-5 w-fit rounded px-1.5 py-0 text-[9px] font-medium">{work}</Badge>
+            <span className="text-right tabular-nums text-muted-foreground" aria-label={node.reused ? 'No fresh duration' : undefined}>
+              {node.reused ? '—' : node.ms != null ? fmtMs(node.ms) : '—'}
+            </span>
+          </div>
+        })}
+      </div>
+    </section>
+  )
+}
+
 function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone, returnQuery }: { item: WorkspaceJobDto; showAuthor: boolean; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void; returnQuery: string }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
@@ -553,6 +586,7 @@ function JobRow({ item, showAuthor, expanded, onSelect, onOutput, selectedOutput
         {item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}
         {item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{jobFailureMessage(item.error)}</div>}
       </div>}
+      {item.perNode?.length ? <JobExecutionBreakdown nodes={item.perNode} /> : null}
       <div className="flex flex-wrap content-start gap-2 sm:col-span-2">
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId ?? undefined)}>Open in Canvas</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}

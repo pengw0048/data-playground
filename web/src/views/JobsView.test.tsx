@@ -511,6 +511,66 @@ describe('JobsView', () => {
     expect(screen.queryByText('transform-1:rejected')).not.toBeInTheDocument()
   })
 
+  it('distinguishes a reused prefix from freshly executed suffix steps', async () => {
+    const internalArtifact = 'file:///private/results/reused-prefix.parquet'
+    const internalManifest = 'b'.repeat(64)
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      status: 'done', error: null, executionManifestSha256: internalManifest,
+      outputs: [{
+        nodeId: 'filter', portId: 'out', portLabel: 'Result', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: internalArtifact, rows: 4,
+      }],
+      perNode: [
+        { nodeId: 'source', label: 'Events source', status: 'done', reused: true, ms: 47 },
+        { nodeId: 'transform', label: 'Normalize events', status: 'done', reused: true, ms: null },
+        { nodeId: 'sample', label: 'Retained sample', status: 'done', reused: true, ms: null },
+        { nodeId: 'boundary-source', label: 'Retained result input', status: 'done', reused: false, ms: 2 },
+        { nodeId: 'filter', label: 'Purchase filter', status: 'done', reused: false, ms: 8 },
+      ],
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    const row = await screen.findByTestId('job-row-run-1')
+    expect(screen.queryByRole('region', { name: 'Execution breakdown' })).not.toBeInTheDocument()
+    fireEvent.click(row)
+
+    const breakdown = screen.getByRole('region', { name: 'Execution breakdown' })
+    expect(within(breakdown).getByText('Reused prefix · executed suffix')).toBeVisible()
+    expect(within(breakdown).getAllByText('reused')).toHaveLength(3)
+    expect(within(breakdown).getAllByText('executed')).toHaveLength(2)
+    const reusedSource = within(breakdown).getByRole('listitem', { name: 'Execution step Events source' })
+    expect(reusedSource).toHaveTextContent('reused')
+    expect(reusedSource).toHaveTextContent('—')
+    expect(reusedSource).not.toHaveTextContent('47 ms')
+    const freshFilter = within(breakdown).getByRole('listitem', { name: 'Execution step Purchase filter' })
+    expect(freshFilter).toHaveTextContent('executed')
+    expect(freshFilter).toHaveTextContent('8 ms')
+    expect(screen.queryByText(internalArtifact)).not.toBeInTheDocument()
+    expect(screen.queryByText(internalManifest)).not.toBeInTheDocument()
+  })
+
+  it.each(['running', 'failed'] as const)('keeps a %s suffix truthful without exposing a synthetic node id', async (status) => {
+    const syntheticNodeId = '__dp_boundary_ref_deadbeef'
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      status, error: status === 'failed' ? 'suffix failed' : null,
+      perNode: [
+        { nodeId: 'source', label: 'Events source', status: 'done', reused: true, ms: null },
+        { nodeId: syntheticNodeId, status, reused: false, ms: null },
+      ],
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    fireEvent.click(await screen.findByTestId('job-row-run-1'))
+
+    const breakdown = screen.getByRole('region', { name: 'Execution breakdown' })
+    expect(within(breakdown).getByText('Reused prefix · current run suffix')).toBeVisible()
+    const suffix = within(breakdown).getByRole('listitem', { name: 'Execution step 2' })
+    expect(suffix).toHaveTextContent('Step 2')
+    expect(suffix).toHaveTextContent(status)
+    expect(screen.queryByText(syntheticNodeId)).not.toBeInTheDocument()
+    expect(screen.queryByTitle(syntheticNodeId)).not.toBeInTheDocument()
+  })
+
   it('keeps progress visible for active work without adding a second status signal', async () => {
     mocks.workspaceJobs.mockResolvedValue({
       items: [job({ status: 'running', progress: 0.5, error: null })],
