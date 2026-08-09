@@ -165,7 +165,9 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} detailsInViewer />)
 
     const open = await screen.findByTestId('revision-open-rev-current')
-    expect(open).toHaveTextContent('Version from Jul 16, 2026, 12:00:00 PM UTC')
+    const versionTime = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'medium' })
+      .format(new Date('2026-07-16T12:00:00Z'))
+    expect(open).toHaveTextContent(`Version from ${versionTime}`)
     expect(open).toHaveTextContent('Current version')
     expect(open).toHaveTextContent('Current')
     expect(open).toHaveTextContent('Open data')
