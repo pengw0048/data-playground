@@ -1295,7 +1295,11 @@ function WorkspaceMixedExplorer() {
             }
             crumbs[0] ? enterContainer(crumbs[0], [crumbs[0]]) : setWorkspaceResource(null)
           }} className="shrink-0 text-[20px] font-bold text-foreground hover:text-primary">Workspace</button>
-          {crumbs.slice(1).map((crumb, index) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => enterContainer(crumb, crumbs.slice(0, index + 2))} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
+          {crumbs.slice(1).map((crumb, index) => <span key={crumb.id} className="flex min-w-0 items-center gap-1.5 text-[12px]"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => {
+            // Shelf crumbs (Favorites/Recent) are views, not workspace containers.
+            if (activeShelf && identity(crumb) === containerId) return
+            enterContainer(crumb, crumbs.slice(0, index + 2))
+          }} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
         </nav>
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
