@@ -6443,6 +6443,44 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.filter((toast) => toast.kind === 'success')).toEqual([])
   })
 
+  it('does not refresh graph metadata for a presentation-only Chart type change', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    source.data.status = 'latest'
+    const chart = NODE('chart', 'chart')
+    chart.data.config = {
+      chartType: 'bar', agg: 'count', xMode: 'column', yMode: 'column', x: 'event',
+    }
+    chart.data.status = 'latest'
+    const doc = {
+      id: 'chart-metadata', version: 1, name: 'Chart metadata', requirements: [],
+      nodes: [source, chart],
+      edges: [{ id: 'source-chart', source: 'source', target: 'chart', data: { wire: 'dataset' as const } }],
+    }
+    apiMocks.listCanvases.mockResolvedValue([{ id: doc.id, name: doc.name, version: 1, role: 'owner' }])
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    localStorage.setItem('dp-open-alice', doc.id)
+    window.history.replaceState(null, '', `#/canvas/${doc.id}`)
+
+    await useStore.getState().bootstrap()
+    // Let bootstrap's intentional initial metadata refresh and any already-scheduled debounce settle.
+    await new Promise((resolve) => setTimeout(resolve, 650))
+    apiMocks.schema.mockClear()
+    apiMocks.graphSizes.mockClear()
+
+    useStore.getState().updateConfig('chart', { chartType: 'line' })
+    await new Promise((resolve) => setTimeout(resolve, 650))
+    expect(apiMocks.schema).not.toHaveBeenCalled()
+    expect(apiMocks.graphSizes).not.toHaveBeenCalled()
+
+    useStore.getState().updateConfig('chart', { agg: 'sum', y: 'amount' })
+    await vi.waitFor(() => {
+      expect(apiMocks.schema).toHaveBeenCalledTimes(1)
+      expect(apiMocks.graphSizes).toHaveBeenCalledTimes(1)
+    }, { timeout: 1_500 })
+    window.history.replaceState(null, '', '#/workspace')
+  })
+
   it('keeps a draft whose server base disappeared in Workspace instead of reopening a dead Canvas', async () => {
     const stale = {
       ...emptyTestDoc('deleted-canvas'),

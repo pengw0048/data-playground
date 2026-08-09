@@ -412,7 +412,7 @@ function isPresentationOnlyConfigPatch(
   return patchKeys.length > 0 && patchKeys.every((key) => keys.has(key))
 }
 
-function executionConfig(node: CanvasDoc['nodes'][number]): Record<string, unknown> {
+export function executionConfig(node: CanvasDoc['nodes'][number]): Record<string, unknown> {
   const config = node.data.config
   if (node.type === 'chart' && 'chartType' in config) {
     // chartType switches Bars/Line/Points/Area without changing the retained (x, y) relation.
@@ -5302,15 +5302,20 @@ let _lastNodesRef: CanvasNode[] | undefined
 let _lastEdgesRef: CanvasEdge[] | undefined
 let _schemaSig: string | undefined
 function structSig(doc: CanvasDoc): string {
-  const nodes = doc.nodes.map((n) => `${n.id}:${n.type}:${n.data.disabled ? 1 : 0}${n.data.bypassed ? 1 : 0}:${JSON.stringify(n.data.config)}`).join('|')
+  const nodes = doc.nodes.map((n) => `${n.id}:${n.type}:${n.data.disabled ? 1 : 0}${n.data.bypassed ? 1 : 0}:${JSON.stringify(executionConfig(n))}`).join('|')
   const edges = doc.edges.map((e) => `${e.source}>${e.sourceHandle ?? ''}>${e.target}>${e.targetHandle ?? ''}`).sort().join(',')
   return `${nodes}#${edges}`
 }
 useStore.subscribe((s) => {
   if (s.doc.nodes === _lastNodesRef && s.doc.edges === _lastEdgesRef) return  // cheap: nothing changed
   _lastNodesRef = s.doc.nodes; _lastEdgesRef = s.doc.edges
-  if (!_bootstrapped) return
   const sig = structSig(s.doc)
+  if (!_bootstrapped) {
+    // Seed the loaded document as the comparison baseline. Otherwise the first presentation-only
+    // edit after bootstrap looks structural merely because no signature has been recorded yet.
+    _schemaSig = sig
+    return
+  }
   if (sig === _schemaSig) return  // refs changed but structure didn't (e.g. a drag) → no schema fetch
   _schemaSig = sig
   clearTimeout(_schemaTimer)

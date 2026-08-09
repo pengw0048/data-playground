@@ -1742,6 +1742,35 @@ describe('Inspector — execution-plan hierarchy', () => {
     expect(screen.getByTitle('storage used between execution regions')).toHaveTextContent('object')
   })
 
+  it('does not request a new plan for a presentation-only Chart type change', async () => {
+    const plan = vi.spyOn(api, 'plan').mockResolvedValue({ regions: [] } as any)
+    useStore.setState({
+      selectedIds: ['chart'],
+      canvasRole: 'owner',
+      runs: {},
+      doc: {
+        id: 'chart-plan', name: 'Chart plan', version: 1, requirements: [], edges: [],
+        nodes: [{
+          id: 'chart', type: 'chart', position: { x: 0, y: 0 },
+          data: {
+            title: 'chart', status: 'latest', history: [],
+            config: { chartType: 'bar', agg: 'count', xMode: 'column', x: 'event' },
+          },
+        }],
+      },
+      schemas: { chart: { out: cols } },
+    } as any)
+    render(<Inspector />)
+
+    await waitFor(() => expect(plan).toHaveBeenCalledTimes(1))
+    act(() => useStore.getState().updateConfig('chart', { chartType: 'line' }))
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 450)) })
+    expect(plan).toHaveBeenCalledTimes(1)
+
+    act(() => useStore.getState().updateConfig('chart', { agg: 'sum', y: 'amount' }))
+    await waitFor(() => expect(plan).toHaveBeenCalledTimes(2))
+  })
+
   it('does not present parallel branches as a serial backend path', async () => {
     const plan = vi.spyOn(api, 'plan').mockResolvedValue({
       regions: [
