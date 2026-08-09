@@ -14,6 +14,9 @@ test('replaces an unknown route with Workspace without borrowing a Canvas', asyn
   try {
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page).toHaveURL(new RegExp(
+      `/#/canvas/${encodeURIComponent(canvasId)}/Dead-link-recovery-source$`,
+    ))
     const canvasUrl = page.url()
 
     await page.evaluate(() => { location.hash = '#/not-a-route' })
