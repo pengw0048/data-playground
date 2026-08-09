@@ -48,7 +48,11 @@ from hub.execution_manifest import (
     execution_manifest_admission,
     execution_manifest_parameter_intent_matches,
 )
-from hub.local_run_inputs import LOCAL_FILE_INPUT_PROVIDER
+from hub.local_run_inputs import (
+    LOCAL_FILE_INPUT_PROVIDER,
+    LocalRunInputError,
+    validate_manifest,
+)
 from hub.plugins.adapters import (
     RevisionPermissionLost,
     RevisionProviderOffline,
@@ -3597,6 +3601,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 run_id=prebound_local_run_id,
                 uid=uid,
                 deps=deps,
+                required_input_manifest=dispatch_manifest,
             )
         if boundary_admission is not None and boundary_admission.admitted:
             from hub.run_boundary_suffix import BoundarySuffixError, prepare_boundary_suffix
@@ -4993,6 +4998,35 @@ def _boundary_admission(
     )
 
 
+def _boundary_input_identity(
+        manifest: object,
+) -> tuple[tuple[str, str, str, str], ...] | None:
+    """Return the exact semantic Source identities from one admitted input manifest."""
+    try:
+        admitted = validate_manifest(manifest)
+    except LocalRunInputError:
+        return None
+    return tuple(sorted(
+        (item["node_id"], item["dataset_id"], item["revision_id"], item["provider"])
+        for item in admitted
+    ))
+
+
+def _execution_manifest_input_identity(
+        execution_manifest_sha256: str,
+) -> tuple[tuple[str, str, str, str], ...] | None:
+    retained = metadb.execution_manifest(execution_manifest_sha256)
+    if retained is None:
+        return None
+    payload = json.dumps(
+        retained["document"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    try:
+        admission = execution_manifest_admission(execution_manifest_sha256, payload)
+    except ExecutionManifestError:
+        return None
+    return _boundary_input_identity(admission.get("input_manifest"))
+
+
 def _select_reusable_execution_boundary(
         graph: Graph,
         canvas_id: str,
@@ -5001,6 +5035,7 @@ def _select_reusable_execution_boundary(
         deps,
         *,
         requested_bindings: list[ParameterBinding] | None = None,
+        required_input_manifest: list[dict[str, str]] | None = None,
 ) -> tuple[BoundaryAdmission, str | None]:
     """Select at most one nearest exact retained upstream output as a reusable local boundary.
 
@@ -5017,6 +5052,13 @@ def _select_reusable_execution_boundary(
         return _boundary_admission(
             admitted=False, reason="not_linear", target_node_id=target_node_id,
             message="reusable boundaries require a linear target cone")
+    required_input_identity = None
+    if required_input_manifest is not None:
+        required_input_identity = _boundary_input_identity(required_input_manifest)
+        if required_input_identity is None:
+            return _boundary_admission(
+                admitted=False, reason="stale", target_node_id=target_node_id,
+                message="this run's admitted input manifest is invalid")
     last_reason: BoundaryAdmissionReason = "no_candidate"
     last_message = "no exact retained upstream result is available"
     for node_id, connected_port_id in _linear_upstream_outputs(cone, target_node_id):
@@ -5048,6 +5090,14 @@ def _select_reusable_execution_boundary(
             else:
                 last_reason = "stale"
                 last_message = str(exc.detail)
+            continue
+        if (
+            required_input_identity is not None
+            and _execution_manifest_input_identity(
+                identity.execution_manifest_sha256) != required_input_identity
+        ):
+            last_reason = "stale"
+            last_message = "retained boundary inputs do not match this run's admitted inputs"
             continue
         readability = _retained_result_readability(identity, deps)
         if readability == "missing":
@@ -5091,6 +5141,7 @@ def _revalidate_reusable_execution_boundary(
         persisted: dict,
         *,
         requested_bindings: list[ParameterBinding] | None = None,
+        required_input_manifest: list[dict[str, str]] | None = None,
 ) -> tuple[bool, BoundaryAdmissionReason, str | None]:
     """Re-prove one persisted boundary before dispatch; fail closed to an ordinary full run."""
     try:
@@ -5107,6 +5158,15 @@ def _revalidate_reusable_execution_boundary(
         if code == APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE:
             return False, "no_candidate", str(exc.detail)
         return False, "stale", str(exc.detail)
+    if required_input_manifest is not None:
+        required_input_identity = _boundary_input_identity(required_input_manifest)
+        if (
+            required_input_identity is None
+            or _execution_manifest_input_identity(
+                identity.execution_manifest_sha256) != required_input_identity
+        ):
+            return False, "stale", (
+                "retained boundary inputs do not match this run's admitted inputs")
     if (
         identity.run_id != persisted["boundary_run_id"]
         or identity.execution_manifest_sha256 != persisted["boundary_execution_manifest_sha256"]
@@ -5131,6 +5191,7 @@ def _admit_local_run_boundary(
         run_id: str,
         uid: str,
         deps,
+        required_input_manifest: list[dict[str, str]],
         requested_bindings: list[ParameterBinding] | None = None,
 ) -> tuple[BoundaryAdmission, str | None]:
     """Select and persist one boundary; keep its storage address in this call stack only."""
@@ -5140,7 +5201,8 @@ def _admit_local_run_boundary(
             message="reusable boundaries require a saved canvas target"), None
     selection, artifact_uri = _select_reusable_execution_boundary(
         graph, canvas_id, target_node_id, uid, deps,
-        requested_bindings=requested_bindings)
+        requested_bindings=requested_bindings,
+        required_input_manifest=required_input_manifest)
     if not selection.admitted or selection.boundary is None or artifact_uri is None:
         metadb.clear_run_boundary_admission(run_id)
         return selection, None
@@ -5169,7 +5231,8 @@ def _admit_local_run_boundary(
             message="reusable boundary disappeared after admission"), None
     ok, reason, message = _revalidate_reusable_execution_boundary(
         graph, canvas_id, uid, deps, persisted,
-        requested_bindings=requested_bindings)
+        requested_bindings=requested_bindings,
+        required_input_manifest=required_input_manifest)
     if not ok:
         metadb.clear_run_boundary_admission(run_id)
         return BoundaryAdmission(

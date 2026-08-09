@@ -17,7 +17,8 @@ from sqlalchemy import select
 from hub import metadb
 from hub.deps import get_deps
 from hub.main import app
-from hub.models import Graph
+from hub.models import Graph, ParameterBinding
+from hub.routers import runs as runs_mod
 from hub.run_boundary_suffix import (
     BoundarySuffixError,
     build_suffix_graph,
@@ -231,6 +232,143 @@ def test_downstream_run_reuses_nearest_boundary_without_reexecuting_prefix(
     assert any(node_id.startswith("__dp_boundary_ref_") for node_id in builds)
     assert "filter" in builds
     assert "uri" not in (status.get("reusedBoundary") or {})
+
+
+@pytest.mark.parametrize(
+    "source_mode", ["registered_latest", "parameterized_latest"])
+def test_source_head_advance_rejects_boundary_and_runs_prefix(
+        tmp_path, monkeypatch, source_mode):
+    lance = pytest.importorskip("lance")
+    canvas_id = f"resume-{source_mode}-{uuid.uuid4().hex}"
+    source_uri = str(tmp_path / f"{canvas_id}.lance")
+    lance.write_dataset(pa.table({
+        "event": ["view", "purchase", "view", "purchase"],
+        "amount": [1, 2, 3, 4],
+    }), source_uri)
+    registered = client.post("/api/catalog/register", json={
+        "uri": source_uri, "name": f"boundary-head-{uuid.uuid4().hex}",
+    })
+    assert registered.status_code == 200, registered.text
+    registration_id = registered.json()["registrationId"]
+    graph = _linear_graph(canvas_id, source_uri, registration_id)
+    graph["nodes"][0]["data"]["config"] = {
+        "uri": source_uri,
+        "registrationId": registration_id,
+    }
+    graph["nodes"][1]["data"]["config"]["n"] = 10
+    bindings = []
+    if source_mode == "parameterized_latest":
+        graph["parameters"] = [{
+            "name": "input_dataset",
+            "type": "dataset",
+            "default": {"kind": "latest", "datasetId": registration_id},
+        }]
+        graph["nodes"][0]["data"]["config"]["datasetRef"] = {
+            "parameterRef": "input_dataset",
+        }
+        bindings = [{
+            "name": "input_dataset",
+            "value": {"kind": "latest", "datasetId": registration_id},
+        }]
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
+            name="Boundary source head"))
+
+    builds: list[str] = []
+    from hub.executors.engine import BuildEngine
+    real_build = BuildEngine.build
+
+    def counting_build(self, node_id, *args, **kwargs):
+        builds.append(node_id)
+        return real_build(self, node_id, *args, **kwargs)
+
+    def run_request(target_node_id):
+        request = {
+            "graph": graph,
+            "targetNodeId": target_node_id,
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        }
+        if bindings:
+            request["parameterBindings"] = bindings
+        return request
+
+    monkeypatch.setattr(BuildEngine, "build", counting_build)
+    try:
+        intermediate = client.post("/api/run", json=run_request("sample"))
+        assert intermediate.status_code == 200, intermediate.text
+        intermediate_status = _wait(intermediate.json()["runId"])
+        assert intermediate_status["status"] == "done", intermediate_status
+        _wait_for_history_projection(intermediate_status["runId"])
+        initial_manifest = metadb.local_run_input_manifest(intermediate_status["runId"])
+        assert initial_manifest is not None
+        assert initial_manifest[0]["revision_id"] == "1"
+
+        if source_mode == "parameterized_latest":
+            # Parameterized boundary selection proves the unresolved graph + binding. Keep its
+            # retained-result/reopen semantics separate from the fresh admitted-input guard below.
+            reusable = client.post("/api/run/boundary-admission", json={
+                "graph": graph,
+                "targetNodeId": "filter",
+                "parameterBindings": bindings,
+            })
+            assert reusable.status_code == 200, reusable.text
+            assert reusable.json()["admitted"] is True
+            assert reusable.json()["boundary"]["boundaryRunId"] == (
+                intermediate_status["runId"])
+        else:
+            unchanged = client.post("/api/run", json=run_request("filter"))
+            assert unchanged.status_code == 200, unchanged.text
+            unchanged_status = _wait(unchanged.json()["runId"])
+            assert unchanged_status["status"] == "done", unchanged_status
+            assert unchanged_status["reusedBoundary"]["boundaryRunId"] == (
+                intermediate_status["runId"])
+
+        lance.write_dataset(pa.table({
+            "event": ["purchase"],
+            "amount": [5],
+        }), source_uri, mode="append")
+        assert lance.dataset(source_uri).version == 2
+        builds.clear()
+
+        if source_mode == "parameterized_latest":
+            requested_bindings = [ParameterBinding.model_validate(item) for item in bindings]
+            resolved = runs_mod._resolve_parameters(
+                Graph.model_validate(graph), requested_bindings, "filter", get_deps())
+            fresh_manifest = runs_mod._resolve_local_run_manifest(
+                resolved, "filter", get_deps())
+            assert fresh_manifest[0]["revision_id"] == "2"
+            selection, artifact_uri = runs_mod._select_reusable_execution_boundary(
+                Graph.model_validate(graph), canvas_id, "filter", metadb.DEFAULT_USER_ID,
+                get_deps(), requested_bindings=requested_bindings,
+                required_input_manifest=fresh_manifest)
+            assert selection.admitted is False
+            assert selection.reason == "stale"
+            assert selection.message == (
+                "retained boundary inputs do not match this run's admitted inputs")
+            assert artifact_uri is None
+
+        advanced = client.post("/api/run", json=run_request("filter"))
+        assert advanced.status_code == 200, advanced.text
+        advanced_status = _wait(advanced.json()["runId"])
+        assert advanced_status["status"] == "done", advanced_status
+        assert advanced_status.get("reusedBoundary") is None
+        by_id = {item["nodeId"]: item for item in advanced_status["perNode"]}
+        assert by_id["source"]["reused"] is False
+        assert by_id["sample"]["reused"] is False
+        assert by_id["filter"]["reused"] is False
+        assert "sample" in builds
+        advanced_manifest = metadb.local_run_input_manifest(advanced_status["runId"])
+        assert advanced_manifest is not None
+        assert advanced_manifest[0]["revision_id"] == "2"
+        assert advanced_status["outputs"][0]["sampleProvenance"]["datasetRevision"] == "2"
+        advanced_rows = pq.read_table(advanced_status["outputs"][0]["uri"]).to_pydict()
+        assert sorted(advanced_rows["amount"]) == [2, 3, 4, 5]
+    finally:
+        metadb.delete_canvas_cascade(canvas_id)
+        get_deps().catalog.unregister(source_uri)
+        shutil.rmtree(source_uri, ignore_errors=True)
 
 
 def test_explicit_subprocess_backend_is_not_silently_switched(
