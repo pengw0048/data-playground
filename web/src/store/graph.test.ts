@@ -234,7 +234,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.runStatus.mockReset()
     apiMocks.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
       runId, status: 'cancelled', jobType: 'run',
-      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
     }))
     apiMocks.activeRuns.mockReset().mockResolvedValue([])
     apiMocks.profileJobs.mockReset().mockResolvedValue([])
@@ -250,6 +250,7 @@ describe('graph store — core authority ops', () => {
       files: [{ id: 'c', name: 'test', version: 1, role: 'owner' }],
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
       serverVersion: 1, saved: true, viewportFitRequest: null, catalog: [],
+      runs: {}, graphRun: null, executionRecovery: null, detachedRuns: {}, supersededResultRunIds: [],
     })
   })
 
@@ -1702,6 +1703,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).toHaveBeenCalledWith(
       expect.objectContaining({ id: doc.id }), 'section', false, expect.any(String),
     )
+    await vi.waitFor(() => expect(useStore.getState().runs.section?.phase).toBe('done'))
 
     apiMocks.estimate.mockClear()
     useStore.getState().rerunAll()
@@ -1818,7 +1820,10 @@ describe('graph store — core authority ops', () => {
       id: 'c', version: 1, name: 'filter preflight', requirements: [], nodes: [source, filter],
       edges: [{ id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' as const } }],
     }
-    useStore.setState({ doc, selectedId: null, selectedIds: [], nodeRevealRequest: null, toasts: [] })
+    useStore.setState({
+      doc, runs: {}, graphRun: null,
+      selectedId: null, selectedIds: [], nodeRevealRequest: null, toasts: [],
+    })
 
     useStore.getState().rerunAll()
 
@@ -1851,7 +1856,17 @@ describe('graph store — core authority ops', () => {
 
   it('rerun all dispatches one whole-graph run instead of one run per sink', async () => {
     const doc = fanOutDoc(8)
-    useStore.setState({ doc, runs: {}, graphRun: null, toasts: [] })
+    const priorStatus = {
+      runId: 'prior-targeted-run', status: 'done', jobType: 'run', targetNodeId: 'sink0',
+      rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
+      outputs: [{
+        nodeId: 'sink0', portId: 'out', wire: 'dataset', publicationKind: 'result',
+        outcome: 'committed', uri: '/outputs/prior-targeted.parquet', rows: 5,
+      }],
+    }
+    useStore.setState({
+      doc, runs: { sink0: { phase: 'done', status: priorStatus } }, graphRun: null, toasts: [],
+    } as any)
     const perNode = doc.nodes.map((node) => ({ nodeId: node.id, status: 'done', ms: 3 }))
     apiMocks.run.mockResolvedValue({
       runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
@@ -1866,6 +1881,10 @@ describe('graph store — core authority ops', () => {
 
     useStore.getState().rerunAll()
 
+    await vi.waitFor(() => expect(useStore.getState().supersededResultRunIds).toContain(
+      'prior-targeted-run',
+    ))
+    expect(useStore.getState().runs.sink0?.status?.runId).toBe('prior-targeted-run')
     await vi.waitFor(() => expect(useStore.getState().graphRun).toBeNull())
     expect(apiMocks.run).toHaveBeenCalledTimes(1)
     expect(apiMocks.run).toHaveBeenCalledWith(
@@ -1878,14 +1897,505 @@ describe('graph store — core authority ops', () => {
       useStore.getState().doc.nodes.every((node) => node.data.status === 'idle'),
     ).toBe(true))
     expect(useStore.getState().doc.nodes.filter((node) => node.data.lastRun)).toHaveLength(9)
+    expect(useStore.getState().runs.sink0?.status?.runId).toBe('prior-targeted-run')
     expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('does not start Rerun all while a targeted run still owns execution', () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc, graphRun: null, toasts: [],
+      runs: { sink0: { phase: 'running', status: {
+        runId: 'active-targeted-run', status: 'running', jobType: 'run', targetNodeId: 'sink0',
+        rowsProcessed: 1, totalRows: 5, ms: 10, placement: 'local', perNode: [], outputs: [],
+      } } },
+    } as any)
+
+    useStore.getState().rerunAll()
+
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().graphRun).toBeNull()
+    expect(useStore.getState().runs.sink0?.status?.runId).toBe('active-targeted-run')
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'info', msg: 'Wait for the active node run to finish before rerunning the Canvas.',
+    }])
+  })
+
+  it('does not start a targeted run while Rerun all owns execution', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc, runs: {}, toasts: [], graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'submitting',
+      },
+    })
+
+    await useStore.getState().requestRun('sink0')
+    await useStore.getState().run('sink0')
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().toasts).toHaveLength(2)
+    expect(useStore.getState().toasts.every((toast) => (
+      toast.kind === 'info'
+      && toast.msg === 'Wait for Rerun all to finish before starting a node run.'
+    ))).toBe(true)
+  })
+
+  it('keeps every durable dispatch closed until active-run recovery settles', async () => {
+    const doc = fanOutDoc(1)
+    let finishActiveRuns!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => {
+      finishActiveRuns = resolve
+    }))
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    expect(useStore.getState().executionRecovery).toMatchObject({
+      canvasId: doc.id, principalId: 'alice', phase: 'checking',
+    })
+    await useStore.getState().requestRun('sink0')
+    await useStore.getState().run('sink0')
+    useStore.getState().rerunAll()
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+
+    finishActiveRuns([])
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    apiMocks.run.mockImplementationOnce(() => new Promise(() => {}))
+    useStore.getState().rerunAll()
+    expect(apiMocks.run).toHaveBeenCalledTimes(1)
+  })
+
+  it('installs a recovered targeted owner before releasing the dispatch fence', async () => {
+    const doc = fanOutDoc(1)
+    const active = {
+      runId: 'recovered-targeted-run', status: 'running', jobType: 'run', targetNodeId: 'sink0',
+      rowsProcessed: 1, totalRows: 5, ms: 5, placement: 'local',
+      perNode: [{ nodeId: 'source', status: 'done' }, { nodeId: 'sink0', status: 'running' }],
+      outputs: [],
+    }
+    let finishActiveRuns!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => {
+      finishActiveRuns = resolve
+    }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(doc, 'owner')
+    finishActiveRuns([active])
+
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().runs.sink0).toMatchObject({
+      phase: 'running', status: { runId: active.runId, status: 'running' },
+    })
+    useStore.getState().rerunAll()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    await useStore.getState().cancelRun('sink0')
+  })
+
+  it('keeps an off-canvas targeted run as the execution owner until it reaches terminal state', async () => {
+    const doc = fanOutDoc(1)
+    const active = {
+      runId: 'deleted-target-run', status: 'running', jobType: 'run', targetNodeId: 'deleted-node',
+      rowsProcessed: 1, totalRows: 5, ms: 5, placement: 'local',
+      perNode: [{ nodeId: 'source', status: 'done' }, { nodeId: 'deleted-node', status: 'running' }],
+      outputs: [],
+    }
+    let finishStatus!: (status: any) => void
+    apiMocks.activeRuns.mockResolvedValueOnce([active])
+    apiMocks.runStatus
+      .mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
+      .mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().detachedRuns).toMatchObject({
+      [active.runId]: {
+        canvasId: doc.id, principalId: 'alice',
+        status: { runId: active.runId, targetNodeId: 'deleted-node', status: 'running' },
+      },
+    })
+    expect(useStore.getState().runs['deleted-node']).toBeUndefined()
+    await useStore.getState().requestRun('sink0')
+    await useStore.getState().run('sink0')
+    useStore.getState().rerunAll()
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledWith(active.runId))
+    finishStatus({ ...active, status: 'done', rowsProcessed: 5, ms: 20,
+      perNode: [{ nodeId: 'source', status: 'done' }, { nodeId: 'deleted-node', status: 'done' }] })
+    await vi.waitFor(() => expect(useStore.getState().detachedRuns).toEqual({}))
+
+    apiMocks.run.mockResolvedValueOnce({
+      runId: 'next-graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 0, totalRows: null, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    useStore.getState().rerunAll()
+    await vi.waitFor(() => expect(apiMocks.run).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(useStore.getState().graphRun?.runId).toBe('next-graph-run'))
+    await useStore.getState().cancelGraphRun()
+  })
+
+  it('lets the user stop a recovered off-canvas run without inventing deleted-node state', async () => {
+    const doc = fanOutDoc(1)
+    const active = {
+      runId: 'deleted-target-run', status: 'running', jobType: 'run', targetNodeId: 'deleted-node',
+      rowsProcessed: 1, totalRows: 5, ms: 5, placement: 'local', perNode: [], outputs: [],
+    }
+    apiMocks.activeRuns.mockResolvedValueOnce([active])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+    apiMocks.cancelRun.mockResolvedValueOnce({
+      ...active, status: 'cancelled', ms: 10,
+      perNode: [{ nodeId: 'source', status: 'done' }, { nodeId: 'deleted-node', status: 'cancelled' }],
+    })
+
+    useStore.getState().loadDoc(doc, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().detachedRuns[active.runId]).toBeDefined())
+
+    await useStore.getState().cancelDetachedRuns()
+
+    expect(apiMocks.cancelRun).toHaveBeenCalledWith(active.runId)
+    expect(useStore.getState().detachedRuns).toEqual({})
+    expect(useStore.getState().runs['deleted-node']).toBeUndefined()
+    expect(apiMocks.currentResults).toHaveBeenCalledWith(expect.objectContaining({ id: doc.id }))
+  })
+
+  it('keeps failed active-run recovery visible and fail-closed until Retry succeeds', async () => {
+    const doc = fanOutDoc(1)
+    apiMocks.activeRuns
+      .mockRejectedValueOnce(new Error('active-run inventory unavailable'))
+      .mockResolvedValueOnce([])
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery?.phase).toBe('unknown'))
+    useStore.getState().rerunAll()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    const retryToast = useStore.getState().toasts.find((toast) => (
+      toast.dedupeKey === 'canvas-execution-recovery-unknown'
+    ))
+    expect(retryToast).toMatchObject({
+      kind: 'error', sticky: true, actions: [{ label: 'Retry' }],
+    })
+
+    await retryToast!.actions![0].onClick()
+
+    await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().toasts.some((toast) => (
+      toast.dedupeKey === 'canvas-execution-recovery-unknown'
+    ))).toBe(false)
+  })
+
+  it('does not let an older active-run lookup release a newer recovery generation', async () => {
+    const doc = fanOutDoc(1)
+    let finishFirst!: (statuses: any[]) => void
+    let finishSecond!: (statuses: any[]) => void
+    apiMocks.activeRuns
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = resolve }))
+
+    useStore.getState().loadDoc(doc, 'owner')
+    const firstGeneration = useStore.getState().executionRecovery?.generation
+    useStore.getState().loadDoc({ ...doc, version: doc.version + 1 }, 'owner')
+    const secondGeneration = useStore.getState().executionRecovery?.generation
+    expect(secondGeneration).toBeGreaterThan(firstGeneration!)
+
+    finishFirst([])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().executionRecovery?.generation).toBe(secondGeneration)
+
+    finishSecond([])
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+  })
+
+  it('preserves a submitting graph owner across same-Canvas load and adopts its late response', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({ doc })
+    let finishSubmission!: (status: any) => void
+    apiMocks.run.mockImplementationOnce(() => new Promise((resolve) => {
+      finishSubmission = resolve
+    }))
+
+    useStore.getState().rerunAll()
+    const submissionId = useStore.getState().graphRun?.submissionId
+    expect(useStore.getState().graphRun).toMatchObject({
+      canvasId: doc.id, principalId: 'alice', phase: 'submitting', submissionId,
+    })
+
+    apiMocks.activeRuns.mockResolvedValueOnce([])
+    useStore.getState().loadDoc({ ...doc, version: doc.version + 1 }, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().graphRun).toMatchObject({
+      principalId: 'alice', phase: 'submitting', submissionId,
+    })
+    useStore.getState().rerunAll()
+    expect(apiMocks.run).toHaveBeenCalledTimes(1)
+
+    finishSubmission({
+      runId: 'late-accepted-graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 0, totalRows: null, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toMatchObject({
+      phase: 'active', runId: 'late-accepted-graph-run', submissionId,
+    }))
+    await useStore.getState().cancelGraphRun()
+  })
+
+  it('preserves a same-principal owner without starting recovery for a local-only document load', () => {
+    const doc = fanOutDoc(1)
+    const graphRun = {
+      canvasId: doc.id, principalId: 'alice', phase: 'active' as const, runId: 'known-graph-run',
+      status: {
+        runId: 'known-graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+        rowsProcessed: 1, ms: 5, placement: 'local' as const, perNode: [], outputs: [],
+      },
+    }
+    const detachedRun = {
+      canvasId: doc.id, principalId: 'alice', status: {
+        runId: 'off-canvas-run', status: 'running', jobType: 'run', targetNodeId: 'deleted-node',
+        rowsProcessed: 1, ms: 5, placement: 'local' as const, perNode: [], outputs: [],
+      },
+    }
+    useStore.setState({
+      doc, graphRun, detachedRuns: { [detachedRun.status.runId]: detachedRun },
+      supersededResultRunIds: ['prior-targeted-run'],
+    })
+
+    useStore.getState().loadDoc({ ...doc, version: doc.version + 1 }, 'owner', {
+      recoverServerState: false,
+    })
+
+    expect(useStore.getState().graphRun).toBe(graphRun)
+    expect(useStore.getState().executionRecovery).toBeNull()
+    expect(useStore.getState().detachedRuns).toEqual({ [detachedRun.status.runId]: detachedRun })
+    expect(useStore.getState().supersededResultRunIds).toEqual(['prior-targeted-run'])
+    expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+  })
+
+  it('requires a lookup started after an ambiguous submission before releasing its owner', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({ doc })
+    let rejectSubmission!: (error: Error) => void
+    let finishEarlyLookup!: (statuses: any[]) => void
+    apiMocks.run.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectSubmission = reject
+    }))
+    useStore.getState().rerunAll()
+    const submissionId = useStore.getState().graphRun?.submissionId
+
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => {
+      finishEarlyLookup = resolve
+    }))
+    useStore.getState().loadDoc({ ...doc, version: doc.version + 1 }, 'owner')
+    rejectSubmission(new TypeError('response lost'))
+    await vi.waitFor(() => expect(useStore.getState().graphRun?.phase).toBe('unknown'))
+
+    finishEarlyLookup([])
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().graphRun).toMatchObject({ phase: 'unknown', submissionId })
+
+    apiMocks.activeRuns.mockResolvedValueOnce([])
+    useStore.getState().retryExecutionRecovery()
+    await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toBeNull())
+    expect(useStore.getState().executionRecovery).toBeNull()
+  })
+
+  it('adopts an active targetless run when an ambiguous submission is retried', async () => {
+    const doc = fanOutDoc(1)
+    const active = {
+      runId: 'adopted-graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 1, totalRows: null, ms: 5, placement: 'local', progress: 0.2,
+      perNode: [{ nodeId: 'source', status: 'done' }, { nodeId: 'sink0', status: 'running' }],
+      outputs: [],
+    }
+    useStore.setState({
+      doc,
+      graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'unknown', submissionId: 'ambiguous-run',
+      },
+    })
+    apiMocks.activeRuns.mockResolvedValueOnce([active])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+
+    useStore.getState().retryExecutionRecovery()
+
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toMatchObject({
+      principalId: 'alice', phase: 'active', submissionId: 'ambiguous-run',
+      runId: active.runId,
+    }))
+    expect(useStore.getState().executionRecovery).toBeNull()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'sink0')?.data.status).toBe('running')
+    await useStore.getState().cancelGraphRun()
+  })
+
+  it('invalidates older targeted snapshots when an unknown graph submission may have completed', async () => {
+    const doc = fanOutDoc(1)
+    for (const node of doc.nodes) {
+      node.data.status = 'latest'
+      ;(node.data as any).lastRun = { rows: 5, ms: 10, placement: 'local' }
+    }
+    const priorStatus = {
+      runId: 'prior-targeted-run', status: 'done', jobType: 'run', targetNodeId: 'sink0',
+      rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
+      outputs: [{
+        nodeId: 'sink0', portId: 'out', wire: 'dataset', publicationKind: 'result',
+        outcome: 'committed', uri: '/outputs/prior-targeted.parquet', rows: 5,
+      }],
+    }
+    useStore.setState({
+      doc,
+      runs: { sink0: { phase: 'done', status: priorStatus } },
+      graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'unknown', submissionId: 'unknown-graph-run',
+      },
+      supersededResultRunIds: [],
+    } as any)
+    apiMocks.activeRuns.mockResolvedValueOnce([])
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['source', 'sink0'], failedNodeIds: [], staleNodeIds: [],
+      unknownNodeIds: [], results: [],
+    })
+
+    useStore.getState().retryExecutionRecovery()
+
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toBeNull())
+    expect(useStore.getState().supersededResultRunIds).toContain(priorStatus.runId)
+    await vi.waitFor(() => expect(apiMocks.currentResults).toHaveBeenCalledWith(
+      expect.objectContaining({ id: doc.id }),
+    ))
+    await vi.waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'sink0')?.data.status,
+    ).toBe('latest'))
+  })
+
+  it('clears principal-bound execution owners and recovery fences on identity change', () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc,
+      graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'unknown', submissionId: 'alice-run',
+      },
+      executionRecovery: {
+        canvasId: doc.id, principalId: 'alice', generation: 42, phase: 'unknown',
+      },
+      detachedRuns: {
+        'alice-off-canvas-run': {
+          canvasId: doc.id, principalId: 'alice', status: {
+            runId: 'alice-off-canvas-run', status: 'running', jobType: 'run',
+            targetNodeId: 'deleted-node', rowsProcessed: 1, ms: 5,
+            placement: 'local', perNode: [], outputs: [],
+          },
+        },
+      },
+      supersededResultRunIds: ['alice-targeted-run'],
+    })
+
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+
+    expect(useStore.getState()).toMatchObject({
+      canvasRole: null, runs: {}, graphRun: null, executionRecovery: null,
+      detachedRuns: {},
+      supersededResultRunIds: [],
+    })
+  })
+
+  it('keeps the prior targeted snapshot when whole-graph submission is rejected', async () => {
+    const doc = fanOutDoc(1)
+    const priorStatus = {
+      runId: 'prior-targeted-run', status: 'done', jobType: 'run', targetNodeId: 'sink0',
+      rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [], outputs: [],
+    }
+    useStore.setState({
+      doc, graphRun: null, supersededResultRunIds: [], toasts: [],
+      runs: { sink0: { phase: 'done', status: priorStatus } },
+    } as any)
+    apiMocks.run.mockRejectedValueOnce(new KernelError(400, 'submission rejected'))
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(useStore.getState().graphRun).toBeNull())
+    expect(useStore.getState().runs.sink0?.status?.runId).toBe('prior-targeted-run')
+    expect(useStore.getState().supersededResultRunIds).toEqual([])
+  })
+
+  it('keeps submission ownership when the whole-graph response is lost', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc, runs: {}, graphRun: null, supersededResultRunIds: [], toasts: [],
+    })
+    apiMocks.run.mockRejectedValueOnce(new TypeError('network unavailable'))
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error',
+      msg: 'Could not confirm whether Rerun all started. Running stays disabled until you retry the run check.',
+    }]))
+    expect(useStore.getState().graphRun).toMatchObject({
+      canvasId: doc.id, principalId: 'alice', phase: 'unknown', submissionId: expect.any(String),
+    })
+    expect(useStore.getState().supersededResultRunIds).toEqual([])
+  })
+
+  it('keeps submission ownership after an ambiguous server failure', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc, runs: {}, graphRun: null, supersededResultRunIds: [], toasts: [],
+    })
+    apiMocks.run.mockRejectedValueOnce(new KernelError(503, 'gateway lost the response'))
+
+    useStore.getState().rerunAll()
+
+    await vi.waitFor(() => expect(useStore.getState().toasts).toHaveLength(1))
+    expect(useStore.getState().graphRun).toMatchObject({
+      canvasId: doc.id, submissionId: expect.any(String),
+    })
+  })
+
+  it('does not let an older submission failure clear a newer Canvas graph-run owner', async () => {
+    let rejectFirst!: (error: Error) => void
+    let resolveSecond!: (status: any) => void
+    apiMocks.run
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve }))
+    const first = { ...fanOutDoc(1), id: 'first-canvas' }
+    useStore.setState({
+      doc: first, runs: {}, graphRun: null, supersededResultRunIds: [], toasts: [],
+    })
+    useStore.getState().rerunAll()
+    const firstSubmission = useStore.getState().graphRun?.submissionId
+
+    const second = { ...fanOutDoc(1), id: 'second-canvas' }
+    useStore.setState({ doc: second, runs: {}, graphRun: null, supersededResultRunIds: [] })
+    useStore.getState().rerunAll()
+    const secondSubmission = useStore.getState().graphRun?.submissionId
+    expect(secondSubmission).toBeTruthy()
+    expect(secondSubmission).not.toBe(firstSubmission)
+
+    rejectFirst(new Error('older submission failed'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().graphRun?.submissionId).toBe(secondSubmission)
+
+    resolveSecond({
+      runId: 'second-graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 0, totalRows: null, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().graphRun?.runId).toBe('second-graph-run'))
+    await useStore.getState().cancelGraphRun()
+    expect(useStore.getState().graphRun).toBeNull()
   })
 
   it('lets the user stop the single whole-graph run', async () => {
     const doc = fanOutDoc(2)
     useStore.setState({
       doc, graphRun: {
-        canvasId: doc.id, runId: 'graph-run', status: {
+        canvasId: doc.id, principalId: 'alice', phase: 'active', runId: 'graph-run', status: {
           runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
           rowsProcessed: 0, ms: 4, placement: 'local', progress: 0.5,
           perNode: [
@@ -1902,6 +2412,72 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.cancelRun).toHaveBeenCalledWith('graph-run')
     expect(useStore.getState().graphRun).toBeNull()
     expect(useStore.getState().doc.nodes.some((node) => node.data.status === 'running')).toBe(false)
+  })
+
+  it('keeps whole-graph ownership when cancellation cannot be confirmed', async () => {
+    const doc = fanOutDoc(1)
+    useStore.setState({
+      doc, toasts: [], graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'active',
+        submissionId: 'graph-submission', runId: 'graph-run', status: {
+          runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+          rowsProcessed: 0, ms: 4, placement: 'local', perNode: [], outputs: [],
+        },
+      },
+    })
+    apiMocks.cancelRun.mockRejectedValueOnce(new Error('cancel response lost'))
+
+    await useStore.getState().cancelGraphRun()
+
+    expect(useStore.getState().graphRun?.runId).toBe('graph-run')
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'Could not confirm that Rerun all stopped. It remains active.',
+    }])
+  })
+
+  it('reconciles current results after confirmed whole-graph cancellation', async () => {
+    const doc = fanOutDoc(1)
+    doc.nodes[0].data.status = 'checking'
+    useStore.setState({
+      doc, graphRun: {
+        canvasId: doc.id, principalId: 'alice', phase: 'active', runId: 'graph-run', status: {
+          runId: 'graph-run', status: 'running', jobType: 'run', targetNodeId: null,
+          rowsProcessed: 1, ms: 4, placement: 'local',
+          perNode: [{ nodeId: 'source', status: 'done' }], outputs: [],
+        },
+      },
+    })
+    apiMocks.cancelRun.mockResolvedValueOnce({
+      runId: 'graph-run', status: 'cancelled', jobType: 'run', targetNodeId: null,
+      rowsProcessed: 1, ms: 5, placement: 'local',
+      perNode: [{ nodeId: 'source', status: 'done' }], outputs: [],
+    })
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['source'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
+
+    await useStore.getState().cancelGraphRun()
+
+    expect(apiMocks.currentResults).toHaveBeenCalledWith(expect.objectContaining({ id: doc.id }))
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('latest'))
+  })
+
+  it('records the authoritative cancelled status before releasing a targeted owner', async () => {
+    const doc = fanOutDoc(1)
+    doc.nodes[1].data.status = 'running'
+    useStore.setState({
+      doc, graphRun: null, runs: { sink0: { phase: 'running', status: {
+        runId: 'targeted-run', status: 'running', jobType: 'run', targetNodeId: 'sink0',
+        rowsProcessed: 1, totalRows: 5, ms: 4, placement: 'local', perNode: [], outputs: [],
+      } } },
+    } as any)
+
+    await useStore.getState().cancelRun('sink0')
+
+    expect(useStore.getState().runs.sink0).toMatchObject({
+      phase: 'idle', status: { runId: 'targeted-run', status: 'cancelled' },
+    })
+    expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
   })
 
   it('keeps rerun all on per-sink dispatch when a sink publishes a Write', async () => {

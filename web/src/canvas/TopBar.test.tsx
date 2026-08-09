@@ -26,8 +26,12 @@ const state = vi.hoisted(() => ({
   localDrafts: [] as Array<{ draftId: string; syncState: string }>,
   canvasRole: 'owner',
   rerunAll: vi.fn(),
+  retryExecutionRecovery: vi.fn(),
+  cancelDetachedRuns: vi.fn(),
   cancelGraphRun: vi.fn(),
   graphRun: null,
+  executionRecovery: null,
+  detachedRuns: {} as Record<string, unknown>,
   past: [] as unknown[],
   future: [] as unknown[],
   peers: {} as Record<string, { name: string; color: string }>,
@@ -81,6 +85,9 @@ beforeEach(() => {
     clear: () => { themeValues.clear() },
   })
   state.canvasRole = 'owner'
+  state.graphRun = null
+  state.executionRecovery = null
+  state.detachedRuns = {}
   state.currentDraftId = null
   state.localDrafts = []
   state.kernelInfo.executionTargets = []
@@ -299,6 +306,79 @@ describe('Canvas execution target', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Rerun all' }))
 
     expect(state.rerunAll).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a disabled run check while active-run recovery is pending', () => {
+    ;(state as any).executionRecovery = {
+      canvasId: state.doc.id, principalId: 'alice', generation: 1, phase: 'checking',
+    }
+
+    render(<TopBar />)
+
+    expect(screen.getByRole('button', { name: /Checking runs…/ })).toBeDisabled()
+  })
+
+  it('turns an unknown run check into an explicit Retry action', async () => {
+    ;(state as any).executionRecovery = {
+      canvasId: state.doc.id, principalId: 'alice', generation: 1, phase: 'unknown',
+    }
+
+    render(<TopBar />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry run check' }))
+
+    expect(state.retryExecutionRecovery).toHaveBeenCalledTimes(1)
+    expect(state.rerunAll).not.toHaveBeenCalled()
+  })
+
+  it('shows Retry instead of Starting for an ambiguous graph submission', async () => {
+    ;(state as any).graphRun = {
+      canvasId: state.doc.id, principalId: 'alice', phase: 'unknown', submissionId: 'submission-1',
+    }
+
+    render(<TopBar />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry run check' }))
+
+    expect(state.retryExecutionRecovery).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: 'Starting…' })).not.toBeInTheDocument()
+  })
+
+  it('keeps an exact active run stoppable while a recovery lookup is unknown', async () => {
+    ;(state as any).graphRun = {
+      canvasId: state.doc.id, principalId: 'alice', phase: 'active', runId: 'graph-run',
+      status: { perNode: [] },
+    }
+    ;(state as any).executionRecovery = {
+      canvasId: state.doc.id, principalId: 'alice', generation: 1, phase: 'unknown',
+    }
+
+    render(<TopBar />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Stop 0/0' }))
+
+    expect(state.cancelGraphRun).toHaveBeenCalledTimes(1)
+    expect(state.retryExecutionRecovery).not.toHaveBeenCalled()
+  })
+
+  it('offers one truthful stop action for an active off-canvas run', async () => {
+    state.detachedRuns = { 'detached-run': {} }
+
+    render(<TopBar />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Stop active run' }))
+
+    expect(state.cancelDetachedRuns).toHaveBeenCalledTimes(1)
+    expect(state.rerunAll).not.toHaveBeenCalled()
+  })
+
+  it('keeps a proven off-canvas run stoppable before retrying an ambiguous graph submission', async () => {
+    state.detachedRuns = { 'detached-run': {} }
+    ;(state as any).graphRun = {
+      canvasId: state.doc.id, principalId: 'alice', phase: 'unknown', submissionId: 'submission-1',
+    }
+
+    render(<TopBar />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Stop active run' }))
+
+    expect(state.cancelDetachedRuns).toHaveBeenCalledTimes(1)
+    expect(state.retryExecutionRecovery).not.toHaveBeenCalled()
   })
 
   it('selects a configured runner from the Canvas top bar', async () => {

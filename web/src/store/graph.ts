@@ -711,8 +711,26 @@ interface RunState {
 
 export interface GraphRunState {
   canvasId: string
+  // In-memory execution authority is principal-bound. Same-Canvas document refreshes may retain it,
+  // but an identity transition must never let the next principal observe or control the old run.
+  principalId: string
+  phase: 'submitting' | 'unknown' | 'active'
+  submissionId?: string
   runId?: string
   status?: RunStatus
+}
+
+export interface ExecutionRecoveryState {
+  canvasId: string
+  principalId: string
+  generation: number
+  phase: 'checking' | 'unknown'
+}
+
+export interface DetachedRunState {
+  canvasId: string
+  principalId: string
+  status: RunStatus
 }
 
 function managedWriteReceiptOutput(
@@ -1330,6 +1348,15 @@ interface Store {
   runs: Record<string, RunState>
   // The single whole-graph pass behind "Rerun all"; null when no such pass is in flight.
   graphRun: GraphRunState | null
+  // Opening/reloading a Canvas must reconcile server-side runs before another durable dispatch.
+  // A failed lookup remains fail-closed until the user explicitly retries it.
+  executionRecovery: ExecutionRecoveryState | null
+  // A targeted run can outlive the node it targeted after an external edit or version restore.
+  // Keep that off-canvas owner explicit until its server lifecycle reaches a terminal state.
+  detachedRuns: Record<string, DetachedRunState>
+  // A whole-graph run has newer execution authority than these in-memory targeted-run snapshots.
+  // Keep the snapshots for Run history, but never present their artifacts as the current result.
+  supersededResultRunIds: string[]
   profileJobs: Record<string, ProfileJobState>
   past: CanvasDoc[]
   future: CanvasDoc[]
@@ -1417,6 +1444,8 @@ interface Store {
   prepareWrite: (id: string) => Promise<WriteAdmission | undefined>
   run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
   rerunAll: () => void
+  retryExecutionRecovery: () => void
+  cancelDetachedRuns: () => Promise<void>
   cancelGraphRun: () => Promise<void>
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
@@ -1562,6 +1591,43 @@ function hubExecutionAvailable(get: () => Store): boolean {
     { dedupeKey: 'hub-offline-execution' },
   )
   return false
+}
+
+const EXECUTION_RECOVERY_TOAST_KEY = 'canvas-execution-recovery-unknown'
+const EXECUTION_RECOVERY_CHECKING_TOAST_KEY = 'canvas-execution-recovery-checking'
+
+function durableExecutionAvailable(get: () => Store): boolean {
+  if (!hubExecutionAvailable(get)) return false
+  const recovery = get().executionRecovery
+  if (recovery?.phase === 'checking') {
+    get().pushToast(
+      'Checking this Canvas for an active run before starting another one.',
+      'info',
+      { dedupeKey: EXECUTION_RECOVERY_CHECKING_TOAST_KEY },
+    )
+    return false
+  }
+  if (recovery?.phase === 'unknown') {
+    get().pushToast(
+      'Could not confirm whether this Canvas has an active run. Running stays disabled until you retry.',
+      'error',
+      {
+        dedupeKey: EXECUTION_RECOVERY_TOAST_KEY,
+        sticky: true,
+        actions: [{ label: 'Retry', onClick: () => get().retryExecutionRecovery() }],
+      },
+    )
+    return false
+  }
+  if (Object.keys(get().detachedRuns).length > 0) {
+    get().pushToast(
+      'Wait for the active off-canvas run to finish or stop it from the Canvas toolbar.',
+      'info',
+      { dedupeKey: 'detached-run-active' },
+    )
+    return false
+  }
+  return true
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
@@ -2322,6 +2388,9 @@ export const useStore = create<Store>((set, get) => ({
   previewBindings: {},
   runs: {},
   graphRun: null,
+  executionRecovery: null,
+  detachedRuns: {},
+  supersededResultRunIds: [],
   profileJobs: {},
   past: [],
   future: [],
@@ -3123,7 +3192,11 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
-    if (!hubExecutionAvailable(get)) return
+    if (!durableExecutionAvailable(get)) return
+    if (get().graphRun) {
+      get().pushToast('Wait for Rerun all to finish before starting a node run.', 'info')
+      return
+    }
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Review the saved-dataset column merge before running.', 'info')
@@ -3209,6 +3282,19 @@ export const useStore = create<Store>((set, get) => ({
         ...(s.runs[id] ?? {}), estimate, phase: 'confirm',
       } }, openPanels: { [id]: 'run' } }))
     } else {
+      if (!durableExecutionAvailable(get)) {
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), estimate, phase: 'estimated',
+        } } }))
+        return
+      }
+      if (get().graphRun) {
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), estimate, phase: 'estimated',
+        } } }))
+        get().pushToast('Wait for Rerun all to finish before starting a node run.', 'info')
+        return
+      }
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate, phase: 'running',
       } } }))
@@ -3397,7 +3483,11 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
-    if (!hubExecutionAvailable(get)) return
+    if (!durableExecutionAvailable(get)) return
+    if (get().graphRun) {
+      get().pushToast('Wait for Rerun all to finish before starting a node run.', 'info')
+      return
+    }
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Review the saved-dataset column merge before running.', 'info')
@@ -3497,6 +3587,13 @@ export const useStore = create<Store>((set, get) => ({
         return
       }
     }
+    // Admission may await provider or input-drift evidence while another control starts Rerun all.
+    // Recheck the single-Canvas execution owner immediately before dispatch.
+    if (!durableExecutionAvailable(get)) return
+    if (get().graphRun) {
+      get().pushToast('Wait for Rerun all to finish before starting a node run.', 'info')
+      return
+    }
     // no openPanels here — status shows on the card; the user opens details if they want them
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? {}), phase: 'running', inputDrift: undefined,
@@ -3559,11 +3656,32 @@ export const useStore = create<Store>((set, get) => ({
   // and reports per-node progress. Notes/unconnected nodes aren't runnable → skipped. A Write
   // publication, a canvas parameter, an invalid node, or a size confirmation each own a decision the
   // targetless pass cannot make, so those fall back to a run per runnable sink.
+  retryExecutionRecovery: () => {
+    const recovery = get().executionRecovery
+    const graphRun = get().graphRun
+    const principalId = get().currentUser?.id
+    const retryableRecovery = recovery?.phase === 'unknown'
+      && recovery.canvasId === get().doc.id
+      && recovery.principalId === principalId
+    const retryableSubmission = graphRun?.phase === 'unknown'
+      && graphRun.canvasId === get().doc.id
+      && graphRun.principalId === principalId
+    if (!retryableRecovery && !retryableSubmission) return
+    if (!hubExecutionAvailable(get)) return
+    reattachRuns(get, set, get().doc.id)
+  },
+
   rerunAll: () => {
     if (!roleCanEdit(get().canvasRole)) return
-    if (!hubExecutionAvailable(get)) return
+    if (!durableExecutionAvailable(get)) return
     if (get().graphRun) return
     const { doc, numericParamDrafts } = get()
+    const targetedRunActive = Object.values(get().runs).some((run) => run.phase === 'running')
+      || doc.nodes.some((node) => node.data.status === 'queued' || node.data.status === 'running')
+    if (targetedRunActive) {
+      get().pushToast('Wait for the active node run to finish before rerunning the Canvas.', 'info')
+      return
+    }
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
     const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
@@ -3599,15 +3717,77 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  cancelDetachedRuns: async () => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const principalId = get().currentUser?.id
+    const canvasId = get().doc.id
+    if (!principalId) return
+    const runs = Object.values(get().detachedRuns).filter((run) => (
+      run.canvasId === canvasId && run.principalId === principalId
+    ))
+    let reconciled = false
+    let failed = false
+    for (const run of runs) {
+      let cancelled: RunStatus
+      try {
+        cancelled = await api.cancelRun(run.status.runId)
+      } catch {
+        failed = true
+        continue
+      }
+      if (cancelled.runId !== run.status.runId) {
+        failed = true
+        continue
+      }
+      const current = get().detachedRuns[run.status.runId]
+      if (!current || current.canvasId !== canvasId || current.principalId !== principalId) continue
+      if (cancelled.status === 'queued' || cancelled.status === 'running') {
+        set((state) => ({ detachedRuns: { ...state.detachedRuns, [cancelled.runId]: {
+          ...current, status: cancelled,
+        } } }))
+        pollDetachedRun(get, set, canvasId, principalId, cancelled.runId)
+        continue
+      }
+      _polling.delete(cancelled.runId)
+      set((state) => {
+        const detachedRuns = { ...state.detachedRuns }
+        delete detachedRuns[cancelled.runId]
+        return {
+          detachedRuns,
+          toasts: state.toasts.filter((toast) => toast.dedupeKey !== `detached-run-lost:${cancelled.runId}`),
+        }
+      })
+      applyPerNodeStatus(set, cancelled.perNode)
+      reconciled = true
+    }
+    if (reconciled) {
+      settleAnimatingNodes(set)
+      recoverCanvasResults(get, set, get().doc)
+    }
+    if (failed) {
+      get().pushToast('Could not confirm that every off-canvas run stopped. Running remains disabled.', 'error')
+    }
+  },
+
   cancelGraphRun: async () => {
     if (!roleCanEdit(get().canvasRole)) return
     const current = get().graphRun
-    if (!current?.runId) return
-    await api.cancelRun(current.runId).catch(() => {})
-    if (get().graphRun?.runId !== current.runId) return
+    if (!current?.runId || current.principalId !== get().currentUser?.id) return
+    let cancelled: RunStatus
+    try {
+      cancelled = await api.cancelRun(current.runId)
+    } catch {
+      get().pushToast('Could not confirm that Rerun all stopped. It remains active.', 'error')
+      return
+    }
+    const owner = get().graphRun
+    if (owner?.runId !== current.runId || owner.canvasId !== current.canvasId
+        || owner.principalId !== current.principalId) return
     _polling.delete(current.runId)
     set({ graphRun: null })
+    applyPerNodeStatus(set, cancelled.perNode)
     settleAnimatingNodes(set)
+    recoverCanvasResults(get, set, get().doc)
   },
 
   cancelRun: async (id) => {
@@ -3615,8 +3795,18 @@ export const useStore = create<Store>((set, get) => ({
     if (!hubExecutionAvailable(get)) return
     const st = get().runs[id]?.status
     if (!st) return
-    await api.cancelRun(st.runId).catch(() => {})
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'idle' } } }))
+    let cancelled: RunStatus
+    try {
+      cancelled = await api.cancelRun(st.runId)
+    } catch {
+      get().pushToast('Could not confirm that the run stopped. It remains active.', 'error')
+      return
+    }
+    if (get().runs[id]?.status?.runId !== st.runId) return
+    _polling.delete(st.runId)
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'idle', status: cancelled,
+    } } }))
     get().updateData(id, { status: 'stale' })
     settleAnimatingNodes(set)  // clear intermediate nodes' animation now, not only when the next poll lands
   },
@@ -5087,7 +5277,19 @@ export const useStore = create<Store>((set, get) => ({
     const d = options?.recoverServerState === false
       ? doc
       : prepareLoadedStatusDoc(doc)
-    const agentLog = d.id === get().doc.id ? get().agentLog : []
+    const previous = get()
+    const sameCanvas = d.id === previous.doc.id
+    const retainedGraphRun = sameCanvas
+      && previous.graphRun?.canvasId === d.id
+      && previous.graphRun.principalId === previous.currentUser?.id
+      ? previous.graphRun
+      : null
+    const retainedDetachedRuns = sameCanvas
+      ? Object.fromEntries(Object.entries(previous.detachedRuns).filter(([, run]) => (
+          run.canvasId === d.id && run.principalId === previous.currentUser?.id
+        )))
+      : {}
+    const agentLog = sameCanvas ? previous.agentLog : []
     // Every loadDoc caller is installing a server response or a deliberately selected server
     // snapshot.  The subscriber observes a different object identity, so it needs this synchronous
     // settling fence even when there was no running-status normalization.
@@ -5110,7 +5312,9 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, graphRun: null, profileJobs: {},
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns,
+        graphRun: retainedGraphRun, executionRecovery: null, detachedRuns: retainedDetachedRuns,
+        supersededResultRunIds: retainedGraphRun ? previous.supersededResultRunIds : [], profileJobs: {},
         schemas: {}, sizes: {}, graphRefusals: {},
         numericParamDrafts: {}, renameDraft: null, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
@@ -5191,6 +5395,8 @@ useStore.subscribe((state) => {
   _roleUserId = userId
   _fileNavigationGeneration += 1
   _fileListGeneration += 1
+  _reattachRunsGeneration += 1
+  _polling.clear()
   // Profile state belongs to a principal, not merely to the open canvas. Remove it synchronously so
   // React can never render Alice's recovered statistics during Bob's file/role refresh window.
   for (const [submissionId, pending] of _pendingProfileSubmissions) {
@@ -5205,6 +5411,11 @@ useStore.subscribe((state) => {
   useStore.setState({
     canvasRole: null,
     agentOpen: false,
+    runs: {},
+    graphRun: null,
+    executionRecovery: null,
+    detachedRuns: {},
+    supersededResultRunIds: [],
     profileJobs: {},
     localDrafts: [],
     draftStorageErrors: [],
@@ -5470,6 +5681,25 @@ function recoverCanvasResults(
 function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void, canvasId: string) {
   const reattachGeneration = ++_reattachRunsGeneration
   const reattachUserId = _profileSubmissionUserId
+  if (reattachUserId === null) {
+    set({ executionRecovery: null })
+    return
+  }
+  const graphOwnerAtLookup = get().graphRun
+  const unknownSubmissionAtLookup = graphOwnerAtLookup?.canvasId === canvasId
+    && graphOwnerAtLookup.principalId === reattachUserId
+    && graphOwnerAtLookup.phase === 'unknown'
+    ? graphOwnerAtLookup.submissionId
+    : undefined
+  set((state) => state.doc.id === canvasId && state.currentUser?.id === reattachUserId ? {
+    executionRecovery: {
+      canvasId, principalId: reattachUserId, generation: reattachGeneration, phase: 'checking',
+    },
+    toasts: state.toasts.filter((toast) => (
+      toast.dedupeKey !== EXECUTION_RECOVERY_TOAST_KEY
+      && toast.dedupeKey !== EXECUTION_RECOVERY_CHECKING_TOAST_KEY
+    )),
+  } : {})
   // Capture this canvas's known authority before any recovery request settles. Reading canvasRole later
   // could accidentally use the role of a different canvas after navigation.
   const recoveryCanCancel = roleCanEdit(get().canvasRole)
@@ -5483,6 +5713,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     && _profileSubmissionUserId === reattachUserId
     && _reattachRunsGeneration === reattachGeneration
     && get().doc.id === canvasId
+    && get().currentUser?.id === reattachUserId
   )
   const recoveredAttemptTracked = (status: RunStatus) => Object.values(get().profileJobs).some(
     (job) => job.principalId === reattachUserId
@@ -5703,6 +5934,9 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
 
   // These requests intentionally settle independently: a hung recovery surface must not block the other.
   void api.activeRuns(canvasId).then((statuses) => {
+    let recoveredTargetlessRun = false
+    let recoveredOrdinaryRun = false
+    const recoveredDetachedRunIds = new Set<string>()
     if (!current()) {
       for (const st of statuses) {
         if (st.jobType === 'profile') superviseRecoveredIfDetached(st)
@@ -5714,14 +5948,39 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         void installProfile(st).catch(() => {})
         continue
       }
+      recoveredOrdinaryRun = true
       const nodeId = st.targetNodeId
-      if (current() && !nodeId && !get().graphRun) {  // the targetless "Rerun all" pass owns no node
-        set({ graphRun: { canvasId, runId: st.runId, status: st } })
+      const graphOwner = get().graphRun
+      if (current() && !nodeId && (
+        !graphOwner
+        || (graphOwner.canvasId === canvasId
+          && graphOwner.principalId === reattachUserId
+          && (!graphOwner.runId || graphOwner.runId === st.runId))
+      )) {  // the targetless "Rerun all" pass owns no node
+        recoveredTargetlessRun = true
+        set((state) => ({
+          graphRun: {
+            canvasId, principalId: reattachUserId, phase: 'active',
+            submissionId: graphOwner?.submissionId, runId: st.runId, status: st,
+          },
+          supersededResultRunIds: supersedeCurrentRunIds(state),
+        }))
         applyPerNodeStatus(set, st.perNode)
         pollGraphRun(get, set, canvasId, st.runId)
         continue
       }
-      if (!current() || !nodeId || !get().doc.nodes.some((node) => node.id === nodeId)) continue
+      if (!current() || !nodeId) continue
+      if (!get().doc.nodes.some((node) => node.id === nodeId)) {
+        if (st.status === 'queued' || st.status === 'running') {
+          recoveredDetachedRunIds.add(st.runId)
+          set((state) => ({ detachedRuns: { ...state.detachedRuns, [st.runId]: {
+            canvasId, principalId: reattachUserId, status: st,
+          } } }))
+          applyPerNodeStatus(set, st.perNode)
+          pollDetachedRun(get, set, canvasId, reattachUserId, st.runId)
+        }
+        continue
+      }
       set((s: Store) => {
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
         return { runs: { ...s.runs, [nodeId]: {
@@ -5739,7 +5998,77 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       }
       if (current()) pollRun(get, set, nodeId, st.runId, reattachGeneration)
     }
-  }).catch(() => { /* profile projection may still recover; leave current state untouched */ })
+    if (!current()) return
+    let detachedRunInventoryChanged = false
+    set((state) => {
+      const detachedRuns = Object.fromEntries(Object.entries(state.detachedRuns).filter(([runId, run]) => {
+        const remove = run.canvasId === canvasId && run.principalId === reattachUserId
+          && !recoveredDetachedRunIds.has(runId)
+        if (remove) {
+          detachedRunInventoryChanged = true
+          _polling.delete(runId)
+        }
+        return !remove
+      }))
+      return detachedRunInventoryChanged ? { detachedRuns } : {}
+    })
+    if (detachedRunInventoryChanged) recoverCanvasResults(get, set, get().doc)
+    const unresolvedOwner = get().graphRun
+    let unknownSubmissionReconciliation: CanvasDoc | undefined
+    if (!recoveredOrdinaryRun && !recoveredTargetlessRun && unknownSubmissionAtLookup
+        && unresolvedOwner?.canvasId === canvasId
+        && unresolvedOwner.principalId === reattachUserId
+        && unresolvedOwner.phase === 'unknown'
+        && unresolvedOwner.submissionId === unknownSubmissionAtLookup) {
+      set((state) => {
+        unknownSubmissionReconciliation = prepareLoadedStatusDoc(state.doc)
+        return {
+          doc: unknownSubmissionReconciliation,
+          graphRun: null,
+          // An accepted targetless run may have reached terminal state before active-runs was read.
+          // Retire every older in-memory targeted artifact, then let current-results restore only
+          // what the server still proves readable. If the submission never started, that same
+          // inventory safely restores the prior result instead.
+          supersededResultRunIds: supersedeCurrentRunIds(state),
+        }
+      })
+      recoverCanvasResults(get, set, unknownSubmissionReconciliation!)
+    }
+    const graphOwner = get().graphRun
+    if (graphOwner?.canvasId === canvasId && graphOwner.principalId === reattachUserId
+        && graphOwner.runId && !_polling.has(graphOwner.runId)) {
+      pollGraphRun(get, set, canvasId, graphOwner.runId)
+    }
+    set((state) => {
+      const recovery = state.executionRecovery
+      if (recovery?.canvasId !== canvasId || recovery.principalId !== reattachUserId
+          || recovery.generation !== reattachGeneration) return {}
+      return {
+        executionRecovery: null,
+        toasts: state.toasts.filter((toast) => (
+          toast.dedupeKey !== EXECUTION_RECOVERY_TOAST_KEY
+          && toast.dedupeKey !== EXECUTION_RECOVERY_CHECKING_TOAST_KEY
+        )),
+      }
+    })
+  }).catch(() => {
+    if (!current()) return
+    set((state) => {
+      const recovery = state.executionRecovery
+      if (recovery?.canvasId !== canvasId || recovery.principalId !== reattachUserId
+          || recovery.generation !== reattachGeneration) return {}
+      return { executionRecovery: { ...recovery, phase: 'unknown' as const } }
+    })
+    get().pushToast(
+      'Could not confirm whether this Canvas has an active run. Running stays disabled until you retry.',
+      'error',
+      {
+        dedupeKey: EXECUTION_RECOVERY_TOAST_KEY,
+        sticky: true,
+        actions: [{ label: 'Retry', onClick: () => get().retryExecutionRecovery() }],
+      },
+    )
+  })
 
   void api.profileJobs(canvasId).then((statuses) => {
     if (!current()) {
@@ -5973,6 +6302,78 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
 
 const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>()
 
+function pollDetachedRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  canvasId: string,
+  principalId: string,
+  runId: string,
+) {
+  if (_polling.has(runId)) return
+  const token = Symbol(runId)
+  _polling.set(runId, { token })
+  const owns = () => _polling.get(runId)?.token === token
+    && get().doc.id === canvasId
+    && get().currentUser?.id === principalId
+    && get().detachedRuns[runId]?.status.runId === runId
+  const stop = () => { if (_polling.get(runId)?.token === token) _polling.delete(runId) }
+  let failures = 0
+  const tick = async () => {
+    if (!owns()) { stop(); return }
+    let status: RunStatus
+    try {
+      status = await api.runStatus(runId)
+      failures = 0
+    } catch {
+      if (++failures <= 6) { setTimeout(tick, 800); return }
+      get().pushToast(
+        'Lost track of an active off-canvas run. New runs remain disabled until it is stopped or recovery succeeds.',
+        'error',
+        { dedupeKey: `detached-run-lost:${runId}`, sticky: true },
+      )
+      stop()
+      return
+    }
+    if (!owns()) { stop(); return }
+    if (status.runId !== runId) {
+      get().pushToast(
+        'The off-canvas run returned a different identity. New runs remain disabled until recovery succeeds.',
+        'error',
+        { dedupeKey: `detached-run-lost:${runId}`, sticky: true },
+      )
+      stop()
+      return
+    }
+    set((state) => {
+      const current = state.detachedRuns[runId]
+      if (!current || current.canvasId !== canvasId || current.principalId !== principalId) return {}
+      return { detachedRuns: { ...state.detachedRuns, [runId]: { ...current, status } } }
+    })
+    applyPerNodeStatus(set, status.perNode)
+    if (status.status === 'queued' || status.status === 'running') {
+      setTimeout(tick, 300)
+      return
+    }
+    set((state) => {
+      const detachedRuns = { ...state.detachedRuns }
+      delete detachedRuns[runId]
+      return { detachedRuns }
+    })
+    stop()
+    if (status.status === 'done') {
+      applyPerNodeResults(set, status.perNode, status.placement)
+      void get().refreshSchemas()
+      void get().refreshCatalog()
+    }
+    recoverCanvasResults(get, set, get().doc)
+    settleAnimatingNodes(set)
+    if (status.status === 'failed') {
+      get().pushToast(presentRunError(status.error).summary, 'error')
+    }
+  }
+  setTimeout(tick, 200)
+}
+
 /** Decisions a single targetless run cannot own: a Write needs its own destination admission and
  * confirmation, a canvas parameter needs its binding panel, and named multi-output publication is
  * declared against one target. */
@@ -5993,19 +6394,56 @@ function startGraphRun(
   fallbackToSinks: () => void,
 ) {
   const doc = get().doc
-  set({ graphRun: { canvasId: doc.id } })
-  void api.run(doc, undefined, false, globalThis.crypto.randomUUID()).then((status) => {
-    if (get().graphRun?.canvasId !== doc.id) return
-    set({ graphRun: { canvasId: doc.id, runId: status.runId, status } })
+  const principalId = get().currentUser?.id
+  if (!principalId) {
+    get().pushToast('Your identity is not available yet', 'error')
+    return
+  }
+  const submissionId = globalThis.crypto.randomUUID()
+  set({ graphRun: { canvasId: doc.id, principalId, phase: 'submitting', submissionId } })
+  void api.run(doc, undefined, false, submissionId).then((status) => {
+    const owner = get().graphRun
+    if (owner?.canvasId !== doc.id || owner.principalId !== principalId
+        || owner.submissionId !== submissionId || get().currentUser?.id !== principalId) return
+    set((state) => ({
+      graphRun: {
+        canvasId: doc.id, principalId, phase: 'active', submissionId,
+        runId: status.runId, status,
+      },
+      supersededResultRunIds: supersedeCurrentRunIds(state),
+    }))
     applyPerNodeStatus(set, status.perNode)
     pollGraphRun(get, set, doc.id, status.runId)
   }).catch((e: unknown) => {
+    const owner = get().graphRun
+    if (owner?.canvasId !== doc.id || owner.principalId !== principalId
+        || owner.submissionId !== submissionId || get().currentUser?.id !== principalId) return
+    if (!(e instanceof KernelError) || e.status >= 500 || e.retryable === true) {
+      set({ graphRun: { ...owner, phase: 'unknown' } })
+      get().pushToast(
+        'Could not confirm whether Rerun all started. Running stays disabled until you retry the run check.',
+        'error',
+        {
+          dedupeKey: EXECUTION_RECOVERY_TOAST_KEY,
+          sticky: true,
+          actions: [{ label: 'Retry', onClick: () => get().retryExecutionRecovery() }],
+        },
+      )
+      return
+    }
     set({ graphRun: null })
     // The size gate is a per-target decision with a per-target card; hand the click back to it.
     if (e instanceof KernelError && e.code === 'run_confirmation_required') { fallbackToSinks(); return }
     const message = (e as Error).message || 'Could not start the run'
     if (!surfaceInvalidGraphRefusal(get(), e)) get().pushToast(presentRunError(message).summary, 'error')
   })
+}
+
+function supersedeCurrentRunIds(state: Store): string[] {
+  const runIds = Object.values(state.runs).flatMap((run) => (
+    run.status?.runId ? [run.status.runId] : []
+  ))
+  return [...new Set([...state.supersededResultRunIds, ...runIds])]
 }
 
 /** A completed targetless pass measures every step, so each executed node carries its own readout. */
@@ -6033,9 +6471,15 @@ function pollGraphRun(
   set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
   canvasId: string, runId: string,
 ) {
+  if (_polling.has(runId)) return
+  const principalId = get().graphRun?.principalId
   const token = Symbol(runId)
   _polling.set(runId, { token })
-  const owns = () => _polling.get(runId)?.token === token && get().graphRun?.runId === runId
+  const owns = () => _polling.get(runId)?.token === token
+    && get().graphRun?.runId === runId
+    && (principalId === undefined || (
+      get().graphRun?.principalId === principalId && get().currentUser?.id === principalId
+    ))
   const stop = () => { if (_polling.get(runId)?.token === token) _polling.delete(runId) }
   let fails = 0
   const tick = async () => {
@@ -6046,9 +6490,11 @@ function pollGraphRun(
       fails = 0
     } catch {
       if (++fails <= 6) { setTimeout(tick, 800); return }
-      set({ graphRun: null })
       settleAnimatingNodes(set)
-      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
+      get().pushToast(
+        'Lost track of Rerun all because Data Playground became unreachable. It remains active until cancellation is confirmed.',
+        'error',
+      )
       stop()
       return
     }
@@ -6109,13 +6555,19 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
         stopPolling()
         return
       }
-      // a transient blip (network hiccup / brief kernel restart) must not strand the node spinning
-      // forever — retry a few times with backoff, then give up and surface it instead of hanging.
+      // Retry transient loss, then stop animation without releasing execution ownership. The server
+      // may still be running; only a terminal poll, confirmed cancellation, or reload may replace it.
       if (++fails <= 6) { setTimeout(tick, 800); return }
-      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'idle' as const }), phase: 'idle' } } }))
-      get().updateData(nodeId, { status: 'stale' })
-      settleAnimatingNodes(set)  // no final status will arrive — clear every still-animating node, not just the target
-      get().pushToast('Lost track of the run because Data Playground became unreachable.', 'error')
+      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
+        ...(s.runs[nodeId] ?? { phase: 'running' as const }), phase: 'running',
+        error: 'Lost track of this run because Data Playground became unreachable.',
+      } } }))
+      get().updateData(nodeId, { status: 'unknown' })
+      settleAnimatingNodes(set)
+      get().pushToast(
+        'Lost track of the run because Data Playground became unreachable. It remains active until cancellation is confirmed.',
+        'error',
+      )
       stopPolling()
       return
     }

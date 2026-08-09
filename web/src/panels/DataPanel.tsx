@@ -34,6 +34,18 @@ const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
 
 type CurrentResultProblem = 'missing' | 'denied'
+type RetainedLookupPhase = 'pending' | 'resolved' | 'fallback' | 'missing' | 'denied' | 'indeterminate'
+type RetainedLookupState = {
+  nodeId: string
+  portId?: string
+  planIdentity: string
+  bindingsIdentity: string
+  bindingsKnown: boolean
+  runAttemptEpoch: number
+  generation: number
+  phase: RetainedLookupPhase
+  identity?: RetainedResultIdentity
+}
 
 function currentResultProblem(error: unknown): CurrentResultProblem | null {
   // The retained-result endpoint promises a structured KernelError. Only its definitive HTTP
@@ -42,6 +54,10 @@ function currentResultProblem(error: unknown): CurrentResultProblem | null {
   if (error.status === 401 || error.status === 403) return 'denied'
   if (error.status === 404 || error.status === 409 || error.status === 410) return 'missing'
   return null
+}
+
+function resultRecoveryInProgress(status: string | undefined) {
+  return status === 'checking' || status === 'queued' || status === 'running'
 }
 
 function settleNodeResultStatus(nodeId: string, status: 'idle' | 'unknown') {
@@ -102,47 +118,93 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   // the visible tab selection is carried on every preview and sampled-profile request.
   const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
   const run = useStore((s) => s.runs[nodeId])
+  const graphRun = useStore((s) => s.graphRun)
+  const detachedRunActive = useStore((s) => Object.keys(s.detachedRuns).length > 0)
+  const supersededResultRunIds = useStore((s) => s.supersededResultRunIds)
+  const graphRunAttemptActive = graphRun?.canvasId === doc.id
+  const runAttemptActive = graphRunAttemptActive || detachedRunActive || run?.phase === 'running'
+    || node?.data.status === 'queued' || node?.data.status === 'running'
+  const runAttempts = useRef(new Map<string, {
+    active: boolean
+    epoch: number
+    supersededRunId?: string
+  }>())
+  let runAttempt = runAttempts.current.get(nodeId)
+  if (!runAttempt) {
+    runAttempt = { active: false, epoch: 0 }
+    runAttempts.current.set(nodeId, runAttempt)
+  }
+  if (runAttemptActive && !runAttempt.active) {
+    runAttempt.epoch += 1
+    const priorStatus = run?.status?.status
+    runAttempt.supersededRunId = priorStatus === 'done'
+      || priorStatus === 'failed' || priorStatus === 'cancelled'
+      ? run.status?.runId
+      : undefined
+  }
+  runAttempt.active = runAttemptActive
+  const runAttemptEpoch = runAttempt.epoch
   const parameterBindings = run?.parameterBindings
   const parameterBindingsKnown = parameterBindings !== undefined
-  const runOutputs = run?.status?.outputs.filter((output) => output.nodeId === nodeId) ?? []
+  const runStatusTerminal = run?.status?.status === 'done'
+    || run?.status?.status === 'failed' || run?.status?.status === 'cancelled'
+  const terminalRunStatusMatchesPhase = (run?.phase === 'done' && run.status?.status === 'done')
+    || (run?.phase === 'failed' && run.status?.status === 'failed')
+    || (run?.phase === 'idle' && run.status?.status === 'cancelled')
+  const preDispatchPhase = run?.phase === 'idle' || run?.phase === 'parameters'
+    || run?.phase === 'estimating' || run?.phase === 'estimated'
+    || run?.phase === 'confirm' || run?.phase === 'drift'
+  const runStatusSuperseded = run?.status?.runId !== undefined
+    && (run.status.runId === runAttempt.supersededRunId
+      || supersededResultRunIds.includes(run.status.runId))
+  const runOutputs = !runStatusSuperseded && runStatusTerminal
+    && (terminalRunStatusMatchesPhase || preDispatchPhase)
+    ? run.status?.outputs.filter((output) => output.nodeId === nodeId) ?? []
+    : []
   const selectedRunOutput = runOutputs.find((output) => (
     output.nodeId === nodeId && (selectedPortId === undefined || output.portId === selectedPortId)
   )) ?? (outputPorts.length <= 1 && runOutputs.length === 1 ? runOutputs[0] : undefined)
   const committedRunOutput = selectedRunOutput?.outcome === 'committed' && selectedRunOutput.uri
     ? selectedRunOutput
     : undefined
+  const retainedLookupMounted = useRef(false)
   const retainedRequestGeneration = useRef(0)
-  const [retainedResult, setRetainedResult] = useState<{
-    nodeId: string
-    portId?: string
-    planIdentity: string
-    bindingsIdentity: string
-    identity: RetainedResultIdentity
-  } | null>(null)
-  // Latches across the status flip from `latest` → `idle` when View data proves the exact artifact
-  // is gone, so the panel can keep the bounded rerun action after the green check disappears.
-  const [currentResultProblemState, setCurrentResultProblemState] = useState<CurrentResultProblem | null>(null)
+  const retainedRequest = useRef<{ key: string; generation: number } | null>(null)
   const planIdentity = previewPlanIdentity(doc, nodeId, selectedPortId)
   const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
+  const lookupKey = JSON.stringify([
+    nodeId, retainedPortId ?? null, planIdentity, parameterBindingsKnown, bindingsIdentity,
+    runAttemptEpoch,
+  ])
+  const currentLookupKey = useRef(lookupKey)
+  currentLookupKey.current = lookupKey
+  // Keep the exact lookup phase across status-only transitions. Current-results may temporarily
+  // demote a node while this request is in flight; only a semantic identity change may supersede it.
+  const [retainedLookupState, setRetainedLookupState] = useState<RetainedLookupState | null>(null)
+  const currentRetainedLookup = retainedLookupState?.nodeId === nodeId
+    && retainedLookupState.portId === retainedPortId
+    && retainedLookupState.planIdentity === planIdentity
+    && retainedLookupState.bindingsKnown === parameterBindingsKnown
+    && retainedLookupState.bindingsIdentity === bindingsIdentity
+    && retainedLookupState.runAttemptEpoch === runAttemptEpoch
+    ? retainedLookupState
+    : null
   const recoveredResult = !editorPreview
-    && (node?.data.status === 'latest'
-      || (node?.data.status === 'idle' && !!node.data.lastRun)
-      || currentResultProblemState !== null)
-    && retainedResult?.nodeId === nodeId
-    && retainedResult.portId === retainedPortId
-    && retainedResult.planIdentity === planIdentity
-    && retainedResult.bindingsIdentity === bindingsIdentity
-    ? retainedResult.identity
+    && currentRetainedLookup?.phase === 'resolved'
+    ? currentRetainedLookup.identity
     : undefined
   // Plan-matched retained identity means this is still the exact current result, even after the
   // green check was cleared because the artifact itself became unreadable.
   const exactCurrentResult = node?.data.status === 'latest' || !!recoveredResult
   // A terminal run can fail or be cancelled after another named output was durably committed.
   // Keep that artifact readable without implying that non-committed sibling ports succeeded.
+  const usableCommittedRunOutput = isChart && currentRetainedLookup?.phase === 'fallback'
+    ? undefined
+    : committedRunOutput
   const selectedOutput = !editorPreview
-    ? committedRunOutput ?? recoveredResult?.output
+    ? usableCommittedRunOutput ?? recoveredResult?.output
     : undefined
-  const selectedRunId = committedRunOutput ? run?.status?.runId : recoveredResult?.runId
+  const selectedRunId = usableCommittedRunOutput ? run?.status?.runId : recoveredResult?.runId
   const displayedRunOutputs = runOutputs.length > 0
     ? runOutputs
     : recoveredResult ? [recoveredResult.output] : []
@@ -153,63 +215,98 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
   const previousOffsets = useRef<number[]>([])
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
+  const retainedLookupEligible = !editorPreview
+    && (node?.data.status === 'latest'
+      || (node?.data.status === 'idle' && !!node.data.lastRun)
+      || (isChart && node?.data.status === 'unknown'))
+    && !runAttemptActive
+    && !committedRunOutput
+    && retainedPortId !== undefined
 
   useEffect(() => {
-    setCurrentResultProblemState(null)
-  }, [nodeId, retainedPortId, planIdentity, bindingsIdentity])
+    retainedLookupMounted.current = true
+    return () => { retainedLookupMounted.current = false }
+  }, [])
   useEffect(() => {
+    if (currentRetainedLookup !== null) return
+    if (!retainedLookupEligible) return
+    if (retainedRequest.current?.key === lookupKey) return
     const requestGeneration = ++retainedRequestGeneration.current
-    // Keep the exact identity that just failed to open long enough to render its bounded error.
-    // A status-only badge demotion must not make the panel fall back to an unrelated sample.
-    if (currentResultProblemState !== null) return
-    setRetainedResult(null)
-    const canLookupRetained = node?.data.status === 'latest'
-      || (node?.data.status === 'idle' && !!node.data.lastRun)
-    if (editorPreview || !canLookupRetained || committedRunOutput
-        || retainedPortId === undefined) return
+    retainedRequest.current = { key: lookupKey, generation: requestGeneration }
     const requestDoc = doc
     const requestPlanIdentity = planIdentity
     const requestBindingsIdentity = bindingsIdentity
-    const statusAllowsRecovery = (status: string | undefined, lastRun: unknown) => (
-      status === 'latest' || (status === 'idle' && !!lastRun)
-    )
+    const requestBindingsKnown = parameterBindingsKnown
+    const requestPortId = retainedPortId
+    const requestSelectedPortId = selectedPortId
+    const requestState = (phase: RetainedLookupPhase, identity?: RetainedResultIdentity): RetainedLookupState => ({
+      nodeId, portId: requestPortId, planIdentity: requestPlanIdentity,
+      bindingsIdentity: requestBindingsIdentity, bindingsKnown: requestBindingsKnown,
+      runAttemptEpoch, generation: requestGeneration, phase, identity,
+    })
+    const requestMatchesState = (state: RetainedLookupState | null) => state?.generation === requestGeneration
+      && state.nodeId === nodeId
+      && state.portId === requestPortId
+      && state.planIdentity === requestPlanIdentity
+      && state.bindingsKnown === requestBindingsKnown
+      && state.bindingsIdentity === requestBindingsIdentity
+      && state.runAttemptEpoch === runAttemptEpoch
+    const requestStillCurrent = () => {
+      const current = useStore.getState()
+      const currentBindings = current.runs[nodeId]?.parameterBindings
+      return retainedLookupMounted.current
+        && retainedRequestGeneration.current === requestGeneration
+        && currentLookupKey.current === lookupKey
+        && (currentBindings !== undefined) === requestBindingsKnown
+        && previewPlanIdentity(current.doc, nodeId, requestSelectedPortId) === requestPlanIdentity
+        && parameterBindingsIdentity(currentBindings) === requestBindingsIdentity
+    }
+    const discardStaleRequest = () => {
+      if (retainedRequest.current?.generation === requestGeneration) retainedRequest.current = null
+      if (!retainedLookupMounted.current) return
+      setRetainedLookupState((state) => (
+        state?.phase === 'pending' && requestMatchesState(state) ? null : state
+      ))
+    }
+    setRetainedLookupState(requestState('pending'))
     void api.retainedResult(requestDoc, nodeId, retainedPortId, parameterBindings)
       .then((identity) => {
-        const current = useStore.getState()
-        const currentNode = current.doc.nodes.find((candidate) => candidate.id === nodeId)
-        const currentBindings = current.runs[nodeId]?.parameterBindings
-        if (
-          retainedRequestGeneration.current !== requestGeneration
-          || !statusAllowsRecovery(currentNode?.data.status, currentNode?.data.lastRun)
-          || (currentBindings !== undefined) !== parameterBindingsKnown
-          || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
-          || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
-        ) return
-        setRetainedResult({
-          nodeId, portId: retainedPortId, planIdentity: requestPlanIdentity,
-          bindingsIdentity: requestBindingsIdentity, identity,
-        })
+        if (!requestStillCurrent()) {
+          discardStaleRequest()
+          return
+        }
+        const currentNode = useStore.getState().doc.nodes.find((candidate) => candidate.id === nodeId)
+        if (resultRecoveryInProgress(currentNode?.data.status)) {
+          discardStaleRequest()
+          return
+        }
+        retainedRequest.current = null
+        setRetainedLookupState(requestState('resolved', identity))
       })
       .catch((error: unknown) => {
+        if (!requestStillCurrent()) {
+          discardStaleRequest()
+          return
+        }
+        retainedRequest.current = null
         const current = useStore.getState()
         const currentNode = current.doc.nodes.find((candidate) => candidate.id === nodeId)
-        const currentBindings = current.runs[nodeId]?.parameterBindings
-        if (
-          retainedRequestGeneration.current !== requestGeneration
-          || currentNode?.data.status !== 'latest'
-          || (currentBindings !== undefined) !== parameterBindingsKnown
-          || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
-          || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
-        ) return
-        const problem = currentResultProblem(error)
-        if (problem !== null) {
-          setCurrentResultProblemState(problem)
-          // Green means readable *and* authorized. Missing artifacts settle to idle; permission
-          // loss stays unknown rather than pretending the saved result was deleted.
-          settleNodeResultStatus(nodeId, problem === 'missing' ? 'idle' : 'unknown')
+        if (resultRecoveryInProgress(currentNode?.data.status)) {
+          setRetainedLookupState(null)
+          return
         }
-        // Never substitute a merely newer or older artifact client-side. Transport and temporary
-        // server failures deliberately stay indeterminate so the result view can be retried.
+        const problem = currentResultProblem(error)
+        if (problem === 'missing') {
+          const phase = currentNode?.type === 'chart' || currentNode?.data.status !== 'latest'
+            ? 'fallback' : 'missing'
+          setRetainedLookupState(requestState(phase))
+          settleNodeResultStatus(nodeId, 'idle')
+        } else if (problem === 'denied') {
+          setRetainedLookupState(requestState('denied'))
+          settleNodeResultStatus(nodeId, 'unknown')
+        } else {
+          setRetainedLookupState(requestState('indeterminate'))
+        }
       })
   // `doc` and bindings are represented by their canonical identities so position-only edits and
   // equivalent binding order do not issue another durable lookup.
@@ -217,23 +314,43 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   }, [
     editorPreview, nodeId, retainedPortId, node?.data.status, node?.data.lastRun,
     committedRunOutput?.uri, parameterBindingsKnown, planIdentity, bindingsIdentity,
-    currentResultProblemState,
+    currentRetainedLookup?.phase, lookupKey, isChart, runAttemptActive, runAttemptEpoch,
   ])
   const clearCurrentResultBadge = (problem: CurrentResultProblem) => {
-    setCurrentResultProblemState(problem)
+    setRetainedLookupState({
+      nodeId, portId: retainedPortId, planIdentity, bindingsIdentity,
+      bindingsKnown: parameterBindingsKnown, generation: retainedRequestGeneration.current,
+      runAttemptEpoch,
+      phase: problem === 'missing' ? (isChart ? 'fallback' : 'missing') : 'denied',
+    })
     settleNodeResultStatus(nodeId, problem === 'missing' ? 'idle' : 'unknown')
   }
+  const chartPreviewFallbackAllowed = currentRetainedLookup?.phase === 'fallback'
+    || (currentRetainedLookup === null && (
+      node?.data.status === 'draft'
+      || node?.data.status === 'stale'
+      || node?.data.status === 'failed'
+      || (node?.data.status === 'idle' && !node.data.lastRun)
+    ))
+  const chartResultRecoveryBlocksPreview = !editorPreview
+    && isChart
+    && !selectedOutput?.uri
+    && !chartPreviewFallbackAllowed
   useEffect(() => {
     // A Chart is a full-input visualization. Once a saved output exists, opening the
     // panel reads that artifact directly instead of issuing a preview request that can only refuse.
+    // Wait for Canvas result recovery and any eligible retained lookup first. Only a definitive
+    // missing response or a state that cannot have a current result may fall back to bounded preview;
+    // access and transport failures stay indeterminate.
     if (isChart && selectedOutput?.uri) return
+    if (chartResultRecoveryBlocksPreview) return
     if (editorPreview?.autoLoad !== false
         && (!preview || preview.portId !== requestPortId)) {
       previewAction(nodeId, 0, requestPortId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad,
-    isChart, selectedOutput?.uri])
+    isChart, selectedOutput?.uri, chartResultRecoveryBlocksPreview])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
@@ -308,16 +425,22 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       }
     : isMetric ? { kind: 'metric' } : undefined
 
-  // Keep a definitive full-result outcome stable. Demoting the card must not unmount the failed
-  // full-result read and reveal an unrelated bounded sample beneath it.
-  if (!editorPreview && currentResultProblemState === 'missing') {
+  // Keep definitive full-result outcomes stable. A missing non-Chart result needs an explicit
+  // rerun; Charts can safely fall back to their bounded preview only after absence is proven.
+  if (!editorPreview && currentRetainedLookup?.phase === 'missing') {
     return withOutputPorts(<CurrentResultUnavailable
       onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
   }
-  if (!editorPreview && currentResultProblemState === 'denied') {
+  if (!editorPreview && currentRetainedLookup?.phase === 'denied') {
     return withOutputPorts(<FullResultMessage
       title="Current result access denied"
       reason="You no longer have access to this saved result. Ask the owner to restore access, or run this step again if you can edit the Canvas." />)
+  }
+  if (!editorPreview && isChart && currentRetainedLookup?.phase === 'indeterminate') {
+    return withOutputPorts(<FullResultMessage
+      title="Couldn’t check saved result"
+      reason="The saved result may still exist. Check the connection and retry before falling back to a new preview."
+      onRetry={() => setRetainedLookupState(null)} />)
   }
 
   // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
@@ -332,6 +455,10 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       onRunUnavailable={() => requestRun(nodeId)}
       onCurrentResultProblem={clearCurrentResultBadge}
       currentResult={exactCurrentResult} />)
+  }
+
+  if (chartResultRecoveryBlocksPreview) {
+    return withOutputPorts(<Skeleton />)
   }
 
   if (!preview || preview.portId !== requestPortId) {

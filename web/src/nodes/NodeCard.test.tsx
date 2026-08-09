@@ -32,6 +32,7 @@ describe('NodeCard result summary', () => {
     apiMocks.graphSizes.mockReset().mockResolvedValue({})
     useStore.setState({
       canvasRole: 'owner', kernelUp: true, selectedIds: [], openPanels: {}, runs: {}, sizes: {}, graphRefusals: {},
+      graphRun: null, executionRecovery: null, detachedRuns: {},
       runPreview, closePanel,
       doc: {
         id: 'c', name: 'test', version: 1, requirements: [], edges: [], nodes: [{
@@ -277,6 +278,41 @@ describe('NodeCard result summary', () => {
     fireEvent.click(preview)
     expect(runPreview).toHaveBeenCalledWith('target')
     expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
+  })
+
+  it('disables a node run while active-run recovery is unresolved', () => {
+    const source = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'source', status: 'latest' as const, config: { uri: 'input.csv' }, history: [] },
+    }
+    const target = {
+      id: 'target', type: 'filter', position: { x: 200, y: 0 },
+      data: { title: 'target', status: 'stale' as const, config: { predicate: 'true' }, history: [] },
+    }
+    useStore.setState((state) => ({
+      selectedIds: ['target'],
+      doc: {
+        ...state.doc,
+        nodes: [source, target],
+        edges: [{
+          id: 'source-target', source: 'source', target: 'target',
+          data: { wire: 'dataset' as const },
+        }],
+      },
+      executionRecovery: {
+        canvasId: state.doc.id, principalId: 'alice', generation: 1, phase: 'unknown' as const,
+      },
+    }))
+
+    render(
+      <TooltipProvider>
+        <ReactFlowProvider><NodeCard id="target" data={target.data} /></ReactFlowProvider>
+      </TooltipProvider>,
+    )
+
+    expect(screen.getByRole('button', {
+      name: 'Run status unknown — retry from the Canvas toolbar',
+    })).toHaveAttribute('aria-disabled', 'true')
   })
 
   it('keeps failed run details available after the transient error toast disappears', () => {

@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test'
 
 test('Chart starts from schema defaults and keeps SQL expressions explicit', async ({ page }) => {
+  test.setTimeout(60_000)
+  await page.setViewportSize({ width: 1440, height: 900 })
   const canvasId = `chart-configuration-${Date.now()}`
   try {
     const created = await page.request.post('/api/canvas', { data: {
@@ -55,6 +57,72 @@ test('Chart starts from schema defaults and keeps SQL expressions explicit', asy
     await expect(page.getByTestId('panel-data').getByTitle('Refresh')).toHaveCount(0)
     await expect(chart.locator('[title="latest"]')).toBeVisible()
     await page.getByRole('button', { name: 'Close' }).click()
+
+    const reopenRetainedPosts: string[] = []
+    const reopenPreviewPosts: string[] = []
+    await page.route('**/api/run**', async (route) => {
+      const request = route.request()
+      if (request.method() === 'POST') {
+        const path = new URL(request.url()).pathname
+        if (path === '/api/run/retained-result') reopenRetainedPosts.push(request.url())
+        if (path === '/api/run/preview') reopenPreviewPosts.push(request.url())
+      }
+      await route.continue()
+    })
+    await page.reload()
+    await expect(chart).toBeVisible()
+    await expect(chart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+    await chart.getByRole('button', { name: 'View chart result' }).click()
+    await expect(page.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
+    await expect.poll(() => reopenRetainedPosts.length).toBe(1)
+    await page.waitForTimeout(1_200)
+    expect(reopenRetainedPosts).toHaveLength(1)
+    expect(reopenPreviewPosts).toEqual([])
+    await page.getByRole('button', { name: 'Close' }).click()
+    await expect(page.getByTestId('panel-data')).toHaveCount(0)
+    await page.waitForTimeout(600)
+    expect(reopenRetainedPosts).toHaveLength(1)
+    expect(reopenPreviewPosts).toEqual([])
+    await page.unroute('**/api/run**')
+
+    const freshPage = await page.context().newPage()
+    const freshRetainedPosts: string[] = []
+    const freshPreviewPosts: string[] = []
+    try {
+      await freshPage.setViewportSize({ width: 1440, height: 900 })
+      await freshPage.route('**/api/run**', async (route) => {
+        const request = route.request()
+        if (request.method() === 'POST') {
+          const path = new URL(request.url()).pathname
+          if (path === '/api/run/retained-result') freshRetainedPosts.push(request.url())
+          if (path === '/api/run/preview') freshPreviewPosts.push(request.url())
+        }
+        await route.continue()
+      })
+      await freshPage.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+      const freshChart = freshPage.locator('.react-flow__node-chart')
+      await expect(freshChart.locator('[title="latest"]')).toBeVisible({ timeout: 15_000 })
+      await freshChart.getByText('Events chart', { exact: true }).click()
+      await freshChart.getByRole('button', { name: 'View chart result' }).click()
+      await expect(freshPage.getByRole('img', { name: 'bar chart, saved result' })).toBeVisible()
+      await expect.poll(() => freshRetainedPosts.length).toBe(1)
+      await freshPage.waitForTimeout(1_200)
+      expect(freshRetainedPosts).toHaveLength(1)
+      expect(freshPreviewPosts).toEqual([])
+      await freshPage.getByRole('button', { name: 'Close' }).click()
+      await expect(freshPage.getByTestId('panel-data')).toHaveCount(0)
+      await freshPage.waitForTimeout(600)
+      expect(freshRetainedPosts).toHaveLength(1)
+      expect(freshPreviewPosts).toEqual([])
+      await freshPage.close()
+      expect(freshRetainedPosts).toHaveLength(1)
+      expect(freshPreviewPosts).toEqual([])
+    } finally {
+      if (!freshPage.isClosed()) {
+        await freshPage.unroute('**/api/run**')
+        await freshPage.close()
+      }
+    }
 
     await chart.getByLabel('Summary').selectOption('sum')
     await expect(chart.getByRole('combobox', { name: 'Y column', exact: true })).toHaveValue('amount')
