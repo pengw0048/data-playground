@@ -1201,7 +1201,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     if (!requestedExact) void loadPreview()
     return () => { previewRequest.current += 1 }
   }, [table.uri, initialRevisionDatasetId, initialRevisionId])
-  const refreshHeadFacts = async () => {
+  const refreshHeadFacts = useCallback(async () => {
     if (!latestHead) return
     const target = latestHead
     const request = ++factsRequest.current
@@ -1221,7 +1221,18 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     } finally {
       if (request === factsRequest.current) setFactsLoading(false)
     }
-  }
+  }, [latestHead, resolveLatestHead])
+  // Facts follow the current version automatically; the banner is for confirmed drift or a failed
+  // refresh, not for a detail that simply has not fetched head facts yet.
+  const autoFactsFor = useRef('')
+  useEffect(() => {
+    if (!latestHead || requestedExact) return
+    if (sameRevision(exactFacts, latestHead)) return
+    const key = revisionLabel(latestHead)
+    if (autoFactsFor.current === key) return
+    autoFactsFor.current = key
+    void refreshHeadFacts()
+  }, [latestHead, exactFacts, requestedExact, refreshHeadFacts])
   const unregister = async () => {
     if (!unregisterSupported || !base.registrationId || !base.metadataRevision) {
       pushToast('This catalog entry cannot be removed with a version precondition', 'error')
@@ -1481,7 +1492,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
               <button type="button" onClick={() => void resolveLatestHead()} className="shrink-0 font-semibold underline">Retry</button>
             </div>
           ) : null}
-          {!requestedExact && latestHead && !factsMatchKnownHead ? (
+          {!requestedExact && latestHead && !factsMatchKnownHead
+            && (exactFacts !== null || factsError !== null) ? (
             <div role="status" data-testid="dataset-facts-stale"
               className="flex flex-col gap-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-3 py-2 text-[11px] text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
               <div>
