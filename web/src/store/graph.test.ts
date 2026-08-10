@@ -798,6 +798,77 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('unknown'))
   })
 
+  it('clears a peer queued badge once the server reports no active run', async () => {
+    const transform = NODE('transform', 'filter')
+    const local = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [],
+      nodes: [{ ...transform, data: { ...transform.data, status: 'stale' as const } }],
+    }
+    const peer = {
+      ...local,
+      nodes: [{ ...local.nodes[0], data: { ...local.nodes[0].data, status: 'queued' as const } }],
+    }
+    apiMocks.currentResults.mockResolvedValue({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['transform'], unknownNodeIds: [], results: [],
+    })
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(peer)
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledWith('c'))
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+    expect(useStore.getState().executionRecovery).toBeNull()
+  })
+
+  it.each(['queued', 'running'] as const)(
+    'keeps a peer %s badge while this tab supervises an active run',
+    (status) => {
+      const transform = NODE('transform', 'filter')
+      const local = {
+        id: 'c', version: 2, name: 'local', requirements: [], edges: [],
+        nodes: [{ ...transform, data: { ...transform.data, status: 'stale' as const } }],
+      }
+      const peer = {
+        ...local,
+        nodes: [{ ...local.nodes[0], data: { ...local.nodes[0].data, status } }],
+      }
+      useStore.setState({ doc: local, runs: { transform: { phase: 'running' } } })
+
+      useStore.getState().applyCollaborativeDoc(peer)
+
+      expect(useStore.getState().doc.nodes[0].data.status).toBe(status)
+      expect(apiMocks.activeRuns).not.toHaveBeenCalled()
+    },
+  )
+
+  it('settles queued intermediates when a reattached run ends cancelled elsewhere', async () => {
+    const doc = fanOutDoc(1)
+    const active = {
+      runId: 'peer-cancelled-run', status: 'running', jobType: 'run', targetNodeId: 'sink0',
+      rowsProcessed: 0, totalRows: 5, ms: 5, placement: 'local',
+      perNode: [{ nodeId: 'source', status: 'queued' }, { nodeId: 'sink0', status: 'running' }],
+      outputs: [],
+    }
+    let finishStatus!: (status: unknown) => void
+    apiMocks.activeRuns.mockResolvedValueOnce([active])
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve) => { finishStatus = resolve }))
+
+    useStore.getState().loadDoc(doc, 'owner')
+    await vi.waitFor(() => expect(useStore.getState().executionRecovery).toBeNull())
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'source')?.data.status)
+      .toBe('queued')
+
+    await vi.waitFor(() => expect(apiMocks.runStatus).toHaveBeenCalledWith(active.runId))
+    finishStatus({ ...active, status: 'cancelled', perNode: [{ nodeId: 'sink0', status: 'cancelled' }] })
+
+    await vi.waitFor(() => {
+      const statuses = useStore.getState().doc.nodes.map((node) => node.data.status)
+      expect(statuses).not.toContain('queued')
+      expect(statuses).not.toContain('running')
+    })
+  })
+
   it.each([
     ['upstream configuration', (base: CanvasDoc) => ({
       ...base,
@@ -960,7 +1031,7 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
   })
 
-  it.each(['queued', 'running', 'failed', 'checking', 'unknown'] as const)(
+  it.each(['failed', 'checking', 'unknown'] as const)(
     'accepts a peer %s status without starting current-result recovery',
     (status) => {
       const local = {

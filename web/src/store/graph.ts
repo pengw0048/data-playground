@@ -5343,8 +5343,16 @@ export const useStore = create<Store>((set, get) => ({
     const structure = structSig(doc)
     const structureChanged = structure !== structSig(previous.doc)
     const previousNodes = new Map(previous.doc.nodes.map((node) => [node.id, node]))
+    const supervisesExecution = tracksActiveExecution(previous)
     let needsResultRecovery = false
+    let needsRunRecovery = false
     const nodes = doc.nodes.map((node) => {
+      if (node.data.status === 'queued' || node.data.status === 'running') {
+        if (supervisesExecution) return node
+        needsRunRecovery = true
+        needsResultRecovery = true
+        return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
+      }
       if (node.data.status !== 'latest'
           || (!structureChanged && previousNodes.get(node.id)?.data.status === 'latest')) return node
       needsResultRecovery = true
@@ -5354,7 +5362,13 @@ export const useStore = create<Store>((set, get) => ({
     set({ doc: next })
     // Collaborative state may carry result metadata for continuity, but only the server can prove
     // that a retained output is still current and readable. Keep a peer promotion fail-closed until
-    // current-results settles it; other live/fail-closed peer statuses need no result lookup.
+    // current-results settles it; a peer queued/running claim this tab does not supervise is checked
+    // against active-runs, which reattaches a real run or lets result recovery settle the badge.
+    if (needsRunRecovery
+        && (previous.executionRecovery?.canvasId !== doc.id
+          || previous.executionRecovery.phase !== 'checking')) {
+      reattachRuns(get, set, doc.id)
+    }
     if (!needsResultRecovery) return
     const userId = previous.currentUser?.id
     const pending = _collaborativeResultRecovery
@@ -5612,6 +5626,15 @@ function prepareLoadedStatusDoc(doc: CanvasDoc): CanvasDoc {
     return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
   })
   return changed ? { ...doc, nodes } : doc
+}
+
+const ACTIVE_RUN_PHASES = new Set(['estimating', 'preflight', 'verifying', 'queued', 'running', 'cancelling'])
+
+/** Whether this tab already supervises live execution state (its own polls settle node badges). */
+function tracksActiveExecution(state: Store): boolean {
+  if (state.graphRun || _polling.size > 0) return true
+  if (Object.values(state.detachedRuns).some((run) => run.canvasId === state.doc.id)) return true
+  return Object.values(state.runs).some((run) => ACTIVE_RUN_PHASES.has(run.phase))
 }
 
 function settleAnimatingNodes(set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void) {
@@ -6701,6 +6724,9 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       // outputs earn a persistent check; re-resolve every temporary `checking` badge now.
       recoverCanvasResults(get, set, get().doc)
       stopPolling()
+      // A terminal snapshot may omit steps that never started; another live poll re-asserts its own
+      // nodes within a tick, so only a tab with no remaining run supervision settles leftovers.
+      if (!_polling.size && !get().graphRun) settleAnimatingNodes(set)
       return
     }
     setTimeout(tick, 300)
