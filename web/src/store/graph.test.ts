@@ -688,6 +688,304 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
   })
 
+  it('keeps a peer latest-result promotion checking until the server proves it stale', async () => {
+    const local = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: { ...NODE('chart', 'chart').data, status: 'stale' as const },
+      }],
+    }
+    const peer = {
+      ...local,
+      name: 'peer edit',
+      nodes: [{
+        ...local.nodes[0],
+        data: {
+          ...local.nodes[0].data,
+          title: 'Peer chart',
+          config: { presentation: { kind: 'line' } },
+          status: 'latest' as const,
+          lastRun: { rows: 4, ms: 12, placement: 'local' as const },
+          history: [{ id: 'chart-v1', ts: 1, rows: 4, label: 'peer run', config: {} }],
+        },
+      }],
+    }
+    let finishRecovery!: (recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(peer)
+
+    const checking = useStore.getState().doc
+    expect(checking.name).toBe('peer edit')
+    expect(checking.nodes[0].data).toMatchObject({
+      title: 'Peer chart',
+      config: { presentation: { kind: 'line' } },
+      status: 'checking',
+      lastRun: peer.nodes[0].data.lastRun,
+      history: peer.nodes[0].data.history,
+    })
+    expect(peer.nodes[0].data.status).toBe('latest')
+    expect(apiMocks.currentResults).toHaveBeenCalledWith(expect.objectContaining({ id: peer.id }))
+
+    finishRecovery({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['chart'], unknownNodeIds: [], results: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual(peer.nodes[0].data.lastRun)
+    expect(useStore.getState().doc.nodes[0].data.history).toEqual(peer.nodes[0].data.history)
+  })
+
+  it('restores a peer latest-result promotion only from exact server evidence', async () => {
+    const local = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: { ...NODE('chart', 'chart').data, status: 'unknown' as const },
+      }],
+    }
+    const peer = {
+      ...local,
+      nodes: [{
+        ...local.nodes[0],
+        data: {
+          ...local.nodes[0].data,
+          status: 'latest' as const,
+          lastRun: { rows: 4, ms: 12, placement: 'local' as const },
+        },
+      }],
+    }
+    apiMocks.currentResults.mockResolvedValueOnce({
+      latestNodeIds: ['chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [],
+      results: [],
+    })
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(peer)
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('latest'))
+    expect(useStore.getState().doc.nodes[0].data.lastRun).toEqual(peer.nodes[0].data.lastRun)
+  })
+
+  it('leaves a peer latest-result promotion unknown when server verification fails', async () => {
+    const local = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: { ...NODE('chart', 'chart').data, status: 'idle' as const },
+      }],
+    }
+    const peer = {
+      ...local,
+      nodes: [{
+        ...local.nodes[0],
+        data: { ...local.nodes[0].data, status: 'latest' as const },
+      }],
+    }
+    apiMocks.currentResults.mockRejectedValueOnce(new Error('result inventory unavailable'))
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(peer)
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('unknown'))
+  })
+
+  it.each([
+    ['upstream configuration', (base: CanvasDoc) => ({
+      ...base,
+      nodes: base.nodes.map((node) => node.id === 'source-a'
+        ? { ...node, data: { ...node.data, config: { uri: '/data/new.parquet' } } }
+        : node),
+    })],
+    ['a target-cone edge', (base: CanvasDoc) => ({
+      ...base,
+      edges: [{ id: 'source-b-chart', source: 'source-b', target: 'chart' }],
+    })],
+  ] as const)('revalidates latest-to-latest when collaboration changes %s', async (_label, change) => {
+    const local: CanvasDoc = {
+      id: 'c', version: 2, name: 'local', requirements: [],
+      nodes: [
+        { ...NODE('source-a'), data: { ...NODE('source-a').data, config: { uri: '/data/old.parquet' } } },
+        { ...NODE('source-b'), data: { ...NODE('source-b').data, config: { uri: '/data/other.parquet' } } },
+        { ...NODE('chart', 'chart'), data: { ...NODE('chart', 'chart').data, status: 'latest' } },
+      ],
+      edges: [{ id: 'source-a-chart', source: 'source-a', target: 'chart' }],
+    }
+    let finishRecovery!: (recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(change(local))
+
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'chart')?.data.status)
+      .toBe('checking')
+    expect(apiMocks.currentResults).toHaveBeenCalledOnce()
+    finishRecovery({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['chart'], unknownNodeIds: [], results: [],
+    })
+    await vi.waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'chart')?.data.status,
+    ).toBe('stale'))
+  })
+
+  it('deduplicates one pending peer result claim across non-structural updates', async () => {
+    const local: CanvasDoc = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [
+        { ...NODE('chart', 'chart'), data: { ...NODE('chart', 'chart').data, status: 'stale' } },
+        NODE('sibling'),
+      ],
+    }
+    const peer: CanvasDoc = {
+      ...local,
+      nodes: local.nodes.map((node) => node.id === 'chart' ? {
+        ...node,
+        data: {
+          ...node.data,
+          status: 'latest',
+          lastRun: { rows: 4, ms: 12, placement: 'local' },
+        },
+      } : node),
+    }
+    let finishRecovery!: (recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void
+    apiMocks.currentResults.mockImplementationOnce(() => new Promise((resolve) => {
+      finishRecovery = resolve
+    }))
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(peer)
+    useStore.getState().applyCollaborativeDoc({
+      ...peer,
+      name: 'Peer rename',
+      nodes: peer.nodes.map((node) => node.id === 'chart'
+        ? { ...node, position: { x: 80, y: 40 }, data: { ...node.data, title: 'Renamed chart' } }
+        : { ...node, data: { ...node.data, status: 'running' } }),
+    })
+
+    expect(apiMocks.currentResults).toHaveBeenCalledOnce()
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'chart')?.data.status)
+      .toBe('checking')
+    expect(useStore.getState().doc).toMatchObject({ name: 'Peer rename' })
+    expect(useStore.getState().doc.nodes.find((node) => node.id === 'chart')).toMatchObject({
+      position: { x: 80, y: 40 }, data: { title: 'Renamed chart' },
+    })
+
+    finishRecovery({
+      latestNodeIds: ['chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
+    await vi.waitFor(() => expect(
+      useStore.getState().doc.nodes.find((node) => node.id === 'chart')?.data.status,
+    ).toBe('latest'))
+  })
+
+  it('restarts a pending peer result claim only when structure changes', async () => {
+    const local: CanvasDoc = {
+      id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [{
+        ...NODE('chart', 'chart'),
+        data: { ...NODE('chart', 'chart').data, status: 'stale', config: { agg: 'count' } },
+      }],
+    }
+    const firstClaim: CanvasDoc = {
+      ...local,
+      nodes: [{
+        ...local.nodes[0],
+        data: { ...local.nodes[0].data, status: 'latest' },
+      }],
+    }
+    const secondClaim: CanvasDoc = {
+      ...firstClaim,
+      nodes: [{
+        ...firstClaim.nodes[0],
+        data: { ...firstClaim.nodes[0].data, config: { agg: 'sum', y: 'amount' } },
+      }],
+    }
+    const finishRecoveries: Array<(recovery: {
+      latestNodeIds: string[]
+      failedNodeIds: string[]
+      staleNodeIds: string[]
+      unknownNodeIds: string[]
+      results: never[]
+    }) => void> = []
+    apiMocks.currentResults.mockImplementation(() => new Promise((resolve) => {
+      finishRecoveries.push(resolve)
+    }))
+    useStore.setState({ doc: local })
+
+    useStore.getState().applyCollaborativeDoc(firstClaim)
+    useStore.getState().applyCollaborativeDoc(secondClaim)
+
+    expect(apiMocks.currentResults).toHaveBeenCalledTimes(2)
+    finishRecoveries[0]({
+      latestNodeIds: ['chart'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+
+    useStore.getState().applyCollaborativeDoc({ ...secondClaim, name: 'Non-structural rename' })
+    expect(apiMocks.currentResults).toHaveBeenCalledTimes(2)
+
+    finishRecoveries[1]({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['chart'], unknownNodeIds: [], results: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+
+    useStore.getState().applyCollaborativeDoc(secondClaim)
+    expect(apiMocks.currentResults).toHaveBeenCalledTimes(3)
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    finishRecoveries[2]({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['chart'], unknownNodeIds: [], results: [],
+    })
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+  })
+
+  it.each(['queued', 'running', 'failed', 'checking', 'unknown'] as const)(
+    'accepts a peer %s status without starting current-result recovery',
+    (status) => {
+      const local = {
+        id: 'c', version: 2, name: 'local', requirements: [], edges: [], nodes: [{
+          ...NODE('chart', 'chart'),
+          data: { ...NODE('chart', 'chart').data, status: 'stale' as const },
+        }],
+      }
+      const peer = {
+        ...local,
+        nodes: [{
+          ...local.nodes[0],
+          data: { ...local.nodes[0].data, status },
+        }],
+      }
+      useStore.setState({ doc: local })
+      apiMocks.currentResults.mockClear()
+
+      useStore.getState().applyCollaborativeDoc(peer)
+
+      expect(useStore.getState().doc.nodes[0].data.status).toBe(status)
+      expect(apiMocks.currentResults).not.toHaveBeenCalled()
+    },
+  )
+
   it('does not spread a saved sink result check across fused upstream steps', async () => {
     const snapshot = {
       id: 'c', version: 1, name: 'fused result', requirements: [], nodes: [

@@ -106,6 +106,12 @@ let _previewRequestGeneration = 0 // every preview captures its own generation; 
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
 let _retainedResultRecoveryGeneration = 0 // persisted full-run bindings recover independently of previews
+let _collaborativeResultRecovery: {
+  canvasId: string
+  userId: string | undefined
+  structure: string
+  generation: number
+} | null = null
 let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
 let _viewportFitGeneration = 0    // example fits are one-shot even when the same Canvas is reused
 const _draftSyncInFlight = new Set<string>()
@@ -1477,6 +1483,8 @@ interface Store {
   // -- persistence --
   save: () => Promise<void>
   loadDoc: (doc: CanvasDoc, role?: CanvasRole | null, options?: { recoverServerState?: boolean }) => void
+  /** Install a Yjs document without trusting a peer's persisted green result badge. */
+  applyCollaborativeDoc: (doc: CanvasDoc) => void
   applyExternalEdit: (canvasId?: string) => void
   // `targetCanvasId` binds a destructive replacement to the canvas the caller created. Imports use
   // it so a late response can never replace whichever canvas became active in the meantime.
@@ -5329,6 +5337,41 @@ export const useStore = create<Store>((set, get) => ({
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
 
+  applyCollaborativeDoc: (doc) => {
+    const previous = get()
+    if (doc.id !== previous.doc.id) return
+    const structure = structSig(doc)
+    const structureChanged = structure !== structSig(previous.doc)
+    const previousNodes = new Map(previous.doc.nodes.map((node) => [node.id, node]))
+    let needsResultRecovery = false
+    const nodes = doc.nodes.map((node) => {
+      if (node.data.status !== 'latest'
+          || (!structureChanged && previousNodes.get(node.id)?.data.status === 'latest')) return node
+      needsResultRecovery = true
+      return { ...node, data: { ...node.data, status: 'checking' as NodeStatus } }
+    })
+    const next = needsResultRecovery ? { ...doc, nodes } : doc
+    set({ doc: next })
+    // Collaborative state may carry result metadata for continuity, but only the server can prove
+    // that a retained output is still current and readable. Keep a peer promotion fail-closed until
+    // current-results settles it; other live/fail-closed peer statuses need no result lookup.
+    if (!needsResultRecovery) return
+    const userId = previous.currentUser?.id
+    const pending = _collaborativeResultRecovery
+    if (pending?.canvasId === doc.id
+        && pending.userId === userId
+        && pending.structure === structure
+        && pending.generation === _retainedResultRecoveryGeneration) return
+    const generation = recoverCanvasResults(get, set, next, {
+      onSettled: (settledGeneration) => {
+        if (_collaborativeResultRecovery?.generation === settledGeneration) {
+          _collaborativeResultRecovery = null
+        }
+      },
+    })
+    _collaborativeResultRecovery = { canvasId: doc.id, userId, structure, generation }
+  },
+
   // An MCP client (the user's own agent) edited THIS canvas out-of-band — the collab room relayed an
   // 'external-edit' nudge. Debounce a burst of agent edits into one refetch, re-apply the server's doc
   // (so nodes appear live, as if you watched it build), and tell the user. Guarded to the open canvas.
@@ -5601,11 +5644,12 @@ function recoverCanvasResults(
   get: () => Store,
   set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
   doc: CanvasDoc,
-) {
+  options?: { onSettled?: (generation: number) => void },
+): number {
   const generation = ++_retainedResultRecoveryGeneration
   const userId = get().currentUser?.id
   const structure = structSig(doc)
-  void api.currentResults(doc).then((recovery) => {
+  const request = api.currentResults(doc).then((recovery) => {
     let installedBindings = false
     set((state) => {
       if (generation !== _retainedResultRecoveryGeneration
@@ -5673,6 +5717,8 @@ function recoverCanvasResults(
       return changed ? { doc: { ...state.doc, nodes } } : {}
     })
   })
+  void request.finally(() => options?.onSettled?.(generation))
+  return generation
 }
 
 // On canvas open, recover normal active runs plus the latest durable profile per node/plan. Profiles
