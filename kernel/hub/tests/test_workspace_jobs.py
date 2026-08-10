@@ -24,6 +24,9 @@ def _identity() -> tuple[str, str]:
         session.add_all([
             metadb.User(id=uid, name="Jobs researcher"),
             metadb.User(id=stranger, name="Jobs stranger"),
+        ])
+        session.flush()
+        session.add_all([
             metadb.Canvas(id=f"jobs-a-{suffix}", owner_id=uid, name="Alpha canvas"),
             metadb.Canvas(id=f"jobs-b-{suffix}", owner_id=uid, name="Beta canvas"),
             metadb.Canvas(id=f"jobs-secret-{suffix}", owner_id=stranger, name="Secret canvas"),
@@ -123,6 +126,45 @@ def test_workspace_jobs_are_accessible_filtered_and_keyset_paginated():
     assert [item["runId"] for item in label["items"]] == [f"failed-{suffix}"]
     node = metadb.list_workspace_runs(uid, node_id="failed-node")
     assert [item["runId"] for item in node["items"]] == [f"failed-{suffix}"]
+
+
+def test_node_filter_includes_whole_canvas_runs_that_executed_the_node():
+    uid, suffix = _identity()
+    alpha, node = f"jobs-a-{suffix}", "chart-node"
+    assert _record(
+        uid, alpha, None, "run", "done",
+        per_node=[{"node_id": node, "status": "done"}, {"node_id": "upstream", "status": "done"}],
+        run_id=f"graph-{suffix}")
+    assert _record(
+        uid, alpha, None, "run", "done",
+        per_node=[{"node_id": "unrelated", "status": "done"}],
+        run_id=f"other-{suffix}")
+    assert _record(uid, alpha, node, "run", "failed", run_id=f"targeted-{suffix}")
+    assert metadb.record_run(
+        alpha, None, "run", "done",
+        outputs=[{
+            "node_id": node, "port_id": "out", "wire": "dataset",
+            "publication_kind": "result", "outcome": "committed",
+            "uri": f"/outputs/produced-{suffix}.parquet",
+        }],
+        run_id=f"produced-{suffix}", created_by=uid)
+    with metadb.session() as session:
+        session.add(metadb.RunState(
+            run_id=f"live-graph-{suffix}", canvas_id=alpha, status="running",
+            doc=json.dumps({
+                "run_id": f"live-graph-{suffix}", "status": "running",
+                "per_node": [{"node_id": node, "status": "running"}],
+            }),
+            created_by=uid, auth_canvas_id=alpha, target_node_id=None,
+        ))
+
+    page = metadb.list_workspace_runs(uid, node_id=node)
+    WorkspaceRunPage.model_validate(page)
+    assert {item["runId"] for item in page["items"]} == {
+        f"graph-{suffix}", f"targeted-{suffix}", f"produced-{suffix}", f"live-graph-{suffix}",
+    }
+    intermediate = metadb.list_workspace_runs(uid, node_id="upstream")
+    assert {item["runId"] for item in intermediate["items"]} == {f"graph-{suffix}"}
 
 
 def test_workspace_jobs_show_only_the_callers_work_on_a_shared_canvas():
@@ -270,6 +312,7 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
 
     with metadb.session() as session:
         session.add(metadb.User(id=viewer, name="Jobs viewer"))
+        session.flush()
         session.add(metadb.CanvasShare(canvas_id=canvas_id, user_id=viewer, role="viewer"))
         task_row = session.get(metadb.DurableTask, task["id"])
         first_row = session.get(metadb.DurableTaskAttempt, first["id"])
