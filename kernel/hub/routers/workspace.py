@@ -776,6 +776,9 @@ def browse_workspace_container(
         name: str | None = Query(default=None, min_length=1, max_length=256),
         updated_after: datetime.datetime | None = Query(default=None, alias="updatedAfter"),
         updated_before: datetime.datetime | None = Query(default=None, alias="updatedBefore"),
+        rows_min: int | None = Query(default=None, alias="rowsMin", ge=0),
+        rows_max: int | None = Query(default=None, alias="rowsMax", ge=0),
+        owner: str | None = Query(default=None, min_length=1, max_length=256),
         source_id: str | None = Query(default=None, alias="sourceId",
                                       min_length=1, max_length=160),
         uid: str = Depends(current_user),
@@ -783,7 +786,9 @@ def browse_workspace_container(
     """One bounded local, connected-source, or legacy mixed Workspace page."""
     try:
         filters_requested = (name is not None or updated_after is not None
-                             or updated_before is not None or source_id is not None)
+                             or updated_before is not None or source_id is not None
+                             or rows_min is not None or rows_max is not None
+                             or owner is not None)
         query_requested = sort is not None or order != "asc" or bool(kind) or filters_requested
         connected_source = workspace_providers.is_connected_source_container(container_id)
         if source == "local":
@@ -800,6 +805,9 @@ def browse_workspace_container(
                 name=name,
                 updated_after=updated_after,
                 updated_before=updated_before,
+                rows_min=rows_min,
+                rows_max=rows_max,
+                owner=owner,
                 source_id=source_id,
             )
         if source == "provider":
@@ -822,6 +830,7 @@ def browse_workspace_container(
                 container_id, uid=uid, limit=limit, cursor=cursor,
                 sort=sort or "name", order=order, kinds=set(kind) or None,
                 name=name, updated_after=updated_after, updated_before=updated_before,
+                rows_min=rows_min, rows_max=rows_max, owner=owner,
                 source_id=source_id,
                 bind_cursor=False,
             )
@@ -835,7 +844,7 @@ def browse_workspace_container(
 
 @router.get("/workspace/facets", response_model=WorkspaceFacetPage)
 def workspace_facets(
-        field: Literal["kind", "source"],
+        field: Literal["kind", "source", "owner"],
         container_id: str | None = Query(default=None, alias="containerId", max_length=512),
         q: str | None = Query(default=None, min_length=1, max_length=512),
         kind: list[Literal["container", "canvas", "dataset", "dataset_view"]]
@@ -843,6 +852,9 @@ def workspace_facets(
         name: str | None = Query(default=None, min_length=1, max_length=256),
         updated_after: datetime.datetime | None = Query(default=None, alias="updatedAfter"),
         updated_before: datetime.datetime | None = Query(default=None, alias="updatedBefore"),
+        rows_min: int | None = Query(default=None, alias="rowsMin", ge=0),
+        rows_max: int | None = Query(default=None, alias="rowsMax", ge=0),
+        owner: str | None = Query(default=None, min_length=1, max_length=256),
         source_id: str | None = Query(default=None, alias="sourceId",
                                       min_length=1, max_length=160),
         search: str | None = Query(default=None, max_length=160),
@@ -856,6 +868,7 @@ def workspace_facets(
             field, uid=uid, container_id=container_id, query=q,
             kinds=set(kind) or None, name=name,
             updated_after=updated_after, updated_before=updated_before,
+            rows_min=rows_min, rows_max=rows_max, owner=owner,
             source_id=source_id, search=search, limit=limit, cursor=cursor)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -970,6 +983,9 @@ def search_workspace(q: str, limit: int = 25, cursor: str | None = None,
                      = Query(default=None, alias="updatedAfter"),
                      updated_before: datetime.datetime | None
                      = Query(default=None, alias="updatedBefore"),
+                     rows_min: int | None = Query(default=None, alias="rowsMin", ge=0),
+                     rows_max: int | None = Query(default=None, alias="rowsMax", ge=0),
+                     owner: str | None = Query(default=None, min_length=1, max_length=256),
                      source_id: str | None = Query(default=None, alias="sourceId",
                                                    min_length=1, max_length=160),
                      uid: str = Depends(current_user)) -> dict:
@@ -978,6 +994,7 @@ def search_workspace(q: str, limit: int = 25, cursor: str | None = None,
         return workspace_providers.search(
             q, uid=uid, limit=limit, cursor=cursor, kinds=set(kind) or None,
             name=name, updated_after=updated_after, updated_before=updated_before,
+            rows_min=rows_min, rows_max=rows_max, owner=owner,
             source_id=source_id)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc

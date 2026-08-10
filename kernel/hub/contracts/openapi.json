@@ -13119,7 +13119,8 @@
           "field": {
             "enum": [
               "kind",
-              "source"
+              "source",
+              "owner"
             ],
             "title": "Field",
             "type": "string"
@@ -13712,6 +13713,28 @@
             "title": "Name",
             "type": "string"
           },
+          "ownerId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ownerid"
+          },
+          "ownerName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ownername"
+          },
           "parentId": {
             "anyOf": [
               {
@@ -13805,6 +13828,18 @@
               }
             ],
             "title": "Resourceid"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
           },
           "source": {
             "default": "local",
@@ -29296,6 +29331,58 @@
           },
           {
             "in": "query",
+            "name": "rowsMin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmin"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rowsMax",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmax"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Owner"
+            }
+          },
+          {
+            "in": "query",
             "name": "sourceId",
             "required": false,
             "schema": {
@@ -29392,7 +29479,8 @@
             "schema": {
               "enum": [
                 "kind",
-                "source"
+                "source",
+                "owner"
               ],
               "title": "Field",
               "type": "string"
@@ -29502,6 +29590,58 @@
                 }
               ],
               "title": "Updatedbefore"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rowsMin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmin"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rowsMax",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmax"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Owner"
             }
           },
           {
@@ -31281,6 +31421,58 @@
                 }
               ],
               "title": "Updatedbefore"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rowsMin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmin"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rowsMax",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rowsmax"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Owner"
             }
           },
           {

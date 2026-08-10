@@ -62,6 +62,8 @@ const LOCAL_QUERY_CAPABILITIES: WorkspaceQueryCapabilities = {
     { field: 'kind', type: 'categorical', supported: true, facet: true },
     { field: 'updated', type: 'date_range', supported: true },
     { field: 'source', type: 'categorical', supported: true, facet: true, options: [{ value: 'local', label: 'Local' }] },
+    { field: 'rows', type: 'numeric_range', supported: true },
+    { field: 'owner', type: 'categorical', supported: true, facet: true },
   ],
 }
 const WORKSPACE_KIND_OPTIONS: Array<{ value: WorkspaceBrowseKind; label: string }> = [
@@ -95,7 +97,8 @@ function adaptiveKindOptions(
 }
 
 function hasActiveColumnFilters(filters: WorkspaceColumnFilters): boolean {
-  return !!(filters.name || filters.source || filters.updatedAfter || filters.updatedBefore)
+  return !!(filters.name || filters.source || filters.updatedAfter || filters.updatedBefore
+    || filters.rowsMin != null || filters.rowsMax != null || filters.owner)
 }
 
 /** Day-granular bounds are committed in the viewer's local time. */
@@ -677,6 +680,7 @@ function WorkspaceMixedExplorer() {
   const {
     name: nameFilter, source: sourceFilter,
     updatedAfter: updatedAfterFilter, updatedBefore: updatedBeforeFilter,
+    rowsMin: rowsMinFilter, rowsMax: rowsMaxFilter, owner: ownerFilter,
   } = columnFilters
   const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
   const [sources, setSources] = useState<WorkspaceSourceStatus[]>([])
@@ -833,6 +837,9 @@ function WorkspaceMixedExplorer() {
         if (sourceFilter) params.sourceId = sourceFilter
         if (updatedAfterFilter) params.updatedAfter = filterDayStart(updatedAfterFilter)
         if (updatedBeforeFilter) params.updatedBefore = filterDayEnd(updatedBeforeFilter)
+        if (rowsMinFilter != null) params.rowsMin = rowsMinFilter
+        if (rowsMaxFilter != null) params.rowsMax = rowsMaxFilter
+        if (ownerFilter) params.owner = ownerFilter
       }
       const page = await api.workspaceBrowse(targetId, params)
       if (sequence !== request.current) return
@@ -886,7 +893,8 @@ function WorkspaceMixedExplorer() {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
   }, [providerPlacementObservations, sortMode, kindFilter, nameFilter, sourceFilter,
-    updatedAfterFilter, updatedBeforeFilter, favoritesOnly, recentOnly])
+    updatedAfterFilter, updatedBeforeFilter, rowsMinFilter, rowsMaxFilter, ownerFilter,
+    favoritesOnly, recentOnly])
 
   useEffect(() => {
     let cancelled = false
@@ -1201,10 +1209,13 @@ function WorkspaceMixedExplorer() {
   const nameFilterCapability = supportedFilter(queryCapabilities, 'name')
   const updatedFilterCapability = supportedFilter(queryCapabilities, 'updated')
   const sourceFilterCapability = supportedFilter(queryCapabilities, 'source')
+  const rowsFilterCapability = supportedFilter(queryCapabilities, 'rows')
+  const ownerFilterCapability = supportedFilter(queryCapabilities, 'owner')
   const columnFiltersActive = hasActiveColumnFilters(columnFilters)
   const filtersNotAppliedReason = !columnFiltersActive ? null
     : activeShelf ? 'Filters do not apply to this view.'
     : !nameFilterCapability && !updatedFilterCapability && !sourceFilterCapability
+        && !rowsFilterCapability && !ownerFilterCapability
       ? queryCapabilities.reason ?? "Filters aren't available for this source."
       : null
   const sourceFilterLabel = (value: string) => (
@@ -1216,13 +1227,17 @@ function WorkspaceMixedExplorer() {
     updatedAfter: updatedAfterFilter ? filterDayStart(updatedAfterFilter) : undefined,
     updatedBefore: updatedBeforeFilter ? filterDayEnd(updatedBeforeFilter) : undefined,
   }
+  const facetItemFilters = {
+    ...facetDayRange,
+    rowsMin: rowsMinFilter, rowsMax: rowsMaxFilter,
+  }
   const localBrowseLens = !searchQuery && !activeShelf && !isProviderBrowseIdentity(containerId)
   const kindFacet = useWorkspaceFacet({
     enabled: localBrowseLens && !!supportedFilter(queryCapabilities, 'kind')?.facet,
     actorId: facetActorId, revision,
     query: {
       field: 'kind', containerId,
-      name: nameFilter, sourceId: sourceFilter, ...facetDayRange,
+      name: nameFilter, sourceId: sourceFilter, owner: ownerFilter, ...facetItemFilters,
     },
   })
   const sourceFacet = useWorkspaceFacet({
@@ -1231,7 +1246,16 @@ function WorkspaceMixedExplorer() {
     query: {
       field: 'source', containerId,
       kinds: kindFilter !== 'all' ? [kindFilter] : undefined,
-      name: nameFilter, ...facetDayRange,
+      name: nameFilter, owner: ownerFilter, ...facetItemFilters,
+    },
+  })
+  const ownerFacet = useWorkspaceFacet({
+    enabled: localBrowseLens && !!ownerFilterCapability?.facet,
+    actorId: facetActorId, revision,
+    query: {
+      field: 'owner', containerId,
+      kinds: kindFilter !== 'all' ? [kindFilter] : undefined,
+      name: nameFilter, sourceId: sourceFilter, ...facetItemFilters,
     },
   })
   const searchKindFacet = useWorkspaceFacet({
@@ -1239,7 +1263,16 @@ function WorkspaceMixedExplorer() {
     actorId: facetActorId, revision,
     query: {
       field: 'kind', q: searchQuery || undefined,
-      name: nameFilter, sourceId: sourceFilter, ...facetDayRange,
+      name: nameFilter, sourceId: sourceFilter, owner: ownerFilter, ...facetItemFilters,
+    },
+  })
+  const searchOwnerFacet = useWorkspaceFacet({
+    enabled: !!searchQuery,
+    actorId: facetActorId, revision,
+    query: {
+      field: 'owner', q: searchQuery || undefined,
+      kinds: kindFilter !== 'all' ? [kindFilter] : undefined,
+      name: nameFilter, sourceId: sourceFilter, ...facetItemFilters,
     },
   })
   const adaptiveSourceFacet = sourceFacet && sourceFacet.completeness !== 'unavailable' ? sourceFacet : null
@@ -1258,9 +1291,26 @@ function WorkspaceMixedExplorer() {
     }
     return options
   })()
+  const adaptiveOwnerFacet = ownerFacet && ownerFacet.completeness !== 'unavailable' ? ownerFacet
+    : searchOwnerFacet && searchOwnerFacet.completeness !== 'unavailable' ? searchOwnerFacet : null
+  const ownerFilterLabel = (value: string) => (
+    adaptiveOwnerFacet?.options.find((option) => option.value === value)?.label ?? value
+  )
+  const ownerSelectOptions = (() => {
+    const options = (adaptiveOwnerFacet?.options ?? []).map((option) => ({
+      value: option.value, label: facetCountLabel(option.label, option.count),
+    }))
+    if (columnFilters.owner && !options.some((option) => option.value === columnFilters.owner)) {
+      options.push({
+        value: columnFilters.owner,
+        label: `${ownerFilterLabel(columnFilters.owner)} (unavailable)`,
+      })
+    }
+    return options
+  })()
   const clearAllFilters = () => commitBrowseState({ kindFilter: 'all', columnFilters: {} })
   const filterChips = columnFiltersActive
-    ? <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel}
+    ? <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel} ownerLabel={ownerFilterLabel}
         notApplied={filtersNotAppliedReason} onChange={commitColumnFilters} onClearAll={clearAllFilters} />
     : null
   const visibleConnectedSources = kindFilter === 'all' || kindFilter === 'container'
@@ -1499,8 +1549,25 @@ function WorkspaceMixedExplorer() {
           onCommit={(range) => commitColumnFilters({
             ...columnFilters, updatedAfter: undefined, updatedBefore: undefined, ...range,
           })} />
+        <RowsFilterPopover variant="toolbar" min={columnFilters.rowsMin} max={columnFilters.rowsMax}
+          onCommit={(range) => commitColumnFilters({
+            ...columnFilters, rowsMin: undefined, rowsMax: undefined, ...range,
+          })} />
+        <select aria-label="Filter Workspace by owner"
+          value={columnFilters.owner ?? 'all'} onChange={(event) => {
+            commitColumnFilters({
+              ...columnFilters,
+              owner: event.target.value === 'all' ? undefined : event.target.value,
+            })
+          }}
+          className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground">
+          <option value="all">All owners</option>
+          {ownerSelectOptions.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
         {columnFiltersActive && <ActiveFilterChips filters={columnFilters} sourceLabel={sourceFilterLabel}
-          onChange={commitColumnFilters} onClearAll={clearAllFilters} />}
+          ownerLabel={ownerFilterLabel} onChange={commitColumnFilters} onClearAll={clearAllFilters} />}
       </div>}
 
       {!searchQuery && (sources.some(sourceNeedsAttention) || completeness === 'partial')
@@ -1573,6 +1640,20 @@ function WorkspaceMixedExplorer() {
             <option key={option.value} value={option.value}>{option.label}</option>
           ))}
         </select>}
+        {ownerFilterCapability && !activeShelf && <select aria-label="Filter Workspace by owner"
+          value={columnFilters.owner ?? 'all'} onChange={(event) => {
+            commitColumnFilters({
+              ...columnFilters,
+              owner: event.target.value === 'all' ? undefined : event.target.value,
+            })
+          }}
+          title={adaptiveOwnerFacet?.completeness === 'partial' ? adaptiveOwnerFacet.reason ?? undefined : undefined}
+          className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground disabled:cursor-not-allowed disabled:opacity-55">
+          <option value="all">All owners</option>
+          {ownerSelectOptions.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>}
         {viewMode === 'grid' && !activeShelf && nameFilterCapability && <NameFilterPopover variant="toolbar"
           value={columnFilters.name}
           onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} />}
@@ -1580,6 +1661,11 @@ function WorkspaceMixedExplorer() {
           after={columnFilters.updatedAfter} before={columnFilters.updatedBefore}
           onCommit={(range) => commitColumnFilters({
             ...columnFilters, updatedAfter: undefined, updatedBefore: undefined, ...range,
+          })} />}
+        {viewMode === 'grid' && !activeShelf && rowsFilterCapability && <RowsFilterPopover variant="toolbar"
+          min={columnFilters.rowsMin} max={columnFilters.rowsMax}
+          onCommit={(range) => commitColumnFilters({
+            ...columnFilters, rowsMin: undefined, rowsMax: undefined, ...range,
           })} />}
         {filterChips}
         {error && (sortMode !== 'source' || kindFilter !== 'all' || columnFiltersActive) && <button type="button" onClick={() => {
@@ -1637,6 +1723,11 @@ function WorkspaceMixedExplorer() {
             nameFilter={!activeShelf && nameFilterCapability ? <NameFilterPopover variant="header"
               value={columnFilters.name}
               onCommit={(name) => commitColumnFilters({ ...columnFilters, name })} /> : undefined}
+            rowsFilter={!activeShelf && rowsFilterCapability ? <RowsFilterPopover variant="header"
+              min={columnFilters.rowsMin} max={columnFilters.rowsMax}
+              onCommit={(range) => commitColumnFilters({
+                ...columnFilters, rowsMin: undefined, rowsMax: undefined, ...range,
+              })} /> : undefined}
             updatedFilter={!activeShelf && updatedFilterCapability ? <UpdatedFilterPopover variant="header"
               after={columnFilters.updatedAfter} before={columnFilters.updatedBefore}
               onCommit={(range) => commitColumnFilters({
@@ -1875,6 +1966,9 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files, kind
         sourceId: filters.source,
         updatedAfter: filters.updatedAfter ? filterDayStart(filters.updatedAfter) : undefined,
         updatedBefore: filters.updatedBefore ? filterDayEnd(filters.updatedBefore) : undefined,
+        rowsMin: filters.rowsMin,
+        rowsMax: filters.rowsMax,
+        owner: filters.owner,
       })
       if (sequence !== request.current) return
       page.groups.forEach((group) => providerPlacementObservations.observe(
@@ -2600,6 +2694,8 @@ function WorkspaceResourceGlyph({ resource, size }: { resource: WorkspaceResourc
   return <Icon name={icon} size={size} />
 }
 
+const WORKSPACE_LIST_GRID = 'grid-cols-[minmax(0,1fr)_90px_110px_130px_130px_16px]'
+
 const FILTER_TRIGGER_TOOLBAR_CLASS = 'inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold'
 
 function filterTriggerToolbarClass(active: boolean): string {
@@ -2700,9 +2796,71 @@ function UpdatedFilterPopover({ after, before, onCommit, variant }: {
   </Popover>
 }
 
-function ActiveFilterChips({ filters, sourceLabel, notApplied, onChange, onClearAll }: {
+function rowsRangeLabel(min: number | undefined, max: number | undefined): string {
+  if (min != null && max != null) return `${min.toLocaleString()}–${max.toLocaleString()}`
+  if (min != null) return `≥ ${min.toLocaleString()}`
+  return `≤ ${(max ?? 0).toLocaleString()}`
+}
+
+function RowsFilterPopover({ min, max, onCommit, variant }: {
+  min: number | undefined
+  max: number | undefined
+  onCommit: (next: { rowsMin?: number; rowsMax?: number }) => void
+  variant: 'header' | 'toolbar'
+}) {
+  const [open, setOpen] = useState(false)
+  const [draftMin, setDraftMin] = useState('')
+  const [draftMax, setDraftMax] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  const active = min != null || max != null
+  const parseBound = (draft: string): number | undefined => {
+    const value = Number(draft)
+    return draft.trim() && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+  }
+  return <Popover open={open} onOpenChange={(next) => {
+    if (next) { setDraftMin(min != null ? String(min) : ''); setDraftMax(max != null ? String(max) : '') }
+    setOpen(next)
+  }}>
+    <PopoverTrigger asChild>
+      <button type="button" aria-label="Filter by row count" data-testid="workspace-filter-rows"
+        title={active ? `Rows ${rowsRangeLabel(min, max)}` : 'Filter by row count'}
+        className={variant === 'header'
+          ? `inline-flex items-center gap-1 normal-case ${active ? 'text-primary' : 'hover:text-foreground'}`
+          : filterTriggerToolbarClass(active)}>
+        <Icon name="filter" size={11} />{variant === 'toolbar' && <>Rows{active ? ` ${rowsRangeLabel(min, max)}` : ''}</>}
+      </button>
+    </PopoverTrigger>
+    <PopoverContent align="start" className="w-64 p-3"
+      onOpenAutoFocus={(event) => { event.preventDefault(); inputRef.current?.focus() }}>
+      <form onSubmit={(event) => {
+        event.preventDefault()
+        onCommit({ rowsMin: parseBound(draftMin), rowsMax: parseBound(draftMax) })
+        setOpen(false)
+      }} className="grid gap-2 text-[12px]">
+        <span className="font-semibold text-foreground">Row count between</span>
+        <label htmlFor="workspace-filter-rows-min" className="text-muted-foreground">At least</label>
+        <input id="workspace-filter-rows-min" ref={inputRef} type="number" min={0} value={draftMin}
+          onChange={(event) => setDraftMin(event.target.value)}
+          className="rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:border-primary" />
+        <label htmlFor="workspace-filter-rows-max" className="text-muted-foreground">At most</label>
+        <input id="workspace-filter-rows-max" type="number" min={0} value={draftMax}
+          onChange={(event) => setDraftMax(event.target.value)}
+          className="rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:border-primary" />
+        <p className="text-[11px] text-muted-foreground">Matches datasets with a tracked row count.</p>
+        <div className="flex items-center justify-end gap-2">
+          <button type="button" disabled={!active} onClick={() => { onCommit({}); setOpen(false) }}
+            className="rounded-md px-2 py-1 font-semibold text-muted-foreground hover:text-foreground disabled:opacity-50">Clear</button>
+          <button type="submit" className="rounded-md bg-foreground px-2.5 py-1 font-semibold text-background">Apply</button>
+        </div>
+      </form>
+    </PopoverContent>
+  </Popover>
+}
+
+function ActiveFilterChips({ filters, sourceLabel, ownerLabel, notApplied, onChange, onClearAll }: {
   filters: WorkspaceColumnFilters
   sourceLabel: (value: string) => string
+  ownerLabel: (value: string) => string
   notApplied?: string | null
   onChange: (next: WorkspaceColumnFilters) => void
   onClearAll: () => void
@@ -2719,6 +2877,14 @@ function ActiveFilterChips({ filters, sourceLabel, notApplied, onChange, onClear
     ...(filters.updatedAfter || filters.updatedBefore ? [{
       key: 'updated', label: `Updated ${updatedRangeLabel(filters.updatedAfter, filters.updatedBefore)}`,
       cleared: { ...filters, updatedAfter: undefined, updatedBefore: undefined },
+    }] : []),
+    ...(filters.rowsMin != null || filters.rowsMax != null ? [{
+      key: 'rows', label: `Rows ${rowsRangeLabel(filters.rowsMin, filters.rowsMax)}`,
+      cleared: { ...filters, rowsMin: undefined, rowsMax: undefined },
+    }] : []),
+    ...(filters.owner ? [{
+      key: 'owner', label: `Owner: ${ownerLabel(filters.owner)}`,
+      cleared: { ...filters, owner: undefined },
     }] : []),
   ]
   if (!chips.length) return null
@@ -2737,13 +2903,16 @@ function ActiveFilterChips({ filters, sourceLabel, notApplied, onChange, onClear
   </div>
 }
 
-function WorkspaceListHeader({ nameFilter, updatedFilter }: {
+function WorkspaceListHeader({ nameFilter, rowsFilter, updatedFilter }: {
   nameFilter?: ReactNode
+  rowsFilter?: ReactNode
   updatedFilter?: ReactNode
 } = {}) {
-  return <div aria-hidden={!nameFilter && !updatedFilter ? 'true' : undefined}
-    className="mb-1 grid grid-cols-[minmax(0,1fr)_130px_130px_16px] gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+  return <div aria-hidden={!nameFilter && !rowsFilter && !updatedFilter ? 'true' : undefined}
+    className={`mb-1 grid ${WORKSPACE_LIST_GRID} gap-4 px-12 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground`}>
     <span className="inline-flex items-center gap-1.5">Name{nameFilter}</span>
+    <span className="inline-flex items-center gap-1.5">Rows{rowsFilter}</span>
+    <span>Owner</span>
     <span className="inline-flex items-center gap-1.5">Last modified{updatedFilter}</span>
     <span>Last opened</span><span />
   </div>
@@ -2853,7 +3022,7 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
       title={unavailable?.reason}
       className={grid
         ? 'flex min-h-0 min-w-0 max-w-full flex-1 flex-col items-center justify-center gap-2 overflow-hidden px-4 pb-3 pt-8 text-center disabled:cursor-not-allowed'
-        : 'grid min-w-0 max-w-full flex-1 grid-cols-[minmax(0,1fr)_130px_130px_16px] items-center gap-4 overflow-hidden px-3 py-1.5 text-left disabled:cursor-not-allowed'}>
+        : `grid min-w-0 max-w-full flex-1 ${WORKSPACE_LIST_GRID} items-center gap-4 overflow-hidden px-3 py-1.5 text-left disabled:cursor-not-allowed`}>
       <span className={`min-w-0 ${grid ? 'contents' : 'flex items-center gap-2.5'}`}>
         <span className="shrink-0 text-muted-foreground"><WorkspaceResourceGlyph resource={resource} size={grid ? 28 : 16} /></span>
         <span className="min-w-0 max-w-full flex-1 overflow-hidden"><span title={resource.name} className={`flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden text-[13px] font-semibold text-foreground ${grid ? 'justify-center' : ''}`}><span className="min-w-0 flex-1 truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind}{isExternal(resource) ? ` · ${resource.mountId ?? resource.provider ?? 'Connected source'}` : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{!grid && isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">{providerPlacementObservations.placementPath(resource)}</span>}</span>
@@ -2861,6 +3030,10 @@ function ResourceRow({ resource, viewMode = 'list', selected = false, contextSel
       {grid ? (resource.updatedAt || openedAtValue) && <span className="text-[10px] text-muted-foreground">
         {resource.updatedAt ? `Edited ${updatedAt}` : `Opened ${openedAt}`}
       </span> : <>
+        <span title={resource.rows != null ? `${resource.rows.toLocaleString()} rows` : 'Row count is not tracked for this item'}
+          className="truncate text-[11px] tabular-nums text-muted-foreground">{resource.rows != null ? resource.rows.toLocaleString() : '—'}</span>
+        <span title={resource.ownerName ?? undefined}
+          className="truncate text-[11px] text-muted-foreground">{resource.ownerName ?? resource.ownerId ?? '—'}</span>
         <span title={updatedAtTitle} className="truncate text-[11px] text-muted-foreground">{updatedAt}</span>
         <span title={openedAtTitle ?? 'Recorded on this browser'} className="truncate text-[11px] text-muted-foreground">{openedAt}</span>
         <span>{resource.kind === 'container' && canOpen && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}</span>

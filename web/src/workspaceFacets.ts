@@ -11,13 +11,16 @@ import { api } from './api/client'
 import type { WorkspaceFacetPage } from './types/api'
 
 export interface WorkspaceFacetQuery {
-  field: 'kind' | 'source'
+  field: 'kind' | 'source' | 'owner'
   containerId?: string
   q?: string
   kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
   name?: string
   updatedAfter?: string
   updatedBefore?: string
+  rowsMin?: number
+  rowsMax?: number
+  owner?: string
   sourceId?: string
 }
 
@@ -31,6 +34,7 @@ export function workspaceFacetKey(actorId: string, revision: number, query: Work
     actorId, revision, query.field, query.containerId ?? null, query.q ?? null,
     [...(query.kinds ?? [])].sort(), query.name ?? null, query.sourceId ?? null,
     query.updatedAfter ?? null, query.updatedBefore ?? null,
+    query.rowsMin ?? null, query.rowsMax ?? null, query.owner ?? null,
   ])
 }
 

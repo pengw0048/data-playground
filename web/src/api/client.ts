@@ -296,6 +296,9 @@ export const api = {
     name?: string
     updatedAfter?: string
     updatedBefore?: string
+    rowsMin?: number
+    rowsMax?: number
+    owner?: string
     sourceId?: string
   }) => {
     const query = new URLSearchParams()
@@ -308,17 +311,23 @@ export const api = {
     if (params?.name) query.set('name', params.name)
     if (params?.updatedAfter) query.set('updatedAfter', params.updatedAfter)
     if (params?.updatedBefore) query.set('updatedBefore', params.updatedBefore)
+    if (params?.rowsMin != null) query.set('rowsMin', String(params.rowsMin))
+    if (params?.rowsMax != null) query.set('rowsMax', String(params.rowsMax))
+    if (params?.owner) query.set('owner', params.owner)
     if (params?.sourceId) query.set('sourceId', params.sourceId)
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
   workspaceFacets: (params: {
-    field: 'kind' | 'source'
+    field: 'kind' | 'source' | 'owner'
     containerId?: string
     q?: string
     kinds?: Array<'container' | 'canvas' | 'dataset' | 'dataset_view'>
     name?: string
     updatedAfter?: string
     updatedBefore?: string
+    rowsMin?: number
+    rowsMax?: number
+    owner?: string
     sourceId?: string
     search?: string
     limit?: number
@@ -332,6 +341,9 @@ export const api = {
     if (params.name) query.set('name', params.name)
     if (params.updatedAfter) query.set('updatedAfter', params.updatedAfter)
     if (params.updatedBefore) query.set('updatedBefore', params.updatedBefore)
+    if (params.rowsMin != null) query.set('rowsMin', String(params.rowsMin))
+    if (params.rowsMax != null) query.set('rowsMax', String(params.rowsMax))
+    if (params.owner) query.set('owner', params.owner)
     if (params.sourceId) query.set('sourceId', params.sourceId)
     if (params.search) query.set('search', params.search)
     if (params.limit) query.set('limit', String(params.limit))
@@ -403,6 +415,9 @@ export const api = {
     name?: string
     updatedAfter?: string
     updatedBefore?: string
+    rowsMin?: number
+    rowsMax?: number
+    owner?: string
     sourceId?: string
   }) => {
     const search = new URLSearchParams({ q: query })
@@ -412,6 +427,9 @@ export const api = {
     if (params?.name) search.set('name', params.name)
     if (params?.updatedAfter) search.set('updatedAfter', params.updatedAfter)
     if (params?.updatedBefore) search.set('updatedBefore', params.updatedBefore)
+    if (params?.rowsMin != null) search.set('rowsMin', String(params.rowsMin))
+    if (params?.rowsMax != null) search.set('rowsMax', String(params.rowsMax))
+    if (params?.owner) search.set('owner', params.owner)
     if (params?.sourceId) search.set('sourceId', params.sourceId)
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },

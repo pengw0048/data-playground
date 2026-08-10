@@ -5939,12 +5939,33 @@ def _workspace_updated_range(
     return after, before
 
 
+def _workspace_owner_names(s, page_rows) -> dict[str, str]:
+    owner_ids = {row.owner_id for row in page_rows if row.owner_id is not None}
+    if not owner_ids:
+        return {}
+    return {user.id: user.name for user in s.scalars(select(User).where(User.id.in_(owner_ids)))}
+
+
+def _workspace_rows_range(
+    rows_min: int | None, rows_max: int | None,
+) -> tuple[int | None, int | None]:
+    for bound in (rows_min, rows_max):
+        if bound is not None and bound < 0:
+            raise ValueError("Workspace rows filter bounds must not be negative")
+    if rows_min is not None and rows_max is not None and rows_min > rows_max:
+        raise ValueError("Workspace rows-minimum bound must not be larger than rows-maximum")
+    return rows_min, rows_max
+
+
 def _workspace_filters_key(tokens: list[str], updated_after: datetime.datetime | None,
-                           updated_before: datetime.datetime | None) -> list:
+                           updated_before: datetime.datetime | None,
+                           rows_min: int | None = None, rows_max: int | None = None,
+                           owner: str | None = None) -> list:
     return [
         " ".join(tokens),
         updated_after.isoformat() if updated_after is not None else None,
         updated_before.isoformat() if updated_before is not None else None,
+        rows_min, rows_max, owner,
     ]
 
 
@@ -6062,7 +6083,10 @@ def _workspace_placement_resource(
         row: WorkspacePlacement, *, detached: bool,
         canvas_version: int | None = None,
         updated_at: datetime.datetime | None = None,
-        last_opened_at: datetime.datetime | None = None) -> dict:
+        last_opened_at: datetime.datetime | None = None,
+        rows: int | None = None,
+        owner_id: str | None = None,
+        owner_name: str | None = None) -> dict:
     return {
         "id": _workspace_ref(row.target_kind, row.target_id), "kind": row.target_kind,
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
@@ -6072,6 +6096,9 @@ def _workspace_placement_resource(
            if last_opened_at is not None else {}),
         **({"canvasVersion": canvas_version}
            if row.target_kind == "canvas" and canvas_version is not None else {}),
+        **({"rows": rows} if rows is not None else {}),
+        **({"ownerId": owner_id, "ownerName": owner_name or owner_id}
+           if owner_id is not None else {}),
     }
 
 
@@ -6942,7 +6969,7 @@ def _workspace_dataset_view_visible_clause(uid: str):
     ))
 
 
-_WORKSPACE_QUERY_CURSOR_VERSION = 4
+_WORKSPACE_QUERY_CURSOR_VERSION = 5
 _WORKSPACE_BROWSE_KINDS = frozenset({"container", "canvas", "dataset", "dataset_view"})
 _WORKSPACE_OPEN_KINDS = frozenset({"canvas", "dataset", "dataset_view"})
 _WORKSPACE_OPEN_MAX_PER_ACTOR = 200
@@ -7328,6 +7355,8 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
     """
     missing_timestamp = cast(literal(None), DateTime(timezone=True))
     missing_canvas_version = cast(literal(None), Integer)
+    missing_rows = cast(literal(None), BigInteger)
+    missing_owner = cast(literal(None), String)
     container_where = [
         *([WorkspaceContainer.parent_id == container_id] if container_id is not None else []),
         *([_workspace_search_matches(WorkspaceContainer.name, tokens)] if tokens else []),
@@ -7349,6 +7378,8 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             missing_timestamp.label("updated_at"),
             missing_timestamp.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
+            missing_rows.label("rows"),
+            missing_owner.label("owner_id"),
         ).where(*container_where))
     if "canvas" in kinds:
         open_table, open_on = _workspace_open_join(
@@ -7361,6 +7392,8 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             Canvas.updated_at.label("updated_at"),
             open_table.last_opened_at.label("last_opened_at"),
             Canvas.version.label("canvas_version"),
+            missing_rows.label("rows"),
+            Canvas.owner_id.label("owner_id"),
         ).join(Canvas, Canvas.id == WorkspacePlacement.target_id).outerjoin(
             open_table, open_on,
         ).where(
@@ -7386,6 +7419,8 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             CatalogEntry.updated_at.label("updated_at"),
             open_table.last_opened_at.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
+            CatalogEntry.row_count.label("rows"),
+            missing_owner.label("owner_id"),
         ).outerjoin(
             CatalogEntry,
             CatalogEntry.registration_id == WorkspacePlacement.target_id,
@@ -7404,6 +7439,8 @@ def _workspace_listing_streams(*, uid: str, kinds: frozenset[str],
             DatasetView.created_at.label("updated_at"),
             open_table.last_opened_at.label("last_opened_at"),
             missing_canvas_version.label("canvas_version"),
+            missing_rows.label("rows"),
+            missing_owner.label("owner_id"),
         ).join(DatasetView, DatasetView.id == WorkspacePlacement.target_id).outerjoin(
             open_table, open_on,
         ).where(
@@ -7420,15 +7457,20 @@ def workspace_facet_counts(*, uid: str, container_id: str | None = None,
                            kinds: set[str] | frozenset[str] | None = None,
                            updated_after: datetime.datetime | None = None,
                            updated_before: datetime.datetime | None = None,
-                           by_kind: bool = False) -> dict[str, int]:
+                           rows_min: int | None = None, rows_max: int | None = None,
+                           owner: str | None = None,
+                           by_kind: bool = False, by_owner: bool = False) -> dict[str, int]:
     """Grouped counts over the same filtered, actor-visible listing browse and search return.
 
     ``container_id`` scopes to one Folder's direct children; ``query`` scopes to the global
-    search match. ``by_kind`` groups per kind; otherwise one total is returned under ``"all"``.
+    search match. ``by_kind`` groups per kind, ``by_owner`` per canvas owner; otherwise one
+    total is returned under ``"all"``.
     """
     kind_set = frozenset(kinds or _WORKSPACE_BROWSE_KINDS)
     if not kind_set or not kind_set <= _WORKSPACE_BROWSE_KINDS:
         raise ValueError("Workspace type filter is invalid")
+    if by_kind and by_owner:
+        raise ValueError("Workspace facet counts group by one field at a time")
     tokens: list[str] = []
     if query is not None:
         normalized = " ".join(query.split()).lower()
@@ -7439,6 +7481,7 @@ def workspace_facet_counts(*, uid: str, container_id: str | None = None,
         tokens.extend(normalized.split())
     tokens.extend(_workspace_filter_tokens(name))
     updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
+    rows_min, rows_max = _workspace_rows_range(rows_min, rows_max)
     with session() as s:
         if container_id is not None:
             container = s.get(WorkspaceContainer, container_id)
@@ -7450,20 +7493,39 @@ def workspace_facet_counts(*, uid: str, container_id: str | None = None,
             tokens=tokens or None)).subquery()
         counted = (
             select(listing.c.kind, func.count()).group_by(listing.c.kind) if by_kind
+            else select(listing.c.owner_id, func.count()).where(
+                listing.c.owner_id.is_not(None)).group_by(listing.c.owner_id) if by_owner
             else select(literal("all"), func.count()).select_from(listing)
         )
         if updated_after is not None:
             counted = counted.where(listing.c.updated_at >= updated_after)
         if updated_before is not None:
             counted = counted.where(listing.c.updated_at <= updated_before)
+        if rows_min is not None:
+            counted = counted.where(listing.c.rows >= rows_min)
+        if rows_max is not None:
+            counted = counted.where(listing.c.rows <= rows_max)
+        if owner is not None:
+            counted = counted.where(listing.c.owner_id == owner)
         return {row[0]: row[1] for row in s.execute(counted).all()}
+
+
+def workspace_user_display_names(user_ids) -> dict[str, str]:
+    """Display names for a bounded set of user ids; unknown ids stay absent."""
+    ids = {str(user_id) for user_id in user_ids if user_id}
+    if not ids:
+        return {}
+    with session() as s:
+        return {user.id: user.name for user in s.scalars(select(User).where(User.id.in_(ids)))}
 
 
 def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                             cursor: str | None, sort: str, order: str,
                             kinds: frozenset[str], name: str | None = None,
                             updated_after: datetime.datetime | None = None,
-                            updated_before: datetime.datetime | None = None) -> dict:
+                            updated_before: datetime.datetime | None = None,
+                            rows_min: int | None = None, rows_max: int | None = None,
+                            owner: str | None = None) -> dict:
     """Run one filtered and globally ordered local Workspace page in the metadata database.
 
     ``updated`` uses the authoritative target timestamp where the current model has one: Canvas
@@ -7480,7 +7542,9 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
         raise ValueError("Workspace type filter is invalid")
     tokens = _workspace_filter_tokens(name)
     updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
-    filters = _workspace_filters_key(tokens, updated_after, updated_before)
+    rows_min, rows_max = _workspace_rows_range(rows_min, rows_max)
+    filters = _workspace_filters_key(
+        tokens, updated_after, updated_before, rows_min, rows_max, owner)
     decoded = _workspace_query_cursor_decode(
         cursor, container_id=container_id, sort=sort, order=order, kinds=kinds,
         filters=filters)
@@ -7531,11 +7595,19 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
             listing.c.updated_at,
             listing.c.last_opened_at,
             listing.c.canvas_version,
+            listing.c.rows,
+            listing.c.owner_id,
         ).order_by(*ordering).limit(limit + 1)
         if updated_after is not None:
             query = query.where(listing.c.updated_at >= updated_after)
         if updated_before is not None:
             query = query.where(listing.c.updated_at <= updated_before)
+        if rows_min is not None:
+            query = query.where(listing.c.rows >= rows_min)
+        if rows_max is not None:
+            query = query.where(listing.c.rows <= rows_max)
+        if owner is not None:
+            query = query.where(listing.c.owner_id == owner)
         if after is not None:
             query = query.where(after)
         rows = list(s.execute(query).all())
@@ -7554,6 +7626,7 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
             row.target_id for row in placements.values() if row.target_kind == "dataset"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
+        owner_names = _workspace_owner_names(s, page_rows)
         items: list[dict] = []
         for row in page_rows:
             if row.kind == "container":
@@ -7570,6 +7643,9 @@ def _workspace_browse_query(container_id: str, *, uid: str, limit: int,
                     canvas_version=row.canvas_version,
                     updated_at=row.updated_at,
                     last_opened_at=row.last_opened_at,
+                    rows=row.rows,
+                    owner_id=row.owner_id,
+                    owner_name=owner_names.get(row.owner_id),
                 ))
         has_more = len(rows) > limit
         last_row = page_rows[-1] if page_rows else None
@@ -7602,16 +7678,20 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
                      order: str = "asc", kinds: set[str] | frozenset[str] | None = None,
                      name: str | None = None,
                      updated_after: datetime.datetime | None = None,
-                     updated_before: datetime.datetime | None = None) -> dict:
+                     updated_before: datetime.datetime | None = None,
+                     rows_min: int | None = None, rows_max: int | None = None,
+                     owner: str | None = None) -> dict:
     """Read one bounded mixed local Workspace page without calling a catalog provider."""
     limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
-    filtered = (name is not None or updated_after is not None or updated_before is not None)
+    filtered = (name is not None or updated_after is not None or updated_before is not None
+                or rows_min is not None or rows_max is not None or owner is not None)
     if sort is not None or kinds is not None or filtered:
         return _workspace_browse_query(
             container_id, uid=uid, limit=limit, cursor=cursor,
             sort=sort or "name", order=order,
             kinds=frozenset(kinds or _WORKSPACE_BROWSE_KINDS),
             name=name, updated_after=updated_after, updated_before=updated_before,
+            rows_min=rows_min, rows_max=rows_max, owner=owner,
         )
     decoded = _workspace_cursor_decode(cursor)
     with session() as s:
@@ -7675,20 +7755,33 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         canvas_ids = [row.target_id for row in placements if row.target_kind == "canvas"]
         view_ids = [row.target_id for row in placements if row.target_kind == "dataset_view"]
         dataset_rows = list(s.execute(select(
-            CatalogEntry.registration_id, CatalogEntry.updated_at,
+            CatalogEntry.registration_id, CatalogEntry.updated_at, CatalogEntry.row_count,
         ).where(CatalogEntry.registration_id.in_(dataset_ids))).all()) if dataset_ids else []
         canvas_rows = list(s.execute(select(
-            Canvas.id, Canvas.version, Canvas.updated_at,
+            Canvas.id, Canvas.version, Canvas.updated_at, Canvas.owner_id,
         ).where(Canvas.id.in_(canvas_ids))).all()) if canvas_ids else []
         view_rows = list(s.execute(select(
             DatasetView.id, DatasetView.created_at,
         ).where(DatasetView.id.in_(view_ids))).all()) if view_ids else []
-        live_datasets = {dataset_id for dataset_id, _updated_at in dataset_rows}
-        dataset_updated_at = dict(dataset_rows)
-        canvas_versions = {canvas_id: version for canvas_id, version, _updated_at in canvas_rows}
-        canvas_updated_at = {
-            canvas_id: updated_at for canvas_id, _version, updated_at in canvas_rows
+        live_datasets = {dataset_id for dataset_id, _updated_at, _rows in dataset_rows}
+        dataset_updated_at = {
+            dataset_id: updated_at for dataset_id, updated_at, _rows in dataset_rows
         }
+        dataset_row_counts = {
+            dataset_id: rows for dataset_id, _updated_at, rows in dataset_rows
+        }
+        canvas_versions = {
+            canvas_id: version for canvas_id, version, _updated_at, _owner in canvas_rows}
+        canvas_updated_at = {
+            canvas_id: updated_at for canvas_id, _version, updated_at, _owner in canvas_rows
+        }
+        canvas_owners = {
+            canvas_id: owner for canvas_id, _version, _updated_at, owner in canvas_rows
+        }
+        owner_names = {
+            user.id: user.name for user in s.scalars(select(User).where(
+                User.id.in_(set(canvas_owners.values()))))
+        } if canvas_owners else {}
         view_updated_at = dict(view_rows)
 
         rows: list[tuple[tuple, dict]] = []
@@ -7703,11 +7796,17 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
                 dataset_updated_at.get(row.target_id) if row.target_kind == "dataset" else
                 view_updated_at.get(row.target_id)
             )
+            owner_id = (
+                canvas_owners.get(row.target_id) if row.target_kind == "canvas" else None)
             rows.append(((row.ordinal, rank, row.name, row.id),
                          _workspace_placement_resource(
                              row, detached=not live,
                              canvas_version=canvas_versions.get(row.target_id),
-                             updated_at=updated_at)))
+                             updated_at=updated_at,
+                             rows=(dataset_row_counts.get(row.target_id)
+                                   if row.target_kind == "dataset" else None),
+                             owner_id=owner_id,
+                             owner_name=owner_names.get(owner_id))))
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
         has_more = len(rows) > limit
@@ -7807,7 +7906,9 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
                      kinds: set[str] | frozenset[str] | None = None,
                      name: str | None = None,
                      updated_after: datetime.datetime | None = None,
-                     updated_before: datetime.datetime | None = None) -> dict:
+                     updated_before: datetime.datetime | None = None,
+                     rows_min: int | None = None, rows_max: int | None = None,
+                     owner: str | None = None) -> dict:
     """Search current local Workspace metadata, most recently updated first.
 
     Results carry the same ``updatedAt`` as browse. Folders and detached Dataset placements have
@@ -7825,10 +7926,13 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         raise ValueError("Workspace type filter is invalid")
     name_tokens = _workspace_filter_tokens(name)
     updated_after, updated_before = _workspace_updated_range(updated_after, updated_before)
+    rows_min, rows_max = _workspace_rows_range(rows_min, rows_max)
     tokens = normalized.split() + name_tokens
     # Normalized queries collapse whitespace, so "\n" cannot collide with a plain query binding.
-    filters = _workspace_filters_key(name_tokens, updated_after, updated_before)
-    unfiltered = kind_set == _WORKSPACE_BROWSE_KINDS and filters == ["", None, None]
+    filters = _workspace_filters_key(
+        name_tokens, updated_after, updated_before, rows_min, rows_max, owner)
+    unfiltered = (kind_set == _WORKSPACE_BROWSE_KINDS
+                  and filters == ["", None, None, None, None, None])
     binding = normalized if unfiltered else "\n".join(
         [normalized, json.dumps([sorted(kind_set), *filters], separators=(",", ":"))])
     decoded = _workspace_search_cursor_decode(cursor, query=binding)
@@ -7844,6 +7948,8 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             name_order.label("sort_name"),
             listing.c.updated_at,
             listing.c.canvas_version,
+            listing.c.rows,
+            listing.c.owner_id,
         ).order_by(
             null_order.asc(), listing.c.updated_at.desc(),
             name_order.asc(), listing.c.kind_rank.asc(), listing.c.row_id.asc(),
@@ -7852,6 +7958,12 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             page_query = page_query.where(listing.c.updated_at >= updated_after)
         if updated_before is not None:
             page_query = page_query.where(listing.c.updated_at <= updated_before)
+        if rows_min is not None:
+            page_query = page_query.where(listing.c.rows >= rows_min)
+        if rows_max is not None:
+            page_query = page_query.where(listing.c.rows <= rows_max)
+        if owner is not None:
+            page_query = page_query.where(listing.c.owner_id == owner)
         if decoded is not None:
             page_query = page_query.where(_workspace_query_updated_after(
                 listing.c.updated_at, null_order, name_order,
@@ -7872,6 +7984,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             row.target_id for row in placements.values() if row.target_kind == "dataset"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
+        owner_names = _workspace_owner_names(s, page_rows)
         items: list[dict] = []
         for row in page_rows:
             if row.kind == "container":
@@ -7887,6 +8000,9 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
                               and placement.target_id not in live_datasets),
                     canvas_version=row.canvas_version,
                     updated_at=row.updated_at,
+                    rows=row.rows,
+                    owner_id=row.owner_id,
+                    owner_name=owner_names.get(row.owner_id),
                 ))
         has_more = len(rows) > limit
         last_row = page_rows[-1] if page_rows else None
