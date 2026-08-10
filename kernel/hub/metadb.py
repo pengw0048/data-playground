@@ -13284,6 +13284,21 @@ def resolve_checkpoint_full_result(task_id: str) -> dict | None:
         }
 
 
+def _json_nodes_include(column, node_id: str, *, postgres: bool, path: str | None = None):
+    """Whether the JSON array at `path` (the column root when None) has an entry for this node."""
+    if postgres:
+        from sqlalchemy.dialects.postgresql import JSONB
+        scope = cast(column, JSONB)
+        if path:
+            scope = scope[path]
+        return scope.contains([{"node_id": node_id}])
+    items = func.json_each(
+        func.coalesce(column, "[]"), *([f"$.{path}"] if path else []),
+    ).table_valued("value", joins_implicitly=True)
+    return exists(select(literal(1)).select_from(items).where(
+        func.json_extract(items.c.value, "$.node_id") == node_id))
+
+
 def list_workspace_runs(
         uid: str, *, limit: int = 50, cursor: str | None = None,
         status: str | None = None, canvas_id: str | None = None,
@@ -13310,7 +13325,8 @@ def list_workspace_runs(
                 CanvasShare.user_id == str(uid),
             )),
         )
-        if s.get_bind().dialect.name == "postgresql":
+        postgres = s.get_bind().dialect.name == "postgresql"
+        if postgres:
             from sqlalchemy.dialects.postgresql import JSONB
             state_json = cast(RunState.doc, JSONB)
             state_placement = state_json.op("->>")("placement")
@@ -13342,7 +13358,15 @@ def list_workspace_runs(
         if status:
             history_predicates.append(RunRecord.status == status)
         if node_id:
-            history_predicates.append(RunRecord.target_node_id == node_id)
+            # A whole-Canvas run has no target but still executed/produced concrete nodes; a
+            # node-filtered view must include it when its per-node facts or outputs name the node.
+            history_predicates.append(or_(
+                RunRecord.target_node_id == node_id,
+                and_(RunRecord.target_node_id.is_(None), or_(
+                    _json_nodes_include(RunRecord.per_node, node_id, postgres=postgres),
+                    _json_nodes_include(RunRecord.outputs, node_id, postgres=postgres),
+                )),
+            ))
         if recorded_after:
             history_predicates.append(RunRecord.created_at >= recorded_after)
         if recorded_before:
@@ -13413,7 +13437,13 @@ def list_workspace_runs(
         if status:
             state_predicates.append(RunState.status == status)
         if node_id:
-            state_predicates.append(RunState.target_node_id == node_id)
+            state_predicates.append(or_(
+                RunState.target_node_id == node_id,
+                and_(RunState.target_node_id.is_(None), or_(
+                    _json_nodes_include(RunState.doc, node_id, postgres=postgres, path="per_node"),
+                    _json_nodes_include(RunState.doc, node_id, postgres=postgres, path="outputs"),
+                )),
+            ))
         if recorded_after:
             state_predicates.append(RunState.created_at >= recorded_after)
         if recorded_before:
