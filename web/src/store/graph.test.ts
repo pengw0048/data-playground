@@ -7317,6 +7317,62 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.filter((toast) => toast.kind === 'success')).toEqual([])
   })
 
+  it('preserves a pending autosave when another Canvas replaces the document', async () => {
+    const canvasA = { ...emptyTestDoc('canvas-a'), name: 'Canvas A', version: 7 }
+    const canvasB = { ...emptyTestDoc('canvas-b'), name: 'Canvas B', version: 3 }
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: canvasA.id, name: canvasA.name, version: 7, role: 'owner' },
+      { id: canvasB.id, name: canvasB.name, version: 3, role: 'owner' },
+    ])
+    apiMocks.getCanvas.mockResolvedValue(canvasA)
+    await useStore.getState().bootstrap()
+    await vi.waitFor(() => expect(useStore.getState().doc.id).toBe('canvas-a'))
+    apiMocks.saveCanvas.mockClear().mockResolvedValue({ ok: true, id: canvasA.id, version: 8 })
+
+    useStore.getState().renameFile('Edited before navigation')
+    useStore.getState().loadDoc(canvasB, 'owner')
+
+    await vi.waitFor(() => expect(apiMocks.saveCanvas).toHaveBeenCalledTimes(1), { timeout: 2_000 })
+    expect(apiMocks.saveCanvas).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'canvas-a', name: 'Edited before navigation' }), false, 7)
+    expect(useStore.getState().doc.id).toBe('canvas-b')
+    expect(useStore.getState().serverVersion).toBe(3)
+    await vi.waitFor(() => expect(useStore.getState().localDrafts).toEqual([]), { timeout: 2_000 })
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(apiMocks.saveCanvas).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().doc.id).toBe('canvas-b')
+    expect(useStore.getState().serverVersion).toBe(3)
+    expect(useStore.getState().saved).toBe(true)
+  })
+
+  it('keeps a recoverable draft when the flushed autosave fails without dirtying the new Canvas', async () => {
+    const canvasA = { ...emptyTestDoc('canvas-a'), name: 'Canvas A', version: 7 }
+    const canvasB = { ...emptyTestDoc('canvas-b'), name: 'Canvas B', version: 3 }
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: canvasA.id, name: canvasA.name, version: 7, role: 'owner' },
+      { id: canvasB.id, name: canvasB.name, version: 3, role: 'owner' },
+    ])
+    apiMocks.getCanvas.mockResolvedValue(canvasA)
+    await useStore.getState().bootstrap()
+    await vi.waitFor(() => expect(useStore.getState().doc.id).toBe('canvas-a'))
+    apiMocks.saveCanvas.mockClear().mockRejectedValue(new Error('network down'))
+
+    useStore.getState().renameFile('Edit awaiting recovery')
+    useStore.getState().loadDoc(canvasB, 'owner')
+
+    await vi.waitFor(() => expect(apiMocks.saveCanvas).toHaveBeenCalledTimes(1), { timeout: 2_000 })
+    await vi.waitFor(() => expect(useStore.getState().localDrafts).toMatchObject([{
+      draftId: 'canvas-a',
+      doc: { name: 'Edit awaiting recovery' },
+      baseVersion: 7,
+      syncState: 'dirty',
+    }]), { timeout: 2_000 })
+    expect(useStore.getState().doc.id).toBe('canvas-b')
+    expect(useStore.getState().saved).toBe(true)
+    expect(useStore.getState().currentDraftId).toBeNull()
+    expect(useStore.getState().serverVersion).toBe(3)
+  })
+
   it('does not refresh graph metadata for a presentation-only Chart type change', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }

@@ -5278,6 +5278,9 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   loadDoc: (doc, role = get().canvasRole, options) => {
+    // An edit still inside the debounce belongs to the outgoing Canvas. Preserve it as that
+    // principal's local draft now; its version-fenced sync may finish in the background.
+    if (doc.id !== get().doc.id) flushPendingAutosave()
     _cfgEdit = { id: '', t: 0 }
     // A canvas document is not execution authority. Any badge that claims a server-side result or
     // run is checked before it is shown again; recovery below then installs readable retained
@@ -5471,6 +5474,7 @@ useStore.subscribe((state) => {
 // version-fenced server save. Drafts are never retried in the background after a transport failure;
 // the Workspace/Canvas chrome exposes an explicit Retry action.
 let _saveTimer: ReturnType<typeof setTimeout> | undefined
+let _pendingAutosave = false
 let _lastDoc: CanvasDoc | undefined
 let _bootstrapped = false  // don't autosave the throwaway initial empty doc before the real one loads
 useStore.subscribe((s) => {
@@ -5489,38 +5493,53 @@ useStore.subscribe((s) => {
   // normally just a safety net for a server/external document refresh or a role changing mid-debounce.
   if (!roleCanEdit(s.canvasRole)) {
     clearTimeout(_saveTimer)
+    _pendingAutosave = false
     if (!s.saved) useStore.setState({ saved: true })
     return
   }
   if (s.saved) useStore.setState({ saved: false })
   clearTimeout(_saveTimer)
+  _pendingAutosave = true
   _saveTimer = setTimeout(() => {
-    const state = useStore.getState()
-    const principalId = state.currentUser?.id
-    if (!principalId || !roleCanEdit(state.canvasRole)) return
-    if (state.doc.nodes.some((node) => numericDraftInvalidReason(node, state.numericParamDrafts[node.id]))) return
-    const doc = state.doc
-    const previous = state.localDrafts.find((draft) => draft.draftId === doc.id)
-    const draft = draftForDoc(principalId, doc, previous?.baseVersion ?? state.serverVersion, previous)
-    const stored = writeCanvasDraft(draft)
-    const visibleDraft = draftAfterStorageWrite(draft, stored)
-    useStore.setState((current) => ({
-      currentDraftId: draft.draftId,
-      localDrafts: replaceDraft(current.localDrafts, visibleDraft),
-      saved: stored.ok,
-      draftStorageErrors: stored.ok ? current.draftStorageErrors : [...current.draftStorageErrors, stored.error!],
-    }))
-    if (!stored.ok) {
-      useStore.getState().pushToast(stored.error!, 'error')
-      return
-    }
-    // A new local-only Canvas is synchronized only through its explicit Retry control. Existing
-    // online Canvases retain autosave, now protected by the persisted base-version CAS.
-    if (draft.baseVersion != null) {
-      void useStore.getState().retryLocalDraft(draft.draftId, { notify: false })
-    }
+    _pendingAutosave = false
+    persistPendingAutosaveDraft()
   }, 400)
 })
+
+function persistPendingAutosaveDraft() {
+  const state = useStore.getState()
+  const principalId = state.currentUser?.id
+  if (!principalId || !roleCanEdit(state.canvasRole)) return
+  if (state.doc.nodes.some((node) => numericDraftInvalidReason(node, state.numericParamDrafts[node.id]))) return
+  const doc = state.doc
+  const previous = state.localDrafts.find((draft) => draft.draftId === doc.id)
+  const draft = draftForDoc(principalId, doc, previous?.baseVersion ?? state.serverVersion, previous)
+  const stored = writeCanvasDraft(draft)
+  const visibleDraft = draftAfterStorageWrite(draft, stored)
+  useStore.setState((current) => ({
+    currentDraftId: draft.draftId,
+    localDrafts: replaceDraft(current.localDrafts, visibleDraft),
+    saved: stored.ok,
+    draftStorageErrors: stored.ok ? current.draftStorageErrors : [...current.draftStorageErrors, stored.error!],
+  }))
+  if (!stored.ok) {
+    useStore.getState().pushToast(stored.error!, 'error')
+    return
+  }
+  // A new local-only Canvas is synchronized only through its explicit Retry control. Existing
+  // online Canvases retain autosave, now protected by the persisted base-version CAS.
+  if (draft.baseVersion != null) {
+    void useStore.getState().retryLocalDraft(draft.draftId, { notify: false })
+  }
+}
+
+/** Persist an edit still inside the debounce before a different Canvas replaces the document. */
+function flushPendingAutosave() {
+  if (!_pendingAutosave) return
+  clearTimeout(_saveTimer)
+  _pendingAutosave = false
+  persistPendingAutosaveDraft()
+}
 
 // Flush an edit still inside the debounce to its principal-scoped record on tab close. Do not start a
 // remote save during unload: its response cannot reliably advance/remove the local draft, and a
