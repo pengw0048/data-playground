@@ -129,6 +129,41 @@ describe('Yjs hydration decisions', () => {
     expect(currentResults).toHaveBeenCalledOnce()
     authority.destroy()
   })
+
+  it('does not let a reconnecting peer replay a cancelled run as queued', async () => {
+    useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
+    const local = {
+      ...doc,
+      nodes: [{
+        ...doc.nodes[0],
+        data: { ...doc.nodes[0].data, status: 'stale' as const },
+      }],
+    }
+    useStore.setState({ doc: local })
+    const activeRuns = vi.spyOn(api, 'activeRuns').mockResolvedValue([])
+    vi.spyOn(api, 'currentResults').mockResolvedValue({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['source'], unknownNodeIds: [], results: [],
+    })
+    const authority = new YSyncReplica()
+    const peerNode = new Y.Map<unknown>()
+    peerNode.set('type', 'source')
+    peerNode.set('x', 0)
+    peerNode.set('y', 0)
+    peerNode.set('parentId', null)
+    peerNode.set('dataJson', JSON.stringify({ ...doc.nodes[0].data, status: 'queued' }))
+    authority.doc.getMap<Y.Map<unknown>>('nodes').set('source', peerNode)
+    authority.markSeedReady()
+    startYSync(() => undefined)
+
+    const reply = authority.encodeState(encodeYStateVector())
+    expect(reply).not.toBeNull()
+    completeYSync(reply!)
+
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('checking')
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+    expect(activeRuns).toHaveBeenCalledWith(doc.id)
+    authority.destroy()
+  })
 })
 
 describe('YSyncReplica readiness', () => {
