@@ -33,6 +33,9 @@ export interface WorkspaceColumnFilters {
   source?: string
   updatedAfter?: string
   updatedBefore?: string
+  rowsMin?: number
+  rowsMax?: number
+  owner?: string
 }
 
 export interface WorkspaceBrowseQuery {
@@ -57,11 +60,17 @@ const COLUMN_FILTER_WIRE_KEYS: Record<string, keyof WorkspaceColumnFilters> = {
   source: 'source',
   updated_after: 'updatedAfter',
   updated_before: 'updatedBefore',
+  rows_min: 'rowsMin',
+  rows_max: 'rowsMax',
+  owner: 'owner',
 }
-const COLUMN_FILTER_KEY_ORDER = ['name', 'source', 'updated_after', 'updated_before'] as const
+const COLUMN_FILTER_KEY_ORDER = [
+  'name', 'source', 'updated_after', 'updated_before', 'rows_min', 'rows_max', 'owner',
+] as const
 
 const DATE_VALUE = /^\d{4}-\d{2}-\d{2}$/
 const SOURCE_VALUE = /^(local|mount:[^\s,]{1,128})$/
+const ROWS_VALUE = /^\d{1,15}$/
 
 const DEFAULT_QUERY: WorkspaceBrowseQuery = { version: WORKSPACE_BROWSE_QUERY_VERSION }
 
@@ -85,7 +94,12 @@ function isDateValue(value: string): boolean {
   return DATE_VALUE.test(value) && !Number.isNaN(new Date(`${value}T00:00:00`).getTime())
 }
 
-/** Drop invalid values, clamp lengths, and keep the updated range ordered. */
+function normalizeRowsBound(value: number | undefined): number | undefined {
+  if (value == null || !Number.isSafeInteger(value) || value < 0) return undefined
+  return value
+}
+
+/** Drop invalid values, clamp lengths, and keep the updated/rows ranges ordered. */
 export function normalizeColumnFilters(
   filters: WorkspaceColumnFilters | undefined,
 ): WorkspaceColumnFilters | undefined {
@@ -102,6 +116,13 @@ export function normalizeColumnFilters(
   if (after && before && after > before) [after, before] = [before, after]
   if (after) normalized.updatedAfter = after
   if (before) normalized.updatedBefore = before
+  let rowsMin = normalizeRowsBound(filters.rowsMin)
+  let rowsMax = normalizeRowsBound(filters.rowsMax)
+  if (rowsMin != null && rowsMax != null && rowsMin > rowsMax) [rowsMin, rowsMax] = [rowsMax, rowsMin]
+  if (rowsMin != null) normalized.rowsMin = rowsMin
+  if (rowsMax != null) normalized.rowsMax = rowsMax
+  const owner = filters.owner?.trim().slice(0, MAX_COLUMN_FILTER_VALUE_CHARS)
+  if (owner) normalized.owner = owner
   return Object.keys(normalized).length ? normalized : undefined
 }
 
@@ -119,10 +140,16 @@ export function parseColumnFilterMap(
     if (!key) continue
     const encoded = trimmed.slice(sep + 1).trim()
     if (!encoded || encoded.length > MAX_COLUMN_FILTER_VALUE_CHARS * 3) continue
+    let value: string
     try {
-      filters[key] = decodeURIComponent(encoded)
+      value = decodeURIComponent(encoded)
     } catch {
       continue
+    }
+    if (key === 'rowsMin' || key === 'rowsMax') {
+      if (ROWS_VALUE.test(value)) filters[key] = Number(value)
+    } else {
+      filters[key] = value
     }
   }
   return normalizeColumnFilters(filters)
@@ -134,7 +161,7 @@ function serializeColumnFilterMap(filters: WorkspaceColumnFilters | undefined): 
   const parts: string[] = []
   for (const wireKey of COLUMN_FILTER_KEY_ORDER) {
     const value = normalized[COLUMN_FILTER_WIRE_KEYS[wireKey]!]
-    if (value) parts.push(`${wireKey}:${encodeURIComponent(value)}`)
+    if (value != null && value !== '') parts.push(`${wireKey}:${encodeURIComponent(String(value))}`)
   }
   return parts.length ? parts.join(',') : undefined
 }

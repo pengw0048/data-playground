@@ -717,4 +717,45 @@ test.describe('workspace column filters', () => {
       await page.request.delete(`/api/canvas/${encodeURIComponent(betaId)}`)
     }
   })
+
+  test('filters by row count and owner through the projected columns', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    const suffix = Date.now()
+    const canvasId = `workspace-rows-owner-${suffix}`
+    const canvasName = `Rows owner ${suffix}`
+    const created = await page.request.post('/api/canvas', {
+      data: { id: canvasId, name: canvasName, version: 1, nodes: [], edges: [] },
+    })
+    expect(created.ok()).toBe(true)
+
+    try {
+      await page.goto('/#/workspace')
+      await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
+
+      // The rows column filters to datasets with a tracked count; an impossible floor matches nothing.
+      await page.getByTestId('workspace-filter-rows').click()
+      await page.getByLabel('At least').fill('999999999999')
+      await page.getByRole('button', { name: 'Apply' }).click()
+      await expect(page).toHaveURL(/rows_min%3A999999999999/)
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+
+      await page.reload()
+      await expect(page).toHaveURL(/rows_min%3A999999999999/)
+      await expect(page.getByText('No items match the current filters.')).toBeVisible()
+      await page.getByRole('button', { name: 'Clear rows filter' }).click()
+      await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
+
+      // Owner options adapt with counts; committing one keeps only that owner's canvases.
+      const ownerSelect = page.getByRole('combobox', { name: 'Filter Workspace by owner' })
+      await expect(ownerSelect.getByRole('option', { name: /Local \(\d+\)/ })).toHaveCount(1)
+      await ownerSelect.selectOption('local')
+      await expect(page).toHaveURL(/cf=owner%3Alocal/)
+      await expect(await workspaceResource(page, 'canvas', canvasName)).toBeVisible()
+
+      await page.getByRole('button', { name: 'Clear filters' }).click()
+      await expect(page).toHaveURL(/#\/workspace$/)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+    }
+  })
 })

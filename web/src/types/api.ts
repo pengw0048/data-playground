@@ -414,6 +414,11 @@ export interface WorkspaceResource {
   unavailableReason?: string | null
   /** Personal favorite membership for the current actor when the server annotated the row. */
   favorited?: boolean
+  /** Catalog row stats, projected only for datasets whose backing store tracks them. */
+  rows?: number | null
+  /** Owning principal, projected only for canvases. */
+  ownerId?: string | null
+  ownerName?: string | null
 }
 export interface WorkspaceSourceStatus {
   id: string
@@ -444,7 +449,7 @@ export interface WorkspaceFacetOption {
   count?: number | null
 }
 export interface WorkspaceFacetPage {
-  field: 'kind' | 'source'
+  field: 'kind' | 'source' | 'owner'
   options: WorkspaceFacetOption[]
   nextCursor?: string | null
   hasMore: boolean

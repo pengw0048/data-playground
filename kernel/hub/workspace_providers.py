@@ -1669,7 +1669,7 @@ _PROVIDER_COUNT_REASON = "Connected sources do not report counts under Workspace
 
 
 def _local_filter_capabilities(folder_mounts: list[_MountedProvider]) -> list[dict]:
-    """Typed column filters the local lens honors; rows/owner stay absent until projected."""
+    """Typed column filters the local lens honors."""
     return [
         {"field": "name", "type": "text", "supported": True},
         {"field": "kind", "type": "categorical", "supported": True, "facet": True},
@@ -1679,6 +1679,8 @@ def _local_filter_capabilities(folder_mounts: list[_MountedProvider]) -> list[di
             *({"value": f"mount:{item.mount.id}", "label": item.mount.id}
               for item in folder_mounts),
         ]},
+        {"field": "rows", "type": "numeric_range", "supported": True},
+        {"field": "owner", "type": "categorical", "supported": True, "facet": True},
     ]
 
 
@@ -1726,6 +1728,9 @@ def facet_page(
     name: str | None = None,
     updated_after: datetime.datetime | None = None,
     updated_before: datetime.datetime | None = None,
+    rows_min: int | None = None,
+    rows_max: int | None = None,
+    owner: str | None = None,
     source_id: str | None = None,
     search: str | None = None,
     limit: int = 20,
@@ -1737,8 +1742,8 @@ def facet_page(
     offered unless its count is known to be zero; sources that cannot report membership stay
     explicitly unavailable or uncounted instead of receiving fabricated counts.
     """
-    if field not in ("kind", "source"):
-        raise ValueError("Workspace facet field must be 'kind' or 'source'")
+    if field not in ("kind", "source", "owner"):
+        raise ValueError("Workspace facet field must be 'kind', 'source', or 'owner'")
     if (container_id is None) == (query is None):
         raise ValueError(
             "Workspace facets take exactly one scope: a folder or a search query")
@@ -1746,6 +1751,8 @@ def facet_page(
         raise ValueError("A kind facet excludes its own filter; drop the kind parameter")
     if field == "source" and source_id is not None:
         raise ValueError("A source facet excludes its own filter; drop the sourceId parameter")
+    if field == "owner" and owner is not None:
+        raise ValueError("An owner facet excludes its own filter; drop the owner parameter")
     limit = max(1, min(int(limit), _FACET_MAX_LIMIT))
 
     def unavailable(reason: str) -> dict:
@@ -1773,10 +1780,14 @@ def facet_page(
         uid=uid, container_id=container_id, query=query, name=name,
         kinds=None if field == "kind" else kinds,
         updated_after=updated_after, updated_before=updated_before,
-        by_kind=field == "kind",
+        rows_min=rows_min, rows_max=rows_max,
+        owner=None if field == "owner" else owner,
+        by_kind=field == "kind", by_owner=field == "owner",
     )
     item_filters_active = (query is not None or name is not None
-                           or updated_after is not None or updated_before is not None)
+                           or updated_after is not None or updated_before is not None
+                           or rows_min is not None or rows_max is not None
+                           or owner is not None)
     if field == "kind":
         # Mount roots are locally known Folder rows; count them where the page shows them.
         if (container_id is not None and source_id is None
@@ -1787,6 +1798,14 @@ def facet_page(
             for kind in _FACET_KIND_ORDER if counts.get(kind)
         ]
         uncounted_mounts = bool(scope_mounts) and query is not None
+    elif field == "owner":
+        # Owner is a canvas projection; provider items never carry it, so mounts add no options.
+        display_names = metadb.workspace_user_display_names(counts)
+        options = sorted((
+            {"value": owner_id, "label": display_names.get(owner_id, owner_id), "count": count}
+            for owner_id, count in counts.items() if count
+        ), key=lambda option: (option["label"].lower(), option["value"]))
+        uncounted_mounts = False
     else:
         options = [{"value": "local", "label": "Local", "count": counts.get("all", 0)}
                    ] if counts.get("all") else []
@@ -1809,6 +1828,7 @@ def facet_page(
         sorted(kinds) if kinds else None, name, source_id,
         updated_after.isoformat() if updated_after is not None else None,
         updated_before.isoformat() if updated_before is not None else None,
+        rows_min, rows_max, owner,
         search, _mount_fingerprint(mounts, invalid),
     ]
     after_value = _facet_cursor_decode(cursor, binding)
@@ -1870,6 +1890,9 @@ def browse_local_source(
     name: str | None = None,
     updated_after: datetime.datetime | None = None,
     updated_before: datetime.datetime | None = None,
+    rows_min: int | None = None,
+    rows_max: int | None = None,
+    owner: str | None = None,
     source_id: str | None = None,
     bind_cursor: bool = True,
 ) -> dict:
@@ -1916,10 +1939,14 @@ def browse_local_source(
         name=name,
         updated_after=updated_after,
         updated_before=updated_before,
+        rows_min=rows_min,
+        rows_max=rows_max,
+        owner=owner,
     )
     # Item filters never apply to provider roots, so an actively filtered page omits them.
     filtered = (source_id is not None or name is not None
-                or updated_after is not None or updated_before is not None)
+                or updated_after is not None or updated_before is not None
+                or rows_min is not None or rows_max is not None or owner is not None)
     connected_sources = [] if filtered else [
         _connected_source_resource(item) for item in folder_mounts
     ]
@@ -2494,6 +2521,8 @@ def search(query: str, *, uid: str, limit: int = 25,
            name: str | None = None,
            updated_after: datetime.datetime | None = None,
            updated_before: datetime.datetime | None = None,
+           rows_min: int | None = None, rows_max: int | None = None,
+           owner: str | None = None,
            source_id: str | None = None) -> dict:
     """Search local metadata and declared provider search surfaces in source-grouped pages."""
     normalized = " ".join(query.split()).lower()
@@ -2515,13 +2544,15 @@ def search(query: str, *, uid: str, limit: int = 25,
         sources = [sources[index] for index in kept]
         source_ids = [source_ids[index] for index in kept]
     filters_active = (bool(kinds) or name is not None
-                      or updated_after is not None or updated_before is not None)
+                      or updated_after is not None or updated_before is not None
+                      or rows_min is not None or rows_max is not None or owner is not None)
     binding = normalized if not filters_active and source_id is None else "\n".join([
         normalized,
         json.dumps([
             sorted(kinds) if kinds else None, name, source_id,
             updated_after.isoformat() if updated_after is not None else None,
             updated_before.isoformat() if updated_before is not None else None,
+            rows_min, rows_max, owner,
         ], separators=(",", ":")),
     ])
     fingerprint = _mount_fingerprint(mounts, invalid)
@@ -2550,7 +2581,8 @@ def search(query: str, *, uid: str, limit: int = 25,
             page = metadb.workspace_search(
                 normalized, uid=uid, limit=limit, cursor=previous["cursor"],
                 kinds=kinds, name=name,
-                updated_after=updated_after, updated_before=updated_before)
+                updated_after=updated_after, updated_before=updated_before,
+                rows_min=rows_min, rows_max=rows_max, owner=owner)
             items = page["items"]
             completeness = "page" if page["nextCursor"] is not None else "complete"
             status = _search_source_status(

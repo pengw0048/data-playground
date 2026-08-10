@@ -946,6 +946,83 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('combobox', { name: 'Filter Workspace by source' })).not.toBeInTheDocument()
   })
 
+  it('projects rows and owner columns and commits a rows range filter server-side', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT,
+      items: [
+        { ...DATASET, parentId: ROOT.id, rows: 50000 },
+        { ...CANVAS, ownerId: 'peer', ownerName: 'Peer Researcher' },
+      ],
+      nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    const view = render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('50,000')).toBeVisible()
+    expect(screen.getByText('Peer Researcher')).toBeVisible()
+
+    fireEvent.click(screen.getByTestId('workspace-filter-rows'))
+    fireEvent.change(screen.getByLabelText('At least'), { target: { value: '1000' } })
+    fireEvent.change(screen.getByLabelText('At most'), { target: { value: '90000' } })
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(store.workspaceBrowseQuery).toContain('rows_min%3A1000')
+    expect(store.workspaceBrowseQuery).toContain('rows_max%3A90000')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', rowsMin: 1000, rowsMax: 90000 },
+    ))
+
+    const chips = screen.getByRole('group', { name: 'Active Workspace filters' })
+    expect(within(chips).getByText('Rows 1,000–90,000')).toBeVisible()
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.click(within(chips).getByRole('button', { name: 'Clear rows filter' }))
+    expect(store.workspaceBrowseQuery).toBe('')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root', { limit: 50, cursor: undefined, source: 'local' },
+    ))
+  })
+
+  it('offers adaptive owner options and applies the owner filter server-side', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    mocks.workspaceFacets.mockImplementation(async (params: { field: 'kind' | 'source' | 'owner' }) => (
+      params.field === 'owner'
+        ? {
+            field: 'owner',
+            options: [
+              { value: 'local', label: 'Local', count: 1 },
+              { value: 'peer', label: 'Peer Researcher', count: 2 },
+            ],
+            nextCursor: null, hasMore: false, completeness: 'complete', reason: null,
+          }
+        : {
+            field: params.field, options: [],
+            nextCursor: null, hasMore: false, completeness: 'complete', reason: null,
+          }
+    ))
+    const view = render(<WorkspaceExplorer />)
+
+    const ownerSelect = await screen.findByRole('combobox', { name: 'Filter Workspace by owner' })
+    await waitFor(() => expect(
+      within(ownerSelect).getByRole('option', { name: 'Peer Researcher (2)' }),
+    ).toBeInTheDocument())
+    mocks.workspaceBrowse.mockClear()
+    fireEvent.change(ownerSelect, { target: { value: 'peer' } })
+    expect(store.workspaceBrowseQuery).toContain('cf=owner%3Apeer')
+    view.rerender(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledWith(
+      'workspace-local-root',
+      { limit: 50, cursor: undefined, source: 'local', owner: 'peer' },
+    ))
+    const chips = screen.getByRole('group', { name: 'Active Workspace filters' })
+    expect(within(chips).getByText('Owner: Peer Researcher')).toBeVisible()
+  })
+
   it('narrows a committed search with kind and column filters', async () => {
     store.workspaceSearchQuery = 'analysis'
     store.workspaceBrowseQuery = 'wq=1&kind=canvas&cf=name%3Adraft'
@@ -1081,11 +1158,11 @@ describe('WorkspaceExplorer', () => {
     expect(within(kindSelect).queryByRole('option', { name: /Folders/ })).not.toBeInTheDocument()
     expect(kindSelect).toHaveAttribute(
       'title', 'Connected sources do not report counts under Workspace filters.')
-    expect(mocks.workspaceFacets).toHaveBeenCalledTimes(1)
     expect(mocks.workspaceFacets).toHaveBeenCalledWith(expect.objectContaining({
       field: 'kind', q: 'analysis',
     }))
-    expect(mocks.workspaceFacets.mock.calls[0]?.[0].containerId).toBeUndefined()
+    const kindCall = mocks.workspaceFacets.mock.calls.find((call) => call[0].field === 'kind')?.[0]
+    expect(kindCall.containerId).toBeUndefined()
   })
 
   it('keeps plain typed filtering when a source cannot facet', async () => {

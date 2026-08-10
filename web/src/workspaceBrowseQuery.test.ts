@@ -86,6 +86,25 @@ describe('workspaceBrowseQuery', () => {
     })
   })
 
+  it('round-trips rows and owner filters and keeps the rows range ordered', () => {
+    expect(parseColumnFilterMap('rows_min:1000,rows_max:90000,owner:peer-user')).toEqual({
+      rowsMin: 1000, rowsMax: 90000, owner: 'peer-user',
+    })
+    expect(parseColumnFilterMap('rows_min:90000,rows_max:1000')).toEqual({
+      rowsMin: 1000, rowsMax: 90000,
+    })
+    expect(parseColumnFilterMap('rows_min:-5,rows_max:abc')).toBeUndefined()
+    expect(parseColumnFilterMap('rows_min:0')).toEqual({ rowsMin: 0 })
+
+    const encoded = serializeBrowseState({
+      sortMode: 'source', kindFilter: 'all', viewMode: 'list',
+      columnFilters: { rowsMin: 0, rowsMax: 500, owner: 'peer-user' },
+    })
+    expect(browseStateFromQuery(encoded).columnFilters).toEqual({
+      rowsMin: 0, rowsMax: 500, owner: 'peer-user',
+    })
+  })
+
   it('normalizes and extracts browse keys without leaking dataset-viewer keys', () => {
     const mixed = new URLSearchParams({
       wq: '1', sort: 'updated', order: 'desc', kind: 'dataset', view: 'grid',

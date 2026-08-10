@@ -1025,6 +1025,8 @@ def _local_filter_capabilities(*mount_ids: str) -> list[dict]:
             {"value": "local", "label": "Local"},
             *({"value": f"mount:{mount_id}", "label": mount_id} for mount_id in mount_ids),
         ], facet=True),
+        entry("rows", "numeric_range"),
+        entry("owner", "categorical", facet=True),
     ]
 
 
@@ -5026,6 +5028,125 @@ def test_workspace_column_filters_combine_with_sort_and_bind_the_cursor(workspac
     finally:
         for canvas in canvases:
             metadb.delete_canvas_cascade(canvas["id"])
+
+
+def test_workspace_rows_and_owner_filters_project_apply_and_bind(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-rows-owner")
+    peer = f"workspace-peer-{token}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=peer, name="Peer Researcher"))
+    mine = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-mine")
+    theirs = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=folder["id"],
+        expected_container_version=folder["version"],
+        name=f"workspace-{token}-theirs")
+    uris = [f"file:///workspace-{token}-rows{index}.parquet" for index in (1, 2)]
+    try:
+        with metadb.session() as session:
+            shared = session.get(metadb.Canvas, theirs["id"])
+            shared.owner_id, shared.visibility = peer, "workspace"
+        for uri, rows in zip(uris, (100, 50_000), strict=True):
+            suffix = uri.removeprefix(f"file:///workspace-{token}-").removesuffix(".parquet")
+            metadb.catalog_upsert_entry(uri, f"workspace-{token}-{suffix}", {
+                "id": f"tbl_{token}_{suffix}", "name": f"workspace-{token}-{suffix}",
+                "uri": uri, "version": "v1", "rowCount": rows,
+            })
+        with metadb.session() as session:
+            registration_ids = list(session.scalars(select(
+                metadb.CatalogEntry.registration_id).where(metadb.CatalogEntry.uri.in_(uris))))
+            session.execute(
+                metadb.WorkspacePlacement.__table__.update().where(
+                    metadb.WorkspacePlacement.target_id.in_(registration_ids),
+                ).values(container_id=folder["id"]))
+        with TestClient(app) as client:
+            def names(page: dict) -> set[str]:
+                return {item["name"].removeprefix(f"workspace-{token}-")
+                        for item in page["items"]}
+
+            default_page = client.get(f"/api/workspace/containers/{folder['id']}")
+            assert default_page.status_code == 200, default_page.text
+            by_name = {item["name"].removeprefix(f"workspace-{token}-"): item
+                       for item in default_page.json()["items"]}
+            assert by_name["rows1"]["rows"] == 100
+            assert by_name["rows2"]["rows"] == 50_000
+            assert by_name["mine"]["ownerId"] == metadb.DEFAULT_USER_ID
+            assert by_name["theirs"] == {**by_name["theirs"],
+                                         "ownerId": peer, "ownerName": "Peer Researcher"}
+            assert by_name["mine"]["rows"] is None
+            assert by_name["rows1"]["ownerId"] is None
+
+            big = client.get(f"/api/workspace/containers/{folder['id']}",
+                             params=[("rowsMin", 1_000)])
+            assert big.status_code == 200, big.text
+            assert names(big.json()) == {"rows2"}
+            assert big.json()["items"][0]["rows"] == 50_000
+            small = client.get(f"/api/workspace/containers/{folder['id']}",
+                               params=[("rowsMin", 10), ("rowsMax", 999)])
+            assert small.status_code == 200, small.text
+            assert names(small.json()) == {"rows1"}
+
+            owned = client.get(f"/api/workspace/containers/{folder['id']}",
+                               params=[("owner", peer)])
+            assert owned.status_code == 200, owned.text
+            assert names(owned.json()) == {"theirs"}
+            assert owned.json()["items"][0]["ownerName"] == "Peer Researcher"
+
+            searched = client.get("/api/workspace/search", params=[
+                ("q", f"workspace-{token}"), ("rowsMin", 1_000)])
+            assert searched.status_code == 200, searched.text
+            local_group = next(group for group in searched.json()["groups"]
+                               if group["source"]["id"] == "local")
+            assert local_group["source"]["completeness"] == "complete"
+            assert {item["name"].removeprefix(f"workspace-{token}-")
+                    for item in local_group["items"]} == {"rows2"}
+
+            first = client.get(f"/api/workspace/containers/{folder['id']}", params=[
+                ("limit", 1), ("rowsMin", 10), ("sort", "name"), ("order", "asc")])
+            assert first.status_code == 200, first.text
+            cursor = first.json()["nextCursor"]
+            assert cursor is not None
+            mismatched = client.get(f"/api/workspace/containers/{folder['id']}", params=[
+                ("limit", 1), ("rowsMin", 20), ("sort", "name"), ("order", "asc"),
+                ("cursor", cursor)])
+            assert mismatched.status_code == 422
+            assert "does not match" in mismatched.text
+
+            inverted = client.get(f"/api/workspace/containers/{folder['id']}",
+                                  params=[("rowsMin", 10), ("rowsMax", 5)])
+            assert inverted.status_code == 422
+            assert "rows-minimum" in inverted.text
+
+            with metadb.session() as session:
+                local_name = session.get(metadb.User, metadb.DEFAULT_USER_ID).name
+            owners = client.get("/api/workspace/facets", params=[
+                ("field", "owner"), ("containerId", folder["id"])])
+            assert owners.status_code == 200, owners.text
+            assert owners.json()["options"] == sorted([
+                {"value": metadb.DEFAULT_USER_ID, "label": local_name, "count": 1},
+                {"value": peer, "label": "Peer Researcher", "count": 1},
+            ], key=lambda option: (option["label"].lower(), option["value"]))
+            assert owners.json()["completeness"] == "complete"
+            own_owner = client.get("/api/workspace/facets", params=[
+                ("field", "owner"), ("containerId", folder["id"]), ("owner", peer)])
+            assert own_owner.status_code == 422
+            assert "excludes its own filter" in own_owner.text
+            kinds_under_rows = client.get("/api/workspace/facets", params=[
+                ("field", "kind"), ("containerId", folder["id"]), ("rowsMin", 10)])
+            assert kinds_under_rows.status_code == 200, kinds_under_rows.text
+            assert [(option["value"], option["count"])
+                    for option in kinds_under_rows.json()["options"]] == [("dataset", 2)]
+    finally:
+        for canvas in (mine, theirs):
+            metadb.delete_canvas_cascade(canvas["id"])
+        for uri in uris:
+            metadb.catalog_delete_entry(uri)
+        with metadb.session() as session:
+            session.execute(delete(metadb.User).where(metadb.User.id == peer))
 
 
 def test_workspace_source_filter_is_capability_advertised_and_honest(

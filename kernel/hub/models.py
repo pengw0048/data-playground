@@ -1290,6 +1290,11 @@ class WorkspaceResource(Wire):
     updated_at: datetime.datetime | None = None
     # Personal successful-open timestamp; never advances collaborative resource updated_at.
     last_opened_at: datetime.datetime | None = None
+    # Projected only where the backing store has them: catalog row stats for datasets,
+    # the owning principal for canvases. Absent fields mean "not tracked", never zero.
+    rows: int | None = Field(default=None, ge=0)
+    owner_id: str | None = None
+    owner_name: str | None = None
     catalog_folder_id: str | None = None
     catalog_folder_state: Literal["current", "detached"] | None = None
     catalog_folder_path: str | None = None
@@ -1376,7 +1381,7 @@ class WorkspaceFacetOption(Wire):
 
 class WorkspaceFacetPage(Wire):
     """Bounded adaptive options for one categorical filter, never a fabricated count."""
-    field: Literal["kind", "source"]
+    field: Literal["kind", "source", "owner"]
     options: list[WorkspaceFacetOption] = []
     next_cursor: str | None = None
     has_more: bool = False
