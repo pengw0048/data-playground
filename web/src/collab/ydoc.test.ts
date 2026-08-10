@@ -1,7 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
+import { api } from '../api/client'
 import { useStore } from '../store/graph'
-import { completeYSync, hydrateIfEmpty, startYSync, stopYSync, YSyncReplica } from './ydoc'
+import {
+  completeYSync, encodeYStateVector, hydrateIfEmpty, startYSync, stopYSync, YSyncReplica,
+} from './ydoc'
 
 const doc = {
   id: 'collab-test', version: 1, name: 'Collab test', edges: [], requirements: [],
@@ -17,6 +20,11 @@ describe('Yjs hydration decisions', () => {
   beforeEach(() => {
     stopYSync()
     useStore.setState({ doc })
+  })
+
+  afterEach(() => {
+    stopYSync()
+    vi.restoreAllMocks()
   })
 
   it('seeds only after the relay explicitly elects this replica', () => {
@@ -77,6 +85,49 @@ describe('Yjs hydration decisions', () => {
       history: 'recent',
     })
     replica.destroy()
+  })
+
+  it('revalidates a ready peer latest-result claim after directed state-vector sync', async () => {
+    const local = {
+      ...doc,
+      nodes: [{
+        ...doc.nodes[0],
+        data: { ...doc.nodes[0].data, status: 'stale' as const },
+      }],
+    }
+    useStore.setState({ doc: local })
+    const currentResults = vi.spyOn(api, 'currentResults').mockResolvedValue({
+      latestNodeIds: [], failedNodeIds: [], staleNodeIds: ['source'], unknownNodeIds: [], results: [],
+    })
+    const authority = new YSyncReplica()
+    const peerNode = new Y.Map<unknown>()
+    peerNode.set('type', 'source')
+    peerNode.set('x', 0)
+    peerNode.set('y', 0)
+    peerNode.set('parentId', null)
+    peerNode.set('dataJson', JSON.stringify({
+      ...doc.nodes[0].data,
+      title: 'Peer source',
+      status: 'latest',
+      lastRun: { rows: 4, ms: 12, placement: 'local' },
+    }))
+    authority.doc.getMap<Y.Map<unknown>>('nodes').set('source', peerNode)
+    authority.doc.getMap('meta').set('name', 'Peer document')
+    authority.markSeedReady()
+    startYSync(() => undefined)
+
+    const reply = authority.encodeState(encodeYStateVector())
+    expect(reply).not.toBeNull()
+    completeYSync(reply!)
+
+    expect(useStore.getState().doc.name).toBe('Peer document')
+    expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+      title: 'Peer source', status: 'checking',
+      lastRun: { rows: 4, ms: 12, placement: 'local' },
+    })
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes[0].data.status).toBe('stale'))
+    expect(currentResults).toHaveBeenCalledOnce()
+    authority.destroy()
   })
 })
 
