@@ -152,6 +152,9 @@ input, textarea, select { font-family: inherit; }
 
 /* ---- React Flow overrides ---- */
 .react-flow { background: var(--canvas); }
+/* selectionOnDrag keeps the pane in its .selection state; empty canvas is not a click target */
+.react-flow__pane.selection { cursor: default; }
+.react-flow__pane.dragging { cursor: grabbing; }
 .react-flow__attribution { display: none; }
 .react-flow__handle { border: none; }
 .react-flow__edge-path { stroke: var(--wire); stroke-width: 1.5; }
