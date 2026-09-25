@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({ workspaceFacets: vi.fn() }))
 
 vi.mock('./api/client', () => ({ api: { workspaceFacets: mocks.workspaceFacets } }))
 
-import { clearWorkspaceFacetCache, useWorkspaceFacet, type WorkspaceFacetQuery } from './workspaceFacets'
+import { useWorkspaceFacet, type WorkspaceFacetQuery } from './workspaceFacets'
 
 const page = (count: number): WorkspaceFacetPage => ({
   field: 'kind', options: [{ value: 'canvas', label: 'Canvases', count }],
@@ -20,7 +20,6 @@ const query = (overrides: Partial<WorkspaceFacetQuery> = {}): WorkspaceFacetQuer
 describe('useWorkspaceFacet', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    clearWorkspaceFacetCache()
   })
 
   it('stays null while disabled and never fetches', async () => {
@@ -32,20 +31,36 @@ describe('useWorkspaceFacet', () => {
     expect(mocks.workspaceFacets).not.toHaveBeenCalled()
   })
 
-  it('fetches once per state and reuses the cache for an identical state', async () => {
-    mocks.workspaceFacets.mockResolvedValue(page(3))
+  it('reuses a filter result within the mounted view', async () => {
+    mocks.workspaceFacets.mockResolvedValueOnce(page(3)).mockResolvedValueOnce(page(1))
+    const { result, rerender } = renderHook(
+      ({ name }: { name: string }) => useWorkspaceFacet({
+        enabled: true, actorId: 'alice', revision: 0, query: query({ name }),
+      }),
+      { initialProps: { name: '' } },
+    )
+    await waitFor(() => expect(result.current?.options[0]?.count).toBe(3))
+    rerender({ name: 'revenue' })
+    await waitFor(() => expect(result.current?.options[0]?.count).toBe(1))
+    rerender({ name: '' })
+    await waitFor(() => expect(result.current?.options[0]?.count).toBe(3))
+    expect(mocks.workspaceFacets).toHaveBeenCalledTimes(2)
+  })
+
+  it('fetches fresh counts when returning after resources changed outside Workspace', async () => {
+    mocks.workspaceFacets.mockResolvedValueOnce(page(3)).mockResolvedValueOnce(page(4))
     const first = renderHook(() => useWorkspaceFacet({
       enabled: true, actorId: 'alice', revision: 0, query: query(),
     }))
-    expect(first.result.current).toBeNull()
     await waitFor(() => expect(first.result.current?.options[0]?.count).toBe(3))
     first.unmount()
 
     const second = renderHook(() => useWorkspaceFacet({
       enabled: true, actorId: 'alice', revision: 0, query: query(),
     }))
-    await waitFor(() => expect(second.result.current?.options[0]?.count).toBe(3))
-    expect(mocks.workspaceFacets).toHaveBeenCalledTimes(1)
+    expect(second.result.current).toBeNull()
+    await waitFor(() => expect(second.result.current?.options[0]?.count).toBe(4))
+    expect(mocks.workspaceFacets).toHaveBeenCalledTimes(2)
   })
 
   it('never lets a slower response replace a newer filter state or poison its cache', async () => {

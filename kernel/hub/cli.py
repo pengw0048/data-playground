@@ -87,6 +87,28 @@ def _load_canvas_graph(canvas_ref: str):
 _CANCEL_ACK_TIMEOUT_S = 10.0
 
 
+class _DurableTaskOwner:
+    """CLI status/cancel view of service-owned work with no in-memory backend owner."""
+
+    cancel_acknowledges_stop = True  # the Task terminal state waits for its owned worker to stop
+
+    def status(self, run_id):
+        from hub import metadb
+        from hub.models import RunStatus
+        task = metadb.durable_task(run_id, include_admission=False)
+        if task is None:
+            raise KeyError(run_id)
+        return RunStatus.model_validate(task["status_doc"])
+
+    def cancel(self, run_id):
+        from hub.durable_tasks import request_cancel
+        from hub.models import RunStatus
+        task = request_cancel(run_id)
+        if task is None:
+            raise KeyError(run_id)
+        return RunStatus.model_validate(task["status_doc"])
+
+
 def _cancel_and_wait(owner, run_id: str, status, metadb, timeout_s: float = _CANCEL_ACK_TIMEOUT_S):
     """Request cancellation and wait a bounded interval for a truthful terminal acknowledgement."""
     import time
@@ -174,6 +196,8 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
         except (RuntimeError, OSError) as e:  # kernel failed to start / became unreachable (default backend)
             raise SystemExit(f"cannot run canvas '{cid}': {e}")
         run_id = status.run_id
+        if owner is None:
+            owner = _DurableTaskOwner()
         deadline = time.monotonic() + timeout_s
         last_reap = time.monotonic()
         try:

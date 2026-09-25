@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test } from '@playwright/test'
-import { canvasIdFromLocation } from './support/canvasRoute'
+import { canvasIdFromLocation, canvasRoutePattern } from './support/canvasRoute'
 import {
   prepareProviderAcceptanceFixture,
   providerAcceptanceNames,
@@ -412,12 +412,8 @@ test.describe('provider Workspace Source acceptance', () => {
       .getByText('value', { exact: true }).first()).toBeVisible()
     await expect(page.getByTestId('canonical-provider-dataset-context')
       .getByText('Text', { exact: true })).toBeVisible()
-    const expectedCanvasReturnUrl = new URL(
-      `/#/canvas/${encodeURIComponent(canvasId)}?node=${encodeURIComponent(exactProviderSource.id)}`,
-      page.url(),
-    ).href
     await page.getByTestId('provider-dataset-viewer').getByRole('button', { name: 'Back to Canvas' }).click()
-    await expect(page).toHaveURL(expectedCanvasReturnUrl)
+    await expect(page).toHaveURL(canvasRoutePattern(canvasId, exactProviderSource.id))
     await expect(page.locator(`.react-flow__node[data-id="${exactProviderSource.id}"]`)).toHaveClass(/selected/)
     await expect(source).toContainText('dp-file-catalog · Saved version · 2 rows · 2 columns')
 

@@ -18244,7 +18244,11 @@ def acquire_result_cache_pin(
 
 def _db_now(s) -> datetime.datetime:
     """The database server's transaction clock, normalized for SQLite's string result."""
-    value = s.scalar(select(func.now()))
+    # Reading the clock must not flush a partially assembled state transition. SQLAlchemy 2.1
+    # autoflushes Core selects too, so a ready/deleting state could reach its CHECK constraint before
+    # the caller assigns the timestamp returned here. The surrounding transaction still flushes normally.
+    with s.no_autoflush:
+        value = s.scalar(select(func.now()))
     if isinstance(value, str):
         value = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if not isinstance(value, datetime.datetime):

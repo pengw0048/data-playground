@@ -558,7 +558,9 @@ export function ERDiagram() {
               ?? (focusedTable && node.uri === lin.rootUri ? {
                 ...focusedTable,
                 uri: node.uri,
-                name: node.name || focusedTable.name,
+                // Lineage may use an opaque URI token as its fallback label. Preserve the
+                // human-readable name already resolved from the Workspace dataset.
+                name: focusedTable.name || node.name,
               } : null)
               ?? ({
                 id: `lineage:${node.uri}`,

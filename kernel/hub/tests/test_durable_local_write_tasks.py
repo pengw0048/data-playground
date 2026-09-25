@@ -1301,14 +1301,15 @@ def test_kernel_default_admits_and_publishes_managed_create(tmp_path, monkeypatc
     deps.storage.close()
 
 
+@pytest.mark.parametrize("target", ["write", None])
 def test_kernel_default_publishes_a_managed_write_without_a_submission_id(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, target):
     # MCP and direct-API callers send no submissionId; the server mints one so they publish
     # through the durable owner.
     _use_kernel_backend(monkeypatch)
     deps, graph, _source, uid = _ordinary_task_context(tmp_path)
 
-    status, owner = runs.start_run(deps, graph, "write", uid, confirmed=True)
+    status, owner = runs.start_run(deps, graph, target, uid, confirmed=True)
     assert owner is None
     task = metadb.durable_task(status.run_id)
     assert task is not None and task["task_kind"] == "managed_local_write"
@@ -1324,6 +1325,75 @@ def test_kernel_default_publishes_a_managed_write_without_a_submission_id(
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
 
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+@pytest.mark.parametrize("target", [None, "write"])
+def test_headless_kernel_write_creates_then_replaces_through_durable_owner(
+        tmp_path, monkeypatch, capsys, target):
+    from hub.cli import _headless_run
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    prior_revision = None
+    for _ in range(2):
+        assert _headless_run(
+            deps, str(graph.id), target, 20.0, as_json=True, uid=uid) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["status"] == "done" and summary["total_rows"] == 2
+        task = metadb.durable_task(summary["run_id"])
+        assert task is not None
+        receipt = task["output_receipt"]
+        assert (receipt["parentHead"]["revisionId"]
+                if receipt["parentHead"] is not None else None) == prior_revision
+        prior_revision = receipt["revisionId"]
+        logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert _managed_revision_count(logical_uri) == 2
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_headless_durable_write_timeout_cancels_queued_task(
+        tmp_path, monkeypatch, capsys):
+    from hub.cli import _headless_run
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    dispatch = durable_tasks.dispatch
+
+    def delayed_dispatch(*args):
+        timer = threading.Timer(0.5, dispatch, args=args)
+        timer.daemon = True
+        timer.start()
+
+    monkeypatch.setattr(durable_tasks, "dispatch", delayed_dispatch)
+    assert _headless_run(
+        deps, str(graph.id), None, 0.01, as_json=True, uid=uid) == 124
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "cancelled"
+    assert summary["cancel_acknowledged"] is True
+    task = metadb.durable_task(summary["run_id"])
+    assert task is not None and task["status"] == "cancelled"
+    assert task["output_receipt"] is None
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_whole_graph_write_does_not_drop_an_independent_output(tmp_path, monkeypatch):
+    from hub.models import GraphNode
+    from hub.settings import settings
+
+    monkeypatch.setattr(settings, "execution", "local-out-of-core")
+    deps, graph, source, uid = _ordinary_task_context(tmp_path)
+    graph.nodes.append(GraphNode(
+        id="independent", type="source", data={"config": {"uri": str(source)}}))
+    status, owner = runs.start_run(deps, graph, None, uid, confirmed=True)
+    assert owner is deps.runner
+    assert owner.wait_for_worker(status.run_id, timeout=20)
+    status = owner.status(status.run_id)
+    assert status.status == "done", status
+    assert {output.node_id for output in status.outputs} == {"write", "independent"}
     metadb.delete_canvas_cascade(str(graph.id))
     deps.storage.close()
 
