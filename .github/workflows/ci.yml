@@ -394,10 +394,16 @@ jobs:
         # -s keeps BACKUP_RESTORE_DRILL RPO/RTO evidence lines in the job log.
         run: cd kernel && uv run pytest -s -q hub/tests/test_backup_restore_drill.py::test_postgres_object_store_isolated_restore_drill
 
-  e2e:
-    name: e2e (Playwright — real UI on the real kernel)
+  e2e-shards:
+    # Each runner owns its kernel, workspace, and browser. Keep a single worker within the shard:
+    # browser workers sharing one kernel/catalog caused state contention in earlier CI runs.
+    name: e2e shard (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 25  # cap billed minutes (the ~17-min job) so a hang can't drain the budget
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false  # retain independent failures; the required e2e job aggregates every shard
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       CI: "true"
       # The reporter and webServer wrapper append durable, machine-readable events here. The
@@ -413,16 +419,14 @@ jobs:
           node-version: "20"
       - name: Initialize E2E timing artifact
         run: node web/scripts/e2e-timing.mjs init
-      # web FIRST: the kernel wheel force-includes ../web/dist as kernel/_web, so the SPA must be
-      # built before `uv sync` or hatchling errors ("Forced include not found").
       - name: Install web deps
         run: >-
           node web/scripts/e2e-timing.mjs phase install-web-deps --
-          bash -c 'cd web && npm install'
-      - name: Build SPA
-        run: >-
-          node web/scripts/e2e-timing.mjs phase build-spa --
-          bash -c 'cd web && npm run build'
+          bash -c 'cd web && npm ci'
+      # The editable environment builds fixtures but does not serve the SPA. The Playwright
+      # webServer builds the real SPA once, immediately before packaging its disposable wheel.
+      - name: Prepare static directory for kernel install
+        run: mkdir -p web/dist
       # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
       - name: Install kernel
         run: >-
@@ -444,12 +448,15 @@ jobs:
           bash -c 'cd web && npx playwright install chromium'
       - name: Test E2E timing aggregation
         run: cd web && npm run test:e2e-timing
-      # The Playwright project DAG runs the tagged researcher smoke first, the remaining Chromium
-      # suite second, and the minimum-viewport project last, without executing smoke fixtures twice.
-      - name: Run E2E (UX smoke first)
+      # --no-deps is essential: otherwise Playwright shards only the final project and repeats its
+      # entire dependency chain in each shard. All projects remain selected, so their disjoint tests
+      # are covered once across the four runners. File groups and project order stay unchanged;
+      # the first shard runs all fresh-workspace first-run tests before any mutating smoke scenario.
+      # Two terminal failures stop a broken kernel from consuming the rest of the job in timeouts.
+      - name: Run E2E shard ${{ matrix.shard }}/4
         run: >-
           node web/scripts/e2e-timing.mjs phase playwright-run --
-          bash -c 'cd web && npm run e2e'
+          bash -c 'cd web && npm run e2e -- --no-deps --shard=${{ matrix.shard }}/4 --workers=1 --max-failures=2'
       - name: Summarize E2E timings
         if: always()
         run: |
@@ -459,16 +466,33 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: e2e-timings
+          name: e2e-timings-shard-${{ matrix.shard }}
           path: web/e2e-timings/
           retention-days: 30
-      - name: Upload report on failure
-        if: failure()
+      - name: Upload report and raw traces on failure or cancellation
+        if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: playwright-report
-          path: web/playwright-report/
+          name: playwright-report-shard-${{ matrix.shard }}
+          path: |
+            web/playwright-report/
+            web/test-results/
           retention-days: 7
+
+  e2e:
+    # Preserve the existing branch-protection status while requiring every isolated browser shard.
+    name: e2e (Playwright — real UI on the real kernel)
+    runs-on: ubuntu-latest
+    needs: e2e-shards
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require every browser shard to pass
+        run: |
+          if [ "${{ needs.e2e-shards.result }}" != "success" ]; then
+            echo "e2e shards did not all pass: ${{ needs.e2e-shards.result }}"
+            exit 1
+          fi
 
   web-unit:
     name: web unit (vitest — store + components)
