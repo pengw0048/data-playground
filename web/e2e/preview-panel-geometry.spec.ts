@@ -138,6 +138,11 @@ test('docks a rightmost Transform preview above the toolbar at 1280x720', async 
     await page.getByRole('button', { name: /Execution target:/ }).click()
     await expect(page.getByText('Run this Canvas on', { exact: true })).toBeVisible()
     await page.keyboard.press('Escape')
+    await expect(page.getByText('Run this Canvas on', { exact: true })).toHaveCount(0)
+    // Escape belongs to the execution menu; dismiss the data panel explicitly before using
+    // the viewport controls underneath it.
+    await panel.getByRole('button', { name: 'Close', exact: true }).click()
+    await expect(panel).toBeHidden()
     await page.getByRole('button', { name: 'Fit view', exact: true }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
   } finally {
