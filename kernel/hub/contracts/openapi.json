@@ -4951,6 +4951,91 @@
         "title": "DurableTaskRetryRequest",
         "type": "object"
       },
+      "EditorInputCell": {
+        "description": "A bounded representation of a value in the actual Python input container.",
+        "properties": {
+          "pythonType": {
+            "description": "Fully qualified type of the actual input value.",
+            "title": "Pythontype",
+            "type": "string"
+          },
+          "representation": {
+            "maxLength": 300,
+            "title": "Representation",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pythonType",
+          "representation"
+        ],
+        "title": "EditorInputCell",
+        "type": "object"
+      },
+      "EditorInputSample": {
+        "description": "Input evidence captured before invoking editor code, separate from its output rows.",
+        "properties": {
+          "columnCount": {
+            "description": "Total input columns before the 20-column display cap.",
+            "minimum": 0.0,
+            "title": "Columncount",
+            "type": "integer"
+          },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Columns",
+            "type": "array"
+          },
+          "containerType": {
+            "title": "Containertype",
+            "type": "string"
+          },
+          "format": {
+            "description": "rows cells are row values; pandas cells come from the actual DataFrame.iat; arrow cells are actual Table column scalars, not converted Python row values.",
+            "enum": [
+              "rows",
+              "pandas",
+              "arrow"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "rowLimit": {
+            "const": 5,
+            "default": 5,
+            "title": "Rowlimit",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": {
+                "$ref": "#/components/schemas/EditorInputCell"
+              },
+              "type": "object"
+            },
+            "maxItems": 5,
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "format",
+          "containerType",
+          "columns",
+          "columnCount",
+          "rows"
+        ],
+        "title": "EditorInputSample",
+        "type": "object"
+      },
       "EditorTestInput": {
         "description": "Opaque, server-proved identity of the retained rows used by one editor preview.",
         "properties": {
@@ -11080,6 +11165,16 @@
             ],
             "title": "Completeness",
             "type": "string"
+          },
+          "editorInputSample": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EditorInputSample"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "editorTestInput": {
             "anyOf": [

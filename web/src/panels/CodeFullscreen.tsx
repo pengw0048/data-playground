@@ -6,6 +6,7 @@ import { useInputColumns } from '../nodes/fields'
 import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
+import { EditorInputSample } from './EditorInputSample'
 import type { ProcessorMode } from '../types/graph'
 import type { InstalledProcessorSource, ProcessorDescriptor } from '../types/api'
 import { configuredProcessorRef, exactProcessor, processorModeLabel } from '../nodes/processorIdentity'
@@ -24,6 +25,7 @@ interface EditorUpstreamRequest {
   upstreamNodeId: string
   upstreamPortId?: string
   upstreamPlanIdentity: string
+  ownsRunPanel: boolean
   baselineRunId?: string
   baselineEditorInputRunId?: string
   baselineUpstreamStatus?: string
@@ -43,6 +45,7 @@ export function CodeFullscreen() {
   const previews = useStore((s) => s.previews)
   const editorPreviews = useStore((s) => s.editorPreviews)
   const runs = useStore((s) => s.runs)
+  const openPanels = useStore((s) => s.openPanels)
   const processors = useStore((s) => s.processors)
   const transformReferences = useStore((s) => s.canvasTransformReferences)
   const kernelUp = useStore((s) => s.kernelUp)
@@ -122,6 +125,18 @@ export function CodeFullscreen() {
       doc, upstreamRequest.upstreamNodeId, upstreamRequest.upstreamPortId,
     ),
   )
+  useEffect(() => {
+    // The editor already owns confirmation and progress for its own input preparation. Do not
+    // leave a duplicate popup obscuring the code node when returning to the Canvas. Controls
+    // needing a separate parameter/drift review remain available through the explicit action.
+    if (!requestIsCurrent || !upstreamRequest?.ownsRunPanel || !editorUpstreamNodeId
+        || openPanels[editorUpstreamNodeId] !== 'run'
+        || !upstreamRun || ['parameters', 'drift', 'estimated'].includes(upstreamRun.phase)) return
+    useStore.getState().closePanel(editorUpstreamNodeId)
+    if (useStore.getState().selectedId === editorUpstreamNodeId) {
+      useStore.getState().select(upstreamRequest.editorNodeId)
+    }
+  }, [requestIsCurrent, upstreamRequest, editorUpstreamNodeId, openPanels, upstreamRun])
   const freshUpstreamRunDone = Boolean(
     requestIsCurrent && upstreamRun?.phase === 'done' && upstreamRunId
     && upstreamRunId !== upstreamRequest?.baselineRunId,
@@ -325,6 +340,7 @@ export function CodeFullscreen() {
       upstreamPlanIdentity: previewPlanIdentity(
         current.doc, editorUpstreamNodeId, editorUpstreamPortId,
       ),
+      ownsRunPanel: current.openPanels[editorUpstreamNodeId] !== 'run',
       baselineRunId: current.runs[editorUpstreamNodeId]?.status?.runId,
       baselineEditorInputRunId: baselinePreview?.result?.editorTestInput?.runId,
       baselineUpstreamStatus: current.doc.nodes.find(
@@ -477,7 +493,16 @@ export function CodeFullscreen() {
                         cancelled={upstreamRequest?.cancelled === true}
                         onConfirm={confirmUpstream}
                         onCancelConfirmation={cancelUpstreamConfirmation}
+                        onReview={() => {
+                          close()
+                          useStore.getState().openPanel(editorUpstreamNodeId!, 'run')
+                        }}
                         onCancelRun={cancelUpstreamRun} />
+                    )}
+                    {isTransform && testInput === 'upstream' && !upstreamAttemptBusy
+                      && (!requestIsCurrent || freshUpstreamResultReady) && (
+                      <EditorInputSample doc={doc} nodeId={fs.nodeId} preview={requestPreview}
+                        parameterBindings={runs[fs.nodeId]?.parameterBindings} />
                     )}
                     <DataPanel key={testInput} nodeId={fs.nodeId} editorPreview={isTransform ? (
                     usingExampleRows
@@ -1007,7 +1032,7 @@ function PromotionDescriptionDialog({
 
 function EditorUpstreamRunStatus({
   nodeId, run, resultReady, selectionFailed, cancelled,
-  onConfirm, onCancelConfirmation, onCancelRun,
+  onConfirm, onCancelConfirmation, onCancelRun, onReview,
 }: {
   nodeId: string
   run?: {
@@ -1022,6 +1047,7 @@ function EditorUpstreamRunStatus({
   onConfirm: () => void
   onCancelConfirmation: () => void
   onCancelRun: () => void
+  onReview: () => void
 }) {
   const phase = run?.phase
   const estimate = run?.estimate
@@ -1083,7 +1109,8 @@ function EditorUpstreamRunStatus({
 
   if (phase === 'parameters' || phase === 'drift' || phase === 'estimated') return (
     <section aria-label="Upstream run needs attention" role="alert" className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px] text-muted-foreground">
-      This upstream run needs attention before it can start. Its existing run controls remain authoritative.
+      This upstream run needs your parameters or input decision before it can start.
+      <button type="button" onClick={onReview} className="ml-2 font-semibold text-primary underline">Review upstream run</button>
     </section>
   )
 

@@ -513,6 +513,11 @@ function targetExecutionPlanIdentity(
     targetNodeId: nodeId,
     targetPortId: portId,
     requirements: [...(doc.requirements ?? [])].sort(),
+    parameters: targetParameterDeclarations(doc, nodeId)
+      .map(({ name, type, required, default: defaultValue, constraints }) => ({
+        name, type, required: required === true, default: defaultValue, constraints,
+      }))
+      .sort((left, right) => compareIdentityText(left.name, right.name)),
     nodes,
     edges,
   }))
@@ -3791,6 +3796,11 @@ export const useStore = create<Store>((set, get) => ({
     const owner = get().graphRun
     if (owner?.runId !== current.runId || owner.canvasId !== current.canvasId
         || owner.principalId !== current.principalId) return
+    if (cancelled.status === 'queued' || cancelled.status === 'running') {
+      set({ graphRun: { ...owner, status: cancelled } })
+      pollGraphRun(get, set, current.canvasId, current.runId)
+      return
+    }
     _polling.delete(current.runId)
     set({ graphRun: null })
     applyPerNodeStatus(set, cancelled.perNode)
@@ -3801,22 +3811,34 @@ export const useStore = create<Store>((set, get) => ({
   cancelRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     if (!hubExecutionAvailable(get)) return
-    const st = get().runs[id]?.status
+    const run = get().runs[id]
+    const st = run?.status
     if (!st) return
+    const canvasId = get().doc.id
+    const principalId = get().currentUser?.id
+    const writeAdmission = run.writeAdmission
+    const ownsRun = () => get().doc.id === canvasId && get().currentUser?.id === principalId
+      && get().runs[id]?.status?.runId === st.runId
+      && get().runs[id]?.phase === 'running'
     let cancelled: RunStatus
     try {
       cancelled = await api.cancelRun(st.runId)
+      if (cancelled.runId !== st.runId) throw new Error('Run cancellation identity changed')
     } catch {
+      if (!ownsRun()) return
       get().pushToast('Could not confirm that the run stopped. It remains active.', 'error')
       return
     }
-    if (get().runs[id]?.status?.runId !== st.runId) return
+    if (!ownsRun()) return
+    if (cancelled.status === 'queued' || cancelled.status === 'running') {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...s.runs[id], phase: 'running', status: cancelled,
+      } } }))
+      pollRun(get, set, id, st.runId, undefined, writeAdmission)
+      return
+    }
     _polling.delete(st.runId)
-    set((s) => ({ runs: { ...s.runs, [id]: {
-      ...(s.runs[id] ?? {}), phase: 'idle', status: cancelled,
-    } } }))
-    get().updateData(id, { status: 'stale' })
-    settleAnimatingNodes(set)  // clear intermediate nodes' animation now, not only when the next poll lands
+    settleTargetRun(get, set, id, cancelled, writeAdmission)
   },
 
   clearRun: (id) =>
@@ -4777,7 +4799,7 @@ export const useStore = create<Store>((set, get) => ({
         : s.runs
       return {
         doc: { ...s.doc, nodes, parameters }, runs,
-        ...(executionChanged ? { previews: {}, previewBindings: {}, schemas: {}, sizes: {} } : {}),
+        ...(executionChanged ? { previews: {}, editorPreviews: {}, previewBindings: {}, schemas: {}, sizes: {} } : {}),
       }
     })
     if (executionChanged) writePreviewBindings(get().currentUser?.id, get().doc.id, {})
@@ -6615,39 +6637,125 @@ function pollGraphRun(
   setTimeout(tick, 200)
 }
 
+function settleTargetRun(
+  get: () => Store,
+  set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
+  nodeId: string, status: RunStatus, writeOutcomeAdmission?: WriteAdmission,
+) {
+  applyPerNodeStatus(set, status.perNode)
+  const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
+  // rowsProcessed is execution work, not result cardinality. A named multi-output result is
+  // summarized by its number of outputs; a single output uses only measured result rows.
+  const resultRows = status.totalRows
+    ?? (status.outputs.length === 1 ? status.outputs[0]?.rows ?? undefined : undefined)
+  const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
+  const target = get().doc.nodes.find((node) => node.id === nodeId)
+  const publishedWrite = status.status === 'done' && target?.type === 'write'
+    ? managedWriteReceiptOutput(status.outputs, nodeId)
+    : undefined
+  set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
+    ...(s.runs[nodeId] ?? { phase } as any), status, phase,
+    writeOutcomeAdmission: status.status === 'done' ? writeOutcomeAdmission : undefined,
+    writeOutcome: status.status === 'done'
+      ? publishedWrite
+        ? { runId: status.runId, receipt: publishedWrite.receipt, outputs: publishedWrite.outputs }
+        : undefined
+      : s.runs[nodeId]?.writeOutcome,
+    writeAdmission: undefined, writeSubmissionId: undefined,
+    writeAdmissionFingerprint: undefined,
+  } } }))
+  if (status.status === 'failed') get().pushToast(presentRunError(status.error, {
+    nodeTitle: target?.data.title,
+    config: target?.data.config,
+  }).summary, 'error')
+  const g = get()
+  const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
+  g.updateData(nodeId, {
+    // A successful execution is not yet proof that this node owns a reopenable artifact.
+    // Durable Write receipts are direct evidence; every other target waits for recovery.
+    status: status.status === 'done'
+      ? publishedWrite ? 'latest' : 'checking'
+      : status.status === 'failed' ? 'failed' : 'stale',
+    lastRun: status.status === 'done'
+      ? {
+          ...(resultRows !== undefined ? { rows: resultRows } : {}),
+          ...(resultOutputCount !== undefined ? { outputCount: resultOutputCount } : {}),
+          ms: status.ms,
+          placement: status.placement,
+          ...(publishedWrite ? { writeReceiptRunId: status.runId } : {}),
+        }
+      : target?.type === 'write' && previousLastRun?.writeReceiptRunId
+        ? previousLastRun
+        : undefined,
+  })
+  if (status.status === 'done') {
+    // snapshot a version (time-travel, FR-C5)
+    const node = g.doc.nodes.find((n) => n.id === nodeId)
+    if (node) {
+      const version: NodeVersion = {
+        id: `v_${Math.floor(performance.now())}`,
+        ts: Date.now(),
+        rows: resultRows,
+        outputCount: resultOutputCount,
+        label: resultOutputCount !== undefined
+          ? `run · ${resultOutputCount} outputs`
+          : resultRows !== undefined
+            ? `run · ${resultRows} ${resultRows === 1 ? 'row' : 'rows'}`
+            : 'run · result',
+        config: { ...node.data.config },
+      }
+      g.updateData(nodeId, {
+        history: [...(node.data.history ?? []), version],
+        currentOutputVersionId: version.id,
+      })
+    }
+    // A successful full run may have just created retained Transform output evidence. Its
+    // schema is server-owned and current-plan verified, so refresh the ordinary propagation
+    // map rather than trying to infer columns from a UI preview.
+    void g.refreshSchemas()
+    void g.refreshCatalog()
+  }
+  // Upstream `done` entries may have been fused into this run. Only independently readable
+  // outputs earn a persistent check; re-resolve every temporary `checking` badge now.
+  recoverCanvasResults(get, set, get().doc)
+  // A terminal snapshot may omit steps that never started. Other live owners keep their animation.
+  if (!_polling.size && !get().graphRun) settleAnimatingNodes(set)
+}
+
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
                  nodeId: string, runId: string, reattachGeneration?: number,
                  writeOutcomeAdmission?: WriteAdmission) {
   const existing = _polling.get(runId)
   if (existing && (reattachGeneration === undefined
       || existing.reattachGeneration === reattachGeneration)) return
+  const canvasId = get().doc.id
+  const principalId = get().currentUser?.id
   const token = Symbol(runId)
   _polling.set(runId, { token, reattachGeneration })
-  const ownsPoll = () => _polling.get(runId)?.token === token
-  const stopPolling = () => { if (ownsPoll()) _polling.delete(runId) }
+  const ownsToken = () => _polling.get(runId)?.token === token
+  const ownsRun = () => ownsToken()
+    && get().doc.id === canvasId && get().currentUser?.id === principalId
+    && get().runs[nodeId]?.status?.runId === runId
+    && get().runs[nodeId]?.phase === 'running'
+    && get().doc.nodes.some((node) => node.id === nodeId)
+    && (reattachGeneration === undefined || _reattachRunsGeneration === reattachGeneration)
+  // An obsolete request must never delete a replacement poll's token.
+  const stopPolling = () => { if (ownsToken()) _polling.delete(runId) }
   let fails = 0
   const tick = async () => {
-    if (!ownsPoll()) return
-    if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
-      stopPolling()
-      return
-    }
-    // stop polling if the node was deleted mid-run (don't re-insert a runs entry for it)
-    if (!get().doc.nodes.some((n) => n.id === nodeId)) { stopPolling(); return }
+    if (!ownsRun()) { stopPolling(); return }
     let status: RunStatus
     try {
       status = await api.runStatus(runId)
+      if (status.runId !== runId) throw new Error('Run status identity changed')
       fails = 0
     } catch {
-      if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
-        stopPolling()
-        return
-      }
+      if (!ownsRun()) { stopPolling(); return }
       // Retry transient loss, then stop animation without releasing execution ownership. The server
       // may still be running; only a terminal poll, confirmed cancellation, or reload may replace it.
       if (++fails <= 6) { setTimeout(tick, 800); return }
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
-        ...(s.runs[nodeId] ?? { phase: 'running' as const }), phase: 'running',
+        ...s.runs[nodeId], phase: 'running',
         error: 'Lost track of this run because Data Playground became unreachable.',
       } } }))
       get().updateData(nodeId, { status: 'unknown' })
@@ -6659,95 +6767,14 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       stopPolling()
       return
     }
-    if (!ownsPoll()) return
-    if (reattachGeneration !== undefined && _reattachRunsGeneration !== reattachGeneration) {
-      stopPolling()
-      return
-    }
-    set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase: 'running' as const }), status } } }))
-    applyPerNodeStatus(set, status.perNode)  // animate every node on the canvas, not just the target
+    if (!ownsRun()) { stopPolling(); return }
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
-      const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
-      // rowsProcessed is execution work, not result cardinality. A named multi-output result is
-      // summarized by its number of outputs; a single output uses only measured result rows.
-      const resultRows = status.totalRows
-        ?? (status.outputs.length === 1 ? status.outputs[0]?.rows ?? undefined : undefined)
-      const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
-      const target = get().doc.nodes.find((node) => node.id === nodeId)
-      const publishedWrite = status.status === 'done' && target?.type === 'write'
-        ? managedWriteReceiptOutput(status.outputs, nodeId)
-        : undefined
-      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
-        ...(s.runs[nodeId] ?? { phase } as any), status, phase,
-        writeOutcomeAdmission: status.status === 'done' ? writeOutcomeAdmission : undefined,
-        writeOutcome: status.status === 'done'
-          ? publishedWrite
-            ? { runId: status.runId, receipt: publishedWrite.receipt, outputs: publishedWrite.outputs }
-            : undefined
-          : s.runs[nodeId]?.writeOutcome,
-        writeAdmission: undefined, writeSubmissionId: undefined,
-        writeAdmissionFingerprint: undefined,
-      } } }))
-      if (status.status === 'failed') get().pushToast(presentRunError(status.error, {
-        nodeTitle: target?.data.title,
-        config: target?.data.config,
-      }).summary, 'error')
-      const g = get()
-      const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
-      g.updateData(nodeId, {
-        // A successful execution is not yet proof that this node owns a reopenable artifact.
-        // Durable Write receipts are direct evidence; every other target waits for recovery.
-        status: status.status === 'done'
-          ? publishedWrite ? 'latest' : 'checking'
-          : status.status === 'failed' ? 'failed' : 'stale',
-        lastRun: status.status === 'done'
-          ? {
-              ...(resultRows !== undefined ? { rows: resultRows } : {}),
-              ...(resultOutputCount !== undefined ? { outputCount: resultOutputCount } : {}),
-              ms: status.ms,
-              placement: status.placement,
-              ...(publishedWrite ? { writeReceiptRunId: status.runId } : {}),
-            }
-          : target?.type === 'write' && previousLastRun?.writeReceiptRunId
-            ? previousLastRun
-            : undefined,
-      })
-      if (status.status === 'done') {
-        // snapshot a version (time-travel, FR-C5)
-        const node = g.doc.nodes.find((n) => n.id === nodeId)
-        if (node) {
-          const version: NodeVersion = {
-            id: `v_${Math.floor(performance.now())}`,
-            ts: Date.now(),
-            rows: resultRows,
-            outputCount: resultOutputCount,
-            label: resultOutputCount !== undefined
-              ? `run · ${resultOutputCount} outputs`
-              : resultRows !== undefined
-                ? `run · ${resultRows} ${resultRows === 1 ? 'row' : 'rows'}`
-                : 'run · result',
-            config: { ...node.data.config },
-          }
-          g.updateData(nodeId, {
-            history: [...(node.data.history ?? []), version],
-            currentOutputVersionId: version.id,
-          })
-        }
-        // A successful full run may have just created retained Transform output evidence. Its
-        // schema is server-owned and current-plan verified, so refresh the ordinary propagation
-        // map rather than trying to infer columns from a UI preview.
-        void g.refreshSchemas()
-        void g.refreshCatalog()
-      }
-      // Upstream `done` entries may have been fused into this run. Only independently readable
-      // outputs earn a persistent check; re-resolve every temporary `checking` badge now.
-      recoverCanvasResults(get, set, get().doc)
       stopPolling()
-      // A terminal snapshot may omit steps that never started; another live poll re-asserts its own
-      // nodes within a tick, so only a tab with no remaining run supervision settles leftovers.
-      if (!_polling.size && !get().graphRun) settleAnimatingNodes(set)
+      settleTargetRun(get, set, nodeId, status, writeOutcomeAdmission)
       return
     }
+    set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...s.runs[nodeId], status } } }))
+    applyPerNodeStatus(set, status.perNode)
     setTimeout(tick, 300)
   }
   setTimeout(tick, 200)

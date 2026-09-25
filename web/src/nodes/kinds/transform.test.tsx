@@ -71,7 +71,7 @@ describe('Transform exact processor labels', () => {
     apiMocks.getCanvas.mockReset()
     apiMocks.workspaceAddTransform.mockReset()
     useStore.setState({
-      canvasRole: 'owner', view: 'canvas', fullscreenCode: null, previews: {},
+      canvasRole: 'owner', view: 'canvas', fullscreenCode: null, previews: {}, openPanels: {},
       transformResourceId: null, transformVersion: null,
       transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
       refreshFiles: originalStoreActions.refreshFiles,
@@ -675,6 +675,43 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByRole('combobox', { name: /runs over/i })).not.toBeInTheDocument()
   })
 
+  it('shows the prepared Python input beside a failed code test and hides it for Example rows', async () => {
+    const input = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Purchases', status: 'latest' as const, config: { uri: 'purchases.parquet' } },
+    }
+    const adhoc = {
+      ...node,
+      data: { ...node.data, config: { source: 'adhoc', mode: 'map', code: 'def fn(row)\n    return row' } },
+    }
+    const doc = {
+      id: 'canvas', version: 1, requirements: [], nodes: [input, adhoc],
+      edges: [{ id: 'input', source: 'source', sourceHandle: 'out', target: 'transform', targetHandle: 'in' }],
+    }
+    useStore.setState({
+      doc, runs: {}, kernelUp: true,
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+      editorPreviews: { transform: {
+        canvasId: doc.id, nodeId: 'transform', requestGeneration: 1,
+        planIdentity: previewPlanIdentity(doc, 'transform'), parameterBindings: [],
+        result: {
+          rows: [], columns: [], error: true, failureCategory: 'syntax_error',
+          editorTestInput: { runId: 'prepared-run', nodeId: 'source', portId: 'out', label: 'Purchases', rows: 500 },
+          editorInputSample: {
+            format: 'rows', containerType: 'dict', columns: ['amount'], columnCount: 1, rowLimit: 5,
+            rows: [{ amount: { pythonType: 'decimal.Decimal', representation: "Decimal('3.14')", truncated: false } }],
+          },
+        },
+      } },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    expect(await screen.findByRole('region', { name: 'Prepared input sample' })).toHaveTextContent("Decimal('3.14')")
+    fireEvent.click(screen.getByRole('button', { name: 'Example rows' }))
+    expect(screen.queryByRole('region', { name: 'Prepared input sample' })).not.toBeInTheDocument()
+  })
+
   it('keeps Example rows local to one fullscreen editor session', async () => {
     const adhocNode = {
       ...node,
@@ -841,10 +878,15 @@ describe('Transform exact processor labels', () => {
     })
 
     await act(async () => {
-      useStore.setState({ runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } } } as any)
+      useStore.setState({
+        runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } },
+        openPanels: { sample: 'run' }, selectedId: 'sample',
+      } as any)
     })
     const confirmation = screen.getByRole('region', { name: 'Confirm upstream run' })
     expect(confirmation).toHaveTextContent('2,001 rows')
+    expect(useStore.getState().openPanels.sample).toBeUndefined()
+    expect(useStore.getState().selectedId).toBe('transform')
     fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }))
     expect(screen.getByRole('status', { name: 'Upstream run cancelled' })).toBeInTheDocument()
     expect(screen.getByTestId('code-editor')).toBeInTheDocument()

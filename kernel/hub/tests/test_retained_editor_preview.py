@@ -998,6 +998,59 @@ def test_retained_editor_preview_reuses_current_upstream_without_freezing_transf
     assert changed_edge.status_code == 200, changed_edge.text
 
 
+@pytest.mark.parametrize("backend", ["local-out-of-core", "kernel"])
+def test_retained_editor_error_keeps_exact_input_without_replaying_upstream(
+        retained_sample, monkeypatch, backend):
+    from hub.executors.engine import BuildEngine
+    from hub.executors.preview import preview_node
+    from hub.kernel import PreviewBody
+
+    graph, run_id, output = retained_sample
+    graph["nodes"][2]["data"]["config"]["code"] = "def fn(row)\n    return row"
+    lowered = []
+    original = BuildEngine._lower
+
+    def track_lower(self, node):
+        lowered.append((node.id, node.type))
+        assert node.id != "source", "the original Source must never be replayed"
+        assert node.type != "sample", "the original upstream operator must never be replayed"
+        return original(self, node)
+
+    monkeypatch.setattr(BuildEngine, "_lower", track_lower)
+    deps = get_deps()
+    if backend == "kernel":
+        class KernelPreview:
+            def preview(self, graph, node_id, k, offset, port_id, *, capture_editor_input=False):
+                body = PreviewBody.model_validate({
+                    "graph": graph.model_dump(), "node_id": node_id, "k": k,
+                    "offset": offset, "port_id": port_id,
+                    "capture_editor_input": capture_editor_input,
+                })
+                assert body.capture_editor_input
+                return preview_node(
+                    graph, node_id, k, deps.resolve_adapter, deps.registry,
+                    deps.node_builders, deps.node_specs, offset=offset,
+                    storage=deps.storage, port_id=port_id,
+                    capture_editor_input=body.capture_editor_input,
+                ).model_dump()
+
+        monkeypatch.setattr(deps, "chosen_backend", lambda *_args: "kernel")
+        monkeypatch.setattr(deps, "kernel_backend", lambda: KernelPreview())
+
+    before = metadb.list_runs(graph["id"])
+    response = _preview(graph)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["error"] and body["failureCategory"] == "syntax_error"
+    assert body["editorTestInput"]["runId"] == run_id
+    assert body["editorTestInput"]["rows"] == 3
+    assert len(body["editorInputSample"]["rows"]) == 3
+    assert body["editorInputSample"]["rows"][0]["amount"]["pythonType"] == "builtins.int"
+    assert output["uri"] not in response.text
+    assert lowered == [("transform", "transform"), ("sample", "source")]
+    assert metadb.list_runs(graph["id"]) == before
+
+
 @pytest.mark.parametrize("drift", ["core-package", "node-spec", "plugin-version"])
 def test_retained_editor_preview_rejects_descriptor_drift(tmp_path, monkeypatch, drift):
     deps = get_deps()

@@ -32,6 +32,7 @@ import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 import { CanvasInboxPopover } from './CanvasInboxPopover'
 import { ConfirmationDialog } from '../components/ConfirmationDialog'
+import { CanvasRunsPanel } from '../panels/CanvasRunsPanel'
 
 /** Step counts for the single whole-graph pass; the run reports every node it will execute. */
 function rerunAllProgress(graphRun: GraphRunState | null) {
@@ -79,6 +80,7 @@ export function TopBar() {
   const [settingsCategory, setSettingsCategory] = useState<string | undefined>()
   const [canvasSettingsOpen, setCanvasSettingsOpen] = useState(false)
   const [runsOpen, setRunsOpen] = useState(false)
+  const [resultsOpen, setResultsOpen] = useState(false)
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
@@ -181,6 +183,10 @@ export function TopBar() {
         <div data-testid="canvas-run-controls" style={{ pointerEvents: 'auto' }} className="flex items-center gap-2.5">
           <PeerAvatars />
           <ExecutionTargetMenu kernelUp={kernelUp} kernelInfo={kernelInfo} canEdit={canEdit} />
+          <Button variant="outline" size="sm" className="rounded-full" aria-expanded={resultsOpen}
+            onClick={() => setResultsOpen((open) => !open)}>
+            <Icon name="clock" size={13} /> Runs &amp; results
+          </Button>
           <span className="relative">
             <Button onClick={() => graphRunActive
               ? void cancelGraphRun()
@@ -240,6 +246,8 @@ export function TopBar() {
       {settingsOpen && <SettingsModal onClose={closeSettings} initialCategory={settingsCategory} />}
       {canvasSettingsOpen && <CanvasSettingsModal onClose={() => setCanvasSettingsOpen(false)} />}
       {runsOpen && <RunHistoryModal onClose={() => setRunsOpen(false)} />}
+      {resultsOpen && <CanvasRunsPanel onClose={() => setResultsOpen(false)}
+        onHistory={() => { setResultsOpen(false); setRunsOpen(true) }} />}
       {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
       {importOpen && <ImportPipelineModal onClose={() => setImportOpen(false)} />}

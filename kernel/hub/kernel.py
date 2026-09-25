@@ -44,6 +44,7 @@ class PreviewBody(BaseModel):
     # The fixture remains request-local and is never written into the graph, catalog, or run state.
     example_rows_json: str | None = None
     example_uri: str | None = None
+    capture_editor_input: bool = False
 
 
 class ProfileJobBody(BaseModel):
@@ -468,7 +469,8 @@ def main() -> None:
             return preview_node(graph, body.node_id, body.k, resolve_adapter,
                                 deps.registry, deps.node_builders, deps.node_specs, offset=body.offset,
                                 cache=preview_cache, storage=deps.storage,
-                                port_id=body.port_id).model_dump()
+                                port_id=body.port_id,
+                                capture_editor_input=body.capture_editor_input).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
