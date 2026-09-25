@@ -2150,6 +2150,73 @@ class _ExactFixtureAdapter:
         }
 
 
+def test_provider_input_transform_create_keeps_admission_identity_and_permissions(
+        workspace_scope, tmp_path, monkeypatch):
+    from hub.plugins.processors import RegisteredProcessor
+
+    path = tmp_path / "private-provider.csv"
+    path.write_text("value\n1\n2\n")
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: [CatalogResource(
+        placement_id="dataset-a", dataset_id="dataset-a", kind="dataset",
+        name="Provider observations", uri=str(path))])
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    mount_id = f"input-{uuid.uuid4().hex}"
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": mount_id, "provider": "fixture"},
+    ]))
+    deps = get_deps()
+    adapter = _ExactFixtureAdapter(str(path))
+    monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: adapter)
+    processor_id = f"fixture.provider-input-{uuid.uuid4().hex}"
+    deps.registry.register(RegisteredProcessor(
+        id=processor_id, version="v7", title="Provider input", mode="map",
+        fn_factory=lambda _params: lambda row: row,
+    ))
+    try:
+        page = workspace_providers.browse(
+            metadb.LOCAL_WORKSPACE_ROOT_ID, uid=metadb.DEFAULT_USER_ID, limit=100)
+        resource = next((item for item in page["items"] if item.get("mountId") == mount_id), None)
+        while resource is None and page["nextCursor"] is not None:
+            page = workspace_providers.browse(
+                metadb.LOCAL_WORKSPACE_ROOT_ID, uid=metadb.DEFAULT_USER_ID, limit=100,
+                cursor=page["nextCursor"])
+            resource = next(
+                (item for item in page["items"] if item.get("mountId") == mount_id), None)
+        assert resource is not None
+        body = {
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID, "expectedContainerVersion": 1,
+            "name": "Provider input", "providerDatasetRefs": [resource["id"]],
+            "transformId": processor_id, "transformVersion": "v7",
+        }
+        with TestClient(app) as client:
+            created = client.post("/api/workspace/canvases", json=body)
+            assert created.status_code == 200, created.text
+            doc = client.get(f"/api/canvas/{created.json()['id']}").json()
+            source, transform = doc["nodes"]
+            config = source["data"]["config"]
+            assert source["type"] == "source" and transform["type"] == "transform"
+            assert created.json()["nodeId"] == transform["id"]
+            assert config["uri"].startswith("workspace-provider://")
+            assert config["providerResourceRef"] == resource["id"]
+            assert config["datasetRef"]["revisionId"] == "fixture-revision-1"
+            assert config["providerReadMode"] == "exact"
+            assert str(path) not in json.dumps(doc)
+            assert transform["data"]["config"]["version"] == "v7"
+            assert [(edge["source"], edge["target"]) for edge in doc["edges"]] == [
+                (source["id"], transform["id"])]
+
+            with metadb.session() as session:
+                before = set(session.scalars(select(metadb.Canvas.id)))
+            adapter.failure = "permission"
+            denied = client.post("/api/workspace/canvases", json=body)
+            assert denied.status_code == 403, denied.text
+            with metadb.session() as session:
+                assert set(session.scalars(select(metadb.Canvas.id))) == before
+    finally:
+        deps.registry._procs.pop(processor_id, None)
+
+
 def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         workspace_scope, tmp_path, monkeypatch):
     path = tmp_path / "provider.csv"

@@ -888,6 +888,53 @@ describe('durable full results', () => {
     expect(screen.queryByText(/test this code/)).not.toBeInTheDocument()
   })
 
+  it('keeps input preparation available after editing code that has never had input', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      }, history: [] },
+    }] }
+    const onRunUpstream = vi.fn()
+    const missingInput = boundPreview(doc, 'target', {
+      columns: [], rows: [], truncated: false, notPreviewable: true,
+      reason: 'No current retained Sample result is available.',
+    })
+    useStore.setState({
+      doc: { ...doc, nodes: doc.nodes.map((node) => ({ ...node, data: {
+        ...node.data, config: { ...node.data.config, code: 'def fn(row): return {**row, "ready": True}' },
+      } })) },
+      editorPreviews: { target: missingInput },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{ onRunUpstream }} />)
+
+    expect(screen.queryByText(/out of date/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Run upstream to test this code')).toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Run upstream' }))
+    expect(onRunUpstream).toHaveBeenCalledOnce()
+  })
+
+  it('offers another code test without showing old output after an editor change', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { source: 'adhoc', mode: 'map' }, history: [] } },
+    ] }
+    const onPreview = vi.fn()
+    useStore.setState({ doc, editorPreviews: { target: {
+      canvasId: doc.id, nodeId: 'target', planIdentity: 'old-code', requestGeneration: 1,
+      result: { columns: [{ name: 'result', type: 'string' }], rows: [{ result: 'old-output' }], truncated: false },
+    } } } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, onPreview }} />)
+
+    expect(screen.getByText('Test result out of date')).toBeInTheDocument()
+    expect(screen.queryByText('old-output')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Refresh preview' })).not.toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Test again' }))
+    expect(onPreview).toHaveBeenCalledWith(0, undefined)
+  })
+
   it('preserves connect-one-upstream guidance when the editor cannot identify an input', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },

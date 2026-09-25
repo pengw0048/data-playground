@@ -626,6 +626,9 @@ describe('Transform exact processor labels', () => {
     const dialog = screen.getByRole('dialog', { name: /Promote transform to the Library/i })
     const submit = within(dialog).getByRole('button', { name: 'Promote' })
     expect(submit).toBeDisabled()
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), {
+      target: { value: '  Normalize training rows  ' },
+    })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Description' }), {
       target: { value: '  Normalizes each row for downstream training.  ' },
     })
@@ -633,7 +636,7 @@ describe('Transform exact processor labels', () => {
     fireEvent.click(submit)
 
     await waitFor(() => expect(promote).toHaveBeenCalledWith(
-      'transform', 'Normalizes each row for downstream training.',
+      'transform', 'Normalizes each row for downstream training.', 'Normalize training rows',
     ))
   })
 
@@ -926,8 +929,11 @@ describe('Transform exact processor labels', () => {
     })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
 
-    useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
+    await act(async () => {
+      useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
+    })
     expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    expect(screen.queryByRole('status', { name: 'Upstream run progress' })).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Test code' }))
     await act(async () => {

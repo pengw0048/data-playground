@@ -524,7 +524,9 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
         await page.request.post(`${base}/api/run/current-results`, { data: { graph } }),
         'recover Canvas result badges after restart',
       )
-      expect(recoveredCanvas.latestNodeIds).toEqual(['source', 'write'])
+      // Only Write produced a retained output. Its fused Source was never run independently,
+      // so recovery must not present that Source as having a separately reopenable result.
+      expect(recoveredCanvas.latestNodeIds).toEqual(['write'])
       expect(recoveredCanvas.failedNodeIds).toEqual([])
       expect(recoveredCanvas.staleNodeIds).toEqual([])
       expect(recoveredCanvas.results).toEqual([

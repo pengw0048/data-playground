@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 import type { CatalogTable } from '../types/api'
@@ -266,6 +266,37 @@ describe('ERDiagram request truth', () => {
     expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveAttribute('data-focused', 'true')
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(mocks.tablesPage).toHaveBeenCalledWith({ uris: [providerUri, CUSTOMERS.uri], limit: 60 })
+  })
+
+  it('replaces an opaque lineage fallback with the resolved Workspace dataset name', async () => {
+    const opaqueName = 'WyJicm93c2VyLXByb3ZpZGVyIiwiYm91bmQtc291cmNlIl0'
+    const providerUri = `workspace-provider://${opaqueName}`
+    store.erFocusUri = providerUri
+    store.erFocusDatasetId = 'dataset:external.observations'
+    store.erMode = 'lineage'
+    let resolveResource!: (value: unknown) => void
+    mocks.workspaceResource.mockImplementation(() => new Promise((resolve) => { resolveResource = resolve }))
+    mocks.workspaceCanonicalDataset.mockResolvedValue({ sourceUri: providerUri, columns: ORDERS.columns })
+    mocks.lineage.mockResolvedValue({
+      rootUri: providerUri,
+      nodes: [{ id: 'provider-root', name: opaqueName, uri: providerUri, kind: 'dataset' }],
+      edges: [],
+    })
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
+    render(<ERDiagram />)
+
+    // First-open lineage can arrive before the provider's authoritative display metadata.
+    expect(await screen.findByTestId(`node-lineage:${providerUri}`)).toHaveTextContent(opaqueName)
+    await act(async () => resolveResource({
+      resource: { id: store.erFocusDatasetId, kind: 'dataset', name: 'Observations' },
+      ancestors: [], source: { id: 'provider', kind: 'provider', completeness: 'complete' },
+    }))
+
+    await waitFor(() => expect(screen.getByTestId(`node-lineage:${providerUri}`)).toHaveTextContent('Observations'))
+    expect(within(screen.getByTestId('er-focus-bar')).getByText('Observations')).toBeInTheDocument()
+    expect(screen.queryByText(opaqueName)).toBeNull()
+    fireEvent.click(screen.getByTestId('er-mode-joins'))
+    expect(await within(screen.getByTestId('er-focus-bar')).findByText('Focused: Observations')).toBeInTheDocument()
   })
 
   it('keeps a connected-source focus human-readable when switching to ER', async () => {

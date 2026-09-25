@@ -99,7 +99,6 @@ vi.mock('./CatalogDiscovery', () => ({
 }))
 
 import { WorkspaceExplorer, workspaceTimestampLabel } from './WorkspaceExplorer'
-import { clearWorkspaceFacetCache } from '../workspaceFacets'
 
 const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const, name: 'Workspace', version: 1, detached: false }
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
@@ -143,7 +142,6 @@ describe('workspaceTimestampLabel', () => {
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    clearWorkspaceFacetCache()
     mocks.workspaceFacets.mockResolvedValue({
       field: 'kind', options: [], nextCursor: null, hasMore: false,
       completeness: 'unavailable', reason: 'facets unavailable in this test',

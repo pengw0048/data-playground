@@ -3,10 +3,11 @@
  *
  * Requests debounce and cancel, and a response commits only while it still matches the latest
  * requested state, so a slower response can never replace a newer filter state. Results cache
- * in memory keyed by actor, page revision, scope, and the normalized filter state.
+ * within the mounted view, keyed by actor, page revision, scope, and normalized filters.
+ * Leaving Workspace discards the cache so returning observes resources changed elsewhere.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from './api/client'
 import type { WorkspaceFacetPage } from './types/api'
 
@@ -27,8 +28,6 @@ export interface WorkspaceFacetQuery {
 export const FACET_DEBOUNCE_MS = 150
 const FACET_CACHE_MAX_ENTRIES = 64
 
-const facetCache = new Map<string, WorkspaceFacetPage>()
-
 export function workspaceFacetKey(actorId: string, revision: number, query: WorkspaceFacetQuery): string {
   return JSON.stringify([
     actorId, revision, query.field, query.containerId ?? null, query.q ?? null,
@@ -36,10 +35,6 @@ export function workspaceFacetKey(actorId: string, revision: number, query: Work
     query.updatedAfter ?? null, query.updatedBefore ?? null,
     query.rowsMin ?? null, query.rowsMax ?? null, query.owner ?? null,
   ])
-}
-
-export function clearWorkspaceFacetCache(): void {
-  facetCache.clear()
 }
 
 /** Latest facet page for the given state, or null while unavailable, disabled, or in flight. */
@@ -50,6 +45,8 @@ export function useWorkspaceFacet(params: {
   query: WorkspaceFacetQuery
 }): WorkspaceFacetPage | null {
   const { enabled, actorId, revision, query } = params
+  const cache = useRef(new Map<string, WorkspaceFacetPage>())
+  const facetCache = cache.current
   const [page, setPage] = useState<WorkspaceFacetPage | null>(null)
   const key = enabled ? workspaceFacetKey(actorId, revision, query) : ''
 

@@ -424,8 +424,9 @@ class WorkspaceCreateCanvasBody(_StrictAuthBody):
             raise ValueError("dataset selection is limited to 50 sources")
         if (self.transform_id is None) != (self.transform_version is None):
             raise ValueError("Transform id and version must be supplied together")
-        if self.transform_id is not None and (self.dataset_ids or self.provider_dataset_refs):
-            raise ValueError("a new Canvas may start with datasets or one Transform, not both")
+        if (self.transform_id is not None
+                and len(self.dataset_ids) + len(self.provider_dataset_refs) > 1):
+            raise ValueError("a new Transform Canvas accepts at most one input dataset")
         return self
 
 

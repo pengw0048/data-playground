@@ -3355,6 +3355,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             if admission.managed and admission.intent is not None:
                 effective_write_intent = admission.intent
                 readiness = admission.exact_run_readiness
+                if (target_node_id is None and operational_canvas is not None
+                        and readiness is not None and readiness.ready
+                        and {node.id for node in graph_mod.upstream_chain(
+                            graph, unadmitted_write_target)} == {node.id for node in graph.nodes}):
+                    # A whole graph consisting solely of this Write's ancestors is the same execution
+                    # cone as an explicit Write target. Route it through the durable publisher too;
+                    # the default kernel's ordinary isolated child cannot consume a managed intent.
+                    # Keep None for graphs with independent branches so none of their work is dropped.
+                    target_node_id = unadmitted_write_target
                 if (unadmitted_write_target == target_node_id
                         and operational_canvas is not None
                         and readiness is not None and readiness.ready):

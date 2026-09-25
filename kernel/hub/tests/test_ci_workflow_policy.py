@@ -395,13 +395,36 @@ def test_release_artifact_smokes_use_the_canonical_package_version() -> None:
 
 def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
     jobs = _workflow("ci.yml")["jobs"]
-    commands = [step.get("run", "") for step in jobs["e2e"]["steps"]]
+    shards = jobs["e2e-shards"]
+    assert shards["strategy"]["matrix"] == {"shard": [1, 2, 3, 4]}
+    assert shards["strategy"]["fail-fast"] is False
+    commands = [step.get("run", "") for step in shards["steps"]]
     playwright_runs = [
         command for command in commands if "e2e-timing.mjs phase playwright-run" in command
     ]
     assert len(playwright_runs) == 1
     assert sum(command.count("cd web && npm run e2e") for command in commands) == 1
     assert "cd web && npm run e2e" in playwright_runs[0]
+    # Without --no-deps each shard would rerun the complete smoke dependency projects.
+    assert "--no-deps --shard=${{ matrix.shard }}/4 --workers=1" in playwright_runs[0]
+    assert "--max-failures=2" in playwright_runs[0]
+    assert "--project" not in playwright_runs[0]
+    assert "--grep" not in playwright_runs[0]
+
+    gate = jobs["e2e"]
+    assert gate["name"] == "e2e (Playwright — real UI on the real kernel)"
+    assert gate["needs"] == "e2e-shards"
+    assert gate["if"] == "always()"
+    gate_command = next(step["run"] for step in gate["steps"] if "run" in step)
+    for outcome in ("success", "failure", "cancelled", "skipped"):
+        completed = subprocess.run(
+            ["bash", "-c", gate_command.replace("${{ needs.e2e-shards.result }}", outcome)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (completed.returncode == 0) == (outcome == "success"), completed.stdout
+
     config = (_ROOT / "web" / "playwright.config.ts").read_text(encoding="utf-8")
     assert "name: 'chromium-first-run'" in config
     assert "grep: /@first-run/" in config

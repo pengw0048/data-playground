@@ -83,16 +83,27 @@ async function createManagedRevision(page: Page, canvasId: string, filename: str
   return receipt!
 }
 
+async function expectReportRoute(page: Page, reportId: string, compareId?: string) {
+  const jobsQuery = new URLSearchParams({ report: reportId })
+  if (compareId) jobsQuery.set('compare', compareId)
+  const legacyQuery = compareId ? `?${new URLSearchParams({ compare: compareId })}` : ''
+  const legacyHash = `#/distribution-reports/${encodeURIComponent(reportId)}${legacyQuery}`
+  const jobsHash = `#/jobs?${jobsQuery}`
+  // Legacy deep links resolve to the same Jobs detail. Store synchronization may canonicalize
+  // the URL before or after its content loads; both forms must retain the exact report pair.
+  await expect(page).toHaveURL((url) => url.hash === legacyHash || url.hash === jobsHash)
+}
+
 async function openTerminalReport(page: Page, reportId: string, viewName: string) {
   await page.getByRole('link', { name: 'Open report' }).first().click()
-  await expect(page).toHaveURL(new RegExp(`#\/distribution-reports\/${reportId}$`))
+  await expectReportRoute(page, reportId)
   await expect(page.getByRole('heading', { name: viewName })).toBeVisible()
   await expect(page.getByText('done', { exact: true })).toBeVisible({ timeout: 20_000 })
   await expect(page.getByText('Report coverage')).toBeVisible()
   await expect(page.getByText(/scanned every row selected/)).toBeVisible()
 
   await page.goto(`/#/distribution-reports/${encodeURIComponent(reportId)}`)
-  await expect(page).toHaveURL(new RegExp(`#\/distribution-reports\/${reportId}$`))
+  await expectReportRoute(page, reportId)
   await expect(page.getByRole('heading', { name: viewName })).toBeVisible()
   await expect(page.getByText('done', { exact: true })).toBeVisible()
   await expect(page.getByText('Report coverage')).toBeVisible()
@@ -183,12 +194,12 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     await drawer.getByRole('button', { name: 'Close' }).click()
 
     await page.reload()
-    await expect(page).toHaveURL(new RegExp(`#\\/distribution-reports\\/${knownSmall.reportId}\\?compare=${secondKnownSmall.reportId}$`))
+    await expectReportRoute(page, knownSmall.reportId, secondKnownSmall.reportId)
     await expect(page.getByText('Comparison coverage')).toBeVisible()
     await page.getByRole('button', { name: 'Close' }).click()
     await expect(page).toHaveURL(/#\/jobs$/)
     await page.goBack()
-    await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?report=${knownSmall.reportId}&compare=${secondKnownSmall.reportId}$`))
+    await expectReportRoute(page, knownSmall.reportId, secondKnownSmall.reportId)
     await expect(page.getByText('Comparison coverage')).toBeVisible()
     await page.goForward()
     await expect(page).toHaveURL(/#\/jobs$/)

@@ -141,6 +141,31 @@ def _artifact(uri: str):
         return session.get(metadb.LocalResultArtifact, uri)
 
 
+@pytest.mark.parametrize("state", ["ready", "deleting"])
+def test_db_clock_does_not_flush_an_incomplete_result_transition(storage, state):
+    run_id = f"run-{uuid.uuid4().hex}"
+    uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
+    pathlib.Path(uri).write_bytes(b"local-result-test")
+
+    with metadb.session() as session:
+        row = session.get(metadb.LocalResultArtifact, uri)
+        assert row is not None
+        row.state = state
+        if state == "deleting":
+            row.delete_token = uuid.uuid4().hex
+        # These transitions deliberately require the database timestamp to be atomic with state.
+        # SQLAlchemy 2.1's Core-query autoflush used to publish the incomplete row at this read.
+        stamp = metadb._db_now(session)
+        if state == "ready":
+            row.committed_at = stamp
+        else:
+            row.delete_attempted_at = stamp
+
+    saved = _artifact(uri)
+    assert saved is not None and saved.state == state
+    assert (saved.committed_at if state == "ready" else saved.delete_attempted_at) == stamp
+
+
 def test_local_result_end_to_end_owner_reader_and_gc(storage):
     run_id = f"run-{uuid.uuid4().hex}"
     uri = _ready_result(storage, run_id)

@@ -27,9 +27,28 @@ tree. This default-branch run does not start environment-heavy acceptance workfl
 ## Pull-request feedback
 
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is the required functional gate. Its browser
-job runs a serialized five-stage chain: the fresh-workspace `@first-run` journey, tagged `@ux-smoke`
-scenarios, the remaining non-overlapping suite, the minimum-viewport proof, and the reference-viewport
-proof. Release builds and the full UX fixture matrix are deliberately absent from the PR event.
+suite runs in four isolated shards, each with its own kernel, workspace, and one browser worker.
+The shards partition the existing fresh-workspace `@first-run` journey, tagged `@ux-smoke` scenarios,
+remaining non-overlapping suite, and minimum-viewport proof. The first shard runs all first-run checks
+before mutating its workspace. The required `e2e (Playwright — real UI on the real kernel)` status
+passes only when every shard succeeds. Release builds and the full UX fixture matrix are deliberately
+absent from the PR event.
+
+CI selects all projects with `--no-deps --shard=N/4`. Without `--no-deps`, Playwright would repeat the
+complete dependency projects in every applicable shard. File groups remain sequential; parallelism
+comes from separate runners, not competing browser workers on one kernel. A shard stops after two
+terminal test failures and reports failure, avoiding a cascade of timeouts against an unhealthy
+server. Healthy runs still execute the complete selected suite. Local `npm run e2e` retains the
+original project dependency chain; reproduce one CI shard with:
+
+```bash
+cd web
+CI=true npm run e2e -- --no-deps --shard=2/4 --workers=1 --max-failures=2
+```
+
+Each shard uploads `e2e-timings-shard-N`; failures and cancellations also upload the HTML report and
+raw `test-results` under `playwright-report-shard-N`. The webServer rebuilds the SPA immediately
+before packaging its disposable wheel, so CI no longer performs a second, redundant SPA build.
 
 Ray and Ray Jobs use explicit `pull_request.paths` ownership instead of running for every change. Both
 suites run when the shared image, `dp_ray`, execution, storage, destination, or plugin contracts change.
