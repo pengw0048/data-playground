@@ -132,7 +132,7 @@ function unavailableEvidence(error: unknown, table: CatalogTable | null): Manife
   return { table, detail: null, availability: 'error', message: `Couldn't verify this saved version: ${errorText(error)}` }
 }
 
-function RunInputManifest({ historyId, manifest }: {
+export function RunInputManifest({ historyId, manifest }: {
   historyId: string
   manifest?: RunInputManifestItem[] | null
 }) {
@@ -238,7 +238,7 @@ function historyOutputKey(runId: string, output: RunOutput): string {
   return JSON.stringify([runId, output.nodeId, output.portId])
 }
 
-function HistoryOutputs({ canvasId, historyId, runId, outputs, openKey, onToggle }: {
+export function HistoryOutputs({ canvasId, historyId, runId, outputs, openKey, onToggle }: {
   canvasId: string
   historyId: string
   runId?: string

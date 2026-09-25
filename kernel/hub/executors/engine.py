@@ -23,7 +23,9 @@ import pyarrow as pa
 from hub import db, graph as g, sandbox
 from hub.backends import ExactRowRestrictionUnsupported, _PreparedNodeRegistration
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
-from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode, dataset_ref_identity
+from hub.models import (
+    PREVIEWABLE_MODES, ColumnSchema, EditorInputSample, Graph, GraphNode, dataset_ref_identity,
+)
 from hub.plugins.adapters import BoundedPreviewUnsupported, display_type, revision_adapter_for_uri
 from hub.plugins.capabilities import tag_columns
 # The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
@@ -494,13 +496,15 @@ class BuildEngine:
                  bound_inputs: dict | None = None, spill_files: list | None = None,
                  schema_only: bool = False, warm=None, warm_scope: str = "",
                  pushdown: bool = False, output_node: str | None = None,
-                 reservoir_preview: bool = False):
+                 reservoir_preview: bool = False, editor_input_node: str | None = None):
         self.graph = graph
         self._nodes = g.node_map(graph)
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
         self.full = full
+        self.editor_input_node = editor_input_node if not full else None
+        self.editor_input_sample: EditorInputSample | None = None
         # The explicit Sample node is the sole interactive exception to bounded source previews. Its
         # reservoir algorithm needs a full local scan; other full-pass operators remain unavailable.
         self.reservoir_preview = reservoir_preview
@@ -1760,6 +1764,7 @@ class BuildEngine:
     # -- transform escape hatch (Python over Arrow batches) ---------------- #
     def _transform(self, node: GraphNode, parent: Relation) -> Relation:
         cfg = resolve_config(node)  # shared resolver (hub.ir): mode/code/source/processor/params/onError
+        proc = None
         if node.type == "transform" and cfg.get("source") == "library":
             pid, version = cfg.get("processor"), cfg.get("version")
             if not pid or not version:
@@ -1776,11 +1781,36 @@ class BuildEngine:
                     f"processor '{pid}' exact version '{version}' requires Canvas dependencies: "
                     + ", ".join(missing_requirements),
                 )
-            fn, mode = proc.build(cfg.get("params", {})), proc.mode
+            mode = proc.mode
+        else:
+            mode = cfg.get("mode", "map")
+
+        fmt = cfg.get("batchFormat", "rows") if mode == "map_batches" else "rows"
+        prepared_batches = None
+        prepared_schema = None
+        prepared_input = None
+        if self.editor_input_node == node.id and mode in PREVIEWABLE_MODES:
+            from hub.executors.editor_input import batch_input, input_sample
+            # Only the retained editor endpoint opts in. Its private Source -> Transform graph
+            # scans the proven artifact once, bounded by PREVIEW_SCAN. Preserve the actual batch
+            # boundaries and convert the first complete batch before compilation, so syntax errors
+            # still expose input evidence and nullable pandas columns retain their real dtype.
+            reader = parent.to_arrow_reader(batch_size=_XF_BATCH)
+            prepared_batches = list(reader)
+            prepared_schema = reader.schema
+            first = pa.Table.from_batches(prepared_batches[:1], schema=prepared_schema)
+            prepared_input = batch_input(first, fmt)
+            self.editor_input_sample = input_sample(
+                prepared_input, fmt, list(first.column_names), mode=mode)
+
+        if proc is not None:
+            fn = proc.build(cfg.get("params", {}))
         else:
             code = cfg.get("code")
-            mode = cfg.get("mode", "map")
             if not code:
+                if prepared_batches is not None:
+                    return db.conn().from_arrow(
+                        pa.Table.from_batches(prepared_batches, schema=prepared_schema))
                 return parent
             try:
                 fn = sandbox.compile_operator(code, mode)
@@ -1798,15 +1828,18 @@ class BuildEngine:
         on_error = cfg.get("onError", "raise")
         # map_batches can hand the whole batch to the cell as a pandas DataFrame or a pyarrow Table
         # (type-preserving) instead of the default row-dicts. Row modes (map/filter/flat_map) are dicts.
-        fmt = cfg.get("batchFormat", "rows") if mode == "map_batches" else "rows"
         try:
             if self.full:
                 return self._transform_spill(node, parent, fn, mode, on_error, fmt)
             # preview: input is bounded (source sampled), so in-memory is fine and fast
             if fmt in ("pandas", "arrow"):
                 tables: list = []
-                for b in parent.to_arrow_reader(batch_size=_XF_BATCH):
-                    t = _apply_batch(fn, pa.Table.from_batches([b]), fmt, on_error, node)
+                batches = (prepared_batches if prepared_batches is not None
+                           else parent.to_arrow_reader(batch_size=_XF_BATCH))
+                for index, b in enumerate(batches):
+                    t = _apply_batch(
+                        fn, pa.Table.from_batches([b]), fmt, on_error, node,
+                        prepared_input=prepared_input if index == 0 else None)
                     if t is None:  # on_error='skip' dropped this batch
                         continue
                     if tables:  # conform each later batch to the first (safe cast; loud on lossy drift)
@@ -1816,9 +1849,12 @@ class BuildEngine:
                 return db.conn().from_arrow(table)
             out: list[dict] = []
             input_row_offset = 0
-            for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
+            batches = (prepared_batches if prepared_batches is not None
+                       else parent.to_arrow_reader(batch_size=_XF_BATCH))
+            for index, batch in enumerate(batches):
                 out.extend(_apply_fn(
-                    fn, batch, mode, on_error, node, row_offset=input_row_offset))
+                    fn, batch, mode, on_error, node, row_offset=input_row_offset,
+                    prepared_rows=prepared_input if index == 0 else None))
                 input_row_offset += batch.num_rows
             table = pa.Table.from_pylist(out) if out else parent.limit(0).to_arrow_table()
             return db.conn().from_arrow(table)
@@ -1980,11 +2016,11 @@ _SPILL_FLUSH_ROWS = 500_000
 
 def _iter_fn(
         fn, batch: "pa.RecordBatch", mode: str, on_error: str, node,
-        *, row_offset: int = 0):
+        *, row_offset: int = 0, prepared_rows: list[dict] | None = None):
     """Yield the transform's output rows for one input batch. flat_map/flat_map_generator are STREAMED
     (yield from — no per-row list()), so a large per-row fan-out never materializes here; the spill
     caller flushes on a BYTE budget, keeping memory bounded regardless of fan-out."""
-    rows = batch.to_pylist()
+    rows = batch.to_pylist() if prepared_rows is None else prepared_rows
     if mode == "map_batches":
         try:
             yield from fn(rows)
@@ -2024,9 +2060,9 @@ def _iter_fn(
 
 def _apply_fn(
         fn, batch: "pa.RecordBatch", mode: str, on_error: str, node,
-        *, row_offset: int = 0) -> list[dict]:
+        *, row_offset: int = 0, prepared_rows: list[dict] | None = None) -> list[dict]:
     return list(_iter_fn(
-        fn, batch, mode, on_error, node, row_offset=row_offset))
+        fn, batch, mode, on_error, node, row_offset=row_offset, prepared_rows=prepared_rows))
 
 
 def _est_row_bytes(v, _depth: int = 0) -> int:
@@ -2050,7 +2086,8 @@ def _est_row_bytes(v, _depth: int = 0) -> int:
     return 32
 
 
-def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Table | None":
+def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node,
+                 *, prepared_input=None) -> "pa.Table | None":
     """Run a `map_batches` UDF over a whole batch in the chosen representation — `pandas` (a DataFrame) or
     `arrow` (a pyarrow.Table) — arrow-NATIVE so column types survive (no dict round-trip). Returns the
     output Table, or None when on_error='skip' swallowed a failure (the caller DROPS it — we can't emit a
@@ -2058,7 +2095,7 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
     (The default `rows` format goes through _apply_fn.) pandas must be declared in the canvas requirements;
     pyarrow is always present."""
     try:
-        return _run_batch(fn, table, fmt)
+        return _run_batch(fn, table, fmt, prepared_input=prepared_input)
     except (NotPreviewable, UserCodeError):
         raise
     except Exception as e:  # noqa: BLE001
@@ -2077,17 +2114,17 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
             node, e, available_columns=list(table.column_names)) from e
 
 
-def _run_batch(fn, table: "pa.Table", fmt: str) -> "pa.Table":
+def _run_batch(fn, table: "pa.Table", fmt: str, *, prepared_input=None) -> "pa.Table":
     """Invoke a batch UDF once over `table` in the chosen representation and return a pyarrow.Table."""
     if fmt == "arrow":
-        res = fn(table)
+        res = fn(table if prepared_input is None else prepared_input)
         if isinstance(res, pa.Table):
             return res
         if isinstance(res, pa.RecordBatch):
             return pa.Table.from_batches([res])
         raise TypeError(f"an arrow batch UDF must return a pyarrow.Table, got {type(res).__name__}")
     import pandas as pd  # noqa: F401 — required only when the user picks the pandas format
-    res = fn(table.to_pandas())
+    res = fn(table.to_pandas() if prepared_input is None else prepared_input)
     if not isinstance(res, pd.DataFrame):
         raise TypeError(f"a pandas batch UDF must return a DataFrame, got {type(res).__name__}")
     return pa.Table.from_pandas(res, preserve_index=False)

@@ -2807,6 +2807,98 @@ describe('graph store — core authority ops', () => {
     }])
   })
 
+  it.each(['graph', 'target'] as const)('keeps the %s run active until a pending cancellation becomes terminal', async (kind) => {
+    vi.useFakeTimers()
+    try {
+      const doc = fanOutDoc(1)
+      const runId = `pending-cancel-${kind}`
+      const status = { runId, status: 'running' as const, jobType: 'run' as const,
+        targetNodeId: kind === 'graph' ? null : 'sink0', rowsProcessed: 0, ms: 10,
+        placement: 'local' as const, perNode: [], outputs: [] }
+      useStore.setState({ doc, ...(kind === 'graph'
+        ? { graphRun: { canvasId: doc.id, principalId: 'alice', phase: 'active' as const, runId, status } }
+        : { runs: { sink0: { phase: 'running' as const, status } } }) })
+      apiMocks.cancelRun.mockResolvedValueOnce(status)
+      apiMocks.runStatus.mockResolvedValueOnce({ ...status, status: 'cancelled' })
+      if (kind === 'graph') await useStore.getState().cancelGraphRun()
+      else await useStore.getState().cancelRun('sink0')
+      expect(kind === 'graph' ? useStore.getState().graphRun?.status?.status
+        : useStore.getState().runs.sink0.status?.status).toBe('running')
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(apiMocks.runStatus).toHaveBeenCalledWith(runId)
+      if (kind === 'graph') expect(useStore.getState().graphRun).toBeNull()
+      else expect(useStore.getState().runs.sink0.status?.status).toBe('cancelled')
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['cancel-response', 'pending-poll'] as const)('recovers a committed Write after %s wins the cancellation race', async (delivery) => {
+    vi.useFakeTimers()
+    try {
+      const doc = { id: 'write-canvas', version: 1, nodes: [NODE('write', 'write')], edges: [] }
+      const status = { runId: `cancel-write-${delivery}`, status: 'running' as const,
+        jobType: 'run' as const, targetNodeId: 'write', rowsProcessed: 0, ms: 0,
+        placement: 'local' as const, perNode: [], outputs: [] }
+      const admission = { nodeId: 'write', managed: true, provider: 'managed-local-file',
+        destination: 'managed://dataset-1', mode: 'create' as const, expectedSchema: [], partitions: [] }
+      const completed = { ...status, status: 'done' as const, totalRows: 2, ms: 7,
+        outputs: [WRITE_OUTPUT('revision-1')], perNode: [{ nodeId: 'write', status: 'done' as const }] }
+      useStore.setState({ doc, runs: { write: { phase: 'running', status, writeAdmission: admission } } })
+      apiMocks.currentResults.mockResolvedValueOnce({
+        latestNodeIds: ['write'], failedNodeIds: [], staleNodeIds: [], unknownNodeIds: [], results: [],
+      })
+      apiMocks.cancelRun.mockResolvedValueOnce(delivery === 'cancel-response' ? completed : status)
+      if (delivery === 'pending-poll') apiMocks.runStatus.mockResolvedValueOnce(completed)
+
+      await useStore.getState().cancelRun('write')
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(useStore.getState().runs.write).toMatchObject({
+        phase: 'done', status: { status: 'done' }, writeOutcomeAdmission: admission,
+        writeOutcome: { runId: status.runId, receipt: { revisionId: 'revision-1' } },
+      })
+      expect(useStore.getState().doc.nodes[0].data).toMatchObject({
+        status: 'latest', lastRun: { rows: 2, writeReceiptRunId: status.runId },
+        history: [expect.objectContaining({ rows: 2 })],
+      })
+      expect(apiMocks.currentResults).toHaveBeenCalledWith(expect.objectContaining({ id: doc.id }))
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['done', 'failure'] as const)('ignores a late %s poll after switching to a Canvas with the same node id', async (outcome) => {
+    vi.useFakeTimers()
+    try {
+      const first = { ...fanOutDoc(1), id: 'first-canvas' }
+      const status = { runId: `cross-canvas-${outcome}`, status: 'running' as const,
+        jobType: 'run' as const, targetNodeId: 'sink0', rowsProcessed: 0, ms: 0,
+        placement: 'local' as const, perNode: [], outputs: [] }
+      let finish!: (status: any) => void
+      let fail!: (error: Error) => void
+      apiMocks.runStatus.mockImplementationOnce(() => new Promise((resolve, reject) => {
+        finish = resolve
+        fail = reject
+      }))
+      apiMocks.cancelRun.mockResolvedValueOnce(status)
+      useStore.setState({ doc: first, runs: { sink0: { phase: 'running', status } } })
+      await useStore.getState().cancelRun('sink0')
+      await vi.advanceTimersByTimeAsync(200)
+      expect(apiMocks.runStatus).toHaveBeenCalledWith(status.runId)
+
+      const second = { ...fanOutDoc(1), id: 'second-canvas' }
+      useStore.getState().loadDoc(second, 'owner', { recoverServerState: false })
+      const expected = useStore.getState().doc
+      const toastCount = useStore.getState().toasts.length
+      if (outcome === 'done') finish({ ...status, status: 'done', totalRows: 99,
+        perNode: [{ nodeId: 'sink0', status: 'done' }], outputs: [] })
+      else fail(new Error('Old Canvas connection closed'))
+      await vi.advanceTimersByTimeAsync(6000)
+
+      expect(useStore.getState().doc).toEqual(expected)
+      expect(useStore.getState().runs.sink0).toBeUndefined()
+      expect(useStore.getState().toasts).toHaveLength(toastCount)
+      expect(apiMocks.runStatus).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
   it('reconciles current results after confirmed whole-graph cancellation', async () => {
     const doc = fanOutDoc(1)
     doc.nodes[0].data.status = 'checking'
@@ -3319,6 +3411,31 @@ describe('graph store — core authority ops', () => {
     expect(data.currentOutputVersionId).toBe(data.history?.[0].id)
     expect(data.history?.[0].rows).toBeUndefined()
     expect(data.history?.[0].label).not.toContain('999')
+  })
+
+  it('invalidates prepared editor input when a used parameter default changes', () => {
+    const source = NODE('source')
+    source.data.config = { uri: { parameterRef: 'input' } }
+    const transform = NODE('transform', 'transform')
+    const doc = { id: 'c', version: 1, name: 'test',
+      parameters: [{ name: 'input', type: 'string' as const, default: 'first.parquet' }],
+      nodes: [source, transform], edges: [{ id: 'input-edge', source: 'source', target: 'transform' }] }
+    const identity = previewPlanIdentity(doc, 'transform')
+    useStore.setState({ doc, editorPreviews: { transform: {
+      requestGeneration: 1, loading: false, canvasId: 'c', nodeId: 'transform', planIdentity: identity,
+    } } })
+    expect(useStore.getState().setParameters([
+      { name: 'input', type: 'string', default: 'second.parquet' },
+    ])).toBeNull()
+    expect(useStore.getState().editorPreviews).toEqual({})
+    expect(previewPlanIdentity(useStore.getState().doc, 'transform')).not.toBe(identity)
+    // A server/peer document update also changes the identity without using this tab's setter.
+    expect(previewPlanIdentity({ ...doc, parameters: [
+      { name: 'input', type: 'string', default: 'third.parquet' },
+    ] }, 'transform')).not.toBe(identity)
+    expect(previewPlanIdentity({ ...doc, parameters: [...doc.parameters,
+      { name: 'unrelated', type: 'string', default: 'ignored' },
+    ] }, 'transform')).toBe(identity)
   })
 
   it('uses one deterministic target execution identity for previews and profiles', () => {

@@ -1773,6 +1773,28 @@ class EditorTestInput(Wire):
     rows: int | None = Field(default=None, ge=0)
 
 
+class EditorInputCell(Wire):
+    """A bounded representation of a value in the actual Python input container."""
+
+    python_type: str = Field(description="Fully qualified type of the actual input value.")
+    representation: str = Field(max_length=300)
+    truncated: bool = False
+
+
+class EditorInputSample(Wire):
+    """Input evidence captured before invoking editor code, separate from its output rows."""
+
+    format: Literal["rows", "pandas", "arrow"] = Field(description=(
+        "rows cells are row values; pandas cells come from the actual DataFrame.iat; "
+        "arrow cells are actual Table column scalars, not converted Python row values."
+    ))
+    container_type: str
+    columns: list[str] = Field(max_length=20)
+    column_count: int = Field(ge=0, description="Total input columns before the 20-column display cap.")
+    rows: list[dict[str, EditorInputCell]] = Field(max_length=5)
+    row_limit: Literal[5] = 5
+
+
 class SampleResult(Wire):
     """One page of rows plus an explicit statement of what that page represents.
 
@@ -1837,6 +1859,7 @@ class SampleResult(Wire):
     # Present only for the fullscreen Transform editor's retained-upstream endpoint. The storage URI
     # stays server-side; this is user-facing evidence, not an input accepted by any later Canvas run.
     editor_test_input: EditorTestInput | None = None
+    editor_input_sample: EditorInputSample | None = None
     # The exact, secret-free Source revisions used for this preview. Inner keys intentionally remain
     # snake_case because the same minimal dict is persisted verbatim in run admission/history.
     input_manifest: list[dict[str, str]] | None = None

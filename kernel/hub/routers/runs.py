@@ -4865,12 +4865,14 @@ def preview_transform_with_retained_upstream(
                 _reject_invalid(editor_graph, deps, req.node_id)
                 if deps.chosen_backend(uid, editor_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
                     result = SampleResult(**kb.preview(
-                        editor_graph, req.node_id, req.k, req.offset, port_id))
+                        editor_graph, req.node_id, req.k, req.offset, port_id,
+                        capture_editor_input=True))
                 else:
                     result = preview_node(
                         editor_graph, req.node_id, req.k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                         offset=req.offset, storage=deps.storage, port_id=port_id,
+                        capture_editor_input=True,
                     )
         except _ExportNotAcceptable:
             continue

@@ -114,7 +114,8 @@ def _reservoir_source_total(graph: Graph, node_id: str, resolve_adapter) -> int 
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                  node_builders=None, node_specs=None, offset: int = 0, cache=None,
-                 storage=None, port_id: str | None = None) -> SampleResult:
+                 storage=None, port_id: str | None = None,
+                 capture_editor_input: bool = False) -> SampleResult:
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -147,8 +148,10 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
     reservoir_preview = _reservoir_preview_allowed(graph, node_id, preview_adapter)
     engine = BuildEngine(graph, preview_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                             node_builders=node_builders, node_specs=node_specs,
-                            warm=cache, warm_scope="preview", output_node=node_id,
-                            reservoir_preview=reservoir_preview)
+                            warm=None if capture_editor_input else cache,
+                            warm_scope="preview", output_node=node_id,
+                            reservoir_preview=reservoir_preview,
+                            editor_input_node=node_id if capture_editor_input else None)
 
     holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
 
@@ -223,18 +226,18 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         (sc.interrupt() if sc is not None else db.interrupt())
 
     try:
-        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+        result = run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
     except ManagedSourceReadError as e:
-        return SampleResult(error=True, reason=str(e))
+        result = SampleResult(error=True, reason=str(e))
     except TransformSyntaxError as e:
-        return SampleResult(
+        result = SampleResult(
             error=True,
             failure_category="syntax_error",
             reason=f"Line {e.line}: {e.message}" if e.line else e.message,
             syntax_error={"line": e.line or 1, "column": e.column, "message": e.message},
         )
     except UserCodeError as e:
-        return SampleResult(
+        result = SampleResult(
             error=True,
             reason=str(e),
             failure_category="user_code_exception",
@@ -252,10 +255,12 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
             },
         )
     except NotPreviewable as e:
-        return SampleResult(                                        # honest P8 state
+        result = SampleResult(                                        # honest P8 state
             not_previewable=True,
             reason=e.reason,
             suggested_action=e.suggested_action,
         )
     except Exception as e:  # noqa: BLE001
-        return SampleResult(error=True, reason=f"{type(e).__name__}: {e}")  # a real failure
+        result = SampleResult(error=True, reason=f"{type(e).__name__}: {e}")  # a real failure
+    result.editor_input_sample = engine.editor_input_sample
+    return result

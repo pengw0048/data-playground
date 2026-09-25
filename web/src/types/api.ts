@@ -681,6 +681,19 @@ export interface LineageFactsPage {
   hasMore: boolean
 }
 
+export interface EditorInputSample {
+  format: 'rows' | 'pandas' | 'arrow'
+  containerType: string
+  columns: string[]
+  rows: Record<string, {
+    pythonType: string
+    representation: string
+    truncated: boolean
+  }>[]
+  rowLimit: number
+  columnCount: number
+}
+
 export interface SampleResult {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]
@@ -701,6 +714,7 @@ export interface SampleResult {
     label: string
     rows?: number | null
   } | null
+  editorInputSample?: EditorInputSample | null
   inputManifest?: RunInputManifestItem[] | null
   notPreviewable: boolean
   error?: boolean
