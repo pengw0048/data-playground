@@ -5,6 +5,8 @@ export type TransformInput = {
   kind: 'registered' | 'provider'
   id: string
   name: string
+  /** Absent when this catalog result does not provide a known, nonempty schema. */
+  columnNames?: string[]
 }
 
 type Choice = TransformInput & { key: string; detail: string; unavailable?: string }
@@ -21,6 +23,7 @@ async function loadChoices(kind: TransformInput['kind'], query: string, cursor?:
     return {
       items: page.items.map((table) => ({
         kind, key: table.id, id: table.registrationId ?? '', name: table.name,
+        columnNames: table.columns.length ? table.columns.map((column) => column.name) : undefined,
         detail: `${table.folder ? `${table.folder} · ` : ''}${table.rowCount == null ? 'Unknown' : table.rowCount.toLocaleString()} rows · ${table.columns.length} columns`,
         unavailable: table.missing ? 'Source file is unavailable'
           : !table.registrationId ? 'Register this dataset in Workspace first' : undefined,
@@ -117,7 +120,7 @@ export function TransformInputPicker({ disabled, onSelect, onCancel }: {
         : !visiblePage && !error ? <p role="status" className="p-2 text-[11px] text-muted-foreground">Loading datasets…</p>
           : visiblePage?.items.length === 0 && !visiblePage.notices.length && <p className="p-2 text-[11px] text-muted-foreground">No datasets found. Choose another search, or connect an input later.</p>}
       {visiblePage?.items.map((item) => <button key={item.key} type="button" disabled={disabled || !!item.unavailable}
-        onClick={() => onSelect({ kind: item.kind, id: item.id, name: item.name })}
+        onClick={() => onSelect({ kind: item.kind, id: item.id, name: item.name, columnNames: item.columnNames })}
         className="block w-full rounded-md px-2 py-2 text-left hover:bg-accent disabled:opacity-50">
         <strong className="block truncate text-[12px]">{item.name}</strong>
         <span className="block truncate text-[10.5px] text-muted-foreground">{item.unavailable ?? item.detail}</span>

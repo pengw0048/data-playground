@@ -358,12 +358,13 @@ describe('graph store — core authority ops', () => {
       'first', 'Normalize each row for reuse.',
     )).rejects.toThrow('response lost')
     await useStore.getState().promote('first', 'Normalize each row for reuse.')
-    await useStore.getState().promote('second', 'Normalize the second input.', '  Normalize second input  ')
+    await useStore.getState().promote('second', 'Normalize the second input.', '  Normalize second input  ', ['amount'])
 
     const keys = apiMocks.promote.mock.calls.map(([body]) => body.id)
     expect(keys[0]).toBe(keys[1])
     expect(keys[2]).not.toBe(keys[1])
     expect(keys.every((key) => key.length <= 256)).toBe(true)
+    expect(apiMocks.promote.mock.calls.map(([body]) => body.inputColumns)).toEqual([[], [], ['amount']])
     expect(apiMocks.promote.mock.calls.map(([body]) => body.title)).toEqual([
       'Same title', 'Same title', 'Normalize second input',
     ])
@@ -372,6 +373,32 @@ describe('graph store — core authority ops', () => {
       'Normalize each row for reuse.',
       'Normalize the second input.',
     ])
+  })
+
+  it.each(['canvas', 'code', 'principal', 'permission', 'requirements'])('does not replace newer editor state when %s changes during promotion', async (change) => {
+    const originalCode = 'def fn(row): return row'
+    const transform = { ...NODE('transform', 'transform'), data: {
+      ...NODE('transform', 'transform').data, config: { source: 'adhoc', mode: 'map', code: originalCode },
+    } }
+    useStore.setState((state) => ({ doc: { ...state.doc, id: 'original-canvas', nodes: [transform] } }))
+    let finish!: (value: unknown) => void
+    apiMocks.promote.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    apiMocks.processors.mockResolvedValue([])
+    const pending = useStore.getState().promote('transform', 'Saved definition', 'Reusable', ['amount'])
+    useStore.setState((state) => ({
+      ...(change === 'principal' ? { currentUser: { id: 'different-user', name: 'Different user' } as any } : {}),
+      ...(change === 'permission' ? { canvasRole: 'viewer' as const } : {}),
+      doc: { ...state.doc, id: change === 'canvas' ? 'other-canvas' : state.doc.id,
+        requirements: change === 'requirements' ? ['changed-dependency'] : state.doc.requirements,
+        nodes: [{ ...transform, data: { ...transform.data, config: { ...transform.data.config,
+          code: change === 'code' ? 'def fn(row): return {"edited": True}' : originalCode,
+        } } }] },
+    }))
+    const expected = useStore.getState().doc
+    finish({ id: 'saved-transform', version: 'v1', mode: 'map' })
+    await pending
+    expect(useStore.getState().doc).toBe(expected)
+    expect(useStore.getState().doc.nodes[0].data.config.source).toBe('adhoc')
   })
 
   it('applyAgentGraph REPLACES nodes/edges and marks them stale (undoable)', () => {

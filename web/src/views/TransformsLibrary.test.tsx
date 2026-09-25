@@ -397,6 +397,49 @@ describe('TransformsLibrary', () => {
     expect(mocks.workspaceAddTransform).not.toHaveBeenCalled()
   })
 
+  it('blocks a known missing input column, then allows changing or removing the input', async () => {
+    mocks.tablesPage.mockResolvedValue({ items: [
+      { id: 'wrong', registrationId: 'wrong-registration', name: 'Missing value', uri: 'file:///wrong.parquet', columns: [{ name: 'id', type: 'int' }] },
+      { id: 'right', registrationId: 'right-registration', name: 'Contains value', uri: 'file:///right.parquet', columns: schema },
+    ], hasMore: false })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Missing value/ }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Missing required input columns: value. Choose another input dataset.')
+    const create = screen.getByRole('button', { name: 'Create and open' })
+    expect(create).toBeDisabled()
+    fireEvent.click(create)
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove input' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(create).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Missing value/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Change input' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Contains value/ }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText('Required column names are present. Types and values still need testing.')).toBeVisible()
+    fireEvent.click(create)
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.objectContaining({
+      datasetIds: ['right-registration'], transformId: 'tr_exact', transformVersion: 'v1',
+    })))
+  })
+
+  it('does not mistake an unavailable catalog schema for known missing columns', async () => {
+    mocks.tablesPage.mockResolvedValue({ items: [{ id: 'unknown', registrationId: 'unknown-registration',
+      name: 'Unknown schema', uri: 'file:///unknown.parquet', columns: [] }], hasMore: false })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Unknown schema/ }))
+    expect(screen.getByText(/Input schema is unknown here/)).toBeVisible()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Create and open' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.objectContaining({ datasetIds: ['unknown-registration'] })))
+  })
+
   it('submits an opaque provider occurrence and leaves source identity and revision admission to the server', async () => {
     const providerRef = 'provider:opaque-occurrence:YWxpYXMvMg=='
     mocks.workspaceSearch.mockResolvedValue({

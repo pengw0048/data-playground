@@ -1804,6 +1804,18 @@ class BuildEngine:
                 prepared_input, fmt, list(first.column_names), mode=mode)
 
         if proc is not None:
+            if proc.provenance == "promoted":
+                # Confirmed input columns are name requirements, not inferred type constraints.
+                # Check the actual relation before user code (and outside onError='skip'), including
+                # zero-row inputs. Installed processors retain their own existing contracts.
+                missing_columns = sorted(set(proc.input_columns) - set(parent.columns))
+                if missing_columns:
+                    raise ValueError(
+                        f"Transform '{proc.title}' has missing required input columns: "
+                        + ", ".join(missing_columns)
+                        + ". Choose an input containing these columns or update the Transform's "
+                        "required-column declaration and promote a new version."
+                    )
             fn = proc.build(cfg.get("params", {}))
         else:
             code = cfg.get("code")

@@ -1463,7 +1463,7 @@ interface Store {
   prepareFullProfile: (id: string, portId?: string) => Promise<void>
   startFullProfile: (id: string, portId?: string) => Promise<void>
   cancelFullProfile: (id: string, portId?: string) => Promise<void>
-  promote: (id: string, description: string, title?: string) => Promise<void>
+  promote: (id: string, description: string, title?: string, inputColumns?: string[]) => Promise<void>
   restoreVersion: (id: string, versionId: string) => void
 
   // -- kernel + catalog --
@@ -4200,31 +4200,43 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  promote: async (id, description, title) => {
+  promote: async (id, description, title, inputColumns = []) => {
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
+    const principalId = get().currentUser?.id
     const n = doc.nodes.find((x) => x.id === id)
     if (!n) return
     const cfg = n.data.config
+    const configIdentity = JSON.stringify(canonicalIdentityValue(cfg))
+    const requirementsIdentity = JSON.stringify([...(doc.requirements ?? [])].sort())
     const desc = await api.promote({
       id: promotedTransformKey(doc.id, n.id),
       title: title?.trim() || n.data.title,
       mode: (cfg.mode as string) ?? 'map',
       code: (cfg.code as string) ?? '',
-      inputColumns: [],
+      inputColumns,
       outputSchema: Array.isArray(cfg.outputSchema) ? (cfg.outputSchema as any) : [],  // a {ref} contract doesn't inline here
       requirements: doc.requirements ?? [],
       blurb: description.trim(),
     })
     // The durable exact reference is now the execution definition. Inline code remains an ad-hoc
     // representation only and must not silently become a fallback for an unavailable library version.
-    get().updateConfig(id, {
-      source: 'library', processor: desc.id, version: desc.version, mode: desc.mode, code: null,
-    })
+    const current = get()
+    const currentNode = current.doc.nodes.find((candidate) => candidate.id === id)
+    if (current.doc.id === doc.id && current.currentUser?.id === principalId
+        && roleCanEdit(current.canvasRole) && currentNode?.type === n.type
+        && JSON.stringify(canonicalIdentityValue(currentNode.data.config)) === configIdentity
+        && JSON.stringify([...(current.doc.requirements ?? [])].sort()) === requirementsIdentity) {
+      current.updateConfig(id, {
+        source: 'library', processor: desc.id, version: desc.version, mode: desc.mode, code: null,
+      })
+    }
     // refresh ONLY the processor list for the library picker — do NOT call bootstrap(), which
     // would re-hydrate the doc from (debounced, still-stale) localStorage and revert this node.
     try {
-      set({ processors: await api.processors() })
+      if (get().currentUser?.id !== principalId) return
+      const processors = await api.processors()
+      if (get().currentUser?.id === principalId) set({ processors })
     } catch { /* offline */ }
   },
 
