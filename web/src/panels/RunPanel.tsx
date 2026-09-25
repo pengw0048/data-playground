@@ -4,6 +4,7 @@ import { color, status as statusTok, statusText } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { ProgressBar } from '../ui/controls'
 import { Button } from '@/components/ui/button'
+import { DatasetParameterPicker } from '../components/DatasetParameterPicker'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
 import { UpsertControl } from '../components/UpsertControl'
@@ -125,7 +126,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <div className="mt-3 flex flex-col gap-3">
             {parameterDeclarations.map((declaration) => {
               const bound = parameterBindings.get(declaration.name)
-              return <ParameterField key={`${declaration.name}:${declaration.type}`} declaration={declaration}
+              return <ParameterField key={`${doc.id}:${nodeId}:${declaration.name}:${declaration.type}`} declaration={declaration} disabled={!canEdit}
                 isBound={parameterBindings.has(declaration.name)} value={bound}
                 error={parameterValueError(declaration, parameterBindings.has(declaration.name), bound)}
                 setValue={(value) => setParameterBinding(nodeId, { name: declaration.name, value })}
@@ -322,7 +323,7 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
     if (!value || typeof value !== 'object' || !['exact', 'latest'].includes(String(ref.kind))
         || typeof ref.datasetId !== 'string' || !ref.datasetId
         || isBuiltInSecretRef(ref.datasetId)
-        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose Follow latest or Selected version, then provide the dataset and version IDs.'
+        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose a dataset and select Follow latest or a saved version.'
   }
   if ((declaration.type === 'integer' || declaration.type === 'float') && typeof value === 'number') {
     if (declaration.constraints?.minimum != null && value < declaration.constraints.minimum) return `Minimum is ${declaration.constraints.minimum}.`
@@ -331,8 +332,8 @@ function parameterValueError(declaration: CanvasParameterDeclaration, isBound: b
   return null
 }
 
-function ParameterField({ declaration, isBound, value, error, setValue, clear }: {
-  declaration: CanvasParameterDeclaration; isBound: boolean; value: unknown; error: string | null
+function ParameterField({ declaration, isBound, value, error, disabled, setValue, clear }: {
+  declaration: CanvasParameterDeclaration; isBound: boolean; value: unknown; error: string | null; disabled: boolean
   setValue: (value: unknown) => void; clear: () => void
 }) {
   const label = declaration.label || declaration.name
@@ -340,7 +341,7 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
   const fallback = declaration.default == null ? 'Use declared type' : `Use default (${JSON.stringify(declaration.default)})`
   let control
   if (declaration.type === 'boolean') {
-    control = <select aria-label={label} value={value == null ? '' : String(value)} onChange={(event) => {
+    control = <select aria-label={label} disabled={disabled} value={value == null ? '' : String(value)} onChange={(event) => {
       event.target.value ? setValue(event.target.value === 'true') : clear()
     }} className={common}><option value="">{fallback}</option><option value="true">true</option><option value="false">false</option></select>
   } else if (declaration.type === 'dataset') {
@@ -351,19 +352,11 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
     const ref = value && typeof value === 'object' ? value as DatasetParameterValue : declaredDefault ?? {}
     const usingDefault = declaredDefault != null
     const kind = ref.kind === 'latest' ? 'latest' : 'exact'
-    control = <div className="grid grid-cols-[92px_1fr] gap-1.5">
-      <select aria-label={`${label} selection`} value={kind} onChange={(event) => setValue({
-        kind: event.target.value, datasetId: ref.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}),
-      })} disabled={usingDefault} className={common}><option value="exact">Selected version</option><option value="latest">Follow latest</option></select>
-      <input aria-label={`${label} dataset`} value={ref.datasetId ?? ''} placeholder="Dataset identity" onChange={(event) => {
-        event.target.value ? setValue({ kind, datasetId: event.target.value, ...(kind === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}) }) : clear()
-      }} disabled={usingDefault} className={common} />
-      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Version ID" onChange={(event) => {
-        event.target.value ? setValue({ kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: event.target.value }) : clear()
-      }} disabled={usingDefault} className={`col-start-2 ${common}`} />}
-      {usingDefault && <div className="col-span-2 flex items-center justify-between gap-2 text-muted-foreground">
+    control = <div className="grid gap-1.5">
+      <DatasetParameterPicker label={label} value={ref} disabled={disabled || usingDefault} onChange={setValue} />
+      {usingDefault && <div className="flex items-center justify-between gap-2 text-muted-foreground">
         <span>Using declared default.</span>
-        <Button type="button" size="sm" variant="ghost" onClick={() => setValue(kind === 'latest'
+        <Button type="button" size="sm" variant="ghost" disabled={disabled} onClick={() => setValue(kind === 'latest'
           ? { kind: 'latest', datasetId: ref.datasetId ?? '' }
           : { kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: ref.revisionId ?? '' })}
           className="h-6 px-1.5 text-[10px]">Override default</Button>
@@ -371,7 +364,7 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
     </div>
   } else {
     const text = value == null ? '' : String(value)
-    control = <input aria-label={label} type={declaration.type === 'date' ? 'date' : 'text'} value={text}
+    control = <input aria-label={label} disabled={disabled} type={declaration.type === 'date' ? 'date' : 'text'} value={text}
       placeholder={declaration.type === 'datetime' ? '2026-07-18T14:30:00-04:00' : fallback}
       onChange={(event) => {
         const raw = event.target.value
@@ -381,17 +374,17 @@ function ParameterField({ declaration, isBound, value, error, setValue, clear }:
         setValue(raw)
       }} className={common} />
   }
-  return <label className="text-[11px]">
+  return <div className="text-[11px]">
     <span className="mb-1 block font-medium text-foreground">{label}{declaration.required ? ' *' : ''}</span>
     {control}
     {declaration.type === 'datetime' && <span className="mt-1 block text-muted-foreground">Timezone required; the server records UTC.</span>}
     {declaration.help && <span className="mt-1 block text-muted-foreground">{declaration.help}</span>}
     {declaration.type === 'string' && !isBound && <Button type="button" size="sm" variant="ghost"
-      onClick={() => setValue('')} className="mt-1 h-6 px-1.5 text-[10px]">Use empty string</Button>}
-    {isBound && <Button type="button" size="sm" variant="ghost" onClick={clear}
+      disabled={disabled} onClick={() => setValue('')} className="mt-1 h-6 px-1.5 text-[10px]">Use empty string</Button>}
+    {isBound && <Button type="button" size="sm" variant="ghost" disabled={disabled} onClick={clear}
       className="mt-1 h-6 px-1.5 text-[10px]">{declaration.default == null ? 'Clear binding' : 'Use default'}</Button>}
     {error && <span role="alert" className="mt-1 block text-destructive">{error}</span>}
-  </label>
+  </div>
 }
 
 function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc }) {

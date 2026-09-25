@@ -99,7 +99,7 @@ vi.mock('../api/client', () => ({
 
 import {
   canvasViewportDocumentIdentity, currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
-  writeAdmissionFingerprint,
+  writeAdmissionFingerprint, nodeRunnable, unsetSourceReason,
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
@@ -185,6 +185,42 @@ const WRITE_JOB = (canvasId: string, runId: string, revisionId = 'revision-1') =
   placement: 'local' as const,
   attempt: runId,
   outputReceipt: WRITE_RECEIPT(revisionId),
+})
+
+describe('dataset parameter run entry', () => {
+  const parameterDoc = (): CanvasDoc => ({
+    id: 'parameter-entry', version: 1,
+    nodes: [{ ...NODE('source'), data: {
+      ...NODE('source').data, config: { datasetRef: { parameterRef: 'input' } },
+    } }, NODE('target', 'filter')],
+    edges: [{ id: 'edge', source: 'source', target: 'target' }],
+    parameters: [{ name: 'input', type: 'dataset', required: true }],
+  })
+
+  it('allows an unbound declared dataset parameter to reach the run form without a source URI', () => {
+    const doc = parameterDoc()
+    expect(nodeRunnable(doc, 'source')).toBe(true)
+    expect(nodeRunnable(doc, 'target')).toBe(true)
+    expect(unsetSourceReason(doc, 'target')).toBeNull()
+  })
+
+  it('keeps missing or incorrectly typed parameter declarations from posing as a configured input', () => {
+    const doc = parameterDoc()
+    doc.parameters = []
+    expect(nodeRunnable(doc, 'target')).toBe(false)
+    expect(unsetSourceReason(doc, 'target')).toContain('Choose a dataset')
+    doc.parameters = [{ name: 'input', type: 'string' }]
+    expect(nodeRunnable(doc, 'target')).toBe(false)
+    doc.parameters = [{ name: 'input', type: 'dataset' }]
+    doc.nodes[0].data.config.datasetRef = { parameterRef: 'input', extra: true }
+    expect(nodeRunnable(doc, 'target')).toBe(false)
+  })
+
+  it('continues to block execution when a parameterized input is disabled', () => {
+    const doc = parameterDoc()
+    doc.nodes[0].data.disabled = true
+    expect(nodeRunnable(doc, 'target')).toBe(false)
+  })
 })
 
 describe('graph store — core authority ops', () => {

@@ -40,6 +40,93 @@ def _deps():
     )
 
 
+def _registered_parameter_dataset(monkeypatch, dataset_id, uri):
+    binding = {"dataset_id": dataset_id, "uri": uri}
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding",
+        lambda identity: binding if identity == dataset_id else None,
+    )
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
+        lambda path: binding if path == uri else None,
+    )
+
+
+@pytest.mark.parametrize("kind", ["exact", "latest"])
+@pytest.mark.parametrize("old_uri", [None, "/data/old-input.parquet"])
+def test_dataset_parameter_selects_its_own_registered_source(monkeypatch, kind, old_uri):
+    graph = _graph(parameters=[{"name": "input", "type": "dataset", "required": True}])
+    config = {"datasetRef": {"parameterRef": "input"}}
+    if old_uri is not None:
+        config["uri"] = old_uri
+    graph.nodes[0].data["config"] = config
+    original = graph.model_dump()
+    _registered_parameter_dataset(monkeypatch, "chosen-input", "/data/chosen.lance")
+    calls = []
+
+    class Adapter:
+        def resolve_revision(self, uri):
+            calls.append(uri)
+            return {"revision_id": "new-version"}
+
+    monkeypatch.setattr("hub.run_parameters.revision_adapter_for_uri", lambda *_: Adapter())
+    value = {"kind": kind, "datasetId": "chosen-input"}
+    if kind == "exact":
+        value["revisionId"] = "old-version"
+    resolved, canonical = resolve_graph_parameters(
+        graph, [ParameterBinding(name="input", value=value)], "target", _deps())
+    assert resolved.nodes[0].data["config"] == {
+        "uri": "/data/chosen.lance",
+        "datasetRef": {"kind": "exact", "datasetId": "chosen-input",
+                       "revisionId": "old-version" if kind == "exact" else "new-version"},
+    }
+    assert graph.model_dump() == original
+    assert calls == ([] if kind == "exact" else ["/data/chosen.lance"])
+    assert canonical[0]["value"] == (
+        value if kind == "exact" else {**value, "resolvedRevisionId": "new-version"})
+
+
+def test_shared_dataset_parameter_freezes_one_revision_for_every_source(monkeypatch):
+    graph = _graph(parameters=[{"name": "input", "type": "dataset", "required": True}])
+    graph.nodes[0].data["config"]["datasetRef"] = {"parameterRef": "input"}
+    other = graph.nodes[0].model_copy(deep=True)
+    other.id = "second-source"
+    graph.nodes.append(other)
+    _registered_parameter_dataset(monkeypatch, "chosen-input", "/data/chosen.lance")
+    calls = []
+
+    class Adapter:
+        def resolve_revision(self, uri):
+            calls.append(uri)
+            return {"revision_id": f"r{len(calls)}"}
+
+    monkeypatch.setattr("hub.run_parameters.revision_adapter_for_uri", lambda *_: Adapter())
+    resolved, canonical = resolve_graph_parameters(graph, [ParameterBinding(
+        name="input", value={"kind": "latest", "datasetId": "chosen-input"},
+    )], None, _deps())
+    assert calls == ["/data/chosen.lance"]
+    assert [node.data["config"]["datasetRef"]["revisionId"]
+            for node in resolved.nodes if node.type == "source"] == ["r1", "r1"]
+    assert canonical[0]["value"]["resolvedRevisionId"] == "r1"
+
+
+@pytest.mark.parametrize("kind", ["exact", "latest"])
+@pytest.mark.parametrize("registration", [None, {"dataset_id": "replacement", "uri": "/old/path"}])
+def test_unregistered_parameter_never_falls_back_to_previous_source(monkeypatch, kind, registration):
+    graph = _graph(parameters=[{"name": "input", "type": "dataset", "required": True}])
+    graph.nodes[0].data["config"]["datasetRef"] = {"parameterRef": "input"}
+    monkeypatch.setattr("hub.run_parameters.metadb.catalog_revision_binding",
+                        lambda _: {"dataset_id": "removed", "uri": "/old/path"})
+    monkeypatch.setattr("hub.run_parameters.metadb.catalog_revision_binding_for_uri",
+                        lambda _: registration)
+    value = {"kind": kind, "datasetId": "removed"}
+    if kind == "exact":
+        value["revisionId"] = "r1"
+    with pytest.raises(ParameterResolutionError, match="no longer registered"):
+        resolve_graph_parameters(
+            graph, [ParameterBinding(name="input", value=value)], "target", _deps())
+
+
 def test_defaults_types_constraints_and_target_cone_are_canonical():
     graph = _graph(
         branch=True,
@@ -123,7 +210,8 @@ def test_public_uri_like_strings_are_not_mistaken_for_registered_secret_refs(val
     assert resolved.nodes[1].data["config"]["value"] == value
 
 
-def test_public_uri_like_dataset_ids_are_allowed_for_exact_bindings():
+def test_public_uri_like_dataset_ids_are_allowed_for_exact_bindings(monkeypatch):
+    _registered_parameter_dataset(monkeypatch, "s3://catalog/dataset", "/data/registered.lance")
     graph = _graph(parameters=[{"name": "input", "type": "dataset", "required": True}])
     graph.nodes[0].data["config"]["datasetRef"] = {"parameterRef": "input"}
     resolved, canonical = resolve_graph_parameters(graph, [ParameterBinding(
@@ -160,6 +248,7 @@ def test_dates_require_real_dates_and_datetime_timezone():
 
 
 def test_exact_and_latest_dataset_intent(monkeypatch):
+    _registered_parameter_dataset(monkeypatch, "dataset-1", "/data/source.parquet")
     graph = _graph(parameters=[{"name": "input", "type": "dataset"}])
     graph.nodes[0].data["config"]["datasetRef"] = {"parameterRef": "input"}
     exact, canonical = resolve_graph_parameters(graph, [ParameterBinding(
@@ -204,6 +293,12 @@ def test_retained_latest_intent_is_validated_without_consulting_mutable_head(mon
         "hub.run_parameters.revision_adapter_for_uri", mutable_head_access_is_a_bug)
     monkeypatch.setattr(
         "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
+        mutable_head_access_is_a_bug,
+    )
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding", mutable_head_access_is_a_bug)
+    monkeypatch.setattr(
+        "hub.run_parameters.workspace_providers.provider_dataset_uri_for_identity",
         mutable_head_access_is_a_bug,
     )
     resolved, canonical = resolve_graph_parameters(
