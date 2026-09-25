@@ -14,20 +14,30 @@ async function editPython(page: Page, code: string): Promise<void> {
   await page.keyboard.insertText(code)
 }
 
-test('edits Python before preparing input, fixes it, and reuses its named Library version with a dataset', async ({ page }, testInfo) => {
+test('edits and tests Python, declares its required input, and reuses the exact Library version with compatible data', async ({ page }, testInfo) => {
   test.setTimeout(90_000)
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const canvasId = `python-library-journey-${suffix}`
   const title = `Acceptance value ${suffix}`
-  const finalCode = "def fn(row):\n    return {'acceptance_value': 23}"
+  const finalCode = "def fn(row):\n    return {'acceptance_value': row['amount'] * 2}"
   const catalogResponse = await page.request.get('/api/catalog/search', {
     params: { q: 'events', mode: 'lexical', limit: 10 },
   })
   expect(catalogResponse.ok()).toBe(true)
   const events = (await catalogResponse.json() as Array<{
-    id: string; name: string; uri: string; registrationId: string
+    id: string; name: string; uri: string; registrationId: string; columns: Array<{ name: string }>
   }>).find((table) => table.name === 'events')
   expect(events, 'the built-in events dataset is available').toBeTruthy()
+  expect(events!.columns.map((column) => column.name)).toContain('amount')
+  const moviesResponse = await page.request.get('/api/catalog/search', {
+    params: { q: 'movies', mode: 'lexical', limit: 10 },
+  })
+  expect(moviesResponse.ok()).toBe(true)
+  const movies = (await moviesResponse.json() as Array<{ name: string; columns: Array<{ name: string }> }>)
+    .find((table) => table.name === 'movies')
+  expect(movies, 'the incompatible fixture has a known schema').toBeTruthy()
+  expect(movies!.columns.length).toBeGreaterThan(0)
+  expect(movies!.columns.map((column) => column.name)).not.toContain('amount')
 
   // Start with an ordinary connected graph whose upstream output has never been retained.
   const created = await page.request.post('/api/canvas', { data: {
@@ -87,26 +97,47 @@ test('edits Python before preparing input, fixes it, and reuses its named Librar
     await page.getByRole('button', { name: 'Test code', exact: true }).click()
     const corrected = await correctedResponse
     expect(corrected.ok()).toBe(true)
+    const testedGraph = corrected.request().postDataJSON().graph as {
+      nodes: Array<{ id: string; data: { config: { code: string } } }>
+    }
+    const testedCode = testedGraph.nodes.find((node) => node.id === 'python')!.data.config.code
     const correctedResult = await corrected.json() as { rows: Array<{ acceptance_value: number }> }
     expect(correctedResult.rows.length).toBeGreaterThan(0)
-    expect(correctedResult.rows.every((row) => row.acceptance_value === 23)).toBe(true)
-    await expect(page.getByText('23', { exact: true }).first()).toBeVisible()
+    // The first purchase has id 2 and amount 3; the real Python calculation produces 6.
+    expect(correctedResult.rows[0].acceptance_value).toBe(6)
+    expect(correctedResult.rows.every((row) => typeof row.acceptance_value === 'number')).toBe(true)
+    await expect(page.getByRole('columnheader', { name: /acceptance_value/ })).toBeVisible()
     await expect(page.getByText('Fix the Python syntax', { exact: true })).toHaveCount(0)
     await page.screenshot({ path: testInfo.outputPath('python-corrected-result.png') })
 
     await page.getByRole('button', { name: 'Promote to library' }).click()
     const promotion = page.getByRole('dialog', { name: /Promote .* to the Library/ })
     await promotion.getByLabel('Name', { exact: true }).fill(title)
-    await promotion.getByLabel('Description', { exact: true }).fill('Produces acceptance_value from each input row; verified against purchase events.')
+    await promotion.getByLabel('Description', { exact: true }).fill('Doubles the required amount column; verified against purchase events.')
+    const requiredAmount = promotion.getByRole('checkbox', { name: 'Require amount', exact: true })
+    await expect(requiredAmount).not.toBeChecked()
+    await requiredAmount.check()
     const promotedResponse = page.waitForResponse((response) =>
       response.url().endsWith('/api/processors/promote') && response.request().method() === 'POST')
     await promotion.getByRole('button', { name: 'Promote', exact: true }).click()
     const saved = await promotedResponse
     expect(saved.ok(), await saved.text()).toBe(true)
     promoted = await saved.json()
+    // Monaco may format pasted indentation; the reusable definition must preserve the code
+    // that actually passed Test code, including its required-column declaration.
+    expect(saved.request().postDataJSON()).toMatchObject({ code: testedCode, inputColumns: ['amount'] })
+    expect(promoted).toMatchObject({ inputColumns: ['amount'] })
+    const definition = await page.request.get(`/api/transform-library/${encodeURIComponent(promoted!.id)}`, {
+      params: { version: promoted!.version },
+    })
+    expect(definition.ok(), await definition.text()).toBe(true)
+    const savedDefinition = await definition.json() as { versions: Array<{ id: string; version: string; inputColumns: string[] }> }
+    expect(savedDefinition.versions.find((version) => version.version === promoted!.version))
+      .toMatchObject({ id: promoted!.id, version: promoted!.version, inputColumns: ['amount'] })
     await expect(promotion).toHaveCount(0)
     await expect(page.locator('.react-flow__node[data-id="python"]')).toContainText(title)
     await expect(page.locator('.monaco-editor')).toHaveCount(0)
+    await page.getByTitle('Close (Esc)', { exact: true }).click()
     await backToWorkspace(page)
     await page.getByTestId('rail-transforms').click()
     await page.getByLabel('Search Transforms').fill(title)
@@ -119,10 +150,19 @@ test('edits Python before preparing input, fixes it, and reuses its named Librar
     const useDialog = page.getByRole('dialog', { name: `Use ${title}`, exact: true })
     await useDialog.getByLabel('New Canvas name').fill(`Reuse ${title}`)
     await useDialog.getByRole('button', { name: 'Choose input dataset…' }).click()
+    await useDialog.getByLabel('Search input datasets').fill('movies')
+    await useDialog.getByRole('region', { name: 'Choose Transform input' })
+      .getByRole('button', { name: /^movies / }).click()
+    const missingColumns = useDialog.getByText('Missing required input columns: amount. Choose another input dataset.', { exact: true })
+    await expect(missingColumns).toBeVisible()
+    await expect(useDialog.getByRole('button', { name: 'Create and open', exact: true })).toBeDisabled()
+    await useDialog.getByRole('button', { name: 'Change input', exact: true }).click()
     await useDialog.getByLabel('Search input datasets').fill('events')
     await useDialog.getByRole('region', { name: 'Choose Transform input' })
       .getByRole('button', { name: /^events / }).click()
     await expect(useDialog.getByRole('region', { name: 'Transform input dataset' })).toContainText('events')
+    await expect(missingColumns).toHaveCount(0)
+    await expect(useDialog.getByRole('button', { name: 'Create and open', exact: true })).toBeEnabled()
     await useDialog.getByRole('button', { name: 'Create and open', exact: true }).click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
     reusedCanvasId = canvasIdFromLocation(page.url())
@@ -157,21 +197,23 @@ test('edits Python before preparing input, fixes it, and reuses its named Librar
       data: { nodeId: transform.id, portId: 'out', k: 50, offset: 0 },
     })
     expect(sampled.ok(), await sampled.text()).toBe(true)
-    const output = await sampled.json() as { rows: Array<{ acceptance_value: number }> }
-    expect(output.rows.length).toBeGreaterThan(0)
-    expect(output.rows.every((row) => row.acceptance_value === 23)).toBe(true)
+    const output = await sampled.json() as { rowCount: number; rows: Array<{ acceptance_value: number }> }
+    expect(output.rowCount).toBe(2000)
+    expect(output.rows.map((row) => row.acceptance_value)).toEqual(Array.from({ length: 50 }, (_, id) => id * 3))
     await page.screenshot({ path: testInfo.outputPath('library-input-connected-run-done.png') })
     await testInfo.attach('user-journey-result', {
-      body: JSON.stringify({ canvasId, title, promoted, reusedCanvasId, runId, correctedResult, output }, null, 2),
+      body: JSON.stringify({ canvasId, title, promoted, reusedCanvasId, runId, requiredInputColumns: ['amount'], correctedResult, output }, null, 2),
       contentType: 'application/json',
     })
   } finally {
-    await page.goto('about:blank')
-    for (const id of [reusedCanvasId, canvasId]) {
-      if (id) expect((await page.request.delete(`/api/canvas/${encodeURIComponent(id)}`)).ok()).toBe(true)
+    if (!page.isClosed()) {
+      await page.goto('about:blank')
+      for (const id of [reusedCanvasId, canvasId]) {
+        if (id) expect((await page.request.delete(`/api/canvas/${encodeURIComponent(id)}`)).ok()).toBe(true)
+      }
+      if (promoted) expect((await page.request.delete(
+        `/api/processors/${encodeURIComponent(promoted.id)}/versions/${encodeURIComponent(promoted.version)}`,
+      )).ok()).toBe(true)
     }
-    if (promoted) expect((await page.request.delete(
-      `/api/processors/${encodeURIComponent(promoted.id)}/versions/${encodeURIComponent(promoted.version)}`,
-    )).ok()).toBe(true)
   }
 })

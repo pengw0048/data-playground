@@ -633,11 +633,65 @@ describe('Transform exact processor labels', () => {
       target: { value: '  Normalizes each row for downstream training.  ' },
     })
     expect(submit).toBeEnabled()
+    expect(within(dialog).getByText(/No required input columns declared/)).toBeVisible()
     fireEvent.click(submit)
 
     await waitFor(() => expect(promote).toHaveBeenCalledWith(
-      'transform', 'Normalizes each row for downstream training.', 'Normalize training rows',
+      'transform', 'Normalizes each row for downstream training.', 'Normalize training rows', [],
     ))
+  })
+
+  it('promotes only explicitly selected and entered input columns, without inferring the whole input schema', async () => {
+    const source = { id: 'input', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Input', status: 'latest', config: { uri: 'orders.parquet' } } }
+    const adhoc = { ...node, data: { ...node.data, config: { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' } } }
+    const promote = vi.fn().mockResolvedValue(undefined)
+    useStore.setState({
+      doc: { id: 'canvas', name: 'canvas', version: 1, nodes: [source, adhoc],
+        edges: [{ id: 'input-transform', source: 'input', sourceHandle: 'out', target: 'transform' }] },
+      schemas: { input: { out: [{ name: 'amount', type: 'decimal' }, { name: 'id', type: 'int' }] } },
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' }, promote,
+    } as any)
+    render(<CodeFullscreen />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Promote to library' }))
+    const dialog = within(screen.getByRole('dialog'))
+    expect(dialog.getByLabelText('Require amount')).not.toBeChecked()
+    expect(dialog.getByLabelText('Require id')).not.toBeChecked()
+    fireEvent.click(dialog.getByLabelText('Require amount'))
+    fireEvent.change(dialog.getByLabelText('Additional required columns'), { target: { value: 'amount\ncountry\ncountry' } })
+    fireEvent.change(dialog.getByLabelText('Description'), { target: { value: 'Requires amounts and countries.' } })
+    expect(dialog.getByText(/Only column names are checked/)).toBeVisible()
+    fireEvent.click(dialog.getByRole('button', { name: 'Promote' }))
+    await waitFor(() => expect(promote).toHaveBeenCalledWith(
+      'transform', 'Requires amounts and countries.', 'transform', ['amount', 'country'],
+    ))
+  })
+
+  it.each(['success', 'error'])('keeps a new promotion dialog owned by its Canvas when the old request returns %s', async (outcome) => {
+    const adhoc = { ...node, data: { ...node.data, config: { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' } } }
+    let resolveOld!: () => void
+    let rejectOld!: (error: Error) => void
+    let resolveNew!: () => void
+    const promote = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => { resolveOld = resolve; rejectOld = reject }))
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveNew = resolve }))
+    useStore.setState({ doc: { id: 'canvas-a', version: 1, nodes: [adhoc], edges: [] },
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' }, promote } as any)
+    render(<CodeFullscreen />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Promote to library' }))
+    fireEvent.change(screen.getByLabelText('Description'), { target: { value: 'Old request' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Promote' }))
+    await act(async () => useStore.setState((state) => ({ doc: { ...state.doc, id: 'canvas-b' } })))
+    fireEvent.click(screen.getByRole('button', { name: 'Promote to library' }))
+    fireEvent.change(screen.getByLabelText('Description'), { target: { value: 'New request' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Promote' }))
+    expect(promote).toHaveBeenCalledTimes(2)
+    await act(async () => { if (outcome === 'success') resolveOld(); else rejectOld(new Error('Old request failed')) })
+    expect(screen.getByRole('dialog')).toBeVisible()
+    expect(screen.getByLabelText('Description')).toHaveValue('New request')
+    expect(screen.getByRole('button', { name: 'Promoting…' })).toBeDisabled()
+    expect(screen.queryByText('Old request failed')).not.toBeInTheDocument()
+    await act(async () => resolveNew())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('labels ad-hoc transforms with their actual operator semantics', () => {

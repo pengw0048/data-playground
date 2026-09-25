@@ -569,6 +569,9 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
   const [name, setName] = useState(`${entry.title} exploration`)
   const [canvasId, setCanvasId] = useState('')
   const [input, setInput] = useState<TransformInput | null>(null)
+  const requiredColumns = [...new Set(entry.inputColumns)]
+  const missingColumns = input?.columnNames
+    ? requiredColumns.filter((name) => !input.columnNames!.includes(name)) : null
   const [choosingInput, setChoosingInput] = useState(false)
   const [root, setRoot] = useState<WorkspaceResource | null>(null)
   const [destinationError, setDestinationError] = useState<string | null>(null)
@@ -591,7 +594,7 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
   useEffect(() => { void refreshDestinations() }, [])
   useEffect(() => { if (!editable.some((file) => file.id === canvasId)) setCanvasId(editable[0]?.id ?? '') }, [files, canvasId])
   const submit = async () => {
-    if (busy) return
+    if (busy || (mode === 'new' && missingColumns?.length)) return
     setBusy(true); setError(null)
     let targetId: string
     let nodeId: string | null | undefined
@@ -646,19 +649,27 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
       </> : <div role="status" className="text-[12px] text-muted-foreground">No editable Canvas is available. Create a new Canvas instead.</div>}
       {mode === 'new' && <section aria-label="Transform input dataset" className="grid gap-2">
         <div className="text-[11px] text-muted-foreground">Input dataset <span>(optional)</span></div>
+        <p className="text-[11px] text-muted-foreground">{requiredColumns.length
+          ? `Required input columns: ${requiredColumns.join(', ')}.`
+          : 'No required input columns declared. Test the Transform with your input.'}</p>
         {input ? <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-[12px]">
           <span className="min-w-0 flex-1 truncate font-semibold">{input.name}</span>
           <button type="button" disabled={busy} onClick={() => setChoosingInput(true)} className="text-primary">Change input</button>
           <button type="button" disabled={busy} onClick={() => { setInput(null); setChoosingInput(false) }} className="text-muted-foreground">Remove input</button>
         </div> : <button type="button" disabled={busy} onClick={() => setChoosingInput(true)} className="rounded-md border border-border px-3 py-2 text-left text-[12px] font-semibold hover:bg-accent">Choose input dataset…</button>}
         {choosingInput && <TransformInputPicker disabled={busy} onSelect={(next) => { setInput(next); setChoosingInput(false) }} onCancel={() => setChoosingInput(false)} />}
+        {input && requiredColumns.length > 0 && (missingColumns?.length
+          ? <p role="alert" className="text-[11px] text-destructive">Missing required input columns: {missingColumns.join(', ')}. Choose another input dataset.</p>
+          : <p role="status" className="text-[11px] text-muted-foreground">{missingColumns === null
+            ? 'Input schema is unknown here, so required columns could not be checked. Test this input in the Canvas.'
+            : 'Required column names are present. Types and values still need testing.'}</p>)}
         <p className="text-[11px] text-muted-foreground">{input
           ? 'A Source will be connected to this Transform. Preview it in the Canvas to check the input columns and results.'
           : 'Create with just the Transform, or choose a dataset to connect its Source automatically.'}</p>
       </section>}
       {destinationError && mode === 'new' && <div role="alert" className="text-[12px] text-destructive">Couldn't load Workspace: {destinationError}</div>}
       {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
-      <div className="flex justify-end gap-2"><button onClick={close} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || entry.availability !== 'active' || (mode === 'new' ? !name.trim() || !root : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'new' ? 'Create and open' : 'Add and open'}</button></div>
+      <div className="flex justify-end gap-2"><button onClick={close} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || entry.availability !== 'active' || (mode === 'new' ? !name.trim() || !root || !!missingColumns?.length : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'new' ? 'Create and open' : 'Add and open'}</button></div>
     </div>
   </div>
 }
