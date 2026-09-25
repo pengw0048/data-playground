@@ -1458,7 +1458,7 @@ interface Store {
   prepareFullProfile: (id: string, portId?: string) => Promise<void>
   startFullProfile: (id: string, portId?: string) => Promise<void>
   cancelFullProfile: (id: string, portId?: string) => Promise<void>
-  promote: (id: string, description: string) => Promise<void>
+  promote: (id: string, description: string, title?: string) => Promise<void>
   restoreVersion: (id: string, versionId: string) => void
 
   // -- kernel + catalog --
@@ -4178,7 +4178,7 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  promote: async (id, description) => {
+  promote: async (id, description, title) => {
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
     const n = doc.nodes.find((x) => x.id === id)
@@ -4186,7 +4186,7 @@ export const useStore = create<Store>((set, get) => ({
     const cfg = n.data.config
     const desc = await api.promote({
       id: promotedTransformKey(doc.id, n.id),
-      title: n.data.title,
+      title: title?.trim() || n.data.title,
       mode: (cfg.mode as string) ?? 'map',
       code: (cfg.code as string) ?? '',
       inputColumns: [],

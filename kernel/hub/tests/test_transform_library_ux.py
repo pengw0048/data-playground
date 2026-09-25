@@ -31,13 +31,14 @@ def _headers(uid: str) -> dict[str, str]:
 def _promote(
         uid: str, key: str, *, title: str, marker: str,
         input_schema: list[dict] | None = None,
-        output_schema: list[dict] | None = None) -> dict:
+        output_schema: list[dict] | None = None,
+        requirements: list[str] | None = None) -> dict:
     response = client.post("/api/processors/promote", headers=_headers(uid), json={
         "id": key, "title": title, "blurb": f"{title} description",
         "category": "robotics", "mode": "map",
         "code": f"def fn(row):\n    row['marker'] = '{marker}'\n    return row",
         "inputSchema": input_schema or [], "outputSchema": output_schema or [],
-        "requirements": ["pyarrow"],
+        "requirements": ["pyarrow"] if requirements is None else requirements,
     })
     assert response.status_code == 200, response.text
     return response.json()
@@ -396,6 +397,76 @@ def test_exact_target_actions_are_atomic_role_checked_and_canvas_scoped() -> Non
     assert refs.json()[0]["availability"] == "active"
     assert refs.json()[0]["descriptor"]["id"] == descriptor["id"]
     assert "code" not in refs.json()[0]["descriptor"]
+
+
+def test_create_transform_with_one_registered_input_is_atomic_exact_and_replayable(tmp_path) -> None:
+    owner = _user("input-owner")
+    other = _user("input-other")
+    key = f"input-{uuid.uuid4().hex}"
+    first = _promote(owner, key, title="Input transform", marker="v1", requirements=[])
+    _promote(owner, key, title="Newer input transform", marker="v2", requirements=[])
+    path = tmp_path / "observations.csv"
+    path.write_text("value\n1\n2\n")
+    table_id = f"tbl_{uuid.uuid4().hex}"
+    metadb.catalog_upsert_entry(str(path), "Observations", {
+        "id": table_id, "name": "Observations", "uri": str(path), "version": "v1",
+    })
+    registration_id = metadb.workspace_builtin_dataset_identity(str(path))
+    body = {
+        "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+        "expectedContainerVersion": 1, "name": "Input transform",
+        "requestId": str(uuid.uuid4()), "datasetIds": [registration_id],
+        "transformId": first["id"], "transformVersion": first["version"],
+    }
+    created = client.post("/api/workspace/canvases", headers=_headers(owner), json=body)
+    assert created.status_code == 200, created.text
+    result = created.json()
+    doc = client.get(f"/api/canvas/{result['id']}", headers=_headers(owner)).json()
+    source, transform = doc["nodes"]
+    assert source["type"] == "source" and transform["type"] == "transform"
+    assert source["data"]["config"] == {
+        "uri": str(path), "tableId": table_id, "registrationId": registration_id,
+    }
+    assert transform["id"] == result["nodeId"]
+    assert transform["data"]["config"] == {
+        "source": "library", "processor": first["id"], "version": "v1", "mode": "map",
+    }
+    assert source["position"]["x"] < transform["position"]["x"]
+    assert len(doc["edges"]) == 1
+    assert doc["edges"][0] | {"id": "edge"} == {
+        "id": "edge", "source": source["id"], "target": transform["id"],
+        "sourceHandle": "out", "targetHandle": "in", "data": {"wire": "dataset"},
+    }
+    preview = client.post("/api/run/preview", headers=_headers(owner), json={
+        "graph": doc, "nodeId": transform["id"], "k": 3,
+    })
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["error"] is False
+    assert [row["marker"] for row in preview.json()["rows"]] == ["v1", "v1"], preview.text
+    replay = client.post("/api/workspace/canvases", headers=_headers(owner), json=body)
+    assert replay.json() == result
+    with metadb.session() as session:
+        refs = session.scalars(select(metadb.PromotedTransformVersionRef).where(
+            metadb.PromotedTransformVersionRef.owner_kind == "canvas",
+            metadb.PromotedTransformVersionRef.owner_key == result["id"],
+        )).all()
+        assert [(ref.transform_id, ref.version) for ref in refs] == [(first["id"], 1)]
+        before = set(session.scalars(select(metadb.Canvas.id)))
+    rejected_cases = [
+        (owner, {"datasetIds": [registration_id, registration_id]}, 422),
+        (owner, {"providerDatasetRefs": ["opaque-provider-ref"]}, 422),
+        (owner, {"datasetIds": [table_id]}, 404),
+        (owner, {"expectedContainerVersion": 999}, 409),
+        (owner, {"transformVersion": "v999"}, 409),
+        (other, {}, 403),
+    ]
+    for uid, changes, expected_status in rejected_cases:
+        rejected = client.post("/api/workspace/canvases", headers=_headers(uid), json={
+            **body, "requestId": str(uuid.uuid4()), **changes,
+        })
+        assert rejected.status_code == expected_status, rejected.text
+    with metadb.session() as session:
+        assert set(session.scalars(select(metadb.Canvas.id))) == before
 
 
 def test_blank_library_transform_is_configured_in_place_and_partial_refs_fail_closed() -> None:

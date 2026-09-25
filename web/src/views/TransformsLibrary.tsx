@@ -13,6 +13,7 @@ import { compareSchemas, isMeaningfulSchemaChange } from '../lib/schemaCompatibi
 import { Icon } from '../ui/Icon'
 import { routeHash } from '../router'
 import { processorModeLabel } from '../nodes/processorIdentity'
+import { TransformInputPicker, type TransformInput } from './TransformInputPicker'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 25
@@ -181,6 +182,7 @@ export function TransformsLibrary() {
           ? <FilteredSelectionNotice onClear={() => setRouteQuery('')} empty />
           : <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
               <strong className="block text-foreground">{hasFilters ? 'No transforms match these filters.' : 'No transforms yet.'}</strong>
+              {!hasFilters && <p className="mx-auto mt-2 max-w-md">Open a Python node in a Canvas, test your code, then choose <strong className="text-foreground">Promote to library</strong> in its editor. Saved versions appear here so you can reuse them with another dataset.</p>}
               {!hasFilters && <a href={routeHash('workspace')} className="mt-3 inline-flex rounded-md border border-border bg-background px-3 py-1.5 font-semibold text-foreground hover:bg-accent">Open Workspace</a>}
             </div>)}
         {!!items.length && selectedOutsideFilteredResults && <FilteredSelectionNotice onClear={() => setRouteQuery('')} />}
@@ -566,6 +568,8 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
   const [mode, setMode] = useState<'new' | 'existing'>('new')
   const [name, setName] = useState(`${entry.title} exploration`)
   const [canvasId, setCanvasId] = useState('')
+  const [input, setInput] = useState<TransformInput | null>(null)
+  const [choosingInput, setChoosingInput] = useState(false)
   const [root, setRoot] = useState<WorkspaceResource | null>(null)
   const [destinationError, setDestinationError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -597,6 +601,8 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
         const result = await api.workspaceCreateCanvas({
           containerId: identity(root), expectedContainerVersion: root.version, name: name.trim(),
           transformId: entry.id, transformVersion: entry.version,
+          ...(input?.kind === 'registered' ? { datasetIds: [input.id] }
+            : input?.kind === 'provider' ? { providerDatasetRefs: [input.id] } : {}),
         })
         targetId = result.id; nodeId = result.nodeId
       } else {
@@ -631,13 +637,25 @@ function TransformUseDialog({ entry, onClose }: { entry: TransformLibraryEntry; 
   }
   const close = () => { if (!busy) onClose() }
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={close}>
-    <div role="dialog" aria-modal="true" aria-label={`Use ${entry.title}`} className="grid w-[500px] max-w-full gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
+    <div role="dialog" aria-modal="true" aria-label={`Use ${entry.title}`} className="grid max-h-[calc(100vh-2rem)] w-[500px] max-w-full gap-3 overflow-y-auto rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
       <div className="flex items-center gap-2"><h2 className="flex-1 text-[15px] font-bold">Use {entry.title} · {entry.version}</h2><button onClick={close} disabled={busy} aria-label="Close"><Icon name="close" size={15} /></button></div>
       <p className="text-[11px] text-muted-foreground">The Canvas stores this version and will not switch to a newer release automatically.</p>
       <div className="grid grid-cols-2 gap-2"><button onClick={() => setMode('new')} disabled={busy} aria-pressed={mode === 'new'} className={`rounded-lg border p-3 text-left ${mode === 'new' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Create new Canvas</strong><span className="text-[10.5px] text-muted-foreground">Create in Workspace</span></button><button onClick={() => setMode('existing')} disabled={busy} aria-pressed={mode === 'existing'} className={`rounded-lg border p-3 text-left ${mode === 'existing' ? 'border-primary bg-primary/5' : 'border-border'}`}><strong className="block text-[12px]">Add to Canvas</strong><span className="text-[10.5px] text-muted-foreground">Choose an editable Canvas</span></button></div>
       {mode === 'new' ? <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name<input aria-label="New Canvas name" value={name} onChange={(event) => setName(event.target.value)} disabled={busy} className="dp-input" /></label> : editable.length ? <>
         <label className="grid gap-1 text-[11px] text-muted-foreground">Target Canvas<select aria-label="Target Canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} disabled={busy} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
       </> : <div role="status" className="text-[12px] text-muted-foreground">No editable Canvas is available. Create a new Canvas instead.</div>}
+      {mode === 'new' && <section aria-label="Transform input dataset" className="grid gap-2">
+        <div className="text-[11px] text-muted-foreground">Input dataset <span>(optional)</span></div>
+        {input ? <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-[12px]">
+          <span className="min-w-0 flex-1 truncate font-semibold">{input.name}</span>
+          <button type="button" disabled={busy} onClick={() => setChoosingInput(true)} className="text-primary">Change input</button>
+          <button type="button" disabled={busy} onClick={() => { setInput(null); setChoosingInput(false) }} className="text-muted-foreground">Remove input</button>
+        </div> : <button type="button" disabled={busy} onClick={() => setChoosingInput(true)} className="rounded-md border border-border px-3 py-2 text-left text-[12px] font-semibold hover:bg-accent">Choose input dataset…</button>}
+        {choosingInput && <TransformInputPicker disabled={busy} onSelect={(next) => { setInput(next); setChoosingInput(false) }} onCancel={() => setChoosingInput(false)} />}
+        <p className="text-[11px] text-muted-foreground">{input
+          ? 'A Source will be connected to this Transform. Preview it in the Canvas to check the input columns and results.'
+          : 'Create with just the Transform, or choose a dataset to connect its Source automatically.'}</p>
+      </section>}
       {destinationError && mode === 'new' && <div role="alert" className="text-[12px] text-destructive">Couldn't load Workspace: {destinationError}</div>}
       {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
       <div className="flex justify-end gap-2"><button onClick={close} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || entry.availability !== 'active' || (mode === 'new' ? !name.trim() || !root : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'new' ? 'Create and open' : 'Add and open'}</button></div>

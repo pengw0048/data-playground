@@ -52,6 +52,7 @@ export function CodeFullscreen() {
   const [exampleRowsJson, setExampleRowsJson] = useState('')
   const [testedExampleRowsJson, setTestedExampleRowsJson] = useState<string | null>(null)
   const [promotionOpen, setPromotionOpen] = useState(false)
+  const [promotionTitle, setPromotionTitle] = useState('')
   const [promotionDescription, setPromotionDescription] = useState('')
   const [promotionBusy, setPromotionBusy] = useState(false)
   const [promotionError, setPromotionError] = useState('')
@@ -87,6 +88,7 @@ export function CodeFullscreen() {
     setExampleRowsJson('')
     setTestedExampleRowsJson(null)
     setPromotionOpen(false)
+    setPromotionTitle('')
     setPromotionDescription('')
     setPromotionBusy(false)
     setPromotionError('')
@@ -242,7 +244,9 @@ export function CodeFullscreen() {
   const freshUpstreamResultReady = Boolean(
     requestIsCurrent && !upstreamRequest?.cancelled
     && upstreamRun?.phase !== 'failed'
-    && preview && previewIsCurrent(preview, doc, fs.nodeId)
+    // The request already binds the upstream plan. Editing this Transform makes its
+    // test output stale, but must not discard the input we just prepared for it.
+    && preview?.canvasId === doc.id && preview.nodeId === fs.nodeId
     && upstreamRequest?.refreshPreviewGeneration != null
     && selectedEditorInputRunId
     && selectedEditorInputRunId !== upstreamRequest?.baselineEditorInputRunId
@@ -355,12 +359,13 @@ export function CodeFullscreen() {
     })
   }
   const submitPromotion = async () => {
+    const title = promotionTitle.trim()
     const description = promotionDescription.trim()
-    if (!description || promotionBusy) return
+    if (!title || !description || promotionBusy) return
     setPromotionBusy(true)
     setPromotionError('')
     try {
-      await promote(fs.nodeId, description)
+      await promote(fs.nodeId, description, title)
       setPromotionOpen(false)
     } catch (error) {
       setPromotionError((error as Error).message || 'Could not promote this Transform')
@@ -516,6 +521,7 @@ export function CodeFullscreen() {
             <span className="flex-1" />
             {canEdit && isTransform && !isLibrary && (
               <button onClick={() => {
+                setPromotionTitle(String(node.data.title || 'Transform'))
                 setPromotionDescription('')
                 setPromotionError('')
                 setPromotionOpen(true)
@@ -541,11 +547,12 @@ export function CodeFullscreen() {
       </div>
       {promotionOpen && (
         <PromotionDescriptionDialog
-          title={String(node.data.title || 'Transform')}
+          title={promotionTitle}
           description={promotionDescription}
           busy={promotionBusy}
           error={promotionError}
           onChange={setPromotionDescription}
+          onTitleChange={setPromotionTitle}
           onCancel={() => {
             if (!promotionBusy) setPromotionOpen(false)
           }}
@@ -926,6 +933,7 @@ function PromotionDescriptionDialog({
   busy,
   error,
   onChange,
+  onTitleChange,
   onCancel,
   onSubmit,
 }: {
@@ -934,6 +942,7 @@ function PromotionDescriptionDialog({
   busy: boolean
   error: string
   onChange: (value: string) => void
+  onTitleChange: (value: string) => void
   onCancel: () => void
   onSubmit: () => void
 }) {
@@ -950,16 +959,23 @@ function PromotionDescriptionDialog({
           Promote {title} to the Library
         </h2>
         <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-          Describe what the processor does and what a researcher should expect. This description is
-          stored with the Library version.
+          Give this Transform a name you can find again, and describe what data it needs and produces.
+          You can reuse this version from Transforms without copying the code.
         </p>
+        <label htmlFor="promotion-title"
+          className="mt-4 block text-[11px] font-semibold text-foreground">
+          Name
+        </label>
+        <input id="promotion-title" autoFocus value={title} maxLength={256}
+          onChange={(event) => onTitleChange(event.target.value)}
+          placeholder="For example: Add tax to purchase amounts"
+          className="mt-1.5 w-full rounded-md border border-border bg-background px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary" />
         <label htmlFor="promotion-description"
           className="mt-4 block text-[11px] font-semibold text-foreground">
           Description
         </label>
         <textarea
           id="promotion-description"
-          autoFocus
           maxLength={2000}
           value={description}
           onChange={(event) => onChange(event.target.value)}
@@ -979,7 +995,7 @@ function PromotionDescriptionDialog({
             className="rounded-md border border-border bg-background px-3 py-2 text-xs font-semibold text-foreground hover:bg-accent disabled:opacity-50">
             Cancel
           </button>
-          <button type="button" onClick={onSubmit} disabled={busy || !description.trim()}
+          <button type="button" onClick={onSubmit} disabled={busy || !title.trim() || !description.trim()}
             className="rounded-md bg-primary px-3.5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
             {busy ? 'Promoting…' : 'Promote'}
           </button>

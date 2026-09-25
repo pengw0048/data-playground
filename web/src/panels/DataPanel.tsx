@@ -465,8 +465,24 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
+    // An unavailable input has no rows to go stale when the researcher edits code.
+    // Keep the preparation action visible; the run still resolves the current graph.
+    if (editorPreview && editorPreview.resultContext !== 'example-rows'
+        && preview.result?.notPreviewable) {
+      const testTarget = editorPreview.testTarget ?? 'code'
+      return withOutputPorts(<NotPreviewable
+        title={editorPreview.onRunUpstream
+          ? `Run upstream to test this ${testTarget}`
+          : `Input needed to test this ${testTarget}`}
+        reason={editorPreview.onRunUpstream
+          ? 'Prepare the upstream data, then run this test here.'
+          : 'Connect one upstream output and prepare its data before testing.'}
+        onRun={editorPreview.onRunUpstream}
+        runLabel="Run upstream" />)
+    }
     return withOutputPorts(<StalePreview
       exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
+      editorTestTarget={editorPreview ? editorPreview.testTarget ?? 'code' : undefined}
       onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
@@ -755,17 +771,22 @@ function OutputOutcomeBadge({ outcome }: { outcome: RunOutput['outcome'] }) {
   )
 }
 
-function StalePreview({ onRefresh, exampleRowsTest = false }: {
+function StalePreview({ onRefresh, exampleRowsTest = false, editorTestTarget }: {
   onRefresh: () => void
   exampleRowsTest?: boolean
+  editorTestTarget?: 'code' | 'transform'
 }) {
   return (
     <div role="status" className="flex flex-col items-start gap-2 px-4 py-5 text-[12px] text-muted-foreground">
-      <span className="font-medium text-foreground">{exampleRowsTest ? 'Example rows test out of date' : 'Preview out of date'}</span>
+      <span className="font-medium text-foreground">{exampleRowsTest ? 'Example rows test out of date'
+        : editorTestTarget ? 'Test result out of date' : 'Preview out of date'}</span>
       <span>{exampleRowsTest
         ? 'The code or example rows changed after this test. Test code again to inspect the current result.'
+        : editorTestTarget
+          ? 'The code or upstream data changed. Test again to check the current input and see the new result.'
         : 'The graph changed after these rows were fetched. Refresh to inspect the current result.'}</span>
-      <Button size="sm" onClick={onRefresh}><Icon name="refresh" size={13} /> {exampleRowsTest ? 'Test code' : 'Refresh preview'}</Button>
+      <Button size="sm" onClick={onRefresh}><Icon name="refresh" size={13} /> {exampleRowsTest
+        ? 'Test code' : editorTestTarget ? 'Test again' : 'Refresh preview'}</Button>
     </div>
   )
 }

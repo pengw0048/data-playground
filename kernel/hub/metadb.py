@@ -4387,19 +4387,27 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
             if replay is not None:
                 return replay
         container = _workspace_container_at_version(s, container_id, expected_container_version)
+        if (transform is not None
+                and len(dataset_ids or []) + len(provider_sources or []) > 1):
+            raise ValueError("a new Transform Canvas accepts at most one input dataset")
         sources = [*_workspace_dataset_sources_in_session(s, dataset_ids or []),
                    *(provider_sources or [])]
+        transform_node = None
         if transform is not None:
-            if sources:
-                raise ValueError("a Transform target cannot include dataset sources")
-            sources.append(_workspace_transform_node_in_session(
-                s, uid=uid, transform=transform))
+            transform_node = _workspace_transform_node_in_session(s, uid=uid, transform=transform)
+            sources.append(transform_node)
         nodes: list[dict] = []
         _workspace_place_sources(nodes, sources)
+        edges = []
+        if transform_node is not None and len(nodes) == 2:
+            edges.append({
+                "id": f"edge_{_uid()}", "source": nodes[0]["id"], "target": transform_node["id"],
+                "sourceHandle": "out", "targetHandle": "in", "data": {"wire": "dataset"},
+            })
         canvas_id = new_canvas_file_key()
         doc = {
             "id": canvas_id, "name": canvas_name, "version": 1,
-            "nodes": nodes, "edges": [],
+            "nodes": nodes, "edges": edges,
         }
         canvas = Canvas(
             id=canvas_id, owner_id=uid, name=canvas_name, version=1, doc=json.dumps(doc))
@@ -4412,7 +4420,8 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         result = {
             "ok": True, "id": canvas_id, "created": True,
-            "nodeId": nodes[0]["id"] if len(nodes) == 1 else None,
+            "nodeId": (transform_node["id"] if transform_node is not None
+                       else nodes[0]["id"] if len(nodes) == 1 else None),
             "resource": _workspace_public_placement_resource(s, placement, detached=False),
         }
         if normalized_request_id is not None and intent_sha256 is not None:

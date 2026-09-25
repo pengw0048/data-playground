@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   transformLibrary: vi.fn(), transformLibraryDetail: vi.fn(), workspaceBrowse: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceAddTransform: vi.fn(), deleteTransformVersion: vi.fn(),
-  installedProcessorSource: vi.fn(), getCanvas: vi.fn(),
+  installedProcessorSource: vi.fn(), getCanvas: vi.fn(), tablesPage: vi.fn(), workspaceSearch: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   transformLibraryQuery: '', transformResourceId: 'tr_exact', transformVersion: 'v1',
@@ -83,6 +83,8 @@ describe('TransformsLibrary', () => {
     })
     mocks.workspaceBrowse.mockResolvedValue({ container: { id: 'container:workspace-local-root', name: 'Workspace', kind: 'container', version: 1 }, items: [], hasMore: false })
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'created', created: true, nodeId: 'new-transform', resource: {} })
+    mocks.tablesPage.mockResolvedValue({ items: [], total: 0, offset: 0, limit: 12, hasMore: false })
+    mocks.workspaceSearch.mockResolvedValue({ groups: [], hasMore: false, nextCursor: null })
     mocks.workspaceAddTransform.mockResolvedValue({ ok: true, id: 'target', version: 10, nodeId: 'new-transform', doc: {} })
     mocks.deleteTransformVersion.mockResolvedValue({ ok: true, deleted: true })
     mocks.installedProcessorSource.mockImplementation((processorId: string, version: string) => (
@@ -301,6 +303,8 @@ describe('TransformsLibrary', () => {
     render(<TransformsLibrary />)
 
     expect(await screen.findByText('No transforms yet.')).toBeVisible()
+    expect(screen.getByText('Promote to library')).toBeVisible()
+    expect(screen.getByText(/Open a Python node in a Canvas, test your code/)).toBeVisible()
     expect(screen.getByRole('link', { name: 'Open Workspace' })).toHaveAttribute('href', '#/workspace')
     expect(screen.queryByRole('region', { name: 'Transform detail' })).not.toBeInTheDocument()
   })
@@ -368,6 +372,138 @@ describe('TransformsLibrary', () => {
     }))
     expect(store.openFile).toHaveBeenCalledWith('target', { serverCopy: true })
     expect(store.select).toHaveBeenCalledWith('new-transform')
+  })
+
+  it('creates an exact Transform with the selected registration, not its catalog table ID', async () => {
+    mocks.tablesPage.mockResolvedValue({
+      items: [{ id: 'table-derived-id', registrationId: 'registration-stable-id', name: 'Robot observations',
+        uri: 'file:///observations.parquet', columns: schema, rowCount: 500 }],
+      total: 1, offset: 0, limit: 12, hasMore: false,
+    })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Robot observations/ }))
+    expect(screen.getByText(/A Source will be connected/)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
+      name: 'Robot scorer exploration', transformId: 'tr_exact', transformVersion: 'v1',
+      datasetIds: ['registration-stable-id'],
+    }))
+    expect(store.openFile).toHaveBeenCalledWith('created', { serverCopy: true })
+    expect(store.select).toHaveBeenCalledWith('new-transform')
+    expect(mocks.workspaceAddTransform).not.toHaveBeenCalled()
+  })
+
+  it('submits an opaque provider occurrence and leaves source identity and revision admission to the server', async () => {
+    const providerRef = 'provider:opaque-occurrence:YWxpYXMvMg=='
+    mocks.workspaceSearch.mockResolvedValue({
+      groups: [{
+        source: { id: 'mount-a', kind: 'provider', completeness: 'complete', provider: 'Robot catalog' },
+        items: [{ id: providerRef, name: 'Provider observations', kind: 'dataset', source: 'provider',
+          detached: false, referenceState: 'current', canonicalReferenceState: 'current',
+          providerDatasetId: 'canonical-observations' },
+        { id: 'stale-occurrence', name: 'Unavailable observations', kind: 'dataset', source: 'provider',
+          detached: false, referenceState: 'current', canonicalReferenceState: 'permission_lost' }],
+      }], hasMore: false, nextCursor: null,
+    })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.change(screen.getByLabelText('Input dataset catalog'), { target: { value: 'provider' } })
+    fireEvent.change(screen.getByLabelText('Search input datasets'), { target: { value: 'observations' } })
+    const selectable = await screen.findByRole('button', { name: /Provider observations/ })
+    expect(screen.queryByRole('button', { name: /Unavailable observations/ })).not.toBeInTheDocument()
+    fireEvent.click(selectable)
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
+      name: 'Robot scorer exploration', transformId: 'tr_exact', transformVersion: 'v1',
+      providerDatasetRefs: [providerRef],
+    }))
+    expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 12, kinds: ['dataset'] })
+  })
+
+  it('can remove a chosen input and create only the Transform', async () => {
+    mocks.tablesPage.mockResolvedValue({
+      items: [{ id: 'table', registrationId: 'registered', name: 'Events', uri: 'events.parquet', columns: [] }],
+      total: 1, offset: 0, limit: 12, hasMore: false,
+    })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Events/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove input' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
+      name: 'Robot scorer exploration', transformId: 'tr_exact', transformVersion: 'v1',
+    }))
+  })
+
+  it('keeps adding to an existing Canvas independent from the optional new-Canvas input', async () => {
+    mocks.tablesPage.mockResolvedValue({
+      items: [{ id: 'table', registrationId: 'registered', name: 'Events', uri: 'events.parquet', columns: [] }],
+      total: 1, offset: 0, limit: 12, hasMore: false,
+    })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Events/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Add to Canvas/ }))
+    expect(screen.queryByRole('region', { name: 'Transform input dataset' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+
+    await waitFor(() => expect(mocks.workspaceAddTransform).toHaveBeenCalledWith('target', {
+      transformId: 'tr_exact', transformVersion: 'v1', expectedCanvasVersion: 9,
+    }))
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+  })
+
+  it('allows creating without input when catalog search fails, and never selects unavailable registrations', async () => {
+    mocks.tablesPage.mockResolvedValueOnce({
+      items: [{ id: 'missing', registrationId: 'missing-registration', name: 'Missing file', missing: true, columns: [] },
+        { id: 'unregistered', name: 'Not registered', columns: [] }],
+      total: 2, offset: 0, limit: 12, hasMore: false,
+    }).mockRejectedValueOnce(new Error('catalog unavailable'))
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    expect(await screen.findByRole('button', { name: /Missing file/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Not registered/ })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Search input datasets'), { target: { value: 'other' } })
+    expect(await screen.findByRole('alert')).toHaveTextContent('catalog unavailable')
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.not.objectContaining({ datasetIds: expect.anything() })))
+  })
+
+  it('does not offer stale input datasets when an earlier load-more request finishes after a new search', async () => {
+    const table = (id: string, name: string) => ({ id, registrationId: `registration-${id}`, name, uri: `${id}.parquet`, columns: [] })
+    let resolveOldPage: ((value: { items: ReturnType<typeof table>[]; hasMore: boolean }) => void) | undefined
+    mocks.tablesPage
+      .mockResolvedValueOnce({ items: [table('first', 'First events')], total: 24, offset: 0, limit: 12, hasMore: true })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldPage = resolve }))
+      .mockResolvedValueOnce({ items: [table('current', 'Current observations')], total: 1, offset: 0, limit: 12, hasMore: false })
+    render(<TransformsLibrary />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Use v1' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Choose input dataset…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more datasets' }))
+    fireEvent.change(screen.getByLabelText('Search input datasets'), { target: { value: 'observations' } })
+    expect(await screen.findByRole('button', { name: /Current observations/ })).toBeVisible()
+    resolveOldPage?.({ items: [table('stale', 'Stale events')], hasMore: false })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(screen.queryByRole('button', { name: /Stale events|First events/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Current observations/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.objectContaining({
+      datasetIds: ['registration-current'],
+    })))
   })
 
   it('keeps a stale target failure in the chooser and never opens a Canvas', async () => {
