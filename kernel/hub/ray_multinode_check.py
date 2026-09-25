@@ -1,7 +1,7 @@
 """Multi-node byte-identical validation for the dp_ray distributed backend (ARC3).
 
 Runs INSIDE the `driver` container of docker-compose.ray.yml, against a REAL Ray cluster (a head + 2
-worker containers, each its own filesystem) plus MinIO as the shared object store. Proves, precisely:
+worker containers, each its own filesystem) plus SeaweedFS as the shared object store. Proves, precisely:
 
   1. the CLUSTER genuinely spreads a HASH-SHUFFLE EXCHANGE (the aggregate's exact mechanism) across
      >=2 distinct Ray node ids — the node probe repartitions-by-key then reports per-partition node ids;
@@ -40,7 +40,8 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
+
+from hub.s3_validation import wait_for_s3
 
 
 def _log(m: str) -> None:
@@ -67,17 +68,6 @@ def _wait_tcp(host: str, port: int, timeout: float = 120) -> None:
         except OSError:
             time.sleep(1)
     raise TimeoutError(f"{host}:{port} not reachable in {timeout}s")
-
-
-def _wait_http(url: str, timeout: float = 120) -> None:
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            urllib.request.urlopen(url + "/minio/health/live", timeout=3)
-            return
-        except Exception:  # noqa: BLE001
-            time.sleep(1)
-    raise TimeoutError(f"{url} not healthy in {timeout}s")
 
 
 # a self-contained node-diversity probe (own process — ray.init must not coexist with DuckDB). It runs
@@ -121,11 +111,11 @@ def _load_dp_ray():
 
 
 def main() -> int:
-    endpoint = os.environ["DP_S3_ENDPOINT"]               # http://minio:9000
+    endpoint = os.environ["DP_S3_ENDPOINT"]               # http://object-store:8333
     bucket = os.environ.get("DP_S3_BUCKET", "dpray")
     # the container already joined the cluster (`ray start --address=…` in the entrypoint) → RAY_ADDRESS is
     # "auto" (connect to the local raylet). Only the object store still needs a readiness wait.
-    _wait_http(endpoint)
+    wait_for_s3(bucket=bucket, timeout=120)
     _log(f"joined cluster; object store {endpoint} reachable")
 
     # (1) multi-node proof — a separate process (keeps ray.init out of this DuckDB process)
@@ -224,7 +214,7 @@ def main() -> int:
     _log(f"PASS: distributed GROUP BY (placement=distributed) byte-identical to DuckDB "
          f"({len(ray_rows)} groups incl. NULL); worker-direct object-store output; cluster shuffle spans {n_nodes} nodes")
 
-    # Native Parquet proof on the real Ray/MinIO path. Ray 2.56 otherwise infers one footer and applies
+    # Native Parquet proof on the real Ray/S3 path. Ray 2.56 otherwise infers one footer and applies
     # Hive parsing above the requested dataset root. Exercise both failure modes plus a genuine immediate
     # Hive partition before this backend can claim worker-direct object reads.
     if not fault:

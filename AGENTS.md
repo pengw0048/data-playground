@@ -7,7 +7,7 @@ Data Playground is a **single product** with two build components managed from t
 - **Kernel** (`kernel/`) — Python 3.12 / FastAPI backend + execution engine (DuckDB, Polars, Arrow) + the `dataplay` CLI. Managed by **uv** (`uv.lock`).
 - **Web** (`web/`) — React + TypeScript + Vite SPA. Managed by **npm** (`package-lock.json`). Built to `web/dist` and served by the kernel.
 
-By default one hub process serves the product on `http://127.0.0.1:8471`; the default kernel backend starts a per-canvas kernel subprocess for execution. The metadata DB (SQLite) and storage (local filesystem) are embedded, not separate services. Postgres, object storage/MinIO, Ray, Kubernetes, and an LLM agent are all optional scale-out add-ons and are not needed for local development or testing.
+By default one hub process serves the product on `http://127.0.0.1:8471`; the default kernel backend starts a per-canvas kernel subprocess for execution. The metadata DB (SQLite) and storage (local filesystem) are embedded, not separate services. Postgres, S3-compatible object storage, Ray, Kubernetes, and an LLM agent are all optional scale-out add-ons and are not needed for local development or testing.
 
 ### Running / building / testing
 

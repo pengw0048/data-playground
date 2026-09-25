@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from hub.s3_validation import bootstrap_storage, client_from_env as _s3_client
+
 
 _PREFIX = "ray-jobs-acceptance-"
 _SOURCE_URI = "s3://dpray/acceptance/input.parquet"
@@ -37,30 +39,6 @@ def _wait(label: str, fn, predicate, timeout: float = 180.0, interval: float = 0
             return last
         time.sleep(interval)
     raise TimeoutError(f"timed out waiting for {label}; last observation={last!r}")
-
-
-def _s3_client():
-    import boto3
-
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("DP_S3_ENDPOINT"),
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("DP_S3_KEY"),
-        aws_secret_access_key=(
-            os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("DP_S3_SECRET")
-        ),
-        region_name=os.environ.get("AWS_REGION") or "us-east-1",
-    )
-
-
-def bootstrap_storage() -> None:
-    client = _s3_client()
-    _wait("MinIO", client.list_buckets, lambda _value: True, timeout=90)
-    names = {bucket["Name"] for bucket in client.list_buckets().get("Buckets", [])}
-    if "dpray" not in names:
-        client.create_bucket(Bucket="dpray")
-    client.put_bucket_versioning(Bucket="dpray", VersioningConfiguration={"Status": "Enabled"})
-    print(json.dumps({"check": "storage", "bucket": "dpray", "versioning": "Enabled"}))
 
 
 def _configure_control_plane() -> None:

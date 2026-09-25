@@ -55,7 +55,9 @@ scripts/ray-jobs-acceptance.sh
 ```
 
 It builds one image for the hub-side Jobs client, Ray head, worker, and remote entrypoint, then starts
-PostgreSQL 16 and a versioned MinIO bucket. The gate proves that a submitting hub can exit while the
+PostgreSQL 16 and a versioned SeaweedFS 4.47 S3 bucket. Initialization uses signed S3 requests with a
+finite readiness deadline and verifies that bucket versioning is enabled before starting Ray jobs.
+The gate proves that a submitting hub can exit while the
 official Ray job is `RUNNING`, a new process reattaches to the same deterministic submission, and the
 terminal run history and logical catalog state converge to one publication. Before that restart, it
 replaces a managed source's catalog generation and proves the recovered job still reads its hash-bound

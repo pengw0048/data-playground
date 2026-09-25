@@ -87,10 +87,12 @@ sed "s|image: dp-ray:local|image: ${IMAGE}|g" \
   "${ROOT}/deploy/kuberay/raycluster.yaml" > "${TMP}/raycluster.yaml"
 sed "s|image: dp-ray:local|image: ${IMAGE}|g" \
   "${ROOT}/deploy/kuberay/differential-job.yaml" > "${TMP}/differential-job.yaml"
+sed "s|image: dp-ray:local|image: ${IMAGE}|g" \
+  "${ROOT}/deploy/kuberay/object-store.yaml" > "${TMP}/object-store.yaml"
 
-say "Start MinIO and create the validation bucket"
-"${KUBECTL[@]}" apply -f "${ROOT}/deploy/kuberay/minio.yaml"
-"${KUBECTL[@]}" rollout status deployment/minio --timeout=180s
+say "Start SeaweedFS and initialize the versioned validation bucket"
+"${KUBECTL[@]}" apply -f "${TMP}/object-store.yaml"
+"${KUBECTL[@]}" rollout status deployment/object-store --timeout=180s
 "${KUBECTL[@]}" wait --for=condition=complete --timeout=180s job/dp-ray-createbucket
 
 say "Start a fresh three-pod RayCluster"

@@ -40,7 +40,7 @@ spec:
               allowPrivilegeEscalation: false
               capabilities: { drop: ["ALL"] }
             resources:
-              # Disposable kind sizing: leave room for Kubernetes, KubeRay, MinIO, and the driver on a
+              # Disposable kind sizing: leave room for Kubernetes, KubeRay, S3, and the driver on a
               # 4-CPU/8-GiB node. This is a validation profile, not production capacity guidance.
               requests: { cpu: "600m", memory: "1500Mi" }
               limits: { cpu: "2", memory: "2Gi" }

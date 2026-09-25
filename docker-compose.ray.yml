@@ -1,12 +1,12 @@
 # Multi-node validation for the dp_ray distributed backend (ARC3).
 #
-# A REAL Ray cluster — a head + 2 workers, each its OWN container (own filesystem), plus MinIO as the
+# A REAL Ray cluster — a head + 2 workers, each its OWN container (own filesystem), plus SeaweedFS as the
 # shared object store the worker-direct handoff writes to (local-dir shards would scatter per-node and be
 # invisible across containers — the multi-node-correct handoff MUST go to object storage). The `driver`
 # service runs the byte-identical differential INSIDE the network so the Ray Client version always matches
-# the cluster and it reaches minio/ray-head by DNS.
+# the cluster and it reaches object-store/ray-head by DNS.
 #
-# VALIDATION-ONLY CREDENTIALS: the MinIO user/secret below (dp-ray-validation-only / …) exist solely so
+# VALIDATION-ONLY CREDENTIALS: the S3 user/secret below (dp-ray-validation-only / …) exist solely so
 # this harness stays zero-config for CI. They must NEVER be copied into a shared or production
 # deployment — supply real IAM/object-store credentials there instead.
 #
@@ -15,7 +15,8 @@
 # ports are published; services stay on the isolated `dpray` network.
 #
 #   docker compose -f docker-compose.ray.yml build ray-head
-#   docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
+#   docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker object-store
+#   docker compose -f docker-compose.ray.yml run --rm --no-deps createbucket
 #   docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # differential; exits 0 on PASS
 #   docker compose -f docker-compose.ray.yml down -v
 #
@@ -52,20 +53,30 @@ services:
     shm_size: "1gb"
     networks: [dpray]
 
-  minio:
-    # Digest-pinned — resolve a new digest with `docker buildx imagetools inspect minio/minio:<tag>`.
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
-    command: server /data --console-address ":9001"
+  object-store:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    command: ["mini", "-dir=/data", "-admin.ui=false", "-webdav=false", "-s3.port.iceberg=0", "-s3.port.lance=0", "-master.telemetry=false"]
     environment:
-      MINIO_ROOT_USER: dp-ray-validation-only
-      MINIO_ROOT_PASSWORD: dp-ray-validation-only-not-for-shared-use
+      AWS_ACCESS_KEY_ID: dp-ray-validation-only
+      AWS_SECRET_ACCESS_KEY: dp-ray-validation-only-not-for-shared-use
+      S3_BUCKET: dpray
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
     networks: [dpray]
 
   createbucket:
-    # Digest-pinned — resolve a new digest with `docker buildx imagetools inspect minio/mc:<tag>`.
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
-    depends_on: [minio]
-    entrypoint: ["/bin/sh", "-c", "until mc alias set m http://minio:9000 dp-ray-validation-only dp-ray-validation-only-not-for-shared-use; do sleep 1; done; mc mb -p m/dpray; exit 0"]
+    image: dp-ray:local
+    depends_on:
+      object-store: { condition: service_healthy }
+    environment:
+      DP_S3_ENDPOINT: "http://object-store:8333"
+      DP_S3_KEY: "dp-ray-validation-only"
+      DP_S3_SECRET: "dp-ray-validation-only-not-for-shared-use"
+      DP_S3_BUCKET: "dpray"
+    command: ["python", "-m", "hub.s3_validation"]
     networks: [dpray]
 
   driver:
@@ -80,7 +91,7 @@ services:
       DP_TEST_RAY_LIVE: "1"
       DP_RAY_SHUFFLE_PARTITIONS: "4"
       DP_MULTINODE_FAULT: "${DP_MULTINODE_FAULT:-}"
-      DP_S3_ENDPOINT: "http://minio:9000"
+      DP_S3_ENDPOINT: "http://object-store:8333"
       DP_S3_KEY: "dp-ray-validation-only"
       DP_S3_SECRET: "dp-ray-validation-only-not-for-shared-use"
       DP_S3_BUCKET: "dpray"

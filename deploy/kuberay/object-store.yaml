@@ -1,0 +1,54 @@
+# Disposable SeaweedFS S3 service and versioned-bucket initialization for KubeRay validation.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: object-store }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: object-store } }
+  template:
+    metadata: { labels: { app: object-store } }
+    spec:
+      containers:
+        - name: object-store
+          image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+          args: ["mini", "-dir=/data", "-admin.ui=false", "-webdav=false", "-s3.port.iceberg=0", "-s3.port.lance=0", "-master.telemetry=false"]
+          env:
+            - { name: AWS_ACCESS_KEY_ID, value: dp-ray-validation-only }
+            - { name: AWS_SECRET_ACCESS_KEY, value: dp-ray-validation-only-not-for-shared-use }
+            - { name: S3_BUCKET, value: dpray }
+          ports: [{ containerPort: 8333 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8333 }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: object-store }
+spec:
+  selector: { app: object-store }
+  ports: [{ port: 8333, targetPort: 8333 }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dp-ray-createbucket }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: storage-init
+          image: dp-ray:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "hub.s3_validation"]
+          env:
+            - { name: DP_S3_ENDPOINT, value: "http://object-store:8333" }
+            - { name: DP_S3_KEY, value: dp-ray-validation-only }
+            - { name: DP_S3_SECRET, value: dp-ray-validation-only-not-for-shared-use }
+            - { name: DP_S3_BUCKET, value: dpray }

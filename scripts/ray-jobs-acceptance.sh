@@ -37,7 +37,7 @@ if [[ ! $DP_RAY_JOBS_CODE_REF =~ ^sha256:[0-9a-f]{64}$ ]]; then
 fi
 echo "$DP_RAY_JOBS_CODE_REF" >"$DIAGNOSTICS/code-ref.txt"
 
-docker compose -f "$COMPOSE_FILE" up -d --wait --wait-timeout 120 --no-build postgres minio
+docker compose -f "$COMPOSE_FILE" up -d --wait --wait-timeout 120 --no-build postgres object-store
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps storage-init \
   2>&1 | tee "$DIAGNOSTICS/storage-init.log"
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps migrate \

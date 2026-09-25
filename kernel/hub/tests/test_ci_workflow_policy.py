@@ -30,6 +30,8 @@ _RAY_SHARED_PATHS = {
     "kernel/uv.lock",
     "examples/plugins/dp_ray/**",
     "kernel/hub/ray_compat.py",
+    "kernel/hub/s3_validation.py",
+    "kernel/hub/s3_storage_check.py",
     "kernel/hub/backends.py",
     "kernel/hub/compiler.py",
     "kernel/hub/db.py",
@@ -465,6 +467,8 @@ def test_ray_path_ownership_routes_representative_changes() -> None:
         "docker/ray/Dockerfile",
         "kernel/hub/storage.py",
         "kernel/hub/workload_env.py",
+        "kernel/hub/s3_validation.py",
+        "kernel/hub/s3_storage_check.py",
     ):
         assert _is_owned(shared, ray)
         assert _is_owned(shared, jobs)
@@ -485,6 +489,23 @@ def test_ray_path_ownership_routes_representative_changes() -> None:
     for docs_only in ("README.md", "docs/CI.md", "docs/RAY.md"):
         assert not _is_owned(docs_only, ray)
         assert not _is_owned(docs_only, jobs)
+
+
+def test_ray_runs_the_real_s3_contract_once_without_masking_failure() -> None:
+    jobs = _workflow("ray-validation.yml")["jobs"]
+    probes = [
+        (job, step)
+        for job in jobs.values()
+        for step in job.get("steps", [])
+        if "python -m hub.s3_storage_check" in step.get("run", "")
+    ]
+    assert len(probes) == 1
+    job, step = probes[0]
+    assert "default-shuffle" in job["strategy"]["matrix"]["scenario"]
+    assert step["if"] == "matrix.scenario == 'default-shuffle'"
+    assert "set -o pipefail" in step["run"]
+    assert "|| true" not in step["run"]
+    assert not step.get("continue-on-error", False)
 
 
 def test_release_publish_waits_for_every_required_gate() -> None:

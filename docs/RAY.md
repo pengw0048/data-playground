@@ -209,13 +209,15 @@ check. Required PR unit and contract tests provide fast feedback for every chang
 differential additionally runs when its owned execution contract changes, on schedule, on demand, and
 before publishing a release. See [CI and release gates](CI.md).
 
-The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and MinIO.
+The automated Compose gate starts a Ray head, two worker containers, a separate driver node, and
+SeaweedFS 4.47's S3 service. A signed S3 readiness check and versioning read-back must pass before the
+driver starts. The default-shuffle leg also runs the real [S3 storage contract](S3_STORAGE.md) probe.
 Before that CPU-only topology starts, a logical-resource Ray check (no NVIDIA runtime) proves typed
 accelerator affinity, a wrong-GPU task remaining pending, finite GPU `map_batches`, and Ray 2.56's typed
 read/write remote options. The distributed gate then requires:
 
 1. a real hash-shuffle to span at least two Ray node IDs
-2. native MinIO Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB
+2. native S3 Parquet reads feeding distributed GROUP BY and broadcast join results to match DuckDB
    in Arrow schema and row values
 3. native Parquet reads to unify compatible physical footer drift, exclude a flat-root Hive-looking
    ancestor, and preserve typed numeric/string Hive columns through a real aggregate and broadcast join
@@ -233,7 +235,8 @@ Run the Compose gate locally:
 ```bash
 docker compose -f docker-compose.ray.yml build ray-head
 docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 \
-  ray-head ray-worker minio createbucket
+  ray-head ray-worker object-store
+docker compose -f docker-compose.ray.yml run --rm --no-deps createbucket
 docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 
 for fault in schema rows join; do
