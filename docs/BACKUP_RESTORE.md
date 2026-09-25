@@ -15,7 +15,7 @@ steps below differ by profile.
 |---|---|
 | **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. Exact execution history additionally requires `execution_manifests` and every `execution_manifest_sha256` owner on admissions, run state/history, receipts/revisions, lineage, durable Tasks/Attempts, and Inbox items. Durable task recovery also requires `durable_tasks`, `durable_task_attempts`, `durable_task_inbox_items`, `durable_external_waits`, `durable_checkpoints`, and the bounded fan-out plan, unit, attempt, and slot tables. The applicable family-specific state is also metadata: `distribution_report_envelopes`, `merge_columns_task_envelopes`, `restore_revision_task_envelopes`, and `keyed_upsert_task_envelopes`; provider placement metadata is in `workspace_provider_datasets` and `workspace_provider_bindings`. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results plus immutable core-owned revision artifacts under `.dp-results/`), and `plugins/` (operator-installed packs). Preserve the complete `.dp-results` namespace metadata and record hashes for every core-owned artifact referenced by `managed_local_file_revisions`; copying only current catalog heads loses retained history. |
-| **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), retain object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. For MinIO, this means a version-preserving replica configured before protected writes, not `mc cp --recursive`; see Profile B. |
+| **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), retain object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. For the SeaweedFS profile, use native filer replication configured before protected writes, then freeze the verified replica for each recovery point; an S3 copy of current objects is insufficient. See Profile B. |
 | **Provider-owned history evidence (not provider bytes)** | The database retains opaque registration / dataset IDs, exact provider revision IDs, pinned Source refs, and admitted run manifests. The logical backup does **not** include provider-owned Lance or plugin-provider bytes. Back those up through the provider's own system if required, and classify each restored exact read as available or unavailable instead of treating a current same-name/path dataset as the old revision. |
 | **Credential references** | Cred rows and plugin `secret` settings contain SecretRefs plus non-secret connection metadata, not resolved credential values. Back up the referenced environment, files, or external secret manager separately; a metadata restore cannot recreate them. |
 | **Catalog mount configuration** | `DP_CATALOG_MOUNTS` is operator deployment configuration, not metadata or workspace state, so it is deliberately **not** in a backup. Restore the same JSON from the protected deployment configuration separately. Its `env:` / `file:` references are safe to record there; restore the referenced secret environment or files separately. Together with provider bytes and resolved credentials, it remains under the external operator/provider ownership boundary and is never backed up by core. |
@@ -24,7 +24,7 @@ steps below differ by profile.
 ### Consistency ordering
 
 1. **Stop every metadata writer** before the snapshot window begins: hub replicas, per-canvas kernels, MCP servers, headless runs, and any external worker using the same database or writing into the same object-store namespace. Wait until they have exited; scaling a Deployment is asynchronous.
-2. Snapshot the **metadata database** and the **artifact / object store** as close together as possible. Prefer: freeze writers → dump DB → verify the version-preserving object replica and namespace marker → copy local workspace files that are not already in the DB dump.
+2. Snapshot the **metadata database** and the **artifact / object store** as close together as possible. Prefer: freeze writers → dump DB → verify and freeze the version-preserving object replica and namespace marker → copy local workspace files that are not already in the DB dump.
 3. Resume writers only after the backup set is complete and verified (checksums or byte sizes recorded).
 
 A backup taken while writers are still active can leave dangling artifact URIs, a retention ref
@@ -131,25 +131,70 @@ namespace and run isolation first. Do not skip that step.
 
 ## Profile B — PostgreSQL + S3-compatible object store
 
-Runnable against the repository harnesses:
+The repository harness uses SeaweedFS 4.47; [RAY.md](RAY.md) documents its Compose setup.
+This profile preserves native S3 version IDs and delete markers through **SeaweedFS-to-SeaweedFS
+filer replication**. It does not migrate an existing MinIO data directory, reconstruct versions
+through S3 PUT, or certify another S3 provider's backup mechanism.
+
+### Configure native replication before protected writes
+
+Provision an independent SeaweedFS cluster with its own master, filer metadata store, and volume
+storage in a separate failure domain. Use the same tested release and bucket names on both sides.
+The source and replica must not share volume files or a filer database. Keep the replica free of
+application writes. Save service configuration and referenced secrets through the deployment
+backup, separately from the data.
+
+Run one persistent active-passive sync process before the first protected object write:
 
 ```bash
-docker compose up -d postgres
-docker compose -f docker-compose.ray.yml up -d minio createbucket
+# Native filer addresses, not the S3 endpoints. Run this as a supervised long-lived process.
+# Both filers and both clusters' volume servers must be reachable by this process.
+weed filer.sync \
+  -a="$DP_PRIMARY_FILER" -b="$DP_BACKUP_FILER" \
+  -a.path=/buckets -b.path=/buckets -isActivePassive \
+  -concurrency=1 -chunkConcurrency=2
 ```
 
-### Backup
+This copies native bucket metadata, version entries, deletion metadata, and their chunks; it does
+not issue a new S3 PUT for every historical version. The `/buckets` scope includes the installation's
+`_dp_control/namespaces/<namespace>.json` object inside its bucket. This procedure does not rename
+buckets or paths. Enable versioning on the new source bucket before application writes; confirm
+`get_bucket_versioning` reports `Enabled` on both endpoints before relying on the replica:
 
 ```bash
-# 1. Record release identity while the old process is still readable:
+uv run --project kernel python - <<'PYTHON'
+import os
+import boto3
+s3 = boto3.client("s3", endpoint_url=os.environ["DP_S3_ENDPOINT"],
+                  aws_access_key_id=os.environ["DP_S3_KEY"],
+                  aws_secret_access_key=os.environ["DP_S3_SECRET"],
+                  region_name=os.environ.get("AWS_REGION", "us-east-1"))
+s3.put_bucket_versioning(Bucket=os.environ["DP_S3_BUCKET"],
+                         VersioningConfiguration={"Status": "Enabled"})
+PYTHON
+```
+
+SeaweedFS documents [active-passive filer synchronization](https://github.com/seaweedfs/seaweedfs/wiki/Filer-Active-Active-cross-cluster-continuous-synchronization)
+as asynchronous native change-log replication. It copies chunks and metadata, persists checkpoints,
+and requires access to both clusters. It is not an immutable archive: subsequent source deletions
+also propagate. If using encryption, retain the provider's required encryption keys for the replica.
+Do not assume that starting sync on an existing populated bucket proves complete historical catch-up;
+that migration needs separate evidence. The certified procedure starts replication before protected
+writes and verifies a bounded recovery point as described below.
+
+### Capture a recovery point
+
+Stop all installation writers, including hub replicas, per-canvas kernels, remote jobs, and any
+lifecycle/GC process that can delete protected objects. Leave filer sync running long enough to catch
+up. Then capture the database and compare the full object-version manifests:
+
+```bash
 mkdir -p backup
 curl -sS http://127.0.0.1:8471/api/version | tee backup/version.json
-
-# 2. Stop every metadata / object-store writer for this installation.
-# 3. Dump Postgres (custom format keeps restore flexible):
+# Stop all writers before the following dump and inventory operations.
 pg_dump --format=custom --no-owner --no-acl \
   "$DP_DATABASE_URL_LIBPQ" -f backup/dataplay.dump
-uv run --project kernel python - <<'PY'
+uv run --project kernel python - <<'PYTHON'
 import json
 from pathlib import Path
 from hub import metadb
@@ -158,84 +203,79 @@ doc = json.loads(path.read_text())
 doc["alembic"] = metadb.require_schema_at_head()
 doc["namespace"] = metadb.object_storage_namespace()
 path.write_text(json.dumps(doc, sort_keys=True) + "\n")
-PY
-# Example libpq URL for the compose harness:
-#   postgresql://dp:dp@127.0.0.1:5432/dataplay
-
-# 4. Record the already-configured version-preserving replica's exact manifest.
-#    The replica must have been created before this installation wrote protected objects.
-mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
-mc alias set dp-backup "$DP_OBJECT_BACKUP_ENDPOINT" \
-  "$DP_OBJECT_BACKUP_KEY" "$DP_OBJECT_BACKUP_SECRET"
-mc ls --json --versions --recursive "dp/${DP_S3_BUCKET}" \
-  | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
-  | sort \
-  > backup/object-versions.primary.jsonl
-mc ls --json --versions --recursive "dp-backup/${DP_OBJECT_BACKUP_BUCKET}" \
-  | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
-  | sort \
-  > backup/object-versions.replica.jsonl
-cmp backup/object-versions.primary.jsonl backup/object-versions.replica.jsonl
-
-# 5. Workspace plugins (optional but recommended):
-cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
-# If this deployment also has built-in local outputs, copy and fingerprint the complete tree exactly
-# as in Profile A; PostgreSQL does not move local revision bytes into the object store.
+PYTHON
 ```
 
-`mc cp --recursive` is intentionally absent: MinIO documents that it copies only the latest or a
-specified version, without version information. The old command therefore loses non-current
-generations and delete markers, and writes new version IDs on a target bucket. A matching current
-object is not an exact-generation restore.
-
-### Configure the object replica before protected writes
-
-The documented object-history mechanism is MinIO bucket replication to an independent, versioned
-bucket. Configure it **before** the first Data Playground object write for the installation. The
-replica is a warm backup: it is not a one-time `mc cp` archive and it must be in a distinct failure
-domain from the source object store.
+Run this comparison from the checkout root. It includes every version and delete marker, the latest
+flags, sizes, and ETags. A mismatch is an incomplete backup; allow replication to catch up and repeat
+while writers remain stopped. Include every bucket referenced by the database, including a separate
+Ray Jobs artifact bucket if configured:
 
 ```bash
-# Run while the source bucket is new/empty, before protected writes.
-mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
-mc alias set dp-backup "$DP_OBJECT_BACKUP_ENDPOINT" \
-  "$DP_OBJECT_BACKUP_KEY" "$DP_OBJECT_BACKUP_SECRET"
-mc mb --ignore-existing "dp-backup/${DP_OBJECT_BACKUP_BUCKET}"
-mc version enable "dp/${DP_S3_BUCKET}"
-mc version enable "dp-backup/${DP_OBJECT_BACKUP_BUCKET}"
-mc replicate add "dp/${DP_S3_BUCKET}" \
-  --remote-bucket "dp-backup/${DP_OBJECT_BACKUP_BUCKET}" \
-  --replicate 'existing-objects,delete,delete-marker' --priority 1 --sync
+uv run --project kernel python - <<'PYTHON'
+import json
+import os
+from pathlib import Path
+import boto3
+from scripts.verify_versioned_object_backup import manifest
+
+bucket = os.environ["DP_S3_BUCKET"]
+results = {}
+for name, prefix in (("primary", "DP_S3"), ("replica", "DP_OBJECT_BACKUP")):
+    client = boto3.client("s3", endpoint_url=os.environ[prefix + "_ENDPOINT"],
+                          aws_access_key_id=os.environ[prefix + "_KEY"],
+                          aws_secret_access_key=os.environ[prefix + "_SECRET"],
+                          region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    if client.get_bucket_versioning(Bucket=bucket).get("Status") != "Enabled":
+        raise RuntimeError(f"{name}: bucket versioning is not enabled")
+    results[name] = manifest(client, bucket)
+    Path(f"backup/{bucket}.{name}.versions.json").write_text(
+        json.dumps(results[name], sort_keys=True, indent=2) + "\n")
+if results["primary"] != results["replica"]:
+    raise RuntimeError("Source and replica version manifests differ; backup is incomplete")
+PYTHON
 ```
 
-Do not treat `existing-objects` as a retrofit guarantee. This runbook certifies the procedure only
-when the replication rule is in place before the objects it protects are written. For an existing
-bucket, establish a provider-supported migration with its own evidence before relying on the
-replica.
+**Stop the dedicated filer sync process after the manifests match, then repeat the comparison.**
+Keep that replica's native metadata and volumes unchanged as the object component of this database
+backup. Record its deployment/storage identity with the backup set. Do not resume syncing into a
+replica retained for this recovery point: later deletes would invalidate the saved database's exact
+references. Continuing live replication requires a separate replica or a separately validated native
+snapshot/retention procedure. A metadata export alone does not contain the object chunks.
 
-Consistency ordering for this profile: configure and continuously verify the replica → stop writers
-→ `pg_dump` → compare primary and replica version manifests (including the namespace marker) →
-workspace plugins. Resume writers only after the manifests match. The two manifest files are
-operator evidence; the replica holds the versioned bytes.
+Copy workspace plugins and any built-in local outputs as in Profile A. Resume source writers only
+after the backup set is complete and the replica is frozen. The manifest JSON files are evidence;
+the independent replica holds the versioned bytes. As an object-level recovery check, stop access to
+the source, restart the replica from its own persistent storage, and read a selected non-current
+version with S3 `get_object(Bucket=..., Key=..., VersionId=...)`. Confirm the bytes and current delete
+markers against the recorded evidence before accepting the recovery point.
 
-The repository's executable drill uses the same digest-pinned MinIO and `mc` images as the Ray
-compose harness. It writes two versions of one key and a delete marker, proves a specific
-non-current version is readable from the replica, and proves that the former `mc cp` sequence loses
-history:
+An ordinary recursive current-object copy (`mc cp`, `aws s3 cp`, or GET followed by PUT) loses
+non-current versions and delete markers and assigns new version IDs. It cannot replace native
+history preservation, even if every current file is byte-identical.
+
+### Executable version-history drill
 
 ```bash
-bash scripts/verify_versioned_object_backup.sh
+# Optional: set DOCKER_CONTEXT to the intended Docker daemon.
+DP_OBJECT_BACKUP_EVIDENCE_DIR=/tmp/dp-object-backup-evidence \
+  bash scripts/verify_versioned_object_backup.sh
 ```
 
-It prints `VERSIONED_OBJECT_BACKUP_EVIDENCE` only after the exact version manifest matches, and
-`VERSIONED_OBJECT_BACKUP_CP_CONTROL=lost_history` only when the negative control has lost the
-historical version and delete-marker entries. Run it as release/operator evidence; it intentionally
-does not run in the ordinary CI matrix because it starts three disposable MinIO servers.
+The drill uses the same pinned SeaweedFS 4.47 image as the Ray harness and the kernel's existing
+Boto3 dependency. It creates disposable source, replica, and ordinary-copy instances with independent
+storage, and one native sync process. It retains the original four-entry test (two versions of one
+key, another historical value, and its delete marker), plus a namespace marker in a separate bucket.
+The historical value exceeds 2 MiB so recovery exercises volume chunks. It then stops both source
+and sync, restarts the replica, compares exact manifests, and reads all retained values. The ordinary
+copy negative control preserves the current value but loses history.
 
-MinIO's [mc cp reference](https://docs.min.io/community/minio-object-store/reference/minio-mc/mc-cp.html)
-documents the current-version limitation. Its [bucket replication reference](https://docs.min.io/community/minio-object-store/administration/bucket-replication.html)
-is the supported version/history mechanism. Use versions of MinIO and `mc` compatible with the
-release you operate; the drill's pinned versions are listed in its output.
+`VERSIONED_OBJECT_BACKUP_EVIDENCE` is printed only after the independent recovery and history checks
+pass. `VERSIONED_OBJECT_BACKUP_CP_CONTROL=lost_history` requires the negative control to demonstrate
+history loss. Manifests and service logs are saved in the evidence directory; disposable containers,
+volumes, and network are removed. This is an operator/release drill, not part of the ordinary CI matrix.
+It proves this fresh-cluster workflow on the pinned release, not arbitrary migration, historical
+backfill, encryption configurations, or automatic Data Playground namespace takeover.
 
 ### Restore (isolated clone — default)
 
@@ -247,8 +287,8 @@ createdb -U dp dataplay_restore   # or restore into an empty database owned by t
 pg_restore --clean --if-exists --no-owner --no-acl -d "$RESTORE_DATABASE_URL_LIBPQ" backup/dataplay.dump
 cp -a backup/version.json "$RESTORE/version.json"
 
-# Do not restore `backup/objects` with mc cp: that archive cannot preserve exact version IDs.
-# The exact generations remain on the already-verified replica. This isolated clone still must
+# Do not restore current-object copies: they cannot preserve exact version IDs.
+# The exact generations remain on the verified, frozen independent replica. This isolated clone still must
 # NOT claim the source namespace marker; isolation creates a new claim under the replacement namespace.
 # Restore any built-in local `outputs/` tree at the same absolute mount path recorded by
 # `local_result_artifacts.storage_root`, and set DP_STORAGE_URL to its parent outputs directory;
@@ -272,8 +312,8 @@ export DP_STORAGE_NAMESPACE="<replacement>"
 The replica preserves object bytes and version IDs for an audited recovery point, but it does **not**
 turn this isolated-clone procedure into disaster recovery. Data Playground currently rejects a clone
 that tries to claim the original namespace marker, so operating the replica as the original
-installation remains unsupported. Use `mc cp --version-id <id>` against the replica only for
-object-level verification or provider-level recovery until an audited takeover workflow exists.
+installation remains unsupported. Use S3 `get_object(..., VersionId=<id>)` against the replica only for object-level verification
+or provider-level recovery until an audited takeover workflow exists.
 
 ## What restore is not
 
@@ -413,7 +453,7 @@ cd kernel && uv run pytest -q hub/tests/test_backup_restore_drill.py -k sqlite
 
 # PostgreSQL + object-store isolation variant (CI job / local harness):
 docker compose up -d postgres
-# optional MinIO: docker compose -f docker-compose.ray.yml up -d minio createbucket
+# Optional S3 service: start the SeaweedFS profile documented in docs/RAY.md.
 export DP_TEST_DATABASE_URL=postgresql+psycopg://dp:dp@127.0.0.1:5432/dataplay_test
 cd kernel && uv run pytest -q hub/tests/test_backup_restore_drill.py -k postgres
 ```

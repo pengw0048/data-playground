@@ -26,14 +26,14 @@ x-jobs-env: &jobs-env
   DP_CANVAS_PIP_DEPS: "0"
   DP_RAY_REMOTE: "1"
   DP_RAY_NUM_CPUS: "4"
-  DP_S3_ENDPOINT: "http://minio:9000"
+  DP_S3_ENDPOINT: "http://object-store:8333"
   DP_S3_BUCKET: "dpray"
-  DP_S3_KEY: "dpminio"
-  DP_S3_SECRET: "dpminio123"
-  AWS_ENDPOINT_URL: "http://minio:9000"
-  AWS_ENDPOINT_URL_S3: "http://minio:9000"
-  AWS_ACCESS_KEY_ID: "dpminio"
-  AWS_SECRET_ACCESS_KEY: "dpminio123"
+  DP_S3_KEY: "dp-ray-jobs-validation"
+  DP_S3_SECRET: "dp-ray-jobs-validation-not-for-shared-use"
+  AWS_ENDPOINT_URL: "http://object-store:8333"
+  AWS_ENDPOINT_URL_S3: "http://object-store:8333"
+  AWS_ACCESS_KEY_ID: "dp-ray-jobs-validation"
+  AWS_SECRET_ACCESS_KEY: "dp-ray-jobs-validation-not-for-shared-use"
   AWS_REGION: "us-east-1"
   RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
   __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "hub.ray_compat.patch_hash_shuffle"
@@ -52,14 +52,15 @@ services:
       retries: 60
     networks: [dprayjobs]
 
-  minio:
-    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: server /data
+  object-store:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    command: ["mini", "-dir=/data", "-admin.ui=false", "-webdav=false", "-s3.port.iceberg=0", "-s3.port.lance=0", "-master.telemetry=false"]
     environment:
-      MINIO_ROOT_USER: dpminio
-      MINIO_ROOT_PASSWORD: dpminio123
+      AWS_ACCESS_KEY_ID: dp-ray-jobs-validation
+      AWS_SECRET_ACCESS_KEY: dp-ray-jobs-validation-not-for-shared-use
+      S3_BUCKET: dpray
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8333/healthz"]
       interval: 2s
       timeout: 5s
       retries: 60
@@ -95,7 +96,7 @@ services:
   storage-init:
     image: dp-ray:local
     depends_on:
-      minio: { condition: service_healthy }
+      object-store: { condition: service_healthy }
     environment: *jobs-env
     command: ["python", "-m", "hub.ray_jobs_acceptance", "bootstrap-storage"]
     networks: [dprayjobs]
@@ -112,7 +113,7 @@ services:
     image: dp-ray:local
     depends_on:
       postgres: { condition: service_healthy }
-      minio: { condition: service_healthy }
+      object-store: { condition: service_healthy }
       ray-head: { condition: service_healthy }
     working_dir: /app/kernel
     environment: *jobs-env

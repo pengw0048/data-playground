@@ -11,6 +11,8 @@ on:
       - "kernel/uv.lock"
       - "examples/plugins/dp_ray/**"
       - "kernel/hub/ray_compat.py"
+      - "kernel/hub/s3_validation.py"
+      - "kernel/hub/s3_storage_check.py"
       # Execution, storage, destination, and plugin contracts exercised by dp_ray.
       - "kernel/hub/backends.py"
       - "kernel/hub/compiler.py"
@@ -128,7 +130,7 @@ jobs:
           cache-from: type=gha,scope=ray-image
           cache-to: type=gha,mode=max,scope=ray-image
 
-      - name: Start head, two workers, and MinIO
+      - name: Start head, two workers, and SeaweedFS
         run: |
           set -o pipefail
           mkdir -p ray-diagnostics
@@ -138,8 +140,16 @@ jobs:
           # or fake GPU declaration is added to the CPU-only Compose/KubeRay validation clusters.
           docker run --rm --shm-size=1g dp-ray:local \
             python -m hub.ray_gpu_contract_check 2>&1 | tee ray-diagnostics/gpu-contract.log
-          docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker minio createbucket
+          docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 ray-head ray-worker object-store
+          docker compose -f docker-compose.ray.yml run --rm --no-deps createbucket 2>&1 | tee ray-diagnostics/storage-init.log
           docker compose -f docker-compose.ray.yml ps -a | tee ray-diagnostics/startup-ps.txt
+
+      - name: Require the real S3 storage contract
+        if: matrix.scenario == 'default-shuffle'
+        run: |
+          set -o pipefail
+          docker compose -f docker-compose.ray.yml run --rm --no-deps createbucket \
+            python -m hub.s3_storage_check 2>&1 | tee ray-diagnostics/storage-contract.log
 
       - name: Require the head and both workers to register
         run: |

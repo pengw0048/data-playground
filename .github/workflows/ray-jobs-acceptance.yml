@@ -11,6 +11,8 @@ on:
       - "kernel/uv.lock"
       - "examples/plugins/dp_ray/**"
       - "kernel/hub/ray_compat.py"
+      - "kernel/hub/s3_validation.py"
+      - "kernel/hub/s3_storage_check.py"
       # Execution, storage, destination, and plugin contracts exercised by dp_ray.
       - "kernel/hub/backends.py"
       - "kernel/hub/compiler.py"

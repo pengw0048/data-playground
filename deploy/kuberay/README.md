@@ -7,7 +7,7 @@ storage and compared with DuckDB. It is not a Ray Jobs deployment procedure and 
 Data Playground shared service.
 
 The KubeRay path needs Docker, `kind`, `kubectl`, Helm, a disposable kind cluster, and a KubeRay operator
-installed in that cluster. The checked-in manifests use fixed workers, ephemeral MinIO, and test
+installed in that cluster. The checked-in manifests use fixed workers, ephemeral SeaweedFS, and test
 credentials. They are an example/operator reference, not a secure, highly available, or production-sized
 manifest. A PASS does not certify every Ray operation, or an operator's KubeRay installation, cluster,
 network, autoscaler, IAM, storage, or incident procedures. Those responsibilities remain in the
@@ -18,12 +18,13 @@ Expose and protect the head Dashboard/Jobs endpoint according to cluster policy;
 not proxy an authenticated logs route, and these validation manifests deliberately do not publish the
 Dashboard.
 
-## 1. docker-compose (fastest — a head + 2 worker containers + MinIO)
+## 1. docker-compose (fastest — a head + 2 worker containers + SeaweedFS)
 
 ```bash
 docker compose -f docker-compose.ray.yml build ray-head
 docker compose -f docker-compose.ray.yml up -d --no-build --scale ray-worker=2 \
-  ray-head ray-worker minio createbucket
+  ray-head ray-worker object-store
+docker compose -f docker-compose.ray.yml run --rm --no-deps createbucket
 docker compose -f docker-compose.ray.yml run --rm --no-deps driver  # → "[multinode] PASS: … byte-identical …"
 docker compose -f docker-compose.ray.yml down -v
 ```
@@ -41,11 +42,11 @@ docker compose -f docker-compose.ray.yml run --rm --no-deps driver
 
 ## 2. KubeRay on Kubernetes (e.g. kind — the pods path)
 
-These manifests are a disposable validation environment: fixed workers, ephemeral MinIO, and test
+These manifests are a disposable validation environment: fixed workers, ephemeral SeaweedFS, and test
 credentials. They are not a secure or highly available production deployment. Their CPU/memory
-**requests** let a scheduler place one head, two workers, MinIO, and the driver on the validated
-4-CPU/8-GiB single-node kind profile; limits and Ray logical capacity can exceed those requests, so this
-is neither a peak-capacity guarantee nor production sizing guidance.
+**requests** target a 4-CPU/8-GiB single-node kind profile for one head, two workers, the object store,
+and the driver. This profile has not been revalidated with SeaweedFS; limits and Ray logical capacity
+can exceed those requests, so this is neither a peak-capacity guarantee nor production sizing guidance.
 
 ```bash
 kind create cluster
@@ -66,7 +67,12 @@ non-default kind cluster; `DP_RAY_VALIDATION_IMAGE=<unique-tag>` can override th
 `DP_RAY_VALIDATION_TIMEOUT_SECONDS=<seconds>` controls the differential deadline. A failed Job is
 reported immediately with its logs instead of waiting through the deadline.
 
-Both paths use the same `docker/ray/Dockerfile` image. The optional dependency, image, and KubeRay
+Both paths use a pinned SeaweedFS 4.47 image for S3 and the same `docker/ray/Dockerfile` image for
+bucket initialization and execution. Initialization retries transient startup failures within a finite
+deadline, fails on invalid credentials, and verifies enabled versioning through the S3 API. The object
+store's `/data` is disposable; these manifests do not provide backup or restore procedures.
+
+The optional dependency, image, and KubeRay
 `rayVersion` are pinned to **Ray 2.56.0**, the only version currently validated against dp_ray's private
 hash-shuffle ABI. At startup the driver runs a node-affine version handshake against every alive node;
 an unsupported or mixed cluster fails before any Dataset source or operator executes. Every worker also

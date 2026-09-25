@@ -74,7 +74,7 @@ const OBJECT_STORE_FIELDS: { key: string; placeholder: string }[] = [
   { key: 'accessKeyId', placeholder: 'env:AWS_ACCESS_KEY_ID' },
   { key: 'secretAccessKey', placeholder: 'env:AWS_SECRET_ACCESS_KEY' },
   { key: 'region', placeholder: 'region (e.g. us-east-1)' },
-  { key: 'endpoint', placeholder: 'endpoint (MinIO/R2, optional)' },
+  { key: 'endpoint', placeholder: 'endpoint (S3-compatible, optional)' },
 ]
 type CredForm = { id: string | null; name: string; kind: CredKind; fields: Record<string, string> }
 const emptyCredForm = (kind: CredKind): CredForm => ({ id: null, name: '', kind, fields: {} })

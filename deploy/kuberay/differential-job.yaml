@@ -35,9 +35,9 @@ spec:
             - { name: __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR, value: "hub.ray_compat.patch_hash_shuffle" }
             - { name: DP_TEST_RAY_LIVE, value: "1" }
             - { name: DP_RAY_SHUFFLE_PARTITIONS, value: "4" }
-            - { name: DP_S3_ENDPOINT, value: "http://minio:9000" }
-            - { name: DP_S3_KEY, value: "dpminio" }
-            - { name: DP_S3_SECRET, value: "dpminio123" }
+            - { name: DP_S3_ENDPOINT, value: "http://object-store:8333" }
+            - { name: DP_S3_KEY, value: "dp-ray-validation-only" }
+            - { name: DP_S3_SECRET, value: "dp-ray-validation-only-not-for-shared-use" }
             - { name: DP_S3_BUCKET, value: "dpray" }
             - { name: DP_STORAGE_URL, value: "s3://dpray/outputs" }
           volumeMounts:
