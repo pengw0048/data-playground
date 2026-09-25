@@ -672,14 +672,14 @@ test.describe('Data Playground canvas', () => {
     const errors: string[] = []
     page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
     page.on('pageerror', (e) => errors.push(e.message))
-    await page.goto('/')
+    await fresh(page)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await page.waitForTimeout(500)
     expect(errors, errors.join('\n')).toEqual([])
   })
 
   test('toolbar category menu opens above the toolbar and does not jump', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     const toolbar = page.getByTestId('toolbar')
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     const menu = page.locator('.dp-panel', { hasText: 'filter' }).last()
@@ -1194,7 +1194,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('there is no Save button — the canvas auto-saves', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await expect(page.getByRole('button', { name: /^save/i })).toHaveCount(0)
     await expect(page.getByTestId('autosave')).toHaveText(/saved|saving/)
   })
@@ -1331,7 +1331,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('the top bar has Run all on a new Canvas, not Export', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await expect(page.getByRole('button', { name: 'Run all' })).toBeVisible()
     await expect(page.getByRole('button', { name: /^export$/i })).toHaveCount(0)
   })
@@ -2397,7 +2397,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('two clients on the same canvas see each other (realtime presence)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     // a second client in the same session opens the same (last-active) canvas → same collab room
     const b = await page.context().newPage()
@@ -2637,7 +2637,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('the URL reflects the open canvas + view (deep-linkable; back button works)', async ({ page }) => {
-    await page.goto('/')
+    await fresh(page)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/#\/canvas\//) // editor URL is a canvas deep link
     const canvasHash = await page.evaluate(() => location.hash)

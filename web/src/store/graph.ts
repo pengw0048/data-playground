@@ -5,6 +5,7 @@ import type {
   CanvasResultRetention,
   LastRun, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
+import { isParameterRef } from '../types/graph'
 import type {
   CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, Placement, ProcessorDescriptor,
   ProfileResult, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
@@ -168,7 +169,15 @@ function spreadAutoPlacedJoinInputs(
   return nodes.map((node) => node.id === movable.id ? { ...node, position } : node)
 }
 
-/** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri —
+function sourceHasInput(doc: CanvasDoc, node: CanvasNode): boolean {
+  const reference = node.data.config.datasetRef
+  return !!node.data.config.uri || (isParameterRef(reference)
+    && (doc.parameters ?? []).some((parameter) => parameter.name === reference.parameterRef
+      && parameter.type === 'dataset'))
+}
+
+/** Whether a node can enter execution: an upstream source has a URI or a declared dataset parameter.
+ * Parameter values are collected by the run form; missing values must not disable that entry point.
  * AND nothing in its upstream chain (including itself) is disabled (disable turns off downstream). */
 export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
   if (isDisabled(doc, id)) return false
@@ -178,7 +187,7 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
     seen.add(nid)
     const n = doc.nodes.find((x) => x.id === nid)
     if (!n) return false
-    if (n.type === 'source') return !!n.data.config.uri
+    if (n.type === 'source') return sourceHasInput(doc, n)
     return doc.edges.filter((e) => e.target === nid).map((e) => e.source).some(walk)
   }
   return walk(id)
@@ -195,7 +204,7 @@ export function unsetSourceReason(doc: CanvasDoc, id: string): string | null {
     const node = doc.nodes.find((item) => item.id === nid)
     if (!node) return
     if (node.type === 'source') {
-      if (!node.data.config.uri) unset.push(node.data.title || 'the source')
+      if (!sourceHasInput(doc, node)) unset.push(node.data.title || 'the source')
       return
     }
     for (const edge of doc.edges.filter((item) => item.target === nid)) walk(edge.source)

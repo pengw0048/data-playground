@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { type CanvasVisibility } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
+import { DatasetParameterPicker } from '../components/DatasetParameterPicker'
 import { Icon } from '../ui/Icon'
 import { useCanvasSharing } from './useCanvasSharing'
 import { cn } from '@/lib/utils'
@@ -195,7 +196,7 @@ export function CanvasSettingsModal({ onClose }: { onClose: () => void }) {
             </div>
             <div className="flex max-h-[360px] flex-col gap-2 overflow-y-auto pr-1">
               {parameters.map((parameter, index) => <ParameterDeclarationEditor
-                key={index} value={parameter} disabled={!canEdit}
+                key={`${doc.id}:${index}`} value={parameter} disabled={!canEdit}
                 moveUp={() => { if (index > 0) { const next = [...parameters]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; applyParameters(next) } }}
                 moveDown={() => { if (index + 1 < parameters.length) { const next = [...parameters]; [next[index], next[index + 1]] = [next[index + 1], next[index]]; applyParameters(next) } }}
                 remove={() => applyParameters(parameters.filter((_item, candidate) => candidate !== index))}
@@ -283,8 +284,6 @@ function ParameterDeclarationEditor({ value, disabled, update, remove, moveUp, m
     if (value.type === 'boolean') parsed = raw === 'true'
     update({ ...value, default: parsed })
   }
-  const ref = value.type === 'dataset' && value.default && typeof value.default === 'object'
-    ? value.default as { kind?: string; datasetId?: string; revisionId?: string } : null
   return <div className="rounded-md border border-border bg-muted/20 p-2">
     <div className="mb-2 flex gap-1">
       <Input aria-label="Parameter name" value={value.name} disabled={disabled} onChange={(event) => update({ ...value, name: event.target.value })} className="h-7 text-[11px]" />
@@ -304,10 +303,9 @@ function ParameterDeclarationEditor({ value, disabled, update, remove, moveUp, m
       <label><input type="checkbox" checked={value.required === true} disabled={disabled} onChange={(event) => update({ ...value, required: event.target.checked, default: undefined })} /> Required</label>
       <label><input type="checkbox" checked={value.default != null} disabled={disabled || value.required} onChange={(event) => update({ ...value, default: event.target.checked ? initialDefault(value.type) : undefined })} /> Default</label>
     </div>
-    {value.default != null && !value.required && (value.type === 'dataset' ? <div className="mt-1.5 grid grid-cols-[90px_1fr] gap-1">
-      <select aria-label={`${value.name} default selection`} value={ref?.kind ?? 'latest'} disabled={disabled} onChange={(event) => update({ ...value, default: { kind: event.target.value, datasetId: ref?.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref?.revisionId ?? '' } : {}) } })} className={field}><option value="latest">Follow latest</option><option value="exact">Selected version</option></select>
-      <Input aria-label={`${value.name} default dataset`} value={ref?.datasetId ?? ''} disabled={disabled} placeholder="Dataset identity" onChange={(event) => update({ ...value, default: { ...ref, kind: ref?.kind ?? 'latest', datasetId: event.target.value } })} className="h-7 text-[10.5px]" />
-      {ref?.kind === 'exact' && <Input aria-label={`${value.name} default revision`} value={ref.revisionId ?? ''} disabled={disabled} placeholder="Version ID" onChange={(event) => update({ ...value, default: { ...ref, revisionId: event.target.value } })} className="col-start-2 h-7 text-[10.5px]" />}
+    {value.default != null && !value.required && (value.type === 'dataset' ? <div className="mt-1.5">
+      <DatasetParameterPicker label={`${value.name} default`} value={value.default} disabled={disabled}
+        onChange={(next) => update({ ...value, default: next })} />
     </div> : value.type === 'boolean' ? <select aria-label={`${value.name} default`} value={String(value.default)} disabled={disabled} onChange={(event) => setDefault(event.target.value)} className={`mt-1.5 ${field}`}><option value="true">true</option><option value="false">false</option></select>
       : <Input aria-label={`${value.name} default`} value={String(value.default)} disabled={disabled} type={value.type === 'date' ? 'date' : 'text'} placeholder={value.type === 'datetime' ? 'ISO 8601 with timezone' : 'Default'} onChange={(event) => setDefault(event.target.value)} className="mt-1.5 h-7 text-[10.5px]" />)}
     {(value.type === 'string' || value.type === 'integer' || value.type === 'float') && <div className="mt-1.5 grid grid-cols-2 gap-1">

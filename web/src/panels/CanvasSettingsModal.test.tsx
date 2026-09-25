@@ -1,9 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   getShares: vi.fn(),
   addShare: vi.fn(),
+  tablesPage: vi.fn(), tableByRegistration: vi.fn(), datasetRevisionCapabilities: vi.fn(),
+  resolveDatasetRevision: vi.fn(), datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
   state: {
     doc: {
       id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[],
@@ -21,7 +23,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/client')>()
-  return { ...actual, api: { ...actual.api, getShares: mocks.getShares, addShare: mocks.addShare } }
+  return { ...actual, api: { ...actual.api, getShares: mocks.getShares, addShare: mocks.addShare,
+    tablesPage: mocks.tablesPage, tableByRegistration: mocks.tableByRegistration,
+    datasetRevisionCapabilities: mocks.datasetRevisionCapabilities, resolveDatasetRevision: mocks.resolveDatasetRevision,
+    datasetRevisions: mocks.datasetRevisions, datasetRevision: mocks.datasetRevision } }
 })
 
 vi.mock('../store/graph', () => ({
@@ -40,6 +45,15 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     mocks.addShare.mockResolvedValue({ ok: true })
     mocks.state.doc.parameters = []
     mocks.state.doc.resultRetention = { history: 'inherit' }
+    const table = { id: 'catalog-orders', registrationId: 'registration-orders', name: 'Orders', uri: 'managed://orders', columns: [] }
+    mocks.tablesPage.mockResolvedValue({ items: [table], hasMore: false })
+    mocks.tableByRegistration.mockResolvedValue(table)
+    mocks.datasetRevisionCapabilities.mockResolvedValue({ selectors: ['latest', 'exact'] })
+    mocks.resolveDatasetRevision.mockResolvedValue({ datasetId: 'logical-orders', revisionId: 'rev-new', retentionOwner: 'core' })
+    mocks.datasetRevisions.mockResolvedValue({ items: [
+      { datasetId: 'logical-orders', revisionId: 'rev-old', committedAt: '2026-09-24T12:00:00Z', retentionOwner: 'core' },
+    ], hasMore: false })
+    mocks.datasetRevision.mockImplementation(async (datasetId, revisionId) => ({ datasetId, revisionId, name: 'Orders', summary: {} }))
   })
 
   it('renders workspace_view accurately and disables document fields for a viewer', async () => {
@@ -102,6 +116,54 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
 
     fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 's3://public-bucket/key' } })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('saves a dataset default by name and pins a version without storing registration or catalog IDs', async () => {
+    mocks.state.doc.parameters = [{ name: 'input', type: 'dataset', required: false }]
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+    fireEvent.click(screen.getByLabelText('Default'))
+    expect(screen.getByRole('alert')).toHaveTextContent('dataset default is incomplete')
+    expect(mocks.state.setParameters).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose dataset Orders' }))
+    await waitFor(() => expect(mocks.state.setParameters).toHaveBeenCalledWith([
+      { name: 'input', type: 'dataset', required: false, default: { kind: 'latest', datasetId: 'logical-orders' } },
+    ]))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByLabelText('input default selection')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('input default selection'), { target: { value: 'exact' } })
+    fireEvent.change(screen.getByLabelText('input default version'), { target: { value: 'rev-old' } })
+    expect(mocks.state.setParameters).toHaveBeenLastCalledWith([
+      { name: 'input', type: 'dataset', required: false, default: { kind: 'exact', datasetId: 'logical-orders', revisionId: 'rev-old' } },
+    ])
+  })
+
+  it('keeps dataset defaults read-only for viewers', async () => {
+    mocks.state.canvasRole = 'viewer'
+    mocks.state.doc.parameters = [{ name: 'input', type: 'dataset', default: { kind: 'latest', datasetId: 'logical-orders' } }]
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+    expect(await screen.findByText('Orders')).toBeVisible()
+    expect(screen.getByLabelText('input default dataset search')).toBeDisabled()
+    expect(screen.getByLabelText('input default selection')).toBeDisabled()
+    expect(mocks.state.setParameters).not.toHaveBeenCalled()
+  })
+
+  it('does not assign a late dataset choice to another parameter after reordering identical defaults', async () => {
+    mocks.state.doc.parameters = ['alpha', 'beta'].map((name) => ({ name, type: 'dataset', default: { kind: 'latest', datasetId: 'logical-orders' } }))
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+    await waitFor(() => expect(screen.getByLabelText('alpha default selection')).toBeEnabled())
+    await waitFor(() => expect(screen.getByLabelText('beta default selection')).toBeEnabled())
+    let resolve!: (value: unknown) => void
+    mocks.resolveDatasetRevision.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
+    const alpha = within(screen.getByLabelText('alpha default dataset binding'))
+    fireEvent.click(await alpha.findByRole('button', { name: 'Choose dataset Orders' }))
+    await waitFor(() => expect(mocks.resolveDatasetRevision).toHaveBeenCalledTimes(3))
+    fireEvent.click(screen.getByRole('button', { name: 'Move alpha down' }))
+    await act(async () => resolve({ datasetId: 'other-logical-dataset', revisionId: 'rev-other', retentionOwner: 'core' }))
+    expect(mocks.state.setParameters).toHaveBeenCalledTimes(1)
+    expect(mocks.state.setParameters).toHaveBeenCalledWith([
+      { name: 'beta', type: 'dataset', default: { kind: 'latest', datasetId: 'logical-orders' } },
+      { name: 'alpha', type: 'dataset', default: { kind: 'latest', datasetId: 'logical-orders' } },
+    ])
   })
 
   it('saves a Canvas history override without offering a per-Canvas location', async () => {

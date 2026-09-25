@@ -21,6 +21,26 @@ class ParameterResolutionError(ValueError):
     """The submitted public binding document cannot be admitted."""
 
 
+def _dataset_source_uri(dataset_id: str, name: str) -> str:
+    """Locate a parameter's registered input, never the Source's previous path or name."""
+    try:
+        provider_uri = workspace_providers.provider_dataset_uri_for_identity(dataset_id)
+        if provider_uri is not None:
+            if workspace_providers.provider_dataset_identity(provider_uri) == dataset_id:
+                return provider_uri
+        else:
+            binding = metadb.catalog_revision_binding(dataset_id)
+            if binding is not None:
+                current = metadb.catalog_revision_binding_for_uri(binding["uri"])
+                if current is not None and current["dataset_id"] == dataset_id:
+                    return str(binding["uri"])
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise ParameterResolutionError(
+            f"dataset parameter '{name}' is unavailable; choose an available dataset") from exc
+    raise ParameterResolutionError(
+        f"dataset parameter '{name}' is no longer registered; choose an available dataset")
+
+
 def _secret_free(value: Any, name: str) -> None:
     if isinstance(value, str) and is_registered_secret_ref(value):
         raise ParameterResolutionError(
@@ -196,6 +216,8 @@ def resolve_graph_parameters(graph: Graph, bindings: list[ParameterBinding], tar
         return bound, []  # the shared graph validator reports the structural error
     referenced: set[str] = set()
     references = 0
+    source_uris: dict[str, str] = {}
+    resolved_datasets: dict[str, tuple[str, dict[str, str]]] = {}
 
     def replace(value: Any, *, node, config_key: str | None = None) -> Any:
         nonlocal references
@@ -221,28 +243,26 @@ def resolve_graph_parameters(graph: Graph, bindings: list[ParameterBinding], tar
                 raise ParameterResolutionError(
                     f"dataset parameter '{name}' must be the complete datasetRef of a Source")
             dataset = _dataset_value(decl, raw)
-            if dataset["kind"] == "exact" or not freeze_latest:
+            if not freeze_latest:
                 return dataset
-            uri = node.data.get("config", {}).get("uri")
-            if not isinstance(uri, str) or not uri:
-                raise ParameterResolutionError(
-                    f"latest dataset parameter '{name}' requires a Source uri")
+            if name in resolved_datasets:
+                uri, resolved_dataset = resolved_datasets[name]
+                source_uris[node.id] = uri
+                return dict(resolved_dataset)
+            uri = _dataset_source_uri(dataset["datasetId"], name)
+            source_uris[node.id] = uri
+            if dataset["kind"] == "exact":
+                resolved_datasets[name] = (uri, dataset)
+                return dataset
             try:
-                logical_uri = deps.catalog.resolve_ref(uri)
-                provider_id = workspace_providers.provider_dataset_identity(logical_uri)
-                adapter = (deps.resolve_adapter(logical_uri) if provider_id is not None
-                           else revision_adapter_for_uri(logical_uri, deps.resolve_adapter))
+                provider_id = workspace_providers.provider_dataset_identity(uri)
+                adapter = (deps.resolve_adapter(uri) if provider_id is not None
+                           else revision_adapter_for_uri(uri, deps.resolve_adapter))
                 if (provider_id is not None
                         and not workspace_providers.provider_dataset_supports_exact(adapter)):
                     raise ParameterResolutionError(
                         f"latest dataset parameter '{name}' requires exact revision support")
-                registration = (None if provider_id is not None
-                                else metadb.catalog_revision_binding_for_uri(logical_uri))
-                current_id = provider_id or (str(registration["dataset_id"]) if registration else None)
-                if current_id != dataset["datasetId"]:
-                    raise ParameterResolutionError(
-                        f"latest dataset parameter '{name}' does not match the Source registration")
-                resolved = adapter.resolve_revision(logical_uri)
+                resolved = adapter.resolve_revision(uri)
                 revision_id = str(resolved.get("revision_id") or "")
                 if not revision_id:
                     raise RuntimeError("provider returned no revision identity")
@@ -251,8 +271,10 @@ def resolve_graph_parameters(graph: Graph, bindings: list[ParameterBinding], tar
             except Exception as exc:
                 raise ParameterResolutionError(
                     f"latest dataset parameter '{name}' could not resolve an exact revision") from exc
-            return {"kind": "exact", "datasetId": dataset["datasetId"],
-                    "revisionId": revision_id}
+            exact = {"kind": "exact", "datasetId": dataset["datasetId"],
+                     "revisionId": revision_id}
+            resolved_datasets[name] = (uri, exact)
+            return exact
         if isinstance(value, dict):
             return {key: replace(child, node=node, config_key=key) for key, child in value.items()}
         if isinstance(value, list):
@@ -263,6 +285,10 @@ def resolve_graph_parameters(graph: Graph, bindings: list[ParameterBinding], tar
         config = node.data.get("config") if isinstance(node.data, dict) else None
         if isinstance(config, dict):
             node.data["config"] = replace(config, node=node)
+            if node.id in source_uris:
+                # Only the dispatch copy changes. The saved Canvas keeps its parameter sentinel,
+                # and response-loss comparison above never consults a mutable registration/head.
+                node.data["config"]["uri"] = source_uris[node.id]
 
     canonical: list[dict[str, Any]] = []
     for decl in graph.parameters:

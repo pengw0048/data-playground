@@ -788,6 +788,10 @@ def test_typed_latest_retry_uses_retained_manifest_without_mutable_head(monkeypa
     monkeypatch.setattr(
         "hub.run_parameters.revision_adapter_for_uri", lambda *_args: InitialAdapter())
     monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding",
+        lambda _dataset_id: {"uri": graph.nodes[0].data["config"]["uri"]},
+    )
+    monkeypatch.setattr(
         "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
         lambda _uri: {"dataset_id": "dataset"},
     )
@@ -817,6 +821,8 @@ def test_typed_latest_retry_uses_retained_manifest_without_mutable_head(monkeypa
 
     monkeypatch.setattr(
         "hub.run_parameters.revision_adapter_for_uri", mutable_head_access_is_a_bug)
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding", mutable_head_access_is_a_bug)
     monkeypatch.setattr(
         "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
         mutable_head_access_is_a_bug,

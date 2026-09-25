@@ -8,7 +8,17 @@ const mocks = vi.hoisted(() => ({
   submit: vi.fn(),
   edit: vi.fn(),
   setJobsQuery: vi.fn(),
+  tablesPage: vi.fn(), tableByRegistration: vi.fn(), datasetRevisionCapabilities: vi.fn(),
+  resolveDatasetRevision: vi.fn(), datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
 }))
+
+vi.mock('../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/client')>()
+  return { ...actual, api: { ...actual.api, tablesPage: mocks.tablesPage,
+    tableByRegistration: mocks.tableByRegistration, datasetRevisionCapabilities: mocks.datasetRevisionCapabilities,
+    resolveDatasetRevision: mocks.resolveDatasetRevision, datasetRevisions: mocks.datasetRevisions,
+    datasetRevision: mocks.datasetRevision } }
+})
 
 vi.mock('../store/graph', () => ({
   hasConfiguredManagedSidecarMerge: () => false,
@@ -22,6 +32,13 @@ import { RunPanel } from './RunPanel'
 describe('RunPanel typed parameter gate', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    const table = { id: 'catalog-entry', registrationId: 'registration-entry', name: 'Orders', uri: 'managed://orders', columns: [] }
+    mocks.tablesPage.mockResolvedValue({ items: [table], hasMore: false })
+    mocks.tableByRegistration.mockImplementation(async (id) => ({ ...table, id }))
+    mocks.datasetRevisionCapabilities.mockResolvedValue({ selectors: ['latest', 'exact'] })
+    mocks.resolveDatasetRevision.mockImplementation(async (id) => ({ datasetId: id === 'catalog-entry' ? 'dataset-1' : id, revisionId: 'revision-1' }))
+    mocks.datasetRevisions.mockResolvedValue({ items: [], hasMore: false })
+    mocks.datasetRevision.mockImplementation(async (datasetId, revisionId) => ({ datasetId, revisionId, name: 'Orders', summary: {} }))
     mocks.state = {
       doc: {
         id: 'canvas', version: 1, nodes: [{
@@ -44,15 +61,18 @@ describe('RunPanel typed parameter gate', () => {
     }
   })
 
-  it('blocks invalid values, clears bindings explicitly, and keeps DatasetRef fields structural', () => {
+  it('blocks invalid values, clears bindings explicitly, and keeps DatasetRef fields structural', async () => {
     render(<RunPanel nodeId="target" />)
     expect(screen.getByText(/explicit timezone/i)).toBeVisible()
-    expect(screen.getByText(/provide the dataset and version IDs/i)).toBeVisible()
+    expect(screen.getByText(/Choose a dataset and select/i)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
 
     fireEvent.change(screen.getByLabelText('When'), { target: { value: '' } })
     expect(mocks.clearBinding).toHaveBeenCalledWith('target', 'when')
-    fireEvent.change(screen.getByLabelText('Input revision'), { target: { value: 'revision-1' } })
+    const choice = await screen.findByRole('button', { name: 'Choose dataset Orders' })
+    await waitFor(() => expect(choice).toBeEnabled())
+    fireEvent.click(choice)
+    await waitFor(() => expect(mocks.setBinding).toHaveBeenCalled())
     expect(mocks.setBinding).toHaveBeenCalledWith('target', {
       name: 'input', value: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-1' },
     })
@@ -80,9 +100,8 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getByLabelText('Input selection')).toHaveValue('latest')
     expect(screen.getByLabelText('Input selection')).toBeDisabled()
-    expect(screen.getByLabelText('Input dataset')).toHaveValue('dataset-latest')
-    expect(screen.getByLabelText('Input dataset')).toBeDisabled()
-    expect(screen.queryByLabelText('Input revision')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Input dataset search')).toBeDisabled()
+    expect(screen.queryByLabelText('Input version')).not.toBeInTheDocument()
     expect(screen.getByText('Using declared default.')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled()
 
@@ -92,7 +111,7 @@ describe('RunPanel typed parameter gate', () => {
     })
   })
 
-  it('shows an exact DatasetRef default and can return an override to the default', () => {
+  it('shows an exact DatasetRef default and can return an override to the default', async () => {
     mocks.state.doc.parameters = [{
       name: 'input', type: 'dataset', label: 'Input',
       default: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-default' },
@@ -102,10 +121,9 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getByLabelText('Input selection')).toHaveValue('exact')
     expect(screen.getByLabelText('Input selection')).toBeDisabled()
-    expect(screen.getByLabelText('Input dataset')).toHaveValue('dataset-exact')
-    expect(screen.getByLabelText('Input dataset')).toBeDisabled()
-    expect(screen.getByLabelText('Input revision')).toHaveValue('revision-default')
-    expect(screen.getByLabelText('Input revision')).toBeDisabled()
+    expect(screen.getByLabelText('Input dataset search')).toBeDisabled()
+    expect(screen.getByLabelText('Input version')).toHaveValue('revision-default')
+    expect(screen.getByLabelText('Input version')).toBeDisabled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Override default' }))
     expect(mocks.setBinding).toHaveBeenCalledWith('target', {
@@ -116,27 +134,38 @@ describe('RunPanel typed parameter gate', () => {
       name: 'input', value: { kind: 'exact', datasetId: 'dataset-exact', revisionId: 'revision-override' },
     }]
     rerender(<RunPanel nodeId="target" />)
-    expect(screen.getByLabelText('Input revision')).toHaveValue('revision-override')
-    expect(screen.getByLabelText('Input revision')).toBeEnabled()
+    expect(screen.getByLabelText('Input version')).toHaveValue('revision-override')
+    await waitFor(() => expect(screen.getByLabelText('Input version')).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Use default' }))
     expect(mocks.clearBinding).toHaveBeenCalledWith('target', 'input')
   })
 
-  it('keeps a required DatasetRef without a default editable and actionable', () => {
+  it('keeps a required DatasetRef without a default editable and actionable', async () => {
     mocks.state.doc.parameters = [{ name: 'input', type: 'dataset', required: true, label: 'Input' }]
     mocks.state.runs.target.parameterBindings = []
     render(<RunPanel nodeId="target" />)
 
-    expect(screen.getByLabelText('Input selection')).toBeEnabled()
-    expect(screen.getByLabelText('Input dataset')).toBeEnabled()
-    expect(screen.getByLabelText('Input revision')).toBeEnabled()
+    expect(screen.getByLabelText('Input dataset search')).toBeEnabled()
+    expect(mocks.setBinding).not.toHaveBeenCalled()
     expect(screen.getByRole('alert')).toHaveTextContent('no default')
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
 
-    fireEvent.change(screen.getByLabelText('Input dataset'), { target: { value: 'dataset-1' } })
-    expect(mocks.setBinding).toHaveBeenCalledWith('target', {
-      name: 'input', value: { kind: 'exact', datasetId: 'dataset-1', revisionId: '' },
-    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose dataset Orders' }))
+    await waitFor(() => expect(mocks.setBinding).toHaveBeenCalledWith('target', {
+      name: 'input', value: { kind: 'latest', datasetId: 'dataset-1' },
+    }))
+  })
+
+  it('does not allow a viewer to override defaults or clear bindings', () => {
+    mocks.state.canvasRole = 'viewer'
+    mocks.state.doc.parameters = [{ name: 'input', type: 'dataset', label: 'Input', default: { kind: 'latest', datasetId: 'dataset-1' } }]
+    mocks.state.runs.target.parameterBindings = []
+    const { rerender } = render(<RunPanel nodeId="target" />)
+    expect(screen.getByRole('button', { name: 'Override default' })).toBeDisabled()
+    expect(screen.getByLabelText('Input dataset search')).toBeDisabled()
+    mocks.state.runs.target.parameterBindings = [{ name: 'input', value: { kind: 'latest', datasetId: 'dataset-1' } }]
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByRole('button', { name: 'Use default' })).toBeDisabled()
   })
 
   it('distinguishes an empty string binding from use-default and only rejects built-in SecretRefs', () => {
