@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
-import { numericFilterStarterReason, numericStarterColumn, type CanvasStarter } from '../starters'
+import { groupCountStarterReason, numericFilterStarterReason, numericStarterColumn, type OwnDataStarter } from '../starters'
 import { useStore, type CanvasCreationResult } from '../store/graph'
 import type { ExampleCreationIntent } from '../store/exampleReplacement'
 import type { CatalogTable } from '../types/api'
@@ -13,12 +13,12 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 const unavailable = (table: CatalogTable) => table.missing ? 'Source file is unavailable'
   : !table.registrationId || table.uri.startsWith('workspace-provider://') ? 'Register this dataset in Workspace first' : null
 
-type NumericStarter = Extract<CanvasStarter, { kind: 'numeric-filter' }>
 type Props = {
   open: boolean
+  kind?: OwnDataStarter['kind']
   onOpenChange: (open: boolean) => void
   intent?: ExampleCreationIntent
-  onCreate?: (starter: NumericStarter) => Promise<CanvasCreationResult>
+  onCreate?: (starter: OwnDataStarter) => Promise<CanvasCreationResult>
 }
 type Page = { items: CatalogTable[]; hasMore: boolean; offset: number; key: string }
 
@@ -26,7 +26,8 @@ export function OwnDataStarterModal({ open, ...props }: Props) {
   return open ? <StarterForm {...props} /> : null
 }
 
-function StarterForm({ onOpenChange, intent = 'create-separate', onCreate }: Omit<Props, 'open'>) {
+function StarterForm({ onOpenChange, intent = 'create-separate', onCreate, kind = 'numeric-filter' }: Omit<Props, 'open'>) {
+  const counting = kind === 'group-count'
   const [query, setQuery] = useState('')
   const [retry, setRetry] = useState(0)
   const [page, setPage] = useState<Page | null>(null)
@@ -88,7 +89,7 @@ function StarterForm({ onOpenChange, intent = 'create-separate', onCreate }: Omi
       const reason = unavailable(current)
       if (reason) throw new Error(reason)
       const source: CanvasDoc = {
-        id: 'own-data-starter-schema', name: 'Filter your data', version: 1, edges: [],
+        id: 'own-data-starter-schema', name: counting ? 'Count rows by group' : 'Filter your data', version: 1, edges: [],
         nodes: [{ id: 'src', type: 'source', position: { x: 0, y: 0 }, data: {
           title: current.name, status: 'draft', config: {
             uri: current.uri, tableId: current.id, registrationId: current.registrationId!,
@@ -107,14 +108,16 @@ function StarterForm({ onOpenChange, intent = 'create-separate', onCreate }: Omi
     }
   }
 
-  const numericColumns = table?.columns.filter(numericStarterColumn) ?? []
-  const invalidReason = table ? numericFilterStarterReason(table, column, threshold) : 'Choose a dataset'
+  const selectableColumns = table?.columns.filter((item) => counting || numericStarterColumn(item)) ?? []
+  const invalidReason = !table ? 'Choose a dataset' : counting
+    ? groupCountStarterReason(table, column) : numericFilterStarterReason(table, column, threshold)
   const create = async () => {
     if (!table || invalidReason || submitting.current || checking) return
     submitting.current = true
     setCreating(true); setCreationError('')
     try {
-      const starter: NumericStarter = { kind: 'numeric-filter', table, column, threshold }
+      const starter: OwnDataStarter = counting
+        ? { kind: 'group-count', table, column } : { kind: 'numeric-filter', table, column, threshold }
       const result = await (onCreate ? onCreate(starter) : useStore.getState().newFromStarter(starter, intent))
       if (!live.current) return
       if (result.ok) onOpenChange(false)
@@ -129,8 +132,10 @@ function StarterForm({ onOpenChange, intent = 'create-separate', onCreate }: Omi
 
   return <Dialog open onOpenChange={(open) => { if (!creating) onOpenChange(open) }}>
     <DialogContent closeDisabled={creating} className="max-h-[90vh] max-w-xl gap-3 overflow-y-auto">
-      <DialogTitle>Filter your data</DialogTitle>
-      <DialogDescription>Choose a dataset and keep rows above a number. Open the Source → Filter steps to review and run when ready.</DialogDescription>
+      <DialogTitle>{counting ? 'Count rows by group' : 'Filter your data'}</DialogTitle>
+      <DialogDescription>{counting
+        ? 'Choose a dataset and a column to count each category. Open the Source → Aggregate steps, then run to count all rows.'
+        : 'Choose a dataset and keep rows above a number. Open the Source → Filter steps to review and run when ready.'}</DialogDescription>
       <form className="grid gap-3" onSubmit={(event) => { event.preventDefault(); void create() }}>
         <label className="grid gap-1 text-[12px] font-medium">Search datasets
           <input aria-label="Search starter datasets" className="dp-input" value={query} disabled={creating}
@@ -157,27 +162,29 @@ function StarterForm({ onOpenChange, intent = 'create-separate', onCreate }: Omi
         {schemaError && <div role="alert" className="text-[12px] text-destructive">{schemaError}{' '}
           <button type="button" disabled={creating} className="font-semibold underline" onClick={() => choice && void choose(choice)}>Retry dataset columns</button>
         </div>}
-        {table && !numericColumns.length && <p role="status" className="text-[12px] text-muted-foreground">{table.columns.length
+        {table && !selectableColumns.length && <p role="status" className="text-[12px] text-muted-foreground">{table.columns.length
           ? 'This dataset has no numeric columns. Choose another dataset.'
           : 'This dataset has no columns. Choose another dataset.'}</p>}
-        <label className="grid gap-1 text-[12px] font-medium">Numeric column
-          <select aria-label="Starter numeric column" className="dp-input" value={column} disabled={creating || checking || !numericColumns.length}
+        <label className="grid gap-1 text-[12px] font-medium">{counting ? 'Group by column' : 'Numeric column'}
+          <select aria-label={counting ? 'Starter grouping column' : 'Starter numeric column'} className="dp-input" value={column} disabled={creating || checking || !selectableColumns.length}
             onChange={(event) => { setColumn(event.target.value); setCreationError('') }}>
-            <option value="">Choose a numeric column</option>
-            {numericColumns.map((item) => <option key={item.name} value={item.name}>{item.name} ({item.type})</option>)}
+            <option value="">{counting ? 'Choose a grouping column' : 'Choose a numeric column'}</option>
+            {selectableColumns.map((item) => <option key={item.name} value={item.name}>{item.name} ({item.type})</option>)}
           </select>
         </label>
-        <label className="grid gap-1 text-[12px] font-medium">Keep values greater than
+        {!counting && <label className="grid gap-1 text-[12px] font-medium">Keep values greater than
           <input aria-label="Starter threshold" className="dp-input" type="text" inputMode="decimal" placeholder="For example, 100"
-            value={threshold} disabled={creating || !table || !numericColumns.length}
+            value={threshold} disabled={creating || !table || !selectableColumns.length}
             onChange={(event) => { setThreshold(event.target.value); setCreationError('') }} />
-        </label>
-        <p className="text-[11px] text-muted-foreground">Missing values are excluded. You can edit this condition in Filter.</p>
-        {column && threshold && invalidReason && <p role="alert" className="text-[12px] text-destructive">{invalidReason}</p>}
+        </label>}
+        <p className="text-[11px] text-muted-foreground">{counting
+          ? 'Missing values form their own group. Counts require all input rows; creating the Canvas does not run or publish data.'
+          : 'Missing values are excluded. You can edit this condition in Filter.'}</p>
+        {column && (counting || threshold) && invalidReason && <p role="alert" className="text-[12px] text-destructive">{invalidReason}</p>}
         {creationError && <p role="alert" className="text-[12px] text-destructive">{creationError}</p>}
         <div className="flex items-center justify-end gap-2 pt-1">
           <Button type="button" variant="outline" disabled={creating} onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button type="submit" disabled={creating || checking || !!invalidReason}>{creating ? 'Creating…' : intent === 'replace-pristine' ? 'Use in this Canvas' : 'Create filter Canvas'}</Button>
+          <Button type="submit" disabled={creating || checking || !!invalidReason}>{creating ? 'Creating…' : intent === 'replace-pristine' ? 'Use in this Canvas' : counting ? 'Create count Canvas' : 'Create filter Canvas'}</Button>
         </div>
       </form>
     </DialogContent>

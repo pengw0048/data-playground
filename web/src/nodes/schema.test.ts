@@ -109,6 +109,16 @@ describe('schemaWarnings — column references vs known input', () => {
     expect(warn(node('x', 'aggregate', { groupBy: 'date_trunc(\'day\', ts)' }), cols('ts'))).toEqual([]) // expr → skip
   })
 
+  it.each(['region, category, code', 'team "label", category, code', 'GROUP'])(
+    'checks a quoted grouping column as one identifier: %s', (name) => {
+      const groupBy = `"${name.replaceAll('"', '""')}"`
+      const aggregate = node('x', 'aggregate', { groupBy })
+      expect(warn(aggregate, cols(name))).toEqual([])
+      expect(warn(aggregate, cols('replacement'))).toEqual([`unknown column: ${name}`])
+      expect(warn(node('x', 'aggregate', { groupBy: `${groupBy}, id` }), cols(name, 'id'))).toEqual([])
+    },
+  )
+
   it('does NOT false-positive on functions, type names, date parts, or string literals', () => {
     expect(warn(node('f', 'filter', { predicate: "date_trunc('day', ts) > now()" }), cols('ts'))).toEqual([])
     expect(warn(node('f', 'filter', { predicate: 'CAST(amount AS INTEGER) > 1' }), cols('amount'))).toEqual([])

@@ -58,6 +58,21 @@ describe('OwnDataStarterModal', () => {
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 
+  it('builds a group count from fresh text columns without requiring a numeric threshold', async () => {
+    const onCreate = vi.fn().mockResolvedValue({ ok: true, canvasId: 'counts', persistence: 'remote' })
+    render(<OwnDataStarterModal open kind="group-count" onOpenChange={() => {}} onCreate={onCreate} />)
+    await choose()
+    await waitFor(() => expect(screen.getByLabelText('Starter grouping column')).toBeEnabled())
+    expect(screen.queryByRole('option', { name: /stale/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'label (string)' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('Starter threshold')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create count Canvas' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Starter grouping column'), { target: { value: 'label' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create count Canvas' }))
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith({ kind: 'group-count', table: { ...table, columns }, column: 'label' }))
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
   it('keeps schema selection working under StrictMode and uses physical numeric types', async () => {
     mocks.schema.mockResolvedValue({ src: { out: [
       { ...column('decimal_value', 'float'), physicalType: 'decimal128(20, 4)' },

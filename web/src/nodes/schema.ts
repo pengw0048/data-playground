@@ -112,10 +112,13 @@ const IDENT = /^(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))$/
 function plainColumns(expr: string): string[] | null {
   if (!expr) return null
   const cols: string[] = []
-  for (const part of expr.split(',')) {
-    const m = part.trim().match(IDENT)
+  // Consume whole identifiers before separators; a quoted name can itself contain commas/quotes.
+  const item = /\s*(?:"((?:""|[^"])*)"|([A-Za-z_][A-Za-z0-9_]*))\s*(,|$)/y
+  while (item.lastIndex < expr.length) {
+    const m = item.exec(expr)
     if (!m) return null
-    cols.push(m[1] ?? m[2])
+    cols.push(m[1] != null ? m[1].replaceAll('""', '"') : m[2])
+    if (m[3] === ',' && item.lastIndex === expr.length) return null
   }
   return cols.length ? cols : null
 }
@@ -158,7 +161,7 @@ function referencedColumns(node: CanvasNode): string[] {
     case 'select': return plainColumns(str('select') || str('expr')) ?? []
     case 'sort': return plain(str('by'))
     case 'dedup': return plain(str('on'))
-    case 'aggregate': return plain(str('groupBy'))
+    case 'aggregate': return plainColumns(str('groupBy')) ?? []
     case 'filter': case 'assert': return exprColumns(str('predicate'))
     case 'chart': {
       const x = str('x')

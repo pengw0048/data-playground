@@ -22,7 +22,7 @@ import { AddDataModal, CatalogDetail } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
 import { examples } from '../examples'
-import type { CanvasStarter } from '../starters'
+import type { OwnDataStarter } from '../starters'
 import { OwnDataStarterModal } from '../canvas/OwnDataStarterModal'
 import { parseDatasetViewerReturn, type ParsedDatasetViewerReturn } from '../router'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
@@ -530,7 +530,7 @@ function FirstRunCanvasChoice() {
   const pushToast = useStore((state) => state.pushToast)
   const [creating, setCreating] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [starterOpen, setStarterOpen] = useState(false)
+  const [starterKind, setStarterKind] = useState<OwnDataStarter['kind'] | null>(null)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
   const creatingRef = useRef(false)
   const live = useRef(true)
@@ -539,13 +539,13 @@ function FirstRunCanvasChoice() {
   currentLocation.current = location
   useEffect(() => { live.current = true; return () => { live.current = false } }, [])
 
-  const create = async (starter?: string | Extract<CanvasStarter, { kind: 'numeric-filter' }>): Promise<CanvasCreationResult> => {
+  const create = async (starter?: string | OwnDataStarter): Promise<CanvasCreationResult> => {
     if (creatingRef.current) return { ok: false }
     creatingRef.current = true
     const exampleKey = typeof starter === 'string' ? starter : undefined
-    const numericStarter = typeof starter === 'object' ? starter : undefined
+    const ownDataStarter = typeof starter === 'object' ? starter : undefined
     const stillHere = () => live.current && currentLocation.current === location
-    setCreating(exampleKey ?? (numericStarter ? 'numeric-filter' : 'blank'))
+    setCreating(exampleKey ?? (ownDataStarter ? ownDataStarter.kind : 'blank'))
     setError(null)
     try {
       // At the Workspace root, the ordinary store path already has the exact placement semantics.
@@ -553,7 +553,7 @@ function FirstRunCanvasChoice() {
       // of the folder currently visible in Workspace.
       if (!requestedResourceId) {
         if (exampleKey) return await newFromExample(exampleKey)
-        if (numericStarter) return await newFromStarter(numericStarter)
+        if (ownDataStarter) return await newFromStarter(ownDataStarter)
         return await newFile()
       }
       const resolved = await api.workspaceResource(requestedResourceId)
@@ -586,7 +586,7 @@ function FirstRunCanvasChoice() {
         if (!applied.ok) throw new Error('The Canvas was created, but the example could not be loaded.')
         return applied
       }
-      if (numericStarter) return await newFromStarter(numericStarter, 'replace-pristine')
+      if (ownDataStarter) return await newFromStarter(ownDataStarter, 'replace-pristine')
       return { ok: true, canvasId: created.id, persistence: 'remote' }
     } catch (caught) {
       const message = errorMessage(caught)
@@ -603,12 +603,16 @@ function FirstRunCanvasChoice() {
       <div className="mx-auto max-w-5xl">
         <h2 id="first-run-canvas-title" className="text-[15px] font-semibold text-foreground">Create your first Canvas</h2>
         <p className="mt-0.5 max-w-2xl text-[12.5px] leading-snug text-muted-foreground">
-          Filter your own data, start with an empty graph, or open an example using sample data.
+          Filter or group your own data, start with an empty graph, or open an example using sample data.
         </p>
         <div className="mt-2 flex flex-wrap gap-2">
-          <button type="button" onClick={() => setStarterOpen(true)} disabled={creating !== null}
+          <button type="button" onClick={() => setStarterKind('numeric-filter')} disabled={creating !== null}
             className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-60">
             Filter my data
+          </button>
+          <button type="button" onClick={() => setStarterKind('group-count')} disabled={creating !== null}
+            className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-60">
+            Count by group
           </button>
           <button type="button" onClick={() => { void create() }} disabled={creating !== null}
             className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-60">
@@ -626,7 +630,7 @@ function FirstRunCanvasChoice() {
         </div>
         {error && <div role="alert" className="mt-2 text-[11.5px] text-destructive">{error}</div>}
       </div>
-      <OwnDataStarterModal key={location} open={starterOpen} onOpenChange={setStarterOpen} onCreate={create} />
+      <OwnDataStarterModal key={location} open={starterKind !== null} kind={starterKind ?? 'numeric-filter'} onOpenChange={(open) => { if (!open) setStarterKind(null) }} onCreate={create} />
     </section>
   )
 }

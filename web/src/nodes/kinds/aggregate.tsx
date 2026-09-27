@@ -13,7 +13,7 @@ function Aggregate({ id, data }: NodeComponentProps) {
     <NodeCard id={id} data={data} metaOverride={`group by ${group || '—'} · needs full pass`}>
       <div className="flex flex-col gap-2">
         <Field label="group by">
-          <ColumnCombo value={group} columns={columns} placeholder="category" onChange={(v) => updateConfig(id, { groupBy: v })} />
+          <ColumnCombo quoteIdentifiers value={group} columns={columns} placeholder="category" onChange={(v) => updateConfig(id, { groupBy: v })} />
         </Field>
         <Field label="aggregations">
           <MiniInput mono value={aggs} placeholder="count(*) AS n, avg(x) AS avg_x" onChange={(v) => updateConfig(id, { aggs: v })} />

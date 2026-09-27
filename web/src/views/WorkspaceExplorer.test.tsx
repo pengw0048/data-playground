@@ -261,7 +261,7 @@ describe('WorkspaceExplorer', () => {
     expect(store.newFromExample).toHaveBeenCalledWith('purchases', 'replace-pristine')
   })
 
-  it('creates an own-data starter inside the current Workspace folder', async () => {
+  it.each(['numeric-filter', 'group-count'] as const)('creates a %s starter inside the current Workspace folder', async (kind) => {
     store.firstRunChoice = true
     store.workspaceResourceId = FOLDER.id
     mocks.workspaceResource.mockResolvedValue({ resource: FOLDER, ancestors: [ROOT], source: { id: 'local', kind: 'local', completeness: 'complete' } })
@@ -273,16 +273,16 @@ describe('WorkspaceExplorer', () => {
     mocks.schema.mockResolvedValue({ src: { out: columns } })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Filter my data' }))
+    fireEvent.click(await screen.findByRole('button', { name: kind === 'group-count' ? 'Count by group' : 'Filter my data' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Choose starter dataset observations' }))
-    await waitFor(() => expect(screen.getByLabelText('Starter numeric column')).toBeEnabled())
-    fireEvent.change(screen.getByLabelText('Starter numeric column'), { target: { value: 'score' } })
-    fireEvent.change(screen.getByLabelText('Starter threshold'), { target: { value: '0.5' } })
+    await waitFor(() => expect(screen.getByLabelText(kind === 'group-count' ? 'Starter grouping column' : 'Starter numeric column')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText(kind === 'group-count' ? 'Starter grouping column' : 'Starter numeric column'), { target: { value: 'score' } })
+    if (kind === 'numeric-filter') fireEvent.change(screen.getByLabelText('Starter threshold'), { target: { value: '0.5' } })
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: 'Create filter Canvas' }))
+    fireEvent.click(screen.getByRole('button', { name: kind === 'group-count' ? 'Create count Canvas' : 'Create filter Canvas' }))
 
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({ containerId: 'folder-1', expectedContainerVersion: 1, name: 'untitled' }))
-    await waitFor(() => expect(store.newFromStarter).toHaveBeenCalledWith({ kind: 'numeric-filter', table: { ...table, columns }, column: 'score', threshold: '0.5' }, 'replace-pristine'))
+    await waitFor(() => expect(store.newFromStarter).toHaveBeenCalledWith({ kind, table: { ...table, columns }, column: 'score', ...(kind === 'numeric-filter' ? { threshold: '0.5' } : {}) }, 'replace-pristine'))
     expect(store.openFile).toHaveBeenCalledWith('folder-starter')
     expect(store.newFromExample).not.toHaveBeenCalled()
   })

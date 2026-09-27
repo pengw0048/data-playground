@@ -22,7 +22,7 @@ import {
 } from '../router'
 import { ownsNavigation, startNavigation, type NavigationToken } from '../navigationOwnership'
 import { newCanvasFileKey } from '../canvas/fileKey'
-import { numericFilterStarterReason, starterDoc, type CanvasStarter } from '../starters'
+import { ownDataStarterReason, starterDoc, type CanvasStarter } from '../starters'
 import {
   api, KernelError, setApiUser,
   type AgentBackendNode, type AgentBackendEdge, type CanvasFile, type CanvasRole, type DpUser,
@@ -4678,11 +4678,11 @@ export const useStore = create<Store>((set, get) => ({
   newFromExample: (key, intent) => get().newFromStarter({ kind: 'example', key }, intent),
 
   newFromStarter: async (starter, intent = 'create-separate') => {
-    if (starter.kind === 'numeric-filter') {
-      const reason = numericFilterStarterReason(starter.table, starter.column, starter.threshold)
+    if (starter.kind !== 'example') {
+      const reason = ownDataStarterReason(starter)
       if (reason) { get().pushToast(reason, 'error'); return { ok: false } }
     }
-    const label = starter.kind === 'example' ? 'example' : 'filter workflow'
+    const label = starter.kind === 'example' ? 'example' : starter.kind === 'group-count' ? 'count workflow' : 'filter workflow'
     const generation = ++_fileNavigationGeneration
     const navigationToken = startNavigation()
     const userId = get().currentUser?.id ?? null
@@ -4813,7 +4813,7 @@ export const useStore = create<Store>((set, get) => ({
       }
     }
     set({ view: 'canvas', firstRunChoice: false })
-    if (starter.kind === 'numeric-filter') get().select('flt')
+    if (starter.kind !== 'example') get().select(starter.kind === 'group-count' ? 'agg' : 'flt')
     get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
   },
