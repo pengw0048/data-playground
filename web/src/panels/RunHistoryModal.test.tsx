@@ -20,6 +20,7 @@ const apiMock = vi.hoisted(() => ({
   runOutputSample: vi.fn(),
   retainedResult: vi.fn(),
   preview: vi.fn(),
+  cancelPreview: vi.fn().mockResolvedValue({ status: 'stopped' }),
   profile: vi.fn(),
   profileEstimate: vi.fn(),
   fullProfile: vi.fn(),
@@ -61,6 +62,7 @@ beforeEach(() => {
   // Most tests exercise preview/profile behavior, not retained-result absence. A transient default
   // keeps those fixtures from mutating their Canvas status; absence tests install a typed 4xx.
   apiMock.retainedResult.mockReset().mockRejectedValue(new TypeError('retained lookup unavailable'))
+  apiMock.cancelPreview.mockReset().mockResolvedValue({ status: 'stopped' })
   apiMock.preview.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({
     columns: [], rowCount: 10, sampled: true, completeness: 'sample',
@@ -1889,7 +1891,7 @@ describe('durable full results', () => {
     expect(screen.getByText('violation row')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Passing' }))
     expect(await screen.findByText('pass row')).toBeInTheDocument()
-    expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'pass')
+    expect(apiMock.preview).toHaveBeenLastCalledWith(doc, 'target', 50, 0, 'pass', undefined, [], expect.any(String))
 
     await user.click(screen.getByRole('button', { name: 'Stats' }))
     await waitFor(() => expect(apiMock.profile).toHaveBeenLastCalledWith(doc, 'target', 'pass'))
@@ -2822,7 +2824,7 @@ describe('durable full results', () => {
     act(() => useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } }))
 
     expect(screen.queryByText('Whole dataset · 10 rows scanned')).not.toBeInTheDocument()
-    expect(screen.getByText('Whole-dataset profile')).toBeInTheDocument()
+    expect(useStore.getState().previews).toEqual({})
   })
 
   it('labels a failed whole-dataset job separately from sample preview failures', async () => {
@@ -2862,3 +2864,48 @@ describe('durable full results', () => {
 function boundPreview(doc: any, nodeId: string, result: any, portId?: string) {
   return { canvasId: doc.id, nodeId, portId, planIdentity: previewPlanIdentity(doc, nodeId, portId), requestGeneration: 1, offset: 0, result }
 }
+
+describe('preview stop feedback', () => {
+  const doc = { id: 'history-canvas', version: 1, nodes: [{
+    id: 'target', type: 'source', position: { x: 0, y: 0 },
+    data: { title: 'source', config: {} },
+  }], edges: [] }
+  const successful = () => boundPreview(doc, 'target', {
+    columns: [{ name: 'value', type: 'string' }], rows: [{ value: 'previous row' }],
+    truncated: false, notPreviewable: false,
+  })
+
+  it('waits for stop confirmation and keeps old rows visibly separate', async () => {
+    let confirm!: (result: { status: string }) => void
+    apiMock.cancelPreview.mockImplementationOnce(() => new Promise((resolve) => { confirm = resolve }))
+    useStore.setState({ doc, previews: { target: {
+      ...successful(), result: undefined, loading: true, previewRequestId: 'preview-1',
+      principalId: 'alice', previousSuccess: successful(),
+    } } } as any)
+    render(<DataPanel nodeId="target" />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Stop preview' }))
+    expect(screen.getByText('Stopping preview…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop preview' })).toBeDisabled()
+    expect(screen.queryByText('Preview stopped')).not.toBeInTheDocument()
+    expect(screen.getByText('Previous successful preview')).toBeInTheDocument()
+    await act(async () => { confirm({ status: 'stopped' }) })
+    expect(screen.getByText('Preview stopped')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeEnabled()
+    await userEvent.setup().click(screen.getByText('Previous successful preview'))
+    expect(screen.getByText('previous row')).toBeVisible()
+    expect(screen.getByText(/They are not a result of the current attempt/)).toBeVisible()
+  })
+
+  it('offers Retry stop after a transport failure without offering another preview', async () => {
+    apiMock.cancelPreview.mockRejectedValueOnce(new Error('offline'))
+    useStore.setState({ doc, previews: { target: {
+      ...successful(), result: undefined, loading: true, previewRequestId: 'preview-2', principalId: 'alice', error: 'Fetch failed',
+    } } } as any)
+    render(<DataPanel nodeId="target" />)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Stop preview' }))
+    expect(await screen.findByRole('button', { name: 'Retry stop' })).toBeEnabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not confirm')
+    expect(screen.getByText('Preview connection failed: Fetch failed')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Refresh preview' })).not.toBeInTheDocument()
+  })
+})

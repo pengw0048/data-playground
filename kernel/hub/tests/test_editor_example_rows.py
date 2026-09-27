@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -22,6 +21,19 @@ from hub.routers import runs as runs_router
 from hub import sandbox
 
 client = TestClient(app)
+
+
+@pytest.fixture
+def syntax_error_dependency(tmp_path, monkeypatch):
+    (tmp_path / "fixture_dependency.py").write_text(
+        "def parse():\n    raise SyntaxError('dependency generated code failed')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    allowed = sandbox.allowed_modules()
+    sandbox.allow_modules(["fixture_dependency"])
+    try:
+        yield
+    finally:
+        sandbox.set_allowed(allowed)
 
 
 def _graph(*, mode: str = "map", code: str | None = None) -> dict:
@@ -131,16 +143,9 @@ def test_example_rows_preserve_syntax_location_without_sandbox_wrapper():
     assert "SandboxError" not in body["reason"]
 
 
-def test_dependency_syntax_error_during_cell_exec_remains_a_runtime_failure(monkeypatch):
-    def parse_dependency_code():
-        raise SyntaxError("dependency generated code failed")
-
-    monkeypatch.setitem(
-        sandbox._ALLOWED_MODULES,
-        "fixture_dependency",
-        SimpleNamespace(parse=parse_dependency_code),
-    )
+def test_dependency_syntax_error_during_cell_exec_remains_a_runtime_failure(syntax_error_dependency):
     response = _preview(_graph(code=(
+        "import fixture_dependency\n"
         "fixture_dependency.parse()\n"
         "def fn(row):\n"
         "    return row"
@@ -154,16 +159,9 @@ def test_dependency_syntax_error_during_cell_exec_remains_a_runtime_failure(monk
     assert "dependency generated code failed" in body["reason"]
 
 
-def test_dependency_syntax_error_while_processing_a_row_remains_user_code_failure(monkeypatch):
-    def parse_dependency_code():
-        raise SyntaxError("dependency generated code failed")
-
-    monkeypatch.setitem(
-        sandbox._ALLOWED_MODULES,
-        "fixture_dependency",
-        SimpleNamespace(parse=parse_dependency_code),
-    )
+def test_dependency_syntax_error_while_processing_a_row_remains_user_code_failure(syntax_error_dependency):
     response = _preview(_graph(code=(
+        "import fixture_dependency\n"
         "def fn(row):\n"
         "    fixture_dependency.parse()\n"
         "    return row"

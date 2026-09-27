@@ -766,6 +766,28 @@ describe('Transform exact processor labels', () => {
     expect(screen.queryByRole('region', { name: 'Prepared input sample' })).not.toBeInTheDocument()
   })
 
+  it('keeps Test code disabled until the active preview has stopped', async () => {
+    const adhoc = { ...node, data: { ...node.data, config: {
+      source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+    } } }
+    const doc = { id: 'canvas', version: 1, nodes: [adhoc], edges: [] }
+    useStore.setState({ doc, kernelUp: true, editorPreviews: {},
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+    } as any)
+    render(<CodeFullscreen />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Example rows' }))
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    act(() => useStore.setState({ editorPreviews: { transform: {
+      canvasId: doc.id, nodeId: 'transform', requestGeneration: 1,
+      planIdentity: previewPlanIdentity(doc, 'transform'), loading: true, stopping: true,
+    } } }))
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    act(() => useStore.setState((state) => ({ editorPreviews: { transform: {
+      ...state.editorPreviews.transform, loading: false, stopping: false, stopped: true,
+    } } })))
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+  })
+
   it('keeps Example rows local to one fullscreen editor session', async () => {
     const adhocNode = {
       ...node,

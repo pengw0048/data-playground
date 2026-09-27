@@ -88,6 +88,12 @@ def set_allowed(names) -> None:
         _KERNEL_ALLOWED.update(names)
 
 
+def allowed_modules() -> list[str]:
+    """Snapshot the current kernel dependency policy for a disposable preview child."""
+    with _allowed_lock:
+        return sorted(_KERNEL_ALLOWED)
+
+
 # The soft baseline is kept I/O-free on purpose (no `open`, no os/io), so the transform `arrow` format
 # gets pyarrow core + compute but NOT arbitrary local read/write. Two layers enforce that:
 # (1) _DENY_IMPORTS blocks the file-I/O SUBMODULES a cell could `import`;

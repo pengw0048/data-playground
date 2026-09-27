@@ -1,6 +1,7 @@
 """Retained editor evidence describes actual Python inputs, including failed code."""
 
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -9,6 +10,27 @@ import pytest
 from hub import db, sandbox
 from hub.executors.preview import preview_node
 from hub.models import Graph
+
+
+@pytest.fixture
+def probe_module(tmp_path, monkeypatch):
+    """Observe the actual child argument without replacing its execution boundary."""
+    records = tmp_path / "records.json"
+    (tmp_path / "dp_preview_probe.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"path = Path({str(records)!r})\n"
+        "def record(value):\n"
+        "    entries = json.loads(path.read_text()) if path.exists() else []\n"
+        "    entries.append({'type': f'{type(value).__module__}.{type(value).__qualname__}', "
+        "'repr': repr(value)})\n"
+        "    path.write_text(json.dumps(entries))\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    allowed = sandbox.allowed_modules()
+    sandbox.allow_modules(["dp_preview_probe"])
+    try:
+        yield lambda: json.loads(records.read_text())
+    finally:
+        sandbox.set_allowed(allowed)
 
 
 def _graph(*, code="def fn(row):\n    return row", mode="map", fmt="rows"):
@@ -54,20 +76,20 @@ def _preview(table, *, capture=True, one_shot=False, **config):
     return result
 
 
-def test_rows_preserve_decimal_none_and_input_before_user_mutation(monkeypatch):
+def test_rows_preserve_decimal_none_and_input_before_user_mutation(probe_module):
     exact = Decimal("12345678901234567890.123456789012345678")
     table = pa.table({"value": pa.array([exact, None], type=pa.decimal128(38, 18))})
-    calls = []
-
-    def fn(row):
-        calls.append(row["value"])
-        row["value"] = "changed by code"
-        return row
-
-    monkeypatch.setattr(sandbox, "compile_operator", lambda _code, _mode: fn)
-    result = _preview(table)
+    result = _preview(table, code=(
+        "import dp_preview_probe\n"
+        "def fn(row):\n"
+        "    dp_preview_probe.record(row['value'])\n"
+        "    row['value'] = 'changed by code'\n"
+        "    return row\n"))
     assert not result.error, result.reason
-    assert calls == [exact, None], "capturing evidence must not call user code again"
+    assert probe_module() == [
+        {"type": "decimal.Decimal", "repr": repr(exact)},
+        {"type": "builtins.NoneType", "repr": "None"},
+    ], "capturing evidence must not call user code again"
     sample = result.editor_input_sample
     assert sample.container_type == "builtins.dict"
     assert sample.rows[0]["value"].python_type == "decimal.Decimal"
@@ -136,24 +158,19 @@ def test_large_arrow_and_numpy_values_never_build_an_unbounded_repr(monkeypatch)
     assert "values omitted" in editor_input._cell(np.array([1, 2, 3])).representation
 
 
-def test_pandas_nested_array_summary_is_honestly_truncated_without_mutating_input(monkeypatch):
-    np = pytest.importorskip("numpy")
+def test_pandas_nested_array_summary_is_honestly_truncated_without_mutating_input(probe_module):
+    pytest.importorskip("numpy")
     pytest.importorskip("pandas")
     values = list(range(2000))
     table = pa.table({"values": [values]})
-    calls = []
-
-    def fn(batch):
-        actual = batch.iat[0, 0]
-        assert isinstance(actual, np.ndarray)
-        assert actual.tolist() == values
-        calls.append(batch)
-        return batch
-
-    monkeypatch.setattr(sandbox, "compile_operator", lambda _code, _mode: fn)
-    result = _preview(table, mode="map_batches", fmt="pandas")
+    result = _preview(table, mode="map_batches", fmt="pandas", code=(
+        "import dp_preview_probe\n"
+        "def fn(batch):\n"
+        "    dp_preview_probe.record(batch.iat[0, 0])\n"
+        "    return batch\n"))
     assert not result.error, result.reason
-    assert len(calls) == 1 and result.rows == [{"values": values}]
+    assert len(probe_module()) == 1 and result.rows == [{"values": values}]
+    assert probe_module()[0]["type"] == "numpy.ndarray"
     cell = result.editor_input_sample.rows[0]["values"]
     assert cell.python_type == "numpy.ndarray" and cell.truncated
     assert "shape=(2000,)" in cell.representation and "values omitted" in cell.representation
@@ -171,7 +188,7 @@ def test_empty_code_reuses_prepared_one_shot_input_and_schema(values):
 
 
 @pytest.mark.parametrize("fmt", ["rows", "pandas", "arrow"])
-def test_batch_samples_use_the_exact_complete_container_passed_to_code(monkeypatch, fmt):
+def test_batch_samples_use_the_exact_complete_container_passed_to_code(probe_module, fmt):
     if fmt == "pandas":
         pytest.importorskip("pandas")
     exact = Decimal("12345678901234567890.123456789012345678")
@@ -181,32 +198,27 @@ def test_batch_samples_use_the_exact_complete_container_passed_to_code(monkeypat
         "nullable": pa.array([1, 2, 3, 4, 5, None], type=pa.int64()),
         "precise": pa.array([exact] * 6, type=pa.decimal128(38, 18)),
     })
-    calls = []
-
-    def fn(batch):
-        calls.append(batch)
-        return batch
-
-    monkeypatch.setattr(sandbox, "compile_operator", lambda _code, _mode: fn)
-    result = _preview(table, mode="map_batches", fmt=fmt)
+    value_expression = {"rows": "batch[0]['precise']", "pandas": "batch.iat[0, 1]",
+                        "arrow": "batch.column(1)[0]"}[fmt]
+    result = _preview(table, mode="map_batches", fmt=fmt, code=(
+        "import dp_preview_probe\n"
+        "def fn(batch):\n"
+        "    dp_preview_probe.record(batch)\n"
+        f"    dp_preview_probe.record({value_expression})\n"
+        "    return batch\n"))
     assert not result.error, result.reason
-    assert len(calls) == 1
+    assert len(probe_module()) == 2, "one batch invocation records its container and first value"
     sample = result.editor_input_sample
     assert sample.format == fmt and len(sample.rows) == 5
     if fmt == "rows":
-        value = calls[0][0]["precise"]
         assert sample.container_type == "builtins.list"
     elif fmt == "pandas":
-        value = calls[0].iat[0, 1]
-        assert sample.container_type == (
-            f"{type(calls[0]).__module__}.{type(calls[0]).__qualname__}")
         assert sample.rows[0]["nullable"].python_type == "numpy.float64"
     else:
-        value = calls[0].column(1)[0]
         assert sample.container_type == "pyarrow.lib.Table"
-    assert sample.rows[0]["precise"].python_type == (
-        f"{type(value).__module__}.{type(value).__qualname__}")
-    assert sample.rows[0]["precise"].representation == repr(value)
+    assert sample.container_type == probe_module()[0]["type"]
+    assert sample.rows[0]["precise"].python_type == probe_module()[1]["type"]
+    assert sample.rows[0]["precise"].representation == probe_module()[1]["repr"]
 
 
 def test_ordinary_preview_does_not_capture_editor_input():

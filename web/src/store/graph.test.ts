@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   kernel: vi.fn(), nodes: vi.fn(), me: vi.fn(), users: vi.fn(),
-  listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(), cancelPreview: vi.fn(),
   currentResults: vi.fn(), retainedResult: vi.fn(), retainedEditorPreview: vi.fn(), exampleRowsEditorPreview: vi.fn(),
   canvasTransformReferences: vi.fn(),
   workspaceOpened: vi.fn(),
@@ -51,6 +51,8 @@ vi.mock('../api/client', () => ({
             ? apiMocks.saveCanvas
           : property === 'deleteCanvas'
             ? apiMocks.deleteCanvas
+          : property === 'cancelPreview'
+            ? apiMocks.cancelPreview
           : property === 'preview'
             ? apiMocks.preview
             : property === 'estimate'
@@ -250,6 +252,7 @@ describe('graph store — core authority ops', () => {
       { ok: true, id: 'c', version: (expectedVersion ?? 0) + 1 }
     ))
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
+    apiMocks.cancelPreview.mockReset().mockResolvedValue({ status: 'stopped' })
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
     apiMocks.writeAdmission.mockReset()
@@ -1921,6 +1924,150 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.sample?.result).toBeUndefined()
   })
 
+  it('waits for confirmed stop, keeps the last successful sample, and retries with edited code', async () => {
+    const transform = NODE('transform', 'transform')
+    transform.data.config = { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' }
+    const doc = { id: 'c', version: 1, nodes: [transform], edges: [] }
+    useStore.setState({ doc, editorPreviews: {} })
+    apiMocks.exampleRowsEditorPreview.mockResolvedValueOnce(previewResult('good'))
+    await useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    const successfulPlan = useStore.getState().editorPreviews.transform.planIdentity
+    useStore.getState().updateConfig('transform', { code: 'def fn(row):\n while True: pass' })
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    let confirmStop!: (value: { status: string }) => void
+    apiMocks.exampleRowsEditorPreview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    apiMocks.cancelPreview.mockImplementationOnce(() => new Promise((resolve) => { confirmStop = resolve }))
+    const pending = useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    const request = useStore.getState().editorPreviews.transform
+    const stopping = useStore.getState().cancelPreview('transform', true)
+    expect(apiMocks.cancelPreview).toHaveBeenCalledWith(request.previewRequestId, 'c')
+    expect(useStore.getState().editorPreviews.transform).toMatchObject({ loading: true, stopping: true })
+    await useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    expect(apiMocks.exampleRowsEditorPreview).toHaveBeenCalledTimes(2)
+    useStore.getState().updateConfig('transform', { code: 'def fn(row): return {"value": 2}' })
+    confirmStop({ status: 'stopped' })
+    await stopping
+    expect(useStore.getState().editorPreviews.transform).toMatchObject({
+      loading: false, stopped: true,
+      previousSuccess: { planIdentity: successfulPlan, result: previewResult('good') },
+    })
+    finish(previewResult('late old code'))
+    await pending
+    expect(useStore.getState().editorPreviews.transform.result).toBeUndefined()
+    apiMocks.exampleRowsEditorPreview.mockResolvedValueOnce(previewResult('fixed'))
+    await useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    expect(useStore.getState().editorPreviews.transform.result?.rows).toEqual([{ value: 'fixed' }])
+    expect(useStore.getState().doc.nodes[0].data.config.code).toBe('def fn(row): return {"value": 2}')
+    expect(apiMocks.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unconfirmed stop busy and allows a deliberate stop retry', async () => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    apiMocks.cancelPreview.mockRejectedValueOnce(new Error('connection lost'))
+    const pending = useStore.getState().runPreview('source')
+    await useStore.getState().cancelPreview('source')
+    expect(useStore.getState().previews.source).toMatchObject({ loading: true, stopping: true, stopError: 'connection lost' })
+    await useStore.getState().runPreview('source')
+    expect(apiMocks.preview).toHaveBeenCalledTimes(1)
+    apiMocks.cancelPreview.mockResolvedValueOnce({ status: 'stopped' })
+    await useStore.getState().cancelPreview('source')
+    expect(useStore.getState().previews.source).toMatchObject({ loading: false, stopped: true })
+    finish(previewResult('late'))
+    await pending
+    expect(useStore.getState().previews.source.result).toBeUndefined()
+  })
+
+  it.each([
+    new TypeError('Failed to fetch'),
+    new KernelError(503, 'Kernel connection lost'),
+  ])('keeps a lost preview request busy until automatic stop is confirmed: %s', async (failure) => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    let confirm!: (result: { status: string }) => void
+    apiMocks.preview.mockRejectedValueOnce(failure)
+    apiMocks.cancelPreview.mockImplementationOnce(() => new Promise((resolve) => { confirm = resolve }))
+    await useStore.getState().runPreview('source')
+    const preview = useStore.getState().previews.source
+    expect(preview).toMatchObject({ loading: true, stopping: true, error: failure.message })
+    expect(apiMocks.cancelPreview).toHaveBeenCalledWith(preview.previewRequestId, 'c')
+    await useStore.getState().runPreview('source')
+    expect(apiMocks.preview).toHaveBeenCalledTimes(1)
+    confirm({ status: 'stopped' })
+    await vi.waitFor(() => expect(useStore.getState().previews.source).toMatchObject({
+      loading: false, stopped: true, error: failure.message,
+    }))
+  })
+
+  it('keeps a failed automatic stop retryable and presents the lost response when the owner had finished', async () => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    apiMocks.preview.mockRejectedValueOnce(new KernelError(500, 'Preview response was lost'))
+    apiMocks.cancelPreview.mockRejectedValueOnce(new Error('Stop owner unavailable'))
+    await useStore.getState().runPreview('source')
+    await vi.waitFor(() => expect(useStore.getState().previews.source).toMatchObject({
+      loading: true, stopping: true, stopError: 'Stop owner unavailable', error: 'Preview response was lost',
+    }))
+    apiMocks.cancelPreview.mockResolvedValueOnce({ status: 'finished' })
+    await useStore.getState().cancelPreview('source')
+    expect(useStore.getState().previews.source).toMatchObject({ loading: false, stopping: false, error: 'Preview response was lost' })
+    expect(useStore.getState().previews.source.stopped).toBeUndefined()
+  })
+
+  it.each([400, 403, 404, 422])('leaves a rejected %i preview terminal without sending Stop', async (status) => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    apiMocks.preview.mockRejectedValueOnce(new KernelError(status, 'Request rejected'))
+    await useStore.getState().runPreview('source')
+    expect(useStore.getState().previews.source).toMatchObject({ loading: false, error: 'Request rejected' })
+    expect(apiMocks.cancelPreview).not.toHaveBeenCalled()
+  })
+
+  it('does not call a preview stopped when it finishes before cancellation', async () => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    apiMocks.cancelPreview.mockResolvedValueOnce({ status: 'finished' })
+    const pending = useStore.getState().runPreview('source')
+    await useStore.getState().cancelPreview('source')
+    expect(useStore.getState().previews.source).toMatchObject({ loading: true, stopping: false })
+    expect(useStore.getState().previews.source.stopped).toBeUndefined()
+    finish(previewResult('finished'))
+    await pending
+    expect(useStore.getState().previews.source.result?.rows).toEqual([{ value: 'finished' }])
+  })
+
+  it('settles a timed-out preview after code changes without relabelling its old result', async () => {
+    const transform = NODE('transform', 'transform')
+    transform.data.config = { code: 'old code' }
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [transform], edges: [] }, editorPreviews: {} })
+    apiMocks.exampleRowsEditorPreview.mockResolvedValueOnce(previewResult('old rows'))
+    await useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    const oldPlan = useStore.getState().editorPreviews.transform.planIdentity
+    let finish!: (result: any) => void
+    apiMocks.exampleRowsEditorPreview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const pending = useStore.getState().runEditorExamplePreview('transform', '[{"value":1}]')
+    useStore.getState().updateConfig('transform', { code: 'new code' })
+    finish({ ...previewResult(''), rows: [], error: true, failureCategory: 'timeout', reason: 'Stopped after the time limit' })
+    await pending
+    expect(useStore.getState().editorPreviews.transform).toMatchObject({
+      loading: false, result: { failureCategory: 'timeout' },
+      previousSuccess: { planIdentity: oldPlan, result: { rows: [{ value: 'old rows' }] } },
+    })
+  })
+
+  it('clears preview samples on an identity switch and rejects the old response', async () => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const pending = useStore.getState().runPreview('source')
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    expect(useStore.getState().previews).toEqual({})
+    expect(useStore.getState().editorPreviews).toEqual({})
+    finish(previewResult('Alice rows'))
+    await pending
+    expect(useStore.getState().previews).toEqual({})
+    expect(apiMocks.cancelPreview).not.toHaveBeenCalled()
+  })
+
   it('tests Transform code through the server-owned retained candidate without binding formal preview state', async () => {
     const source = NODE('source')
     source.data.config = { uri: 'events.parquet' }
@@ -1952,7 +2099,7 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.listRuns).not.toHaveBeenCalled()
     expect(apiMocks.retainedEditorPreview).toHaveBeenCalledWith(
-      doc, 'transform', 50, 0, undefined, [],
+      doc, 'transform', 50, 0, undefined, [], expect.any(String),
     )
     expect(useStore.getState().editorPreviews.transform?.result).toEqual(retained)
     expect(useStore.getState().previews).toBe(formalPreview)
@@ -1991,7 +2138,7 @@ describe('graph store — core authority ops', () => {
     )
 
     expect(apiMocks.exampleRowsEditorPreview).toHaveBeenCalledWith(
-      doc, 'transform', '[{"value":1}]', 50, 0, undefined, [],
+      doc, 'transform', '[{"value":1}]', 50, 0, undefined, [], expect.any(String),
     )
     expect(useStore.getState().editorPreviews.transform?.result).toEqual(structuredFailure)
     expect(useStore.getState().doc).toBe(doc)
@@ -2026,7 +2173,8 @@ describe('graph store — core authority ops', () => {
     finish(previewResult('old fixture'))
     await pending
 
-    expect(useStore.getState().editorPreviews.transform).toBeUndefined()
+    expect(useStore.getState().editorPreviews.transform?.result).toBeUndefined()
+    expect(useStore.getState().editorPreviews.transform?.loading).toBe(false)
   })
 
   it('turns an explicit retained-input miss into the editor-only Run upstream state', async () => {
@@ -2066,7 +2214,7 @@ describe('graph store — core authority ops', () => {
 
     expect(previewPlanIdentity(doc, 'section', 'pass')).not.toBe(previewPlanIdentity(doc, 'section', 'out'))
     await useStore.getState().runPreview('section')
-    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out')
+    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out', undefined, [], expect.any(String))
     const pass = useStore.getState().runPreview('section', 0, 'pass')
     const out = useStore.getState().runPreview('section', 0, 'out')
     finishOut(previewResult('selected out'))
@@ -2079,7 +2227,7 @@ describe('graph store — core authority ops', () => {
     })
     apiMocks.preview.mockResolvedValueOnce(previewResult('refreshed out'))
     await useStore.getState().runPreview('section')
-    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out')
+    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out', undefined, [], expect.any(String))
     expect(useStore.getState().previews.section).toMatchObject({
       portId: 'out', result: previewResult('refreshed out'),
     })
@@ -3284,7 +3432,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.preview.mockResolvedValueOnce({ ...previewResult('latest'), inputManifest: latestManifest })
     await useStore.getState().refreshPreviewInputs('target')
     expect(apiMocks.preview).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: doc.id }), 'target', 50, 0, undefined,
+      expect.objectContaining({ id: doc.id }), 'target', 50, 0, undefined, undefined, [], expect.any(String),
     )
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
     // Post-run recovery revalidates every green check against current-results. Without a readable
@@ -7428,7 +7576,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc, runs: { target: { phase: 'idle', parameterBindings: threshold } }, previewBindings: {} })
     apiMocks.preview.mockResolvedValueOnce(previewResult('bound'))
     await useStore.getState().runPreview('target')
-    expect(apiMocks.preview).toHaveBeenCalledWith(doc, 'target', 50, 0, undefined, undefined, threshold)
+    expect(apiMocks.preview).toHaveBeenCalledWith(doc, 'target', 50, 0, undefined, undefined, threshold, expect.any(String))
 
     const manifest = [{ node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'local', resolved_at: 'now' }]
     useStore.setState({ previewBindings: { target: {

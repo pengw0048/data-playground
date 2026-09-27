@@ -236,9 +236,12 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                 error=True, reason=f"{type(e).__name__}: {e}")
 
     reservoir_preview = _reservoir_profile_allowed(graph, node_id, resolve_adapter)
+    from hub.python_preview import PreviewControl
+    control = PreviewControl()
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
                          node_builders=node_builders, node_specs=node_specs,
-                         warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview)
+                         warm=cache, warm_scope="preview", reservoir_preview=reservoir_preview,
+                         preview_control=control)
     holder: dict = {}
 
     def work() -> ProfileResult:
@@ -275,7 +278,11 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         (sc.interrupt() if sc is not None else db.interrupt())
 
     try:
-        return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+        remove_interrupt = control.add_interrupt(on_timeout)
+        try:
+            return control.run(work, PREVIEW_BUDGET_S)
+        finally:
+            remove_interrupt()
     except ManagedSourceReadError as e:
         return ProfileResult(target_port_id=selected_port, error=True, reason=str(e))
     except NotPreviewable as e:

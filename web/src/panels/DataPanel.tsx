@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   parameterBindingsIdentity, previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey,
-  roleCanEdit, useStore,
+  roleCanEdit, useStore, type PreviewState,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api, KernelError } from '../api/client'
@@ -92,6 +92,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   ))
   const runPreview = useStore((s) => s.runPreview)
   const runEditorPreview = useStore((s) => s.runEditorPreview)
+  const cancelPreview = useStore((s) => s.cancelPreview)
   const previewAction = editorPreview?.onPreview
     ? (_nodeId: string, nextOffset = 0, portId?: string) => (
         editorPreview.onPreview?.(nextOffset, portId)
@@ -461,6 +462,39 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     return withOutputPorts(<Skeleton />)
   }
 
+  if (preview?.loading && preview.previewRequestId) {
+    return withOutputPorts(<div>
+      <div role="status" className="flex flex-col items-start gap-2 px-4 py-5 text-[12px] text-muted-foreground">
+        <span className="font-medium text-foreground">{preview.stopping ? 'Stopping preview…' : 'Preview running…'}</span>
+        <span>{preview.stopping
+          ? 'Waiting for the calculation to finish stopping. Your code and graph are kept.'
+          : 'You can stop this preview and keep editing.'}</span>
+        {preview.error && <span>Preview connection failed: {preview.error}</span>}
+        {preview.stopError && <span role="alert">Could not confirm that the preview stopped. {preview.stopError}</span>}
+        <Button size="sm" variant="outline" disabled={preview.stopping && !preview.stopError}
+          onClick={() => { void cancelPreview(nodeId, !!editorPreview) }}>
+          {preview.stopError ? 'Retry stop' : 'Stop preview'}
+        </Button>
+      </div>
+      <PreviousPreview preview={preview.previousSuccess} />
+    </div>)
+  }
+  if (preview?.stopped || preview?.result?.failureCategory === 'cancelled'
+      || preview?.result?.failureCategory === 'timeout') {
+    const timedOut = preview.result?.failureCategory === 'timeout'
+    return withOutputPorts(<div>
+      <div role="status" className="flex flex-col items-start gap-2 px-4 py-5 text-[12px] text-muted-foreground">
+        <span className="font-medium text-foreground">{timedOut ? 'Preview timed out' : 'Preview stopped'}</span>
+        <span>{timedOut ? preview.result?.reason || 'The preview exceeded its time limit and was stopped.'
+          : 'The calculation has stopped. Your code and graph are kept.'}</span>
+        {preview.error && <span>Preview connection failed: {preview.error}</span>}
+        <Button size="sm" onClick={() => previewAction(nodeId, 0, requestPortId)}>
+          {editorPreview ? 'Test again' : 'Refresh preview'}
+        </Button>
+      </div>
+      <PreviousPreview preview={preview.previousSuccess} />
+    </div>)
+  }
   if (!preview || preview.portId !== requestPortId) {
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
@@ -486,13 +520,15 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
-  if (preview.error) return withOutputPorts(<ErrorState
+  if (preview.error) return withOutputPorts(<><ErrorState
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
-    reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
+    reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />
+    <PreviousPreview preview={preview.previousSuccess} /></>)
   const res = preview.result!
   if (res.failureCategory === 'syntax_error' && res.syntaxError) {
-    return withOutputPorts(<SyntaxFailure failure={res.syntaxError} />)
+    return withOutputPorts(<><SyntaxFailure failure={res.syntaxError} />
+      <PreviousPreview preview={preview.previousSuccess} /></>)
   }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
@@ -501,17 +537,19 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       && failureNode.data.config.source === 'library'
     const canEditFailure = canEdit && failureNode?.type === 'transform'
       && !immutableProcessor
-    return withOutputPorts(<UserCodeFailure failure={res.userCodeException}
+    return withOutputPorts(<><UserCodeFailure failure={res.userCodeException}
       exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
       immutableProcessor={immutableProcessor}
       onEdit={canEditFailure
         ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
-        : undefined} />)
+        : undefined} />
+      <PreviousPreview preview={preview.previousSuccess} /></>)
   }
-  if (res.error) return withOutputPorts(<ErrorState
+  if (res.error) return withOutputPorts(<><ErrorState
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
-    reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />)
+    reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />
+    <PreviousPreview preview={preview.previousSuccess} /></>)
   const resultModeToggle = selectedOutput?.uri
     ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
         fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
@@ -1694,6 +1732,15 @@ function MetricValue({ rows }: { rows: Record<string, unknown>[] }) {
       <div className="mt-1.5 text-[11px] text-muted-foreground">{String(rows[0]?.metric ?? 'metric')} · over the full dataset</div>
     </div>
   )
+}
+
+function PreviousPreview({ preview }: { preview?: Omit<PreviewState, 'previousSuccess'> }) {
+  if (!preview?.result) return null
+  return <details className="border-t border-border text-[12px]">
+    <summary className="cursor-pointer px-4 py-3 font-medium">Previous successful preview</summary>
+    <p className="px-4 pb-3 text-muted-foreground">These rows came from the previous successful preview. They are not a result of the current attempt.</p>
+    <RowsTable columns={preview.result.columns.map((column) => ({ ...column, capabilities: column.capabilities ?? [] }))} rows={preview.result.rows} onRowClick={() => {}} />
+  </details>
 }
 
 function Skeleton() {
