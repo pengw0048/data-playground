@@ -26,6 +26,17 @@ describe('schemaWarnings — column references vs known input', () => {
     expect(w[0]).toContain('score')
   })
 
+  it('checks an escaped quoted name as one column, including exact numeric casts', () => {
+    const name = 'cost "gross" AND tax'
+    const predicate = '"cost ""gross"" AND tax" > CAST(\'0.12345678901234567890123456789012345678\' AS DECIMAL(38,38))'
+    const filter = node('f', 'filter', {
+      predicate,
+      filterBuilder: { conditions: [{ col: 'obsolete', op: '>', val: '1' }] },
+    })
+    expect(warn(filter, cols(name))).toEqual([])
+    expect(warn(filter, cols('obsolete'))).toEqual([`unknown column: ${name}`])
+  })
+
   it('stays silent when the upstream is untyped (null) — cannot check', () => {
     expect(warn(node('f', 'filter', { predicate: 'score > 0' }), null)).toEqual([])
   })

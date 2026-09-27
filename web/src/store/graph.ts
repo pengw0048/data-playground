@@ -22,7 +22,7 @@ import {
 } from '../router'
 import { ownsNavigation, startNavigation, type NavigationToken } from '../navigationOwnership'
 import { newCanvasFileKey } from '../canvas/fileKey'
-import { exampleDoc } from '../examples'
+import { numericFilterStarterReason, starterDoc, type CanvasStarter } from '../starters'
 import {
   api, KernelError, setApiUser,
   type AgentBackendNode, type AgentBackendEdge, type CanvasFile, type CanvasRole, type DpUser,
@@ -1586,6 +1586,7 @@ interface Store {
   openFile: (id: string, options?: OpenFileOptions) => Promise<boolean>
   newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
   newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
+  newFromStarter: (starter: CanvasStarter, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   setExecutionBackend: (backend: string | null) => void
@@ -4617,7 +4618,14 @@ export const useStore = create<Store>((set, get) => ({
     return { ok: true, canvasId: doc.id, persistence }
   },
 
-  newFromExample: async (key, intent = 'create-separate') => {
+  newFromExample: (key, intent) => get().newFromStarter({ kind: 'example', key }, intent),
+
+  newFromStarter: async (starter, intent = 'create-separate') => {
+    if (starter.kind === 'numeric-filter') {
+      const reason = numericFilterStarterReason(starter.table, starter.column, starter.threshold)
+      if (reason) { get().pushToast(reason, 'error'); return { ok: false } }
+    }
+    const label = starter.kind === 'example' ? 'example' : 'filter workflow'
     const generation = ++_fileNavigationGeneration
     const navigationToken = startNavigation()
     const userId = get().currentUser?.id ?? null
@@ -4654,15 +4662,17 @@ export const useStore = create<Store>((set, get) => ({
       // example here would replace the in-memory document before that edit is persisted. Cancel this
       // click instead; the edited Canvas stays mounted and autosave can complete normally.
       if (!sameCandidate) {
-        get().pushToast('Canvas changed while preparing the example; your edit was kept. Choose the example again.', 'info')
+        get().pushToast(`Canvas changed while preparing the ${label}; your edit was kept. Choose the ${label} again.`, 'info')
         return { ok: false }
       }
       replacePristine = runsEmpty
     }
     const id = replacePristine ? current.doc.id : newCanvasFileKey()
-    const example = exampleDoc(key, id)  // bare seeded names remain the offline runnable fallback
-    if (!example) return get().newFile()
-    const resolved = await canonicalizeExampleSources(example)
+    const proposed = starterDoc(starter, id)
+    if (!proposed) return get().newFile()
+    const resolved = starter.kind === 'example'
+      ? await canonicalizeExampleSources(proposed)
+      : { doc: proposed, tables: [starter.table] }
     if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     if (replacePristine) {
       const latest = get()
@@ -4674,7 +4684,7 @@ export const useStore = create<Store>((set, get) => ({
       }
       if (!isPristineExampleReplacement(latestCandidate)
           || !isSameExampleReplacementSnapshot(candidate, latestCandidate)) {
-        get().pushToast('Canvas changed while preparing the example; your edit was kept. Choose the example again.', 'info')
+        get().pushToast(`Canvas changed while preparing the ${label}; your edit was kept. Choose the ${label} again.`, 'info')
         return { ok: false }
       }
     }
@@ -4746,6 +4756,7 @@ export const useStore = create<Store>((set, get) => ({
       }
     }
     set({ view: 'canvas', firstRunChoice: false })
+    if (starter.kind === 'numeric-filter') get().select('flt')
     get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
   },

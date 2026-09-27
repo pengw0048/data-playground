@@ -136,11 +136,11 @@ function exprColumns(expr: string): string[] {
   const lambdaVars = new Set<string>()
   for (const lm of s.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*->/g)) lambdaVars.add(lm[1].toLowerCase())
   const out: string[] = []
-  const re = /"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*)/g
+  const re = /"((?:""|[^"])*)"|([A-Za-z_][A-Za-z0-9_]*)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(s))) {
     const quoted = m[1] != null
-    const name = m[1] ?? m[2]
+    const name = quoted ? m[1].replaceAll('""', '"') : m[2]
     if (/^\s*[.(]/.test(s.slice(re.lastIndex))) continue     // function call `ident(` OR qualifier `ident.`
     if (/\.\s*$/.test(s.slice(0, m.index))) continue         // qualified/struct field `.col`
     if (!quoted && (SQL_WORDS.has(name.toLowerCase()) || lambdaVars.has(name.toLowerCase()))) continue
