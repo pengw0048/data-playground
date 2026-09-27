@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   workspaceFavorites: vi.fn(), workspaceFavoriteStatus: vi.fn(),
   workspaceFavoriteAdd: vi.fn(), workspaceFavoriteRemove: vi.fn(),
   workspaceRecent: vi.fn(), workspaceOpened: vi.fn(), workspaceResource: vi.fn(),
-  workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
+  workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(), schema: vi.fn(),
   workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(), lineage: vi.fn(), table: vi.fn(),
   unregisterTable: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRemoveDetachedDataset: vi.fn(), workspaceBatch: vi.fn(), workspaceRelink: vi.fn(), removeProviderDataset: vi.fn(),
@@ -29,7 +29,7 @@ const store = vi.hoisted(() => ({
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
   firstRunChoice: false,
-  newFile: vi.fn(), newFromExample: vi.fn(),
+  newFile: vi.fn(), newFromExample: vi.fn(), newFromStarter: vi.fn(),
   localDrafts: [] as never[],
   draftStorageErrors: [] as string[],
   doc: { id: '', version: 0 },
@@ -155,6 +155,7 @@ describe('WorkspaceExplorer', () => {
     store.firstRunChoice = false
     store.newFile.mockResolvedValue({ ok: true, canvasId: 'blank', persistence: 'remote' })
     store.newFromExample.mockResolvedValue({ ok: true, canvasId: 'example', persistence: 'remote' })
+    store.newFromStarter.mockResolvedValue({ ok: true, canvasId: 'numeric-filter', persistence: 'remote' })
     store.localDrafts = []
     store.draftStorageErrors = []
     store.doc = { id: 'canvas-1', version: 3 }
@@ -258,6 +259,58 @@ describe('WorkspaceExplorer', () => {
     }))
     await waitFor(() => expect(store.openFile).toHaveBeenCalledWith('folder-example'))
     expect(store.newFromExample).toHaveBeenCalledWith('purchases', 'replace-pristine')
+  })
+
+  it('creates an own-data starter inside the current Workspace folder', async () => {
+    store.firstRunChoice = true
+    store.workspaceResourceId = FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({ resource: FOLDER, ancestors: [ROOT], source: { id: 'local', kind: 'local', completeness: 'complete' } })
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [] })
+    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'folder-starter', created: true })
+    const table = { id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] }
+    const columns = [{ name: 'score', type: 'double', capabilities: [] }]
+    mocks.tableByRegistration.mockResolvedValue(table)
+    mocks.schema.mockResolvedValue({ src: { out: columns } })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Filter my data' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose starter dataset observations' }))
+    await waitFor(() => expect(screen.getByLabelText('Starter numeric column')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('Starter numeric column'), { target: { value: 'score' } })
+    fireEvent.change(screen.getByLabelText('Starter threshold'), { target: { value: '0.5' } })
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Create filter Canvas' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({ containerId: 'folder-1', expectedContainerVersion: 1, name: 'untitled' }))
+    await waitFor(() => expect(store.newFromStarter).toHaveBeenCalledWith({ kind: 'numeric-filter', table: { ...table, columns }, column: 'score', threshold: '0.5' }, 'replace-pristine'))
+    expect(store.openFile).toHaveBeenCalledWith('folder-starter')
+    expect(store.newFromExample).not.toHaveBeenCalled()
+  })
+
+  it('does not create in a previous folder after a delayed starter destination lookup', async () => {
+    store.firstRunChoice = true
+    store.workspaceResourceId = FOLDER.id
+    const destination = { resource: FOLDER, ancestors: [ROOT], source: { id: 'local', kind: 'local', completeness: 'complete' } }
+    mocks.workspaceResource.mockResolvedValue(destination)
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [] })
+    mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
+    mocks.schema.mockResolvedValue({ src: { out: [{ name: 'score', type: 'double', capabilities: [] }] } })
+    const { rerender } = render(<WorkspaceExplorer />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Filter my data' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose starter dataset observations' }))
+    await waitFor(() => expect(screen.getByLabelText('Starter numeric column')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('Starter numeric column'), { target: { value: 'score' } })
+    fireEvent.change(screen.getByLabelText('Starter threshold'), { target: { value: '1' } })
+    let finish!: (value: typeof destination) => void
+    mocks.workspaceResource.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create filter Canvas' }))
+    await waitFor(() => expect(finish).toBeDefined())
+    store.workspaceResourceId = null
+    rerender(<WorkspaceExplorer />)
+    await act(async () => finish(destination))
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    expect(store.newFromStarter).not.toHaveBeenCalled()
+    expect(store.openFile).not.toHaveBeenCalled()
   })
 
   it('resolves a stable DatasetView URL beside its Catalog source and replays its exact revision', async () => {

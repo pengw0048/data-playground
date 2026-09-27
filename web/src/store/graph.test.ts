@@ -6420,6 +6420,71 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.filter((toast) => toast.msg.includes('permission'))).toHaveLength(2)
   })
 
+  const numericStarterTable: CatalogTable = {
+    id: 'catalog-table', registrationId: 'registered-dataset', name: 'My measurements',
+    uri: '/data/measurements.parquet',
+    columns: [{ name: 'sale "USD"', type: 'float', physicalType: 'DECIMAL(20, 2)', capabilities: [] }],
+  }
+  const numericStarter = () => ({
+    kind: 'numeric-filter' as const, table: numericStarterTable,
+    column: 'sale "USD"', threshold: '9007199254740993.25',
+  })
+
+  it('creates a numeric starter with the selected registration and editable condition without running', async () => {
+    const result = await useStore.getState().newFromStarter(numericStarter())
+    expect(result).toMatchObject({ ok: true, persistence: 'remote' })
+    const doc = apiMocks.createCanvas.mock.calls[0][0] as CanvasDoc
+    expect(doc.nodes.map((node) => node.type)).toEqual(['source', 'filter'])
+    expect(doc.nodes[0].data.config).toEqual({
+      uri: numericStarterTable.uri, tableId: 'catalog-table', registrationId: 'registered-dataset',
+    })
+    expect(doc.nodes[1].data.config).toMatchObject({
+      predicate: '"sale ""USD""" > 9007199254740993.25',
+      filterBuilder: { conditions: [{ col: 'sale "USD"', op: '>', val: '9007199254740993.25' }] },
+    })
+    expect(useStore.getState().selectedId).toBe('flt')
+    expect(useStore.getState().viewportFitRequest?.canvasId).toBe(doc.id)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(apiMocks.resolveExampleSources).not.toHaveBeenCalled()
+  })
+
+  it('retains the complete numeric starter as a retryable draft when creation loses its response', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+    const result = await useStore.getState().newFromStarter(numericStarter())
+    expect(result).toMatchObject({ ok: true, persistence: 'local-draft' })
+    const draft = useStore.getState().localDrafts.at(-1)!
+    expect(draft.createAttemptDoc).toEqual(useStore.getState().doc)
+    expect(draft.doc.nodes[0].data.config.registrationId).toBe('registered-dataset')
+    expect(draft.doc.nodes[1].data.config.filterBuilder?.conditions[0].val).toBe('9007199254740993.25')
+  })
+
+  it('keeps a Canvas edit made while numeric starter replacement checks run history', async () => {
+    const blank = { ...emptyTestDoc('numeric-blank'), name: 'untitled' }
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    let finishHistory!: (runs: never[]) => void
+    apiMocks.listRuns.mockReturnValueOnce(new Promise((resolve) => { finishHistory = resolve }))
+    const pending = useStore.getState().newFromStarter(numericStarter(), 'replace-pristine')
+    useStore.getState().renameFile('My pending edit')
+    finishHistory([])
+    expect(await pending).toEqual({ ok: false })
+    expect(useStore.getState().doc.name).toBe('My pending edit')
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('rejects an invalid numeric starter before creating or replacing a Canvas', async () => {
+    const before = useStore.getState().doc
+    expect(await useStore.getState().newFromStarter({ ...numericStarter(), threshold: '0 OR true' }))
+      .toEqual({ ok: false })
+    expect(await useStore.getState().newFromStarter({ ...numericStarter(), column: 'deleted column' }))
+      .toEqual({ ok: false })
+    expect(useStore.getState().doc).toBe(before)
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+  })
+
   it('replaces an explicit pristine blank with an example in place', async () => {
     const blank = emptyTestDoc('pristine')
     blank.name = 'untitled'

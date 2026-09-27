@@ -3,7 +3,7 @@ import {
   type DragEvent, type FocusEvent, type ReactNode,
 } from 'react'
 import { api, KernelError, type CanvasFile } from '../api/client'
-import { useStore } from '../store/graph'
+import { useStore, type CanvasCreationResult } from '../store/graph'
 import type { ColumnSchema } from '../types/graph'
 import type {
   CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceResource, WorkspaceSearchGroup,
@@ -22,6 +22,8 @@ import { AddDataModal, CatalogDetail } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 import { DatasetViewDetail } from './DatasetViewDetail'
 import { examples } from '../examples'
+import type { CanvasStarter } from '../starters'
+import { OwnDataStarterModal } from '../canvas/OwnDataStarterModal'
 import { parseDatasetViewerReturn, type ParsedDatasetViewerReturn } from '../router'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 import { DatasetLineageSummary } from '../components/DatasetLineageSummary'
@@ -519,28 +521,43 @@ export function WorkspaceExplorer() {
 function FirstRunCanvasChoice() {
   const newFile = useStore((state) => state.newFile)
   const newFromExample = useStore((state) => state.newFromExample)
+  const newFromStarter = useStore((state) => state.newFromStarter)
   const requestedResourceId = useStore((state) => state.workspaceResourceId)
+  const userId = useStore((state) => state.currentUser?.id)
+  const view = useStore((state) => state.view)
   const openFile = useStore((state) => state.openFile)
   const refreshFiles = useStore((state) => state.refreshFiles)
   const pushToast = useStore((state) => state.pushToast)
   const [creating, setCreating] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [starterOpen, setStarterOpen] = useState(false)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
+  const creatingRef = useRef(false)
+  const live = useRef(true)
+  const location = JSON.stringify([requestedResourceId, userId, view])
+  const currentLocation = useRef(location)
+  currentLocation.current = location
+  useEffect(() => { live.current = true; return () => { live.current = false } }, [])
 
-  const create = async (exampleKey?: string) => {
-    if (creating) return
-    setCreating(exampleKey ?? 'blank')
+  const create = async (starter?: string | Extract<CanvasStarter, { kind: 'numeric-filter' }>): Promise<CanvasCreationResult> => {
+    if (creatingRef.current) return { ok: false }
+    creatingRef.current = true
+    const exampleKey = typeof starter === 'string' ? starter : undefined
+    const numericStarter = typeof starter === 'object' ? starter : undefined
+    const stillHere = () => live.current && currentLocation.current === location
+    setCreating(exampleKey ?? (numericStarter ? 'numeric-filter' : 'blank'))
     setError(null)
     try {
       // At the Workspace root, the ordinary store path already has the exact placement semantics.
       // A selected folder needs an explicit destination: the previously-open Canvas is not evidence
       // of the folder currently visible in Workspace.
       if (!requestedResourceId) {
-        if (exampleKey) await newFromExample(exampleKey)
-        else await newFile()
-        return
+        if (exampleKey) return await newFromExample(exampleKey)
+        if (numericStarter) return await newFromStarter(numericStarter)
+        return await newFile()
       }
       const resolved = await api.workspaceResource(requestedResourceId)
+      if (!stillHere()) return { ok: false }
       const target = resolved.resource?.kind === 'container'
         ? resolved.resource
         : resolved.ancestors[resolved.ancestors.length - 1]
@@ -560,18 +577,24 @@ function FirstRunCanvasChoice() {
         name: 'untitled',
         ...(destination.externalOverlay ? { requestId: replay.current!.requestId } : {}),
       })
+      if (!stillHere()) return { ok: false }
       await refreshFiles()
+      if (!stillHere()) return { ok: false }
       if (!await openFile(created.id)) throw new Error('The Canvas was created but could not be opened.')
       if (exampleKey) {
         const applied = await newFromExample(exampleKey, 'replace-pristine')
         if (!applied.ok) throw new Error('The Canvas was created, but the example could not be loaded.')
+        return applied
       }
+      if (numericStarter) return await newFromStarter(numericStarter, 'replace-pristine')
+      return { ok: true, canvasId: created.id, persistence: 'remote' }
     } catch (caught) {
       const message = errorMessage(caught)
-      setError(message)
-      pushToast(message, 'error')
+      if (stillHere()) { setError(message); pushToast(message, 'error') }
+      return { ok: false }
     } finally {
-      setCreating(null)
+      creatingRef.current = false
+      if (live.current) setCreating(null)
     }
   }
   return (
@@ -580,11 +603,15 @@ function FirstRunCanvasChoice() {
       <div className="mx-auto max-w-5xl">
         <h2 id="first-run-canvas-title" className="text-[15px] font-semibold text-foreground">Create your first Canvas</h2>
         <p className="mt-0.5 max-w-2xl text-[12.5px] leading-snug text-muted-foreground">
-          Start with an empty graph, or open a runnable example using the seeded sample data.
+          Filter your own data, start with an empty graph, or open an example using sample data.
         </p>
         <div className="mt-2 flex flex-wrap gap-2">
-          <button type="button" onClick={() => { void create() }} disabled={creating !== null}
+          <button type="button" onClick={() => setStarterOpen(true)} disabled={creating !== null}
             className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-60">
+            Filter my data
+          </button>
+          <button type="button" onClick={() => { void create() }} disabled={creating !== null}
+            className="rounded-md border border-border px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-60">
             {creating === 'blank' ? 'Creating…' : 'Start a blank Canvas'}
           </button>
         </div>
@@ -599,6 +626,7 @@ function FirstRunCanvasChoice() {
         </div>
         {error && <div role="alert" className="mt-2 text-[11.5px] text-destructive">{error}</div>}
       </div>
+      <OwnDataStarterModal key={location} open={starterOpen} onOpenChange={setStarterOpen} onCreate={create} />
     </section>
   )
 }

@@ -28,6 +28,7 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '../ui/Icon'
 import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
+import { OwnDataStarterModal } from './OwnDataStarterModal'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 import { canvasFitOptions, rightViewportShiftToReveal } from './viewportFit'
 import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
@@ -111,12 +112,15 @@ function ArrowDefs() {
 
 function EmptyState({ canEdit }: { canEdit: boolean }) {
   const { screenToFlowPosition } = useReactFlow()
+  const canvasId = useStore((s) => s.doc.id)
+  const userId = useStore((s) => s.currentUser?.id)
   const addNode = useStore((s) => s.addNode)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const newFromExample = useStore((s) => s.newFromExample)
   // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
   // straight to "Agent unavailable" (the default is no model).
   const [agentOk, setAgentOk] = useState(false)
+  const [starterOpen, setStarterOpen] = useState(false)
   const exampleIntent = useExampleCreationIntent(canEdit)
   const exampleCreatesSeparate = exampleIntent === 'create-separate'
   useEffect(() => {
@@ -138,6 +142,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
         {canEdit && (
           <>
             <div className="mt-3.5 flex flex-wrap justify-center gap-2">
+              <Button onClick={() => setStarterOpen(true)} className="rounded-lg text-[12.5px]">Filter my data</Button>
               <Button variant="outline" onClick={() => add('select')} className="rounded-lg text-[12.5px] text-muted-foreground">Choose dataset</Button>
               <Button variant="outline" onClick={() => add('upload')} className="rounded-lg text-[12.5px] text-muted-foreground">Upload file</Button>
               <Button variant="outline" onClick={() => add('browse')} className="rounded-lg text-[12.5px] text-muted-foreground">Register path or URL</Button>
@@ -161,6 +166,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
           ))}
         </div>}
       </div>
+      {canEdit && <OwnDataStarterModal key={JSON.stringify([canvasId, userId])} open={starterOpen} onOpenChange={setStarterOpen} intent={exampleIntent} />}
     </div>
   )
 }
