@@ -6621,6 +6621,21 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.resolveExampleSources).not.toHaveBeenCalled()
   })
 
+  it('creates an editable group count for the exact registration without executing it', async () => {
+    const result = await useStore.getState().newFromStarter({
+      kind: 'group-count', table: numericStarterTable, column: 'sale "USD"',
+    })
+    expect(result).toMatchObject({ ok: true, persistence: 'remote' })
+    const doc = apiMocks.createCanvas.mock.calls[0][0] as CanvasDoc
+    expect(doc.nodes.map((node) => node.type)).toEqual(['source', 'aggregate'])
+    expect(doc.nodes[0].data.config.registrationId).toBe('registered-dataset')
+    expect(doc.nodes[1].data.config).toEqual({ groupBy: '"sale ""USD"""', aggs: 'count(*) AS row_count' })
+    expect(useStore.getState().selectedId).toBe('agg')
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(apiMocks.resolveExampleSources).not.toHaveBeenCalled()
+  })
+
   it('retains the complete numeric starter as a retryable draft when creation loses its response', async () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
     const result = await useStore.getState().newFromStarter(numericStarter())

@@ -120,7 +120,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
   // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
   // straight to "Agent unavailable" (the default is no model).
   const [agentOk, setAgentOk] = useState(false)
-  const [starterOpen, setStarterOpen] = useState(false)
+  const [starterKind, setStarterKind] = useState<'numeric-filter' | 'group-count' | null>(null)
   const exampleIntent = useExampleCreationIntent(canEdit)
   const exampleCreatesSeparate = exampleIntent === 'create-separate'
   useEffect(() => {
@@ -142,7 +142,8 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
         {canEdit && (
           <>
             <div className="mt-3.5 flex flex-wrap justify-center gap-2">
-              <Button onClick={() => setStarterOpen(true)} className="rounded-lg text-[12.5px]">Filter my data</Button>
+              <Button onClick={() => setStarterKind('numeric-filter')} className="rounded-lg text-[12.5px]">Filter my data</Button>
+              <Button variant="outline" onClick={() => setStarterKind('group-count')} className="rounded-lg text-[12.5px]">Count by group</Button>
               <Button variant="outline" onClick={() => add('select')} className="rounded-lg text-[12.5px] text-muted-foreground">Choose dataset</Button>
               <Button variant="outline" onClick={() => add('upload')} className="rounded-lg text-[12.5px] text-muted-foreground">Upload file</Button>
               <Button variant="outline" onClick={() => add('browse')} className="rounded-lg text-[12.5px] text-muted-foreground">Register path or URL</Button>
@@ -166,7 +167,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
           ))}
         </div>}
       </div>
-      {canEdit && <OwnDataStarterModal key={JSON.stringify([canvasId, userId])} open={starterOpen} onOpenChange={setStarterOpen} intent={exampleIntent} />}
+      {canEdit && <OwnDataStarterModal key={JSON.stringify([canvasId, userId])} open={starterKind !== null} kind={starterKind ?? 'numeric-filter'} onOpenChange={(open) => { if (!open) setStarterKind(null) }} intent={exampleIntent} />}
     </div>
   )
 }

@@ -56,8 +56,8 @@ export function useSchemaWarnings(nodeId: string): string[] {
 let _dl = 0
 /** A text input backed by a <datalist> of column names — autocomplete that still accepts free
  * expressions. When the upstream port is untyped (no columns known yet) it's just a text box. */
-export function ColumnCombo({ value, columns, placeholder, onChange, mono = true }: {
-  value: string; columns: ColumnSchema[]; placeholder?: string; onChange: (v: string) => void; mono?: boolean
+export function ColumnCombo({ value, columns, placeholder, onChange, mono = true, quoteIdentifiers = false }: {
+  value: string; columns: ColumnSchema[]; placeholder?: string; onChange: (v: string) => void; mono?: boolean; quoteIdentifiers?: boolean
 }) {
   const [id] = useState(() => `dp-cols-${++_dl}`)
   return (
@@ -72,7 +72,7 @@ export function ColumnCombo({ value, columns, placeholder, onChange, mono = true
       />
       {columns.length > 0 && (
         <datalist id={id}>
-          {columns.map((c) => <option key={c.name} value={c.name}>{c.type}</option>)}
+          {columns.map((c) => <option key={c.name} value={quoteIdentifiers ? '"' + c.name.replaceAll('"', '""') + '"' : c.name}>{c.type}</option>)}
         </datalist>
       )}
     </>

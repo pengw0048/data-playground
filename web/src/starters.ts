@@ -10,7 +10,13 @@ export type CanvasStarter = { kind: 'example'; key: string } | {
   table: CatalogTable
   column: string
   threshold: string
+} | {
+  kind: 'group-count'
+  table: CatalogTable
+  column: string
 }
+
+export type OwnDataStarter = Exclude<CanvasStarter, { kind: 'example' }>
 
 export function numericStarterColumn(column: ColumnSchema): boolean {
   return isScalarNumericType(column.physicalType || column.type)
@@ -29,15 +35,33 @@ export function numericFilterStarterReason(table: CatalogTable, column: string, 
   return filterBuilderReason([condition(table, column, threshold)], table.columns)
 }
 
+export function groupCountStarterReason(table: CatalogTable, column: string): string | null {
+  if (table.missing) return 'This dataset is unavailable. Choose another dataset.'
+  if (!table.registrationId || !table.id || !table.uri) return 'Choose a registered dataset.'
+  if (table.columns.filter((candidate) => candidate.name === column).length !== 1) return 'Choose a grouping column.'
+  return null
+}
+
+export function ownDataStarterReason(starter: OwnDataStarter): string | null {
+  return starter.kind === 'group-count'
+    ? groupCountStarterReason(starter.table, starter.column)
+    : numericFilterStarterReason(starter.table, starter.column, starter.threshold)
+}
+
 /** A concrete two-step workflow; execution and result storage remain explicit Canvas actions. */
 export function starterDoc(starter: CanvasStarter, id: string): CanvasDoc | null {
   if (starter.kind === 'example') return exampleDoc(starter.key, id)
-  const { table, column, threshold } = starter
-  const reason = numericFilterStarterReason(table, column, threshold)
+  const { table, column } = starter
+  const reason = ownDataStarterReason(starter)
   if (reason) throw new Error(reason)
-  const conditions = [condition(table, column, threshold)]
+  const counting = starter.kind === 'group-count'
+  const conditions = counting ? [] : [condition(table, column, starter.threshold)]
+  // Group keys are identifiers, including names containing quotes, commas, or SQL words.
+  const groupBy = '"' + column.replaceAll('"', '""') + '"'
+  const countName = column.toLowerCase() === 'row_count' ? 'row_count_2' : 'row_count'
+  const stepId = counting ? 'agg' : 'flt'
   return {
-    id, name: `Filter ${table.name}`, version: 1,
+    id, name: `${counting ? 'Count by group in' : 'Filter'} ${table.name}`, version: 1,
     nodes: [
       {
         id: 'src', type: 'source', position: { x: 80, y: 180 },
@@ -48,9 +72,11 @@ export function starterDoc(starter: CanvasStarter, id: string): CanvasDoc | null
         },
       },
       {
-        id: 'flt', type: 'filter', position: { x: 400, y: 180 },
+        id: stepId, type: counting ? 'aggregate' : 'filter', position: { x: 400, y: 180 },
         data: {
-          title: 'Filter rows', status: 'draft', config: {
+          title: counting ? 'Count rows by group' : 'Filter rows', status: 'draft', config: counting ? {
+            groupBy, aggs: `count(*) AS ${countName}`,
+          } : {
             predicate: serializeFilterConditions(conditions, table.columns),
             filterBuilder: { conditions },
           },
@@ -58,7 +84,7 @@ export function starterDoc(starter: CanvasStarter, id: string): CanvasDoc | null
       },
     ],
     edges: [{
-      id: 'e_src_flt', source: 'src', target: 'flt', sourceHandle: 'out', targetHandle: 'in',
+      id: `e_src_${stepId}`, source: 'src', target: stepId, sourceHandle: 'out', targetHandle: 'in',
       data: { wire: 'dataset' },
     }],
   }
