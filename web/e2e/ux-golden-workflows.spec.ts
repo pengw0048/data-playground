@@ -353,6 +353,10 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expect(errorResult.getByText('adapter failed while opening the retained artifact')).toBeVisible()
     await expectNoTechnicalResultEvidence(errorResult, runId, 'filter:out')
     await page.unroute(sampleRoute)
+    // View data preserves an already-open viewer. Close it so the expiry check below exercises
+    // reopening the saved result, not the previous adapter-error state in the same mounted panel.
+    await errorResult.getByTitle('Close', { exact: true }).click()
+    await expect(errorResult).toHaveCount(0)
 
     const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
     expect(historyResponse.ok(), await historyResponse.text()).toBe(true)
