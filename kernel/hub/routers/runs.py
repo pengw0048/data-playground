@@ -15,7 +15,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -58,6 +58,8 @@ from hub.plugins.adapters import (
     RevisionProviderOffline,
     revision_adapter_for_uri,
 )
+from hub.preview_requests import PreviewRequestConflict, PreviewSession, PreviewStopStatus, preview_requests
+from hub.python_preview import PreviewCancelled, PreviewTimedOut
 from hub.run_outputs import (
     UnsupportedRunOutputs, expected_plan_run_outputs, expected_run_outputs,
     preflight_run_output_target,
@@ -1487,6 +1489,8 @@ class RetainedEditorPreviewRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
     graph: Graph
+    preview_request_id: str | None = Field(
+        default=None, pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
     node_id: str = Field(min_length=1, max_length=256)
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
     k: int = Field(default=50, ge=0, le=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
@@ -1581,6 +1585,8 @@ class ExampleRowsEditorPreviewRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
     graph: Graph
+    preview_request_id: str | None = Field(
+        default=None, pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
     node_id: str = Field(min_length=1, max_length=256)
     example_rows_json: str = Field(min_length=1, max_length=EDITOR_EXAMPLE_MAX_BYTES)
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -1861,9 +1867,78 @@ def compile_graph(req: CompileRequest, uid: str = Depends(current_user)) -> Comp
     return compiler.compile_plan(graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
 
 
+class PreviewCancelRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    canvas_id: str = Field(min_length=1, max_length=256)
+
+
+class PreviewCancelResponse(BaseModel):
+    status: PreviewStopStatus
+
+
+@router.post("/run/preview/{preview_request_id}/cancel", response_model=PreviewCancelResponse)
+def cancel_preview_request(
+        preview_request_id: uuid.UUID, req: PreviewCancelRequest,
+        uid: str = Depends(current_user)) -> PreviewCancelResponse:
+    if auth.auth_enabled() and metadb.canvas_role(req.canvas_id, uid) is None:
+        raise HTTPException(404, "canvas not found")
+    try:
+        from hub.kernel_backend import cancel_kernel_preview
+        kernel = metadb.get_kernel(req.canvas_id)
+        fallback: Callable[[], dict] | None = None
+        if kernel and kernel["endpoint"]:
+            # The warm kernel survives a hub restart. Preserve the endpoint and token from
+            # this lookup; retries must keep asking that owner instead of a replacement.
+            def cancel_existing() -> dict:
+                return cancel_kernel_preview(
+                    kernel["endpoint"], kernel["token"], req.canvas_id, uid, str(preview_request_id))
+            fallback = cancel_existing
+        status = preview_requests.cancel(
+            uid, req.canvas_id, str(preview_request_id), fallback_cancel=fallback)
+    except Exception as exc:  # noqa: BLE001 - an unreachable execution owner cannot confirm stop
+        raise HTTPException(503, "Could not confirm preview stopped. Retry stop.") from exc
+    return PreviewCancelResponse(status=status)
+
+
+def _run_preview_request(
+        req: PreviewRequest | RetainedEditorPreviewRequest | ExampleRowsEditorPreviewRequest,
+        uid: str, work: Callable[[PreviewSession], SampleResult]) -> SampleResult:
+    _require_graph_read_access(req.graph, uid)
+    try:
+        with preview_requests.request(
+                uid, req.graph.id or "canvas", req.preview_request_id) as session:
+            session.control.check()
+            result = work(session)
+            # A completed kernel result proves the owner returned; an HTTP exception does not.
+            session.remote_terminal = True
+            return result
+    except PreviewCancelled as exc:
+        return SampleResult(error=True, failure_category="cancelled", reason=str(exc))
+    except PreviewTimedOut as exc:
+        return SampleResult(error=True, failure_category="timeout", reason=str(exc))
+    except PreviewRequestConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _kernel_preview_control(
+        req: PreviewRequest | RetainedEditorPreviewRequest | ExampleRowsEditorPreviewRequest,
+        uid: str, session: PreviewSession) -> dict:
+    if req.preview_request_id is None:
+        return {}
+    return {
+        "preview_request_id": req.preview_request_id,
+        "preview_owner": uid,
+        "control": session.control,
+        "register_remote_cancel": session.set_remote_cancel,
+    }
+
+
 @router.post("/run/preview", response_model=SampleResult)
 def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
-    _require_graph_read_access(req.graph, uid)
+    return _run_preview_request(req, uid, lambda session: _run_preview(req, uid, session))
+
+
+def _run_preview(req: PreviewRequest, uid: str, session: PreviewSession) -> SampleResult:
     deps = get_deps()
     req.graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
@@ -1903,24 +1978,32 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     if deps.chosen_backend(uid, preview_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
         try:
             result = SampleResult(**kb.preview(
-                preview_graph, req.node_id, k, max(0, req.offset), port_id))
+                preview_graph, req.node_id, k, max(0, req.offset), port_id,
+                **_kernel_preview_control(req, uid, session)))
             result.input_manifest = manifest
-            if result.error or result.not_previewable:
+            if (result.error or result.not_previewable) and result.failure_category not in ("cancelled", "timeout"):
                 result.reason = _provider_inspection_failure_reason(
                     preview_graph, result.reason or "provider dataset inspection failed",
                     runtime_error=result.error,
                 )
             return result
+        except (PreviewCancelled, PreviewTimedOut):
+            raise
         except Exception as e:  # noqa: BLE001 — kernel unreachable / spawn timeout → a clean error, not a raw 500
+            if req.preview_request_id is not None:
+                # The transport failed; the execution owner may still be working. Keep this
+                # distinct from a completed SampleResult so an in-flight Stop stays pending.
+                raise HTTPException(503, "Preview connection lost. Stop the preview or retry when it finishes.") from e
             return SampleResult(error=True, reason=_provider_inspection_failure_reason(
                 preview_graph, f"kernel unavailable: {type(e).__name__}: {e}",
                 runtime_error=True,
             ))
     result = preview_node(preview_graph, req.node_id, k,
                           deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
-                          offset=max(0, req.offset), storage=deps.storage, port_id=port_id)
+                          offset=max(0, req.offset), storage=deps.storage, port_id=port_id,
+                          control=session.control)
     result.input_manifest = manifest
-    if result.error or result.not_previewable:
+    if (result.error or result.not_previewable) and result.failure_category not in ("cancelled", "timeout"):
         result.reason = _provider_inspection_failure_reason(
             preview_graph, result.reason or "provider dataset inspection failed",
             runtime_error=result.error,
@@ -4779,7 +4862,11 @@ def preview_transform_with_example_rows(
         req: ExampleRowsEditorPreviewRequest,
         uid: str = Depends(current_user)) -> SampleResult:
     """Test one ad-hoc Transform against a bounded, request-only JSON fixture."""
-    _require_graph_read_access(req.graph, uid)
+    return _run_preview_request(req, uid, lambda session: _preview_example_rows(req, uid, session))
+
+
+def _preview_example_rows(
+        req: ExampleRowsEditorPreviewRequest, uid: str, session: PreviewSession) -> SampleResult:
     deps = get_deps()
     _rows, table = parse_editor_example_rows(req.example_rows_json)
     fixture_uri = f"mem://editor-example-{uuid.uuid4().hex}"
@@ -4797,6 +4884,7 @@ def preview_transform_with_example_rows(
             port_id,
             example_rows_json=req.example_rows_json,
             example_uri=fixture_uri,
+            **_kernel_preview_control(req, uid, session),
         ))
     else:
         adapter = EditorExampleRowsAdapter(
@@ -4809,6 +4897,7 @@ def preview_transform_with_example_rows(
             graph, req.node_id, req.k,
             resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
             offset=req.offset, storage=deps.storage, port_id=port_id,
+            control=session.control,
         )
     return _finalize_example_rows_result(result, offset=req.offset)
 
@@ -4817,6 +4906,11 @@ def preview_transform_with_example_rows(
 def preview_transform_with_retained_upstream(
         req: RetainedEditorPreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
     """Test one Transform against its newest current retained immediate-upstream result."""
+    return _run_preview_request(req, uid, lambda session: _preview_retained_upstream(req, uid, session))
+
+
+def _preview_retained_upstream(
+        req: RetainedEditorPreviewRequest, uid: str, session: PreviewSession) -> SampleResult:
     authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
     canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
     if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
@@ -4866,13 +4960,15 @@ def preview_transform_with_retained_upstream(
                 if deps.chosen_backend(uid, editor_graph.execution_backend) == "kernel" and (kb := deps.kernel_backend()):
                     result = SampleResult(**kb.preview(
                         editor_graph, req.node_id, req.k, req.offset, port_id,
-                        capture_editor_input=True))
+                        capture_editor_input=True,
+                        **_kernel_preview_control(req, uid, session)))
                 else:
                     result = preview_node(
                         editor_graph, req.node_id, req.k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                         offset=req.offset, storage=deps.storage, port_id=port_id,
                         capture_editor_input=True,
+                        control=session.control,
                     )
         except _ExportNotAcceptable:
             continue

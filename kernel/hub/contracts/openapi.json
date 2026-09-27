@@ -5293,6 +5293,18 @@
               }
             ],
             "title": "Portid"
+          },
+          "previewRequestId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previewrequestid"
           }
         },
         "required": [
@@ -8338,6 +8350,40 @@
         "title": "Position",
         "type": "object"
       },
+      "PreviewCancelRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "canvasId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Canvasid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "canvasId"
+        ],
+        "title": "PreviewCancelRequest",
+        "type": "object"
+      },
+      "PreviewCancelResponse": {
+        "properties": {
+          "status": {
+            "enum": [
+              "stopped",
+              "finished",
+              "stopping"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "PreviewCancelResponse",
+        "type": "object"
+      },
       "PreviewRequest": {
         "additionalProperties": false,
         "properties": {
@@ -8401,6 +8447,18 @@
               }
             ],
             "title": "Portid"
+          },
+          "previewRequestId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previewrequestid"
           }
         },
         "required": [
@@ -9904,6 +9962,18 @@
               }
             ],
             "title": "Portid"
+          },
+          "previewRequestId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previewrequestid"
           }
         },
         "required": [
@@ -11198,7 +11268,9 @@
                   "not_previewable",
                   "syntax_error",
                   "user_code_exception",
-                  "runtime_error"
+                  "runtime_error",
+                  "cancelled",
+                  "timeout"
                 ],
                 "type": "string"
               },
@@ -26680,6 +26752,98 @@
           }
         },
         "summary": "Run Preview"
+      }
+    },
+    "/api/run/preview/{preview_request_id}/cancel": {
+      "post": {
+        "operationId": "cancel_preview_request_api_run_preview__preview_request_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "preview_request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Preview Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewCancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewCancelResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Cancel Preview Request"
       }
     },
     "/api/run/profile": {

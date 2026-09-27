@@ -260,7 +260,8 @@ export function CodeFullscreen() {
   const preview = isTransform ? requestPreview : previews[fs.nodeId]
   const syntaxErrorLine = preview?.result?.failureCategory === 'syntax_error'
     ? preview.result.syntaxError?.line : undefined
-  const selectedEditorInputRunId = preview?.result?.editorTestInput?.runId
+  const selectedEditorInputRunId = (preview?.result?.editorTestInput
+    ?? preview?.previousSuccess?.result?.editorTestInput)?.runId
   const freshUpstreamResultReady = Boolean(
     requestIsCurrent && !upstreamRequest?.cancelled
     && upstreamRun?.phase !== 'failed'
@@ -298,7 +299,7 @@ export function CodeFullscreen() {
   )
   const upstreamInputUnavailable = Boolean(
     isTransform && testInput === 'upstream'
-    && !preview?.result?.editorTestInput
+    && !preview?.result?.editorTestInput && !preview?.previousSuccess?.result?.editorTestInput
     && (!preview || preview.loading || preview.error || preview.result?.notPreviewable),
   )
   const canRunUpstream = Boolean(
@@ -564,7 +565,7 @@ export function CodeFullscreen() {
               </button>
             )}
             {canTest && (
-              <button disabled={(usingExampleRows && !exampleValidation.ok)
+              <button disabled={preview?.loading || (usingExampleRows && !exampleValidation.ok)
                   || upstreamAttemptBlocksTest || upstreamInputUnavailable}
                 onClick={() => (
                   usingExampleRows

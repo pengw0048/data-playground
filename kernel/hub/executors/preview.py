@@ -18,18 +18,14 @@ from hub.ir import resolve_config
 from hub.models import Graph, SampleResult, dataset_ref_identity
 from hub.plugins.adapters import csv_date_order_notices, revision_adapter_for_uri
 from hub.sampling import provenance_for_graph
-from hub.sandbox import run_with_timeout
+from hub.python_preview import PreviewCancelled, PreviewControl, PreviewTimedOut
 from hub.storage import ManagedSourceReadError
 
 PREVIEW_SCAN = 2000       # rows read at each source during preview (bounds transforms too)
 PREVIEW_BUDGET_S = 8.0
 
-# node kinds that run an ARBITRARY user Python cell in-process — the thread-based preview timeout can
-# interrupt an in-flight DuckDB query but CANNOT kill a runaway `while True:` in such a cell (no
-# thread-kill in Python), so in multi-user mode we refuse to preview/profile them (P0-EXEC-02). Runs
-# execute in a killable, deadline-bounded child instead. `section` runs a user driver script via exec
-# (section.run_section), so it belongs here too. (vector-search is pure SQL/Lance — interruptible — so
-# it is NOT here.)
+# Multi-user deployments continue to refuse arbitrary Python previews (P0-EXEC-02).
+# Disposable local preview children provide termination, not a security boundary.
 _CODE_CELL_KINDS = ("transform", "section")
 _LOCAL_SAMPLE_ADAPTERS = {"duckdb", "lance"}
 
@@ -115,7 +111,9 @@ def _reservoir_source_total(graph: Graph, node_id: str, resolve_adapter) -> int 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                  node_builders=None, node_specs=None, offset: int = 0, cache=None,
                  storage=None, port_id: str | None = None,
-                 capture_editor_input: bool = False) -> SampleResult:
+                 capture_editor_input: bool = False,
+                 control: PreviewControl | None = None) -> SampleResult:
+    control = control or PreviewControl()
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -151,9 +149,8 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                             warm=None if capture_editor_input else cache,
                             warm_scope="preview", output_node=node_id,
                             reservoir_preview=reservoir_preview,
-                            editor_input_node=node_id if capture_editor_input else None)
-
-    holder: dict = {}  # published by the worker thread so the timeout can interrupt its cursor
+                            editor_input_node=node_id if capture_editor_input else None,
+                            preview_control=control)
 
     def work() -> SampleResult:
         # run on our OWN cursor (created on THIS worker thread so its thread-local binding is correct),
@@ -162,8 +159,10 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         with source_read_scope(
                 storage, g.all_upstream_source_uris(graph, node_id),
                 owner=f"preview:{uuid.uuid4().hex}"):
-            with db.run_scope() as scope:
-                holder["scope"] = scope
+            with db.run_scope() as scope, contextlib.ExitStack() as cleanup:
+                # Detach the callback before this request's cursor closes.
+                cleanup.callback(control.add_interrupt(scope.interrupt))
+                control.check()
                 # fetch one extra row to know if a NEXT page exists (so the UI can disable Next at the
                 # true end, even when the total is an exact multiple of the page size). NOTE: offset
                 # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
@@ -219,14 +218,12 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                     parse_notices=_parse_notices(graph, node_id),
                 )
 
-    def on_timeout() -> None:
-        # interrupt THIS preview's cursor so the worker unwinds (its scope exit drops its views);
-        # interrupting the base connection would NOT stop a query running on the cursor
-        sc = holder.get("scope")
-        (sc.interrupt() if sc is not None else db.interrupt())
-
     try:
-        result = run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
+        result = control.run(work, PREVIEW_BUDGET_S)
+    except PreviewCancelled as e:
+        result = SampleResult(error=True, reason=str(e), failure_category="cancelled")
+    except PreviewTimedOut as e:
+        result = SampleResult(error=True, reason=str(e), failure_category="timeout")
     except ManagedSourceReadError as e:
         result = SampleResult(error=True, reason=str(e))
     except TransformSyntaxError as e:

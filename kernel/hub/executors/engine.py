@@ -496,13 +496,15 @@ class BuildEngine:
                  bound_inputs: dict | None = None, spill_files: list | None = None,
                  schema_only: bool = False, warm=None, warm_scope: str = "",
                  pushdown: bool = False, output_node: str | None = None,
-                 reservoir_preview: bool = False, editor_input_node: str | None = None):
+                 reservoir_preview: bool = False, editor_input_node: str | None = None,
+                 preview_control=None):
         self.graph = graph
         self._nodes = g.node_map(graph)
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
         self.full = full
+        self.preview_control = preview_control if not full else None
         self.editor_input_node = editor_input_node if not full else None
         self.editor_input_sample: EditorInputSample | None = None
         # The explicit Sample node is the sole interactive exception to bounded source previews. Its
@@ -1816,6 +1818,34 @@ class BuildEngine:
                         + ". Choose an input containing these columns or update the Transform's "
                         "required-column declaration and promote a new version."
                     )
+        # Keep adapters, source leases and cached upstream relations in this process. Only
+        # user-authored Python receives the bounded Arrow input in a disposable child.
+        code = proc.code if proc is not None else cfg.get("code")
+        if (self.preview_control is not None and code
+                and (proc is None or proc.fn_factory is None)):
+            from hub.python_preview import raise_worker_error, run_python_preview
+            if mode not in PREVIEWABLE_MODES:
+                raise NotPreviewable(
+                    node,
+                    f"Transform mode '{mode}' runs only as a complete step. Run this step to produce "
+                    "its result.",
+                    suggested_action="run",
+                )
+            if prepared_batches is not None:
+                batches, schema = prepared_batches, prepared_schema
+            else:
+                reader = parent.to_arrow_reader(batch_size=_XF_BATCH)
+                batches, schema = list(reader), reader.schema
+            table, sample, error = run_python_preview(
+                node, batches, schema, code=code, mode=mode, control=self.preview_control,
+                capture_editor_input=self.editor_input_node == node.id)
+            if sample is not None:
+                self.editor_input_sample = sample
+            if error is not None:
+                raise_worker_error(error, node)
+            return db.conn().from_arrow(table)
+
+        if proc is not None:
             fn = proc.build(cfg.get("params", {}))
         else:
             code = cfg.get("code")

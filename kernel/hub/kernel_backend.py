@@ -18,9 +18,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from hub import metadb
 from hub.models import CompilePlan, Graph, RunEstimate, RunStatus
+from hub.python_preview import PreviewControl
 
 # How long to wait for a freshly-spawned kernel to mark its lease ready. A local process is up in a
 # second or two, but a POD cold-start (schedule + image + heavy imports: duckdb/polars/pyarrow) can take
@@ -111,6 +113,13 @@ class LocalProcessSpawner:
         # force-kill is the pod substrate's job (delete the pod); a local process on another host is
         # unreachable to SIGKILL anyway.
         pass
+
+
+def cancel_kernel_preview(endpoint: str, token: str, canvas_id: str,
+                          owner: str, request_id: str) -> dict:
+    return _post(endpoint, "/cancel-preview", token, {
+        "canvas_id": canvas_id, "owner": owner, "preview_request_id": request_id,
+    }, timeout=3.0, connect_retries=0)
 
 
 class KernelBackend:
@@ -227,11 +236,18 @@ class KernelBackend:
             port_id: str | None = None, *,
             example_rows_json: str | None = None,
             example_uri: str | None = None,
-            capture_editor_input: bool = False) -> dict:
+            capture_editor_input: bool = False,
+            preview_request_id: str | None = None,
+            preview_owner: str = "",
+            control: PreviewControl | None = None,
+            register_remote_cancel: Callable[[Callable[[], dict]], None] | None = None) -> dict:
         """Run a sample preview on the canvas's warm kernel (so it shares the kernel's engine + cache)."""
         from hub.graph import require_output_port
+        if control is not None:
+            control.check()
         selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
-        endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
+        canvas_id = getattr(graph, "id", None) or "canvas"
+        endpoint, token = self._ensure_kernel(canvas_id)
         body = {
             "graph": graph.model_dump(),
             "node_id": node_id,
@@ -244,6 +260,21 @@ class KernelBackend:
             body["example_uri"] = example_uri
         if capture_editor_input:
             body["capture_editor_input"] = True
+        if preview_request_id is not None:
+            body["preview_request_id"] = preview_request_id
+            body["preview_owner"] = preview_owner
+
+            def cancel_preview() -> dict:
+                return cancel_kernel_preview(endpoint, token, canvas_id, preview_owner, preview_request_id)
+
+            if register_remote_cancel is not None:
+                register_remote_cancel(cancel_preview)
+            if control is not None:
+                control.check()
+            # Never replay a possibly admitted preview after a transport failure.
+            return _post(endpoint, "/preview", token, body, connect_retries=0)
+        if control is not None:
+            control.check()
         return _post(endpoint, "/preview", token, body)
 
     def profile(

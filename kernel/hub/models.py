@@ -33,7 +33,7 @@ DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
 SampleStrategy = Literal["prefix", "reservoir"]
-SampleFailureCategory = Literal["not_previewable", "syntax_error", "user_code_exception", "runtime_error"]
+SampleFailureCategory = Literal["not_previewable", "syntax_error", "user_code_exception", "runtime_error", "cancelled", "timeout"]
 SampleSuggestedAction = Literal["run"]
 ProfileSuggestedAction = Literal["full_profile"]
 RunConfirmationReason = Literal[
@@ -1897,9 +1897,9 @@ class SampleResult(Wire):
                 raise ValueError("notPreviewable requires failureCategory=not_previewable")
             self.failure_category = "not_previewable"
         elif self.error:
-            if self.failure_category not in (None, "runtime_error"):
-                raise ValueError("an ordinary preview error requires failureCategory=runtime_error")
-            self.failure_category = "runtime_error"
+            if self.failure_category not in (None, "runtime_error", "cancelled", "timeout"):
+                raise ValueError("an ordinary preview error requires a runtime or stopped-preview category")
+            self.failure_category = self.failure_category or "runtime_error"
         elif self.failure_category is not None:
             raise ValueError("a successful sample cannot carry a failureCategory")
         limit_parts = (self.row_limit, self.limit_reason, self.limit_scope)
@@ -3182,6 +3182,8 @@ class PreviewRequest(Wire):
     model_config = ConfigDict(extra="forbid")
 
     graph: Graph
+    preview_request_id: str | None = Field(
+        default=None, pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins

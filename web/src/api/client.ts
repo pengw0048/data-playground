@@ -596,21 +596,21 @@ export const api = {
   }),
   retainedEditorPreview: (
     doc: CanvasDoc, nodeId: string, k = 50, offset = 0,
-    portId?: string, parameterBindings?: CanvasParameterBinding[],
+    portId?: string, parameterBindings?: CanvasParameterBinding[], previewRequestId?: string,
   ) => req<SampleResult>('/run/editor-preview', {
     method: 'POST',
     body: JSON.stringify({
-      graph: toGraph(doc), nodeId, portId, k, offset, parameterBindings,
+      graph: toGraph(doc), nodeId, portId, k, offset, parameterBindings, previewRequestId,
     }),
   }),
   exampleRowsEditorPreview: (
     doc: CanvasDoc, nodeId: string, exampleRowsJson: string,
     k = 50, offset = 0, portId?: string,
-    parameterBindings?: CanvasParameterBinding[],
+    parameterBindings?: CanvasParameterBinding[], previewRequestId?: string,
   ) => req<SampleResult>('/run/editor-preview/examples', {
     method: 'POST',
     body: JSON.stringify({
-      graph: toGraph(doc), nodeId, exampleRowsJson, portId, k, offset, parameterBindings,
+      graph: toGraph(doc), nodeId, exampleRowsJson, portId, k, offset, parameterBindings, previewRequestId,
     }),
   }),
   fullResultExportUrl: (runId: string, nodeId: string, portId: string, filename?: string) =>
@@ -682,9 +682,13 @@ export const api = {
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }) }),
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0, portId?: string,
-    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[], previewRequestId?: string) =>
     req<SampleResult>('/run/preview', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest, parameterBindings }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest, parameterBindings, previewRequestId }),
+    }),
+  cancelPreview: (previewRequestId: string, canvasId: string) =>
+    req<{ status: 'stopped' | 'finished' | 'stopping' }>(`/run/preview/${encodeURIComponent(previewRequestId)}/cancel`, {
+      method: 'POST', body: JSON.stringify({ canvasId }),
     }),
   profile: (doc: CanvasDoc, nodeId: string, portId?: string,
     inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>

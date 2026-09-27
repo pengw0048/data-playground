@@ -45,6 +45,14 @@ class PreviewBody(BaseModel):
     example_rows_json: str | None = None
     example_uri: str | None = None
     capture_editor_input: bool = False
+    preview_request_id: str | None = None
+    preview_owner: str = ""
+
+
+class CancelPreviewBody(BaseModel):
+    canvas_id: str
+    owner: str
+    preview_request_id: str
 
 
 class ProfileJobBody(BaseModel):
@@ -440,9 +448,35 @@ def main() -> None:
         st = run_runner.run(plan, graph, body.target, body.placement, **run_kwargs)
         return st.model_dump()
 
+    @app.post("/cancel-preview")
+    def cancel_preview(body: CancelPreviewBody, x_dp_kernel_token: str = Header(None)):
+        _auth(x_dp_kernel_token)
+        if body.canvas_id != canvas:
+            raise HTTPException(404, "canvas not found")
+        from hub.preview_requests import preview_requests
+        return {"status": preview_requests.cancel(body.owner, canvas, body.preview_request_id)}
+
     @app.post("/preview")
     def preview(body: PreviewBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
+        from hub.models import SampleResult
+        from hub.preview_requests import PreviewRequestConflict, preview_requests
+        from hub.python_preview import PreviewCancelled, PreviewTimedOut
+        if (body.graph.get("id") or "canvas") != canvas:
+            raise HTTPException(404, "canvas not found")
+        try:
+            with _inflight_work(), preview_requests.request(
+                    body.preview_owner, canvas, body.preview_request_id) as session:
+                session.control.check()
+                return _preview(body, session)
+        except PreviewCancelled as exc:
+            return SampleResult(error=True, failure_category="cancelled", reason=str(exc)).model_dump()
+        except PreviewTimedOut as exc:
+            return SampleResult(error=True, failure_category="timeout", reason=str(exc)).model_dump()
+        except PreviewRequestConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    def _preview(body, session):
         resolve_adapter = deps.resolve_adapter
         preview_cache = warm
         if body.example_rows_json is not None or body.example_uri is not None:
@@ -465,12 +499,13 @@ def main() -> None:
         from hub.executors.preview import preview_node
         graph = Graph(**body.graph)
         _ensure_deps(graph)
-        with _inflight_work():
-            return preview_node(graph, body.node_id, body.k, resolve_adapter,
+        session.control.check()
+        return preview_node(graph, body.node_id, body.k, resolve_adapter,
                                 deps.registry, deps.node_builders, deps.node_specs, offset=body.offset,
                                 cache=preview_cache, storage=deps.storage,
                                 port_id=body.port_id,
-                                capture_editor_input=body.capture_editor_input).model_dump()
+                                capture_editor_input=body.capture_editor_input,
+                                control=session.control).model_dump()
 
     @app.post("/profile")
     def profile(body: PreviewBody, x_dp_kernel_token: str = Header(None)):

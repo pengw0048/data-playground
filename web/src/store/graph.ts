@@ -376,9 +376,117 @@ export interface PreviewState {
   parameterBindings?: CanvasParameterBinding[]
   requestGeneration: number
   loading?: boolean
+  previewRequestId?: string
+  principalId?: string
+  stopping?: boolean
+  stopError?: string
+  stopped?: boolean
+  inputChanged?: boolean
+  previousSuccess?: Omit<PreviewState, 'previousSuccess'>
   result?: SampleResult
   error?: string
   offset?: number
+}
+
+// Request completion belongs to the captured principal and request, even if code changed while
+// computing. Result freshness remains separate: an obsolete result must never acquire a new plan.
+function beginPreviewRequest(
+  get: () => Store, set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
+  id: string, editor: boolean, portId: string | undefined, offset: number,
+) {
+  const state = get()
+  const field = editor ? 'editorPreviews' : 'previews'
+  const previous = state[field][id]
+  if (previous?.loading && previous.canvasId === state.doc.id
+      && previous.principalId === state.currentUser?.id
+      && previous.portId === portId && previous.offset === offset) return null
+  const doc = state.doc
+  const principalId = state.currentUser?.id
+  const parameterBindings = state.runs[id]?.parameterBindings ?? []
+  const previewRequestId = crypto.randomUUID()
+  const successful = previous?.result && !previous.result.error && !previous.result.notPreviewable
+    && !previous.result.failureCategory
+    ? previous : previous?.previousSuccess
+  const previousSuccess = successful?.canvasId === doc.id && successful.portId === portId
+    && successful.principalId === principalId
+    ? { ...successful, previousSuccess: undefined } : undefined
+  const base: PreviewState = {
+    canvasId: doc.id, nodeId: id, portId, planIdentity: previewPlanIdentity(doc, id, portId),
+    parameterBindings, requestGeneration: ++_previewRequestGeneration,
+    previewRequestId, principalId, offset, previousSuccess,
+  }
+  const owns = () => {
+    const current = get()
+    return current.currentUser?.id === principalId && current.doc.id === doc.id
+      && current[field][id]?.previewRequestId === previewRequestId
+      && current[field][id]?.loading === true
+  }
+  const current = () => owns() && previewIsCurrent(base, get().doc, id, portId)
+    && parameterBindingsIdentity(get().runs[id]?.parameterBindings) === parameterBindingsIdentity(parameterBindings)
+  set((currentState) => ({
+    [field]: { ...currentState[field], [id]: { ...base, loading: true } },
+  }))
+  return {
+    ...base, doc, current,
+    finish(result: SampleResult) {
+      if (!owns()) return false
+      const terminal = result.failureCategory === 'cancelled' || result.failureCategory === 'timeout'
+      if (get()[field][id]?.inputChanged && !terminal) {
+        set((currentState) => ({ [field]: {
+          ...currentState[field], [id]: { ...base, loading: false, error: 'The test input changed. Test again to see its result.' },
+        } }))
+        return false
+      }
+      if (!current() && !terminal) {
+        set((currentState) => ({ [field]: {
+          ...currentState[field], [id]: { ...base, loading: false },
+        } }))
+        return false
+      }
+      set((currentState) => ({ [field]: {
+        ...currentState[field], [id]: {
+          ...base, result, loading: false,
+          previousSuccess: result.error || result.notPreviewable || result.failureCategory ? previousSuccess : undefined,
+        },
+      } }))
+      return true
+    },
+    fail(error: unknown) {
+      if (!owns()) return
+      // A lost preview response does not prove the cancellation request finished its work.
+      if (get()[field][id]?.stopping) {
+        set((currentState) => ({ [field]: {
+          ...currentState[field], [id]: { ...currentState[field][id], error: error instanceof Error ? error.message : String(error) },
+        } }))
+        return
+      }
+      if (error instanceof TypeError || (error instanceof KernelError && error.status >= 500)) {
+        // A transport failure can leave an admitted Python cell running. Keep the request's Stop
+        // handle until its owner confirms termination, even though the preview response was lost.
+        set((currentState) => ({ [field]: {
+          ...currentState[field], [id]: { ...currentState[field][id], error: error.message },
+        } }))
+        void get().cancelPreview(id, editor)
+        return
+      }
+      set((currentState) => ({ [field]: {
+        ...currentState[field], [id]: {
+          ...base, loading: false, error: error instanceof Error ? error.message : String(error),
+        },
+      } }))
+    },
+  }
+}
+
+async function stopDetachedPreview(preview: PreviewState): Promise<void> {
+  if (!preview.loading || !preview.previewRequestId) return
+  try {
+    while (useStore.getState().currentUser?.id === preview.principalId) {
+      const result = await api.cancelPreview(preview.previewRequestId, preview.canvasId)
+      if (result.status !== 'stopping') return
+      await wait(250)
+    }
+  } catch { /* The server deadline remains responsible when cancellation cannot be confirmed. */ }
 }
 
 export interface PreviewBindingState {
@@ -1453,6 +1561,7 @@ interface Store {
   runEditorExamplePreview: (
     id: string, exampleRowsJson: string, offset?: number, portId?: string,
   ) => Promise<void>
+  cancelPreview: (id: string, editor?: boolean) => Promise<void>
   clearEditorPreview: (id: string) => void
   refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
@@ -2919,46 +3028,19 @@ export const useStore = create<Store>((set, get) => ({
     const portId = requestedPortId ?? (ports.length > 1
       ? ports.find((port) => port.id === currentPortId)?.id ?? defaultPortId
       : undefined)
-    const planIdentity = previewPlanIdentity(doc, id, portId)
-    const parameterBindings = get().runs[id]?.parameterBindings ?? []
-    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
-    const requestGeneration = ++_previewRequestGeneration
-    const isCurrent = () => {
-      const state = get()
-      const preview = state.previews[id]
-      return preview?.requestGeneration === requestGeneration
-        && previewIsCurrent(preview, state.doc, id, portId)
-        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
-    }
-    set((s) => ({
-      previews: {
-        ...s.previews,
-        [id]: refreshLatest && previousPreview
-          ? { ...previousPreview, parameterBindings, requestGeneration, loading: true, error: undefined }
-          : { canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, loading: true, offset },
-      },
-      openPanels: { [id]: 'data' },
-    }))
+    // Reopening an active preview restores its Stop control without starting another calculation.
+    set({ openPanels: { [id]: 'data' } })
+    const request = beginPreviewRequest(get, set, id, false, portId, offset)
+    if (!request) return
+    const { planIdentity, parameterBindings } = request
     const spec = getSpec(node.type)
     if (spec?.previewable === false) {
-      set((s) => ({
-        previews: {
-          ...s.previews,
-          [id]: {
-            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, offset,
-            result: {
-              columns: [],
-              rows: [],
-              truncated: false,
-              completeness: 'unknown',
-              notPreviewable: true,
-              reason: `${spec.title} does not support bounded previews. Run this step to produce its result.`,
-              suggestedAction: 'run',
-              wire: 'dataset',
-            },
-          },
-        },
-      }))
+      request.finish({
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true,
+        reason: `${spec.title} does not support bounded previews. Run this step to produce its result.`,
+        suggestedAction: 'run', wire: 'dataset',
+      })
       return
     }
     try {
@@ -2968,14 +3050,11 @@ export const useStore = create<Store>((set, get) => ({
       // budget instead of a 50-row page. Durable run artifacts retain every group.
       const k = node.type === 'chart' ? 2000 : 50
       const retainedBinding = refreshLatest ? undefined : currentPreviewBinding(get(), id)?.inputManifest
-      const result = retainedBinding
-        ? parameterBindings.length
-          ? await api.preview(doc, id, k, offset, portId, retainedBinding, parameterBindings)
-          : await api.preview(doc, id, k, offset, portId, retainedBinding)
-        : parameterBindings.length
-          ? await api.preview(doc, id, k, offset, portId, undefined, parameterBindings)
-          : await api.preview(doc, id, k, offset, portId)
-      if (!isCurrent()) return
+      const result = await api.preview(
+        doc, id, k, offset, portId, retainedBinding, parameterBindings, request.previewRequestId,
+      )
+      const current = request.current()
+      if (!request.finish(result) || !current) return
       const binding = result.inputManifest ? {
         canvasId: doc.id, nodeId: id, portId, planIdentity,
         parameterBindings,
@@ -2983,9 +3062,6 @@ export const useStore = create<Store>((set, get) => ({
       } : undefined
       const clearRetainedBinding = refreshLatest && !binding && !result.error && !result.notPreviewable
       set((s) => ({
-        previews: { ...s.previews, [id]: {
-          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, result, offset,
-        } },
         previewBindings: (() => {
           if (binding) return { ...s.previewBindings, [id]: binding }
           if (!clearRetainedBinding) return s.previewBindings
@@ -2998,15 +3074,7 @@ export const useStore = create<Store>((set, get) => ({
         writePreviewBindings(get().currentUser?.id, doc.id, get().previewBindings)
       }
     } catch (e) {
-      if (!isCurrent()) return
-      set((s) => ({
-        previews: {
-          ...s.previews,
-          [id]: refreshLatest && previousPreview
-            ? { ...previousPreview, requestGeneration, error: (e as Error).message, loading: false }
-            : { canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, error: (e as Error).message, offset },
-        },
-      }))
+      request.fail(e)
     }
   },
 
@@ -3028,35 +3096,10 @@ export const useStore = create<Store>((set, get) => ({
     const portId = requestedPortId ?? (ports.length > 1
       ? ports.find((port) => port.id === previous?.portId)?.id ?? defaultPortId
       : undefined)
-    const planIdentity = previewPlanIdentity(doc, id, portId)
-    const parameterBindings = get().runs[id]?.parameterBindings ?? []
-    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
-    const requestGeneration = ++_previewRequestGeneration
-    const current = () => {
-      const state = get()
-      const preview = state.editorPreviews[id]
-      return preview?.requestGeneration === requestGeneration
-        && previewIsCurrent(preview, state.doc, id, portId)
-        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
-    }
-    const installResult = (result: SampleResult) => set((state) => ({
-      editorPreviews: {
-        ...state.editorPreviews,
-        [id]: {
-          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-          requestGeneration, result, offset,
-        },
-      },
-    }))
-    set((state) => ({
-      editorPreviews: {
-        ...state.editorPreviews,
-        [id]: {
-          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-          requestGeneration, loading: true, offset,
-        },
-      },
-    }))
+    const request = beginPreviewRequest(get, set, id, true, portId, offset)
+    if (!request) return
+    const installResult = request.finish
+    const parameterBindings = request.parameterBindings
     if (!edge || !upstream) {
       installResult({
         columns: [], rows: [], truncated: false, completeness: 'unknown',
@@ -3069,12 +3112,10 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // Candidate discovery and proof are server-owned; no run id or artifact URI crosses this seam.
       const result = await api.retainedEditorPreview(
-        doc, id, 50, offset, portId, parameterBindings,
+        doc, id, 50, offset, portId, parameterBindings, request.previewRequestId,
       )
-      if (!current()) return
       installResult(result)
     } catch (error) {
-      if (!current()) return
       if (error instanceof KernelError && (
         error.code === 'retained_upstream_stale'
         || error.code === 'retained_upstream_unavailable'
@@ -3088,17 +3129,7 @@ export const useStore = create<Store>((set, get) => ({
         })
         return
       }
-      set((state) => ({
-        editorPreviews: {
-          ...state.editorPreviews,
-          [id]: {
-            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-            requestGeneration,
-            error: (error as Error).message || 'Could not verify a retained upstream result',
-            offset,
-          },
-        },
-      }))
+      request.fail(error)
     }
   },
 
@@ -3115,62 +3146,67 @@ export const useStore = create<Store>((set, get) => ({
     const portId = requestedPortId ?? (ports.length > 1
       ? ports.find((port) => port.id === previous?.portId)?.id ?? defaultPortId
       : undefined)
-    const planIdentity = previewPlanIdentity(doc, id, portId)
-    const parameterBindings = get().runs[id]?.parameterBindings ?? []
-    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
-    const requestGeneration = ++_previewRequestGeneration
-    const current = () => {
-      const state = get()
-      const preview = state.editorPreviews[id]
-      return preview?.requestGeneration === requestGeneration
-        && previewIsCurrent(preview, state.doc, id, portId)
-        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
-    }
-    set((state) => ({
-      editorPreviews: {
-        ...state.editorPreviews,
-        [id]: {
-          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-          requestGeneration, loading: true, offset,
-        },
-      },
-    }))
+    const request = beginPreviewRequest(get, set, id, true, portId, offset)
+    if (!request) return
     try {
       const result = await api.exampleRowsEditorPreview(
-        doc, id, exampleRowsJson, 50, offset, portId, parameterBindings,
+        doc, id, exampleRowsJson, 50, offset, portId, request.parameterBindings, request.previewRequestId,
       )
-      if (!current()) return
-      set((state) => ({
-        editorPreviews: {
-          ...state.editorPreviews,
-          [id]: {
-            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-            requestGeneration, result, offset,
-          },
-        },
-      }))
+      request.finish(result)
     } catch (error) {
-      if (!current()) return
-      set((state) => ({
-        editorPreviews: {
-          ...state.editorPreviews,
-          [id]: {
-            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
-            requestGeneration,
-            error: (error as Error).message || 'Could not test Example rows',
-            offset,
-          },
-        },
-      }))
+      request.fail(error)
     }
   },
 
-  clearEditorPreview: (id: string) => set((state) => {
-    if (!(id in state.editorPreviews)) return {}
-    const editorPreviews = { ...state.editorPreviews }
-    delete editorPreviews[id]
-    return { editorPreviews }
-  }),
+  cancelPreview: async (id, editor = false) => {
+    const field = editor ? 'editorPreviews' : 'previews'
+    const preview = get()[field][id]
+    if (!preview?.loading || !preview.previewRequestId
+        || (preview.stopping && !preview.stopError)) return
+    const owns = () => get().currentUser?.id === preview.principalId
+      && get().doc.id === preview.canvasId
+      && get()[field][id]?.previewRequestId === preview.previewRequestId
+      && get()[field][id]?.loading === true
+    const update = (patch: Partial<PreviewState>) => set((state) => ({
+      [field]: { ...state[field], [id]: { ...state[field][id], ...patch } },
+    }))
+    update({ stopping: true, stopError: undefined })
+    try {
+      while (owns()) {
+        const result = await api.cancelPreview(preview.previewRequestId, preview.canvasId)
+        if (!owns()) return
+        if (result.status === 'stopped') {
+          update({ loading: false, stopping: false, stopped: true })
+          return
+        }
+        if (result.status === 'finished') {
+          // The original response still owns the result; completion is not a stopped preview.
+          update({ stopping: false, ...(get()[field][id]?.error ? { loading: false } : {}) })
+          return
+        }
+        await wait(250)
+      }
+    } catch (error) {
+      if (!owns()) return
+      update({ stopError: error instanceof Error ? error.message : String(error) })
+    }
+  },
+
+  clearEditorPreview: (id: string) => {
+    if (get().editorPreviews[id]?.loading) {
+      set((state) => ({ editorPreviews: {
+        ...state.editorPreviews, [id]: { ...state.editorPreviews[id], inputChanged: true },
+      } }))
+      void get().cancelPreview(id, true)
+      return
+    }
+    set((state) => {
+      if (!(id in state.editorPreviews)) return {}
+      const editorPreviews = { ...state.editorPreviews }
+      delete editorPreviews[id]
+      return { editorPreviews }
+    })
+  },
 
   refreshPreviewInputs: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
@@ -5525,6 +5561,8 @@ useStore.subscribe((state) => {
   useStore.setState({
     canvasRole: null,
     agentOpen: false,
+    previews: {},
+    editorPreviews: {},
     runs: {},
     graphRun: null,
     executionRecovery: null,
@@ -5536,6 +5574,22 @@ useStore.subscribe((state) => {
     currentDraftId: null,
     serverVersion: null,
   })
+})
+
+// Closing an editor, replacing a Canvas, or leaving its view retires only its request IDs.
+// Never send an old principal's cancellation using a newly selected user's identity.
+useStore.subscribe((state, previous) => {
+  if (state.currentUser?.id !== previous.currentUser?.id) return
+  for (const field of ['previews', 'editorPreviews'] as const) {
+    for (const [id, preview] of Object.entries(previous[field])) {
+      if (!preview.loading || !preview.previewRequestId) continue
+      if (state[field][id]?.previewRequestId !== preview.previewRequestId) {
+        void stopDetachedPreview(preview)
+      } else if (previous.view === 'canvas' && state.view !== 'canvas') {
+        void state.cancelPreview(id, field === 'editorPreviews')
+      }
+    }
+  }
 })
 
 // Persist every locally edited Canvas in its principal-scoped draft record before attempting a

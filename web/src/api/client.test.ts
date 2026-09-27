@@ -132,6 +132,22 @@ describe('API error recovery contract', () => {
     )
   })
 
+  it('binds each preview request and its stop request to one explicit ID', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ status: 'stopped' }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    const doc: CanvasDoc = { id: 'canvas', version: 1, nodes: [], edges: [] }
+    await api.preview(doc, 'target', 50, 0, undefined, undefined, [], 'normal-preview')
+    await api.retainedEditorPreview(doc, 'target', 50, 0, undefined, [], 'retained-preview')
+    await api.exampleRowsEditorPreview(doc, 'target', '[{"value":1}]', 50, 0, undefined, [], 'example-preview')
+    expect(fetchMock.mock.calls.slice(0, 3).map(([, options]) => JSON.parse(String(options?.body)).previewRequestId))
+      .toEqual(['normal-preview', 'retained-preview', 'example-preview'])
+    await expect(api.cancelPreview('example-preview', doc.id)).resolves.toEqual({ status: 'stopped' })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/run/preview/example-preview/cancel', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ canvasId: 'canvas' }),
+    }))
+  })
+
   it('asks the server to discover retained editor input without sending a run id or artifact URI', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       columns: [], rows: [], truncated: false,

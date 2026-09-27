@@ -720,7 +720,7 @@ export interface SampleResult {
   error?: boolean
   reason?: string | null
   suggestedAction?: 'run' | null
-  failureCategory?: 'not_previewable' | 'syntax_error' | 'user_code_exception' | 'runtime_error' | null
+  failureCategory?: 'not_previewable' | 'syntax_error' | 'user_code_exception' | 'runtime_error' | 'cancelled' | 'timeout' | null
   syntaxError?: {
     line: number
     column?: number | null
