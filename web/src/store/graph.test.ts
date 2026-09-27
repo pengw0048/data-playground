@@ -1525,6 +1525,80 @@ describe('graph store — core authority ops', () => {
     expect(next.data.autoPlaced).toBe(false)
   })
 
+  it('inserts a linear step in one document update and Undo, preserving other branches and positions', () => {
+    register({
+      kind: 'insert-linear', title: 'Linear', category: 'shape', canBypass: true, blurb: '',
+      inputs: [{ id: 'rows', wire: 'dataset' }], outputs: [{ id: 'result', wire: 'dataset' }],
+      defaultData: () => ({ title: 'Linear', config: {}, status: 'draft' }),
+    }, () => null)
+    const before: CanvasDoc = {
+      id: 'insertion', version: 1,
+      nodes: ['source', 'target', 'downstream', 'branch'].map((id, index) => ({
+        ...CURRENT_NODE(id, 'insert-linear'), position: { x: index * 400, y: 120 },
+      })),
+      edges: [
+        { id: 'replace', source: 'source', sourceHandle: 'result', target: 'target', targetHandle: 'rows', data: { wire: 'dataset' } },
+        { id: 'down', source: 'target', sourceHandle: 'result', target: 'downstream', targetHandle: 'rows', data: { wire: 'dataset' } },
+        { id: 'branch', source: 'source', sourceHandle: 'result', target: 'branch', targetHandle: 'rows', data: { wire: 'dataset' } },
+      ],
+    }
+    useStore.setState({ doc: before })
+    const updates: CanvasDoc[] = []
+    const unsubscribe = useStore.subscribe((state, previous) => {
+      if (state.doc !== previous.doc) updates.push(state.doc)
+    })
+    const node = useStore.getState().insertNodeOnEdge('insert-linear', { x: 200, y: 120 }, {
+      canvasId: before.id, edge: { ...before.edges[0] },
+    })!
+    unsubscribe()
+    expect(node).not.toBeNull()
+    expect(updates).toHaveLength(1)
+    const after = useStore.getState().doc
+    expect(after.nodes.slice(0, 4).map((item) => item.position)).toEqual(before.nodes.map((item) => item.position))
+    expect(after.nodes.map((item) => item.data.status)).toEqual(['latest', 'stale', 'stale', 'latest', 'draft'])
+    expect(after.nodes[1].data.lastRun).toEqual(before.nodes[1].data.lastRun)
+    expect(after.edges).toEqual([
+      expect.objectContaining({ source: 'source', sourceHandle: 'result', target: node.id, targetHandle: 'rows' }),
+      expect.objectContaining({ source: node.id, sourceHandle: 'result', target: 'target', targetHandle: 'rows' }),
+      ...before.edges.slice(1),
+    ])
+    expect(useStore.getState().selectedId).toBe(node.id)
+    expect(useStore.getState().past).toHaveLength(1)
+    expect(node.data.autoPlaced).toBe(false)
+    expect(before.nodes.every((old) => Math.abs(old.position.x - node.position.x) >= 280
+      || Math.abs(old.position.y - node.position.y) >= 180)).toBe(true)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    useStore.getState().undo()
+    expect(useStore.getState().doc).toEqual(before)
+    useStore.getState().redo()
+    expect(useStore.getState().doc).toEqual(after)
+  })
+
+  it.each(['canvas', 'endpoints', 'handles', 'missing', 'permission', 'spec'] as const)(
+    'does not partially insert or record Undo after a stale picker: %s', (change) => {
+      const spec = {
+        kind: 'insert-guard', title: 'Guard', category: 'shape' as const, canBypass: true, blurb: '',
+        inputs: [{ id: 'in', wire: 'dataset' as const }], outputs: [{ id: 'out', wire: 'dataset' as const }],
+        defaultData: () => ({ title: 'Guard', config: {}, status: 'draft' as const }),
+      }
+      register(spec, () => null)
+      const edge = { id: 'edge', source: 'source', sourceHandle: 'out', target: 'target', targetHandle: 'in' }
+      const doc: CanvasDoc = { id: 'insertion-guard', version: 1,
+        nodes: [NODE('source', spec.kind), NODE('target', spec.kind)], edges: [edge] }
+      const snapshot = { canvasId: doc.id, edge: { ...edge } }
+      if (change === 'canvas') doc.id = 'other'
+      if (change === 'endpoints') doc.edges = [{ ...edge, target: 'replacement' }]
+      if (change === 'handles') doc.edges = [{ ...edge, sourceHandle: 'replacement' }]
+      if (change === 'missing') doc.edges = []
+      if (change === 'spec') register({ ...spec, outputs: [] }, () => null)
+      useStore.setState({ doc, canvasRole: change === 'permission' ? 'viewer' : 'owner' })
+      expect(useStore.getState().insertNodeOnEdge(spec.kind, { x: 200, y: 120 }, snapshot)).toBeNull()
+      expect(useStore.getState().doc).toBe(doc)
+      expect(useStore.getState().past).toHaveLength(0)
+    },
+  )
+
   it('places connected insertions rightward and only recenters an un-dragged Join', () => {
     register({
       kind: 'topology-source', title: 'Topology source', category: 'io',

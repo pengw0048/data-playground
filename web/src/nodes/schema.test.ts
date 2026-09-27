@@ -109,6 +109,13 @@ describe('schemaWarnings — column references vs known input', () => {
     expect(warn(node('x', 'aggregate', { groupBy: 'date_trunc(\'day\', ts)' }), cols('ts'))).toEqual([]) // expr → skip
   })
 
+  it('checks whole quoted Sort columns without mistaking NULLS or direction for column names', () => {
+    const sort = node('x', 'sort', { by: '"kind, ""label""" DESC NULLS LAST, "ASC" NULLS FIRST' })
+    expect(warn(sort, cols('kind, "label"', 'ASC'))).toEqual([])
+    expect(warn(sort, cols('ASC'))).toEqual(['unknown column: kind, "label"'])
+    expect(warn(node('x', 'sort', { by: 'score + penalty DESC, id' }), cols('id'))).toEqual([])
+  })
+
   it.each(['region, category, code', 'team "label", category, code', 'GROUP'])(
     'checks a quoted grouping column as one identifier: %s', (name) => {
       const groupBy = `"${name.replaceAll('"', '""')}"`

@@ -146,10 +146,13 @@ function secondaryCue(result: FinderResult, results: FinderResult[]): string | n
   return source ?? result.spec.category
 }
 
-export function NodeFinder({ specs, wire, compatibleOnly = false, anchor, boundary, returnFocus, onPick, onClose }: {
+export function NodeFinder({ specs, wire, compatibleOnly = false, title, description, actionLabel, anchor, boundary, returnFocus, onPick, onClose }: {
   specs: NodeSpec[]
   wire?: WireType
   compatibleOnly?: boolean
+  title?: string
+  description?: string
+  actionLabel?: string
   anchor?: ScreenRect
   boundary?: ScreenRect
   returnFocus?: HTMLElement | null
@@ -210,7 +213,7 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, anchor, bounda
       ref={panel}
       role="dialog"
       aria-modal={anchored ? undefined : true}
-      aria-label={compatibleOnly ? 'Connect to an operation' : 'Add an operation'}
+      aria-label={title ?? (compatibleOnly ? 'Connect to an operation' : 'Add an operation')}
       className={anchored
         ? 'dp-panel fixed z-[70] flex flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-xl'
         : 'flex w-[min(620px,calc(100vw-32px))] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-xl'}
@@ -223,6 +226,10 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, anchor, bounda
         closeFromKeyboard()
       }}
     >
+      {title && <div className="flex-none border-b border-border px-3 py-2.5">
+        <div className="text-[13px] font-semibold">{title}</div>
+        {description && <p className="mt-1 text-[11px] text-muted-foreground">{description}</p>}
+      </div>}
       <div className="flex flex-none items-center gap-2 border-b border-border px-3 py-2.5">
         <Icon name="search" size={16} style={{ color: color.text3 }} />
         <input ref={input} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown}
@@ -254,7 +261,7 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, anchor, bounda
         {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching node.</div>}
         {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
       </div>
-      <div className="flex-none border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to {compatibleOnly ? 'connect' : 'add operation'}</div>
+      <div className="flex-none border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to {actionLabel ?? (compatibleOnly ? 'connect' : 'add operation')}</div>
     </section>
   )
 

@@ -41,6 +41,8 @@ import {
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
 import { connectedBasePosition } from '../canvas/connectedPlacement'
+import { insertionEdge, insertionPorts, type EdgeInsertionSnapshot } from '../canvas/edgeInsertion'
+import { absoluteNodePosition } from '../canvas/locateNode'
 import { rememberCanvasOpenedAt } from './canvasRecents'
 import { failedRunNode, presentRunError } from '../lib/runErrors'
 
@@ -1526,6 +1528,7 @@ interface Store {
   addConnectedNode: (kind: string, position: { x: number; y: number }, connection: {
     source: string; sourceHandle: string; targetHandle: string; wire: WireType
   }, options?: { autoPlaced?: boolean }) => CanvasNode | null
+  insertNodeOnEdge: (kind: string, position: { x: number; y: number }, snapshot: EdgeInsertionSnapshot) => CanvasNode | null
   setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
   replaceSourceBinding: (id: string, title: string, config: NodeConfig) => void
@@ -2648,6 +2651,44 @@ export const useStore = create<Store>((set, get) => ({
           }],
         },
         selectedId: node.id, selectedIds: [node.id], runs,
+      }
+    })
+    return node
+  },
+
+  insertNodeOnEdge: (kind, position, snapshot) => {
+    const current = get()
+    if (!roleCanEdit(current.canvasRole)) return null
+    const edge = insertionEdge(current.doc, snapshot)
+    const spec = getSpec(kind)
+    if (!edge || !spec) return null
+    const base = spec.defaultData()
+    const ports = insertionPorts(current.doc, edge, spec, base)
+    if (!ports) return null
+    const node: CanvasNode = {
+      id: newId(kind), type: kind,
+      position: freePosition(current.doc.nodes.map((candidate) => ({
+        ...candidate, position: absoluteNodePosition(current.doc.nodes, candidate),
+      })), position),
+      data: { ...base, config: { ...base.config }, autoPlaced: false },
+    }
+    get().commit()
+    // One document update is also one collaboration transaction: no subscriber sees a broken wire.
+    set((state) => {
+      const invalidated = invalidateCurrentResults(state.doc, state.runs, [
+        edge.target, ...downstream(state.doc, edge.target),
+      ])
+      return {
+        doc: {
+          ...state.doc, nodes: [...invalidated.nodes, node],
+          edges: state.doc.edges.flatMap((candidate) => candidate.id !== edge.id ? [candidate] : [
+            { id: newId('e'), source: edge.source, sourceHandle: edge.sourceHandle,
+              target: node.id, targetHandle: ports.input.id, data: { wire: ports.sourceWire } },
+            { id: newId('e'), source: node.id, sourceHandle: ports.output.id,
+              target: edge.target, targetHandle: edge.targetHandle, data: { wire: ports.output.wire } },
+          ]),
+        },
+        selectedId: node.id, selectedIds: [node.id], runs: invalidated.runs,
       }
     })
     return node

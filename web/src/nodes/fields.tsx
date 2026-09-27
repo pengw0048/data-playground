@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { miniInputClass, miniSelectClass } from '../ui/controls'
 import { cn } from '@/lib/utils'
 import type { ColumnSchema } from '../types/graph'
+import { parseSortKeys, serializeSortKeys, type SortKey } from './sortKeys'
 import {
   FILTER_OPS, type FilterCondition, type FilterOp, filterBuilderConditions,
   parseFilterConditions, serializeFilterConditions,
@@ -126,36 +127,31 @@ export function ColumnListPicker({ value, columns, onChange }: {
   )
 }
 
-// ---- sort: chips of {column, direction} ---------------------------------- //
-interface SortKey { col: string; dir: 'ASC' | 'DESC' }
-
-function parseSort(by: string): SortKey[] {
-  return by.split(',').map((t) => t.trim()).filter(Boolean).map((t) => {
-    const m = t.match(/^(.*?)(?:\s+(ASC|DESC))?$/i)
-    return { col: (m?.[1] ?? t).trim(), dir: (m?.[2]?.toUpperCase() as 'ASC' | 'DESC') || 'ASC' }
-  })
-}
-function serializeSort(keys: SortKey[]): string {
-  return keys.filter((k) => k.col.trim()).map((k) => (k.dir === 'DESC' ? `${k.col} DESC` : k.col)).join(', ')
-}
-
+// ---- sort: ordered columns, direction, and explicit null placement -------- //
 export function SortBuilder({ nodeId }: { nodeId: string }) {
   const by = String(useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config.by) ?? '')
   const updateConfig = useStore((s) => s.updateConfig)
   const columns = useInputColumns(nodeId)
-  // a function expression can contain commas the chip-splitter would wrongly tear apart → free text
-  const complex = by.includes('(')
-  const [advanced, setAdvanced] = useState(complex)
-  const keys = parseSort(by)
-  const commit = (next: SortKey[]) => updateConfig(nodeId, { by: serializeSort(next) })
+  const parsed = parseSortKeys(by)
+  const [advanced, setAdvanced] = useState(parsed === null)
+  // Keep an empty field while the user replaces a column; SQL omits it, but the input must not
+  // disappear between clearing the old name and choosing/typing the new one.
+  const [draft, setDraft] = useState<{ nodeId: string; by: string; keys: SortKey[] } | null>(null)
+  const keys = draft?.nodeId === nodeId && draft.by === by ? draft.keys : parsed ?? []
+  const commit = (next: SortKey[]) => {
+    const nextBy = serializeSortKeys(next)
+    setDraft({ nodeId, by: nextBy, keys: next })
+    updateConfig(nodeId, { by: nextBy })
+  }
 
-  if (advanced || complex) {
+  if (advanced || parsed === null) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <ColumnCombo value={by} columns={columns} placeholder="score DESC, id"
+        <ColumnCombo quoteIdentifiers value={by} columns={columns} placeholder="score DESC, id"
           onChange={(v) => updateConfig(nodeId, { by: v })} />
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); if (!by.includes('(')) setAdvanced(false) }}
-          style={{ ...addBtn, opacity: by.includes('(') ? 0.5 : 1 }} title={by.includes('(') ? 'Contains an expression — edit as text' : 'Switch to the builder'}>
+        <button className="nodrag" disabled={parsed === null}
+          onClick={(e) => { e.stopPropagation(); setAdvanced(false) }}
+          style={{ ...addBtn, opacity: parsed === null ? 0.5 : 1 }} title={parsed === null ? 'Contains an expression — edit as text' : 'Switch to the builder'}>
           <Icon name="fx" size={11} /> builder
         </button>
       </div>
@@ -172,14 +168,24 @@ export function SortBuilder({ nodeId }: { nodeId: string }) {
           </div>
           <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit(keys.map((x, j) => (j === i ? { ...x, dir: x.dir === 'ASC' ? 'DESC' : 'ASC' } : x))) }}
             title="Toggle direction" style={dirBtn}>{k.dir}</button>
+          <select aria-label={`Null placement for sort key ${i + 1}`} value={k.nulls ?? ''}
+            className={cn('nodrag w-[82px]', miniSelectClass)} onClick={(e) => e.stopPropagation()}
+            onChange={(e) => commit(keys.map((x, j) => (j === i
+              ? { ...x, nulls: (e.target.value || undefined) as SortKey['nulls'] } : x)))}>
+            <option value="">Nulls: default</option>
+            <option value="FIRST">Nulls first</option>
+            <option value="LAST">Nulls last</option>
+          </select>
           <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit(keys.filter((_, j) => j !== i)) }}
             title="Remove" style={xBtn}><Icon name="close" size={11} /></button>
         </div>
       ))}
       <div style={{ display: 'flex', gap: 6 }}>
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...keys, { col: columns[0]?.name ?? '', dir: 'ASC' }]) }}
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); commit([...keys, {
+          col: columns.find((column) => !keys.some((key) => key.col === column.name))?.name ?? '', dir: 'ASC',
+        }]) }}
           style={addBtn}><Icon name="plus" size={11} /> add sort key</button>
-        <button className="nodrag" onClick={(e) => { e.stopPropagation(); setAdvanced(true) }}
+        <button className="nodrag" onClick={(e) => { e.stopPropagation(); setDraft(null); setAdvanced(true) }}
           style={addBtn} title="Edit order-by as text">raw</button>
       </div>
     </div>

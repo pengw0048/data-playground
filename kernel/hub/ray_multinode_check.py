@@ -161,7 +161,7 @@ def main() -> int:
     g = Graph(**{"id": "c", "version": 1, "nodes": [
         {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": src}}},
         {"id": "a", "type": "aggregate", "position": {"x": 0, "y": 0},
-         "data": {"config": {"groupBy": "cat",
+         "data": {"config": {"groupBy": '"cat"',
                              "aggs": "count(*) AS n, count(v) AS nv, min(v) AS lo, max(v) AS hi, "
                                      "sum(v) AS sm, avg(v) AS av"}}},
     ], "edges": [{"id": "e", "source": "src", "target": "a", "data": {"wire": "dataset"}}]})

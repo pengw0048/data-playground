@@ -50,36 +50,59 @@ DISTRIBUTABLE_RELATIONAL = frozenset({"aggregate", "window", "dedup", "join", "s
 # the hand-written surface tiny and conservative: an un-parseable key returns None → the backend falls
 # back to single-node DuckDB. The aggregates/expressions themselves are never parsed — DuckDB runs the
 # same SQL fragment the single-node engine does, so the result is identical by construction.
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_KEY_NAME = r'(?:"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))'
+_GROUP_TERM = re.compile(_KEY_NAME)
+# These bare terms are SQL expressions, not columns. Quoted names remain real column names.
+_BARE_KEY_EXPRESSIONS = frozenset({
+    "all", "null", "true", "false", "current_date", "current_time", "current_timestamp",
+    "localtime", "localtimestamp", "current_user", "session_user", "current_schema",
+    "current_catalog", "current_role", "user",
+})
+
+
+def _key_name(match: re.Match[str]) -> str | None:
+    quoted, bare = match.group(1), match.group(2)
+    return quoted if quoted is not None else (None if bare.lower() in _BARE_KEY_EXPRESSIONS else bare)
 
 
 def parse_group_keys(group: str) -> list[str] | None:
-    """A GROUP BY fragment → the list of bare group-key columns to hash-shuffle on ([] = a global/no-key
-    aggregate), or None if any key is an expression / quoted / parenthesized (no plain shuffle key ⇒ not
-    distributable ⇒ DuckDB single-node)."""
+    """A GROUP BY fragment → simple group-key columns ([] = a global/no-key aggregate).
+
+    Quotes around the same ASCII identifiers do not change the shuffle key. Expressions and more
+    complex column names still return None and use DuckDB single-node.
+    """
     s = (group or "").strip()
     if not s:
         return []  # global aggregate — valid (a single-partition reduce), distinct from unparseable (None)
-    keys = [p.strip() for p in s.split(",")]
-    return keys if all(_IDENT_RE.match(k) for k in keys) else None
+    keys: list[str] = []
+    for part in s.split(","):
+        match = _GROUP_TERM.fullmatch(part.strip())
+        key = _key_name(match) if match else None
+        if key is None:
+            return None
+        keys.append(key)
+    return keys
 
 
-_SORT_TERM = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(asc|desc)?\s*$", re.I)
+_SORT_TERM = re.compile(rf"\s*{_KEY_NAME}(?:\s+(asc|desc))?\s*", re.I | re.ASCII)
 
 
 def parse_sort_keys(by: str) -> list[tuple[str, bool]] | None:
-    """An ORDER BY fragment → [(column, descending)], or None if any term is not a bare column with an
-    optional ASC/DESC (an expression / NULLS clause / quoted name → None → DuckDB single-node). A
-    distributed sort is only claimed for a plain-column key; ties + NULL placement are checked per-op."""
+    """An ORDER BY fragment → [(column, descending)] for simple, optionally quoted column names.
+
+    Expressions, NULLS clauses, and complex column names return None and use DuckDB single-node.
+    Ties and default NULL placement are still checked per-op by the distributed backend.
+    """
     s = (by or "").strip()
     if not s:
         return None
     out: list[tuple[str, bool]] = []
     for part in s.split(","):
-        m = _SORT_TERM.match(part)
-        if not m:
+        m = _SORT_TERM.fullmatch(part)
+        key = _key_name(m) if m else None
+        if key is None or m is None:
             return None
-        out.append((m.group(1), (m.group(2) or "asc").lower() == "desc"))
+        out.append((key, (m.group(3) or "asc").lower() == "desc"))
     return out
 
 # canvas node type → IR op. `transform` resolves to its MODE (a clean transform mode, or

@@ -31,6 +31,7 @@ import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { OwnDataStarterModal } from './OwnDataStarterModal'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 import { outputConnectionDrop } from './outputConnectionDrop'
+import { insertionEdge, insertionPorts, type EdgeInsertionSnapshot } from './edgeInsertion'
 import { canvasFitOptions, rightViewportShiftToReveal } from './viewportFit'
 import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
 import {
@@ -258,9 +259,14 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
     wire: WireType
     canvasId: string
     position?: { x: number; y: number }
-    source: { nodeId: string; handleId: string | null }
-  } | null>(null)
+  } & ({ mode: 'append'; source: { nodeId: string; handleId: string | null } }
+    | { mode: 'insert'; snapshot: EdgeInsertionSnapshot }) | null>(null)
   const [contextPosition, setContextPosition] = useState({ x: 0, y: 0 })
+  const [edgeContext, setEdgeContext] = useState<{
+    snapshot: EdgeInsertionSnapshot
+    anchor: ScreenRect
+  } | null>(null)
+  const pendingInsertionFinder = useRef<Extract<NonNullable<typeof finder>, { mode: 'insert' }> | null>(null)
   const [activeNodePointer, setActiveNodePointer] = useState<{
     nodeId: string
     pointerId: number
@@ -609,7 +615,7 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
       left: surface.left, right: surface.right, top: surface.top,
       bottom: toolbarTop == null ? surface.bottom : Math.min(surface.bottom, toolbarTop - 8),
     }
-    setFinder({ anchor, boundary, opener, wire: wire as WireType, source, position, canvasId: current.doc.id })
+    setFinder({ mode: 'append', anchor, boundary, opener, wire: wire as WireType, source, position, canvasId: current.doc.id })
   }, [])
 
   const onConnectEnd = useCallback<OnConnectEnd>((event, state) => {
@@ -716,6 +722,27 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
     useStore.getState().addNode(kind, position, undefined, undefined, { autoPlaced: false })
   }
   const contextSpecs = allSpecs()
+  const insertionSnapshot = edgeContext?.snapshot.canvasId === doc.id ? edgeContext.snapshot : null
+  const contextEdge = insertionSnapshot ? insertionEdge(doc, insertionSnapshot) : undefined
+  const insertableSpecs = (edge: typeof contextEdge) => edge
+    ? contextSpecs.filter((spec) => insertionPorts(doc, edge, spec)) : []
+  const openInsertionFinder = () => {
+    if (!edgeContext) return
+    const current = useStore.getState()
+    const edge = insertionEdge(current.doc, edgeContext.snapshot)
+    const surface = canvasRef.current?.getBoundingClientRect()
+    if (!roleCanEdit(current.canvasRole) || !edge || !surface) return
+    const sourceWire = portWire(current.doc.nodes, edge.source, edge.sourceHandle, 'source')
+    if (!sourceWire) return
+    const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
+    pendingInsertionFinder.current = {
+      mode: 'insert', snapshot: edgeContext.snapshot, canvasId: current.doc.id,
+      wire: sourceWire, anchor: edgeContext.anchor, opener: null,
+      position: { x: contextPosition.x - 116, y: contextPosition.y - 40 },
+      boundary: { left: surface.left, right: surface.right, top: surface.top,
+        bottom: toolbarTop == null ? surface.bottom : Math.min(surface.bottom, toolbarTop - 8) },
+    }
+  }
 
   return (
     <ContextMenu>
@@ -732,7 +759,15 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
       }}
       onContextMenu={(event) => {
         setContextPosition(screenToFlowPosition({ x: event.clientX, y: event.clientY }))
-        select(null)
+        const edgeId = (event.target as Element).closest('.react-flow__edge')?.getAttribute('data-id')
+        const current = useStore.getState()
+        const edge = current.doc.edges.find((candidate) => candidate.id === edgeId)
+        setEdgeContext(edge ? {
+          snapshot: { canvasId: current.doc.id, edge: { ...edge } },
+          anchor: { left: event.clientX, right: event.clientX, top: event.clientY, bottom: event.clientY },
+        } : null)
+        if (edge) current.setSelection([edge.id])
+        else select(null)
         setFinder(null)
       }}
       onMouseMove={(e) => { const p = screenToFlowPosition({ x: e.clientX, y: e.clientY }); sendCursor(p.x, p.y) }}
@@ -817,7 +852,10 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
 
       {canEdit && finder?.canvasId === doc.id && (
         <NodeFinder
-          specs={allSpecs()}
+          specs={finder.mode === 'insert' ? insertableSpecs(insertionEdge(doc, finder.snapshot)) : contextSpecs}
+          title={finder.mode === 'insert' ? 'Insert step' : undefined}
+          description={finder.mode === 'insert' ? 'Choose a step that connects to both ends of this connection.' : undefined}
+          actionLabel={finder.mode === 'insert' ? 'insert step' : undefined}
           wire={finder.wire}
           compatibleOnly
           anchor={finder.anchor}
@@ -826,6 +864,14 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
           onClose={() => setFinder(null)}
           onPick={(kind) => {
             if (useStore.getState().doc.id !== finder.canvasId) { setFinder(null); return }
+            if (finder.mode === 'insert') {
+              const current = useStore.getState()
+              const created = current.insertNodeOnEdge(kind, finder.position!, finder.snapshot)
+              if (created) current.requestNodeReveal(current.doc.id, created.id)
+              else current.pushToast('This connection changed. Open Insert step again.', 'error')
+              setFinder(null)
+              return
+            }
             const target = firstCompatibleInput(kind, finder.wire)
             // Keep the graph contract at the creation boundary as well as in the picker. This prevents
             // a stale plugin registry update from creating an incompatible unconnected node.
@@ -852,8 +898,25 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
       )}
     </div>
     </ContextMenuTrigger>
-    <ContextMenuContent aria-label="Canvas actions" className="w-[220px]">
-      <ContextMenuLabel>Canvas</ContextMenuLabel>
+    <ContextMenuContent aria-label={insertionSnapshot ? 'Connection actions' : 'Canvas actions'} className="w-[220px]"
+      onCloseAutoFocus={(event) => {
+        const pending = pendingInsertionFinder.current
+        if (!pending) return
+        event.preventDefault()
+        pendingInsertionFinder.current = null
+        // Mount after the menu's focus trap is gone, so the first keystroke searches the picker.
+        window.requestAnimationFrame(() => {
+          const current = useStore.getState()
+          if (roleCanEdit(current.canvasRole) && insertionEdge(current.doc, pending.snapshot)) setFinder(pending)
+        })
+      }}>
+      <ContextMenuLabel>{insertionSnapshot ? 'Connection' : 'Canvas'}</ContextMenuLabel>
+      {insertionSnapshot && canEdit && <>
+        <ContextMenuItem disabled={!insertableSpecs(contextEdge).length} onSelect={openInsertionFinder}>
+          <Icon name="plus" /> Insert step
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+      </>}
       {canEdit && <>
         <ContextMenuItem disabled={!canUndo} onSelect={() => useStore.getState().undo()}>
           <Icon name="undo" /> Undo <ContextMenuShortcut>⌘Z</ContextMenuShortcut>
@@ -862,7 +925,7 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
           <Icon name="redo" /> Redo <ContextMenuShortcut>⇧⌘Z</ContextMenuShortcut>
         </ContextMenuItem>
         <ContextMenuSeparator />
-        {categoryOrder.map((category) => {
+        {!insertionSnapshot && categoryOrder.map((category) => {
           const specs = contextSpecs.filter((spec) => spec.category === category)
           if (!specs.length) return null
           return <ContextMenuSub key={category}>
@@ -877,9 +940,9 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
             </ContextMenuSubContent>
           </ContextMenuSub>
         })}
-        <ContextMenuItem onSelect={() => useStore.getState().paste()}>
+        {!insertionSnapshot && <ContextMenuItem onSelect={() => useStore.getState().paste()}>
           <Icon name="duplicate" /> Paste <ContextMenuShortcut>⌘V</ContextMenuShortcut>
-        </ContextMenuItem>
+        </ContextMenuItem>}
       </>}
       <ContextMenuItem disabled={!doc.nodes.length} onSelect={() => useStore.getState().selectAll()}>
         <Icon name="check" /> Select all <ContextMenuShortcut>⌘A</ContextMenuShortcut>
