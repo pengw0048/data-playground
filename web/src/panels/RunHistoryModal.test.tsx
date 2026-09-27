@@ -7,6 +7,7 @@ import type { PerNodeStat, RunRecordDto } from '../api/client'
 import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
 import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
+import { resultViewKey, useResultViewStore } from '../store/resultView'
 import { register } from '../nodes/registry'
 import type { RetainedResultIdentity } from '../types/api'
 import '../nodes/capabilities'
@@ -53,6 +54,7 @@ function registerAssertUiTestNode() {
 }
 
 beforeEach(() => {
+  useResultViewStore.setState({ views: {} })
   apiMock.listRuns.mockReset()
   apiMock.executionManifest.mockReset()
   apiMock.tableByRegistration.mockReset()
@@ -476,6 +478,98 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Previous page' }))
     expect(await screen.findByText(/rows 1–1/)).toBeInTheDocument()
     expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 0)
+  })
+
+  it('reopens the exact saved page and retains Previous across short pages', async () => {
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) => sample(offset, offset === 0 ? 7 : offset === 7 ? 11 : 4, true))
+    const user = userEvent.setup()
+    const first = render(<FullResult uri="/outputs/short-pages.parquet" total={105} {...fullIdentity} />)
+    await screen.findByText('rows 1–7')
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('rows 8–18')
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('rows 19–22')
+    first.unmount()
+
+    render(<FullResult uri="/outputs/short-pages.parquet" total={105} {...fullIdentity} />)
+    await screen.findByText('rows 19–22')
+    expect(apiMock.runOutputSample.mock.calls.map((call) => call[4])).toEqual([0, 7, 18, 18])
+    await user.click(screen.getByRole('button', { name: 'Previous page' }))
+    await screen.findByText('rows 8–18')
+    expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 7)
+  })
+
+  it.each(['user', 'run', 'node', 'port', 'uri'] as const)(
+    'starts at page one without exposing prior rows when the %s changes', async (changed) => {
+      apiMock.runOutputSample.mockImplementation(async (
+        _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+      ) => sample(offset, 50, true))
+      const user = userEvent.setup()
+      const props = { uri: '/outputs/identity.parquet', total: 105, ...fullIdentity }
+      const view = render(<FullResult {...props} />)
+      await screen.findByText('rows 1–50')
+      await user.click(screen.getByRole('button', { name: 'Next page' }))
+      await screen.findByText('rows 51–100')
+      const fresh = deferred<ReturnType<typeof sample>>()
+      apiMock.runOutputSample.mockReturnValueOnce(fresh.promise)
+      if (changed === 'user') {
+        act(() => useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } } as any))
+      } else {
+        view.rerender(<FullResult {...props}
+          {...(changed === 'run' ? { runId: 'new-run' }
+            : changed === 'node' ? { nodeId: 'other-node' }
+            : changed === 'port' ? { portId: 'other-port' }
+            : { uri: '/outputs/new-revision.parquet' })} />)
+      }
+      expect(screen.queryByText('rows 51–100')).not.toBeInTheDocument()
+      expect(screen.queryByRole('table')).not.toBeInTheDocument()
+      expect(apiMock.runOutputSample.mock.lastCall?.[4]).toBe(0)
+      await act(async () => fresh.resolve(sample(0, 50, true)))
+      await screen.findByText('rows 1–50')
+    },
+  )
+
+  it.each([
+    [410, 'Full result expired or removed'], [403, 'Full result access denied'],
+  ])('rechecks availability when reopening a saved page after HTTP %s', async (status, title) => {
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) => sample(offset, 50, true))
+    const user = userEvent.setup()
+    const first = render(<FullResult uri="/outputs/rechecked.parquet" total={105} {...fullIdentity} />)
+    await screen.findByText('rows 1–50')
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('rows 51–100')
+    first.unmount()
+    apiMock.runOutputSample.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status }))
+
+    render(<FullResult uri="/outputs/rechecked.parquet" total={105} {...fullIdentity} />)
+    expect(await screen.findByText(title)).toBeInTheDocument()
+    expect(apiMock.runOutputSample).toHaveBeenLastCalledWith('run-direct', 'target', 'out', 50, 50)
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Export result' })).not.toBeInTheDocument()
+  })
+
+  it('opens a chart at zero without replacing the same artifact table page', async () => {
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) => sample(offset, 50, true))
+    const user = userEvent.setup()
+    const props = { uri: '/outputs/chart-and-table.parquet', total: 105, ...fullIdentity }
+    const view = render(<FullResult {...props} />)
+    await screen.findByText('rows 1–50')
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('rows 51–100')
+    view.rerender(<FullResult {...props}
+      presentation={{ kind: 'chart', type: 'bar', xLabel: 'kind', yLabel: 'value', grouped: true }} />)
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
+      'run-direct', 'target', 'out', 2000, 0,
+    ))
+    view.rerender(<FullResult {...props} />)
+    await screen.findByText('rows 51–100')
+    expect(apiMock.runOutputSample.mock.calls.map((call) => call[4])).toEqual([0, 50, 0, 50])
   })
 
   it('stops at the read budget while preserving truncated export labeling', async () => {
@@ -1055,6 +1149,202 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Full result' }))
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 0))
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+  })
+
+  it('reopens a previewable node in Full mode on the same saved page', async () => {
+    apiMock.runOutputSample.mockImplementation(async (
+      _runId: string, _nodeId: string, _portId: string, _k: number, offset: number,
+    ) => sample(offset, 50, true))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc, previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
+        targetNodeId: 'target', perNode: [], outputs: [committedOutput('/outputs/result.parquet', 105)] } } },
+    } as any)
+    const user = userEvent.setup()
+    const first = render(<DataPanel nodeId="target" />)
+    await user.click(screen.getByRole('button', { name: 'Full result' }))
+    await screen.findByTestId('full-result-status')
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('rows 51–100')
+    first.unmount()
+
+    render(<DataPanel nodeId="target" />)
+    await screen.findByText('rows 51–100')
+    expect(screen.getByRole('button', { name: 'Full result' })).toHaveAttribute('aria-pressed', 'true')
+    expect(apiMock.runOutputSample.mock.calls.map((call) => call[4])).toEqual([0, 50, 50])
+    expect(apiMock.preview).not.toHaveBeenCalled()
+  })
+
+  it.each(['stale sample', 'failed sample', 'edited graph', 'edited graph without sample'])(
+    'restores Full despite a %s only when its exact result is still current', async (previous) => {
+      const uri = '/outputs/result.parquet'
+      useResultViewStore.getState().remember(resultViewKey('alice', 'run-real', 'target', 'out', uri), {
+        mode: 'full', offset: 50, previousOffsets: [0],
+      })
+      apiMock.runOutputSample.mockResolvedValue(sample(50, 50, true))
+      const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'target', type: 'source', position: { x: 0, y: 0 },
+        data: { title: 'target', status: previous.startsWith('edited graph') ? 'stale' : 'latest', config: {}, history: [] },
+      }] }
+      const prior = boundPreview(doc, 'target', sample(0, 50, true))
+      useStore.setState({
+        doc, previews: previous === 'edited graph without sample' ? {} : {
+          target: previous === 'failed sample'
+            ? { ...prior, error: 'old preview failure' } : { ...prior, planIdentity: 'previous-plan' },
+        },
+        runs: { target: { phase: 'done', status: { runId: 'run-real', status: 'done',
+          targetNodeId: 'target', perNode: [], outputs: [committedOutput(uri, 105)] } } },
+      } as any)
+      render(<DataPanel nodeId="target" />)
+      if (previous.startsWith('edited graph')) {
+        expect(await screen.findByText('Preview out of date')).toBeInTheDocument()
+        expect(apiMock.runOutputSample).not.toHaveBeenCalled()
+      } else {
+        await screen.findByText('rows 51–100')
+        expect(screen.getByRole('button', { name: 'Full result' })).toHaveAttribute('aria-pressed', 'true')
+        expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 50)
+      }
+      expect(apiMock.preview).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['cancelled', 'timeout'] as const)(
+    'can open a new successful Full result after the earlier preview was %s', async (failureCategory) => {
+      const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'target', type: 'source', position: { x: 0, y: 0 },
+        data: { title: 'target', status: 'stale', config: {}, history: [] },
+      }] }
+      const preview = { ...boundPreview(doc, 'target', {
+        ...sample(0, 0, false), failureCategory,
+      }), stopped: failureCategory === 'cancelled' }
+      useStore.setState({ doc, previews: { target: preview } } as any)
+      const user = userEvent.setup()
+      render(<DataPanel nodeId="target" />)
+      expect(screen.getByText(failureCategory === 'cancelled' ? 'Preview stopped' : 'Preview timed out')).toBeVisible()
+
+      apiMock.runOutputSample.mockResolvedValueOnce(sample(0, 50, true))
+      act(() => useStore.setState({
+        doc: { ...doc, nodes: doc.nodes.map((node) => ({ ...node, data: { ...node.data, status: 'latest' } })) },
+        runs: { target: { phase: 'done', status: { runId: 'new-successful-run', status: 'done',
+          targetNodeId: 'target', perNode: [], outputs: [committedOutput('/outputs/new-result.parquet', 105)] } } },
+      } as any))
+      // Full runs do not discard preview state; the old stop feedback still has an explicit exit.
+      expect(useStore.getState().previews.target).toBe(preview)
+      await user.click(screen.getByRole('button', { name: 'Full result' }))
+      await screen.findByText('rows 1–50')
+      expect(apiMock.runOutputSample).toHaveBeenCalledWith('new-successful-run', 'target', 'out', 50, 0)
+      expect(apiMock.preview).not.toHaveBeenCalled()
+    },
+  )
+
+  it('keeps active Stop visible while another output saved-result lookup is pending', async () => {
+    registerAssertUiTestNode()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    apiMock.retainedResult.mockImplementation(() => new Promise(() => {}))
+    useStore.setState({ doc, previews: { target: {
+      ...boundPreview(doc, 'target', sample(0, 50, true), 'out'),
+      loading: true, previewRequestId: 'active-preview', principalId: 'alice',
+    } } } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+    expect(screen.getByRole('button', { name: 'Stop preview' })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: 'Passing' }))
+    expect(screen.getByRole('button', { name: 'Stop preview' })).toBeEnabled()
+    expect(screen.getByText('Preview running…')).toBeVisible()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(apiMock.runOutputSample).not.toHaveBeenCalled()
+  })
+
+  it('restores an explicit Sample choice only after the exact retained output resolves', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    const key = resultViewKey('alice', 'persisted-run', 'target', 'out', '/outputs/persisted.parquet')!
+    useResultViewStore.getState().remember(key, { mode: 'sample', offset: 50, previousOffsets: [0] })
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({ doc, previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) } } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+    await act(async () => lookup.resolve({ runId: 'persisted-run',
+      executionManifestSha256: 'a'.repeat(64), output: committedOutput('/outputs/persisted.parquet', 105) }))
+    expect(screen.getByRole('button', { name: 'Preview sample' })).toHaveAttribute('aria-pressed', 'true')
+    expect(apiMock.runOutputSample).not.toHaveBeenCalled()
+    apiMock.runOutputSample.mockResolvedValueOnce(sample(50, 50, true))
+    await user.click(screen.getByRole('button', { name: 'Full result' }))
+    await screen.findByText('rows 51–100')
+    expect(apiMock.runOutputSample).toHaveBeenCalledWith('persisted-run', 'target', 'out', 50, 50)
+  })
+
+  it('waits for saved-result recovery without running a preview, then loads only an explicit Sample', async () => {
+    const lookup = deferred<RetainedResultIdentity>()
+    apiMock.retainedResult.mockReturnValueOnce(lookup.promise)
+    apiMock.runOutputSample.mockResolvedValue(sample(50, 50, true))
+    apiMock.preview.mockResolvedValue(sample(0, 50, true))
+    useResultViewStore.getState().remember(
+      resultViewKey('alice', 'persisted-run', 'target', 'out', '/outputs/persisted.parquet'),
+      { mode: 'full', offset: 50, previousOffsets: [0] },
+    )
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({ doc } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    await act(async () => lookup.resolve({ runId: 'persisted-run',
+      executionManifestSha256: 'a'.repeat(64), output: committedOutput('/outputs/persisted.parquet', 105) }))
+    await screen.findByText('rows 51–100')
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(apiMock.runOutputSample.mock.calls.map((call) => call[4])).toEqual([50])
+    await user.click(screen.getByRole('button', { name: 'Preview sample' }))
+    await screen.findByText('rows 1–50')
+    expect(apiMock.preview).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not execute a preview on an indeterminate saved-result lookup and allows retry', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({ doc } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+    await screen.findByText('Couldn’t check saved result')
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    apiMock.retainedResult.mockResolvedValueOnce({ runId: 'persisted-run',
+      executionManifestSha256: 'a'.repeat(64), output: committedOutput('/outputs/persisted.parquet', 105) })
+    apiMock.runOutputSample.mockResolvedValueOnce(sample(0, 50, true))
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await screen.findByText('rows 1–50')
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(apiMock.runOutputSample).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows a bounded preview after definitive absence of a non-current retained output', async () => {
+    apiMock.retainedResult.mockRejectedValueOnce(new apiMock.KernelError(404, 'not saved'))
+    apiMock.preview.mockResolvedValueOnce(sample(0, 50, true))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'idle', config: {}, history: [],
+        lastRun: { rows: 105, ms: 10, placement: 'local' } },
+    }] }
+    useStore.setState({ doc } as any)
+    render(<DataPanel nodeId="target" />)
+    await screen.findByText('rows 1–50')
+    expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+    expect(apiMock.preview).toHaveBeenCalledTimes(1)
+    expect(apiMock.runOutputSample).not.toHaveBeenCalled()
   })
 
   it('recovers the current retained full result when an in-memory run is absent', async () => {

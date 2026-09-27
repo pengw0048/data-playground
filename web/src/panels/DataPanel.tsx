@@ -29,6 +29,7 @@ import {
   temporalTickBudget, temporalTickGranularity, type TimeBucket,
 } from '../lib/chartTemporal'
 import type { ArtifactPresentation } from '../lib/artifactPresentation'
+import { resultViewKey, useResultViewStore } from '../store/resultView'
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
@@ -101,6 +102,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const requestRun = useStore((s) => s.requestRun)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const principalId = useStore((s) => s.currentUser?.id)
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
   const isMetric = node?.type === 'metric'
@@ -218,7 +220,15 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const displayedSelectedOutput = selectedRunOutput ?? recoveredResult?.output
   const pushToast = useStore((s) => s.pushToast)
   const [tab, setTab] = useState('rows')
-  const [resultMode, setResultMode] = useState<'sample' | 'full'>('sample')
+  const savedViewKey = resultViewKey(principalId, selectedRunId ?? undefined,
+    selectedOutput?.nodeId, selectedOutput?.portId, selectedOutput?.uri ?? undefined)
+  const rememberedMode = useResultViewStore((s) => savedViewKey ? s.views[savedViewKey]?.mode : undefined)
+  // Do not persist a default while an asynchronous lookup has not resolved the exact output yet.
+  const resultMode = rememberedMode
+    ?? (selectedOutput?.uri && (recoveredResult || preview?.result?.notPreviewable) ? 'full' : 'sample')
+  const setResultMode = (mode: 'sample' | 'full') => {
+    useResultViewStore.getState().remember(savedViewKey, { mode })
+  }
   const [detail, setDetail] = useState<number | null>(null)  // index of the row whose detail is open
   const previousOffsets = useRef<number[]>([])
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
@@ -339,39 +349,29 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       || node?.data.status === 'failed'
       || (node?.data.status === 'idle' && !node.data.lastRun)
     ))
-  const chartResultRecoveryBlocksPreview = !editorPreview
-    && isChart
+  const savedResultRecoveryBlocksPreview = !editorPreview
     && !selectedOutput?.uri
-    && !chartPreviewFallbackAllowed
+    && (isChart ? !chartPreviewFallbackAllowed
+      : currentRetainedLookup?.phase !== 'fallback'
+        && (retainedLookupEligible || currentRetainedLookup !== null
+          || (node?.data.status === 'checking' && !!node.data.lastRun)))
   useEffect(() => {
-    // A Chart is a full-input visualization. Once a saved output exists, opening the
-    // panel reads that artifact directly instead of issuing a preview request that can only refuse.
-    // Wait for Canvas result recovery and any eligible retained lookup first. Only a definitive
-    // missing response or a state that cannot have a current result may fall back to bounded preview;
-    // access and transport failures stay indeterminate.
-    if (isChart && selectedOutput?.uri) return
-    if (chartResultRecoveryBlocksPreview) return
+    // Resolve a known saved result before deciding whether a sample is needed. Browsing a saved
+    // full result must not execute the graph while its exact artifact lookup is still pending.
+    if (selectedOutput?.uri && (isChart || resultMode === 'full')) return
+    if (savedResultRecoveryBlocksPreview) return
     if (editorPreview?.autoLoad !== false
         && (!preview || preview.portId !== requestPortId)) {
       previewAction(nodeId, 0, requestPortId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad,
-    isChart, selectedOutput?.uri, chartResultRecoveryBlocksPreview])
-  useEffect(() => setResultMode('sample'), [nodeId])
+    isChart, selectedOutput?.uri, savedResultRecoveryBlocksPreview, resultMode])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
     // Refresh and other callers reset the store-owned page to zero. Discard navigation state too.
     if (offset === 0) previousOffsets.current = []
   }, [offset])
-  useEffect(() => {
-    // A node that cannot produce a bounded preview should reveal the exact artifact as soon as its
-    // durable run finishes. A later explicit click on Sample remains sticky until the artifact changes.
-    if (preview?.result?.notPreviewable && selectedOutput?.uri) setResultMode('full')
-  }, [nodeId, requestPortId, selectedOutput?.uri, preview?.result?.notPreviewable])
-  useEffect(() => {
-    if (recoveredResult?.output.uri) setResultMode('full')
-  }, [recoveredResult?.runId, recoveredResult?.output.uri])
   const nextPage = (rowsRead: number) => {
     previousOffsets.current.push(offset)
     setDetail(null)
@@ -385,7 +385,6 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   const choosePort = (portId: string) => {
     setPortSelection({ nodeId, portId })
     setDetail(null)
-    setResultMode('sample')
   }
   const withOutputPorts = (content: ReactNode) => (
     <>
@@ -431,42 +430,20 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           : (node?.data.config.y ?? 'y')),
       }
     : isMetric ? { kind: 'metric' } : undefined
-
-  // Keep definitive full-result outcomes stable. A missing non-Chart result needs an explicit
-  // rerun; Charts can safely fall back to their bounded preview only after absence is proven.
-  if (!editorPreview && currentRetainedLookup?.phase === 'missing') {
-    return withOutputPorts(<CurrentResultUnavailable
-      onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
-  }
-  if (!editorPreview && currentRetainedLookup?.phase === 'denied') {
-    return withOutputPorts(<FullResultMessage
-      title="Current result access denied"
-      reason="You no longer have access to this saved result. Ask the owner to restore access, or run this step again if you can edit the Canvas." />)
-  }
-  if (!editorPreview && isChart && currentRetainedLookup?.phase === 'indeterminate') {
-    return withOutputPorts(<FullResultMessage
-      title="Couldn’t check saved result"
-      reason="The saved result may still exist. Check the connection and retry before falling back to a new preview."
-      onRetry={() => setRetainedLookupState(null)} />)
-  }
-
-  // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
-  // toggle or let an old preview error cover the last successful full result.
-  if (!editorPreview && isChart && selectedOutput?.uri) {
-    return withOutputPorts(<FullResult uri={selectedOutput.uri}
-      total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
-      runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
-      publicationKind={selectedOutput.publicationKind}
-      name={String(node?.data.title || node?.id || 'result')}
-      presentation={artifactPresentation} fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)}
-      onCurrentResultProblem={clearCurrentResultBadge}
-      currentResult={exactCurrentResult} />)
-  }
-
-  if (chartResultRecoveryBlocksPreview) {
-    return withOutputPorts(<Skeleton />)
-  }
+  const resultModeToggle = selectedOutput?.uri
+    ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
+        fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
+    : undefined
+  const fullResult = selectedOutput?.uri ? <FullResult uri={selectedOutput.uri}
+    total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
+    runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
+    publicationKind={selectedOutput.publicationKind}
+    name={String(node?.data.title || node?.id || 'result')}
+    modeToggle={isChart ? undefined : resultModeToggle} presentation={artifactPresentation}
+    fillAvailableHeight={fillAvailableHeight}
+    onRunUnavailable={() => requestRun(nodeId)}
+    onCurrentResultProblem={clearCurrentResultBadge}
+    currentResult={exactCurrentResult} /> : null
 
   if (preview?.loading && preview.previewRequestId) {
     return withOutputPorts(<div>
@@ -485,6 +462,37 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       <PreviousPreview preview={previousSuccessfulPreview} />
     </div>)
   }
+
+  // Keep definitive full-result outcomes stable. A missing non-Chart result needs an explicit
+  // rerun; Charts can safely fall back to their bounded preview only after absence is proven.
+  if (!editorPreview && currentRetainedLookup?.phase === 'missing') {
+    return withOutputPorts(<CurrentResultUnavailable
+      onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
+  }
+  if (!editorPreview && currentRetainedLookup?.phase === 'denied') {
+    return withOutputPorts(<FullResultMessage
+      title="Current result access denied"
+      reason="You no longer have access to this saved result. Ask the owner to restore access, or run this step again if you can edit the Canvas." />)
+  }
+  if (!editorPreview && currentRetainedLookup?.phase === 'indeterminate'
+      && (isChart || !preview || preview.portId !== requestPortId)) {
+    return withOutputPorts(<FullResultMessage
+      title="Couldn’t check saved result"
+      reason="The saved result may still exist. Check the connection and retry before falling back to a new preview."
+      onRetry={() => setRetainedLookupState(null)} />)
+  }
+
+  // Charts deliberately have one result scope: the complete saved run. Do not offer a sample/full
+  // toggle or let an old preview error cover the last successful full result.
+  if (!editorPreview && isChart && selectedOutput?.uri) {
+    return withOutputPorts(fullResult)
+  }
+
+  // A previous sample failure or stale sample plan must not hide an exact current saved result.
+  // Active preview controls remain above this branch; real graph edits remain stale.
+  if (!editorPreview && resultMode === 'full' && fullResult && exactCurrentResult) {
+    return withOutputPorts(fullResult)
+  }
   if (preview?.stopped || preview?.result?.failureCategory === 'cancelled'
       || preview?.result?.failureCategory === 'timeout') {
     const timedOut = preview.result?.failureCategory === 'timeout'
@@ -494,6 +502,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         <span>{timedOut ? preview.result?.reason || 'The preview exceeded its time limit and was stopped.'
           : 'The calculation has stopped. Your code and graph are kept.'}</span>
         {preview.error && <span>Preview connection failed: {preview.error}</span>}
+        {resultModeToggle}
         <Button size="sm" onClick={() => previewAction(nodeId, 0, requestPortId)}>
           {editorPreview ? 'Test again' : 'Refresh preview'}
         </Button>
@@ -501,7 +510,18 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       <PreviousPreview preview={previousSuccessfulPreview} />
     </div>)
   }
+  if (savedResultRecoveryBlocksPreview && (!preview || preview.portId !== requestPortId)) {
+    return withOutputPorts(<Skeleton />)
+  }
+
   if (!preview || preview.portId !== requestPortId) {
+    if (resultMode === 'full' && fullResult) {
+      if (node?.data.status === 'stale') return withOutputPorts(<StalePreview onRefresh={() => {
+        setResultMode('sample')
+        previewAction(nodeId, 0, requestPortId)
+      }} />)
+      return withOutputPorts(fullResult)
+    }
     return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
   }
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
@@ -523,7 +543,10 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     return withOutputPorts(<><StalePreview
       exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
       editorTestTarget={editorPreview ? editorPreview.testTarget ?? 'code' : undefined}
-      onRefresh={() => previewAction(nodeId, 0, requestPortId)} />
+      onRefresh={() => {
+        setResultMode('sample')
+        previewAction(nodeId, 0, requestPortId)
+      }} />
       <PreviousPreview preview={previousSuccessfulPreview} stale /></>)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
@@ -557,25 +580,12 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />
     <PreviousPreview preview={previousSuccessfulPreview} /></>)
-  const resultModeToggle = selectedOutput?.uri
-    ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
-        fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
-    : undefined
   if (res.notPreviewable) {
     // P0-UX-01: a sample can't preview this node (an aggregate/sort), but a full run MATERIALIZES the
     // result to a durable artifact — so if this node's last run is done and produced one, show the exact
     // Full result (restorable after a restart via the persisted run status) instead of a dead end.
     if (selectedOutput?.uri && resultMode === 'full') {
-      return withOutputPorts(<FullResult uri={selectedOutput.uri}
-        total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
-        runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
-        publicationKind={selectedOutput.publicationKind}
-        name={String(node?.data.title || node?.id || 'result')}
-        modeToggle={resultModeToggle} presentation={artifactPresentation}
-        fillAvailableHeight={fillAvailableHeight}
-        onRunUnavailable={() => requestRun(nodeId)}
-        onCurrentResultProblem={clearCurrentResultBadge}
-        currentResult={exactCurrentResult} />)
+      return withOutputPorts(fullResult)
     }
     if (editorPreview) {
       const testTarget = editorPreview.testTarget ?? 'code'
@@ -610,16 +620,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
-    return withOutputPorts(<FullResult uri={selectedOutput.uri}
-      total={selectedOutput.publicationKind === 'result' ? selectedOutput.rows ?? null : null}
-      runId={selectedRunId} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId}
-      publicationKind={selectedOutput.publicationKind}
-      name={String(node?.data.title || node?.id || 'result')}
-      modeToggle={resultModeToggle} presentation={artifactPresentation}
-      fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)}
-      onCurrentResultProblem={clearCurrentResultBadge}
-      currentResult={exactCurrentResult} />)
+    return withOutputPorts(fullResult)
   }
 
   const columns = res.columns
@@ -1837,10 +1838,7 @@ function UserCodeFailure({
 
 // Page a durable run output through its server-owned run/node/port identity. The kernel resolves the
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
-export function FullResult({
-  uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
-  onRunUnavailable, onCurrentResultProblem, currentResult = false, fillAvailableHeight = false,
-}: {
+type FullResultProps = {
   uri: string
   total: number | null
   runId?: string
@@ -1854,12 +1852,32 @@ export function FullResult({
   onCurrentResultProblem?: (problem: CurrentResultProblem) => void
   fillAvailableHeight?: boolean
   currentResult?: boolean
-}) {
+}
+
+export function FullResult(props: FullResultProps) {
+  const principalId = useStore((s) => s.currentUser?.id)
+  const viewKey = resultViewKey(principalId, props.runId, props.nodeId, props.portId, props.uri)
+  // Remount on identity changes so even the first render cannot expose another result's rows.
+  const identity = JSON.stringify([
+    principalId, props.runId, props.nodeId, props.portId, props.uri, props.presentation?.kind === 'chart',
+  ])
+  return <FullResultView key={identity} {...props} viewKey={viewKey} />
+}
+
+function FullResultView({
+  uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
+  onRunUnavailable, onCurrentResultProblem, currentResult = false, fillAvailableHeight = false,
+  viewKey,
+}: FullResultProps & { viewKey?: string }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
   const [detail, setDetail] = useState<number | null>(null)
-  const [offset, setOffset] = useState(0)
-  const previousOffsets = useRef<number[]>([])
+  const [navigation, setNavigation] = useState(() => {
+    const saved = viewKey && presentation?.kind !== 'chart'
+      ? useResultViewStore.getState().views[viewKey] : undefined
+    return { offset: saved?.offset ?? 0, previousOffsets: saved?.previousOffsets ?? [] }
+  })
+  const { offset, previousOffsets } = navigation
   const missingNotified = useRef(false)
   const [retry, setRetry] = useState(0)
   const [exporting, setExporting] = useState(false)
@@ -1873,9 +1891,9 @@ export function FullResult({
   const reportedTotal = data?.rowCount ?? (publicationKind === 'result' ? total : null) ?? null
 
   useEffect(() => {
-    previousOffsets.current = []
-    setOffset(0)
-  }, [uri, runId, nodeId, portId])
+    // Opening a chart keeps its whole visible window at zero without replacing a table's page.
+    useResultViewStore.getState().remember(viewKey, { mode: 'full' })
+  }, [viewKey])
   useEffect(() => {
     let live = true
     setData(null); setErr(null); setDetail(null)
@@ -1967,12 +1985,15 @@ export function FullResult({
   const rows = data.rows ?? []
   const canTryNext = data.hasMore === true || (data.hasMore == null && rows.length > 0)
   const nextPage = () => {
-    previousOffsets.current.push(offset)
-    setData(null); setDetail(null); setOffset(offset + rows.length)
+    const next = { offset: offset + rows.length, previousOffsets: [...previousOffsets, offset] }
+    useResultViewStore.getState().remember(viewKey, next)
+    setData(null); setDetail(null); setNavigation(next)
   }
   const previousPage = () => {
-    const prior = previousOffsets.current.pop() ?? Math.max(0, offset - pageSize)
-    setData(null); setDetail(null); setOffset(prior)
+    const prior = previousOffsets[previousOffsets.length - 1] ?? Math.max(0, offset - pageSize)
+    const next = { offset: prior, previousOffsets: previousOffsets.slice(0, -1) }
+    useResultViewStore.getState().remember(viewKey, next)
+    setData(null); setDetail(null); setNavigation(next)
   }
   return (
     <div className={cn('dp-dark text-foreground', fillAvailableHeight && 'flex min-h-0 flex-1 flex-col')}>

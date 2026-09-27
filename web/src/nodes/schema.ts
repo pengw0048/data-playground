@@ -5,6 +5,7 @@ import type { CanvasDoc, CanvasNode, ColumnSchema } from '../types/graph'
 import type { CatalogTable, SampleResult } from '../types/api'
 import { nodeOutputs } from './registry'
 import { parseJoinKeys } from './joinKeys'
+import { parseSortKeys } from './sortKeys'
 
 /** Metadata schemas by node and named output port. ``null`` means that port is untyped. */
 export type SchemaMap = Record<string, Record<string, ColumnSchema[] | null>>
@@ -159,7 +160,7 @@ function referencedColumns(node: CanvasNode): string[] {
   const plain = (v: string) => v.split(',').map(leadingColumn).filter((x): x is string => !!x)
   switch (node.type) {
     case 'select': return plainColumns(str('select') || str('expr')) ?? []
-    case 'sort': return plain(str('by'))
+    case 'sort': return parseSortKeys(str('by'))?.map((key) => key.col) ?? []
     case 'dedup': return plain(str('on'))
     case 'aggregate': return plainColumns(str('groupBy')) ?? []
     case 'filter': case 'assert': return exprColumns(str('predicate'))
