@@ -3028,10 +3028,11 @@ export const useStore = create<Store>((set, get) => ({
     const portId = requestedPortId ?? (ports.length > 1
       ? ports.find((port) => port.id === currentPortId)?.id ?? defaultPortId
       : undefined)
+    // Reopening an active preview restores its Stop control without starting another calculation.
+    set({ openPanels: { [id]: 'data' } })
     const request = beginPreviewRequest(get, set, id, false, portId, offset)
     if (!request) return
     const { planIdentity, parameterBindings } = request
-    set({ openPanels: { [id]: 'data' } })
     const spec = getSpec(node.type)
     if (spec?.previewable === false) {
       request.finish({

@@ -1961,6 +1961,25 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.cancelRun).not.toHaveBeenCalled()
   })
 
+  it('reopens an active preview without dispatching again so Stop remains reachable', async () => {
+    useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
+    let finish!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const pending = useStore.getState().runPreview('source')
+    const requestId = useStore.getState().previews.source.previewRequestId
+    useStore.getState().closePanel('source')
+    expect(useStore.getState().openPanels).toEqual({})
+    await useStore.getState().runPreview('source')
+    expect(useStore.getState().openPanels).toEqual({ source: 'data' })
+    expect(useStore.getState().previews.source).toMatchObject({ loading: true, previewRequestId: requestId })
+    expect(apiMocks.preview).toHaveBeenCalledTimes(1)
+    await useStore.getState().cancelPreview('source')
+    expect(apiMocks.cancelPreview).toHaveBeenCalledWith(requestId, 'c')
+    expect(useStore.getState().previews.source.stopped).toBe(true)
+    finish(previewResult('late'))
+    await pending
+  })
+
   it('keeps an unconfirmed stop busy and allows a deliberate stop retry', async () => {
     useStore.setState({ doc: { id: 'c', version: 1, nodes: [NODE('source')], edges: [] } })
     let finish!: (result: ReturnType<typeof previewResult>) => void
