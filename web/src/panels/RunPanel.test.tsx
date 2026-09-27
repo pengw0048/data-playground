@@ -55,6 +55,7 @@ describe('RunPanel typed parameter gate', () => {
       ] } },
       sizes: {},
       estimate: vi.fn(), requestRun: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), refreshPreviewInputs: vi.fn(),
+      select: vi.fn(), requestNodeReveal: vi.fn(), closePanel: vi.fn(), openCodeFullscreen: vi.fn(),
       previewBindings: {}, canvasRole: 'owner', setRunParameterBinding: mocks.setBinding,
       clearRunParameterBinding: mocks.clearBinding, submitRunParameters: mocks.submit,
       editRunParameters: mocks.edit, setJobsQuery: mocks.setJobsQuery,
@@ -573,7 +574,7 @@ describe('RunPanel typed parameter gate', () => {
 
     mocks.state.runs.target = {
       phase: 'failed', error: 'aggregate failed',
-      status: { runId: 'failed-job', status: 'failed', jobType: 'run', targetNodeId: 'target', rowsProcessed: 50, ms: 10, placement: 'local', perNode: [], outputs },
+      status: { runId: 'failed-job', status: 'failed', error: 'aggregate failed', jobType: 'run', targetNodeId: 'target', rowsProcessed: 50, ms: 10, placement: 'local', perNode: [], outputs },
     }
     rerender(<RunPanel nodeId="target" />)
     expect(screen.getByLabelText('Run outputs')).toHaveTextContent('top_users')
@@ -622,7 +623,8 @@ describe('RunPanel typed parameter gate', () => {
       phase: 'failed', error: raw,
       status: {
         runId: 'failed-chart', status: 'failed', jobType: 'run', targetNodeId: 'target',
-        rowsProcessed: 0, ms: 12, placement: 'local', perNode: [],
+        error: raw, rowsProcessed: 0, ms: 12, placement: 'local',
+        perNode: [{ nodeId: 'target', status: 'failed', error: raw }],
         outputs: [{ nodeId: 'target', portId: 'out', outcome: 'failed', error: raw }],
       },
     }
@@ -644,5 +646,101 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.state.requestRun).toHaveBeenCalledWith('target')
     expect(mocks.state.estimate).not.toHaveBeenCalled()
     expect(mocks.state.run).not.toHaveBeenCalled()
+  })
+
+  function failedWrite() {
+    const raw = "at 'Calculate amount': KeyError: 'missing_amount'"
+    mocks.state.doc.nodes = [
+      { id: 'python', type: 'transform', position: { x: 0, y: 0 },
+        data: { title: 'Calculate amount', status: 'failed', config: { source: 'adhoc', code: "def fn(row):\n    return row['missing_amount']" } } },
+      { id: 'target', type: 'write', position: { x: 400, y: 0 },
+        data: { title: 'Save filtered rows', status: 'failed', config: { filename: 'filtered_output' } } },
+    ]
+    mocks.state.runs.target = { phase: 'failed', status: {
+      runId: 'current-failed-run', status: 'failed', jobType: 'run', targetNodeId: 'target',
+      error: raw, rowsProcessed: 0, ms: 12, placement: 'local', outputs: [],
+      perNode: [
+        { nodeId: 'target', status: 'failed' },
+        { nodeId: 'python', status: 'failed', label: 'Calculate amount', error: "KeyError: 'missing_amount'" },
+      ],
+    } }
+    return raw
+  }
+
+  it('shows and locates the failed upstream step while retaining the original Write retry', () => {
+    failedWrite()
+    render(<RunPanel nodeId="target" />)
+    expect(screen.getByLabelText('Failed step')).toHaveTextContent('Calculate amount')
+    expect(screen.getByText("Calculate amount: 'missing_amount'")).toBeVisible()
+    expect(screen.queryByText(/Save filtered rows:/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show failing step' }))
+    expect(mocks.state.select).toHaveBeenCalledWith('python')
+    expect(mocks.state.requestNodeReveal).toHaveBeenCalledWith('canvas', 'python')
+    expect(mocks.state.closePanel).toHaveBeenCalledWith('target')
+    expect(mocks.state.requestRun).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(mocks.state.requestRun).toHaveBeenCalledWith('target')
+  })
+
+  it('opens the existing Python editor for the diagnosed editable transform', () => {
+    failedWrite()
+    render(<RunPanel nodeId="target" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Edit code' }))
+    expect(mocks.state.openCodeFullscreen).toHaveBeenCalledWith('python', 'code', 'python')
+    expect(mocks.state.select).toHaveBeenCalledWith('python')
+    expect(mocks.state.requestRun).not.toHaveBeenCalled()
+    expect(mocks.state.run).not.toHaveBeenCalled()
+  })
+
+  it.each(['viewer', 'library'])('locates %s failures without offering a false code edit', (kind) => {
+    failedWrite()
+    if (kind === 'viewer') mocks.state.canvasRole = 'viewer'
+    else mocks.state.doc.nodes[0].data.config.source = 'library'
+    render(<RunPanel nodeId="target" />)
+    expect(screen.getByRole('button', { name: 'Show failing step' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
+    if (kind === 'viewer') expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+  })
+
+  it('keeps the server attribution after the failed node has been deleted', () => {
+    failedWrite()
+    mocks.state.doc.nodes = mocks.state.doc.nodes.filter((node: { id: string }) => node.id !== 'python')
+    render(<RunPanel nodeId="target" />)
+    expect(screen.getByText("Calculate amount: 'missing_amount'")).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Show failing step' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
+  })
+
+  it('does not reuse a previous failed attempt for a new preflight error', () => {
+    failedWrite()
+    mocks.state.runs.target.error = 'The destination changed while the run was starting.'
+    render(<RunPanel nodeId="target" />)
+    expect(screen.getByText('The destination changed while the run was starting.')).toBeVisible()
+    expect(screen.queryByLabelText('Failed step')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show failing step' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'View in Jobs' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
+    expect(screen.queryByText(/missing_amount/)).not.toBeInTheDocument()
+  })
+
+  it('does not offer recovery for a terminal status belonging to a different target', () => {
+    failedWrite()
+    mocks.state.runs.target.status.targetNodeId = 'different-target'
+    render(<RunPanel nodeId="target" />)
+    expect(screen.queryByLabelText('Failed step')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show failing step' })).not.toBeInTheDocument()
+  })
+
+  it('uses the diagnosed aggregate config instead of the downstream Write config', () => {
+    failedWrite()
+    const raw = "at 'Summarize': Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'"
+    mocks.state.doc.nodes[0] = { ...mocks.state.doc.nodes[0], type: 'aggregate',
+      data: { title: 'Summarize', status: 'failed', config: { aggs: 'avg(subject) AS average_subject' } } }
+    mocks.state.runs.target.status.error = raw
+    mocks.state.runs.target.status.perNode[1].error = raw
+    render(<RunPanel nodeId="target" />)
+    expect(screen.getByText('“subject” is a text column. Average needs a number column. Choose a numeric column or change the summary.')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Edit code' })).not.toBeInTheDocument()
   })
 })

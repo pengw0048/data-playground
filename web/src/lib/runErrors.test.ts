@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { presentRunError } from './runErrors'
+import { failedRunNode, presentRunError } from './runErrors'
+import type { CanvasNode } from '../types/graph'
 
 describe('presentRunError', () => {
   it('turns an engine function signature into an actionable column error', () => {
@@ -27,11 +28,43 @@ avg(DOUBLE) -> DOUBLE`
     expect(result.details).toContain('ConversionException')
   })
 
+  it('preserves the server attribution when its failing node is not available', () => {
+    const result = presentRunError("at 'Calculate amount': KeyError: 'missing_amount'")
+    expect(result.summary).toBe("Calculate amount: 'missing_amount'")
+    expect(result.details).toBe("at 'Calculate amount': KeyError: 'missing_amount'")
+  })
+
   it('keeps graph internals out of the primary explanation', () => {
     const raw = "invalid graph: edge 'e-9' references missing source node 'gone'"
     const result = presentRunError(raw)
 
     expect(result.summary).toBe('This branch is not ready to run. Check its connections and required fields.')
     expect(result.details).toBe(raw)
+  })
+})
+
+describe('failedRunNode', () => {
+  const nodes: CanvasNode[] = [{ id: 'python', type: 'transform', position: { x: 0, y: 0 },
+    data: { title: 'Calculate amount', status: 'failed', config: { source: 'adhoc' } } },
+  { id: 'write', type: 'write', position: { x: 300, y: 0 },
+    data: { title: 'Save rows', status: 'failed', config: {} } }]
+
+  it('uses the error-bearing step rather than a failed or blocked downstream target', () => {
+    expect(failedRunNode({ status: 'failed', perNode: [
+      { nodeId: 'write', status: 'failed' },
+      { nodeId: 'python', status: 'failed', error: "KeyError: 'missing_amount'" },
+    ] }, nodes)).toBe(nodes[0])
+  })
+
+  it('does not guess when attribution is missing, deleted, ambiguous, or not terminal', () => {
+    expect(failedRunNode(undefined, nodes)).toBeUndefined()
+    expect(failedRunNode({ status: 'failed' } as never, nodes)).toBeUndefined()
+    expect(failedRunNode({ status: 'failed', perNode: [{ nodeId: 'python', status: 'failed', error: '  ' }] }, nodes)).toBeUndefined()
+    expect(failedRunNode({ status: 'failed', perNode: [{ nodeId: 'deleted', status: 'failed', error: 'Bad column' }] }, nodes)).toBeUndefined()
+    expect(failedRunNode({ status: 'running', perNode: [{ nodeId: 'python', status: 'failed', error: 'Bad column' }] }, nodes)).toBeUndefined()
+    expect(failedRunNode({ status: 'failed', perNode: [
+      { nodeId: 'python', status: 'failed', error: 'Bad column' },
+      { nodeId: 'write', status: 'failed', error: 'Another failure' },
+    ] }, nodes)).toBeUndefined()
   })
 })

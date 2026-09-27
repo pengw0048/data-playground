@@ -4069,6 +4069,7 @@ describe('graph store — core authority ops', () => {
 
   it('persists the exact managed receipt run and keeps it until another successful Write replaces it', async () => {
     const source = NODE('source')
+    source.data.title = 'Sales data'
     source.data.config = { uri: '/data/source.parquet' }
     const write = NODE('write', 'write')
     write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
@@ -4110,7 +4111,9 @@ describe('graph store — core authority ops', () => {
     })
     apiMocks.runStatus.mockResolvedValueOnce({
       runId: 'failed-run', status: 'failed', jobType: 'run', targetNodeId: 'write',
-      rowsProcessed: 1, ms: 3, placement: 'local', perNode: [], outputs: [], error: 'write failed',
+      rowsProcessed: 1, ms: 3, placement: 'local', outputs: [],
+      perNode: [{ nodeId: 'source', status: 'failed', error: 'FileNotFoundError: source disappeared' }],
+      error: "at 'source': FileNotFoundError: source disappeared",
     })
 
     await useStore.getState().run('write')
@@ -4118,6 +4121,8 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes.find((node) => node.id === 'write')?.data.lastRun)
       .toMatchObject({ writeReceiptRunId: 'published-run' })
     expect(useStore.getState().runs.write.writeOutcome?.runId).toBe('published-run')
+    expect(useStore.getState().toasts.at(-1)?.msg).toBe('Sales data: source disappeared')
+    expect(useStore.getState().runs.write.error).toBe("at 'source': FileNotFoundError: source disappeared")
 
     apiMocks.writeAdmission.mockResolvedValueOnce({
       ...admission, managed: false, destination: '/tmp/output.parquet',

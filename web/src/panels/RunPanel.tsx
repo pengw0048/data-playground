@@ -14,7 +14,7 @@ import type { InputDrift, RunEstimate, RunOutput, WriteAdmission, WriteReceipt }
 import type { CanvasDoc, CanvasParameterDeclaration } from '../types/graph'
 import type { DatasetViewerCanvasReturn } from '../router'
 import { isMeaningfulSchemaChange } from '../lib/schemaCompatibility'
-import { presentRunError } from '../lib/runErrors'
+import { failedRunNode, presentRunError } from '../lib/runErrors'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -44,6 +44,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const editParameters = useStore((s) => s.editRunParameters)
   const submitParameters = useStore((s) => s.submitRunParameters)
   const setJobsQuery = useStore((s) => s.setJobsQuery)
+  const select = useStore((s) => s.select)
+  const requestNodeReveal = useStore((s) => s.requestNodeReveal)
+  const closePanel = useStore((s) => s.closePanel)
+  const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
 
   useEffect(() => {
     if (!isConfiguredManagedSidecarMerge && !isConfiguredMerge && !isConfiguredUpsert && (!run || run.phase === 'idle')) estimate(nodeId)
@@ -53,6 +57,23 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
   const st = run?.status
+  // A fresh preflight error can coexist with the previous attempt's status. Only use per-step
+  // evidence when this panel still describes that terminal attempt.
+  const failedAttempt = phase === 'failed' && st?.status === 'failed' && st.runId
+    && (!st.targetNodeId || st.targetNodeId === nodeId)
+    && (run?.error == null || run.error === st.error) ? st : undefined
+  const failureNode = failedRunNode(failedAttempt, doc.nodes)
+  const failureError = failedAttempt
+    ? failedAttempt.error ?? failedAttempt.perNode?.find((step) => step.nodeId === failureNode?.id)?.error
+    : run?.error
+  const editableFailureCode = canEdit && failureNode?.type === 'transform'
+    && failureNode.data.config.source !== 'library'
+  const showFailure = () => {
+    if (!failureNode) return
+    select(failureNode.id)
+    requestNodeReveal(doc.id, failureNode.id)
+    closePanel(nodeId)
+  }
   const writeAdmission = run?.writeAdmission
     ?? (run?.phase === 'done' ? run.writeOutcomeAdmission : undefined)
   const writeSubmissionUnresolved = Boolean(
@@ -65,7 +86,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const currentJobRunId = st?.runId && (
     (phase === 'running' && (st.status === 'queued' || st.status === 'running'))
     || (phase === 'done' && st.status === 'done')
-    || (phase === 'failed' && st.status === 'failed')
+    || !!failedAttempt
     || (phase === 'idle' && st.status === 'cancelled')
   ) ? st.runId : null
   const writeConfig = (target?.data.config ?? {}) as Record<string, unknown>
@@ -263,9 +284,19 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             <span className="text-destructive">✕</span>
             <span className="text-[13px] font-semibold text-destructive">run failed</span>
           </div>
-          <ReadableRunError raw={run?.error ?? st?.error} nodeTitle={target?.data.title}
-            config={target?.data.config} details />
-          {st?.status === 'failed' && <RunOutputs outputs={st.outputs} showErrors={false} />}
+          {failureNode && <div aria-label="Failed step" className="mt-2 text-[12px] font-medium text-foreground">
+            Failed step: {failureNode.data.title || failureNode.id}
+          </div>}
+          <ReadableRunError raw={failureError} nodeTitle={failureNode?.data.title}
+            config={failureNode?.data.config} details />
+          {failedAttempt && <RunOutputs outputs={failedAttempt.outputs} showErrors={false} />}
+          {failureNode && <div className="mt-3 flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" onClick={showFailure}>Show failing step</Button>
+            {editableFailureCode && <Button size="sm" variant="outline" onClick={() => {
+              showFailure()
+              openCodeFullscreen(failureNode.id, 'code', 'python')
+            }}>Edit code</Button>}
+          </div>}
           <div className="mt-3 flex gap-2">
             <Button size="sm" variant="outline"
               onClick={() => writeSubmissionUnresolved
