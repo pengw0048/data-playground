@@ -1158,16 +1158,16 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
-  test('dragging from an output port and releasing shows no menu', async ({ page }) => {
+  test('dragging from an input port onto empty Canvas does not offer a downstream operation', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Query', 'sql')
-    const handle = page.locator('.react-flow__node .react-flow__handle-right').first()
+    const handle = page.locator('.react-flow__node .react-flow__handle-left').first()
     const b = await boxOf(handle)
     await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2)
     await page.mouse.down()
-    await page.mouse.move(b.x + 160, b.y + 120, { steps: 8 }) // a real drag onto empty pane
+    await page.mouse.move(b.x - 160, b.y + 120, { steps: 8 }) // a real drag onto empty pane
     await page.mouse.up()
-    await expect(page.getByRole('dialog', { name: 'Connect to an operation' })).toHaveCount(0) // drag-release must not pop the picker
+    await expect(page.getByRole('dialog', { name: 'Connect to an operation' })).toHaveCount(0) // only output drags can offer a downstream step
   })
 
   test('a node with no upstream source has Run disabled', async ({ page }) => {
@@ -2661,7 +2661,13 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('input[readonly]').first()).toHaveValue(/#\/canvas\//)
   })
 
-  test('the data viewer opens a row detail and paginates', async ({ page }) => {
+  test('the data viewer reopens its page and keeps old rows until an explicit refresh', async ({ page }, testInfo) => {
+    const requests: Array<{ nodeId: string; offset: number }> = []
+    page.on('request', (request) => {
+      if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/run/preview') {
+        requests.push(request.postDataJSON())
+      }
+    })
     await fresh(page)
     // start a pipeline from the seeded 'events' dataset via Workspace
     await addWorkspaceDatasetToCurrentCanvas(page, 'events')
@@ -2676,12 +2682,51 @@ test.describe('Data Playground canvas', () => {
     const panel = page.getByTestId('panel-data')
     await expect(panel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
     await panel.getByRole('button', { name: 'Next page' }).click()
+    await expect(panel.getByText('rows 51–100', { exact: true })).toBeVisible()
     await expect(panel.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+    const priorRows = await panel.locator('table tbody').textContent() ?? ''
     await panel.locator('table tbody tr').first().click()
     await expect(panel.getByRole('button', { name: /^Row / })).toBeVisible() // detail back-button
+    await panel.getByTitle('Close', { exact: true }).click()
+
+    const inspector = page.getByTestId('inspector')
+    await inspector.getByRole('button', { name: 'View data', exact: true }).click()
+    await expect(panel.getByText('rows 51–100', { exact: true })).toBeVisible()
+    await expect(panel.locator('table tbody')).toHaveText(priorRows)
+    expect(requests.map((request) => request.offset)).toEqual([0, 50])
+
+    await source.getByRole('button', { name: 'Change dataset' }).click()
+    const picker = page.locator('.dp-panel').filter({ has: page.getByTestId('source-search') })
+    await picker.getByTestId('source-search').fill('movies')
+    await picker.getByRole('button', { name: /^movies\b/i }).click()
+    await expect(source.getByRole('button', { name: 'Change dataset' })).toContainText('movies')
+    await expect(panel.getByText('Preview out of date', { exact: true })).toBeVisible()
+    await expect(panel.getByText(/These rows are from before your changes/)).toBeVisible()
+    await expect(panel.locator('table tbody')).toHaveText(priorRows)
+    await inspector.getByRole('button', { name: 'View data', exact: true }).click()
+    await expect(panel.locator('table tbody')).toHaveText(priorRows)
+    expect(requests.map((request) => request.offset)).toEqual([0, 50])
+    await testInfo.attach('old-result-reference', { body: await panel.screenshot(), contentType: 'image/png' })
+
+    const refreshed = page.waitForResponse((response) => response.request().method() === 'POST'
+      && new URL(response.url()).pathname === '/api/run/preview')
+    await panel.getByRole('button', { name: 'Refresh preview', exact: true }).click()
+    const response = await refreshed
+    expect(response.ok()).toBe(true)
+    const result = await response.json() as { error?: boolean; columns: Array<{ name: string }>; rows: unknown[] }
+    expect(result.error).not.toBe(true)
+    expect(result.columns.map((column) => column.name)).toContain('title')
+    await expect(panel.getByText('rows 1–50', { exact: true })).toBeVisible()
+    await expect(panel.getByRole('columnheader', { name: 'title' })).toBeVisible()
+    await expect(panel.getByText('Preview out of date', { exact: true })).toHaveCount(0)
+    expect(requests.map((request) => request.offset)).toEqual([0, 50, 0])
+    await testInfo.attach('preview-request-sequence', {
+      body: JSON.stringify({ requests, refreshedColumns: result.columns, refreshedRows: result.rows.length }, null, 2),
+      contentType: 'application/json',
+    })
   })
 
-  test('editing a graph blocks rows from the previous preview until it is refreshed', async ({ page }) => {
+  test('editing a graph clearly labels the previous preview without automatically refreshing', async ({ page }) => {
     await fresh(page)
     await addWorkspaceDatasetToCurrentCanvas(page, 'events')
     await page.route('**/api/run/preview', (route) => route.fulfill({
@@ -2708,7 +2753,9 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('status').filter({ hasText: 'Preview out of date' }))
       .toContainText('Preview out of date')
     await expect(page.getByRole('button', { name: 'Refresh preview' })).toBeVisible()
-    await expect(page.getByText('purchase', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('purchase', { exact: true })).toBeVisible()
+    await expect(page.getByText('Previous successful preview', { exact: true })).toBeVisible()
+    await expect(page.getByText(/These rows are from before your changes/)).toBeVisible()
   })
 
   test('a write node picks an output destination via the save dialog', async ({ page }) => {

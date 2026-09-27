@@ -917,7 +917,7 @@ describe('durable full results', () => {
     expect(onRunUpstream).toHaveBeenCalledOnce()
   })
 
-  it('offers another code test without showing old output after an editor change', async () => {
+  it('offers another code test while keeping old output clearly marked after an editor change', async () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'stale', config: { source: 'adhoc', mode: 'map' }, history: [] } },
@@ -931,7 +931,8 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, onPreview }} />)
 
     expect(screen.getByText('Test result out of date')).toBeInTheDocument()
-    expect(screen.queryByText('old-output')).not.toBeInTheDocument()
+    expect(screen.getByText('old-output')).toBeVisible()
+    expect(screen.getByText(/These rows are from before your changes/)).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Refresh preview' })).not.toBeInTheDocument()
     await userEvent.setup().click(screen.getByRole('button', { name: 'Test again' }))
     expect(onPreview).toHaveBeenCalledWith(0, undefined)
@@ -2270,7 +2271,7 @@ describe('durable full results', () => {
     expect(apiMock.fullProfile).not.toHaveBeenCalled()
   })
 
-  it('blocks stale rows and offers a refresh for the current graph', () => {
+  it('keeps successful stale rows visible for comparison without treating them as current', () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'filter', position: { x: 0, y: 0 },
       data: { title: 'target', status: 'stale', config: { predicate: 'event = view' }, history: [] },
@@ -2289,7 +2290,93 @@ describe('durable full results', () => {
     render(<DataPanel nodeId="target" />)
     expect(screen.getByRole('status')).toHaveTextContent('Preview out of date')
     expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeInTheDocument()
-    expect(screen.queryByText('purchase')).not.toBeInTheDocument()
+    expect(screen.getByText('purchase')).toBeVisible()
+    expect(screen.getByText('Previous successful preview').closest('details')).toHaveAttribute('open')
+    expect(screen.getByText(/These rows are from before your changes/)).toBeVisible()
+    expect(screen.queryByRole('button', { name: /Export/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Stats' })).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+    expect(useStore.getState().previews.target.planIdentity).toBe('a-previous-plan')
+  })
+
+  it('uses previousSuccess after the failed preview becomes stale', () => {
+    const doc = { id: 'history-canvas', version: 1, nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { source: 'adhoc', code: 'changed code' } },
+    }], edges: [] }
+    const oldSuccess = {
+      ...boundPreview(doc, 'target', {
+        columns: [{ name: 'value', type: 'string' }], rows: [{ value: 'last successful row' }],
+        truncated: false,
+      }), planIdentity: 'previous-successful-code',
+    }
+    const onPreview = vi.fn()
+    useStore.setState({ doc, editorPreviews: { target: {
+      ...oldSuccess, planIdentity: 'previous-failed-code', previousSuccess: oldSuccess,
+      result: { columns: [], rows: [{ value: 'failed attempt row' }], truncated: false,
+        error: true, failureCategory: 'runtime_error', reason: 'old failure' },
+    } } } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, onPreview }} />)
+
+    expect(screen.getByText('Test result out of date')).toBeInTheDocument()
+    expect(screen.getByText('last successful row')).toBeVisible()
+    expect(screen.queryByText('failed attempt row')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test again' })).toBeInTheDocument()
+    expect(onPreview).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['no success', undefined],
+    ['another Canvas', { canvasId: 'another-canvas' }],
+    ['another node', { nodeId: 'another-node' }],
+    ['another output', { portId: 'another-port' }],
+  ])('does not invent or borrow old rows when there is %s', (_label, otherIdentity) => {
+    const doc = { id: 'history-canvas', version: 1, nodes: [{
+      id: 'target', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'stale', config: { predicate: 'value > 2' } },
+    }], edges: [] }
+    const previousSuccess = otherIdentity ? {
+      ...boundPreview(doc, 'target', {
+        columns: [{ name: 'value', type: 'string' }], rows: [{ value: 'unrelated old row' }],
+        truncated: false,
+      }), ...otherIdentity,
+    } : undefined
+    useStore.setState({ doc, previews: { target: {
+      canvasId: doc.id, nodeId: 'target', planIdentity: 'failed-old-plan', requestGeneration: 1,
+      error: 'previous request failed', previousSuccess,
+    } } } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Preview out of date')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh preview' })).toBeInTheDocument()
+    expect(screen.queryByText('Previous successful preview')).not.toBeInTheDocument()
+    expect(screen.queryByText('unrelated old row')).not.toBeInTheDocument()
+    expect(apiMock.preview).not.toHaveBeenCalled()
+  })
+
+  it('removes the old comparison table when switching to a different output', async () => {
+    registerAssertUiTestNode()
+    const doc = { id: 'history-canvas', version: 1, nodes: [{
+      id: 'target', type: 'assert-ui-test', position: { x: 0, y: 0 },
+      data: { title: 'gate', status: 'stale', config: {} },
+    }], edges: [] }
+    const onPreview = vi.fn()
+    useStore.setState({ doc, editorPreviews: { target: {
+      ...boundPreview(doc, 'target', {
+        columns: [{ name: 'value', type: 'string' }], rows: [{ value: 'old passing row' }],
+        truncated: false,
+      }, 'pass'), planIdentity: 'old-port-plan',
+    } } } as any)
+    render(<DataPanel nodeId="target" editorPreview={{ autoLoad: false, onPreview }} />)
+    expect(screen.getByText('old passing row')).toBeVisible()
+
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Violations' }))
+
+    expect(screen.queryByText('old passing row')).not.toBeInTheDocument()
+    expect(screen.queryByText('Previous successful preview')).not.toBeInTheDocument()
+    expect(onPreview).not.toHaveBeenCalled()
   })
 
   it('uses test language for stale and failed Example rows results', () => {

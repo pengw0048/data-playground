@@ -1844,3 +1844,26 @@ describe('PortRow — port schema badge', () => {
     expect(screen.queryByText('untyped')).not.toBeInTheDocument()
   })
 })
+
+describe('Inspector preview inspection', () => {
+  it('opens a retained sample despite a now-empty source and offline kernel without executing', () => {
+    const previewApi = vi.spyOn(api, 'preview')
+    const doc = { id: 'inspect-retained', name: 'Retained sample', version: 1, edges: [], nodes: [{
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Source', status: 'draft' as const, config: { uri: '' } },
+    }] }
+    const preview = { canvasId: doc.id, nodeId: 'source', principalId: undefined,
+      requestGeneration: 1, planIdentity: 'before the source was cleared', offset: 50,
+      result: { columns: [], rows: [{ value: 'previous rows' }], truncated: false, notPreviewable: false } }
+    useStore.setState({ doc, selectedId: 'source', selectedIds: ['source'], canvasRole: 'owner',
+      kernelUp: false, previews: { source: preview }, openPanels: {}, schemas: {}, runs: {},
+      catalog: [], processors: [], canvasTransformReferences: [], numericParamDrafts: {} })
+    render(<Inspector />)
+    const view = screen.getByRole('button', { name: 'View data' })
+    expect(view).toBeEnabled()
+    fireEvent.click(view)
+    expect(useStore.getState().openPanels).toEqual({ source: 'data' })
+    expect(useStore.getState().previews.source).toBe(preview)
+    expect(previewApi).not.toHaveBeenCalled()
+  })
+})

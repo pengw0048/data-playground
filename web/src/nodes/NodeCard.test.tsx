@@ -31,7 +31,7 @@ describe('NodeCard result summary', () => {
     apiMocks.schema.mockReset().mockResolvedValue({})
     apiMocks.graphSizes.mockReset().mockResolvedValue({})
     useStore.setState({
-      canvasRole: 'owner', kernelUp: true, selectedIds: [], openPanels: {}, runs: {}, sizes: {}, graphRefusals: {},
+      canvasRole: 'owner', kernelUp: true, currentUser: null, previews: {}, selectedIds: [], openPanels: {}, runs: {}, sizes: {}, graphRefusals: {},
       graphRun: null, executionRecovery: null, detachedRuns: {},
       runPreview, closePanel,
       doc: {
@@ -236,13 +236,31 @@ describe('NodeCard result summary', () => {
     expect(preview).toBeVisible()
     expect(preview).toBeEnabled()
     fireEvent.click(preview)
-    expect(runPreview).toHaveBeenCalledWith('target')
+    expect(useStore.getState().openPanels).toEqual({ target: 'data' })
+    expect(runPreview).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
 
     act(() => useStore.setState({ openPanels: { target: 'data' } }))
     const hide = screen.getByRole('button', { name: 'Hide data' })
     fireEvent.click(hide)
     expect(closePanel).toHaveBeenCalledWith('target')
+  })
+
+  it('keeps an existing preview reachable after disconnecting its source and going offline', () => {
+    const doc = useStore.getState().doc
+    const data = { ...doc.nodes[0].data, config: { uri: '' } }
+    const preview = { canvasId: doc.id, nodeId: 'target', principalId: undefined,
+      requestGeneration: 1, planIdentity: 'before the edit', offset: 100,
+      result: { columns: [], rows: [{ value: 'old result' }], truncated: false, notPreviewable: false } }
+    useStore.setState({ doc: { ...doc, nodes: [{ ...doc.nodes[0], data }] },
+      previews: { target: preview }, selectedIds: ['target'], kernelUp: false })
+    render(<TooltipProvider><ReactFlowProvider><NodeCard id="target" data={data} /></ReactFlowProvider></TooltipProvider>)
+    const button = screen.getByRole('button', { name: 'View data' })
+    expect(button).toHaveAttribute('aria-disabled', 'false')
+    fireEvent.click(button)
+    expect(useStore.getState().openPanels).toEqual({ target: 'data' })
+    expect(useStore.getState().previews.target).toBe(preview)
+    expect(runPreview).not.toHaveBeenCalled()
   })
 
   it('reveals Source preview from the shared shelf on hover', () => {
@@ -276,7 +294,8 @@ describe('NodeCard result summary', () => {
     const preview = screen.getByRole('button', { name: 'View data' })
     expect(preview).toBeEnabled()
     fireEvent.click(preview)
-    expect(runPreview).toHaveBeenCalledWith('target')
+    expect(useStore.getState().openPanels).toEqual({ target: 'data' })
+    expect(runPreview).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Run up to here' })).not.toBeInTheDocument()
   })
 

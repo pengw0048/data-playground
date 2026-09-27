@@ -67,7 +67,11 @@ test('starts a Full run from an actionable Preview response', async ({ page }) =
     await expect(panel.getByTestId('full-result-status')).toHaveText(/Complete · [\d,]+ rows/)
 
     await panel.getByRole('button', { name: 'Preview sample', exact: true }).click()
+    await expect(panel.getByText('Run this step to see results')).toBeVisible()
+    expect(previewRequests).toBe(1)
+    await panel.getByTitle('Refresh', { exact: true }).click()
     await expect(panel.getByText('rows 1–50', { exact: true })).toBeVisible()
+    expect(previewRequests).toBe(2)
   } finally {
     // The isolated E2E workspace is discarded after the run. Do not let a collab-room teardown
     // delay the browser assertion result when best-effort fixture cleanup races that shutdown.

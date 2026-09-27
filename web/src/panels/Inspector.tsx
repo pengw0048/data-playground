@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  currentPreviews, executionConfig, parameterBindingsIdentity, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
+  currentPreviews, executionConfig, parameterBindingsIdentity, previewPlanIdentity, hasInspectablePreview, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -195,6 +195,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, nodeId))
   const allSchemas = useStore((s) => s.schemas)
   const previews = useStore((s) => s.previews)
+  const hasPreview = useStore((s) => hasInspectablePreview(s, nodeId))
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const inputColumns = useInputColumns(nodeId)
@@ -204,7 +205,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const kernelUp = useStore((s) => s.kernelUp)
-  const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen, updateConfig } = useStore.getState()
+  const { rename, openPanel, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen, updateConfig } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   const [editingDraftSourceUri, setEditingDraftSourceUri] = useState(false)
   const [advancedExecutionOpen, setAdvancedExecutionOpen] = useState(false)
@@ -466,13 +467,15 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         ))}
         <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
-          {!unboundSource && kind !== 'note' && <>
+          {(!unboundSource || hasPreview) && kind !== 'note' && <>
             <Action icon="eye"
-              label={!kernelUp
+              label={hasPreview
+                ? (kind === 'chart' ? 'View chart result' : 'View data')
+                : !kernelUp
                 ? `Offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
                 : kind === 'chart' ? 'View chart result' : 'View data'}
-              disabled={!kernelUp || !runnable || !!invalid}
-              onClick={() => (kind === 'chart' ? togglePanel(nodeId, 'data') : runPreview(nodeId))} />
+              disabled={!hasPreview && (!kernelUp || !runnable || !!invalid)}
+              onClick={() => openPanel(nodeId, 'data')} />
           <Action icon={runState === 'running' ? 'stop' : 'play'} label={!kernelUp ? 'Offline — run unavailable' : kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review saved-dataset column merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}

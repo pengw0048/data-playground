@@ -671,6 +671,17 @@ function profileJobKeyForDoc(doc: CanvasDoc, nodeId: string, portId?: string): s
   return node && nodeOutputs(node).length <= 1 ? nodeId : profileJobKey(nodeId, portId)
 }
 
+// Viewing an existing sample is independent of whether the edited graph can execute again.
+// Ownership still belongs to one principal, Canvas and node; freshness is shown by DataPanel.
+export function hasInspectablePreview(
+  state: Pick<Store, 'doc' | 'currentUser' | 'previews'>, nodeId: string,
+): boolean {
+  const preview = state.previews[nodeId]
+  return !!preview && preview.canvasId === state.doc.id && preview.nodeId === nodeId
+    && preview.principalId === state.currentUser?.id
+    && state.doc.nodes.some((node) => node.id === nodeId)
+}
+
 export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string, portId = preview.portId): boolean {
   return preview.canvasId === doc.id
     && preview.nodeId === nodeId
@@ -1514,7 +1525,7 @@ interface Store {
   ) => CanvasNode | null
   addConnectedNode: (kind: string, position: { x: number; y: number }, connection: {
     source: string; sourceHandle: string; targetHandle: string; wire: WireType
-  }) => CanvasNode | null
+  }, options?: { autoPlaced?: boolean }) => CanvasNode | null
   setParent: (id: string, parentId: string | null, position: { x: number; y: number }) => void
   updateConfig: (id: string, patch: Partial<NodeConfig>) => void
   replaceSourceBinding: (id: string, title: string, config: NodeConfig) => void
@@ -2598,7 +2609,7 @@ export const useStore = create<Store>((set, get) => ({
   // Creation plus its initial edge is one graph mutation: subscribers never observe a detached
   // node, and one undo returns to the exact pre-add document. Port-started and selected-node adds
   // both use this boundary so their compatibility rules cannot drift.
-  addConnectedNode: (kind, position, connection) => {
+  addConnectedNode: (kind, position, connection, options) => {
     if (!roleCanEdit(get().canvasRole)) return null
     const source = get().doc.nodes.find((node) => node.id === connection.source)
     const spec = getSpec(kind)
@@ -2611,10 +2622,12 @@ export const useStore = create<Store>((set, get) => ({
     const base = spec.defaultData()
     const node: CanvasNode = {
       id: newId(kind), type: kind,
-      position: connectedPosition(get().doc.nodes, [source], position),
+      position: options?.autoPlaced === false
+        ? freePosition(get().doc.nodes, position)
+        : connectedPosition(get().doc.nodes, [source], position),
       // A later second Join input can center this product-created card between its sources. A user
       // drag clears the marker in Canvas.onNodeDragStop, so this never reshuffles a hand-arranged canvas.
-      data: { ...base, title: base.title, config: { ...base.config }, autoPlaced: true },
+      data: { ...base, title: base.title, config: { ...base.config }, autoPlaced: options?.autoPlaced !== false },
     }
     set((s) => {
       const stale = downstream(s.doc, node.id)
@@ -3005,7 +3018,15 @@ export const useStore = create<Store>((set, get) => ({
   togglePanel: (id, kind) =>
     set((s) => (s.openPanels[id] === kind ? { openPanels: {} } : { openPanels: { [id]: kind }, selectedId: id })),
 
-  openPanel: (id, kind) => set({ openPanels: { [id]: kind }, selectedId: id }),
+  openPanel: (id, kind) => set((state) => {
+    if (kind === 'data' && !state.doc.nodes.some((node) => node.id === id)) return {}
+    if (kind === 'data' && state.previews[id] && !hasInspectablePreview(state, id)) {
+      const previews = { ...state.previews }
+      delete previews[id]
+      return { openPanels: { [id]: kind }, selectedId: id, previews }
+    }
+    return { openPanels: { [id]: kind }, selectedId: id }
+  }),
 
   closePanel: (id) =>
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
