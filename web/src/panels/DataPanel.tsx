@@ -118,6 +118,12 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   // Single-output requests may omit the port. Multi-output requests never rely on backend ordering:
   // the visible tab selection is carried on every preview and sampled-profile request.
   const requestPortId = outputPorts.length > 1 ? selectedPortId : undefined
+  const previousSuccessfulPreview = [preview, preview?.previousSuccess].find((candidate) => (
+    candidate?.canvasId === doc.id && candidate.nodeId === nodeId && candidate.portId === requestPortId
+    && !candidate.loading && !candidate.error && !candidate.stopped
+    && candidate.result && !candidate.result.error && !candidate.result.notPreviewable
+    && !candidate.result.failureCategory
+  ))
   const run = useStore((s) => s.runs[nodeId])
   const graphRun = useStore((s) => s.graphRun)
   const detachedRunActive = useStore((s) => Object.keys(s.detachedRuns).length > 0)
@@ -476,7 +482,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           {preview.stopError ? 'Retry stop' : 'Stop preview'}
         </Button>
       </div>
-      <PreviousPreview preview={preview.previousSuccess} />
+      <PreviousPreview preview={previousSuccessfulPreview} />
     </div>)
   }
   if (preview?.stopped || preview?.result?.failureCategory === 'cancelled'
@@ -492,7 +498,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           {editorPreview ? 'Test again' : 'Refresh preview'}
         </Button>
       </div>
-      <PreviousPreview preview={preview.previousSuccess} />
+      <PreviousPreview preview={previousSuccessfulPreview} />
     </div>)
   }
   if (!preview || preview.portId !== requestPortId) {
@@ -514,21 +520,22 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         onRun={editorPreview.onRunUpstream}
         runLabel="Run upstream" />)
     }
-    return withOutputPorts(<StalePreview
+    return withOutputPorts(<><StalePreview
       exampleRowsTest={editorPreview?.resultContext === 'example-rows'}
       editorTestTarget={editorPreview ? editorPreview.testTarget ?? 'code' : undefined}
-      onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
+      onRefresh={() => previewAction(nodeId, 0, requestPortId)} />
+      <PreviousPreview preview={previousSuccessfulPreview} stale /></>)
   }
   if (preview.loading) return withOutputPorts(<Skeleton />)
   if (preview.error) return withOutputPorts(<><ErrorState
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={preview.error} onRetry={() => previewAction(nodeId, offset, requestPortId)} />
-    <PreviousPreview preview={preview.previousSuccess} /></>)
+    <PreviousPreview preview={previousSuccessfulPreview} /></>)
   const res = preview.result!
   if (res.failureCategory === 'syntax_error' && res.syntaxError) {
     return withOutputPorts(<><SyntaxFailure failure={res.syntaxError} />
-      <PreviousPreview preview={preview.previousSuccess} /></>)
+      <PreviousPreview preview={previousSuccessfulPreview} /></>)
   }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
@@ -543,13 +550,13 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       onEdit={canEditFailure
         ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
         : undefined} />
-      <PreviousPreview preview={preview.previousSuccess} /></>)
+      <PreviousPreview preview={previousSuccessfulPreview} /></>)
   }
   if (res.error) return withOutputPorts(<><ErrorState
     title={editorPreview?.resultContext === 'example-rows' ? 'Example rows test failed' : undefined}
     retryLabel={editorPreview?.resultContext === 'example-rows' ? 'Test again' : undefined}
     reason={res.reason ?? 'preview failed'} onRetry={() => previewAction(nodeId, offset, requestPortId)} />
-    <PreviousPreview preview={preview.previousSuccess} /></>)
+    <PreviousPreview preview={previousSuccessfulPreview} /></>)
   const resultModeToggle = selectedOutput?.uri
     ? <ResultModeToggle mode={resultMode} onChange={setResultMode}
         fullLabel={selectedOutput.publicationKind === 'catalog' ? 'Published dataset' : 'Full result'} />
@@ -1734,11 +1741,16 @@ function MetricValue({ rows }: { rows: Record<string, unknown>[] }) {
   )
 }
 
-function PreviousPreview({ preview }: { preview?: Omit<PreviewState, 'previousSuccess'> }) {
+function PreviousPreview({ preview, stale = false }: {
+  preview?: Omit<PreviewState, 'previousSuccess'>
+  stale?: boolean
+}) {
   if (!preview?.result) return null
-  return <details className="border-t border-border text-[12px]">
+  return <details open={stale || undefined} className="border-t border-border text-[12px]">
     <summary className="cursor-pointer px-4 py-3 font-medium">Previous successful preview</summary>
-    <p className="px-4 pb-3 text-muted-foreground">These rows came from the previous successful preview. They are not a result of the current attempt.</p>
+    <p className="px-4 pb-3 text-muted-foreground">{stale
+      ? 'These rows are from before your changes, kept here for comparison. Refresh or test again to see the current result.'
+      : 'These rows came from the previous successful preview. They are not a result of the current attempt.'}</p>
     <RowsTable columns={preview.result.columns.map((column) => ({ ...column, capabilities: column.capabilities ?? [] }))} rows={preview.result.rows} onRowClick={() => {}} />
   </details>
 }

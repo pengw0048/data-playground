@@ -30,6 +30,7 @@ import { absoluteNodePosition, locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 import { OwnDataStarterModal } from './OwnDataStarterModal'
 import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
+import { outputConnectionDrop } from './outputConnectionDrop'
 import { canvasFitOptions, rightViewportShiftToReveal } from './viewportFit'
 import { requestSourceEntryAction, type SourceEntryAction } from '../nodes/kinds/source'
 import {
@@ -252,8 +253,10 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
   const [finder, setFinder] = useState<{
     anchor: ScreenRect
     boundary: ScreenRect
-    opener: HTMLElement
+    opener: HTMLElement | null
     wire: WireType
+    canvasId: string
+    position?: { x: number; y: number }
     source: { nodeId: string; handleId: string | null }
   } | null>(null)
   const [contextPosition, setContextPosition] = useState({ x: 0, y: 0 })
@@ -589,13 +592,43 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
     return !occupied
   }, [canEdit, doc.nodes, doc.edges])
 
-  // `isValidConnection` only returns a boolean. React Flow gives us the rejected endpoints at the
-  // end of a drag, which lets the product explain why the connection did not persist.
-  const onConnectEnd = useCallback<OnConnectEnd>((_event, state) => {
-    if (state.isValid !== false || !state.fromNode || !state.toNode) return
-    const reason = cycleGestureReason(doc.edges, state, reconnectingEdgeId.current)
-    if (reason) useStore.getState().pushToast(reason, 'error')
-  }, [doc.edges])
+  const openConnectedFinder = useCallback((
+    source: { nodeId: string; handleId: string | null },
+    anchor: ScreenRect,
+    opener: HTMLElement | null,
+    position?: { x: number; y: number },
+  ) => {
+    const current = useStore.getState()
+    if (!roleCanEdit(current.canvasRole)) return
+    const wire = portWire(current.doc.nodes, source.nodeId, source.handleId, 'source')
+    const surface = canvasRef.current?.getBoundingClientRect()
+    if (!wire || !surface) return
+    const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
+    const boundary = {
+      left: surface.left, right: surface.right, top: surface.top,
+      bottom: toolbarTop == null ? surface.bottom : Math.min(surface.bottom, toolbarTop - 8),
+    }
+    setFinder({ anchor, boundary, opener, wire: wire as WireType, source, position, canvasId: current.doc.id })
+  }, [])
+
+  const onConnectEnd = useCallback<OnConnectEnd>((event, state) => {
+    if (!canEdit) return
+    // Keep the existing rejection explanation when the user tried an actual node/handle.
+    if (state.isValid === false && state.fromNode && state.toNode) {
+      const reason = cycleGestureReason(doc.edges, state, reconnectingEdgeId.current)
+      if (reason) useStore.getState().pushToast(reason, 'error')
+    }
+    const point = 'changedTouches' in event ? event.changedTouches[0] : event
+    if (!point) return
+    // Touch events retain their original target; hit-test the release position for both inputs.
+    const target = document.elementFromPoint(point.clientX, point.clientY)
+    const source = outputConnectionDrop(state, target, canEdit, reconnectingEdgeId.current)
+    if (!source) return
+    const drop = screenToFlowPosition({ x: point.clientX, y: point.clientY })
+    openConnectedFinder(source, {
+      left: point.clientX, right: point.clientX, top: point.clientY, bottom: point.clientY,
+    }, null, { x: drop.x, y: drop.y - 40 })
+  }, [canEdit, doc.edges, openConnectedFinder, screenToFlowPosition])
 
   const onConnect = useCallback((c: Connection) => {
     if (!isValidConnection(c)) return
@@ -656,8 +689,8 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
     }
   }, [canEdit, setParent])
 
-  // A CLICK on an output port opens the shared compatible-node picker (Port dispatches this event). A drag to
-  // connect never fires a click on the origin handle, so pulling a wire never pops the picker.
+  // Plain clicks use the same picker; React Flow calls onConnectEnd only after movement, so a
+  // stationary port click does not also take the drag-to-blank path.
   useEffect(() => {
     const onPortClick = (ev: Event) => {
       if (!canEdit) return
@@ -667,24 +700,11 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
         anchor: ScreenRect
         opener: HTMLElement
       }
-      // Resolve compatibility at activation time. A newly added node can paint before this effect
-      // is refreshed with the next graph snapshot; reading the store avoids dropping a fast click
-      // or key press against an otherwise visible port.
-      const wire = portWire(useStore.getState().doc.nodes, nodeId, handleId, 'source')
-      const surface = canvasRef.current?.getBoundingClientRect()
-      if (!wire || !surface) return
-      const toolbarTop = document.querySelector<HTMLElement>('[data-testid="toolbar"]')?.getBoundingClientRect().top
-      const boundary = {
-        left: surface.left,
-        right: surface.right,
-        top: surface.top,
-        bottom: toolbarTop == null ? surface.bottom : Math.min(surface.bottom, toolbarTop - 8),
-      }
-      setFinder({ anchor, boundary, opener, wire: wire as WireType, source: { nodeId, handleId } })
+      openConnectedFinder({ nodeId, handleId }, anchor, opener)
     }
     window.addEventListener('dp-port-click', onPortClick)
     return () => window.removeEventListener('dp-port-click', onPortClick)
-  }, [canEdit])
+  }, [canEdit, openConnectedFinder])
 
   useCanvasShortcuts(removeSelected, bypass, disable)
 
@@ -794,7 +814,7 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
 
       <PanelHost />
 
-      {canEdit && finder && (
+      {canEdit && finder?.canvasId === doc.id && (
         <NodeFinder
           specs={allSpecs()}
           wire={finder.wire}
@@ -804,6 +824,7 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
           returnFocus={finder.opener}
           onClose={() => setFinder(null)}
           onPick={(kind) => {
+            if (useStore.getState().doc.id !== finder.canvasId) { setFinder(null); return }
             const target = firstCompatibleInput(kind, finder.wire)
             // Keep the graph contract at the creation boundary as well as in the picker. This prevents
             // a stale plugin registry update from creating an incompatible unconnected node.
@@ -812,11 +833,11 @@ export function Canvas({ inspectorCollapsed }: { inspectorCollapsed: boolean }) 
                 x: finder.anchor.right,
                 y: (finder.anchor.top + finder.anchor.bottom) / 2,
               })
-              const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
+              const pos = finder.position ?? freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
               const created = useStore.getState().addConnectedNode(kind, pos, {
                 source: finder.source.nodeId, sourceHandle: finder.source.handleId ?? '',
                 targetHandle: target.id, wire: finder.wire,
-              })
+              }, finder.position ? { autoPlaced: false } : undefined)
               // Selection opens the Inspector and narrows the Canvas. Reveal only after that real
               // surface resize, so a consecutive rightward insertion cannot land underneath it.
               if (created) {

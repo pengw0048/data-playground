@@ -39,10 +39,18 @@ test('starts from an uploaded dataset and edits a quoted numeric column without 
   const filter = page.locator('.react-flow__node[data-id="flt"]')
   const inspector = page.getByTestId('inspector')
   const panel = page.getByTestId('panel-data')
-  const preview = async (ids: number[]) => {
+  const preview = async (ids: number[], refreshExisting = false) => {
+    const requestsBeforeOpening = previewRequests
     const sampled = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/run/preview'
       && response.request().method() === 'POST')
     await inspector.getByRole('button', { name: 'View data', exact: true }).click()
+    if (refreshExisting) {
+      await expect(panel.getByText('Preview out of date', { exact: true })).toBeVisible()
+      await expect(panel.getByText('Previous successful preview', { exact: true })).toBeVisible()
+      await expect(panel.getByText('above', { exact: true })).toBeVisible()
+      expect(previewRequests).toBe(requestsBeforeOpening)
+      await panel.getByRole('button', { name: 'Refresh preview', exact: true }).click()
+    }
     const response = await sampled
     const result = await json<SampleResult>(response, 'preview the selected Filter')
     expect(response.request().postDataJSON()).toMatchObject({ nodeId: 'flt' })
@@ -50,6 +58,7 @@ test('starts from an uploaded dataset and edits a quoted numeric column without 
     await expect(panel.getByRole('columnheader', { name: column })).toBeVisible()
     await expect(panel.locator('tbody tr')).toHaveCount(ids.length)
     await expect(panel.getByText('high', { exact: true })).toBeVisible()
+    expect(previewRequests).toBe(requestsBeforeOpening + 1)
     await panel.getByTitle('Close', { exact: true }).click()
     return result
   }
@@ -112,7 +121,7 @@ test('starts from an uploaded dataset and edits a quoted numeric column without 
     await filter.getByPlaceholder('value', { exact: true }).fill('10.75')
     await expect.poll(async () => (await saved()).nodes.find((node) => node.id === 'flt')?.data.config.predicate)
       .toBe('"sale ""USD""" > 10.75')
-    const second = await preview([4])
+    const second = await preview([4], true)
     expect(second.rows[0][column]).toBe(20.25)
     await page.reload()
     await filter.getByText('Filter rows', { exact: true }).click()

@@ -1495,6 +1495,36 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges).toHaveLength(1)
   })
 
+  it('keeps a connected node at the chosen drop point with one undo for its node and wire', () => {
+    register({
+      kind: 'drop-source', title: 'Drop source', category: 'io',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Drop source', config: {}, status: 'draft' }),
+    }, () => null)
+    register({
+      kind: 'drop-target', title: 'Drop target', category: 'shape',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'Drop target', config: {}, status: 'draft' }),
+    }, () => null)
+    useStore.setState((state) => ({ doc: { ...state.doc, nodes: [NODE('source', 'drop-source')], edges: [] } }))
+    const position = { x: -520, y: 420 }
+    const connection = { source: 'source', sourceHandle: 'out', targetHandle: 'in', wire: 'dataset' as const }
+    const node = useStore.getState().addConnectedNode('drop-target', position, connection, { autoPlaced: false })!
+    expect(node.position).toEqual(position)
+    expect(node.data.autoPlaced).toBe(false)
+    expect(useStore.getState().doc.edges).toEqual([expect.objectContaining({ source: 'source', target: node.id })])
+    useStore.getState().undo()
+    expect(useStore.getState().doc.nodes.map((item) => item.id)).toEqual(['source'])
+    expect(useStore.getState().doc.edges).toEqual([])
+    useStore.getState().redo()
+    expect(useStore.getState().doc.nodes.find((item) => item.id === node.id)?.position).toEqual(position)
+    const next = useStore.getState().addConnectedNode('drop-target', position, connection, { autoPlaced: false })!
+    expect(next.position).not.toEqual(position)
+    expect(next.data.autoPlaced).toBe(false)
+  })
+
   it('places connected insertions rightward and only recenters an un-dragged Join', () => {
     register({
       kind: 'topology-source', title: 'Topology source', category: 'io',
@@ -1978,6 +2008,40 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previews.source.stopped).toBe(true)
     finish(previewResult('late'))
     await pending
+  })
+
+  it.each(['sample', 'stale', 'failed', 'running'] as const)('opens a %s preview at its existing output and page without re-executing', (phase) => {
+    const section = NODE('target', 'section')
+    section.data.config = { outputs: ['pass', 'out'] }
+    const doc = { id: 'c', version: 1, nodes: [section], edges: [] }
+    const preview = {
+      canvasId: 'c', nodeId: 'target', principalId: 'alice', portId: 'pass',
+      planIdentity: phase === 'stale' ? 'earlier-plan' : previewPlanIdentity(doc, 'target', 'pass'),
+      requestGeneration: 1, previewRequestId: 'active-request', offset: 100,
+      ...(phase === 'failed' ? { error: 'Preview failed' }
+        : phase === 'running' ? { loading: true } : { result: previewResult('page three') }),
+    }
+    useStore.setState({ doc, previews: { target: preview }, openPanels: {} })
+    useStore.getState().openPanel('target', 'data')
+    expect(useStore.getState().openPanels).toEqual({ target: 'data' })
+    expect(useStore.getState().previews.target).toBe(preview)
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(apiMocks.cancelPreview).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['another Canvas', 'different-canvas', 'alice'],
+    ['another user', 'c', 'bob'],
+  ])('does not reopen a cached preview from %s', (_case, canvasId, principalId) => {
+    useStore.setState({
+      doc: { id: 'c', version: 1, nodes: [NODE('target')], edges: [] },
+      previews: { target: { canvasId, nodeId: 'target', principalId, planIdentity: 'old',
+        requestGeneration: 1, offset: 100, result: previewResult('private rows') } },
+    })
+    useStore.getState().openPanel('target', 'data')
+    expect(useStore.getState().openPanels).toEqual({ target: 'data' })
+    expect(useStore.getState().previews.target).toBeUndefined()
+    expect(apiMocks.preview).not.toHaveBeenCalled()
   })
 
   it('keeps an unconfirmed stop busy and allows a deliberate stop retry', async () => {

@@ -21,7 +21,7 @@ import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useInputColumns, useSchemaWarnings } from './fields'
 import {
-  useStore, nodeRunnable, unsetSourceReason, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite, type PanelKind,
+  useStore, hasInspectablePreview, nodeRunnable, unsetSourceReason, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite, type PanelKind,
 } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -44,7 +44,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
   // shift-select of many cards must not float (and strand) one shelf per card
   const soleSelected = useStore((s) => s.selectedIds.length <= 1 && s.selectedIds.includes(id))
   const openPanel = useStore((s) => s.openPanels[id])
-  const runPreview = useStore((s) => s.runPreview)
+  const showPanel = useStore((s) => s.openPanel)
+  const hasPreview = useStore((s) => hasInspectablePreview(s, id))
   const requestRun = useStore((s) => s.requestRun)
   const cancelRun = useStore((s) => s.cancelRun)
   const executionRecovery = useStore((s) => s.executionRecovery)
@@ -250,15 +251,17 @@ export function NodeCard({ id, data, children, metaOverride }: {
           <ActionIcon
             name="eye" label={openPanel === 'data'
               ? 'Hide data'
+              : hasPreview
+                ? (kind === 'chart' ? 'View chart result' : 'View data')
               : !kernelUp
                 ? `Offline — ${kind === 'chart' ? 'chart result' : 'preview'} unavailable`
                 : runnable
                   ? invalid ?? (kind === 'chart' ? 'View chart result' : 'View data')
                   : blocked ?? `Connect a source to ${kind === 'chart' ? 'run this chart' : 'preview'}`}
-            active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
+            active={openPanel === 'data'} disabled={openPanel !== 'data' && !hasPreview && (!kernelUp || !runnable || !!invalid)}
             onClick={() => (openPanel === 'data'
               ? closePanel(id)
-              : kind === 'chart' ? togglePanel(id, 'data') : runPreview(id))}
+              : showPanel(id, 'data'))}
           />
           {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick action
               here. Preview shares the same action shelf as every other node; run/materialize stays
@@ -449,6 +452,7 @@ function NodeContextActions({ id, kind, canEdit, disabled, bypassed, kernelUp, r
   id: string; kind: string; canEdit: boolean; disabled: boolean; bypassed: boolean
   kernelUp: boolean; runnable: boolean; invalid: string | null
 }) {
+  const hasPreview = useStore((s) => hasInspectablePreview(s, id))
   const renameRequested = useRef(false)
   const canBypass = getSpec(kind)?.canBypass
   const requestRename = () => { renameRequested.current = true }
@@ -471,10 +475,9 @@ function NodeContextActions({ id, kind, canEdit, disabled, bypassed, kernelUp, r
     }}>
     {canEdit && item('rename', 'Rename', requestRename)}
     {item('eye', kind === 'chart' ? 'View chart result' : 'Preview data', () => {
-      if (kind === 'chart') useStore.getState().openPanel(id, 'data')
-      else void useStore.getState().runPreview(id)
+      useStore.getState().openPanel(id, 'data')
     }, {
-      disabled: !kernelUp || !runnable || !!invalid,
+      disabled: !hasPreview && (!kernelUp || !runnable || !!invalid),
     })}
     {item('play', 'Run details', () => useStore.getState().openPanel(id, 'run'))}
     {item('lineage', 'Lineage', () => useStore.getState().openPanel(id, 'lineage'))}
