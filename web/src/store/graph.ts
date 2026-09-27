@@ -42,7 +42,7 @@ import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 import { graphHasCycle } from '../canvas/connectionCycle'
 import { connectedBasePosition } from '../canvas/connectedPlacement'
 import { rememberCanvasOpenedAt } from './canvasRecents'
-import { presentRunError } from '../lib/runErrors'
+import { failedRunNode, presentRunError } from '../lib/runErrors'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -6659,8 +6659,7 @@ function pollGraphRun(
     recoverCanvasResults(get, set, get().doc)
     settleAnimatingNodes(set)
     if (status.status === 'failed') {
-      const failed = status.perNode?.find((step) => step.status === 'failed')
-      const node = get().doc.nodes.find((item) => item.id === failed?.nodeId)
+      const node = failedRunNode(status, get().doc.nodes)
       get().pushToast(presentRunError(status.error, {
         nodeTitle: node?.data.title, config: node?.data.config,
       }).summary, 'error')
@@ -6686,7 +6685,7 @@ function settleTargetRun(
     ? managedWriteReceiptOutput(status.outputs, nodeId)
     : undefined
   set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
-    ...(s.runs[nodeId] ?? { phase } as any), status, phase,
+    ...(s.runs[nodeId] ?? { phase } as any), status, phase, error: status.error ?? undefined,
     writeOutcomeAdmission: status.status === 'done' ? writeOutcomeAdmission : undefined,
     writeOutcome: status.status === 'done'
       ? publishedWrite
@@ -6696,10 +6695,12 @@ function settleTargetRun(
     writeAdmission: undefined, writeSubmissionId: undefined,
     writeAdmissionFingerprint: undefined,
   } } }))
-  if (status.status === 'failed') get().pushToast(presentRunError(status.error, {
-    nodeTitle: target?.data.title,
-    config: target?.data.config,
-  }).summary, 'error')
+  if (status.status === 'failed') {
+    const failed = failedRunNode(status, get().doc.nodes)
+    get().pushToast(presentRunError(status.error, {
+      nodeTitle: failed?.data.title, config: failed?.data.config,
+    }).summary, 'error')
+  }
   const g = get()
   const previousLastRun = g.doc.nodes.find((node) => node.id === nodeId)?.data.lastRun
   g.updateData(nodeId, {

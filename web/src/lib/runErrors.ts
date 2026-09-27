@@ -1,3 +1,6 @@
+import type { RunStatus } from '../types/api'
+import type { CanvasNode } from '../types/graph'
+
 export interface RunErrorContext {
   nodeTitle?: string
   config?: Record<string, unknown>
@@ -6,6 +9,18 @@ export interface RunErrorContext {
 export interface RunErrorPresentation {
   summary: string
   details?: string
+}
+
+/** Attribute only one explicitly diagnosed step in the failed attempt, never a blocked sibling. */
+export function failedRunNode(
+  status: Pick<RunStatus, 'status' | 'perNode'> | null | undefined,
+  nodes: readonly CanvasNode[],
+): CanvasNode | undefined {
+  if (status?.status !== 'failed') return undefined
+  const ids = new Set((status.perNode ?? []).filter((step) => step.status === 'failed' && step.error?.trim())
+    .map((step) => step.nodeId))
+  if (ids.size !== 1) return undefined
+  return nodes.find((node) => ids.has(node.id))
 }
 
 const NUMBER_SUMMARIES: Record<string, string> = {
@@ -35,7 +50,7 @@ function readableType(type: string): string {
 }
 
 function fallbackSummary(raw: string, context: RunErrorContext): string {
-  const attributed = /^at '[^']+':/i.test(raw.trim())
+  const attribution = /^at '([^']+)':/i.exec(raw.trim())
   let value = raw
     .split(/\n\s*(?:Candidate functions:|Candidates:|LINE \d+:)/i)[0]
     .split('\n')
@@ -48,8 +63,9 @@ function fallbackSummary(raw: string, context: RunErrorContext): string {
     .replace(/^(?:Binder|Conversion|Catalog) Error:\s*/i, '')
     .trim()
   if (!value) return 'This step could not run.'
-  if (attributed && context.nodeTitle && !value.toLowerCase().includes(context.nodeTitle.toLowerCase())) {
-    return `${context.nodeTitle}: ${value}`
+  const title = context.nodeTitle || attribution?.[1]
+  if (attribution && title && !value.toLowerCase().includes(title.toLowerCase())) {
+    return `${title}: ${value}`
   }
   return value
 }
